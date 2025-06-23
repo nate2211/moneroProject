@@ -49,9 +49,10 @@ Subject: {subject}
         print(f"[!] Failed to send email: {e}")
 
 # === LOG EVENT FOR WEB UI ===
-def log_event(event_type, message):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    event = {"time": now, "type": event_type, "message": message}
+def log_event(event_type, message, event_time=None):
+    if event_time is None:
+        event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    event = {"time": event_time, "type": event_type, "message": message}
     events = []
 
     if os.path.exists(EVENT_LOG):
@@ -66,6 +67,59 @@ def log_event(event_type, message):
 
     with open(EVENT_LOG, "w") as f:
         json.dump(events, f, indent=2)
+
+# === PARSE P2POOL OUTPUT ===
+import re
+
+def parse_p2pool_line(line):
+    """Parse a line from the p2pool log and log interesting events."""
+    # extract timestamp from line if present
+    time_match = re.match(r"^\w+\s+(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})", line)
+    event_time = None
+    if time_match:
+        event_time = f"{time_match.group(1)} {time_match.group(2)}"
+
+    l = line.lower()
+
+    if "sidechain verified block" in l:
+        m = re.search(r"height\s*=\s*(\d+).*?id\s*=\s*([0-9a-f]+)", line)
+        if m:
+            height, bid = m.group(1), m.group(2)
+            msg = f"verified block height {height} id {bid}"
+        else:
+            msg = line.strip()
+        log_event("VerifiedBlock", msg, event_time)
+        return
+    if "sidechain new chain tip" in l:
+        m = re.search(r"next height\s*=\s*(\d+).*?difficulty\s*=\s*(\d+)", line)
+        if m:
+            height, diff = m.group(1), m.group(2)
+            msg = f"new tip height {height}, diff {diff}"
+        else:
+            msg = line.strip()
+        log_event("ChainTip", msg, event_time)
+        return
+    if "blocktemplate final reward" in l:
+        m = re.search(r"final reward =\s*([0-9.]+) XMR", line)
+        if m:
+            reward = m.group(1)
+            msg = f"final reward {reward} XMR"
+        else:
+            msg = line.strip()
+        log_event("BlockTemplate", msg, event_time)
+        return
+    if "p2pserver peer" in l and "banned" in l:
+        m = re.search(r"peer ([0-9.:]+) banned for (\d+)", line)
+        if m:
+            ip, secs = m.group(1), m.group(2)
+            msg = f"peer {ip} banned for {secs}s"
+        else:
+            msg = line.strip()
+        log_event("PeerBanned", msg, event_time)
+        return
+    if "stratumserver sent new job" in l:
+        log_event("NewJob", line.strip(), event_time)
+        return
 
 # === MONITOR FUNCTION ===
 def monitor_log():
@@ -88,18 +142,22 @@ def monitor_log():
             l = line.lower().strip()
             buffer.append(line)
 
+            handled = False
             if "found block" in l:
                 send_email("P2Pool Block Found", line.strip())
                 log_event("Block", line.strip())
+                handled = True
             elif "found share" in l:
                 send_email("P2Pool Share Found", line.strip())
                 log_event("Share", line.strip())
+                handled = True
             elif "hashrate:" in l:
                 try:
                     hashrate_str = line.split("hashrate:")[1].split()[0]
                     latest_hashrate = hashrate_str + " H/s"
                 except Exception as e:
                     print(f"[!] Failed to parse hashrate: {e}")
+                handled = True
             elif "p2pool new miner data" in l:
                 # look ahead to find IP or host info
                 for i in range(10):
@@ -114,6 +172,10 @@ def monitor_log():
                         except Exception as e:
                             print(f"[!] Failed to parse host: {e}")
                         break
+                handled = True
+
+            if not handled:
+                parse_p2pool_line(line)
 
 # === START P2POOL IN ADMIN POWERSHELL ===
 def start_p2pool():
