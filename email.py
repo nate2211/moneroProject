@@ -22,10 +22,8 @@ P2POOL_DIR = "X:\\Programs\\p2pool-v4.8-windows-x64"
 P2POOL_EXE = "p2pool_min_payout_mod.exe"
 WALLET = "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk"
 LOG_FILE = os.path.join(P2POOL_DIR, "p2pool_log.txt")
-EVENT_LOG = os.path.join(P2POOL_DIR, "events.json")
 
-latest_hashrate = ""
-connected_miners = []
+latest_events = []
 
 # === EMAIL FUNCTION ===
 def send_email(subject, body):
@@ -47,29 +45,16 @@ Subject: {subject}
             print(f"[+] Email sent ({subject})")
     except Exception as e:
         print(f"[!] Failed to send email: {e}")
+import re
 
-# === LOG EVENT FOR WEB UI ===
-def log_event(event_type, message):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    event = {"time": now, "type": event_type, "message": message}
-    events = []
+def strip_ansi_codes(text):
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
-    if os.path.exists(EVENT_LOG):
-        with open(EVENT_LOG, "r") as f:
-            try:
-                events = json.load(f)
-            except:
-                pass
-
-    events.insert(0, event)
-    events = events[:100]
-
-    with open(EVENT_LOG, "w") as f:
-        json.dump(events, f, indent=2)
 
 # === MONITOR FUNCTION ===
 def monitor_log():
-    global latest_hashrate, connected_miners
+    global latest_events
 
     print(f"[~] Waiting for '{LOG_FILE}'...")
     while not os.path.exists(LOG_FILE):
@@ -78,42 +63,36 @@ def monitor_log():
     print("[+] Monitoring p2pool_log.txt...")
     with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
         f.seek(0, os.SEEK_END)
-        buffer = []
         while True:
             line = f.readline()
             if not line:
                 time.sleep(0.3)
                 continue
 
-            l = line.lower().strip()
-            buffer.append(line)
+            clean_line = strip_ansi_codes(line).strip()
+            l = clean_line.lower()
+            event = None
 
-            if "found block" in l:
-                send_email("P2Pool Block Found", line.strip())
-                log_event("Block", line.strip())
+            if "sidechain verified block" in l:
+                event = "Sidechain Verified Block"
+            elif "sidechain new chain tip" in l:
+                event = "Sidechain New Chain Tip"
+            elif "blocktemplate final reward" in l:
+                event = "Final Block Reward"
             elif "found share" in l:
-                send_email("P2Pool Share Found", line.strip())
-                log_event("Share", line.strip())
-            elif "hashrate:" in l:
-                try:
-                    hashrate_str = line.split("hashrate:")[1].split()[0]
-                    latest_hashrate = hashrate_str + " H/s"
-                except Exception as e:
-                    print(f"[!] Failed to parse hashrate: {e}")
-            elif "p2pool new miner data" in l:
-                # look ahead to find IP or host info
-                for i in range(10):
-                    line2 = f.readline()
-                    if not line2:
-                        break
-                    if "host =" in line2:
-                        try:
-                            ip = line2.split("host =")[1].strip().split(":")[0]
-                            if ip not in connected_miners:
-                                connected_miners.append(ip)
-                        except Exception as e:
-                            print(f"[!] Failed to parse host: {e}")
-                        break
+                event = "Found Share"
+                send_email("Found Share", "Share has been found.")
+            elif "found block" in l:
+                event = "Found Block"
+                send_email("Found Block", "Block has been found.")
+            elif "p2pool caught sigint" in l or "p2pool stopping" in l:
+                event = "P2Pool Stopped"
+
+            if event:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                latest_events.insert(0, {"time": timestamp, "event": event, "line": line.strip()})
+                latest_events = latest_events[:50]
+
 
 # === START P2POOL IN ADMIN POWERSHELL ===
 def start_p2pool():
@@ -149,7 +128,7 @@ app = Flask(__name__)
 
 HTML = """
 <!DOCTYPE html>
-<html><head><title>P2Pool Status</title>
+<html><head><title>P2Pool Events</title>
 <meta http-equiv="refresh" content="10">
 <style>
 body { font-family: Arial; margin: 40px; }
@@ -158,79 +137,19 @@ th, td { border: 1px solid #ddd; padding: 8px; }
 th { background-color: #444; color: white; }
 </style></head>
 <body>
-<h2>P2Pool Mining Events</h2>
+<h2>P2Pool Event Monitor</h2>
 <table>
-<tr><th>Time</th><th>Type</th><th>Message</th></tr>
+<tr><th>Time</th><th>Event</th><th>Message</th></tr>
 {% for e in events %}
-<tr><td>{{ e.time }}</td><td>{{ e.type }}</td><td>{{ e.message }}</td></tr>
+<tr><td>{{ e.time }}</td><td>{{ e.event }}</td><td>{{ e.line }}</td></tr>
 {% endfor %}
 </table>
-<hr>
-<h3>Live Hashrate</h3>
-<p><span id="hashrate">Loading...</span></p>
-<h3>Connected Miners</h3>
-<ul id="miners"></ul>
-<h3>System Status</h3>
-<ul>
-  <li>CPU Usage: <span id="cpu"></span>%</li>
-  <li>RAM Usage: <span id="ram"></span>%</li>
-</ul>
-<script>
-function updateData() {
-  fetch('/hashrate').then(r => r.json()).then(data => {
-    document.getElementById('hashrate').innerText = data.hashrate || "N/A";
-  });
-  fetch('/miners').then(r => r.json()).then(data => {
-    let list = document.getElementById('miners');
-    list.innerHTML = "";
-    for (let m of data.miners) {
-      let li = document.createElement('li');
-      li.innerText = m;
-      list.appendChild(li);
-    }
-  });
-  fetch('/status').then(res => res.json()).then(data => {
-    document.getElementById('cpu').innerText = data.cpu;
-    document.getElementById('ram').innerText = data.ram;
-  });
-}
-setInterval(updateData, 5000);
-updateData();
-</script>
 </body></html>
 """
 
 @app.route("/")
 def index():
-    try:
-        with open(EVENT_LOG, "r") as f:
-            events = json.load(f)
-    except:
-        events = []
-    return render_template_string(HTML, events=events)
-
-@app.route("/api")
-def api():
-    try:
-        with open(EVENT_LOG, "r") as f:
-            return jsonify(json.load(f))
-    except:
-        return jsonify([])
-
-@app.route("/status")
-def status():
-    return jsonify({
-        "cpu": psutil.cpu_percent(interval=1),
-        "ram": psutil.virtual_memory().percent
-    })
-
-@app.route("/hashrate")
-def hashrate():
-    return jsonify({"hashrate": latest_hashrate})
-
-@app.route("/miners")
-def miners():
-    return jsonify({"miners": connected_miners})
+    return render_template_string(HTML, events=latest_events)
 
 def start_flask():
     app.run(host="0.0.0.0", port=5000)
