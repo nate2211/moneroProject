@@ -22,4 +22,4 @@ def get_monero_price_at_datetime_est(target_datetime_str):
         print("Price data not available for the given date.")
 
 # Example usage
-get_monero_price_at_datetime_est("2025-06-28 01:07:38")
+get_monero_price_at_datetime_est("2025-06-28 09:41:22")

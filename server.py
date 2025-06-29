@@ -7,7 +7,7 @@ import threading
 import re
 import queue
 from datetime import datetime
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 import psutil
 
 P2POOL_DIR = "X:\\Programs\\p2pool-v4.8-windows-x64"
@@ -17,6 +17,15 @@ p2pool_proc = None
 p2pool_status_output = ""
 client_hashrates = {}
 client_newjobs = {}
+client_threads = {}
+client_last_seen = {}
+client_temps = {} # New dictionary for CPU temps
+client_status = {}
+client_cpu_shares = {}
+client_nvidia_shares = {}
+client_gpu_stats = {}
+
+COMMAND_QUEUE = {} # Holds pending commands, e.g., {"Miner1": {"command": "set_threads", "threads": 8}}
 EVENT_LOG = os.path.join(P2POOL_DIR, "event_log.txt")
 RAW_LOG = os.path.join(P2POOL_DIR, "p2pool_raw_output.txt")
 log_queue = queue.Queue()
@@ -146,6 +155,26 @@ def tail_p2pool_log():
                 log_event_now("P2Pool Stopped", clean_line)
 
 
+def time_ago(timestamp):
+    """Converts a Unix timestamp into a 'time ago' string."""
+    now = datetime.now()
+    dt = datetime.fromtimestamp(timestamp)
+    diff = now - dt
+
+    seconds = diff.total_seconds()
+
+    if seconds < 60:
+        return f"{int(seconds)} seconds ago"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        return f"{hours} hour{'s' if hours > 1 else ''} ago"
+    else:
+        days = int(seconds / 86400)
+        return f"{days} day{'s' if days > 1 else ''} ago"
+
 # === FLASK ===
 app = Flask(__name__)
 
@@ -232,6 +261,29 @@ HTML = """
             color: #555;
         }
         .status-grid .value { color: #000; }
+        
+                /* --- Modal Styles --- */
+        .modal {
+            display: none; /* This is the critical rule that hides the modal by default */
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.5);
+            animation: fadeIn 0.3s;
+        }
+        .modal-content { background-color: #fff; margin: 10% auto; padding: 0; width: 90%; max-width: 450px; border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); }
+        .modal-header { padding: 16px 24px; background-color: #007bff; color: white; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h3 { margin: 0; font-size: 20px; }
+        .modal-body { padding: 24px; }
+        .modal-footer { padding: 16px 24px; text-align: right; background-color: #f1f1f1; border-radius: 0 0 8px 8px; }
+        .close-button { color: #fff; font-size: 28px; font-weight: bold; cursor: pointer; }
+        .form-group { margin-bottom: 1rem; }
+        .form-group label { display: block; margin-bottom: .5rem; }
+        .form-group input { display: block; width: 95%; padding: .5rem .75rem; font-size: 1rem; border: 1px solid #ced4da; border-radius: .25rem; }
     </style>
 </head>
 <body>
@@ -240,24 +292,85 @@ HTML = """
     <button id="status-btn" class="status-button" onclick="fetchStatus()">Get Status</button>
 
     <div id="status-container"></div>
-
-    <h2>Client Stats</h2>
+   <h2>Client Dashboard</h2>
     <table>
-        <tr><th>Client ID</th><th>Hashrate</th><th>Difficulty</th><th>Height</th><th>Algo</th><th>TX Count</th><th>IP</th></tr>
-        {% for cid, rate in hashrates.items() %}
-        <tr>
-            <td>{{ cid }}</td>
-            <td>{{ rate }} H/s</td>
-            <td>{{ newjobs[cid]["difficulty"] if cid in newjobs else '—' }}</td>
-            <td>{{ newjobs[cid]["height"] if cid in newjobs else '—' }}</td>
-            <td>{{ newjobs[cid]["algo"] if cid in newjobs else '—' }}</td>
-            <td>{{ newjobs[cid]["tx_count"] if cid in newjobs else '—' }}</td>
-            <td>{{ newjobs[cid]["ip"] if cid in newjobs else '—' }}</td>
-        </tr>
-        {% endfor %}
+        <thead>
+            <tr>
+                <th>Client ID</th>
+                <th>Hashrate</th>
+                <th>CPU Temp</th>
+                <th>Threads</th>
+                <th>Last Seen</th>
+                <th>CPU Shares / GPU Shares</th>
+                <th>GPU Stats</th>
+                <th>Job Difficulty</th>
+                <th>Job Height</th>
+                <th>Algo</th>
+                <th>TXs</th>
+                <th>Pool IP</th>
+                <th>Set Threads</th>
+                <th>Control Pool</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cid, rate in hashrates.items() %}
+            <tr>
+                <td><span class="status-online">●</span> {{ cid }}</td>
+                <td><strong>{{ "%.2f"|format(rate) }} H/s</strong></td>
+                <td>{{ temps.get(cid, 'N/A') }}</td>
+                <td>{{ threads.get(cid, 'N/A') }}</td>
+                <td>{{client_last_seen[cid]}}</td>
+                <td>{{ client_cpu_shares[cid] }} / {{ client_nvidia_shares[cid] }}</td>
+                <td>{{ client_gpu_stats[cid].temp }} | {{ client_gpu_stats[cid].fan }}</td>
+                <td>{{ newjobs[cid].difficulty if cid in newjobs and newjobs[cid].difficulty else '—' }}</td>
+                <td>{{ newjobs[cid].height if cid in newjobs and newjobs[cid].height else '—' }}</td>
+                <td>{{ newjobs[cid].algo if cid in newjobs and newjobs[cid].algo else '—' }}</td>
+                <td>{{ newjobs[cid].tx_count if cid in newjobs and newjobs[cid].tx_count else '—' }}</td>
+                <td>{{ newjobs[cid].ip if cid in newjobs and newjobs[cid].ip else '—' }}</td>
+                <td>
+                    <form action="{{ url_for('set_threads', client_id=cid) }}" method="post" class="form-inline">
+                        <input type="number" name="threads" min="1" placeholder="{{ threads.get(cid, '1') }}" required>
+                        <button type="submit">Set</button>
+                    </form>
+                </td>
+                <td>
+                    {% if client_status.get(cid) == 'Started' %}
+                        <button class="action-button stop" onclick="stopMiner('{{ cid }}')">Stop</button>
+                    {% else %}
+                        <button class="action-button" onclick="openStartModal('{{ cid }}')">Start</button>
+                    {% endif %}
+                </td>
+                <div id="startMinerModal" class="modal">
+                      <div class="modal-content">
+                        <div class="modal-header">
+                          <span class="close-button" onclick="closeStartModal()">&times;</span>
+                          <h3>Start Miner</h3>
+                        </div>
+                        <form id="startMinerForm" method="post">
+                            <div class="modal-body">
+                                <div class="form-group">
+                                    <label for="pool_url">Pool URL</label>
+                                    <input type="text" id="pool_url" name="pool" placeholder="e.g., 192.168.0.10:3333" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="threads">Threads</label>
+                                    <input type="number" id="threads" name="threads" min="1" placeholder="e.g., 4" required>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="submit" class="action-button">Send Start Command</button>
+                            </div>
+                        </form>
+                      </div>
+                </div>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="10" style="text-align: center;" class="text-muted">No clients have connected yet.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
     </table>
-
-    <h2>Recent Events</h2>
     <table>
     <h2>Shares Found</h2>
     <table>
@@ -269,18 +382,6 @@ HTML = """
         </tr>
         {% endfor %}
     </table>
-
-    <h2>Jobs Sent</h2>
-    <table>
-        <tr><th>Time</th><th>Message</th></tr>
-        {% for j in jobs %}
-        <tr>
-            <td>{{ j.time }}</td>
-            <td>{{ j.message }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-
     <h2>New Miner Data</h2>
     <table>
         <tr><th>Time</th><th>Message</th></tr>
@@ -291,10 +392,65 @@ HTML = """
         </tr>
         {% endfor %}
     </table>
+        <h2>Other Events</h2>
+    <table>
+        <tr><th>Time</th><th>Type</th><th>Message</th></tr>
+        {% for o in other %}
+        <tr>
+            <td>{{ o.time }}</td>
+            <td>{{ o.type }}</td>
+            <td>{{ o.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>Jobs Sent</h2>
+    <table>
+        <tr><th>Time</th><th>Message</th></tr>
+        {% for j in jobs %}
+        <tr>
+            <td>{{ j.time }}</td>
+            <td>{{ j.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
     </table>
     </div>
 
 <script>
+    const modal = document.getElementById('startMinerModal');
+    const form = document.getElementById('startMinerForm');
+    function openStartModal(clientId) {
+        form.action = '/start_miner/' + clientId;
+        modal.style.display = 'block';
+    }
+    function closeStartModal() {
+        modal.style.display = 'none';
+    }
+    window.onclick = function(event) {
+        if (event.target == modal) {
+            closeStartModal();
+        }
+    }
+
+    // NEW: JavaScript function to handle the stop command
+    function stopMiner(clientId) {
+        if (!confirm(`Are you sure you want to stop miner: ${clientId}?`)) {
+            return;
+        }
+        fetch(`/stop_miner/${clientId}`, {
+            method: 'POST'
+        })
+        .then(response => response.json())
+        .then(data => {
+            console.log(data.message);
+            // Reload the page to see the updated status
+            window.location.reload();
+        })
+        .catch(error => {
+            console.error('Error stopping miner:', error);
+            alert('Failed to stop the miner.');
+        });
+    }
 function renderStatus(data) {
     const container = document.getElementById('status-container');
     container.innerHTML = ''; // Clear previous content
@@ -373,6 +529,70 @@ document.addEventListener('DOMContentLoaded', () => {
 </html>
 """
 
+
+# NEW: Endpoint for clients to report their status (e.g., "started" or "stopped")
+@app.route("/miners/<client_id>", methods=["POST"])
+def update_miner_status(client_id):
+    """
+    Endpoint for clients to report their running status.
+    """
+    data = request.get_json()
+    if not data or 'status' not in data:
+        return jsonify({"error": "Invalid payload. 'status' is required."}), 400
+
+    status = data['status']
+
+    print(f"[+] Received status update from '{client_id}': {status}")
+    client_status[client_id] = status
+    # If stopped, also clear hashrate
+    if status in ['Stopped', 'Error']:
+        client_hashrates[client_id] = 0
+
+    return jsonify({"message": "Status updated successfully"}), 200
+
+
+# NEW: Endpoints to queue start/stop commands
+@app.route("/start_miner/<client_id>", methods=["POST"])
+def start_miner(client_id):
+    pool = request.form.get("pool")
+    threads = request.form.get("threads")
+    if not pool or not threads:
+        return "Pool and threads are required.", 400
+
+    COMMAND_QUEUE[client_id] = {
+        "command": "start",
+        "pool": pool,
+        "threads": int(threads)
+    }
+    print(f"[+] Queued START command for '{client_id}'")
+    return redirect(url_for('index'))
+
+
+@app.route("/stop_miner/<client_id>", methods=["POST"])
+def stop_miner(client_id):
+    COMMAND_QUEUE[client_id] = {"command": "stop"}
+    client_status[client_id] = 'Stopped'  # Optimistically update UI
+    client_hashrates[client_id] = 0
+    print(f"[+] Queued STOP command for '{client_id}'")
+    return jsonify({"status": "ok", "message": f"Stop command queued for {client_id}"})
+
+
+@app.route("/set_threads/<client_id>", methods=["POST"])
+def set_threads(client_id):
+    """Adds a 'set_threads' command to the queue for a specific client."""
+    try:
+        new_threads = int(request.form["threads"])
+    except (ValueError, KeyError):
+        return "Invalid thread count provided", 400
+
+    COMMAND_QUEUE[client_id] = {"command": "set_threads", "threads": new_threads}
+    print(f"[+] Command queued for '{client_id}': Set threads to {new_threads}")
+    return redirect(url_for('index'))
+@app.route("/get_command/<client_id>", methods=["GET"])
+def get_command(client_id):
+    """Allows clients to poll for and receive commands."""
+    command = COMMAND_QUEUE.pop(client_id, None)
+    return jsonify(command) if command else jsonify({})
 def parse_p2pool_status(raw_text):
     """
     Parses the raw multi-line status text from P2Pool into a structured dictionary.
@@ -456,8 +676,8 @@ def index():
 
     if os.path.exists(EVENT_LOG):
         with open(EVENT_LOG, "r", encoding="utf-8") as f:
-            # Read the last 100 lines to ensure we have enough events to categorize
-            for line in list(f.readlines())[-100:]:
+            # Read the last 200 lines to ensure we have enough events to categorize
+            for line in list(f.readlines())[-200:]:
                 match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
                 if match:
                     event = {
@@ -475,27 +695,64 @@ def index():
                     else:
                         other_events.insert(0, event)
 
-    # Pass the categorized lists to the template
+    # ✅ THE FIX: Limit the number of events passed to the template
+    # This takes the first 10 items from each list (which are the newest)
+    limit = 1000
+    # --- NEW: Format the 'last seen' timestamps ---
+    client_last_seen_formatted = {}
+    for cid, timestamp in client_last_seen.items():
+        client_last_seen_formatted[cid] = time_ago(timestamp)
+    # Pass the categorized and LIMITED lists to the template
     return render_template_string(HTML,
                                   hashrates=client_hashrates,
                                   newjobs=client_newjobs,
+                                  client_last_seen=client_last_seen_formatted,
+                                  client_status=client_status,
+                                  client_cpu_shares=client_cpu_shares,
+                                  client_gpu_stats=client_gpu_stats,
+                                  client_nvidia_shares=client_nvidia_shares,
                                   status_output=p2pool_status_output,
-                                  shares=shares_found,
-                                  jobs=jobs_sent,
-                                  miners=miner_data)
+                                  threads=client_threads,
+                                  temps=client_temps,
+                                  shares=shares_found[:limit],
+                                  jobs=jobs_sent[:limit],
+                                  miners=miner_data[:limit],
+                                  other=other_events[:limit])
+
 
 @app.route("/hashrate", methods=["POST"])
 def receive_hashrate():
     data = request.get_json()
-    if data and "hashrate" in data and "client_id" in data:
-        client_hashrates[data["client_id"]] = data["hashrate"]
-        return "OK", 200
-    return "Bad Request", 400
+    if not data or "client_id" not in data:
+        return "Bad Request", 400
+
+    client_id = data["client_id"]
+    if client_status.get(client_id) == "Disconnected":
+        print(f"[+] Client '{client_id}' reconnected.")
+
+    # Update all data from the client's heartbeat
+    client_hashrates[client_id] = data.get("hashrate", 0)
+    client_threads[client_id] = data.get("threads", 0)
+    client_temps[client_id] = data.get("cpu_temp", "N/A")
+    client_last_seen[client_id] = time.time()
+
+    # NEW: Store the detailed stats from the new payload
+    client_cpu_shares[client_id] = data.get("cpu_accepted_shares", 0)
+    client_nvidia_shares[client_id] = data.get("nvidia_accepted_shares", 0)
+    client_gpu_stats[client_id] = {
+        "temp": data.get("gpu_temp", "N/A"),
+        "fan": data.get("gpu_fan", "N/A")
+    }
+
+    # This endpoint can also send back commands, making the system more efficient
+    command = COMMAND_QUEUE.pop(client_id, None)
+    return jsonify(command) if command else jsonify({"message": "ok"})
 
 @app.route("/newjob", methods=["POST"])
 def receive_newjob():
     data = request.get_json()
-    if data and "newjob" in data and "client_id" in data:
+    # FIX: Remove the check for "newjob". Only check for the essential client_id.
+    if data and "client_id" in data:
         client_newjobs[data["client_id"]] = data
         return "OK", 200
     return "Bad Request", 400
