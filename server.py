@@ -677,7 +677,7 @@ def index():
     if os.path.exists(EVENT_LOG):
         with open(EVENT_LOG, "r", encoding="utf-8") as f:
             # Read the last 200 lines to ensure we have enough events to categorize
-            for line in list(f.readlines())[-200:]:
+            for line in list(f.readlines()):
                 match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
                 if match:
                     event = {
@@ -697,7 +697,7 @@ def index():
 
     # ✅ THE FIX: Limit the number of events passed to the template
     # This takes the first 10 items from each list (which are the newest)
-    limit = 1000
+    limit = 500
     # --- NEW: Format the 'last seen' timestamps ---
     client_last_seen_formatted = {}
     for cid, timestamp in client_last_seen.items():
