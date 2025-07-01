@@ -6,7 +6,7 @@ import os
 import threading
 import re
 import queue
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 import psutil
 
@@ -175,6 +175,8 @@ def time_ago(timestamp):
         days = int(seconds / 86400)
         return f"{days} day{'s' if days > 1 else ''} ago"
 
+
+
 # === FLASK ===
 app = Flask(__name__)
 
@@ -319,9 +321,9 @@ HTML = """
                 <td><strong>{{ "%.2f"|format(rate) }} H/s</strong></td>
                 <td>{{ temps.get(cid, 'N/A') }}</td>
                 <td>{{ threads.get(cid, 'N/A') }}</td>
-                <td>{{client_last_seen[cid]}}</td>
-                <td>{{ client_cpu_shares[cid] }} / {{ client_nvidia_shares[cid] }}</td>
-                <td>{{ client_gpu_stats[cid].temp }} | {{ client_gpu_stats[cid].fan }}</td>
+                <td>{{client_last_seen.get(cid, "N/A")}}</td>
+                <td>{{ client_cpu_shares.get(cid, 0) }} / {{ client_nvidia_shares.get(cid, 0) }}</td>
+                <td>{{ client_gpu_stats.get(cid, {}).get('temp', 'N/A') }} | {{ client_gpu_stats.get(cid, {}).get('fan', 'N/A') }}</td>
                 <td>{{ newjobs[cid].difficulty if cid in newjobs and newjobs[cid].difficulty else '—' }}</td>
                 <td>{{ newjobs[cid].height if cid in newjobs and newjobs[cid].height else '—' }}</td>
                 <td>{{ newjobs[cid].algo if cid in newjobs and newjobs[cid].algo else '—' }}</td>

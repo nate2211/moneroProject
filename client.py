@@ -285,7 +285,7 @@ def command_loop():
 
 # NEW: The new heart of the client.
 def poll_server():
-    global client_stats
+    global client_status
     """Main loop to send status heartbeat and receive commands."""
     while True:
         try:
@@ -296,6 +296,8 @@ def poll_server():
                 command = cmd_response.json()
                 print(f"\n[+] Received command from server: '{command.get('command')}'")
                 if command.get("command") == "start":
+                    if client_status == "Started":
+                        stop_miner()
                     start_miner(command["pool"], command["threads"])
                 if command.get("command") == "stop":
                     stop_miner()
