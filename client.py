@@ -31,41 +31,39 @@ custom_pool_url = None
 client_status = None
 threads = None
 # === HELPER FUNCTIONS ===
+
 def get_cpu_temperature():
     """
-    Gets CPU temperature on Windows using WMI.
-    Returns a formatted string in Fahrenheit or 'N/A'.
-    MUST be run with Administrator privileges.
+    Gets the live CPU temperature on Windows using WMI thermal zones.
+    Must run as Administrator. Returns string in Fahrenheit or 'N/A'.
     """
     try:
-        # The linter will not complain about this line
-        pythoncom.CoInitialize()  # noqa
-
-        # Connect to the WMI namespace that contains thermal data
+        pythoncom.CoInitialize()  # Required for WMI in multithreaded environments
         c = wmi.WMI(namespace="root\\wmi")
-        # Query for the thermal zone information
-        temp_info = c.MSAcpi_ThermalZoneTemperature()
+        temp_infos = c.MSAcpi_ThermalZoneTemperature()
 
-        if not temp_info:
+        if not temp_infos:
             return "N/A"
 
-        # The temperature is given in tenths of a Kelvin.
-        # Convert to Celsius: (temp_in_kelvin / 10) - 273.15
-        temp_kelvin = temp_info[0].CurrentTemperature
-        temp_celsius = (temp_kelvin / 10.0) - 273.15
+        temps = []
+        for sensor in temp_infos:
+            # Some systems may return 0 or invalid temps
+            if sensor.CurrentTemperature > 2732:  # Roughly >0°C
+                temp_c = (sensor.CurrentTemperature / 10.0) - 273.15
+                temp_f = (temp_c * 9 / 5) + 32
+                temps.append(temp_f)
 
-        # 1. Convert Celsius to Fahrenheit
-        temp_fahrenheit = (temp_celsius * 9 / 5) + 32
+        if not temps:
+            return "N/A"
 
-        # 2. Return the temperature in Fahrenheit
-        return f"{temp_fahrenheit:.1f}°F"
+        # Average or max temperature
+        avg_temp = sum(temps) / len(temps)
+        return f"{avg_temp:.1f}°F"
 
     except Exception as e:
-        # This error often occurs if the script is not run as an administrator
         print(f"[!] WMI Error: {e}", file=sys.stderr)
-        print("[!] Could not get CPU temp. Try running this script as an Administrator.", file=sys.stderr)
+        print("[!] Could not get CPU temp. Try running as Administrator.", file=sys.stderr)
         return "N/A"
-
 
 def get_current_threads_from_config():
     with miner_lock:
@@ -265,6 +263,7 @@ def stop_miner():
         xmrig_process = None
     else:
         print("[!] Miner is not running.")
+        client_status = "Stopped"
         # FIX: Also reset the variable here to clean up any old, dead processes.
         xmrig_process = None
 
@@ -296,8 +295,7 @@ def poll_server():
                 command = cmd_response.json()
                 print(f"\n[+] Received command from server: '{command.get('command')}'")
                 if command.get("command") == "start":
-                    if client_status == "Started":
-                        stop_miner()
+                    stop_miner()
                     start_miner(command["pool"], command["threads"])
                 if command.get("command") == "stop":
                     stop_miner()
@@ -313,7 +311,6 @@ def poll_server():
         # Wait before the next poll
         time.sleep(5)
 if __name__ == "__main__":
-
     if not os.path.exists(XMRIG_PATH):
         print(f"[!] XMRig not found at {XMRIG_PATH}")
         sys.exit(1)
