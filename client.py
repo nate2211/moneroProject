@@ -325,7 +325,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Ask user for target hashrate reporting URL
-    FLASK_SERVER_URL = input("Enter Flask server URL to send requests (e.g., http://127.0.0.1:5000): ").strip()
+    FLASK_SERVER_URL = input("Enter Flask server URL to send requests (e.g., http://192.168.0.10:5000): ").strip()
     if not FLASK_SERVER_URL:
         print("[!] No URL provided. Exiting.")
         sys.exit(1)
