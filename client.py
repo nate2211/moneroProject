@@ -10,6 +10,7 @@ import re
 import requests
 import wmi
 import pythoncom
+import WinTmp
 # === CONFIGURATION ===
 XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
 CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
@@ -34,36 +35,44 @@ threads = None
 
 def get_cpu_temperature():
     """
-    Gets the live CPU temperature on Windows using WMI thermal zones.
-    Must run as Administrator. Returns string in Fahrenheit or 'N/A'.
+    Gets the CPU temperature using WinTmp.CPU_Temps() and returns the lowest one.
+    Assumes WinTmp.CPU_Temps() returns an iterable of temperature values (e.g., in Fahrenheit or Celsius).
     """
     try:
-        pythoncom.CoInitialize()  # Required for WMI in multithreaded environments
-        c = wmi.WMI(namespace="root\\wmi")
-        temp_infos = c.MSAcpi_ThermalZoneTemperature()
+        # Ensure pythoncom is initialized if WinTmp relies on COM objects
+        # (though typically WinTmp would handle its own COM initialization if needed).
+        pythoncom.CoInitialize()
 
-        if not temp_infos:
+        # Call WinTmp.CPU_Temps() to get the list of temperatures
+        temperatures = WinTmp.CPU_Temps()
+
+        if not temperatures:
+            print("[!] WinTmp.CPU_Temps() returned no temperature data.", file=sys.stderr)
             return "N/A"
 
-        temps = []
-        for sensor in temp_infos:
-            # Some systems may return 0 or invalid temps
-            if sensor.CurrentTemperature > 2732:  # Roughly >0°C
-                temp_c = (sensor.CurrentTemperature / 10.0) - 273.15
-                temp_f = (temp_c * 9 / 5) + 32
-                temps.append(temp_f)
+        # Filter out any non-numeric or invalid temperature readings if necessary
+        # Assuming CPU_Temps() returns numeric values.
+        valid_temps = [temp for temp in temperatures if isinstance(temp, (int, float))]
 
-        if not temps:
+        if not valid_temps:
+            print("[!] No valid numeric temperatures found from WinTmp.CPU_Temps().", file=sys.stderr)
             return "N/A"
 
-        # Average or max temperature
-        avg_temp = sum(temps) / len(temps)
-        return f"{avg_temp:.1f}°F"
+        # Find the lowest temperature from the valid readings
+        lowest_temp = min(valid_temps)
 
-    except Exception as e:
-        print(f"[!] WMI Error: {e}", file=sys.stderr)
-        print("[!] Could not get CPU temp. Try running as Administrator.", file=sys.stderr)
+        # Assuming the temperatures from WinTmp.CPU_Temps() are already in a desired unit,
+        # or you would convert them here if needed (e.g., to Fahrenheit if they are Celsius).
+        # For now, returning as-is with a generic '°' symbol.
+        return f"{lowest_temp:.1f}°"
+
+    except NameError:
+        print("[!] Error: 'WinTmp' is not defined. Please ensure the WinTmp module/class is available.", file=sys.stderr)
         return "N/A"
+    except Exception as e:
+        print(f"[!] Error getting CPU temp via WinTmp: {e}", file=sys.stderr)
+        return "N/A"
+
 
 def get_current_threads_from_config():
     with miner_lock:
@@ -311,6 +320,7 @@ def poll_server():
         # Wait before the next poll
         time.sleep(5)
 if __name__ == "__main__":
+    print(get_cpu_temperature())
     if not os.path.exists(XMRIG_PATH):
         print(f"[!] XMRig not found at {XMRIG_PATH}")
         sys.exit(1)
