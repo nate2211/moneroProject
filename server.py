@@ -384,17 +384,7 @@ HTML = """
         </tr>
         {% endfor %}
     </table>
-    <h2>New Miner Data</h2>
-    <table>
-        <tr><th>Time</th><th>Message</th></tr>
-        {% for m in miners %}
-        <tr>
-            <td>{{ m.time }}</td>
-            <td><pre style="background:none; border:none; padding:0; margin:0; font-family: inherit;">{{ m.message }}</pre></td>
-        </tr>
-        {% endfor %}
-    </table>
-        <h2>Other Events</h2>
+    <h2>Other Events</h2>
     <table>
         <tr><th>Time</th><th>Type</th><th>Message</th></tr>
         {% for o in other %}
@@ -402,6 +392,16 @@ HTML = """
             <td>{{ o.time }}</td>
             <td>{{ o.type }}</td>
             <td>{{ o.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>New Miner Data</h2>
+    <table>
+        <tr><th>Time</th><th>Message</th></tr>
+        {% for m in miners %}
+        <tr>
+            <td>{{ m.time }}</td>
+            <td><pre style="background:none; border:none; padding:0; margin:0; font-family: inherit;">{{ m.message }}</pre></td>
         </tr>
         {% endfor %}
     </table>
@@ -700,6 +700,8 @@ def index():
     # ✅ THE FIX: Limit the number of events passed to the template
     # This takes the first 10 items from each list (which are the newest)
     limit = 500
+    joblimit = 20
+    minerlimit = 20
     # --- NEW: Format the 'last seen' timestamps ---
     client_last_seen_formatted = {}
     for cid, timestamp in client_last_seen.items():
@@ -717,8 +719,8 @@ def index():
                                   threads=client_threads,
                                   temps=client_temps,
                                   shares=shares_found[:limit],
-                                  jobs=jobs_sent[:limit],
-                                  miners=miner_data[:limit],
+                                  jobs=jobs_sent[:joblimit],
+                                  miners=miner_data[:minerlimit],
                                   other=other_events[:limit])
 
 
