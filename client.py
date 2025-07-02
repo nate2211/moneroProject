@@ -35,44 +35,54 @@ threads = None
 
 def get_cpu_temperature():
     """
-    Gets the CPU temperature using WinTmp.CPU_Temps() and returns the lowest one.
-    Assumes WinTmp.CPU_Temps() returns an iterable of temperature values (e.g., in Fahrenheit or Celsius).
+    Gets CPU temperatures using WinTmp.CPU_Temps().
+    It prefers the highest reading if the lowest valid reading is below a threshold,
+    otherwise, it returns the lowest valid reading.
+    Assumes WinTmp.CPU_Temps() returns an iterable of temperature values in Celsius.
     """
-    try:
-        # Ensure pythoncom is initialized if WinTmp relies on COM objects
-        # (though typically WinTmp would handle its own COM initialization if needed).
-        pythoncom.CoInitialize()
+    LOW_TEMP_THRESHOLD_CELSIUS = 30.0  # Define what you consider "too low" in Celsius
 
-        # Call WinTmp.CPU_Temps() to get the list of temperatures
+    try:
+        pythoncom.CoInitialize()
         temperatures = WinTmp.CPU_Temps()
 
         if not temperatures:
             print("[!] WinTmp.CPU_Temps() returned no temperature data.", file=sys.stderr)
             return "N/A"
 
-        # Filter out any non-numeric or invalid temperature readings if necessary
-        # Assuming CPU_Temps() returns numeric values.
-        valid_temps = [temp for temp in temperatures if isinstance(temp, (int, float))]
+        # Filter out non-numeric or invalid temperature readings.
+        # We're also filtering out 0 or negative readings as they are almost certainly errors.
+        valid_temps = [temp for temp in temperatures if isinstance(temp, (int, float)) and temp > 0]
 
         if not valid_temps:
             print("[!] No valid numeric temperatures found from WinTmp.CPU_Temps().", file=sys.stderr)
             return "N/A"
 
-        # Find the lowest temperature from the valid readings
-        lowest_temp = min(valid_temps)
+        lowest_temp_celsius = min(valid_temps)
+        highest_temp_celsius = max(valid_temps)
 
-        # Assuming the temperatures from WinTmp.CPU_Temps() are already in a desired unit,
-        # or you would convert them here if needed (e.g., to Fahrenheit if they are Celsius).
-        # For now, returning as-is with a generic '°' symbol.
-        return f"{lowest_temp:.1f}°"
+        # Decide which temperature to return
+        temp_to_report_celsius = lowest_temp_celsius
+        if lowest_temp_celsius < LOW_TEMP_THRESHOLD_CELSIUS:
+            print(
+                f"[!] Lowest temperature ({lowest_temp_celsius:.1f}°C) is below threshold ({LOW_TEMP_THRESHOLD_CELSIUS:.1f}°C). Reporting highest valid temperature.",
+                file=sys.stderr)
+            temp_to_report_celsius = highest_temp_celsius
+
+        # Convert to Fahrenheit
+        temp_to_report_fahrenheit = (temp_to_report_celsius * 9 / 5) + 32
+
+        return f"{temp_to_report_celsius:.1f}°C / {temp_to_report_fahrenheit:.1f}°F"
 
     except NameError:
-        print("[!] Error: 'WinTmp' is not defined. Please ensure the WinTmp module/class is available.", file=sys.stderr)
+        print(
+            "[!] Error: 'WinTmp' is not defined. Please ensure the WinTmp module/class is available and correctly imported.",
+            file=sys.stderr)
         return "N/A"
     except Exception as e:
         print(f"[!] Error getting CPU temp via WinTmp: {e}", file=sys.stderr)
+        print("[!] Ensure the script is run with administrator privileges.", file=sys.stderr)
         return "N/A"
-
 
 def get_current_threads_from_config():
     with miner_lock:
