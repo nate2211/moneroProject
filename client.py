@@ -64,9 +64,6 @@ def get_cpu_temperature():
         # Decide which temperature to return
         temp_to_report_celsius = lowest_temp_celsius
         if lowest_temp_celsius < LOW_TEMP_THRESHOLD_CELSIUS:
-            print(
-                f"[!] Lowest temperature ({lowest_temp_celsius:.1f}°C) is below threshold ({LOW_TEMP_THRESHOLD_CELSIUS:.1f}°C). Reporting highest valid temperature.",
-                file=sys.stderr)
             temp_to_report_celsius = highest_temp_celsius
 
         # Convert to Fahrenheit

