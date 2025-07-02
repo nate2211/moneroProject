@@ -5,7 +5,7 @@ a = Analysis(
     ['client.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('X:\\Users\\natem\\PycharmProjects\\moneroProject\\.venv\\Lib\\site-packages\\WinTmp', 'WinTmp')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
