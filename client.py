@@ -320,7 +320,6 @@ def poll_server():
         # Wait before the next poll
         time.sleep(5)
 if __name__ == "__main__":
-    print(get_cpu_temperature())
     if not os.path.exists(XMRIG_PATH):
         print(f"[!] XMRig not found at {XMRIG_PATH}")
         sys.exit(1)
