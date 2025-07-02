@@ -1,0 +1,2 @@
+pyinstaller --onefile --console --add-data "X:\Users\natem\PycharmProjects\moneroProject\.venv\Lib\site-packages\WinTmp;WinTmp" client.py
+pyinstaller --onefile --hidden-import flask --hidden-import psutil server.py
