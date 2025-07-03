@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import subprocess
 import threading
 import ctypes
@@ -105,7 +106,7 @@ def update_config_threads(thread_count):
             return False
 # === CORE MINER AND REPORTING LOGIC ===
 def monitor_output(process):
-    global client_id
+    global client_id, FLASK_SERVER_URL
 
     cpu_accepted_shares = 0
     nvidia_accepted_shares = 0
@@ -180,7 +181,7 @@ def monitor_output(process):
             except Exception:
                 pass
 def start_miner(pool_url = "", thread_count = None):
-    global xmrig_process, threads, custom_pool_url, client_id, client_status
+    global xmrig_process, threads, custom_pool_url, client_id, client_status, FLASK_SERVER_URL
 
     if xmrig_process is not None:
         print("[!] Miner already running.")
@@ -300,7 +301,7 @@ def command_loop():
 
 # NEW: The new heart of the client.
 def poll_server():
-    global client_status
+    global client_status, FLASK_SERVER_URL
     """Main loop to send status heartbeat and receive commands."""
     while True:
         try:
@@ -332,6 +333,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Ask user for target hashrate reporting URL
+
     FLASK_SERVER_URL = input("Enter Flask server URL to send requests (e.g., http://192.168.0.10:5000): ").strip()
     if not FLASK_SERVER_URL:
         print("[!] No URL provided. Exiting.")
