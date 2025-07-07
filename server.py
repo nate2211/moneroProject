@@ -25,6 +25,9 @@ client_cpu_shares = {}
 client_nvidia_shares = {}
 client_gpu_stats = {}
 client_power_draws = {}
+client_start_times = {}
+client_costs = {}
+ELECTRICITY_RATE_PER_KWH = 0.13  # Adjust to your region's power cost
 COMMAND_QUEUE = {} # Holds pending commands, e.g., {"Miner1": {"command": "set_threads", "threads": 8}}
 EVENT_LOG = os.path.join(P2POOL_DIR, "event_log.txt")
 RAW_LOG = os.path.join(P2POOL_DIR, "p2pool_raw_output.txt")
@@ -294,6 +297,16 @@ HTML = """
     <button id="status-btn" class="status-button" onclick="fetchStatus()">Get Status</button>
 
     <div id="status-container"></div>
+    <h2>System Totals</h2>
+    <table>
+        <tr><th>Total Hashrate</th><td>{{ total_hashrate }} H/s</td></tr>
+        <tr><th>Total CPU Shares</th><td>{{ total_cpu_shares }}</td></tr>
+        <tr><th>Total GPU Shares</th><td>{{ total_gpu_shares }}</td></tr>
+        <tr><th>Total Power Draw</th><td>{{ total_power_draw }} W</td></tr>
+        <tr><th>Average CPU Temp</th><td>{{ average_temp }} °C</td></tr>
+        <tr><th>Total Cost</th><td>${{ total_cost }}</td></tr>
+    </table>
+    
    <h2>Client Dashboard</h2>
     <table>
         <thead>
@@ -303,6 +316,7 @@ HTML = """
                 <th>CPU Temp</th>
                 <th>Threads</th>
                 <th>Power Draw</th>
+                <th>Cost</th>
                 <th>Last Seen</th>
                 <th>CPU Shares / GPU Shares</th>
                 <th>GPU Stats</th>
@@ -323,7 +337,8 @@ HTML = """
                 <td>{{ temps.get(cid, 'N/A') }}</td>
                 <td>{{ threads.get(cid, 'N/A') }}</td>
                 <td>{{ client_power_draws.get(cid, "N/A") }}</td>
-                <td>{{client_last_seen.get(cid, "N/A")}}</td>
+                <td>${{ client_costs.get(cid, 0.0) }}</td>
+                <td>{{ client_last_seen.get(cid, "N/A") }}</td>
                 <td>{{ client_cpu_shares.get(cid, 0) }} / {{ client_nvidia_shares.get(cid, 0) }}</td>
                 <td>{{ client_gpu_stats.get(cid, {}).get('temp', 'N/A') }} | {{ client_gpu_stats.get(cid, {}).get('fan', 'N/A') }}</td>
                 <td>{{ newjobs[cid].difficulty if cid in newjobs and newjobs[cid].difficulty else '—' }}</td>
@@ -702,6 +717,12 @@ def index():
 
     # ✅ THE FIX: Limit the number of events passed to the template
     # This takes the first 10 items from each list (which are the newest)
+    total_hashrate = round(sum(client_hashrates.values()), 2)
+    total_cpu_shares = sum(client_cpu_shares.values())
+    total_gpu_shares = sum(client_nvidia_shares.values())
+    total_power_draw = sum([p for p in client_power_draws.values() if isinstance(p, (int, float))])
+    total_cost = round(sum(client_costs.values()), 4)
+
     limit = 500
     joblimit = 20
     minerlimit = 20
@@ -714,6 +735,7 @@ def index():
                                   hashrates=client_hashrates,
                                   newjobs=client_newjobs,
                                   client_power_draws=client_power_draws,
+                                  client_costs=client_costs,
                                   client_last_seen=client_last_seen_formatted,
                                   client_status=client_status,
                                   client_cpu_shares=client_cpu_shares,
@@ -722,6 +744,11 @@ def index():
                                   status_output=p2pool_status_output,
                                   threads=client_threads,
                                   temps=client_temps,
+                                  total_cost=total_cost,
+                                  total_hashrate=total_hashrate,
+                                  total_cpu_shares=total_cpu_shares,
+                                  total_gpu_shares=total_gpu_shares,
+                                  total_power_draw=total_power_draw,
                                   shares=shares_found[:limit],
                                   jobs=jobs_sent[:joblimit],
                                   miners=miner_data[:minerlimit],
@@ -752,6 +779,24 @@ def receive_hashrate():
         "fan": data.get("gpu_fan", "N/A")
     }
     client_power_draws[client_id] = data.get("power_draw", "N/A")
+
+    # Track when client started mining
+    if client_id not in client_start_times:
+        client_start_times[client_id] = time.time()
+
+    # Calculate elapsed time in hours
+    elapsed_hours = (time.time() - client_start_times[client_id]) / 3600
+
+    # Get the latest power draw value
+    power_watts = data.get("power_draw", 0)
+    if isinstance(power_watts, (int, float)) and power_watts > 0:
+        kilowatts = power_watts / 1000
+        kwh_used = kilowatts * elapsed_hours
+        cost = kwh_used * ELECTRICITY_RATE_PER_KWH
+        client_costs[client_id] = round(cost, 4)
+    else:
+        client_costs[client_id] = 0.0
+
     # This endpoint can also send back commands, making the system more efficient
     command = COMMAND_QUEUE.pop(client_id, None)
     return jsonify(command) if command else jsonify({"message": "ok"})
