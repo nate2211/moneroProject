@@ -11,7 +11,7 @@ import re
 import requests
 import wmi
 import pythoncom
-import WinTmp
+
 import clr
 try:
     clr.AddReference("LibreHardwareMonitorLib")
@@ -79,53 +79,39 @@ def get_power_draw():
         return "N/A"
 
 def get_cpu_temperature():
-    """
-    Gets CPU temperatures using WinTmp.CPU_Temps().
-    It prefers the highest reading if the lowest valid reading is below a threshold,
-    otherwise, it returns the lowest valid reading.
-    Assumes WinTmp.CPU_Temps() returns an iterable of temperature values in Celsius.
-    """
-    LOW_TEMP_THRESHOLD_CELSIUS = 30.0  # Define what you consider "too low" in Celsius
-
     try:
-        pythoncom.CoInitialize()
-        temperatures = WinTmp.CPU_Temps()
+        from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
 
-        if not temperatures:
-            print("[!] WinTmp.CPU_Temps() returned no temperature data.", file=sys.stderr)
+        c = Computer()
+        c.IsCpuEnabled = True
+        c.Open()
+        time.sleep(0.5)
+
+        temps = []
+
+        for hw in c.Hardware:
+            if hw.HardwareType == HardwareType.Cpu:
+                try:
+                    hw.Update()
+                    for sensor in hw.Sensors:
+                        if sensor.SensorType == SensorType.Temperature and sensor.Value is not None:
+                            temps.append(sensor.Value)
+                except Exception as e:
+                    print(f"[!] CPU temp update failed: {e}")
+        c.Close()
+
+        if not temps:
             return "N/A"
 
-        # Filter out non-numeric or invalid temperature readings.
-        # We're also filtering out 0 or negative readings as they are almost certainly errors.
-        valid_temps = [temp for temp in temperatures if isinstance(temp, (int, float)) and temp > 0]
+        low = min(temps)
+        high = max(temps)
+        selected = high if low < 30 else low
+        f = (selected * 9 / 5) + 32
+        return f"{selected:.1f}°C / {f:.1f}°F"
 
-        if not valid_temps:
-            print("[!] No valid numeric temperatures found from WinTmp.CPU_Temps().", file=sys.stderr)
-            return "N/A"
-
-        lowest_temp_celsius = min(valid_temps)
-        highest_temp_celsius = max(valid_temps)
-
-        # Decide which temperature to return
-        temp_to_report_celsius = lowest_temp_celsius
-        if lowest_temp_celsius < LOW_TEMP_THRESHOLD_CELSIUS:
-            temp_to_report_celsius = highest_temp_celsius
-
-        # Convert to Fahrenheit
-        temp_to_report_fahrenheit = (temp_to_report_celsius * 9 / 5) + 32
-
-        return f"{temp_to_report_celsius:.1f}°C / {temp_to_report_fahrenheit:.1f}°F"
-
-    except NameError:
-        print(
-            "[!] Error: 'WinTmp' is not defined. Please ensure the WinTmp module/class is available and correctly imported.",
-            file=sys.stderr)
-        return "N/A"
     except Exception as e:
-        print(f"[!] Error getting CPU temp via WinTmp: {e}", file=sys.stderr)
-        print("[!] Ensure the script is run with administrator privileges.", file=sys.stderr)
+        print(f"[!] Error getting CPU temp inline: {e}")
         return "N/A"
-
 def get_current_threads_from_config():
     with miner_lock:
         try:
