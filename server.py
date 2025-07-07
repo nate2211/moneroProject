@@ -24,7 +24,7 @@ client_status = {}
 client_cpu_shares = {}
 client_nvidia_shares = {}
 client_gpu_stats = {}
-
+client_power_draws = {}
 COMMAND_QUEUE = {} # Holds pending commands, e.g., {"Miner1": {"command": "set_threads", "threads": 8}}
 EVENT_LOG = os.path.join(P2POOL_DIR, "event_log.txt")
 RAW_LOG = os.path.join(P2POOL_DIR, "p2pool_raw_output.txt")
@@ -302,6 +302,7 @@ HTML = """
                 <th>Hashrate</th>
                 <th>CPU Temp</th>
                 <th>Threads</th>
+                <th>Power Draw</th>
                 <th>Last Seen</th>
                 <th>CPU Shares / GPU Shares</th>
                 <th>GPU Stats</th>
@@ -321,6 +322,7 @@ HTML = """
                 <td><strong>{{ "%.2f"|format(rate) }} H/s</strong></td>
                 <td>{{ temps.get(cid, 'N/A') }}</td>
                 <td>{{ threads.get(cid, 'N/A') }}</td>
+                <td>{{ client_power_draws.get(cid, "N/A") }}</td>
                 <td>{{client_last_seen.get(cid, "N/A")}}</td>
                 <td>{{ client_cpu_shares.get(cid, 0) }} / {{ client_nvidia_shares.get(cid, 0) }}</td>
                 <td>{{ client_gpu_stats.get(cid, {}).get('temp', 'N/A') }} | {{ client_gpu_stats.get(cid, {}).get('fan', 'N/A') }}</td>
@@ -711,6 +713,7 @@ def index():
     return render_template_string(HTML,
                                   hashrates=client_hashrates,
                                   newjobs=client_newjobs,
+                                  client_power_draws=client_power_draws,
                                   client_last_seen=client_last_seen_formatted,
                                   client_status=client_status,
                                   client_cpu_shares=client_cpu_shares,
@@ -748,7 +751,7 @@ def receive_hashrate():
         "temp": data.get("gpu_temp", "N/A"),
         "fan": data.get("gpu_fan", "N/A")
     }
-
+    client_power_draws[client_id] = data.get("power_draw", "N/A")
     # This endpoint can also send back commands, making the system more efficient
     command = COMMAND_QUEUE.pop(client_id, None)
     return jsonify(command) if command else jsonify({"message": "ok"})
