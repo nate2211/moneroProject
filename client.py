@@ -12,6 +12,14 @@ import requests
 import wmi
 import pythoncom
 import WinTmp
+import clr
+try:
+    clr.AddReference("LibreHardwareMonitorLib")
+except Exception as e:
+    print(f"[!] Could not load LibreHardwareMonitorLib: {e}")
+    sys.exit(1)
+
+from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
 # === CONFIGURATION ===
 XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
 CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
@@ -33,6 +41,42 @@ custom_pool_url = None
 client_status = None
 threads = None
 # === HELPER FUNCTIONS ===
+
+def get_power_draw():
+    try:
+        c = Computer()
+        c.IsCpuEnabled = True
+        c.IsGpuEnabled = True
+        c.IsMemoryEnabled = True
+        c.IsMotherboardEnabled = True
+        c.IsControllerEnabled = True
+        c.IsNetworkEnabled = True
+        c.IsStorageEnabled = True
+        c.Open()
+
+        total_power_draw = 0.0
+        found = False
+
+        for hardware in c.Hardware:
+            hardware.Update()
+            for sensor in hardware.Sensors:
+                if sensor.SensorType == SensorType.Power:
+                    if sensor.Value is not None:
+                        total_power_draw += sensor.Value
+                        found = True
+            for subhardware in hardware.SubHardware:
+                subhardware.Update()
+                for sensor in subhardware.Sensors:
+                    if sensor.SensorType == SensorType.Power and sensor.Value is not None:
+                        total_power_draw += sensor.Value
+                        found = True
+
+        c.Close()
+        return round(total_power_draw, 2) if found else "N/A"
+
+    except Exception as e:
+        print(f"[!] Power draw error: {e}")
+        return "N/A"
 
 def get_cpu_temperature():
     """
@@ -175,6 +219,7 @@ def monitor_output(process):
                 "gpu_fan": gpu_fan,
                 "cpu_accepted_shares": cpu_accepted_shares,
                 "nvidia_accepted_shares": nvidia_accepted_shares,
+                "power_draw": get_power_draw()
             }
             try:
                 requests.post(f"{FLASK_SERVER_URL}/hashrate", json=payload, timeout=10)

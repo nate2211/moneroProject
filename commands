@@ -1,2 +1,4 @@
 pyinstaller --onefile --console --add-data "X:\Users\natem\PycharmProjects\moneroProject\.venv\Lib\site-packages\WinTmp;WinTmp" client.py
 pyinstaller --onefile --hidden-import flask --hidden-import psutil server.py
+
+pyinstaller --onefile --console --add-data "X:\Users\natem\PycharmProjects\moneroProject\.venv\Lib\site-packages\WinTmp;WinTmp" --add-data "X:\Users\natem\PycharmProjects\moneroProject\LibreHardwareMonitorLib.dll;." --add-data "X:\Users\natem\PycharmProjects\moneroProject\HidSharp.dll;." client.py
