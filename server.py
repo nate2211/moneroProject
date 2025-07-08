@@ -329,7 +329,6 @@ HTML = """
         <tr><th>Total CPU Shares</th><td>{{ total_cpu_shares }}</td></tr>
         <tr><th>Total GPU Shares</th><td>{{ total_gpu_shares }}</td></tr>
         <tr><th>Total Power Draw</th><td>{{ total_power_draw }} W</td></tr>
-        <tr><th>Average CPU Temp</th><td>{{ average_temp }} °C</td></tr>
         <tr><th>Total Cost</th><td>${{ total_cost }}</td></tr>
     </table>
 
