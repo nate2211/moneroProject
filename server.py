@@ -180,8 +180,14 @@ def tail_p2pool_log():
                     log_event_now("Found Share", clean_line)
                 elif "block found" in lower_line:
                     log_event_now("Found Block", clean_line)
+                # NEW: Specific classification for sidechain add_block messages
+                elif "sidechain add_block" in lower_line:
+                    log_event_now("Sidechain Block Added", clean_line)
+                # FIX: Corrected boolean logic for "p2pool stopping"
                 elif "p2pool caught sigint" in lower_line or "p2pool stopping" in lower_line:
                     log_event_now("P2Pool Stopped", clean_line)
+                else: # Fallback for any other messages
+                    log_event_now("Other P2Pool Event", clean_line)
     except FileNotFoundError:
         print(f"[!] Error: RAW_LOG file '{RAW_LOG}' not found during tailing. It might have been deleted.")
     except Exception as e:
@@ -426,10 +432,10 @@ HTML = """
         </tr>
         {% endfor %}
     </table>
-    <h2>Other Events</h2>
+    <h2>Blocks Found</h2>
     <table>
         <tr><th>Time</th><th>Type</th><th>Message</th></tr>
-        {% for o in other %}
+        {% for o in blocks %}
         <tr>
             <td>{{ o.time }}</td>
             <td>{{ o.type }}</td>
@@ -454,6 +460,17 @@ HTML = """
         <tr>
             <td>{{ j.time }}</td>
             <td>{{ j.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>Other Events</h2>
+    <table>
+        <tr><th>Time</th><th>Type</th><th>Message</th></tr>
+        {% for o in other %}
+        <tr>
+            <td>{{ o.time }}</td>
+            <td>{{ o.type }}</td>
+            <td>{{ o.message }}</td>
         </tr>
         {% endfor %}
     </table>
@@ -723,6 +740,7 @@ def index():
     shares_found = []
     jobs_sent = []
     miner_data = []
+    blocks_found = []
     other_events = []
 
     if os.path.exists(EVENT_LOG):  # Check if the event log file exists
@@ -741,6 +759,8 @@ def index():
                         jobs_sent.insert(0, event)
                     elif event["type"] == "New Miner Data":
                         miner_data.insert(0, event)
+                    elif event["type"] == "Found Block":  # This is where "Found Block" is classified
+                        blocks_found.insert(0, event)
                     else:
                         other_events.insert(0, event)
 
@@ -794,7 +814,8 @@ def index():
                                   shares=shares_found[:limit],
                                   jobs=jobs_sent[:joblimit],
                                   miners=miner_data[:minerlimit],
-                                  other=other_events[:limit])
+                                  blocks=blocks_found[:minerlimit],
+                                  other=other_events[:minerlimit])
 
 
 @app.route("/hashrate", methods=["POST"])
