@@ -1,6 +1,7 @@
 import subprocess
 import smtplib
 import ssl
+import sys
 import time
 import os
 import threading
@@ -10,16 +11,16 @@ from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 import psutil
 
-P2POOL_DIR = "X:\\Programs\\p2pool-v4.8-windows-x64"
+P2POOL_DIR = os.path.dirname(sys.executable)
 P2POOL_EXE = "p2pool.exe"
 WALLET = "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk"
 p2pool_proc = None
-p2pool_status_output = ""
+p2pool_status_output = {"message": "P2Pool status not yet available."}  # Initialize with a message
 client_hashrates = {}
 client_newjobs = {}
 client_threads = {}
 client_last_seen = {}
-client_temps = {} # New dictionary for CPU temps
+client_temps = {}
 client_status = {}
 client_cpu_shares = {}
 client_nvidia_shares = {}
@@ -27,16 +28,15 @@ client_gpu_stats = {}
 client_power_draws = {}
 client_start_times = {}
 client_costs = {}
-ELECTRICITY_RATE_PER_KWH = 0.13  # Adjust to your region's power cost
-COMMAND_QUEUE = {} # Holds pending commands, e.g., {"Miner1": {"command": "set_threads", "threads": 8}}
+ELECTRICITY_RATE_PER_KWH = 0.13
+COMMAND_QUEUE = {}
 EVENT_LOG = os.path.join(P2POOL_DIR, "event_log.txt")
 RAW_LOG = os.path.join(P2POOL_DIR, "p2pool_raw_output.txt")
 log_queue = queue.Queue()
 current_hashrate = 0.0
 
-open(EVENT_LOG, "w").close()
-open(RAW_LOG, "w").close()
 
+# Removed: open(EVENT_LOG, "w").close() and open(RAW_LOG, "w").close()
 
 def handle_user_input(proc):
     """
@@ -50,12 +50,16 @@ def handle_user_input(proc):
             user_input = input()
             if user_input.lower() in ["exit", "quit"]:
                 print("[!] Shutting down P2Pool...")
-                proc.terminate()  # or proc.kill()
+                proc.terminate()
                 break
 
-
-            proc.stdin.write(user_input + '\n')
-            proc.stdin.flush()
+            # Check if stdin pipe is still open before writing
+            if proc.poll() is None:  # None means process is still running
+                proc.stdin.write(user_input + '\n')
+                proc.stdin.flush()
+            else:
+                print("[!] P2Pool process has already terminated.")
+                break
         except (IOError, OSError) as e:
             print(f"[!] Lost connection to P2Pool process: {e}")
             break
@@ -63,9 +67,11 @@ def handle_user_input(proc):
             print(f"[!] An error occurred: {e}")
             break
 
+
 def strip_ansi_codes(text):
     ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
     return ansi_escape.sub('', text)
+
 
 def start_p2pool_direct():
     global p2pool_proc
@@ -83,7 +89,7 @@ def start_p2pool_direct():
         p2pool_proc = subprocess.Popen(
             args,
             cwd=P2POOL_DIR,
-            stdin=subprocess.PIPE,  # ✅ this is what allows status commands
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -91,12 +97,15 @@ def start_p2pool_direct():
         )
 
         def redirect_output(proc):
+            # 'a' mode creates the file if it doesn't exist
             with open(RAW_LOG, "a", encoding="utf-8") as log_file:
                 for line in proc.stdout:
                     clean_line = strip_ansi_codes(line.strip())
                     log_file.write(clean_line + "\n")
                     log_file.flush()
                     print("[P2Pool]", clean_line)
+            # Log that the process ended, if this function exits
+            log_event_now("P2Pool Process", "P2Pool stdout stream ended.")
 
         threading.Thread(target=redirect_output, args=(p2pool_proc,), daemon=True).start()
         return True
@@ -104,58 +113,79 @@ def start_p2pool_direct():
         print(f"[!] Failed to launch P2Pool: {e}")
         return False
 
+
 def log_event_now(event_type, message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_queue.put(f"[{timestamp}] [{event_type}] {message}")
 
+
 def log_writer():
+    # 'a' mode creates the file if it doesn't exist
     with open(EVENT_LOG, "a", encoding="utf-8") as evlog:
         while True:
-            while not log_queue.empty():
-                evlog.write(log_queue.get() + "\n")
-            evlog.flush()
-            time.sleep(0.1)
+            # Continuously try to get items from the queue without blocking indefinitely
+            try:
+                log_entry = log_queue.get(timeout=0.5)  # Wait up to 0.5 seconds
+                evlog.write(log_entry + "\n")
+                evlog.flush()
+            except queue.Empty:
+                pass  # No logs in queue, continue loop
+            time.sleep(0.1)  # Short delay to prevent busy-waiting
+
 
 def tail_p2pool_log():
+    # Wait for the RAW_LOG file to exist, but with a timeout to prevent infinite loops
+    # if P2Pool never creates it.
+    timeout_start = time.time()
+    timeout_seconds = 60  # Wait up to 60 seconds for the log file
     while not os.path.exists(RAW_LOG):
+        if time.time() - timeout_start > timeout_seconds:
+            print(f"[!] Timeout: RAW_LOG file '{RAW_LOG}' did not appear within {timeout_seconds} seconds.")
+            return  # Exit the thread if file doesn't appear
         time.sleep(0.5)
 
-    with open(RAW_LOG, "r", encoding="utf-8") as f:
-        f.seek(0, os.SEEK_END)
-        miner_data_block = []
-        in_miner_data = False
+    try:
+        with open(RAW_LOG, "r", encoding="utf-8") as f:
+            f.seek(0, os.SEEK_END)  # Start reading from the end
 
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
+            miner_data_block = []
+            in_miner_data = False
 
-            clean_line = line.strip()
-            lower_line = clean_line.lower()
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.1)  # Wait for new content
+                    continue
 
-            if "p2pool new miner data" in lower_line:
-                in_miner_data = True
-                miner_data_block = [clean_line]
-                continue
+                clean_line = line.strip()
+                lower_line = clean_line.lower()
 
-            if in_miner_data:
-                if clean_line == "" or clean_line.startswith("-"):
-                    full_block = "\n".join(miner_data_block).strip()
-                    log_event_now("New Miner Data", full_block)
-                    in_miner_data = False
-                else:
-                    miner_data_block.append(clean_line)
-                continue
+                if "p2pool new miner data" in lower_line:
+                    in_miner_data = True
+                    miner_data_block = [clean_line]
+                    continue
 
-            if "sent new job" in lower_line:
-                log_event_now("Sent Jobs", clean_line)
-            elif "share found" in lower_line:
-                log_event_now("Found Share", clean_line)
-            elif "block found" in lower_line:
-                log_event_now("Found Block", clean_line)
-            elif "p2pool caught sigint" in lower_line or "p2pool stopping" in lower_line:
-                log_event_now("P2Pool Stopped", clean_line)
+                if in_miner_data:
+                    if clean_line == "" or clean_line.startswith("-"):
+                        full_block = "\n".join(miner_data_block).strip()
+                        log_event_now("New Miner Data", full_block)
+                        in_miner_data = False
+                    else:
+                        miner_data_block.append(clean_line)
+                    continue
+
+                if "sent new job" in lower_line:
+                    log_event_now("Sent Jobs", clean_line)
+                elif "share found" in lower_line:
+                    log_event_now("Found Share", clean_line)
+                elif "block found" in lower_line:
+                    log_event_now("Found Block", clean_line)
+                elif "p2pool caught sigint" in lower_line or "p2pool stopping" in lower_line:
+                    log_event_now("P2Pool Stopped", clean_line)
+    except FileNotFoundError:
+        print(f"[!] Error: RAW_LOG file '{RAW_LOG}' not found during tailing. It might have been deleted.")
+    except Exception as e:
+        print(f"[!] An error occurred while tailing P2Pool log: {e}")
 
 
 def time_ago(timestamp):
@@ -179,14 +209,10 @@ def time_ago(timestamp):
         return f"{days} day{'s' if days > 1 else ''} ago"
 
 
-
 # === FLASK ===
 app = Flask(__name__)
 
-
-
-
-
+# HTML content remains the same, ensuring robust error handling in JS and Python
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -266,7 +292,7 @@ HTML = """
             color: #555;
         }
         .status-grid .value { color: #000; }
-        
+
                 /* --- Modal Styles --- */
         .modal {
             display: none; /* This is the critical rule that hides the modal by default */
@@ -306,7 +332,7 @@ HTML = """
         <tr><th>Average CPU Temp</th><td>{{ average_temp }} °C</td></tr>
         <tr><th>Total Cost</th><td>${{ total_cost }}</td></tr>
     </table>
-    
+
    <h2>Client Dashboard</h2>
     <table>
         <thead>
@@ -525,7 +551,15 @@ function fetchStatus() {
     statusBtn.textContent = 'Fetching...';
 
     fetch('/status', { method: 'POST' })
-        .then(response => response.json()) // Expect a JSON response
+        .then(response => {
+            if (!response.ok) {
+                // If response is not OK, try to read error message from body
+                return response.json().then(errorData => {
+                    throw new Error(errorData.error || `HTTP error! Status: ${response.status}`);
+                });
+            }
+            return response.json(); // Expect a JSON response
+        })
         .then(data => {
             renderStatus(data); // Render the data into a beautiful table
         })
@@ -540,6 +574,7 @@ function fetchStatus() {
 
 // Initial render for the placeholder message
 document.addEventListener('DOMContentLoaded', () => {
+    // Correctly initialize status_output with a JSON string if it's not a dict
     renderStatus({{ status_output | tojson }});
 });
 </script>
@@ -549,7 +584,6 @@ document.addEventListener('DOMContentLoaded', () => {
 """
 
 
-# NEW: Endpoint for clients to report their status (e.g., "started" or "stopped")
 @app.route("/miners/<client_id>", methods=["POST"])
 def update_miner_status(client_id):
     """
@@ -570,7 +604,6 @@ def update_miner_status(client_id):
     return jsonify({"message": "Status updated successfully"}), 200
 
 
-# NEW: Endpoints to queue start/stop commands
 @app.route("/start_miner/<client_id>", methods=["POST"])
 def start_miner(client_id):
     pool = request.form.get("pool")
@@ -590,7 +623,7 @@ def start_miner(client_id):
 @app.route("/stop_miner/<client_id>", methods=["POST"])
 def stop_miner(client_id):
     COMMAND_QUEUE[client_id] = {"command": "stop"}
-    client_status[client_id] = 'Stopped'  # Optimistically update UI
+    client_status[client_id] = 'Stopped'
     client_hashrates[client_id] = 0
     print(f"[+] Queued STOP command for '{client_id}'")
     return jsonify({"status": "ok", "message": f"Stop command queued for {client_id}"})
@@ -606,13 +639,16 @@ def set_threads(client_id):
 
     COMMAND_QUEUE[client_id] = {"command": "set_threads", "threads": new_threads}
     print(f"[+] Command queued for '{client_id}': Set threads to {new_threads}")
-    # Return a success message directly
     return f"Command 'set_threads' queued for client '{client_id}' with {new_threads} threads.", 200
+
+
 @app.route("/get_command/<client_id>", methods=["GET"])
 def get_command(client_id):
     """Allows clients to poll for and receive commands."""
     command = COMMAND_QUEUE.pop(client_id, None)
     return jsonify(command) if command else jsonify({})
+
+
 def parse_p2pool_status(raw_text):
     """
     Parses the raw multi-line status text from P2Pool into a structured dictionary.
@@ -637,7 +673,6 @@ def parse_p2pool_status(raw_text):
             continue
 
         if current_section:
-            # Regex to find "Key = Value" pairs, allowing for varied spacing
             match = re.match(r'^\s*(.*?)\s*=\s*(.*)$', line)
             if match:
                 key = match.group(1).strip()
@@ -650,53 +685,49 @@ def parse_p2pool_status(raw_text):
 def get_status_output():
     global p2pool_proc, p2pool_status_output
 
-    if p2pool_proc and p2pool_proc.stdin:
+    if p2pool_proc and p2pool_proc.poll() is None and p2pool_proc.stdin:
         try:
-            # 1. Send the command to the process as before.
             p2pool_proc.stdin.write("status\n")
             p2pool_proc.stdin.flush()
 
-            # 2. Give the redirect_output thread a moment to write the log file.
-            time.sleep(0.5)
+            time.sleep(0.5)  # Give the redirect_output thread a moment to write
 
-            # 3. Read the entire log file to find the LATEST status report.
+            if not os.path.exists(RAW_LOG):
+                p2pool_status_output = {"error": "P2Pool raw log file does not exist yet."}
+                return jsonify(p2pool_status_output), 503
+
             with open(RAW_LOG, "r", encoding="utf-8") as f:
                 log_content = f.read()
 
-            # Find the position of the last status report
             last_status_pos = log_content.rfind("SideChain status")
             if last_status_pos == -1:
-                p2pool_status_output = {"error": "Status report not found in logs yet."}
-                return p2pool_status_output, 404
+                p2pool_status_output = {"error": "Status report not found in logs yet. P2Pool might be starting up."}
+                return jsonify(p2pool_status_output), 404
 
-            # Extract the text from the last status report to the end of the file
             raw_text = log_content[last_status_pos:]
-
-            # 4. Parse the text you just read from the file.
             p2pool_status_output = parse_p2pool_status(raw_text)
+            return jsonify(p2pool_status_output)
 
-            # Return the parsed data as JSON
-            return p2pool_status_output
-
+        except FileNotFoundError:
+            p2pool_status_output = {"error": f"P2Pool raw log file '{RAW_LOG}' not found."}
+            return jsonify(p2pool_status_output), 500
         except Exception as e:
             p2pool_status_output = {"error": str(e)}
-            return p2pool_status_output, 500
+            return jsonify(p2pool_status_output), 500
     else:
-        p2pool_status_output = {"error": "P2Pool is not running."}
-        return p2pool_status_output, 503
+        p2pool_status_output = {"error": "P2Pool is not running or its stdin pipe is closed."}
+        return jsonify(p2pool_status_output), 503
 
-# ... (Your other routes and main execution block) ...
+
 @app.route("/")
 def index():
-    # Create separate lists for each event type
     shares_found = []
     jobs_sent = []
     miner_data = []
     other_events = []
 
-    if os.path.exists(EVENT_LOG):
+    if os.path.exists(EVENT_LOG):  # Check if the event log file exists
         with open(EVENT_LOG, "r", encoding="utf-8") as f:
-            # Read the last 200 lines to ensure we have enough events to categorize
             for line in list(f.readlines()):
                 match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
                 if match:
@@ -705,7 +736,6 @@ def index():
                         "type": match.group(2),
                         "message": match.group(3).strip()
                     }
-                    # Categorize the event based on its type
                     if event["type"] == "Found Share":
                         shares_found.insert(0, event)
                     elif event["type"] == "Sent Jobs":
@@ -715,22 +745,34 @@ def index():
                     else:
                         other_events.insert(0, event)
 
-    # ✅ THE FIX: Limit the number of events passed to the template
-    # This takes the first 10 items from each list (which are the newest)
     total_hashrate = round(sum(client_hashrates.values()), 2)
     total_cpu_shares = sum(client_cpu_shares.values())
     total_gpu_shares = sum(client_nvidia_shares.values())
-    total_power_draw = sum([p for p in client_power_draws.values() if isinstance(p, (int, float))])
+    total_power_draw_values = [p for p in client_power_draws.values() if isinstance(p, (int, float)) and p != "N/A"]
+    total_power_draw = round(sum(total_power_draw_values), 2) if total_power_draw_values else "N/A"
+
+    # Calculate average CPU temp if available
+    valid_cpu_temps = []
+    for temp_str in client_temps.values():
+        if isinstance(temp_str, str) and '°C' in temp_str:
+            try:
+                # Extract numerical part before °C
+                temp_c = float(temp_str.split('°C')[0].strip())
+                valid_cpu_temps.append(temp_c)
+            except ValueError:
+                continue  # Skip if parsing fails
+    average_temp = round(sum(valid_cpu_temps) / len(valid_cpu_temps), 1) if valid_cpu_temps else "N/A"
+
     total_cost = round(sum(client_costs.values()), 4)
 
     limit = 500
     joblimit = 20
     minerlimit = 20
-    # --- NEW: Format the 'last seen' timestamps ---
+
     client_last_seen_formatted = {}
     for cid, timestamp in client_last_seen.items():
         client_last_seen_formatted[cid] = time_ago(timestamp)
-    # Pass the categorized and LIMITED lists to the template
+
     return render_template_string(HTML,
                                   hashrates=client_hashrates,
                                   newjobs=client_newjobs,
@@ -749,6 +791,7 @@ def index():
                                   total_cpu_shares=total_cpu_shares,
                                   total_gpu_shares=total_gpu_shares,
                                   total_power_draw=total_power_draw,
+                                  average_temp=average_temp,  # Pass average temp
                                   shares=shares_found[:limit],
                                   jobs=jobs_sent[:joblimit],
                                   miners=miner_data[:minerlimit],
@@ -765,13 +808,11 @@ def receive_hashrate():
     if client_status.get(client_id) == "Disconnected":
         print(f"[+] Client '{client_id}' reconnected.")
 
-    # Update all data from the client's heartbeat
     client_hashrates[client_id] = data.get("hashrate", 0)
     client_threads[client_id] = data.get("threads", 0)
     client_temps[client_id] = data.get("cpu_temp", "N/A")
     client_last_seen[client_id] = time.time()
 
-    # NEW: Store the detailed stats from the new payload
     client_cpu_shares[client_id] = data.get("cpu_accepted_shares", 0)
     client_nvidia_shares[client_id] = data.get("nvidia_accepted_shares", 0)
     client_gpu_stats[client_id] = {
@@ -780,16 +821,13 @@ def receive_hashrate():
     }
     client_power_draws[client_id] = data.get("power_draw", "N/A")
 
-    # Track when client started mining
     if client_id not in client_start_times:
         client_start_times[client_id] = time.time()
 
-    # Calculate elapsed time in hours
     elapsed_hours = (time.time() - client_start_times[client_id]) / 3600
 
-    # Get the latest power draw value
     power_watts = data.get("power_draw", 0)
-    if isinstance(power_watts, (int, float)) and power_watts > 0:
+    if isinstance(power_watts, (int, float)) and power_watts != "N/A" and power_watts > 0:
         kilowatts = power_watts / 1000
         kwh_used = kilowatts * elapsed_hours
         cost = kwh_used * ELECTRICITY_RATE_PER_KWH
@@ -797,28 +835,49 @@ def receive_hashrate():
     else:
         client_costs[client_id] = 0.0
 
-    # This endpoint can also send back commands, making the system more efficient
     command = COMMAND_QUEUE.pop(client_id, None)
     return jsonify(command) if command else jsonify({"message": "ok"})
+
 
 @app.route("/newjob", methods=["POST"])
 def receive_newjob():
     data = request.get_json()
-    # FIX: Remove the check for "newjob". Only check for the essential client_id.
     if data and "client_id" in data:
         client_newjobs[data["client_id"]] = data
         return "OK", 200
     return "Bad Request", 400
 
+
 def start_flask():
-    app.run(host="0.0.0.0", port=5000)
+    # Use a more robust way to get local IP if 0.0.0.0 is not desired for display
+    # host_ip = "0.0.0.0" # Listen on all interfaces
+    # You might want to get the actual LAN IP for display purposes if multiple interfaces
+    # import socket
+    # s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # try:
+    #     s.connect(("8.8.8.8", 80)) # Doesn't actually send data
+    #     host_ip = s.getsockname()[0]
+    # except Exception:
+    #     pass
+    # finally:
+    #     s.close()
+    app.run(host="0.0.0.0", port=5000, debug=False)  # Set debug=False for production
+
 
 if __name__ == "__main__":
-
+    # Start Flask server first, as it's the main interface
     threading.Thread(target=start_flask, daemon=True).start()
+    # Start the log writer thread. It will create EVENT_LOG if it doesn't exist.
     threading.Thread(target=log_writer, daemon=True).start()
+
+    # Attempt to start P2Pool
     if start_p2pool_direct():
+        # Start the P2Pool log tailer only if P2Pool was successfully launched.
+        # It will wait for RAW_LOG to be created.
         threading.Thread(target=tail_p2pool_log, daemon=True).start()
         handle_user_input(p2pool_proc)
     else:
         print("[!] Could not start P2Pool. Exiting.")
+        # If P2Pool doesn't start, gracefully exit after a brief pause
+        time.sleep(5)  # Give Flask a moment to be accessible if needed for error viewing
+        os._exit(1)  # Force exit if P2Pool didn't start
