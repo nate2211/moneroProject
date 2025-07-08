@@ -20,6 +20,17 @@ except Exception as e:
     sys.exit(1)
 
 from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
+
+c = Computer()
+c.IsCpuEnabled = True
+c.IsGpuEnabled = True
+c.IsMemoryEnabled = True
+c.IsMotherboardEnabled = True
+c.IsControllerEnabled = True
+c.IsNetworkEnabled = True
+c.IsStorageEnabled = True
+c.Open()
+
 # === CONFIGURATION ===
 XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
 CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
@@ -44,15 +55,7 @@ threads = None
 
 def get_power_draw():
     try:
-        c = Computer()
-        c.IsCpuEnabled = True
-        c.IsGpuEnabled = True
-        c.IsMemoryEnabled = True
-        c.IsMotherboardEnabled = True
-        c.IsControllerEnabled = True
-        c.IsNetworkEnabled = True
-        c.IsStorageEnabled = True
-        c.Open()
+
 
         total_power_draw = 0.0
         found = False
@@ -71,7 +74,7 @@ def get_power_draw():
                         total_power_draw += sensor.Value
                         found = True
 
-        c.Close()
+
         return round(total_power_draw, 2) if found else "N/A"
 
     except Exception as e:
@@ -82,10 +85,6 @@ def get_cpu_temperature():
     try:
         from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
 
-        c = Computer()
-        c.IsCpuEnabled = True
-        c.Open()
-        time.sleep(0.5)
 
         temps = []
 
@@ -98,7 +97,6 @@ def get_cpu_temperature():
                             temps.append(sensor.Value)
                 except Exception as e:
                     print(f"[!] CPU temp update failed: {e}")
-        c.Close()
 
         if not temps:
             return "N/A"
@@ -145,8 +143,9 @@ def monitor_output(process):
     hashrate = 0
 
     for line in iter(process.stdout.readline, b''):
-        decoded = line.decode("utf-8", errors="ignore").strip()
-        print(f"[XMRIG] {decoded}")
+        decoded = line.strip()
+        if(decoded != ""):
+            print(f"[XMRIG] {decoded}")
         if "error" in decoded.lower():
             stop_miner()
             time.sleep(30)
@@ -283,6 +282,8 @@ def start_miner(pool_url = "", thread_count = None):
         [XMRIG_PATH],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        bufsize=1,  # line-buffered
+        universal_newlines=True,
         creationflags=subprocess.CREATE_NO_WINDOW | DETACHED_PROCESS
     )
 
