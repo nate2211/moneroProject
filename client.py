@@ -336,8 +336,28 @@ async def start_miner(pool_url="", thread_count=None):
 
     asyncio.create_task(monitor_output(xmrig_process))
 
+# NEW HELPER FUNCTION: Check for NVIDIA GPU
+def check_nvidia_gpu_sync():
+    """
+    Synchronous function to check for NVIDIA GPU using LibreHardwareMonitorLib.
+    """
+    try:
+        c = Computer()
+        c.IsGpuEnabled = True
+        c.Open()
 
-def update_config_file_sync(pool_url, thread_count):
+        found_nvidia = False
+        for hardware in c.Hardware:
+            if hardware.HardwareType == HardwareType.Gpu and "NVIDIA" in hardware.Name:
+                found_nvidia = True
+                break
+        c.Close()
+        return found_nvidia
+    except Exception as e:
+        print(f"[!] Error checking for NVIDIA GPU: {e}")
+        return False
+
+def update_config_file_sync(pool_url, thread_count): # Removed enable_cuda parameter
     with open(CONFIG_PATH, "r+", encoding="utf-8") as f:
         config = json.load(f)
 
@@ -345,15 +365,14 @@ def update_config_file_sync(pool_url, thread_count):
         if "randomx" in config:
             config["randomx"]["algo"] = "rx"
 
+        # Detect NVIDIA GPU internally
+        has_nvidia_gpu = check_nvidia_gpu_sync()
         config.setdefault("cuda", {})
-        config["cuda"]["enabled"] = True
+        config["cuda"]["enabled"] = has_nvidia_gpu # Set CUDA enabled based on internal detection
 
         if "cpu" in config:
             config["cpu"]["enabled"] = True
             config["cpu"]["rx"] = list(range(thread_count))
-
-        for key in ["rx/wow"]:
-            config["cpu"].pop(key, None)
 
         if config.get("pools") and isinstance(config["pools"], list):
             for pool in config["pools"]:
@@ -365,7 +384,7 @@ def update_config_file_sync(pool_url, thread_count):
         f.seek(0)
         json.dump(config, f, indent=4)
         f.truncate()
-    print(f"[+] Updated config.json with {thread_count} threads and pool: {pool_url}")
+    print(f"[+] Updated config.json with {thread_count} threads, pool: {pool_url}, CUDA enabled: {has_nvidia_gpu}")
 
 
 async def stop_miner():
