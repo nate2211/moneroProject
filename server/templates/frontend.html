@@ -470,8 +470,8 @@ function updateClientDashboard() {
             console.error("Failed to update dashboard:", err);
         });
 }
-setInterval(updateSystemDashboard, 1000);
-setInterval(updateClientDashboard, 1000); // Poll every 5 seconds
+setInterval(updateSystemDashboard, 5000);
+setInterval(updateClientDashboard, 5000); // Poll every 5 seconds
 // Initial render for the placeholder message
 
 document.addEventListener('DOMContentLoaded', () => {
