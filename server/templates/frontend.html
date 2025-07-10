@@ -12,12 +12,13 @@
 
     <div id="status-container"></div>
     <h2>System Totals</h2>
-    <table>
-        <tr><th>Total Hashrate</th><td>{{ total_hashrate }} H/s</td></tr>
-        <tr><th>Total CPU Shares</th><td>{{ total_cpu_shares }}</td></tr>
-        <tr><th>Total GPU Shares</th><td>{{ total_gpu_shares }}</td></tr>
-        <tr><th>Total Power Draw</th><td>{{ total_power_draw }} W</td></tr>
-        <tr><th>Total Cost</th><td>${{ total_cost }}</td></tr>
+    <table id="system-total-dashboard-body">
+        <tr><th>Total Hashrate</th><td id="total-hashrate">N/A</td></tr>
+        <tr><th>Total CPU Shares</th><td id="total-cpu-shares">N/A</td></tr>
+        <tr><th>Total GPU Shares</th><td id="total-gpu-shares">N/A</td></tr>
+        <tr><th>Total Power Draw</th><td id="total-power-draw">N/A</td></tr>
+        <tr><th>Total Cost</th><td id="total-cost">N/A</td></tr>
+        <tr><th>Average CPU Temp</th><td id="average-cpu-temp">N/A</td></tr>
     </table>
 
    <h2>Client Dashboard</h2>
@@ -357,6 +358,55 @@ function fetchStatus() {
             statusBtn.textContent = 'Get Status';
         });
 }
+    function updateSystemDashboard() {
+        fetch("/api/clients")
+            .then(res => res.json())
+            .then(data => {
+                let totalHashrate = 0;
+                let totalCpuShares = 0;
+                let totalGpuShares = 0;
+                let totalPowerDraw = 0;
+                let totalCost = 0;
+                let validCpuTemps = [];
+
+                // Iterate through client data to sum up totals
+                for (const clientId in data.hashrates) {
+                    totalHashrate += data.hashrates[clientId] || 0;
+                    totalCpuShares += data.cpu_shares[clientId] || 0;
+                    totalGpuShares += data.nvidia_shares[clientId] || 0;
+
+                    const power = data.power_draws[clientId];
+                    if (typeof power === 'number' && power !== 'N/A') {
+                        totalPowerDraw += power;
+                    }
+
+                    totalCost += data.costs[clientId] || 0;
+
+                    const cpuTemp = data.temps[clientId];
+                    if (typeof cpuTemp === 'string' && cpuTemp.includes('°C')) {
+                        try {
+                            validCpuTemps.push(parseFloat(cpuTemp.split('°C')[0].trim()));
+                        } catch (e) { /* ignore parse errors */ }
+                    }
+                }
+
+                const averageCpuTemp = validCpuTemps.length > 0
+                    ? (validCpuTemps.reduce((sum, temp) => sum + temp, 0) / validCpuTemps.length).toFixed(1) + '°C'
+                    : 'N/A';
+
+                // Update the DOM elements for system totals
+                document.getElementById("total-hashrate").textContent = `${totalHashrate.toFixed(2)} H/s`;
+                document.getElementById("total-cpu-shares").textContent = totalCpuShares;
+                document.getElementById("total-gpu-shares").textContent = totalGpuShares;
+                document.getElementById("total-power-draw").textContent = `${totalPowerDraw.toFixed(2)} W`;
+                document.getElementById("total-cost").textContent = `$${totalCost.toFixed(4)}`;
+                document.getElementById("average-cpu-temp").textContent = averageCpuTemp;
+
+            })
+            .catch(err => {
+                console.error("Failed to update system totals dashboard:", err);
+            });
+    }
 function updateClientDashboard() {
     fetch("/api/clients")
         .then(res => res.json())
@@ -420,8 +470,8 @@ function updateClientDashboard() {
             console.error("Failed to update dashboard:", err);
         });
 }
-
-setInterval(updateClientDashboard, 5000); // Poll every 5 seconds
+setInterval(updateSystemDashboard, 1000);
+setInterval(updateClientDashboard, 1000); // Poll every 5 seconds
 // Initial render for the placeholder message
 
 document.addEventListener('DOMContentLoaded', () => {

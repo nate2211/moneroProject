@@ -27,7 +27,7 @@ class P2poolData:
 
         args = [
             exe_path, "--host", "127.0.0.1", "--wallet", self.WALLET,
-            "--mini", "--stratum", "192.168.0.10:3333", "--no-upnp", "--no-color", "--p2p", "0.0.0.0:37888"
+            "--mini", "--stratum", "0.0.0.0:3333", "--no-upnp", "--no-color", "--p2p", "0.0.0.0:37888"
         ]
 
         try:

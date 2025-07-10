@@ -167,11 +167,11 @@ def get_clients():
         "last_seen": client_last_seen_formatted,
         "newjobs": {
             cid: {
-                "difficulty": j.difficulty if hasattr(j, "difficulty") else None,
-                "height": j.height if hasattr(j, "height") else None,
-                "algo": j.algo if hasattr(j, "algo") else None,
-                "tx_count": j.tx_count if hasattr(j, "tx_count") else None,
-                "ip": j.ip if hasattr(j, "ip") else None,
+                "difficulty": j.get("difficulty"),
+                "height": j.get("height"),
+                "algo": j.get("algo"),
+                "tx_count": j.get("tx_count"),
+                "ip": j.get("ip"),
             } for cid, j in clientdata.client_newjobs.items()
         }
     }
@@ -478,6 +478,8 @@ def clear_all_client_data():
     COMMAND_QUEUE.clear() # Clear any commands from a previous run
     p2pooldata.log_event_now("System Startup", "All client data cleared.")
     print("[+] Client data cleared successfully.")
+
+
 
 if __name__ == "__main__":
     clear_all_client_data()
