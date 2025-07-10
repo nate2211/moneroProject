@@ -20,7 +20,6 @@ class P2poolData:
         self.log_queue = queue.Queue()
 
     def start_p2pool_direct(self):
-        global p2pool_proc
         exe_path = os.path.join(self.P2POOL_DIR, self.P2POOL_EXE)
         if not os.path.exists(exe_path):
             print(f"[!] Executable not found at: {exe_path}")
@@ -32,7 +31,7 @@ class P2poolData:
         ]
 
         try:
-            p2pool_proc = subprocess.Popen(
+            self.p2pool_proc = subprocess.Popen(
                 args,
                 cwd=self.P2POOL_DIR,
                 stdin=subprocess.PIPE,
@@ -53,7 +52,7 @@ class P2poolData:
                 # Log that the process ended, if this function exits
                 self.log_event_now("P2Pool Process", "P2Pool stdout stream ended.")
 
-            threading.Thread(target=redirect_output, args=(p2pool_proc,), daemon=True).start()
+            threading.Thread(target=redirect_output, args=(self.p2pool_proc,), daemon=True).start()
             return True
         except Exception as e:
             print(f"[!] Failed to launch P2Pool: {e}")
@@ -157,8 +156,8 @@ class P2poolData:
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
-        now = datetime.now()
-        dt = datetime.fromtimestamp(timestamp)
+        now = datetime.datetime.now()
+        dt = datetime.datetime.fromtimestamp(timestamp)
         diff = now - dt
 
         seconds = diff.total_seconds()
@@ -193,5 +192,5 @@ class P2poolData:
         return ansi_escape.sub('', text)
 
     def log_event_now(self, event_type, message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_queue.put(f"[{timestamp}] [{event_type}] {message}")
