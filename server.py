@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 import psutil
 
+
 P2POOL_DIR = os.path.dirname(sys.executable)
 P2POOL_EXE = "p2pool.exe"
 WALLET = "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk"
@@ -215,8 +216,165 @@ def time_ago(timestamp):
         return f"{days} day{'s' if days > 1 else ''} ago"
 
 
+
+
 # === FLASK ===
 app = Flask(__name__)
+
+@app.route("/connect_wifi", methods=["POST"])
+def connect_wifi():
+    data = request.get_json()
+    ssid = data.get("ssid")
+    password = data.get("password")
+
+    if not ssid or not password:
+        return jsonify({"status": "error", "message": "SSID and password are required."}), 400
+
+    # These commands are Windows-specific and require administrative privileges.
+    # It's crucial that the script running this Flask app has admin rights.
+    try:
+        # 1. Delete existing profile for this SSID (optional, but good for clean reconnect)
+        # Using a subprocess.run with capture_output=True to get stdout/stderr
+        # and text=True to decode it.
+        # We don't check=True for deletion as it might fail if profile doesn't exist.
+        delete_command = f'netsh wlan delete profile name="{ssid}"'
+        delete_result = subprocess.run(delete_command, shell=True, capture_output=True, text=True)
+        if delete_result.returncode == 0:
+            log_event_now("Network Control", f"Deleted existing Wi-Fi profile for '{ssid}'.")
+        else:
+            # It's common for deletion to fail if the profile doesn't exist, not an error.
+            if "profile \"" + ssid + "\" is not found" not in delete_result.stderr:
+                log_event_now("Network Control", f"Warning: Failed to delete Wi-Fi profile for '{ssid}': {delete_result.stderr.strip()}")
+
+        # 2. Create a temporary XML profile for the network
+        # This is the most reliable way to connect to a new Wi-Fi network with a password
+        profile_xml = f"""<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+    <name>{ssid}</name>
+    <SSIDConfig>
+        <SSID>
+            <name>{ssid}</name>
+        </SSID>
+    </SSIDConfig>
+    <connectionType>ESS</connectionType>
+    <connectionMode>auto</connectionMode>
+    <MSM>
+        <security>
+            <authEncryption>
+                <authentication>WPA2PSK</authentication>
+                <encryption>AES</encryption>
+                <useOneX>false</useOneX>
+            </authEncryption>
+            <sharedKey>
+                <keyType>passPhrase</keyType>
+                <protected>false</protected>
+                <keyMaterial>{password}</keyMaterial>
+            </sharedKey>
+        </security>
+    </MSM>
+</WLANProfile>"""
+
+        # Save the XML to a temporary file
+        temp_xml_path = os.path.join(P2POOL_DIR, f"{ssid}_profile.xml")
+        with open(temp_xml_path, "w", encoding="utf-8") as f:
+            f.write(profile_xml)
+
+        # 3. Add the profile
+        add_profile_command = f'netsh wlan add profile filename="{temp_xml_path}"'
+        subprocess.run(add_profile_command, shell=True, check=True)
+        log_event_now("Network Control", f"Added Wi-Fi profile for '{ssid}'.")
+
+        # 4. Connect to the profile
+        connect_command = f'netsh wlan connect name="{ssid}" ssid="{ssid}"' # ssid param sometimes needed
+        subprocess.run(connect_command, shell=True, check=True)
+        log_event_now("Network Control", f"Attempted to connect to Wi-Fi network: '{ssid}'.")
+
+        # Clean up the temporary XML file
+        os.remove(temp_xml_path)
+
+        return jsonify({"status": "success", "message": f"Attempted to connect to Wi-Fi network: {ssid}. Check network status."})
+
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Failed to connect to Wi-Fi network '{ssid}'. Error: {e.stderr.strip()}. Ensure script is run as administrator."
+        log_event_now("Network Control", error_msg)
+        # Attempt to clean up XML even on error
+        if os.path.exists(temp_xml_path):
+            os.remove(temp_xml_path)
+        return jsonify({"status": "error", "message": error_msg}), 500
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during Wi-Fi connection: {e}"
+        log_event_now("Network Control", error_msg)
+        if os.path.exists(temp_xml_path):
+            os.remove(temp_xml_path)
+        return jsonify({"status": "error", "message": error_msg}), 500
+@app.route("/restart_p2pool", methods=["POST"])
+def restart_p2pool():
+    global p2pool_proc, p2pool_status_output
+
+    if p2pool_proc and p2pool_proc.poll() is None:
+        print("[!] Attempting to restart P2Pool: Terminating existing process...")
+        try:
+            # Send SIGTERM to allow for graceful shutdown
+            p2pool_proc.terminate()
+            p2pool_proc.wait(timeout=10) # Wait for process to terminate
+            print("[+] Existing P2Pool process terminated.")
+        except subprocess.TimeoutExpired:
+            print("[!] P2Pool process did not terminate gracefully, forcing kill.")
+            p2pool_proc.kill()
+        except Exception as e:
+            print(f"[!] Error terminating P2Pool process: {e}")
+
+    # Clear previous status to indicate restart
+    p2pool_status_output = {"message": "P2Pool is restarting..."}
+
+    # Attempt to start a new P2Pool process
+    success = start_p2pool_direct()
+    if success:
+        print("[+] P2Pool restarted successfully.")
+        log_event_now("P2Pool Control", "P2Pool process restarted.")
+        return jsonify({"status": "success", "message": "P2Pool restarted successfully."})
+    else:
+        print("[!] Failed to restart P2Pool.")
+        p2pool_status_output = {"error": "Failed to restart P2Pool. Check logs."}
+        log_event_now("P2Pool Control", "Failed to restart P2Pool process.")
+        return jsonify({"status": "error", "message": "Failed to restart P2Pool."}), 500
+
+# Modify the `handle_user_input` function to clean up the raw log on exit
+def handle_user_input(proc):
+    """
+    Waits for user input in the console and forwards it to the p2pool process.
+    """
+    print("\n[+] P2Pool is running in the background.")
+    print("[+] Type commands here and press Enter to send them to P2Pool (e.g., 'status').")
+    print("[+] Type 'exit' or 'quit' to stop P2Pool and the script.")
+    while True:
+        try:
+            user_input = input()
+            if user_input.lower() in ["exit", "quit"]:
+                print("[!] Shutting down P2Pool...")
+                proc.terminate()
+                # Wait for the process to actually terminate
+                proc.wait(timeout=5)
+                # Clean up raw log file before exiting
+                if os.path.exists(RAW_LOG):
+                    os.remove(RAW_LOG)
+                    print(f"[+] Removed raw log file: {RAW_LOG}")
+                break
+
+            # Check if stdin pipe is still open before writing
+            if proc.poll() is None:  # None means process is still running
+                proc.stdin.write(user_input + '\n')
+                proc.stdin.flush()
+            else:
+                print("[!] P2Pool process has already terminated.")
+                break
+        except (IOError, OSError) as e:
+            print(f"[!] Lost connection to P2Pool process: {e}")
+            break
+        except Exception as e:
+            print(f"[!] An error occurred: {e}")
+            break
+
 
 # HTML content remains the same, ensuring robust error handling in JS and Python
 HTML = """
@@ -438,10 +596,26 @@ HTML = """
         {% for o in blocks %}
         <tr>
             <td>{{ o.time }}</td>
-            <td>{{ o.type }}</td>
             <td>{{ o.message }}</td>
         </tr>
         {% endfor %}
+    </table>
+    <h2>System Control</h2>
+    <table>
+        <tr>
+            <th>Restart P2Pool</th>
+            <td>
+                <button id="restart-p2pool-btn" class="status-button" onclick="restartP2Pool()">Restart</button>
+            </td>
+        </tr>
+         <tr>
+            <th>Connect to Wi-Fi</th>
+            <td>
+                <input type="text" id="wifi-ssid" placeholder="Network SSID (e.g., ARRIS-7d41-5g)" value="ARRIS-7D41-5G" style="width: 250px;">
+                <input type="password" id="wifi-password" placeholder="Password" value="535102108332" style="width: 250px; margin-left: 10px;">
+                <button class="status-button" onclick="connectToWifi()" style="margin-left: 10px;">Connect</button>
+            </td>
+        </tr>
     </table>
     <h2>New Miner Data</h2>
     <table>
@@ -512,6 +686,78 @@ HTML = """
             alert('Failed to stop the miner.');
         });
     }
+        function connectToWifi() {
+        const ssid = document.getElementById('wifi-ssid').value.trim();
+        const password = document.getElementById('wifi-password').value.trim();
+
+        if (!ssid || !password) {
+            alert("Please enter both Wi-Fi SSID and Password.");
+            return;
+        }
+
+        if (!confirm(`Attempt to connect to Wi-Fi network "${ssid}"? This might temporarily disconnect your current connection.`)) {
+            return;
+        }
+
+        const connectBtn = document.querySelector('#wifi-ssid ~ button'); // Select the connect button
+        connectBtn.disabled = true;
+        connectBtn.textContent = 'Connecting...';
+
+        fetch('/connect_wifi', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ ssid: ssid, password: password })
+        })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.message);
+            console.log(data.message);
+        })
+        .catch(error => {
+            console.error('Error connecting to Wi-Fi:', error);
+            alert('Failed to connect to Wi-Fi. Check console for details and ensure the script has administrative privileges.');
+        })
+        .finally(() => {
+            connectBtn.disabled = false;
+            connectBtn.textContent = 'Connect';
+            // You might want to automatically refresh status or wait a bit
+            // and then check connectivity
+            // setTimeout(fetchStatus, 5000);
+        });
+    }
+
+    function restartP2Pool() {
+    if (!confirm("Are you sure you want to restart P2Pool? This will temporarily stop mining.")) {
+        return;
+    }
+
+    const restartBtn = document.getElementById('restart-p2pool-btn');
+    restartBtn.disabled = true;
+    restartBtn.textContent = 'Restarting...';
+
+    fetch('/restart_p2pool', {
+        method: 'POST'
+    })
+    .then(response => response.json())
+    .then(data => {
+        alert(data.message);
+        console.log(data.message);
+        // You might want to automatically fetch status after a short delay
+        // to see the new P2Pool status
+        setTimeout(fetchStatus, 3000); // Fetch status after 3 seconds
+    })
+    .catch(error => {
+        console.error('Error restarting P2Pool:', error);
+        alert('Failed to restart P2Pool. Check console for details.');
+    })
+    .finally(() => {
+        restartBtn.disabled = false;
+        restartBtn.textContent = 'Restart P2Pool';
+    });
+}
+
 function renderStatus(data) {
     const container = document.getElementById('status-container');
     container.innerHTML = ''; // Clear previous content

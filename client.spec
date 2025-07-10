@@ -5,7 +5,7 @@ a = Analysis(
     ['client.py'],
     pathex=[],
     binaries=[],
-    datas=[('C:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'), ('C:\\Users\\natem\\PycharmProjects\\moneroProject\\HidSharp.dll', '.')],
+    datas=[('X:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'), ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\HidSharp.dll', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
