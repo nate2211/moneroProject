@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>P2Pool Monitor</title>
+    <link rel="stylesheet" href="../static/styles.css"/>
+</head>
+<body>
+<div class="container">
+    <h2>P2Pool Status</h2>
+    <button id="status-btn" class="status-button" onclick="fetchStatus()">Get Status</button>
+
+    <div id="status-container"></div>
+    <h2>System Totals</h2>
+    <table>
+        <tr><th>Total Hashrate</th><td>{{ total_hashrate }} H/s</td></tr>
+        <tr><th>Total CPU Shares</th><td>{{ total_cpu_shares }}</td></tr>
+        <tr><th>Total GPU Shares</th><td>{{ total_gpu_shares }}</td></tr>
+        <tr><th>Total Power Draw</th><td>{{ total_power_draw }} W</td></tr>
+        <tr><th>Total Cost</th><td>${{ total_cost }}</td></tr>
+    </table>
+
+   <h2>Client Dashboard</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Client ID</th>
+                <th>Hashrate</th>
+                <th>CPU Temp</th>
+                <th>Threads</th>
+                <th>Power Draw</th>
+                <th>Cost</th>
+                <th>Last Seen</th>
+                <th>CPU Shares / GPU Shares</th>
+                <th>GPU Stats</th>
+                <th>Job Difficulty</th>
+                <th>Job Height</th>
+                <th>Algo</th>
+                <th>TXs</th>
+                <th>Pool IP</th>
+                <th>Set Threads</th>
+                <th>Control Pool</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cid, rate in hashrates.items() %}
+            <tr>
+                <td><span class="status-online">●</span> {{ cid }}</td>
+                <td><strong>{{ "%.2f"|format(rate) }} H/s</strong></td>
+                <td>{{ temps.get(cid, 'N/A') }}</td>
+                <td>{{ threads.get(cid, 'N/A') }}</td>
+                <td>{{ client_power_draws.get(cid, "N/A") }}</td>
+                <td>${{ client_costs.get(cid, 0.0) }}</td>
+                <td>{{ client_last_seen.get(cid, "N/A") }}</td>
+                <td>{{ client_cpu_shares.get(cid, 0) }} / {{ client_nvidia_shares.get(cid, 0) }}</td>
+                <td>{{ client_gpu_stats.get(cid, {}).get('temp', 'N/A') }} | {{ client_gpu_stats.get(cid, {}).get('fan', 'N/A') }}</td>
+                <td>{{ newjobs[cid].difficulty if cid in newjobs and newjobs[cid].difficulty else '—' }}</td>
+                <td>{{ newjobs[cid].height if cid in newjobs and newjobs[cid].height else '—' }}</td>
+                <td>{{ newjobs[cid].algo if cid in newjobs and newjobs[cid].algo else '—' }}</td>
+                <td>{{ newjobs[cid].tx_count if cid in newjobs and newjobs[cid].tx_count else '—' }}</td>
+                <td>{{ newjobs[cid].ip if cid in newjobs and newjobs[cid].ip else '—' }}</td>
+                <td>
+                    <form action="{{ url_for('set_threads', client_id=cid) }}" method="post" class="form-inline">
+                        <input type="number" name="threads" min="1" placeholder="{{ threads.get(cid, '1') }}" required>
+                        <button type="submit">Set</button>
+                    </form>
+                </td>
+                <td>
+                    {% if client_status.get(cid) == 'Started' %}
+                        <button class="action-button stop" onclick="stopMiner('{{ cid }}')">Stop</button>
+                    {% else %}
+                        <button class="action-button" onclick="openStartModal('{{ cid }}')">Start</button>
+                    {% endif %}
+                </td>
+                <div id="startMinerModal" class="modal">
+                      <div class="modal-content">
+                        <div class="modal-header">
+                          <span class="close-button" onclick="closeStartModal()">&times;</span>
+                          <h3>Start Miner</h3>
+                        </div>
+                        <form id="startMinerForm" method="post">
+                            <div class="modal-body">
+                                <div class="form-group">
+                                    <label for="pool_url">Pool URL</label>
+                                    <input type="text" id="pool_url" name="pool" placeholder="e.g., 192.168.0.10:3333" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="threads">Threads</label>
+                                    <input type="number" id="threads" name="threads" min="1" placeholder="e.g., 4" required>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="submit" class="action-button">Send Start Command</button>
+                            </div>
+                        </form>
+                      </div>
+                </div>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="10" style="text-align: center;" class="text-muted">No clients have connected yet.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <table>
+    <h2>Shares Found</h2>
+    <table>
+        <tr><th>Time</th><th>Message</th></tr>
+        {% for s in shares %}
+        <tr>
+            <td>{{ s.time }}</td>
+            <td>{{ s.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>Blocks Found</h2>
+    <table>
+        <tr><th>Time</th><th>Type</th><th>Message</th></tr>
+        {% for o in blocks %}
+        <tr>
+            <td>{{ o.time }}</td>
+            <td>{{ o.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>System Control</h2>
+    <table>
+        <tr>
+            <th>Restart P2Pool</th>
+            <td>
+                <button id="restart-p2pool-btn" class="status-button" onclick="restartP2Pool()">Restart</button>
+            </td>
+        </tr>
+         <tr>
+            <th>Connect to Wi-Fi</th>
+            <td>
+                <input type="text" id="wifi-ssid" placeholder="Network SSID (e.g., ARRIS-7d41-5g)" value="ARRIS-7D41-5G" style="width: 250px;">
+                <input type="password" id="wifi-password" placeholder="Password" value="535102108332" style="width: 250px; margin-left: 10px;">
+                <button class="status-button" onclick="connectToWifi()" style="margin-left: 10px;">Connect</button>
+            </td>
+        </tr>
+    </table>
+    <h2>New Miner Data</h2>
+    <table>
+        <tr><th>Time</th><th>Message</th></tr>
+        {% for m in miners %}
+        <tr>
+            <td>{{ m.time }}</td>
+            <td><pre style="background:none; border:none; padding:0; margin:0; font-family: inherit;">{{ m.message }}</pre></td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>Jobs Sent</h2>
+    <table>
+        <tr><th>Time</th><th>Message</th></tr>
+        {% for j in jobs %}
+        <tr>
+            <td>{{ j.time }}</td>
+            <td>{{ j.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>Other Events</h2>
+    <table>
+        <tr><th>Time</th><th>Type</th><th>Message</th></tr>
+        {% for o in other %}
+        <tr>
+            <td>{{ o.time }}</td>
+            <td>{{ o.type }}</td>
+            <td>{{ o.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    </table>
+    </div>
+
+<script>
+    const modal = document.getElementById('startMinerModal');
+    const form = document.getElementById('startMinerForm');
+    function openStartModal(clientId) {
+        form.action = '/start_miner/' + clientId;
+        modal.style.display = 'block';
+    }
+    function closeStartModal() {
+        modal.style.display = 'none';
+    }
+    window.onclick = function(event) {
+        if (event.target == modal) {
+            closeStartModal();
+        }
+    }
+
+    // NEW: JavaScript function to handle the stop command
+    function stopMiner(clientId) {
+        if (!confirm(`Are you sure you want to stop miner: ${clientId}?`)) {
+            return;
+        }
+        fetch(`/stop_miner/${clientId}`, {
+            method: 'POST'
+        })
+        .then(response => response.json())
+        .then(data => {
+            console.log(data.message);
+            // Reload the page to see the updated status
+            window.location.reload();
+        })
+        .catch(error => {
+            console.error('Error stopping miner:', error);
+            alert('Failed to stop the miner.');
+        });
+    }
+        function connectToWifi() {
+        const ssid = document.getElementById('wifi-ssid').value.trim();
+        const password = document.getElementById('wifi-password').value.trim();
+
+        if (!ssid || !password) {
+            alert("Please enter both Wi-Fi SSID and Password.");
+            return;
+        }
+
+        if (!confirm(`Attempt to connect to Wi-Fi network "${ssid}"? This might temporarily disconnect your current connection.`)) {
+            return;
+        }
+
+        const connectBtn = document.querySelector('#wifi-ssid ~ button'); // Select the connect button
+        connectBtn.disabled = true;
+        connectBtn.textContent = 'Connecting...';
+
+        fetch('/connect_wifi', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ ssid: ssid, password: password })
+        })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.message);
+            console.log(data.message);
+        })
+        .catch(error => {
+            console.error('Error connecting to Wi-Fi:', error);
+            alert('Failed to connect to Wi-Fi. Check console for details and ensure the script has administrative privileges.');
+        })
+        .finally(() => {
+            connectBtn.disabled = false;
+            connectBtn.textContent = 'Connect';
+            // You might want to automatically refresh status or wait a bit
+            // and then check connectivity
+            // setTimeout(fetchStatus, 5000);
+        });
+    }
+
+    function restartP2Pool() {
+    if (!confirm("Are you sure you want to restart P2Pool? This will temporarily stop mining.")) {
+        return;
+    }
+
+    const restartBtn = document.getElementById('restart-p2pool-btn');
+    restartBtn.disabled = true;
+    restartBtn.textContent = 'Restarting...';
+
+    fetch('/restart_p2pool', {
+        method: 'POST'
+    })
+    .then(response => response.json())
+    .then(data => {
+        alert(data.message);
+        console.log(data.message);
+        // You might want to automatically fetch status after a short delay
+        // to see the new P2Pool status
+        setTimeout(fetchStatus, 3000); // Fetch status after 3 seconds
+    })
+    .catch(error => {
+        console.error('Error restarting P2Pool:', error);
+        alert('Failed to restart P2Pool. Check console for details.');
+    })
+    .finally(() => {
+        restartBtn.disabled = false;
+        restartBtn.textContent = 'Restart P2Pool';
+    });
+}
+
+function renderStatus(data) {
+    const container = document.getElementById('status-container');
+    container.innerHTML = ''; // Clear previous content
+
+    if (data.error || data.message) {
+        container.innerHTML = `<div class="status-section"><p>${data.error || data.message}</p></div>`;
+        return;
+    }
+
+    const sectionTitles = {
+        sidechain: "SideChain Status",
+        stratum: "Stratum Server Status",
+        p2p: "P2P Server Status"
+    };
+
+    for (const sectionKey in data) {
+        const sectionData = data[sectionKey];
+        if (Object.keys(sectionData).length === 0) continue;
+
+        const sectionDiv = document.createElement('div');
+        sectionDiv.className = 'status-section';
+
+        const title = document.createElement('h3');
+        title.textContent = sectionTitles[sectionKey] || sectionKey;
+        sectionDiv.appendChild(title);
+
+        const gridDiv = document.createElement('div');
+        gridDiv.className = 'status-grid';
+
+        for (const key in sectionData) {
+            const keySpan = document.createElement('span');
+            keySpan.className = 'key';
+            keySpan.textContent = key;
+
+            const valueSpan = document.createElement('span');
+            valueSpan.className = 'value';
+            valueSpan.textContent = sectionData[key];
+
+            gridDiv.appendChild(keySpan);
+            gridDiv.appendChild(valueSpan);
+        }
+
+        sectionDiv.appendChild(gridDiv);
+        container.appendChild(sectionDiv);
+    }
+}
+
+function fetchStatus() {
+    const statusBtn = document.getElementById('status-btn');
+    const container = document.getElementById('status-container');
+
+    statusBtn.disabled = true;
+    statusBtn.textContent = 'Fetching...';
+
+    fetch('/status', { method: 'POST' })
+        .then(response => {
+            if (!response.ok) {
+                // If response is not OK, try to read error message from body
+                return response.json().then(errorData => {
+                    throw new Error(errorData.error || `HTTP error! Status: ${response.status}`);
+                });
+            }
+            return response.json(); // Expect a JSON response
+        })
+        .then(data => {
+            renderStatus(data); // Render the data into a beautiful table
+        })
+        .catch(error => {
+            renderStatus({ error: "Failed to fetch or parse status. " + error.message });
+        })
+        .finally(() => {
+            statusBtn.disabled = false;
+            statusBtn.textContent = 'Get Status';
+        });
+}
+function updateClientDashboard() {
+    fetch("/api/clients")
+        .then(res => res.json())
+        .then(data => {
+            const tbody = document.querySelector("table tbody");
+            if (!tbody) return;
+
+            tbody.innerHTML = ""; // Clear current rows
+
+            const keys = Object.keys(data.hashrates);
+            if (keys.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center;" class="text-muted">No clients have connected yet.</td></tr>`;
+                return;
+            }
+
+            keys.forEach(cid => {
+                const row = document.createElement("tr");
+                const hashrate = data.hashrates[cid]?.toFixed(2) || "0.00";
+                const temp = data.temps[cid] || "N/A";
+                const threads = data.threads[cid] || "N/A";
+                const power = data.power_draws[cid] || "N/A";
+                const cost = data.costs[cid]?.toFixed(4) || "0.0000";
+                const lastSeen = data.last_seen[cid] || "N/A";
+                const cpuShares = data.cpu_shares[cid] || 0;
+                const gpuShares = data.nvidia_shares[cid] || 0;
+                const gpuTemp = data.gpu_stats[cid]?.temp || "N/A";
+                const gpuFan = data.gpu_stats[cid]?.fan || "N/A";
+                const job = data.newjobs[cid] || {};
+
+                row.innerHTML = `
+                    <td><span class="status-online">●</span> ${cid}</td>
+                    <td><strong>${hashrate} H/s</strong></td>
+                    <td>${temp}</td>
+                    <td>${threads}</td>
+                    <td>${power}</td>
+                    <td>$${cost}</td>
+                    <td>${lastSeen}</td>
+                    <td>${cpuShares} / ${gpuShares}</td>
+                    <td>${gpuTemp} | ${gpuFan}</td>
+                    <td>${job.difficulty || '—'}</td>
+                    <td>${job.height || '—'}</td>
+                    <td>${job.algo || '—'}</td>
+                    <td>${job.tx_count || '—'}</td>
+                    <td>${job.ip || '—'}</td>
+                    <td>
+                        <form action="/set_threads/${cid}" method="post">
+                            <input type="number" name="threads" min="1" placeholder="${threads}" required>
+                            <button type="submit">Set</button>
+                        </form>
+                    </td>
+                    <td>
+                        ${data.status[cid] === 'Started'
+                            ? `<button class="action-button stop" onclick="stopMiner('${cid}')">Stop</button>`
+                            : `<button class="action-button" onclick="openStartModal('${cid}')">Start</button>`}
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        })
+        .catch(err => {
+            console.error("Failed to update dashboard:", err);
+        });
+}
+
+setInterval(updateClientDashboard, 5000); // Poll every 5 seconds
+// Initial render for the placeholder message
+document.addEventListener('DOMContentLoaded', () => {
+    // Correctly initialize status_output with a JSON string if it's not a dict
+    renderStatus({{ status_output | tojson }});
+
+
+});
+</script>
+
+</body>
+</html>

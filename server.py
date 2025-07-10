@@ -833,7 +833,71 @@ function fetchStatus() {
             statusBtn.textContent = 'Get Status';
         });
 }
+function updateClientDashboard() {
+    fetch("/api/clients")
+        .then(res => res.json())
+        .then(data => {
+            const tbody = document.querySelector("table tbody");
+            if (!tbody) return;
 
+            tbody.innerHTML = ""; // Clear current rows
+
+            const keys = Object.keys(data.hashrates);
+            if (keys.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center;" class="text-muted">No clients have connected yet.</td></tr>`;
+                return;
+            }
+
+            keys.forEach(cid => {
+                const row = document.createElement("tr");
+                const hashrate = data.hashrates[cid]?.toFixed(2) || "0.00";
+                const temp = data.temps[cid] || "N/A";
+                const threads = data.threads[cid] || "N/A";
+                const power = data.power_draws[cid] || "N/A";
+                const cost = data.costs[cid]?.toFixed(4) || "0.0000";
+                const lastSeen = data.last_seen[cid] || "N/A";
+                const cpuShares = data.cpu_shares[cid] || 0;
+                const gpuShares = data.nvidia_shares[cid] || 0;
+                const gpuTemp = data.gpu_stats[cid]?.temp || "N/A";
+                const gpuFan = data.gpu_stats[cid]?.fan || "N/A";
+                const job = data.newjobs[cid] || {};
+
+                row.innerHTML = `
+                    <td><span class="status-online">●</span> ${cid}</td>
+                    <td><strong>${hashrate} H/s</strong></td>
+                    <td>${temp}</td>
+                    <td>${threads}</td>
+                    <td>${power}</td>
+                    <td>$${cost}</td>
+                    <td>${lastSeen}</td>
+                    <td>${cpuShares} / ${gpuShares}</td>
+                    <td>${gpuTemp} | ${gpuFan}</td>
+                    <td>${job.difficulty || '—'}</td>
+                    <td>${job.height || '—'}</td>
+                    <td>${job.algo || '—'}</td>
+                    <td>${job.tx_count || '—'}</td>
+                    <td>${job.ip || '—'}</td>
+                    <td>
+                        <form action="/set_threads/${cid}" method="post">
+                            <input type="number" name="threads" min="1" placeholder="${threads}" required>
+                            <button type="submit">Set</button>
+                        </form>
+                    </td>
+                    <td>
+                        ${data.status[cid] === 'Started'
+                            ? `<button class="action-button stop" onclick="stopMiner('${cid}')">Stop</button>`
+                            : `<button class="action-button" onclick="openStartModal('${cid}')">Start</button>`}
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        })
+        .catch(err => {
+            console.error("Failed to update dashboard:", err);
+        });
+}
+
+setInterval(updateClientDashboard, 5000); // Poll every 5 seconds
 // Initial render for the placeholder message
 document.addEventListener('DOMContentLoaded', () => {
     // Correctly initialize status_output with a JSON string if it's not a dict
@@ -847,6 +911,35 @@ document.addEventListener('DOMContentLoaded', () => {
 </html>
 """
 
+
+@app.route("/api/clients", methods=["GET"])
+def get_clients():
+    client_last_seen_formatted = {
+        cid: time_ago(ts) for cid, ts in client_last_seen.items()
+    }
+
+    data = {
+        "hashrates": client_hashrates,
+        "threads": client_threads,
+        "temps": client_temps,
+        "power_draws": client_power_draws,
+        "costs": client_costs,
+        "status": client_status,
+        "cpu_shares": client_cpu_shares,
+        "nvidia_shares": client_nvidia_shares,
+        "gpu_stats": client_gpu_stats,
+        "last_seen": client_last_seen_formatted,
+        "newjobs": {
+            cid: {
+                "difficulty": j.difficulty if hasattr(j, "difficulty") else None,
+                "height": j.height if hasattr(j, "height") else None,
+                "algo": j.algo if hasattr(j, "algo") else None,
+                "tx_count": j.tx_count if hasattr(j, "tx_count") else None,
+                "ip": j.ip if hasattr(j, "ip") else None,
+            } for cid, j in client_newjobs.items()
+        }
+    }
+    return jsonify(data)
 
 @app.route("/miners/<client_id>", methods=["POST"])
 def update_miner_status(client_id):
