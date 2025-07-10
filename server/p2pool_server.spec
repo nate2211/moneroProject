@@ -10,12 +10,10 @@ a = Analysis(
     pathex=['.'], # The current directory where your Python files reside
     binaries=[],
     datas=[
-        ('scripts', 'scripts'),
         ('templates', 'templates'),
         ('static', 'static'),
         ('client_data.py', '.'),            # Include app.py
         ('p2pool_data.py', '.'), # Include p2pool_handler.py
-        ('frontend.html', '.'),          # Include utils.py
     ],
     hiddenimports=[
         'flask',          # Explicitly include Flask
