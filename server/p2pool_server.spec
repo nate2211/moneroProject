@@ -10,6 +10,7 @@ a = Analysis(
     pathex=['.'], # The current directory where your Python files reside
     binaries=[],
     datas=[
+        ('scripts', 'scripts'),
         ('templates', 'templates'),
         ('static', 'static'),
         ('client_data.py', '.'),            # Include app.py
