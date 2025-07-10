@@ -418,13 +418,21 @@ function updateClientDashboard() {
 
             const keys = Object.keys(data.hashrates);
             if (keys.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center;" class="text-muted">No clients have connected yet.</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="16" style="text-align: center;" class="text-muted">No clients have connected yet.</td></tr>`;
                 return;
             }
 
             keys.forEach(cid => {
                 const row = document.createElement("tr");
-                const hashrate = data.hashrates[cid]?.toFixed(2) || "0.00";
+                const status = data.status[cid];
+
+                // MODIFICATION START
+                // If the client's status is not 'Started', force the hashrate to be 0.
+                // This prevents showing a stale hashrate after a client is stopped.
+                let hashrateValue = (status === 'Started') ? (data.hashrates[cid] || 0) : 0;
+                const hashrate = hashrateValue.toFixed(2);
+                // MODIFICATION END
+
                 const temp = data.temps[cid] || "N/A";
                 const threads = data.threads[cid] || "N/A";
                 const power = data.power_draws[cid] || "N/A";
@@ -458,7 +466,7 @@ function updateClientDashboard() {
                         </form>
                     </td>
                     <td>
-                        ${data.status[cid] === 'Started'
+                        ${status === 'Started'
                             ? `<button class="action-button stop" onclick="stopMiner('${cid}')">Stop</button>`
                             : `<button class="action-button" onclick="openStartModal('${cid}')">Start</button>`}
                     </td>
@@ -468,6 +476,7 @@ function updateClientDashboard() {
         })
         .catch(err => {
             console.error("Failed to update dashboard:", err);
+            tbody.innerHTML = `<tr><td colspan="16" style="text-align: center;" class="text-danger">Error loading client data.</td></tr>`;
         });
 }
 setInterval(updateSystemDashboard, 5000);
