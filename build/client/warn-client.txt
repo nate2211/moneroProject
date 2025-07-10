@@ -45,7 +45,7 @@ missing module named importlib_resources - imported by setuptools._vendor.jaraco
 missing module named trove_classifiers - imported by setuptools.config._validate_pyproject.formats (optional)
 missing module named pyimod02_importers - imported by X:\Users\natem\PycharmProjects\moneroProject\.venv\Lib\site-packages\PyInstaller\hooks\rthooks\pyi_rth_pkgutil.py (delayed)
 missing module named collections.Callable - imported by collections (optional), cffi.api (optional)
-missing module named LibreHardwareMonitor - imported by X:\Users\natem\PycharmProjects\moneroProject\client.py (optional)
+missing module named LibreHardwareMonitor - imported by X:\Users\natem\PycharmProjects\moneroProject\client.py (top-level)
 missing module named 'setuptools._distutils.msvc9compiler' - imported by cffi._shimmed_dist_utils (conditional, optional)
 missing module named imp - imported by cffi.verifier (conditional), cffi._imp_emulation (optional)
 missing module named _dummy_thread - imported by cffi.lock (conditional, optional)

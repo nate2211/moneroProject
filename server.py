@@ -838,6 +838,8 @@ function fetchStatus() {
 document.addEventListener('DOMContentLoaded', () => {
     // Correctly initialize status_output with a JSON string if it's not a dict
     renderStatus({{ status_output | tojson }});
+    
+    
 });
 </script>
 
