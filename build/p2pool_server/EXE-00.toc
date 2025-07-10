@@ -70,7 +70,7 @@
  [],
  False,
  False,
- 1752168302,
+ 1752182053,
  [('run.exe',
    'C:\\Users\\natem\\PycharmProjects\\moneroProject\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\run.exe',
    'EXECUTABLE')],
