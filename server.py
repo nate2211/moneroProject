@@ -1129,8 +1129,35 @@ def start_flask():
     #     s.close()
     app.run(host="0.0.0.0", port=5000, debug=False)  # Set debug=False for production
 
+def clear_all_client_data():
+    """
+    Clears all data associated with connected clients.
+    Call this on startup to ensure a fresh dashboard state.
+    """
+    global client_hashrates, client_newjobs, client_threads, client_last_seen, \
+           client_temps, client_status, client_cpu_shares, client_nvidia_shares, \
+           client_gpu_stats, client_power_draws, client_start_times, client_costs, \
+           COMMAND_QUEUE
+
+    print("[!] Clearing all existing client data on startup...")
+    client_hashrates.clear()
+    client_newjobs.clear()
+    client_threads.clear()
+    client_last_seen.clear()
+    client_temps.clear()
+    client_status.clear()
+    client_cpu_shares.clear()
+    client_nvidia_shares.clear()
+    client_gpu_stats.clear()
+    client_power_draws.clear()
+    client_start_times.clear()
+    client_costs.clear()
+    COMMAND_QUEUE.clear() # Clear any commands from a previous run
+    log_event_now("System Startup", "All client data cleared.")
+    print("[+] Client data cleared successfully.")
 
 if __name__ == "__main__":
+    clear_all_client_data()
     # Start Flask server first, as it's the main interface
     threading.Thread(target=start_flask, daemon=True).start()
     # Start the log writer thread. It will create EVENT_LOG if it doesn't exist.
