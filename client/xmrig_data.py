@@ -7,13 +7,13 @@ import os
 try:
     clr.AddReference("LibreHardwareMonitorLib")
 except Exception as e:
-    print(f"[!] Could not load LibreHardwareMonitorLib: {e}")
+    self.logger.log_message(f"[!] Could not load LibreHardwareMonitorLib: {e}")
     sys.exit(1)
 
 from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
 
 class XmrigData:
-    def __init__(self):
+    def __init__(self, Logger):
         self.xmrig_process = None
         self.output_queue = asyncio.Queue()
         self.FLASK_SERVER_URL = None
@@ -34,6 +34,7 @@ class XmrigData:
         self._latest_power_draw_value = "N/A"
         self.XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
         self.CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
+        self.logger = Logger
 
     async def get_power_draw_async(self):
         """Wrapper to run synchronous get_power_draw in a separate thread."""
@@ -63,7 +64,7 @@ class XmrigData:
                 try:
                     hardware.Update()
                 except Exception as update_error:
-                    print(f"[!] Could not update hardware {hardware.Name}: {update_error}")
+                    self.logger.log_message(f"[!] Could not update hardware {hardware.Name}: {update_error}")
                     continue  # Skip to the next piece of hardware
                 # --------------------------------------------------------
 
@@ -88,7 +89,7 @@ class XmrigData:
             return round(total_power_draw, 2) if found_power_sensor else "N/A"
 
         except Exception as e:
-            print(f"[!] Power draw error: {e}")
+            self.logger.log_message(f"[!] Power draw error: {e}")
             return "N/A"
 
     async def get_cpu_temperature_async(self):
@@ -113,7 +114,7 @@ class XmrigData:
                     try:
                         hardware.Update()
                     except Exception as update_error:
-                        print(f"[!] Could not update CPU hardware {hardware.Name}: {update_error}", file=sys.stderr)
+                        self.logger.log_message(f"[!] Could not update CPU hardware {hardware.Name}: {update_error}", file=sys.stderr)
                         continue  # Skip this faulty hardware component
 
                     for sensor in hardware.Sensors:
@@ -130,7 +131,7 @@ class XmrigData:
             return f"{max_temp_celsius:.1f}°C / {max_temp_fahrenheit:.1f}°F"
 
         except Exception as e:
-            print(f"[!] Error getting CPU temp via LibreHardwareMonitorLib: {e}", file=sys.stderr)
+            self.logger.log_message(f"[!] Error getting CPU temp via LibreHardwareMonitorLib: {e}", file=sys.stderr)
             return "N/A"
 
     def check_nvidia_gpu_sync(self):
@@ -151,5 +152,5 @@ class XmrigData:
             c.Close()
             return found_nvidia
         except Exception as e:
-            print(f"[!] Error checking for NVIDIA GPU: {e}")
+            self.logger.log_message(f"[!] Error checking for NVIDIA GPU: {e}")
             return False

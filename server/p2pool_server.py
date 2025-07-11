@@ -459,6 +459,21 @@ def start_flask():
     #     s.close()
     app.run(host="0.0.0.0", port=5000, debug=False)  # Set debug=False for production
 
+
+def clear_file_contents(filepath):
+    """
+    Clears the content of a file. If the file does not exist, it will be created.
+    """
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.truncate(0) # Ensures the file is empty, even if opened in r+ mode
+        print(f"[+] Cleared contents of: {filepath}")
+    except Exception as e:
+        print(f"[!] Error clearing file {filepath}: {e}")
+
+
+
+
 def clear_all_client_data():
 
 
@@ -483,6 +498,8 @@ def clear_all_client_data():
 
 if __name__ == "__main__":
     clear_all_client_data()
+    clear_file_contents(p2pooldata.EVENT_LOG)
+    clear_file_contents(p2pooldata.RAW_LOG)
     # Start Flask server first, as it's the main interface
     threading.Thread(target=start_flask, daemon=True).start()
     # Start the log writer thread. It will create EVENT_LOG if it doesn't exist.
