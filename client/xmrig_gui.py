@@ -112,8 +112,9 @@ class CollapsibleBox(QWidget):
         # Set initial state without animation
         if self.toggle_button.isChecked():
             self.content_area.setMaximumHeight(content_height)
-            self.setMinimumHeight(collapsed_height + content_height)
-            self.setMaximumHeight(collapsed_height + content_height)
+        else:
+            self.content_area.setMaximumHeight(0)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
 
 class StatsDisplay(QWidget):
@@ -170,7 +171,7 @@ class MinerGui(QWidget):
         """Sets up all the widgets and layouts in the window."""
         self.setWindowTitle("Nate's Mining Client")
         self.setGeometry(100, 100, 1000, 700)
-
+        self.resize(1000, 700)
         # --- Apply High-Contrast Black and White Stylesheet ---
         stylesheet = """
             QWidget {
@@ -270,12 +271,13 @@ class MinerGui(QWidget):
         # --- Console Output ---
         console_label = QLabel("<b>Console Output:</b>")
         console_label.setObjectName("consoleTitle")
-        console_label.setFixedHeight(40)  # Set fixed height for the title
+        console_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)  # Keep label small but flexible
         main_layout.addWidget(console_label)
 
         self.console_output = QPlainTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setFixedHeight(400) # Set fixed height for the console box
+        self.console_output.setMinimumHeight(150) # Set fixed height for the console box
+        self.console_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.console_output)
 
         # Add a spacer at the end to push everything up
