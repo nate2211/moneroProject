@@ -4,20 +4,21 @@ import os
 import subprocess
 import re
 import aiohttp
+import psutil
 
-
+REPORT_INTERVAL_SECONDS = 5
 
 class XmrigMiner:
 
-    def __init__(self, XmrigData):
+    def __init__(self, XmrigData, Logger):
         self.xmrig_data = XmrigData
-
+        self.logger = Logger
     async def monitor_output(self, process):
 
         async for line_bytes in process.stdout:
             decoded = line_bytes.decode("utf-8", errors="ignore").strip()
-            print(f"[XMRIG] {decoded}")
 
+            self.logger.log_message(f"[XMRIG] {decoded}")
             if "error" in decoded.lower():
                 await self.stop_miner()
                 await asyncio.sleep(30)
@@ -68,14 +69,59 @@ class XmrigMiner:
                                                                      json=job_info,
                                                                      timeout=aiohttp.ClientTimeout(total=10))
                 except Exception as e:
-                    print(f"[!] Error sending new job info: {e}")
+                    self.logger.log_message(f"[!] Error sending new job info: {e}")
                     pass
 
+    async def periodic_reporter(self, session: aiohttp.ClientSession, ui_signal):
+
+        while True:
+            await asyncio.sleep(REPORT_INTERVAL_SECONDS)
+
+            current_cpu_temp = await self.xmrig_data.get_cpu_temperature_async()
+            current_power_draw = await self.xmrig_data.get_power_draw_async()
+            current_threads = await self.get_current_threads_from_config_async()
+
+            payload = {
+                "client_id": self.xmrig_data.client_id,
+                "hashrate": self.xmrig_data._latest_hashrate,
+                "threads": current_threads,
+                "cpu_temp": current_cpu_temp,
+                "gpu_temp": self.xmrig_data._latest_gpu_temp,
+                "gpu_fan": self.xmrig_data._latest_gpu_fan,
+                "cpu_accepted_shares": self.xmrig_data._latest_cpu_accepted_shares,
+                "nvidia_accepted_shares": self.xmrig_data._latest_nvidia_accepted_shares,
+                "power_draw": current_power_draw
+            }
+            ui_signal.emit(payload)
+            try:
+
+                await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate", json=payload,
+                                   timeout=aiohttp.ClientTimeout(total=10))
+            except aiohttp.ClientError as e:
+                self.logger.log_message(f"[!] Error sending periodic hashrate report: {e}")
+            except Exception as e:
+                self.logger.log_message(f"[!] Unexpected error during periodic hashrate report send: {e}")
+
+    async def command_loop(self):
+        self.logger.log_message("Type 'start' to launch miner, 'stop' to terminate it, 'exit' to quit.")
+        while True:
+            cmd = await asyncio.to_thread(input, "> ")
+            cmd = cmd.strip().lower()
+            self.logger.log_message(cmd)
+            if cmd == "start":
+                await self.start_miner()
+            elif cmd == "stop":
+                await self.stop_miner()
+            elif cmd == "exit":
+                await self.stop_miner()
+                break
+            else:
+                self.logger.log_message("Unknown command.")
     async def start_miner(self, pool_url="", thread_count=None):
 
-
+        await self.kill_all_xmrig_processes()
         if self.xmrig_data.xmrig_process is not None and self.xmrig_data.xmrig_process.returncode is None:
-            print("[!] Miner already running.")
+            self.logger.log_message("[!] Miner already running.")
             return
 
         if thread_count is None:
@@ -85,45 +131,46 @@ class XmrigMiner:
                 if self.xmrig_data.threads <= 0:
                     raise ValueError
             except ValueError:
-                print("[!] Invalid thread count.")
+                self.logger.log_message("[!] Invalid thread count.")
                 return
+        else:
+            self.xmrig_data.threads = thread_count
 
         if pool_url == "":
             input_pool_url = await asyncio.to_thread(input, "Enter custom pool URL (e.g., 192.168.0.10:3333): ")
             self.xmrig_data.custom_pool_url = input_pool_url.strip()
             if not self.xmrig_data.custom_pool_url:
-                print("[!] No pool URL provided.")
+                self.logger.log_message("[!] No pool URL provided.")
                 return
         else:
             self.xmrig_data.custom_pool_url = pool_url
 
         if not os.path.exists(self.xmrig_data.CONFIG_PATH):
-            print("[!] config.json not found.")
+            self.logger.log_message("[!] config.json not found.")
             return
 
         try:
             await asyncio.to_thread(self.update_config_file_sync, self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
 
         except Exception as e:
-            print(f"[!] Failed to update config.json: {e}")
+            self.logger.log_message(f"[!] Failed to update config.json: {e}")
             return
 
         self.xmrig_data.client_status = "Started"
         payload = {"status": self.xmrig_data.client_status}
 
-        print("[+] Starting miner...")
+        self.logger.log_message("[+] Starting miner...")
         try:
             # Use the shared session here
             await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
                                               timeout=aiohttp.ClientTimeout(total=10))
         except aiohttp.ClientError as e:
-            print(f"[!] Error reporting miner status: {e}")
+            self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
         self.xmrig_data.xmrig_process = await asyncio.create_subprocess_exec(
             self.xmrig_data.XMRIG_PATH,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            # universal_newlines=False is the default and required if you pipe stdout/stderr and want bytes
             creationflags=subprocess.CREATE_NO_WINDOW
         )
 
@@ -132,8 +179,9 @@ class XmrigMiner:
 
     async def stop_miner(self):
 
+        await self.kill_all_xmrig_processes()
         if self.xmrig_data.xmrig_process and self.xmrig_data.xmrig_process.returncode is None:
-            print("[+] Stopping miner...")
+            self.logger.log_message("[+] Stopping miner...")
             self.xmrig_data.xmrig_process.terminate()
             self.xmrig_data.client_status = "Stopped"
             payload = {"status": self.xmrig_data.client_status}
@@ -142,19 +190,19 @@ class XmrigMiner:
                 await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
                                                   timeout=aiohttp.ClientTimeout(total=10))
             except aiohttp.ClientError as e:
-                print(f"[!] Error reporting miner status: {e}")
+                self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
             try:
                 await asyncio.wait_for(self.xmrig_data.xmrig_process.wait(), timeout=5)
-                print("[+] Miner stopped.")
+                self.logger.log_message("[+] Miner stopped.")
             except asyncio.TimeoutError:
-                print("[!] Miner did not stop in time, killing process.")
+                self.logger.log_message("[!] Miner did not stop in time, killing process.")
                 self.xmrig_data.xmrig_process.kill()
-                print("[+] Miner process killed.")
+                self.logger.log_message("[+] Miner process killed.")
             finally:
                 self.xmrig_data.xmrig_process = None
         else:
-            print("[!] Miner is not running.")
+            self.logger.log_message("[!] Miner is not running.")
             self.xmrig_data.client_status = "Stopped"
             self.xmrig_data.xmrig_process = None
 
@@ -174,7 +222,7 @@ class XmrigMiner:
                     command = await response.json()
 
                 if command:
-                    print(f"\n[+] Received command from server: '{command.get('command')}'")
+                    self.logger.log_message(f"\n[+] Received command from server: '{command.get('command')}'")
                     if command.get("command") == "start":
                         await self.stop_miner()
                         self.xmrig_data.custom_pool_url = command.get("pool", self.xmrig_data.custom_pool_url)
@@ -184,13 +232,13 @@ class XmrigMiner:
                         await self.stop_miner()
                     elif command.get("command") == "set_threads":
                         new_threads = int(command["threads"])
-                        print(f"\n[+] Received command: Setting threads to {new_threads}.")
+                        self.logger.log_message(f"\n[+] Received command: Setting threads to {new_threads}.")
                         await self.update_config_threads_async(new_threads)
 
             except aiohttp.ClientError as e:
-                print(f"[!] Cannot connect to server at {self.xmrig_data.FLASK_SERVER_URL} or HTTP error: {e}. Retrying...")
+                self.logger.log_message(f"[!] Cannot connect to server at {self.xmrig_data.FLASK_SERVER_URL} or HTTP error: {e}. Retrying...")
             except Exception as e:
-                print(f"[!] An unexpected error occurred during polling: {e}")
+                self.logger.log_message(f"[!] An unexpected error occurred during polling: {e}")
 
             await asyncio.sleep(5)
 
@@ -220,10 +268,10 @@ class XmrigMiner:
                 f.seek(0)
                 json.dump(config, f, indent=4)
                 f.truncate()
-            print(f"[+] Config updated to {thread_count} threads.")
+            self.logger.log_message(f"[+] Config updated to {thread_count} threads.")
             return True
         except Exception as e:
-            print(f"[!] Failed to update config: {e}")
+            self.logger.log_message(f"[!] Failed to update config: {e}")
             return False
 
     def update_config_file_sync(self, pool_url, thread_count):  # Removed enable_cuda parameter
@@ -253,6 +301,53 @@ class XmrigMiner:
             f.seek(0)
             json.dump(config, f, indent=4)
             f.truncate()
-        print(f"[+] Updated config.json with {thread_count} threads, pool: {pool_url}, CUDA enabled: {has_nvidia_gpu}")
+        self.logger.log_message(f"[+] Updated config.json with {thread_count} threads, pool: {pool_url}, CUDA enabled: {has_nvidia_gpu}")
 
+# --- New function to kill existing xmrig processes ---
+    async def kill_all_xmrig_processes(self):
+        self.logger.log_message("[!] Checking for and terminating existing XMRig processes...")
+        current_pid = os.getpid() # Get the PID of the current script
+        running_xmrigs=[]
+        found_and_killed = False
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                # Check if the process name contains 'xmrig' (case-insensitive)
+                # and it's not the current script's process
+                process_name_lower = proc.info['name'].lower()
+                if 'xmrig' in process_name_lower and (process_name_lower.endswith('xmrig') or process_name_lower.endswith('xmrig.exe')) and proc.pid != current_pid:
+                    self.logger.log_message(f"    - Found XMRig process (PID: {proc.info['pid']}, Name: {proc.info['name']}). Terminating...")
+                    proc.terminate() # Send SIGTERM
+                    found_and_killed = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Ignore processes that no longer exist, or cannot be accessed
+                continue
 
+        if found_and_killed:
+            self.logger.log_message("[!] Waiting for XMRig processes to terminate...")
+            # Wait for processes to actually terminate (with a timeout)
+            # Filter for xmrig processes again, excluding the current script
+            for _ in range(5): # Try for up to 5 seconds
+
+                for proc in psutil.process_iter(['pid', 'name']):
+                    try:
+                        process_name_lower = proc.info['name'].lower()
+                        if 'xmrig' in process_name_lower and (process_name_lower.endswith('xmrig') or process_name_lower.endswith('xmrig.exe')) and proc.pid != current_pid:
+                            running_xmrigs.append(proc)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                if not running_xmrigs:
+                    self.logger.log_message("[+] All identified XMRig processes terminated.")
+                    return
+                await asyncio.sleep(1) # Wait a bit before re-checking
+
+            # If loop finishes and processes are still there, try to kill forcefully
+            for proc in running_xmrigs:
+                if proc.is_running():
+                    self.logger.log_message(f"[!] XMRig process (PID: {proc.info['pid']}) still running. Forcing kill.")
+                    try:
+                        proc.kill() # Send SIGKILL
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass # Already gone or inaccessible
+
+        if not found_and_killed:
+            self.logger.log_message("[+] No existing XMRig processes found to terminate.")
