@@ -1,12 +1,20 @@
 import asyncio
+import os
+import subprocess
 import sys
+import shutil
+import textwrap
+
+import psutil
+import tempfile
+
 import aiohttp
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
-                             QFrame, QToolButton, QSizePolicy, QSpacerItem)
+                             QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
-    QAbstractAnimation
+    QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon
 
 
@@ -153,7 +161,7 @@ class MinerGui(QWidget):
     """The main GUI window for the application."""
     # New signal to safely update stats on the GUI thread
     stats_update_signal = pyqtSignal(dict)
-
+    force_update_signal = pyqtSignal(str)
     def __init__(self, xmrig_data, xmrig_miner, logger):
         super().__init__()
         # --- Initialize Core Components ---
@@ -174,56 +182,87 @@ class MinerGui(QWidget):
         self.resize(1000, 700)
         # --- Apply High-Contrast Black and White Stylesheet ---
         stylesheet = """
+            /* Main Window and General Widget Styling */
             QWidget {
-                background-color: #121212;
-                color: #E0E0E0;
+                background-color: #0D0D0D;  /* deep black */
+                color: #FFFFFF;             /* white text */
                 font-family: Segoe UI, sans-serif;
                 font-size: 10pt;
             }
+
+            /* Labels */
             QLabel {
-                color: #E0E0E0;
+                color: #FFFFFF;  /* white */
             }
+
+            /* Buttons */
             QPushButton {
-                background-color: #333333;
+                background-color: #8B0000;  /* dark red */
                 color: #FFFFFF;
-                border: 1px solid #555555;
+                border: 1px solid #FF4C4C;  /* bright red border */
                 padding: 8px 16px;
                 border-radius: 4px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #444444;
-                border: 1px solid #777777;
+                background-color: #B22222;  /* firebrick */
+                border: 1px solid #FF6666;
             }
             QPushButton:pressed {
-                background-color: #222222;
+                background-color: #660000;  /* darker red */
             }
             QPushButton:disabled {
-                background-color: #2a2a2a;
-                color: #555555;
+                background-color: #2A2A2A;
+                color: #888888;
                 border: 1px solid #444444;
             }
+
+            /* Input Fields */
             QLineEdit, QPlainTextEdit {
-                background-color: #1E1E1E;
+                background-color: #1A1A1A;
                 border: 1px solid #555555;
-                padding: 5px;
+                padding: 6px;
                 border-radius: 4px;
-                color: #E0E0E0;
-            }
-            QFrame {
-                border: 1px solid #333333;
-            }
-            QToolButton {
                 color: #FFFFFF;
-                font-size: 11pt;
             }
+
+            /* Frames and Separators */
+            QFrame {
+                border: 1px solid #2E2E2E;
+            }
+
+            /* Collapsible Box Headers */
+            QToolButton {
+                color: #FF4C4C;  /* bright red */
+                font-size: 12pt;
+                font-weight: bold;
+            }
+
+            /* Form Layout Label Styling */
             QFormLayout QLabel {
                 font-weight: bold;
+                color: #FFFFFF;
             }
+
+            /* Console Title */
             #consoleTitle {
-                font-size: 9pt;
+                font-size: 11pt;
                 font-weight: bold;
                 padding-top: 10px;
+                color: #FF4C4C;
+            }
+
+            /* Scrollbar (optional for better visual consistency) */
+            QScrollBar:vertical {
+                border: none;
+                background: #1A1A1A;
+                width: 8px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #FF4C4C;
+                min-height: 20px;
+                border-radius: 4px;
             }
         """
         self.setStyleSheet(stylesheet)
@@ -293,12 +332,21 @@ class MinerGui(QWidget):
         self.stop_button.clicked.connect(self.handle_stop_mining)
         self.logger.message_signal.connect(self.update_console)
         self.stats_update_signal.connect(self.stats_display.update_stats)
-
+        self.force_update_signal.connect(self.handle_force_update)
     @pyqtSlot(str)
     def update_console(self, message):
         """Appends a message to the console widget in a thread-safe way."""
         self.console_output.appendPlainText(message)
-
+    @pyqtSlot(str)
+    def handle_force_update(self, download_url):
+        """Handles a forced update command from the server, skipping the user prompt."""
+        self.logger.log_message("[UPDATE] Forced update triggered by server.")
+        self.progress_dialog = QProgressDialog("Downloading forced update...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowTitle("Downloading Update")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.show()
+        # Start the download process
+        asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url), self.async_worker.loop)
     def handle_connect(self):
         """Handles the 'Connect' button click by starting the async worker."""
         server_url = self.server_url_input.text().strip()
@@ -350,7 +398,7 @@ class MinerGui(QWidget):
         self.logger.log_message(f"[+] Connecting to {self.xmrig_data.FLASK_SERVER_URL} as {self.xmrig_data.client_id}")
         self.xmrig_data.aiohttp_client_session = aiohttp.ClientSession()
 
-        polling_task = asyncio.create_task(self.xmrig_miner.poll_server(self.xmrig_data.aiohttp_client_session))
+        polling_task = asyncio.create_task(self.xmrig_miner.poll_server(self.xmrig_data.aiohttp_client_session, self.force_update_signal))
         reporter_task = asyncio.create_task(
             self.xmrig_miner.periodic_reporter(self.xmrig_data.aiohttp_client_session, self.stats_update_signal))
 
@@ -375,3 +423,82 @@ class MinerGui(QWidget):
             self.async_worker.loop.call_soon_threadsafe(self.async_worker.loop.stop)
             self.async_worker.wait(5000)
         event.accept()
+
+    def create_and_run_updater_script(self, new_exe_path: str) -> None:
+        """
+        Creates and runs a Windows batch script to replace the current executable with a new one.
+        """
+        self.logger.log_message("[+] Started updater script")
+
+        current_exe = os.path.basename(sys.executable)
+        base_dir = os.path.dirname(sys.executable)
+        new_exe = os.path.basename(new_exe_path)
+
+        # Create a .bat script
+        script_content = textwrap.dedent(f"""\
+            @echo off
+            echo Waiting for application to close...
+            timeout /t 2 /nobreak >nul
+
+            echo Killing process {current_exe}...
+            taskkill /f /im "{current_exe}" >nul 2>&1
+
+            echo Waiting for file to unlock...
+            ping 127.0.0.1 -n 4 >nul
+
+            echo Replacing executable...
+            del "{current_exe}" >nul 2>&1
+            move /Y "{new_exe}" "{current_exe}"
+
+            echo Relaunching application...
+            start "" "{current_exe}"
+
+            echo Cleaning up updater...
+            del "%~f0"
+        """)
+
+        # Save the .bat file in the same directory as the EXE
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bat", dir=base_dir, mode='w', encoding='utf-8') as tmp:
+            tmp.write(script_content)
+            updater_bat_path = os.path.normpath(tmp.name)
+
+        # Copy the downloaded new exe into the base directory (if not already there)
+        if os.path.dirname(new_exe_path) != base_dir:
+            shutil.copy2(new_exe_path, os.path.join(base_dir, new_exe))
+
+        # Run the updater script
+        self.logger.log_message(f"[+] Running updater batch file: {updater_bat_path}")
+        subprocess.Popen(
+            ["cmd.exe", "/c", updater_bat_path],
+            cwd=base_dir,
+            creationflags=subprocess.CREATE_NEW_CONSOLE
+        )
+
+        self.logger.log_message("[+] Exiting current process for updater...")
+        os._exit(0)
+
+    async def download_update(self, session, url):
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded_size = 0
+
+                base_dir = os.path.dirname(sys.executable)  # ✅ FIX
+                save_path = os.path.join(base_dir, "client_new.exe")
+
+                with open(save_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        self.logger.log_message(f"[+] Downloaded {downloaded_size} bytes / {total_size} bytes")
+
+                self.logger.log_message(f"[+] Download complete: {save_path}")
+                self.create_and_run_updater_script(save_path)
+
+        except Exception as e:
+            self.logger.log_message(f"[!] Download failed: {e}")
+            if self.progress_dialog:
+                self.progress_dialog.setValue(0)
+                self.progress_dialog.setLabelText("Download Failed!")
+                QMessageBox.critical(self, "Error", f"Failed to download update: {e}")

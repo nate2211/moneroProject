@@ -37,6 +37,7 @@ async def main():
 
     # 3. Create the GUI, passing the logic components to it
     gui = MinerGui(xmrig_data=xmrig_data, xmrig_miner=xmrig_miner, logger=logger)
+
     gui.show()
 
     # 4. Start the application event loop

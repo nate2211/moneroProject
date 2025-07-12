@@ -4,16 +4,16 @@ import time
 import os
 import threading
 import re
-from flask import Flask, request, jsonify, redirect, url_for, render_template
+from flask import Flask, request, jsonify, redirect, url_for, render_template, send_from_directory
 from waitress import serve
 from p2pool_data import P2poolData
 from client_data import ClientData
+
 p2pooldata = P2poolData()
 clientdata = ClientData()
 ELECTRICITY_RATE_PER_KWH = 0.13
 COMMAND_QUEUE = {}
 
-current_hashrate = 0.0
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     # Running in a PyInstaller bundle
     BASE_DIR = sys._MEIPASS
@@ -21,13 +21,13 @@ else:
     # Running as a normal Python script
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
-
 # === FLASK ===
 app = Flask(
     __name__,
     template_folder=os.path.join(BASE_DIR, 'templates'),
     static_folder=os.path.join(BASE_DIR, 'static')
 )
+
 
 @app.route("/connect_wifi", methods=["POST"])
 def connect_wifi():
@@ -52,7 +52,8 @@ def connect_wifi():
         else:
             # It's common for deletion to fail if the profile doesn't exist, not an error.
             if "profile \"" + ssid + "\" is not found" not in delete_result.stderr:
-                p2pooldata.log_event_now("Network Control", f"Warning: Failed to delete Wi-Fi profile for '{ssid}': {delete_result.stderr.strip()}")
+                p2pooldata.log_event_now("Network Control",
+                                         f"Warning: Failed to delete Wi-Fi profile for '{ssid}': {delete_result.stderr.strip()}")
 
         # 2. Create a temporary XML profile for the network
         # This is the most reliable way to connect to a new Wi-Fi network with a password
@@ -93,14 +94,15 @@ def connect_wifi():
         p2pooldata.log_event_now("Network Control", f"Added Wi-Fi profile for '{ssid}'.")
 
         # 4. Connect to the profile
-        connect_command = f'netsh wlan connect name="{ssid}" ssid="{ssid}"' # ssid param sometimes needed
+        connect_command = f'netsh wlan connect name="{ssid}" ssid="{ssid}"'  # ssid param sometimes needed
         subprocess.run(connect_command, shell=True, check=True)
         p2pooldata.log_event_now("Network Control", f"Attempted to connect to Wi-Fi network: '{ssid}'.")
 
         # Clean up the temporary XML file
         os.remove(temp_xml_path)
 
-        return jsonify({"status": "success", "message": f"Attempted to connect to Wi-Fi network: {ssid}. Check network status."})
+        return jsonify(
+            {"status": "success", "message": f"Attempted to connect to Wi-Fi network: {ssid}. Check network status."})
 
     except subprocess.CalledProcessError as e:
         error_msg = f"Failed to connect to Wi-Fi network '{ssid}'. Error: {e.stderr.strip()}. Ensure script is run as administrator."
@@ -115,16 +117,16 @@ def connect_wifi():
         if os.path.exists(temp_xml_path):
             os.remove(temp_xml_path)
         return jsonify({"status": "error", "message": error_msg}), 500
+
+
 @app.route("/restart_p2pool", methods=["POST"])
 def restart_p2pool():
-
-
     if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None:
         print("[!] Attempting to restart P2Pool: Terminating existing process...")
         try:
             # Send SIGTERM to allow for graceful shutdown
             p2pooldata.p2pool_proc.terminate()
-            p2pooldata.p2pool_proc.wait(timeout=10) # Wait for process to terminate
+            p2pooldata.p2pool_proc.wait(timeout=10)  # Wait for process to terminate
             print("[+] Existing P2Pool process terminated.")
         except subprocess.TimeoutExpired:
             print("[!] P2Pool process did not terminate gracefully, forcing kill.")
@@ -176,6 +178,7 @@ def get_clients():
         }
     }
     return jsonify(data)
+
 
 @app.route("/miners/<client_id>", methods=["POST"])
 def update_miner_status(client_id):
@@ -276,7 +279,6 @@ def parse_p2pool_status(raw_text):
 
 @app.route("/status", methods=["POST"])
 def get_status_output():
-
     if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None and p2pooldata.p2pool_proc.stdin:
         try:
             p2pooldata.p2pool_proc.stdin.write("status\n")
@@ -343,7 +345,8 @@ def index():
     total_hashrate = round(sum(clientdata.client_hashrates.values()), 2)
     total_cpu_shares = sum(clientdata.client_cpu_shares.values())
     total_gpu_shares = sum(clientdata.client_nvidia_shares.values())
-    total_power_draw_values = [p for p in clientdata.client_power_draws.values() if isinstance(p, (int, float)) and p != "N/A"]
+    total_power_draw_values = [p for p in clientdata.client_power_draws.values() if
+                               isinstance(p, (int, float)) and p != "N/A"]
     total_power_draw = round(sum(total_power_draw_values), 2) if total_power_draw_values else "N/A"
 
     # Calculate average CPU temp if available
@@ -369,29 +372,29 @@ def index():
         client_last_seen_formatted[cid] = p2pooldata.time_ago(timestamp)
 
     return render_template("frontend.html",
-                                  hashrates=clientdata.client_hashrates,
-                                  newjobs=clientdata.client_newjobs,
-                                  client_power_draws=clientdata.client_power_draws,
-                                  client_costs=clientdata.client_costs,
-                                  client_last_seen=client_last_seen_formatted,
-                                  client_status=clientdata.client_status,
-                                  client_cpu_shares=clientdata.client_cpu_shares,
-                                  client_gpu_stats=clientdata.client_gpu_stats,
-                                  client_nvidia_shares=clientdata.client_nvidia_shares,
-                                  status_output=p2pooldata.p2pool_status_output,
-                                  threads=clientdata.client_threads,
-                                  temps=clientdata.client_temps,
-                                  total_cost=total_cost,
-                                  total_hashrate=total_hashrate,
-                                  total_cpu_shares=total_cpu_shares,
-                                  total_gpu_shares=total_gpu_shares,
-                                  total_power_draw=total_power_draw,
-                                  average_temp=average_temp,  # Pass average temp
-                                  shares=shares_found[:limit],
-                                  jobs=jobs_sent[:joblimit],
-                                  miners=miner_data[:minerlimit],
-                                  blocks=blocks_found[:minerlimit],
-                                  other=other_events[:minerlimit])
+                           hashrates=clientdata.client_hashrates,
+                           newjobs=clientdata.client_newjobs,
+                           client_power_draws=clientdata.client_power_draws,
+                           client_costs=clientdata.client_costs,
+                           client_last_seen=client_last_seen_formatted,
+                           client_status=clientdata.client_status,
+                           client_cpu_shares=clientdata.client_cpu_shares,
+                           client_gpu_stats=clientdata.client_gpu_stats,
+                           client_nvidia_shares=clientdata.client_nvidia_shares,
+                           status_output=p2pooldata.p2pool_status_output,
+                           threads=clientdata.client_threads,
+                           temps=clientdata.client_temps,
+                           total_cost=total_cost,
+                           total_hashrate=total_hashrate,
+                           total_cpu_shares=total_cpu_shares,
+                           total_gpu_shares=total_gpu_shares,
+                           total_power_draw=total_power_draw,
+                           average_temp=average_temp,  # Pass average temp
+                           shares=shares_found[:limit],
+                           jobs=jobs_sent[:joblimit],
+                           miners=miner_data[:minerlimit],
+                           blocks=blocks_found[:minerlimit],
+                           other=other_events[:minerlimit])
 
 
 @app.route("/hashrate", methods=["POST"])
@@ -431,8 +434,7 @@ def receive_hashrate():
     else:
         clientdata.client_costs[client_id] = 0.0
 
-    command = COMMAND_QUEUE.pop(client_id, None)
-    return jsonify(command) if command else jsonify({"message": "ok"})
+    return jsonify({"message": "ok"})
 
 
 @app.route("/newjob", methods=["POST"])
@@ -444,8 +446,45 @@ def receive_newjob():
     return "Bad Request", 400
 
 
-def start_flask():
+# --- NEW UPDATE CLIENT ENDPOINT ---
+@app.route("/update_client/<client_id>", methods=["POST"])
+def update_client(client_id):
+    """Queues a remote 'update' command for a specific client."""
+    if client_id not in clientdata.client_status:
+        return jsonify({"status": "error", "message": "Client not found."}), 404
 
+    download_url = url_for('download_client', _external=True)
+
+    COMMAND_QUEUE[client_id] = {
+        "command": "update",
+        "url": download_url
+    }
+    print(f"[+] Queued UPDATE command for '{client_id}'")
+    message = f"Update command queued for client '{client_id}."
+
+    return jsonify({"status": "success", "message": message})
+
+
+# --- NEW DOWNLOAD ENDPOINT ---
+@app.route("/download/client")
+def download_client():
+    """Endpoint to serve the client.exe file for updates."""
+    # IMPORTANT: This path is hardcoded as per the request.
+    # For better portability, consider making this path configurable.
+    directory = r"X:\Users\natem\PycharmProjects\moneroProject\dist"
+    filename = "client.exe"
+
+    # Security check: Ensure the file exists before attempting to send it.
+    if not os.path.exists(os.path.join(directory, filename)):
+        p2pooldata.log_event_now("File Server",
+                                 f"Error: Client download failed. File not found at {directory}\\{filename}")
+        return "File not found.", 404
+
+    p2pooldata.log_event_now("File Server", f"Client download initiated for {filename}.")
+    return send_from_directory(directory, filename, as_attachment=True)
+
+
+def start_flask():
     print("[+] Starting Flask server with Waitress on port 5000...")
     serve(app, host="0.0.0.0", port=5000)
 
@@ -456,17 +495,13 @@ def clear_file_contents(filepath):
     """
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.truncate(0) # Ensures the file is empty, even if opened in r+ mode
+            f.truncate(0)  # Ensures the file is empty, even if opened in r+ mode
         print(f"[+] Cleared contents of: {filepath}")
     except Exception as e:
         print(f"[!] Error clearing file {filepath}: {e}")
 
 
-
-
 def clear_all_client_data():
-
-
     print("[!] Clearing all existing client data on startup...")
     clientdata.client_hashrates.clear()
     clientdata.client_newjobs.clear()
@@ -480,10 +515,9 @@ def clear_all_client_data():
     clientdata.client_power_draws.clear()
     clientdata.client_start_times.clear()
     clientdata.client_costs.clear()
-    COMMAND_QUEUE.clear() # Clear any commands from a previous run
+    COMMAND_QUEUE.clear()  # Clear any commands from a previous run
     p2pooldata.log_event_now("System Startup", "All client data cleared.")
     print("[+] Client data cleared successfully.")
-
 
 
 if __name__ == "__main__":
@@ -497,8 +531,8 @@ if __name__ == "__main__":
     threading.Thread(target=p2pooldata.log_writer, daemon=True).start()
 
     # --- P2Pool Handling ---
-    time.sleep(1) # Give server thread a moment to initialize
-    p2pool_proc = None # Define p2pool_proc in the main scope
+    time.sleep(1)  # Give server thread a moment to initialize
+    p2pool_proc = None  # Define p2pool_proc in the main scope
 
     if p2pooldata.start_p2pool_direct():
         p2pool_proc = p2pooldata.p2pool_proc
