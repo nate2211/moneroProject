@@ -5,7 +5,7 @@ import os
 import threading
 import re
 from flask import Flask, request, jsonify, redirect, url_for, render_template
-
+from waitress import serve
 from p2pool_data import P2poolData
 from client_data import ClientData
 p2pooldata = P2poolData()
@@ -445,19 +445,9 @@ def receive_newjob():
 
 
 def start_flask():
-    # Use a more robust way to get local IP if 0.0.0.0 is not desired for display
-    # host_ip = "0.0.0.0" # Listen on all interfaces
-    # You might want to get the actual LAN IP for display purposes if multiple interfaces
-    # import socket
-    # s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # try:
-    #     s.connect(("8.8.8.8", 80)) # Doesn't actually send data
-    #     host_ip = s.getsockname()[0]
-    # except Exception:
-    #     pass
-    # finally:
-    #     s.close()
-    app.run(host="0.0.0.0", port=5000, debug=False)  # Set debug=False for production
+
+    print("[+] Starting Flask server with Waitress on port 5000...")
+    serve(app, host="0.0.0.0", port=5000)
 
 
 def clear_file_contents(filepath):
@@ -497,22 +487,42 @@ def clear_all_client_data():
 
 
 if __name__ == "__main__":
+    # --- Startup ---
     clear_all_client_data()
     clear_file_contents(p2pooldata.EVENT_LOG)
     clear_file_contents(p2pooldata.RAW_LOG)
-    # Start Flask server first, as it's the main interface
+
+    # --- Start Background Services ---
     threading.Thread(target=start_flask, daemon=True).start()
-    # Start the log writer thread. It will create EVENT_LOG if it doesn't exist.
     threading.Thread(target=p2pooldata.log_writer, daemon=True).start()
 
-    # Attempt to start P2Pool
+    # --- P2Pool Handling ---
+    time.sleep(1) # Give server thread a moment to initialize
+    p2pool_proc = None # Define p2pool_proc in the main scope
+
     if p2pooldata.start_p2pool_direct():
-        # Start the P2Pool log tailer only if P2Pool was successfully launched.
-        # It will wait for RAW_LOG to be created.
+        p2pool_proc = p2pooldata.p2pool_proc
         threading.Thread(target=p2pooldata.tail_p2pool_log, daemon=True).start()
-        p2pooldata.handle_user_input(p2pooldata.p2pool_proc)
+        threading.Thread(target=p2pooldata.handle_user_input, args=(p2pool_proc,), daemon=True).start()
+        print("[+] Server fully initialized.")
     else:
-        print("[!] Could not start P2Pool. Exiting.")
-        # If P2Pool doesn't start, gracefully exit after a brief pause
-        time.sleep(5)  # Give Flask a moment to be accessible if needed for error viewing
-        os._exit(1)  # Force exit if P2Pool didn't start
+        print("[!] CRITICAL: Could not start P2Pool.")
+
+    # --- Main Loop to Keep Server Running ---
+    try:
+        print("[+] Server is running. Press CTRL+C to shut down.")
+        # This loop keeps the main thread alive, allowing the background server to run.
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[!] Shutdown signal (Ctrl+C) received...")
+    finally:
+        # --- Shutdown Sequence ---
+        if p2pool_proc and p2pool_proc.poll() is None:
+            print("[!] Terminating P2Pool process...")
+            p2pool_proc.terminate()
+            try:
+                p2pool_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p2pool_proc.kill()
+        print("[+] Shutdown complete. ✅")
