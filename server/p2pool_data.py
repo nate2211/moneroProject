@@ -20,6 +20,7 @@ class P2poolData:
         self.log_queue = queue.Queue()
 
     def start_p2pool_direct(self):
+
         exe_path = os.path.join(self.P2POOL_DIR, self.P2POOL_EXE)
         if not os.path.exists(exe_path):
             print(f"[!] Executable not found at: {exe_path}")
@@ -58,53 +59,25 @@ class P2poolData:
             print(f"[!] Failed to launch P2Pool: {e}")
             return False
 
-    # Modify the `handle_user_input` function to clean up the raw log on exit
+    # In the P2poolData class
     def handle_user_input(self, proc):
         """
-        Waits for user input in the console and forwards it to the p2pool process.
+        Waits for user input in a dedicated thread and forwards it to the p2pool process.
         """
-        print("\n[+] P2Pool is running in the background.")
-        print("[+] Type commands here and press Enter to send them to P2Pool (e.g., 'status').")
-        print("[+] Type 'exit' or 'quit' to stop P2Pool and the script.")
-        while True:
+        while proc.poll() is None:  # Loop only while the process is running
             try:
                 user_input = input()
-                if user_input.lower() in ["exit", "quit"]:
-                    print("[!] Shutting down P2Pool...")
-                    proc.terminate()
-                    # Wait for the process to actually terminate
-                    proc.wait(timeout=5)
-                    # Clean up raw log file before exiting
-                    if os.path.exists(self.RAW_LOG):
-                        os.remove(self.RAW_LOG)
-                        print(f"[+] Removed raw log file: {self.RAW_LOG}")
-                    break
-
-                # Check if stdin pipe is still open before writing
-                if proc.poll() is None:  # None means process is still running
+                if proc.poll() is None:  # Check again before writing
                     proc.stdin.write(user_input + '\n')
                     proc.stdin.flush()
                 else:
-                    print("[!] P2Pool process has already terminated.")
-                    break
-            except (IOError, OSError) as e:
-                print(f"[!] Lost connection to P2Pool process: {e}")
+                    break  # Exit loop if process has stopped
+            except (IOError, OSError, ValueError):
                 break
             except Exception as e:
-                print(f"[!] An error occurred: {e}")
                 break
 
     def tail_p2pool_log(self,):
-        # Wait for the RAW_LOG file to exist, but with a timeout to prevent infinite loops
-        # if P2Pool never creates it.
-        timeout_start = time.time()
-        timeout_seconds = 60  # Wait up to 60 seconds for the log file
-        while not os.path.exists(self.RAW_LOG):
-            if time.time() - timeout_start > timeout_seconds:
-                print(f"[!] Timeout: RAW_LOG file '{self.RAW_LOG}' did not appear within {timeout_seconds} seconds.")
-                return  # Exit the thread if file doesn't appear
-            time.sleep(0.5)
-
         try:
             with open(self.RAW_LOG, "r", encoding="utf-8") as f:
                 f.seek(0, os.SEEK_END)  # Start reading from the end
@@ -149,10 +122,8 @@ class P2poolData:
                         self.log_event_now("P2Pool Stopped", clean_line)
                     else:  # Fallback for any other messages
                         self.log_event_now("Other P2Pool Event", clean_line)
-        except FileNotFoundError:
-            print(f"[!] Error: RAW_LOG file '{self.RAW_LOG}' not found during tailing. It might have been deleted.")
         except Exception as e:
-            print(f"[!] An error occurred while tailing P2Pool log: {e}")
+            pass
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
