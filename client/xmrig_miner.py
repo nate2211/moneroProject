@@ -13,6 +13,7 @@ class XmrigMiner:
     def __init__(self, XmrigData, Logger):
         self.xmrig_data = XmrigData
         self.logger = Logger
+
     async def monitor_output(self, process):
 
         async for line_bytes in process.stdout:
@@ -102,21 +103,6 @@ class XmrigMiner:
             except Exception as e:
                 self.logger.log_message(f"[!] Unexpected error during periodic hashrate report send: {e}")
 
-    async def command_loop(self):
-        self.logger.log_message("Type 'start' to launch miner, 'stop' to terminate it, 'exit' to quit.")
-        while True:
-            cmd = await asyncio.to_thread(input, "> ")
-            cmd = cmd.strip().lower()
-            self.logger.log_message(cmd)
-            if cmd == "start":
-                await self.start_miner()
-            elif cmd == "stop":
-                await self.stop_miner()
-            elif cmd == "exit":
-                await self.stop_miner()
-                break
-            else:
-                self.logger.log_message("Unknown command.")
     async def start_miner(self, pool_url="", thread_count=None):
 
         await self.kill_all_xmrig_processes()
@@ -174,7 +160,7 @@ class XmrigMiner:
             creationflags=subprocess.CREATE_NO_WINDOW
         )
 
-        asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
+        await asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
 
 
     async def stop_miner(self):
@@ -206,21 +192,21 @@ class XmrigMiner:
             self.xmrig_data.client_status = "Stopped"
             self.xmrig_data.xmrig_process = None
 
-    async def poll_server(self, session: aiohttp.ClientSession):
+    async def poll_server(self, session: aiohttp.ClientSession, force_update_signal):
 
         while True:
             try:
                 payload = {"status": self.xmrig_data.client_status}
                 # Use the shared session here
-                await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
-                                   timeout=aiohttp.ClientTimeout(total=10))
+                await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
+                                         json=payload,
+                                         timeout=aiohttp.ClientTimeout(total=10))
 
-                # Use the shared session here
+
                 async with session.get(f"{self.xmrig_data.FLASK_SERVER_URL}/get_command/{self.xmrig_data.client_id}",
                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
                     response.raise_for_status()
                     command = await response.json()
-
                 if command:
                     self.logger.log_message(f"\n[+] Received command from server: '{command.get('command')}'")
                     if command.get("command") == "start":
@@ -232,9 +218,11 @@ class XmrigMiner:
                         await self.stop_miner()
                     elif command.get("command") == "set_threads":
                         new_threads = int(command["threads"])
-                        self.logger.log_message(f"\n[+] Received command: Setting threads to {new_threads}.")
                         await self.update_config_threads_async(new_threads)
-
+                    elif command.get("command") == "update":
+                        update_url = command.get("url")
+                        if update_url:
+                            force_update_signal.emit(update_url)
             except aiohttp.ClientError as e:
                 self.logger.log_message(f"[!] Cannot connect to server at {self.xmrig_data.FLASK_SERVER_URL} or HTTP error: {e}. Retrying...")
             except Exception as e:
@@ -282,8 +270,11 @@ class XmrigMiner:
             if "randomx" in config:
                 config["randomx"]["algo"] = "rx"
 
-            # Detect NVIDIA GPU internally
-            has_nvidia_gpu = self.xmrig_data.check_nvidia_gpu_sync()
+
+            has_nvidia_gpu = False
+            if self.xmrig_data.hardware_monitor:
+                has_nvidia_gpu = self.xmrig_data.hardware_monitor.has_nvidia_gpu
+
             config.setdefault("cuda", {})
             config["cuda"]["enabled"] = has_nvidia_gpu  # Set CUDA enabled based on internal detection
 
@@ -351,3 +342,4 @@ class XmrigMiner:
 
         if not found_and_killed:
             self.logger.log_message("[+] No existing XMRig processes found to terminate.")
+

@@ -3,12 +3,6 @@ import sys
 import clr
 import json
 import os
-
-import asyncio
-import sys
-import clr
-import json
-import os
 import time
 from threading import Thread, Event
 
@@ -24,6 +18,7 @@ class HardwareMonitor(Thread):
     """
     A dedicated, self-healing thread to safely manage LibreHardwareMonitor.
     It can now recover from internal library crashes by re-initializing.
+    It also handles GPU detection to avoid resource conflicts.
     """
 
     def __init__(self, logger):
@@ -34,6 +29,7 @@ class HardwareMonitor(Thread):
         # Public attributes to hold the latest data
         self.cpu_temperature_formatted = "N/A"
         self.total_power_draw = "N/A"
+        self.has_nvidia_gpu = False  # Flag for GPU detection
 
         # Internal state
         self.computer = None
@@ -50,18 +46,24 @@ class HardwareMonitor(Thread):
             self.computer.IsGpuEnabled = True
             self.computer.Open()
 
-            # Clear previous sensor lists to prevent duplicates
+            # Clear previous state
             self._cpu_temp_sensors.clear()
             self._power_sensors.clear()
             self._unique_hardware.clear()
+            self.has_nvidia_gpu = False  # Reset flag on re-initialization
 
             # Find sensors and their parent hardware
             for hardware in self.computer.Hardware:
                 hardware.Update()
+
+                # Consolidated check for NVIDIA GPU
+                if "nvidia" in str(hardware.HardwareType).lower():
+                    self.has_nvidia_gpu = True
+
                 for sensor in hardware.Sensors:
                     if sensor.SensorType == SensorType.Temperature and "cpu" in str(hardware.HardwareType).lower():
                         self._cpu_temp_sensors.append(sensor)
-                    elif sensor.SensorType == SensorType.Power and sensor.Value is not None:
+                    elif sensor.SensorType == SensorType.Power:
                         self._power_sensors.append(sensor)
                 for subhardware in hardware.SubHardware:
                     subhardware.Update()
@@ -71,10 +73,12 @@ class HardwareMonitor(Thread):
 
             self._unique_hardware = {s.Hardware for s in self._cpu_temp_sensors + self._power_sensors}
             self.logger.log_message("[+] Hardware monitor initialized successfully.")
+            if self.has_nvidia_gpu:
+                self.logger.log_message("[+] NVIDIA GPU detected by hardware monitor.")
             return True
         except Exception as e:
             self.logger.log_message(f"[!] Critical error during hardware monitor initialization: {e}")
-            self._close()  # Ensure we clean up even if init fails
+            self._close()
             return False
 
     def _close(self):
@@ -91,11 +95,9 @@ class HardwareMonitor(Thread):
     def _perform_update(self):
         """Performs one update cycle. Returns False if a critical error occurs."""
         try:
-            # Update each unique hardware object ONCE to prevent race conditions
             for hardware in self._unique_hardware:
                 hardware.Update()
 
-            # Read sensor values now that hardware is updated
             cpu_temps = [s.Value for s in self._cpu_temp_sensors if s.Value is not None]
             if cpu_temps:
                 max_temp_c = max(cpu_temps)
@@ -106,37 +108,40 @@ class HardwareMonitor(Thread):
             if power_vals:
                 self.total_power_draw = f"{sum(power_vals):.2f} W"
 
-            return True  # Success
+            return True
         except Exception as e:
-            # A NullReferenceException from the DLL will be caught here
             self.logger.log_message(f"[!] Unrecoverable error in hardware monitor update: {e}")
             self.logger.log_message("[!] The hardware monitor will now attempt to restart.")
-            return False  # Failure
+            return False
 
     def run(self):
         """The main self-healing loop for the monitoring thread."""
+        # Initial initialization attempt
+        if not self._initialize():
+            # If it fails right away, wait before entering the main loop
+            self._stop_event.wait(30)
+
         while not self._stop_event.is_set():
             if self.computer is None:
-                # Attempt to initialize if not already running
                 if not self._initialize():
-                    # If initialization fails, wait 30 seconds before retrying
                     self._stop_event.wait(30)
                     continue
 
-            # Perform the update; if it fails, the loop will cycle and trigger re-initialization.
             if not self._perform_update():
                 self._close()
-                # Wait 15 seconds after a crash before trying to restart
                 self._stop_event.wait(15)
                 continue
 
-            # On success, wait the normal 2-second interval
             self._stop_event.wait(2)
 
-    def stop(self):
-        """Signals the thread to stop and cleans up resources."""
-        self._stop_event.set()
+        # Final cleanup once the stop event is set
         self._close()
+
+    def stop(self):
+        """Signals the thread to stop."""
+        self._stop_event.set()
+
+
 class XmrigData:
     def __init__(self, Logger):
         self.xmrig_process = None
@@ -155,39 +160,27 @@ class XmrigData:
         self._latest_nvidia_accepted_shares = 0
         self._latest_gpu_temp = "N/A"
         self._latest_gpu_fan = "N/A"
-        self._latest_cpu_temp = "N/A"
-        self._latest_power_draw_value = "N/A"
         self.XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
         self.CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
         self.logger = Logger
+
         self.hardware_monitor = HardwareMonitor(self.logger)
         self.hardware_monitor.start()
-    async def get_power_draw_async(self):
-        """Wrapper to run synchronous get_power_draw in a separate thread."""
-        return self.hardware_monitor.total_power_draw
 
+    async def get_power_draw_async(self):
+        """Async wrapper to get total power draw from the monitor thread."""
+        if self.hardware_monitor:
+            return self.hardware_monitor.total_power_draw
+        return "N/A"
 
     async def get_cpu_temperature_async(self):
-        """Wrapper to run synchronous get_cpu_temperature_lhm in a separate thread."""
-        return self.hardware_monitor.cpu_temperature_formatted
+        """Async wrapper to get CPU temperature from the monitor thread."""
+        if self.hardware_monitor:
+            return self.hardware_monitor.cpu_temperature_formatted
+        return "N/A"
 
-    def check_nvidia_gpu_sync(self):
-        """
-        Synchronous function to check for NVIDIA GPU using LibreHardwareMonitorLib.
-        """
-        try:
-            c = Computer()
-            c.IsCpuEnabled = False
-            c.IsGpuEnabled = True
-            c.Open()
-
-            found_nvidia = False
-            for hardware in c.Hardware:
-                if "nvidia" in str(hardware.HardwareType).lower():
-                    found_nvidia = True
-                    break
-            c.Close()
-            return found_nvidia
-        except Exception as e:
-            self.logger.log_message(f"[!] Error checking for NVIDIA GPU: {e}")
-            return False
+    async def has_nvidia_gpu_async(self):
+        """Async wrapper to check if an NVIDIA GPU was detected."""
+        if self.hardware_monitor:
+            return self.hardware_monitor.has_nvidia_gpu
+        return False
