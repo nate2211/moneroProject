@@ -1,21 +1,102 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import './App.css'; // Make sure to have styles for .container, table, .modal etc.
+import {
+  Container,
+  Typography,
+  Grid,
+  Card,
+  CardContent,
+  Button,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  CircularProgress,
+  TextField,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  ThemeProvider,
+  createTheme,
+  CssBaseline,
+  Box,
+  IconButton,
+  Tooltip
+} from '@mui/material';
+import {
+  RestartAlt,
+  Wifi,
+  PlayArrow,
+  Stop,
+  Update,
+  Settings,
+  Info,
+  BarChart,
+  Lan,
+  Memory,
+  Speed,
+  Power,
+  AttachMoney,
+  Thermostat,
+  Share,
+  Dns,
+  EventNote // Icon for Other Events
+} from '@mui/icons-material';
+import './App.css';
 
+// A dark theme for the dashboard
+const darkTheme = createTheme({
+  palette: {
+    mode: 'dark',
+    primary: {
+      main: '#bb86fc',
+    },
+    secondary: {
+      main: '#03dac6',
+    },
+    background: {
+      default: '#121212',
+      paper: '#1e1e1e', // This ensures Paper components have a dark background
+    },
+    text: {
+        primary: '#ffffff', // Ensures primary text is white
+        secondary: '#b3b3b3', // Softer white for secondary text
+    }
+  },
+  components: {
+    MuiCard: {
+      styleOverrides: {
+        root: {
+          backgroundImage: 'linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05))',
+        },
+      },
+    },
+  },
+});
+
+// Main App Component
 function App() {
   // State for all dynamic data
   const [p2poolStatus, setP2poolStatus] = useState(null);
   const [systemTotals, setSystemTotals] = useState({});
   const [clients, setClients] = useState({});
   const [events, setEvents] = useState({});
+  const [lastSeenData, setLastSeenData] = useState({});
 
   // State for UI interactions
   const [loading, setLoading] = useState({});
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isStartModalOpen, setIsStartModalOpen] = useState(false);
+  const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
+  const [confirmDialogContent, setConfirmDialogContent] = useState({ title: '', message: '', onConfirm: () => {} });
+
   const [modalClientId, setModalClientId] = useState('');
   const [wifi, setWifi] = useState({ ssid: 'ARRIS-7D41-5G', password: '' });
   const [startMinerForm, setStartMinerForm] = useState({ pool: '', threads: '' });
   const [threadInputs, setThreadInputs] = useState({});
-
 
   // === API Abstraction ===
   const apiCall = async (endpoint, options = {}) => {
@@ -28,9 +109,7 @@ function App() {
       }
       return await response.json();
     } catch (error) {
-      alert(`Error with ${endpoint}: ${error.message}`);
       console.error(`Error with ${endpoint}:`, error);
-      throw error; // re-throw to handle in specific functions if needed
     } finally {
       setLoading(prev => ({ ...prev, [endpoint]: false }));
     }
@@ -39,25 +118,37 @@ function App() {
   // === Data Fetching ===
   const fetchData = useCallback(async () => {
     try {
-      const [totalsData, clientsData, eventsData] = await Promise.all([
+      const [totalsData, clientsData, eventsData, lastSeenData] = await Promise.all([
         apiCall('/api/totals'),
         apiCall('/api/clients'),
         apiCall('/api/events'),
+        apiCall('/api/lastseen')
       ]);
-      setSystemTotals(totalsData);
-      setClients(clientsData);
-      setEvents(eventsData);
+      if (totalsData) setSystemTotals(totalsData);
+      if (clientsData) setClients(clientsData);
+      if (eventsData) setEvents(eventsData);
+      if (lastSeenData) setLastSeenData(lastSeenData);
     } catch (error) {
       console.error("Failed to fetch primary dashboard data:", error);
     }
   }, []);
 
   useEffect(() => {
-    fetchData(); // Fetch initial data
-    const intervalId = setInterval(fetchData, 5000); // Refresh every 5 seconds
-    return () => clearInterval(intervalId); // Cleanup on unmount
+    fetchData();
+    const intervalId = setInterval(fetchData, 5000);
+    return () => clearInterval(intervalId);
   }, [fetchData]);
 
+  // === Confirmation Dialog Logic ===
+  const openConfirmDialog = (title, message, onConfirm) => {
+    setConfirmDialogContent({ title, message, onConfirm });
+    setConfirmDialogOpen(true);
+  };
+
+  const handleConfirm = () => {
+    confirmDialogContent.onConfirm();
+    setConfirmDialogOpen(false);
+  };
 
   // === Event Handlers ===
   const handleFetchStatus = async () => {
@@ -65,47 +156,45 @@ function App() {
     if (statusData) setP2poolStatus(statusData);
   };
 
-  const handleRestartP2Pool = async () => {
-    if (window.confirm("Are you sure you want to restart P2Pool?")) {
-      await apiCall('/restart_p2pool', { method: 'POST' });
-      setTimeout(handleFetchStatus, 3000); // Re-fetch status after a delay
-    }
+  const handleRestartP2Pool = () => {
+    openConfirmDialog("Restart P2Pool?", "Are you sure you want to restart the P2Pool server process?", async () => {
+        await apiCall('/restart_p2pool', { method: 'POST' });
+        setTimeout(handleFetchStatus, 3000);
+    });
   };
 
   const handleConnectToWifi = async (e) => {
     e.preventDefault();
-    if (!wifi.ssid || !wifi.password) return alert("SSID and Password are required.");
-    if (window.confirm(`Attempt to connect to Wi-Fi network "${wifi.ssid}"?`)) {
+    if (!wifi.ssid || !wifi.password) return;
+    openConfirmDialog("Connect to Wi-Fi?", `Attempt to connect to network "${wifi.ssid}"?`, async () => {
         await apiCall('/connect_wifi', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(wifi),
-      });
-    }
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(wifi),
+        });
+    });
   };
 
-  const handleStopMiner = async (clientId) => {
-    if (window.confirm(`Are you sure you want to stop miner: ${clientId}?`)) {
-      await apiCall(`/stop_miner/${clientId}`, { method: 'POST' });
-      fetchData(); // Refresh data
-    }
+  const handleStopMiner = (clientId) => {
+    openConfirmDialog("Stop Miner?", `Are you sure you want to stop miner: ${clientId}?`, async () => {
+        await apiCall(`/stop_miner/${clientId}`, { method: 'POST' });
+        fetchData();
+    });
   };
 
-  const handleUpdateClient = async (clientId) => {
-    if (window.confirm(`Are you sure you want to update client: ${clientId}?`)) {
+  const handleUpdateClient = (clientId) => {
+    openConfirmDialog("Update Client?", `Are you sure you want to update client: ${clientId}?`, async () => {
         await apiCall(`/update_client/${clientId}`, { method: 'POST' });
-        fetchData(); // Refresh data
-    }
+        fetchData();
+    });
   };
 
   const handleSetThreads = async (e, clientId) => {
     e.preventDefault();
     const threads = threadInputs[clientId];
-    if (!threads || threads < 1) return alert("Please enter a valid thread count.");
-
+    if (!threads || threads < 1) return;
     const formData = new FormData();
     formData.append('threads', threads);
-
     await apiCall(`/set_threads/${clientId}`, { method: 'POST', body: formData });
     fetchData();
   };
@@ -115,197 +204,247 @@ function App() {
     const formData = new FormData();
     formData.append('pool', startMinerForm.pool);
     formData.append('threads', startMinerForm.threads);
-
     await apiCall(`/start_miner/${modalClientId}`, { method: 'POST', body: formData });
-    setIsModalOpen(false);
+    setIsStartModalOpen(false);
     fetchData();
   };
 
-  // === UI Helpers ===
   const openStartModal = (clientId) => {
     setModalClientId(clientId);
     setStartMinerForm({ pool: '', threads: '' });
-    setIsModalOpen(true);
+    setIsStartModalOpen(true);
   };
 
+  // === UI Helper Components ===
   const renderStatus = (data) => {
-    if (!data) return null;
-    if (data.error || data.message) return <p>{data.error || data.message}</p>;
+    if (!data) return <Typography variant="body2" color="text.secondary">Click 'Get Status' to load P2Pool details.</Typography>;
+    if (data.error || data.message) return <Typography color="error">{data.error || data.message}</Typography>;
 
     const titles = { sidechain: "SideChain Status", stratum: "Stratum Server Status", p2p: "P2P Server Status" };
-    return Object.entries(data).map(([sectionKey, sectionData]) => (
-      Object.keys(sectionData).length > 0 && (
-        <div key={sectionKey} className="status-section">
-          <h3>{titles[sectionKey] || sectionKey}</h3>
-          <div className="status-grid">
-            {Object.entries(sectionData).map(([key, value]) => (
-              <React.Fragment key={key}>
-                <span className="key">{key}</span>
-                <span className="value">{value}</span>
-              </React.Fragment>
+    return (
+        <Grid container spacing={2}>
+            {Object.entries(data).map(([sectionKey, sectionData]) => (
+                Object.keys(sectionData).length > 0 && (
+                    <Grid item xs={12} md={4} key={sectionKey}>
+                        <Typography variant="h6" gutterBottom>{titles[sectionKey] || sectionKey}</Typography>
+                        <Paper elevation={3} sx={{ p: 1.5 }}>
+                            {Object.entries(sectionData).map(([key, value]) => (
+                                <Box key={key} sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.1)', py: 0.5 }}>
+                                    <Typography variant="body2" color="text.secondary">{key}</Typography>
+                                    <Typography variant="body2" sx={{ fontWeight: 'bold' }}>{value}</Typography>
+                                </Box>
+                            ))}
+                        </Paper>
+                    </Grid>
+                )
             ))}
-          </div>
-        </div>
-      )
-    ));
+        </Grid>
+    );
   };
 
   const EventTable = ({ title, events = [] }) => (
-    <>
-      <h2>{title}</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            {events[0] && events[0].type && <th>Type</th>}
-            <th>Message</th>
-          </tr>
-        </thead>
-        <tbody>
-          {events.length > 0 ? (
-            events.map((event, index) => (
-              <tr key={index}>
-                <td>{event.time}</td>
-                {event.type && <td>{event.type}</td>}
-                <td><pre>{event.message}</pre></td>
-              </tr>
-            ))
-          ) : (
-            <tr><td colSpan="3">No events to show.</td></tr>
-          )}
-        </tbody>
-      </table>
-    </>
+    <Card sx={{ mb: 3 }}>
+        <CardContent>
+            <Typography variant="h5" component="div" gutterBottom>{title}</Typography>
+            <TableContainer component={Paper}>
+                <Table size="small">
+                    <TableHead>
+                        <TableRow>
+                            <TableCell>Time</TableCell>
+                            {events[0] && events[0].type && <TableCell>Type</TableCell>}
+                            <TableCell>Message</TableCell>
+                        </TableRow>
+                    </TableHead>
+                    <TableBody>
+                        {events.length > 0 ? (
+                            events.map((event, index) => (
+                                <TableRow key={index}>
+                                    <TableCell>{event.time}</TableCell>
+                                    {event.type && <TableCell>{event.type}</TableCell>}
+                                    <TableCell><pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>{event.message}</pre></TableCell>
+                                </TableRow>
+                            ))
+                        ) : (
+                            <TableRow><TableCell colSpan={3} align="center">No events to show.</TableCell></TableRow>
+                        )}
+                    </TableBody>
+                </Table>
+            </TableContainer>
+        </CardContent>
+    </Card>
+  );
+
+  const StatCard = ({ icon, title, value, unit }) => (
+      <Grid item xs={6} sm={4} md={2}>
+          <Card>
+              <CardContent sx={{ textAlign: 'center' }}>
+                  <Box sx={{ color: 'primary.main', mb: 1 }}>{icon}</Box>
+                  <Typography variant="h6">{value ?? 'N/A'}</Typography>
+                  <Typography variant="caption" color="text.secondary">{title} {unit}</Typography>
+              </CardContent>
+          </Card>
+      </Grid>
   );
 
   return (
-    <div className="container">
-      <h2>P2Pool Status</h2>
-      <button onClick={handleFetchStatus} disabled={loading['/status']}>
-        {loading['/status'] ? 'Fetching...' : 'Get Status'}
-      </button>
-      <div id="status-container">{renderStatus(p2poolStatus)}</div>
+    <ThemeProvider theme={darkTheme}>
+        <CssBaseline />
+        <Container maxWidth="xl" sx={{ py: 3 }}>
+            <Typography variant="h3" gutterBottom component="h1" sx={{ fontWeight: 'bold', textAlign: 'center', mb: 4 }}>
+                Miner Dashboard
+            </Typography>
 
-      <h2>System Totals</h2>
-      <table>
-        <tbody>
-            <tr><th>Total Hashrate</th><td>{systemTotals.total_hashrate?.toFixed(2) || 'N/A'} H/s</td></tr>
-            <tr><th>Total CPU Shares</th><td>{systemTotals.total_cpu_shares || 'N/A'}</td></tr>
-            <tr><th>Total GPU Shares</th><td>{systemTotals.total_gpu_shares || 'N/A'}</td></tr>
-            <tr><th>Total Power Draw</th><td>{systemTotals.total_power_draw || 'N/A'} W</td></tr>
-            <tr><th>Total Cost</th><td>${systemTotals.total_cost?.toFixed(4) || 'N/A'}</td></tr>
-            <tr><th>Average CPU Temp</th><td>{systemTotals.total_temp || 'N/A'}°C</td></tr>
-        </tbody>
-      </table>
+            {/* --- P2Pool Status (Moved to top) --- */}
+            <Card sx={{ mb: 3 }}>
+                <CardContent>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                        <Typography variant="h5" component="div">P2Pool Status</Typography>
+                        <Button onClick={handleFetchStatus} startIcon={loading['/status'] ? <CircularProgress size={20} /> : <Info />}>
+                            Get Status
+                        </Button>
+                    </Box>
+                    {renderStatus(p2poolStatus)}
+                </CardContent>
+            </Card>
 
-      <h2>Client Dashboard</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Client ID</th><th>Hashrate</th><th>CPU Temp</th><th>Threads</th>
-            <th>Power Draw</th><th>Cost</th><th>Last Seen</th><th>Shares (CPU/GPU)</th>
-            <th>GPU Stats</th><th>Job Difficulty</th><th>Job Height</th><th>Algo</th>
-            <th>TXs</th><th>Pool IP</th><th>Set Threads</th><th>Control Pool</th><th>Update</th>
-          </tr>
-        </thead>
-        <tbody>
-          {clients.hashrates && Object.keys(clients.hashrates).length > 0 ? (
-            Object.keys(clients.hashrates).map(cid => (
-              <tr key={cid}>
-                <td><span className={clients.status?.[cid] === 'Started' ? 'status-online' : 'status-offline'}>●</span> {cid}</td>
-                <td><strong>{clients.hashrates?.[cid]?.toFixed(2) || 'N/A'} H/s</strong></td>
-                <td>{clients.temps?.[cid] || 'N/A'}</td>
-                <td>{clients.threads?.[cid] || 'N/A'}</td>
-                <td>{clients.power_draws?.[cid] || 'N/A'} W</td>
-                <td>${clients.costs?.[cid]?.toFixed(4) || '0.00'}</td>
-                <td>{clients.last_seen?.[cid] || 'N/A'}</td>
-                <td>{clients.cpu_shares?.[cid] || 0} / {clients.nvidia_shares?.[cid] || 0}</td>
-                <td>{clients.gpu_stats?.[cid]?.temp || 'N/A'} | {clients.gpu_stats?.[cid]?.fan || 'N/A'}</td>
-                <td>{clients.newjobs?.[cid]?.difficulty || '—'}</td>
-                <td>{clients.newjobs?.[cid]?.height || '—'}</td>
-                <td>{clients.newjobs?.[cid]?.algo || '—'}</td>
-                <td>{clients.newjobs?.[cid]?.tx_count || '—'}</td>
-                <td>{clients.newjobs?.[cid]?.ip || '—'}</td>
-                <td>
-                  <form onSubmit={(e) => handleSetThreads(e, cid)} className="form-inline">
-                    <input type="number" min="1" placeholder={clients.threads?.[cid] || '1'} required
-                           onChange={e => setThreadInputs({...threadInputs, [cid]: e.target.value})} />
-                    <button type="submit">Set</button>
-                  </form>
-                </td>
-                <td>
-                  {clients.status?.[cid] === 'Started' ?
-                    <button className="action-button stop" onClick={() => handleStopMiner(cid)}>Stop</button> :
-                    <button className="action-button start" onClick={() => openStartModal(cid)}>Start</button>
-                  }
-                </td>
-                <td><button className="action-button update" onClick={() => handleUpdateClient(cid)}>Update</button></td>
-              </tr>
-            ))
-          ) : (
-            <tr><td colSpan="17">No clients have connected yet.</td></tr>
-          )}
-        </tbody>
-      </table>
+            {/* --- System Totals (Centered) --- */}
+            <Card sx={{ mb: 3 }}>
+                <CardContent>
+                    <Typography variant="h5" component="div" gutterBottom>System Totals</Typography>
+                    <Grid container spacing={2} justifyContent="center">
+                        <StatCard icon={<Speed />} title="Total Hashrate" value={systemTotals.total_hashrate?.toFixed(2)} unit="H/s" />
+                        <StatCard icon={<Share />} title="CPU Shares" value={systemTotals.total_cpu_shares} />
+                        <StatCard icon={<Share />} title="GPU Shares" value={systemTotals.total_gpu_shares} />
+                        <StatCard icon={<Power />} title="Total Power" value={systemTotals.total_power_draw} unit="W" />
+                        <StatCard icon={<AttachMoney />} title="Total Cost" value={`$${systemTotals.total_cost?.toFixed(4) ?? 'N/A'}`} />
+                        <StatCard icon={<Thermostat />} title="Avg CPU Temp" value={systemTotals.total_temp} unit="°C" />
+                    </Grid>
+                </CardContent>
+            </Card>
 
-      <EventTable title="Shares Found" events={events.shares_found} />
-      <EventTable title="Blocks Found" events={events.blocks_found} />
+            {/* --- Client Dashboard (Readable Table) --- */}
+            <Card sx={{ mb: 3 }}>
+                <CardContent>
+                    <Typography variant="h5" component="div" gutterBottom>Client Dashboard</Typography>
+                    <TableContainer component={Paper}>
+                        <Table>
+                            <TableHead>
+                                <TableRow >
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Client</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Hashrate</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Temp</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Threads</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Power</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Cost</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Last Seen</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Shares</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>GPU</TableCell>
+                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Job</TableCell>
+                                    <TableCell align="center"  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Actions</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {clients.hashrates && Object.keys(clients.hashrates).length > 0 ? (
+                                    Object.keys(clients.hashrates).map(cid => (
+                                        <TableRow key={cid} hover>
+                                            <TableCell>
+                                                <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                                                    <Box component="span" sx={{ width: 10, height: 10, borderRadius: '50%', mr: 1, bgcolor: clients.status?.[cid] === 'Started' ? 'success.main' : 'error.main' }} />
+                                                    {cid}
+                                                </Box>
+                                            </TableCell>
+                                            <TableCell><strong>{clients.hashrates?.[cid]?.toFixed(2) || 'N/A'} H/s</strong></TableCell>
+                                            <TableCell>{clients.temps?.[cid] || 'N/A'}</TableCell>
+                                            <TableCell>{clients.threads?.[cid] || 'N/A'}</TableCell>
+                                            <TableCell>{clients.power_draws?.[cid] || 'N/A'} W</TableCell>
+                                            <TableCell>${clients.costs?.[cid]?.toFixed(4) || '0.0000'}</TableCell>
+                                            <TableCell>{lastSeenData.client_last_seen_formatted?.[cid] || 'N/A'}</TableCell>
+                                            <TableCell>{clients.cpu_shares?.[cid] || 0} / {clients.nvidia_shares?.[cid] || 0}</TableCell>
+                                            <TableCell>{clients.gpu_stats?.[cid]?.temp || 'N/A'} | {clients.gpu_stats?.[cid]?.fan || 'N/A'}</TableCell>
+                                            <TableCell>
+                                                <Tooltip title={`Height: ${clients.newjobs?.[cid]?.height || 'N/A'} | Algo: ${clients.newjobs?.[cid]?.algo || 'N/A'}`}>
+                                                    <Typography variant="body2">{clients.newjobs?.[cid]?.difficulty || '—'}</Typography>
+                                                </Tooltip>
+                                            </TableCell>
+                                            <TableCell>
+                                                <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+                                                    <form onSubmit={(e) => handleSetThreads(e, cid)} style={{ display: 'flex', alignItems: 'center' }}>
+                                                        <TextField size="small" type="number" variant="outlined" sx={{ width: '70px', mr: 1 }} placeholder={String(clients.threads?.[cid] || '1')} onChange={e => setThreadInputs({...threadInputs, [cid]: e.target.value})} />
+                                                        <Button type="submit" size="small" variant="contained">Set</Button>
+                                                    </form>
+                                                    {clients.status?.[cid] === 'Started' ?
+                                                        <Button variant="contained" color="error" size="small" onClick={() => handleStopMiner(cid)} startIcon={<Stop />}>Stop</Button> :
+                                                        <Button variant="contained" color="success" size="small" onClick={() => openStartModal(cid)} startIcon={<PlayArrow />}>Start</Button>
+                                                    }
+                                                    <Button variant="outlined" color="secondary" size="small" onClick={() => handleUpdateClient(cid)} startIcon={<Update />}>Update</Button>
+                                                </Box>
+                                            </TableCell>
+                                        </TableRow>
+                                    ))
+                                ) : (
+                                    <TableRow><TableCell colSpan={11} align="center">No clients have connected yet.</TableCell></TableRow>
+                                )}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+                </CardContent>
+            </Card>
 
-      <h2>System Control</h2>
-      <table>
-        <tbody>
-            <tr>
-              <th>Restart P2Pool</th>
-              <td>
-                <button onClick={handleRestartP2Pool} disabled={loading['/restart_p2pool']}>
-                  {loading['/restart_p2pool'] ? 'Restarting...' : 'Restart'}
-                </button>
-              </td>
-            </tr>
-            <tr>
-              <th>Connect to Wi-Fi</th>
-              <td>
-                <form onSubmit={handleConnectToWifi} className="form-inline">
-                  <input type="text" placeholder="Network SSID" value={wifi.ssid} onChange={e => setWifi({...wifi, ssid: e.target.value})} />
-                  <input type="password" placeholder="Password" value={wifi.password} onChange={e => setWifi({...wifi, password: e.target.value})} />
-                  <button type="submit" disabled={loading['/connect_wifi']}>{loading['/connect_wifi'] ? 'Connecting...' : 'Connect'}</button>
+            {/* --- System Control --- */}
+            <Card sx={{ mb: 3 }}>
+                <CardContent>
+                    <Typography variant="h5" component="div" gutterBottom>System Control</Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                        <Button variant="contained" onClick={handleRestartP2Pool} startIcon={<RestartAlt />} disabled={loading['/restart_p2pool']}>
+                            {loading['/restart_p2pool'] ? 'Restarting...' : 'Restart P2Pool'}
+                        </Button>
+                        <form onSubmit={handleConnectToWifi} style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                            <TextField label="Network SSID" variant="outlined" size="small" value={wifi.ssid} onChange={e => setWifi({...wifi, ssid: e.target.value})} />
+                            <TextField label="Password" type="password" variant="outlined" size="small" value={wifi.password} onChange={e => setWifi({...wifi, password: e.target.value})} />
+                            <Button type="submit" variant="contained" startIcon={<Wifi />} disabled={loading['/connect_wifi']}>{loading['/connect_wifi'] ? 'Connecting...' : 'Connect'}</Button>
+                        </form>
+                    </Box>
+                </CardContent>
+            </Card>
+
+            {/* --- Event Tables (Added Other Events) --- */}
+            <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', mt: 4 }}>Event Logs</Typography>
+            <Grid container spacing={3}>
+                <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found} /></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="Blocks Found" events={events.blocks_found} /></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="New Miner Data" events={events.miner_data} /></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="Jobs Sent" events={events.jobs_sent} /></Grid>
+                <Grid item xs={12}><EventTable title="Other Events" events={events.other_events} /></Grid>
+            </Grid>
+
+            {/* --- Dialogs --- */}
+            <Dialog open={isStartModalOpen} onClose={() => setIsStartModalOpen(false)}>
+                <DialogTitle>Start Miner: {modalClientId}</DialogTitle>
+                <form onSubmit={handleStartMiner}>
+                    <DialogContent>
+                        <TextField autoFocus margin="dense" label="Pool URL" type="text" fullWidth variant="standard" required value={startMinerForm.pool} onChange={e => setStartMinerForm({...startMinerForm, pool: e.target.value})} />
+                        <TextField margin="dense" label="Threads" type="number" fullWidth variant="standard" required value={startMinerForm.threads} onChange={e => setStartMinerForm({...startMinerForm, threads: e.target.value})} />
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setIsStartModalOpen(false)}>Cancel</Button>
+                        <Button type="submit">Send Start Command</Button>
+                    </DialogActions>
                 </form>
-              </td>
-            </tr>
-        </tbody>
-      </table>
+            </Dialog>
 
-      <EventTable title="New Miner Data" events={events.miner_data} />
-      <EventTable title="Jobs Sent" events={events.jobs_sent} />
+            <Dialog open={confirmDialogOpen} onClose={() => setConfirmDialogOpen(false)}>
+                <DialogTitle>{confirmDialogContent.title}</DialogTitle>
+                <DialogContent>
+                    <DialogContentText>{confirmDialogContent.message}</DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setConfirmDialogOpen(false)}>Cancel</Button>
+                    <Button onClick={handleConfirm} autoFocus>Confirm</Button>
+                </DialogActions>
+            </Dialog>
 
-      {isModalOpen && (
-        <div className="modal">
-          <div className="modal-content">
-            <div className="modal-header">
-              <span className="close-button" onClick={() => setIsModalOpen(false)}>&times;</span>
-              <h3>Start Miner: {modalClientId}</h3>
-            </div>
-            <form onSubmit={handleStartMiner}>
-              <div className="modal-body">
-                <div className="form-group">
-                  <label htmlFor="pool_url">Pool URL</label>
-                  <input type="text" id="pool_url" name="pool" placeholder="e.g., 192.168.0.10:3333" required
-                         value={startMinerForm.pool} onChange={e => setStartMinerForm({...startMinerForm, pool: e.target.value})} />
-                </div>
-                <div className="form-group">
-                  <label htmlFor="threads">Threads</label>
-                  <input type="number" id="threads" name="threads" min="1" placeholder="e.g., 4" required
-                         value={startMinerForm.threads} onChange={e => setStartMinerForm({...startMinerForm, threads: e.target.value})} />
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button type="submit" className="action-button">Send Start Command</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-    </div>
+        </Container>
+    </ThemeProvider>
   );
 }
 

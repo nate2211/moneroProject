@@ -15,7 +15,6 @@ class XmrigMiner:
         self.logger = Logger
 
     async def monitor_output(self, process):
-
         async for line_bytes in process.stdout:
             decoded = line_bytes.decode("utf-8", errors="ignore").strip()
 
@@ -76,32 +75,45 @@ class XmrigMiner:
     async def periodic_reporter(self, session: aiohttp.ClientSession, ui_signal):
 
         while True:
-            await asyncio.sleep(REPORT_INTERVAL_SECONDS)
+                await asyncio.sleep(REPORT_INTERVAL_SECONDS)
 
-            current_cpu_temp = await self.xmrig_data.get_cpu_temperature_async()
-            current_power_draw = await self.xmrig_data.get_power_draw_async()
-            current_threads = await self.get_current_threads_from_config_async()
+                current_cpu_temp = await self.xmrig_data.get_cpu_temperature_async()
+                current_power_draw = await self.xmrig_data.get_power_draw_async()
+                current_threads = await self.get_current_threads_from_config_async()
+                payload = {}
+                if self.xmrig_data.client_status == "Started":
+                    payload = {
+                        "client_id": self.xmrig_data.client_id,
+                        "hashrate": self.xmrig_data._latest_hashrate,
+                        "threads": current_threads,
+                        "cpu_temp": current_cpu_temp,
+                        "gpu_temp": self.xmrig_data._latest_gpu_temp,
+                        "gpu_fan": self.xmrig_data._latest_gpu_fan,
+                        "cpu_accepted_shares": self.xmrig_data._latest_cpu_accepted_shares,
+                        "nvidia_accepted_shares": self.xmrig_data._latest_nvidia_accepted_shares,
+                        "power_draw": current_power_draw
+                    }
+                else:
+                    payload = {
+                        "client_id": self.xmrig_data.client_id,
+                        "hashrate": 0,
+                        "threads": current_threads,
+                        "cpu_temp": current_cpu_temp,
+                        "gpu_temp": self.xmrig_data._latest_gpu_temp,
+                        "gpu_fan": self.xmrig_data._latest_gpu_fan,
+                        "cpu_accepted_shares": 0,
+                        "nvidia_accepted_shares": 0,
+                        "power_draw": current_power_draw
+                    }
+                ui_signal.emit(payload)
+                try:
 
-            payload = {
-                "client_id": self.xmrig_data.client_id,
-                "hashrate": self.xmrig_data._latest_hashrate,
-                "threads": current_threads,
-                "cpu_temp": current_cpu_temp,
-                "gpu_temp": self.xmrig_data._latest_gpu_temp,
-                "gpu_fan": self.xmrig_data._latest_gpu_fan,
-                "cpu_accepted_shares": self.xmrig_data._latest_cpu_accepted_shares,
-                "nvidia_accepted_shares": self.xmrig_data._latest_nvidia_accepted_shares,
-                "power_draw": current_power_draw
-            }
-            ui_signal.emit(payload)
-            try:
-
-                await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate", json=payload,
-                                   timeout=aiohttp.ClientTimeout(total=10))
-            except aiohttp.ClientError as e:
-                self.logger.log_message(f"[!] Error sending periodic hashrate report: {e}")
-            except Exception as e:
-                self.logger.log_message(f"[!] Unexpected error during periodic hashrate report send: {e}")
+                    await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate", json=payload,
+                                       timeout=aiohttp.ClientTimeout(total=10))
+                except aiohttp.ClientError as e:
+                    self.logger.log_message(f"[!] Error sending periodic hashrate report: {e}")
+                except Exception as e:
+                    self.logger.log_message(f"[!] Unexpected error during periodic hashrate report send: {e}")
 
     async def start_miner(self, pool_url="", thread_count=None):
 
@@ -166,36 +178,26 @@ class XmrigMiner:
     async def stop_miner(self):
 
         await self.kill_all_xmrig_processes()
-        if self.xmrig_data.xmrig_process and self.xmrig_data.xmrig_process.returncode is None:
-            self.logger.log_message("[+] Stopping miner...")
-            self.xmrig_data.xmrig_process.terminate()
-            self.xmrig_data.client_status = "Stopped"
-            payload = {"status": self.xmrig_data.client_status}
-            try:
-                # Use the shared session here
-                await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
-                                                  timeout=aiohttp.ClientTimeout(total=10))
-            except aiohttp.ClientError as e:
-                self.logger.log_message(f"[!] Error reporting miner status: {e}")
+        self.logger.log_message("[+] Stopped Miner now reporting")
+        self.xmrig_data.client_status = "Stopped"
+        payload = {"status": self.xmrig_data.client_status}
+        try:
+            # Use the shared session here
+            await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
+                                              timeout=aiohttp.ClientTimeout(total=10))
+        except aiohttp.ClientError as e:
+            self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
-            try:
-                await asyncio.wait_for(self.xmrig_data.xmrig_process.wait(), timeout=5)
-                self.logger.log_message("[+] Miner stopped.")
-            except asyncio.TimeoutError:
-                self.logger.log_message("[!] Miner did not stop in time, killing process.")
-                self.xmrig_data.xmrig_process.kill()
-                self.logger.log_message("[+] Miner process killed.")
-            finally:
-                self.xmrig_data.xmrig_process = None
-        else:
-            self.logger.log_message("[!] Miner is not running.")
-            self.xmrig_data.client_status = "Stopped"
             self.xmrig_data.xmrig_process = None
 
     async def poll_server(self, session: aiohttp.ClientSession, force_update_signal):
 
         while True:
             try:
+                if self.xmrig_data.xmrig_process is not None and self.xmrig_data.xmrig_process.returncode is None:
+                    self.xmrig_data.client_status = "Started"
+                else:
+                    self.xmrig_data.client_status = "Stopped"
                 payload = {"status": self.xmrig_data.client_status}
                 # Use the shared session here
                 await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
@@ -342,4 +344,3 @@ class XmrigMiner:
 
         if not found_and_killed:
             self.logger.log_message("[+] No existing XMRig processes found to terminate.")
-
