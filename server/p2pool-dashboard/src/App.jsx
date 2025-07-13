@@ -94,7 +94,7 @@ function App() {
   const [confirmDialogContent, setConfirmDialogContent] = useState({ title: '', message: '', onConfirm: () => {} });
 
   const [modalClientId, setModalClientId] = useState('');
-  const [wifi, setWifi] = useState({ ssid: 'ARRIS-7D41-5G', password: '' });
+  const [wifi, setWifi] = useState({ ssid: 'ARRIS-7D41-5G', password: '535102108332' });
   const [startMinerForm, setStartMinerForm] = useState({ pool: '', threads: '' });
   const [threadInputs, setThreadInputs] = useState({});
 
@@ -249,7 +249,7 @@ function App() {
             <TableContainer component={Paper}>
                 <Table size="small">
                     <TableHead>
-                        <TableRow>
+                        <TableRow sx={{ backgroundColor: 'rgba(255, 255, 255, 0.08)' }}>
                             <TableCell>Time</TableCell>
                             {events[0] && events[0].type && <TableCell>Type</TableCell>}
                             <TableCell>Message</TableCell>
@@ -258,10 +258,10 @@ function App() {
                     <TableBody>
                         {events.length > 0 ? (
                             events.map((event, index) => (
-                                <TableRow key={index}>
+                                <TableRow key={index} hover>
                                     <TableCell>{event.time}</TableCell>
                                     {event.type && <TableCell>{event.type}</TableCell>}
-                                    <TableCell><pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>{event.message}</pre></TableCell>
+                                    <TableCell><pre>{event.message}</pre></TableCell>
                                 </TableRow>
                             ))
                         ) : (
@@ -294,7 +294,6 @@ function App() {
                 Miner Dashboard
             </Typography>
 
-            {/* --- P2Pool Status (Moved to top) --- */}
             <Card sx={{ mb: 3 }}>
                 <CardContent>
                     <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
@@ -307,7 +306,6 @@ function App() {
                 </CardContent>
             </Card>
 
-            {/* --- System Totals (Centered) --- */}
             <Card sx={{ mb: 3 }}>
                 <CardContent>
                     <Typography variant="h5" component="div" gutterBottom>System Totals</Typography>
@@ -322,25 +320,27 @@ function App() {
                 </CardContent>
             </Card>
 
-            {/* --- Client Dashboard (Readable Table) --- */}
             <Card sx={{ mb: 3 }}>
                 <CardContent>
                     <Typography variant="h5" component="div" gutterBottom>Client Dashboard</Typography>
                     <TableContainer component={Paper}>
                         <Table>
                             <TableHead>
-                                <TableRow >
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Client</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Hashrate</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Temp</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Threads</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Power</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Cost</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Last Seen</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Shares</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>GPU</TableCell>
-                                    <TableCell  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Job</TableCell>
-                                    <TableCell align="center"  sx={{ backgroundColor: 'rgb(16,15,15)' }}>Actions</TableCell>
+                                <TableRow>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Client</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Hashrate</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Temp</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Threads</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Power</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Cost</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Last Seen</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Shares</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>GPU</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Difficulty</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Height</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Algo</TableCell>
+                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Pool IP</TableCell>
+                                    <TableCell align="center"sx={{ backgroundColor: 'rgb(73,71,71)' }}>Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
@@ -361,11 +361,10 @@ function App() {
                                             <TableCell>{lastSeenData.client_last_seen_formatted?.[cid] || 'N/A'}</TableCell>
                                             <TableCell>{clients.cpu_shares?.[cid] || 0} / {clients.nvidia_shares?.[cid] || 0}</TableCell>
                                             <TableCell>{clients.gpu_stats?.[cid]?.temp || 'N/A'} | {clients.gpu_stats?.[cid]?.fan || 'N/A'}</TableCell>
-                                            <TableCell>
-                                                <Tooltip title={`Height: ${clients.newjobs?.[cid]?.height || 'N/A'} | Algo: ${clients.newjobs?.[cid]?.algo || 'N/A'}`}>
-                                                    <Typography variant="body2">{clients.newjobs?.[cid]?.difficulty || '—'}</Typography>
-                                                </Tooltip>
-                                            </TableCell>
+                                            <TableCell>{clients.newjobs?.[cid]?.difficulty || '—'}</TableCell>
+                                            <TableCell>{clients.newjobs?.[cid]?.height || '—'}</TableCell>
+                                            <TableCell>{clients.newjobs?.[cid]?.algo || '—'}</TableCell>
+                                            <TableCell>{clients.newjobs?.[cid]?.ip || '—'}</TableCell>
                                             <TableCell>
                                                 <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
                                                     <form onSubmit={(e) => handleSetThreads(e, cid)} style={{ display: 'flex', alignItems: 'center' }}>
@@ -382,7 +381,7 @@ function App() {
                                         </TableRow>
                                     ))
                                 ) : (
-                                    <TableRow><TableCell colSpan={11} align="center">No clients have connected yet.</TableCell></TableRow>
+                                    <TableRow><TableCell colSpan={14} align="center">No clients have connected yet.</TableCell></TableRow>
                                 )}
                             </TableBody>
                         </Table>
@@ -390,7 +389,6 @@ function App() {
                 </CardContent>
             </Card>
 
-            {/* --- System Control --- */}
             <Card sx={{ mb: 3 }}>
                 <CardContent>
                     <Typography variant="h5" component="div" gutterBottom>System Control</Typography>
@@ -407,7 +405,6 @@ function App() {
                 </CardContent>
             </Card>
 
-            {/* --- Event Tables (Added Other Events) --- */}
             <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', mt: 4 }}>Event Logs</Typography>
             <Grid container spacing={3}>
                 <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found} /></Grid>
@@ -417,7 +414,6 @@ function App() {
                 <Grid item xs={12}><EventTable title="Other Events" events={events.other_events} /></Grid>
             </Grid>
 
-            {/* --- Dialogs --- */}
             <Dialog open={isStartModalOpen} onClose={() => setIsStartModalOpen(false)}>
                 <DialogTitle>Start Miner: {modalClientId}</DialogTitle>
                 <form onSubmit={handleStartMiner}>
