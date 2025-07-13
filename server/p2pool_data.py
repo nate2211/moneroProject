@@ -46,10 +46,13 @@ class P2poolData:
                 # 'a' mode creates the file if it doesn't exist
                 with open(self.RAW_LOG, "a", encoding="utf-8") as log_file:
                     for line in proc.stdout:
-                        clean_line = self.strip_ansi_codes(line.strip())
-                        log_file.write(clean_line + "\n")
-                        log_file.flush()
-                        print("[P2Pool]", clean_line)
+                        try:
+                            clean_line = self.strip_ansi_codes(line.strip())
+                            log_file.write(clean_line + "\n")
+                            log_file.flush()
+                            print("[P2Pool]", clean_line)
+                        except Exception as e:
+                            self.log_event_now("P2pool Process", "Failed to redirect output to log file")
                 # Log that the process ended, if this function exits
                 self.log_event_now("P2Pool Process", "P2Pool stdout stream ended.")
 
@@ -123,6 +126,7 @@ class P2poolData:
                     else:  # Fallback for any other messages
                         self.log_event_now("Other P2Pool Event", clean_line)
         except Exception as e:
+            self.log_event_now("P2pool Process","Failed to tail p2pool log")
             pass
 
     def time_ago(self, timestamp):
@@ -155,6 +159,7 @@ class P2poolData:
                     evlog.write(log_entry + "\n")
                     evlog.flush()
                 except queue.Empty:
+                    self.log_event_now("P2Pool Process", "P2Pool log queue empty")
                     pass  # No logs in queue, continue loop
                 time.sleep(0.1)  # Short delay to prevent busy-waiting
 

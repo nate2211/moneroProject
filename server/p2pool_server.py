@@ -24,8 +24,7 @@ else:
 # === FLASK ===
 app = Flask(
     __name__,
-    template_folder=os.path.join(BASE_DIR, 'templates'),
-    static_folder=os.path.join(BASE_DIR, 'static')
+    static_folder='p2pool-dashboard/dist'
 )
 
 
@@ -313,8 +312,39 @@ def get_status_output():
         return jsonify(p2pool_status_output), 503
 
 
-@app.route("/")
-def index():
+
+
+@app.route("/api/lastseen", methods=["GET"])
+def get_last_seen():
+    client_last_seen_formatted = {}
+    for cid, timestamp in clientdata.client_last_seen.items():
+        client_last_seen_formatted[cid] = p2pooldata.time_ago(timestamp)
+    return jsonify({"client_last_seen_formatted": client_last_seen_formatted})
+@app.route("/api/totals", methods=["GET"])
+def get_totals():
+    total_hashrate = round(sum(clientdata.client_hashrates.values()), 2)
+    total_cpu_shares = sum(clientdata.client_cpu_shares.values())
+    total_gpu_shares = sum(clientdata.client_nvidia_shares.values())
+    total_power_draw_values = [p for p in clientdata.client_power_draws.values() if
+                               isinstance(p, (int, float)) and p != "N/A"]
+    total_power_draw = round(sum(total_power_draw_values), 2) if total_power_draw_values else "N/A"
+
+    # Calculate average CPU temp if available
+    valid_cpu_temps = []
+    for temp_str in clientdata.client_temps.values():
+        if isinstance(temp_str, str) and '°C' in temp_str:
+            try:
+                # Extract numerical part before °C
+                temp_c = float(temp_str.split('°C')[0].strip())
+                valid_cpu_temps.append(temp_c)
+            except ValueError:
+                continue  # Skip if parsing fails
+    average_temp = round(sum(valid_cpu_temps) / len(valid_cpu_temps), 1) if valid_cpu_temps else "N/A"
+
+    total_cost = round(sum(clientdata.client_costs.values()), 4)
+    return jsonify({"total_hashrate":total_hashrate, "total_cpu_shares":total_cpu_shares,"total_gpu_shares":total_gpu_shares, "total_temp":average_temp, "total_cost":total_cost, "total_power_draw":total_power_draw})
+@app.route("/api/events", methods=["GET"])
+def get_events():
     shares_found = []
     jobs_sent = []
     miner_data = []
@@ -341,61 +371,8 @@ def index():
                         blocks_found.insert(0, event)
                     else:
                         other_events.insert(0, event)
-
-    total_hashrate = round(sum(clientdata.client_hashrates.values()), 2)
-    total_cpu_shares = sum(clientdata.client_cpu_shares.values())
-    total_gpu_shares = sum(clientdata.client_nvidia_shares.values())
-    total_power_draw_values = [p for p in clientdata.client_power_draws.values() if
-                               isinstance(p, (int, float)) and p != "N/A"]
-    total_power_draw = round(sum(total_power_draw_values), 2) if total_power_draw_values else "N/A"
-
-    # Calculate average CPU temp if available
-    valid_cpu_temps = []
-    for temp_str in clientdata.client_temps.values():
-        if isinstance(temp_str, str) and '°C' in temp_str:
-            try:
-                # Extract numerical part before °C
-                temp_c = float(temp_str.split('°C')[0].strip())
-                valid_cpu_temps.append(temp_c)
-            except ValueError:
-                continue  # Skip if parsing fails
-    average_temp = round(sum(valid_cpu_temps) / len(valid_cpu_temps), 1) if valid_cpu_temps else "N/A"
-
-    total_cost = round(sum(clientdata.client_costs.values()), 4)
-
-    limit = 500
-    joblimit = 20
-    minerlimit = 20
-
-    client_last_seen_formatted = {}
-    for cid, timestamp in clientdata.client_last_seen.items():
-        client_last_seen_formatted[cid] = p2pooldata.time_ago(timestamp)
-
-    return render_template("frontend.html",
-                           hashrates=clientdata.client_hashrates,
-                           newjobs=clientdata.client_newjobs,
-                           client_power_draws=clientdata.client_power_draws,
-                           client_costs=clientdata.client_costs,
-                           client_last_seen=client_last_seen_formatted,
-                           client_status=clientdata.client_status,
-                           client_cpu_shares=clientdata.client_cpu_shares,
-                           client_gpu_stats=clientdata.client_gpu_stats,
-                           client_nvidia_shares=clientdata.client_nvidia_shares,
-                           status_output=p2pooldata.p2pool_status_output,
-                           threads=clientdata.client_threads,
-                           temps=clientdata.client_temps,
-                           total_cost=total_cost,
-                           total_hashrate=total_hashrate,
-                           total_cpu_shares=total_cpu_shares,
-                           total_gpu_shares=total_gpu_shares,
-                           total_power_draw=total_power_draw,
-                           average_temp=average_temp,  # Pass average temp
-                           shares=shares_found[:limit],
-                           jobs=jobs_sent[:joblimit],
-                           miners=miner_data[:minerlimit],
-                           blocks=blocks_found[:minerlimit],
-                           other=other_events[:minerlimit])
-
+    limit = 10
+    return jsonify({"shares_found":shares_found[:limit], "jobs_sent":jobs_sent[:limit], "miner_data": miner_data[:limit], "blocks_found":blocks_found[:limit], "other_events":other_events[:limit]})
 
 @app.route("/hashrate", methods=["POST"])
 def receive_hashrate():
@@ -425,7 +402,14 @@ def receive_hashrate():
 
     elapsed_hours = (time.time() - clientdata.client_start_times[client_id]) / 3600
 
-    power_watts = data.get("power_draw", 0)
+    try:
+        power_watts_value = data.get("power_draw")
+        if power_watts_value == "N/A":
+            power_watts = 0.0
+        else:
+            power_watts = float(power_watts_value)
+    except (ValueError, TypeError):
+        power_watts = 0.0
     if isinstance(power_watts, (int, float)) and power_watts != "N/A" and power_watts > 0:
         kilowatts = power_watts / 1000
         kwh_used = kilowatts * elapsed_hours
@@ -483,7 +467,13 @@ def download_client():
     p2pooldata.log_event_now("File Server", f"Client download initiated for {filename}.")
     return send_from_directory(directory, filename, as_attachment=True)
 
-
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
 def start_flask():
     print("[+] Starting Flask server with Waitress on port 5000...")
     serve(app, host="0.0.0.0", port=5000)
