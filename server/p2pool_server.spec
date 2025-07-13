@@ -10,8 +10,7 @@ a = Analysis(
     pathex=['.'], # The current directory where your Python files reside
     binaries=[],
     datas=[
-        ('templates', 'templates'),
-        ('static', 'static'),
+        ('p2pool-dashboard/dist', 'p2pool-dashboard/dist'),
         ('client_data.py', '.'),            # Include app.py
         ('p2pool_data.py', '.'), # Include p2pool_handler.py
     ],

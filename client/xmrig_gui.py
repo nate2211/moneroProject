@@ -182,88 +182,115 @@ class MinerGui(QWidget):
         self.resize(1000, 700)
         # --- Apply High-Contrast Black and White Stylesheet ---
         stylesheet = """
-            /* Main Window and General Widget Styling */
-            QWidget {
-                background-color: #0D0D0D;  /* deep black */
-                color: #FFFFFF;             /* white text */
-                font-family: Segoe UI, sans-serif;
-                font-size: 10pt;
-            }
-
-            /* Labels */
-            QLabel {
-                color: #FFFFFF;  /* white */
-            }
-
-            /* Buttons */
-            QPushButton {
-                background-color: #8B0000;  /* dark red */
-                color: #FFFFFF;
-                border: 1px solid #FF4C4C;  /* bright red border */
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #B22222;  /* firebrick */
-                border: 1px solid #FF6666;
-            }
-            QPushButton:pressed {
-                background-color: #660000;  /* darker red */
-            }
-            QPushButton:disabled {
-                background-color: #2A2A2A;
-                color: #888888;
-                border: 1px solid #444444;
-            }
-
-            /* Input Fields */
-            QLineEdit, QPlainTextEdit {
-                background-color: #1A1A1A;
-                border: 1px solid #555555;
-                padding: 6px;
-                border-radius: 4px;
-                color: #FFFFFF;
-            }
-
-            /* Frames and Separators */
-            QFrame {
-                border: 1px solid #2E2E2E;
-            }
-
-            /* Collapsible Box Headers */
-            QToolButton {
-                color: #FF4C4C;  /* bright red */
-                font-size: 12pt;
-                font-weight: bold;
-            }
-
-            /* Form Layout Label Styling */
-            QFormLayout QLabel {
-                font-weight: bold;
-                color: #FFFFFF;
-            }
-
-            /* Console Title */
-            #consoleTitle {
-                font-size: 11pt;
-                font-weight: bold;
-                padding-top: 10px;
-                color: #FF4C4C;
-            }
-
-            /* Scrollbar (optional for better visual consistency) */
-            QScrollBar:vertical {
-                border: none;
-                background: #1A1A1A;
-                width: 8px;
-                margin: 0px 0px 0px 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #FF4C4C;
-                min-height: 20px;
-                border-radius: 4px;
-            }
+                    /* Main Window and General Widget Styling */
+                    QWidget {
+                        background-color: #0D0D0D;  /* deep black */
+                        color: #FFFFFF;             /* white text */
+                        font-family: Segoe UI, sans-serif;
+                        font-size: 10pt;
+                    }
+                    
+                    /* Labels */
+                    QLabel {
+                        color: #FFFFFF;  /* white */
+                        background-color: transparent; /* Ensure labels don't have a background */
+                    }
+                    
+                    /* Buttons - Embossed Effect */
+                    QPushButton {
+                        background-color: #8B0000;  /* dark red */
+                        color: #FFFFFF;
+                        /* Emboss Effect: light top/left, dark bottom/right */
+                        border-top: 1px solid #B22222;    /* Lighter red for highlight */
+                        border-left: 1px solid #B22222;
+                        border-bottom: 1px solid #660000; /* Darker red for shadow */
+                        border-right: 1px solid #660000;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                    }
+                    
+                    QPushButton:hover {
+                        background-color: #9B111E; /* Slightly brighter red on hover */
+                        /* Maintain emboss effect on hover */
+                        border-top: 1px solid #C83C3C;
+                        border-left: 1px solid #C83C3C;
+                        border-bottom: 1px solid #7C0A0A;
+                        border-right: 1px solid #7C0A0A;
+                    }
+                    
+                    QPushButton:pressed {
+                        background-color: #660000;  /* darker red */
+                        /* Inset/Debossed Effect on press */
+                        border-top: 1px solid #550000;    /* Darker border on top */
+                        border-left: 1px solid #550000;
+                        border-bottom: 1px solid #B22222; /* Lighter border on bottom */
+                        border-right: 1px solid #B22222;
+                        padding-top: 9px; /* Shift text down to enhance pressed feel */
+                        padding-left: 17px;/* Shift text right */
+                    }
+                    
+                    QPushButton:disabled {
+                        background-color: #2A2A2A;
+                        color: #888888;
+                        /* Flat border for disabled state */
+                        border: 1px solid #444444;
+                    }
+                    
+                    /* Input Fields - Inset/Debossed Effect */
+                    QLineEdit, QPlainTextEdit {
+                        background-color: #1A1A1A;
+                        padding: 6px;
+                        border-radius: 4px;
+                        color: #FFFFFF;
+                        /* Inset Effect: dark top/left, light bottom/right */
+                        border-top: 1px solid #000000;   /* Black for shadow */
+                        border-left: 1px solid #000000;
+                        border-bottom: 1px solid #2E2E2E;/* Gray for highlight */
+                        border-right: 1px solid #2E2E2E;
+                    }
+                    
+                    /* Frames and Separators */
+                    QFrame {
+                        /* Made slightly darker to blend with the inset inputs */
+                        border: 1px solid #252525;
+                    }
+                    
+                    /* Collapsible Box Headers */
+                    QToolButton {
+                        color: #FF4C4C;  /* bright red */
+                        font-size: 12pt;
+                        font-weight: bold;
+                        background-color: transparent; /* Ensure no background conflicts */
+                        border: none;
+                    }
+                    
+                    /* Form Layout Label Styling */
+                    QFormLayout QLabel {
+                        font-weight: bold;
+                        color: #FFFFFF;
+                    }
+                    
+                    /* Console Title */
+                    #consoleTitle {
+                        font-size: 11pt;
+                        font-weight: bold;
+                        padding-top: 10px;
+                        color: #FF4C4C;
+                    }
+                    
+                    /* Scrollbar (optional for better visual consistency) */
+                    QScrollBar:vertical {
+                        border: none;
+                        background: #1A1A1A;
+                        width: 8px;
+                        margin: 0px 0px 0px 0px;
+                    }
+                    QScrollBar::handle:vertical {
+                        background: #FF4C4C;
+                        min-height: 20px;
+                        border-radius: 4px;
+                    }
         """
         self.setStyleSheet(stylesheet)
 
