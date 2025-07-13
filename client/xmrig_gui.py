@@ -162,6 +162,7 @@ class MinerGui(QWidget):
     # New signal to safely update stats on the GUI thread
     stats_update_signal = pyqtSignal(dict)
     force_update_signal = pyqtSignal(str)
+
     def __init__(self, xmrig_data, xmrig_miner, logger):
         super().__init__()
         # --- Initialize Core Components ---
@@ -189,13 +190,13 @@ class MinerGui(QWidget):
                         font-family: Segoe UI, sans-serif;
                         font-size: 10pt;
                     }
-                    
+
                     /* Labels */
                     QLabel {
                         color: #FFFFFF;  /* white */
                         background-color: transparent; /* Ensure labels don't have a background */
                     }
-                    
+
                     /* Buttons - Embossed Effect */
                     QPushButton {
                         background-color: #8B0000;  /* dark red */
@@ -209,7 +210,7 @@ class MinerGui(QWidget):
                         border-radius: 4px;
                         font-weight: bold;
                     }
-                    
+
                     QPushButton:hover {
                         background-color: #9B111E; /* Slightly brighter red on hover */
                         /* Maintain emboss effect on hover */
@@ -218,7 +219,7 @@ class MinerGui(QWidget):
                         border-bottom: 1px solid #7C0A0A;
                         border-right: 1px solid #7C0A0A;
                     }
-                    
+
                     QPushButton:pressed {
                         background-color: #660000;  /* darker red */
                         /* Inset/Debossed Effect on press */
@@ -229,14 +230,14 @@ class MinerGui(QWidget):
                         padding-top: 9px; /* Shift text down to enhance pressed feel */
                         padding-left: 17px;/* Shift text right */
                     }
-                    
+
                     QPushButton:disabled {
                         background-color: #2A2A2A;
                         color: #888888;
                         /* Flat border for disabled state */
                         border: 1px solid #444444;
                     }
-                    
+
                     /* Input Fields - Inset/Debossed Effect */
                     QLineEdit, QPlainTextEdit {
                         background-color: #1A1A1A;
@@ -249,13 +250,13 @@ class MinerGui(QWidget):
                         border-bottom: 1px solid #2E2E2E;/* Gray for highlight */
                         border-right: 1px solid #2E2E2E;
                     }
-                    
+
                     /* Frames and Separators */
                     QFrame {
                         /* Made slightly darker to blend with the inset inputs */
                         border: 1px solid #252525;
                     }
-                    
+
                     /* Collapsible Box Headers */
                     QToolButton {
                         color: #FF4C4C;  /* bright red */
@@ -264,13 +265,13 @@ class MinerGui(QWidget):
                         background-color: transparent; /* Ensure no background conflicts */
                         border: none;
                     }
-                    
+
                     /* Form Layout Label Styling */
                     QFormLayout QLabel {
                         font-weight: bold;
                         color: #FFFFFF;
                     }
-                    
+
                     /* Console Title */
                     #consoleTitle {
                         font-size: 11pt;
@@ -278,7 +279,7 @@ class MinerGui(QWidget):
                         padding-top: 10px;
                         color: #FF4C4C;
                     }
-                    
+
                     /* Scrollbar (optional for better visual consistency) */
                     QScrollBar:vertical {
                         border: none;
@@ -342,7 +343,7 @@ class MinerGui(QWidget):
 
         self.console_output = QPlainTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setMinimumHeight(150) # Set fixed height for the console box
+        self.console_output.setMinimumHeight(150)  # Set fixed height for the console box
         self.console_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.console_output)
 
@@ -360,10 +361,12 @@ class MinerGui(QWidget):
         self.logger.message_signal.connect(self.update_console)
         self.stats_update_signal.connect(self.stats_display.update_stats)
         self.force_update_signal.connect(self.handle_force_update)
+
     @pyqtSlot(str)
     def update_console(self, message):
         """Appends a message to the console widget in a thread-safe way."""
         self.console_output.appendPlainText(message)
+
     @pyqtSlot(str)
     def handle_force_update(self, download_url):
         """Handles a forced update command from the server, skipping the user prompt."""
@@ -373,7 +376,9 @@ class MinerGui(QWidget):
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.show()
         # Start the download process
-        asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url), self.async_worker.loop)
+        asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url),
+                                         self.async_worker.loop)
+
     def handle_connect(self):
         """Handles the 'Connect' button click by starting the async worker."""
         server_url = self.server_url_input.text().strip()
@@ -425,7 +430,8 @@ class MinerGui(QWidget):
         self.logger.log_message(f"[+] Connecting to {self.xmrig_data.FLASK_SERVER_URL} as {self.xmrig_data.client_id}")
         self.xmrig_data.aiohttp_client_session = aiohttp.ClientSession()
 
-        polling_task = asyncio.create_task(self.xmrig_miner.poll_server(self.xmrig_data.aiohttp_client_session, self.force_update_signal))
+        polling_task = asyncio.create_task(
+            self.xmrig_miner.poll_server(self.xmrig_data.aiohttp_client_session, self.force_update_signal))
         reporter_task = asyncio.create_task(
             self.xmrig_miner.periodic_reporter(self.xmrig_data.aiohttp_client_session, self.stats_update_signal))
 

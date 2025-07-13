@@ -160,8 +160,8 @@ class XmrigData:
         self._latest_nvidia_accepted_shares = 0
         self._latest_gpu_temp = "N/A"
         self._latest_gpu_fan = "N/A"
-        self.XMRIG_PATH = os.path.join(os.getcwd(), "xmrig.exe")
-        self.CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
+        self.XMRIG_PATH = os.path.join(os.path.dirname(sys.executable), "xmrig.exe")
+        self.CONFIG_PATH = os.path.join(os.path.dirname(sys.executable), "config.json")
         self.logger = Logger
 
         self.hardware_monitor = HardwareMonitor(self.logger)

@@ -183,18 +183,16 @@ def get_clients():
 def update_miner_status(client_id):
     """
     Endpoint for clients to report their running status.
+    Clears stale metrics on stopped/error clients.
     """
     data = request.get_json()
     if not data or 'status' not in data:
         return jsonify({"error": "Invalid payload. 'status' is required."}), 400
 
-    status = data['status']
+    status = data['status'].strip().capitalize()
 
     print(f"[+] Received status update from '{client_id}': {status}")
     clientdata.client_status[client_id] = status
-    # If stopped, also clear hashrate
-    if status in ['Stopped', 'Error']:
-        clientdata.client_hashrates[client_id] = 0
 
     return jsonify({"message": "Status updated successfully"}), 200
 
@@ -212,14 +210,11 @@ def start_miner(client_id):
         "threads": int(threads)
     }
     print(f"[+] Queued START command for '{client_id}'")
-    return redirect(url_for('index'))
-
+    return jsonify({"status": "success", "message": f"Start command queued for {client_id}"})
 
 @app.route("/stop_miner/<client_id>", methods=["POST"])
 def stop_miner(client_id):
     COMMAND_QUEUE[client_id] = {"command": "stop"}
-    clientdata.client_status[client_id] = 'Stopped'
-    clientdata.client_hashrates[client_id] = 0
     print(f"[+] Queued STOP command for '{client_id}'")
     return jsonify({"status": "ok", "message": f"Stop command queued for {client_id}"})
 
@@ -374,6 +369,7 @@ def get_events():
     limit = 10
     return jsonify({"shares_found":shares_found[:limit], "jobs_sent":jobs_sent[:limit], "miner_data": miner_data[:limit], "blocks_found":blocks_found[:limit], "other_events":other_events[:limit]})
 
+
 @app.route("/hashrate", methods=["POST"])
 def receive_hashrate():
     data = request.get_json()
@@ -381,45 +377,60 @@ def receive_hashrate():
         return "Bad Request", 400
 
     client_id = data["client_id"]
-    if clientdata.client_status.get(client_id) == "Disconnected":
-        print(f"[+] Client '{client_id}' reconnected.")
 
+    # Record the client's start time on their very first report
+    if client_id not in clientdata.client_start_times:
+        print(f"[+] First report from new client '{client_id}'. Recording start time.")
+        clientdata.client_start_times[client_id] = time.time()
+
+    # --- ✅ Sanitize Power Draw Input ---
+    power_watts = 0.0
+    power_draw_raw = data.get("power_draw", "0.0")
+
+    # Check if the power draw data is a string that needs cleaning
+    if isinstance(power_draw_raw, str):
+        # Remove the "W" and any extra whitespace before converting
+        cleaned_str = power_draw_raw.replace("W", "", 2).strip()
+        try:
+            power_watts = float(cleaned_str)
+        except (ValueError, TypeError):
+            # If conversion fails after cleaning, default to 0
+            power_watts = 0.0
+    # If it's already a number, use it directly
+    elif isinstance(power_draw_raw, (int, float)):
+        power_watts = float(power_draw_raw)
+
+    # --- Update Basic Client Data ---
     clientdata.client_hashrates[client_id] = data.get("hashrate", 0)
     clientdata.client_threads[client_id] = data.get("threads", 0)
     clientdata.client_temps[client_id] = data.get("cpu_temp", "N/A")
     clientdata.client_last_seen[client_id] = time.time()
-
     clientdata.client_cpu_shares[client_id] = data.get("cpu_accepted_shares", 0)
     clientdata.client_nvidia_shares[client_id] = data.get("nvidia_accepted_shares", 0)
     clientdata.client_gpu_stats[client_id] = {
         "temp": data.get("gpu_temp", "N/A"),
         "fan": data.get("gpu_fan", "N/A")
     }
-    clientdata.client_power_draws[client_id] = data.get("power_draw", "N/A")
+    # Store the cleaned numerical value
+    clientdata.client_power_draws[client_id] = power_watts
 
-    if client_id not in clientdata.client_start_times:
-        clientdata.client_start_times[client_id] = time.time()
+    # --- Cost Calculation Based on Total Uptime ---
+    start_time = clientdata.client_start_times.get(client_id)
 
-    elapsed_hours = (time.time() - clientdata.client_start_times[client_id]) / 3600
+    if start_time:
+        # Calculate total uptime in hours
+        total_uptime_seconds = time.time() - start_time
+        total_uptime_hours = total_uptime_seconds / 3600
 
-    try:
-        power_watts_value = data.get("power_draw")
-        if power_watts_value == "N/A":
-            power_watts = 0.0
-        else:
-            power_watts = float(power_watts_value)
-    except (ValueError, TypeError):
-        power_watts = 0.0
-    if isinstance(power_watts, (int, float)) and power_watts != "N/A" and power_watts > 0:
-        kilowatts = power_watts / 1000
-        kwh_used = kilowatts * elapsed_hours
-        cost = kwh_used * ELECTRICITY_RATE_PER_KWH
-        clientdata.client_costs[client_id] = round(cost, 4)
-    else:
-        clientdata.client_costs[client_id] = 0.0
+        # Calculate total energy consumed in kWh and the total cost
+        if power_watts > 0 and total_uptime_hours > 0:
+            total_kwh_used = (power_watts / 1000) * total_uptime_hours
+            total_cost = total_kwh_used * ELECTRICITY_RATE_PER_KWH
+
+            # Update the client's total cost
+            clientdata.client_costs[client_id] = total_cost
 
     return jsonify({"message": "ok"})
-
 
 @app.route("/newjob", methods=["POST"])
 def receive_newjob():
@@ -437,7 +448,7 @@ def update_client(client_id):
     if client_id not in clientdata.client_status:
         return jsonify({"status": "error", "message": "Client not found."}), 404
 
-    download_url = url_for('download_client', _external=True)
+    download_url = f"http://192.168.0.10:5000/download/client"
 
     COMMAND_QUEUE[client_id] = {
         "command": "update",
