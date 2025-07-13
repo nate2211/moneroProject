@@ -367,9 +367,13 @@ def get_events():
                     else:
                         other_events.insert(0, event)
     limit = 10
-    return jsonify({"shares_found":shares_found[:limit], "jobs_sent":jobs_sent[:limit], "miner_data": miner_data[:limit], "blocks_found":blocks_found[:limit], "other_events":other_events[:limit]})
-
-
+    return jsonify({
+        "shares_found": shares_found[-limit:],
+        "jobs_sent": jobs_sent[-limit:],
+        "miner_data": miner_data[-limit:],
+        "blocks_found": blocks_found[-limit:],
+        "other_events": other_events[-limit:]
+    })
 @app.route("/hashrate", methods=["POST"])
 def receive_hashrate():
     data = request.get_json()
