@@ -15,7 +15,7 @@ import aiohttp
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
                              QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
-                             QSystemTrayIcon, QMenu, QAction)
+                             QSystemTrayIcon, QMenu, QAction, QApplication)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -240,10 +240,14 @@ class MinerGui(QWidget):
         console_label = QLabel("<b>Console Output:</b>")
         console_label.setObjectName("consoleTitle")
         main_layout.addWidget(console_label)
+        # --- CONSOLE WIDGET SETUP ---
         self.console_output = QPlainTextEdit()
         self.console_output.setReadOnly(True)
+        # The Expanding size policy is still good practice.
         self.console_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        main_layout.addWidget(self.console_output)
+        # THE FIX: Add the console widget with a stretch factor of 1.
+        # This tells the layout to give all available vertical space to the console.
+        main_layout.addWidget(self.console_output, 1)
         main_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
     def resource_path(self, relative_path):
@@ -519,6 +523,8 @@ class MinerGui(QWidget):
                                  f"Could not create the updater script: {e}\n\nPlease check logs and antivirus settings.")
 
     async def download_update(self, session, url):
+        if self.xmrig_data.client_status == "Started":
+            await self.xmrig_miner.stop_miner()
         save_path = os.path.join(os.path.dirname(sys.executable), "client_new.exe")
         try:
             self.logger.log_message(f"[+] Starting download from {url}...")
