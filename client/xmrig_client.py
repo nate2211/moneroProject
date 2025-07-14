@@ -25,7 +25,7 @@ xmrig_miner = XmrigMiner(xmrig_data, logger)
 def main():
     """Main function to initialize and run the application."""
     app = QApplication(sys.argv)
-
+    app.setQuitOnLastWindowClosed(False)
     gui = MinerGui(xmrig_data=xmrig_data, xmrig_miner=xmrig_miner, logger=logger)
     gui.show()
 
