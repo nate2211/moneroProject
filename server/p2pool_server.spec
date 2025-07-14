@@ -29,28 +29,6 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# This section creates the executable.
-# `--onefile` creates a single executable file.
-# `console=True` will show a console window for P2Pool output and debugging.
-# Change to `console=False` (or use `--windowed` flag) to hide the console.
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name='P2PoolMonitor', # Name of your executable
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True, # Set to True for console output (recommended for P2Pool logs)
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    cipher=block_cipher,
-    version=None,
-)
 exe = EXE(
     pyz,
     a.scripts,

@@ -5,7 +5,7 @@ import os
 import threading
 import re
 from flask import Flask, request, jsonify, redirect, url_for, render_template, send_from_directory
-
+from flask_cors import CORS
 from p2pool_data import P2poolData
 from client_data import ClientData
 
@@ -26,7 +26,21 @@ app = Flask(
     __name__,
     static_folder='p2pool-dashboard/dist'
 )
+CORS(app)
 
+
+def queue_command(client_id, command_data):
+    """
+    Safely adds a command to a client's command list in the queue.
+    Initializes the list if the client is new.
+    """
+    # If the client doesn't have a queue yet, create one.
+    if client_id not in COMMAND_QUEUE:
+        COMMAND_QUEUE[client_id] = []
+
+    # Append the new command to the client's list.
+    COMMAND_QUEUE[client_id].append(command_data)
+    print(f"[+] Queued command for '{client_id}': {command_data}")
 
 @app.route("/connect_wifi", methods=["POST"])
 def connect_wifi():
@@ -204,39 +218,50 @@ def start_miner(client_id):
     if not pool or not threads:
         return "Pool and threads are required.", 400
 
-    COMMAND_QUEUE[client_id] = {
+    command_data = {
         "command": "start",
         "pool": pool,
         "threads": int(threads)
     }
+    queue_command(client_id, command_data)
     print(f"[+] Queued START command for '{client_id}'")
+
     return jsonify({"status": "success", "message": f"Start command queued for {client_id}"})
 
 @app.route("/stop_miner/<client_id>", methods=["POST"])
 def stop_miner(client_id):
-    COMMAND_QUEUE[client_id] = {"command": "stop"}
+    queue_command(client_id, {"command": "stop"})
     print(f"[+] Queued STOP command for '{client_id}'")
     return jsonify({"status": "ok", "message": f"Stop command queued for {client_id}"})
 
 
 @app.route("/set_threads/<client_id>", methods=["POST"])
 def set_threads(client_id):
-    """Adds a 'set_threads' command to the queue for a specific client."""
     try:
         new_threads = int(request.form["threads"])
     except (ValueError, KeyError):
-        return "Invalid thread count provided", 400
+        return jsonify({"status": "error", "message": "Invalid thread count provided"}), 400
 
-    COMMAND_QUEUE[client_id] = {"command": "set_threads", "threads": new_threads}
+    command_data = {"command": "set_threads", "threads": new_threads}
+    queue_command(client_id, command_data)
     print(f"[+] Command queued for '{client_id}': Set threads to {new_threads}")
-    return f"Command 'set_threads' queued for client '{client_id}' with {new_threads} threads.", 200
+    return jsonify({"status": "ok", "message": f"Set thread command queued for {client_id}"})
 
 
 @app.route("/get_command/<client_id>", methods=["GET"])
 def get_command(client_id):
-    """Allows clients to poll for and receive commands."""
-    command = COMMAND_QUEUE.pop(client_id, None)
-    return jsonify(command) if command else jsonify({})
+    """
+    Allows clients to poll for and receive the oldest command in their queue.
+    """
+    if client_id in COMMAND_QUEUE and COMMAND_QUEUE[client_id]:
+        # Pop the oldest command (at index 0) from the list
+        command = COMMAND_QUEUE[client_id].pop(0)
+        print(f"[-] De-queued and sent command to '{client_id}': {command}")
+        return jsonify(command)
+
+    # Return an empty object if no command is available
+    return jsonify({})
+
 
 
 def parse_p2pool_status(raw_text):
@@ -454,10 +479,11 @@ def update_client(client_id):
 
     download_url = f"http://192.168.0.10:5000/download/client"
 
-    COMMAND_QUEUE[client_id] = {
+    command = {
         "command": "update",
         "url": download_url
     }
+    queue_command(client_id, command)
     print(f"[+] Queued UPDATE command for '{client_id}'")
     message = f"Update command queued for client '{client_id}."
 

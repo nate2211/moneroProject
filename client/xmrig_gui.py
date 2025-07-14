@@ -376,7 +376,7 @@ class MinerGui(QWidget):
         self.xmrig_data.client_id = client_id
         if not self.async_worker or not self.async_worker.isRunning():
             self.logger.log_message("[+] Starting background services...")
-            self.async_worker = AsyncWorker(self.run_async_tasks(start_mining_on_success))
+            self.async_worker = AsyncWorker(self.run_async_tasks())
             self.async_worker.start()
             self.connect_button.setEnabled(False)
             self.server_url_input.setDisabled(True)
@@ -401,16 +401,10 @@ class MinerGui(QWidget):
             self.logger.log_message("[+] Stop mining command issued from GUI.")
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.stop_miner(), self.async_worker.loop)
 
-    async def run_async_tasks(self, start_mining_on_success=False):
+    async def run_async_tasks(self):
         self.logger.log_message(f"[+] Connecting to {self.xmrig_data.FLASK_SERVER_URL} as {self.xmrig_data.client_id}")
         async with aiohttp.ClientSession() as session:
             self.xmrig_data.aiohttp_client_session = session
-            if start_mining_on_success:
-                self.logger.log_message("[+] Silent mode: Auto-starting miner in 3 seconds...")
-                await asyncio.sleep(3)
-                pool = self.pool_ip_input.text().strip()
-                threads = int(self.thread_count_input.text().strip())
-                await self.xmrig_miner.start_miner(pool, threads)
             polling_task = asyncio.create_task(self.xmrig_miner.poll_server(session, self.force_update_signal))
             reporter_task = asyncio.create_task(self.xmrig_miner.periodic_reporter(session, self.stats_update_signal))
             self.logger.log_message("[+] Background services running.")

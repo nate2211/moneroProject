@@ -180,7 +180,7 @@ class XmrigMiner:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             self.logger.log_message("[!] Could not set XMRig process priority. Run as admin/root for best results.")
 
-        await asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
+        asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
 
 
     async def stop_miner(self):

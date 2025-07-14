@@ -1,31 +1,31 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Container,
-  Typography,
-  Grid,
-  Card,
-  CardContent,
-  Button,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  CircularProgress,
-  TextField,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  ThemeProvider,
-  createTheme,
-  CssBaseline,
-  Box,
-  IconButton,
-  Tooltip
+    Container,
+    Typography,
+    Grid,
+    Card,
+    CardContent,
+    Button,
+    Table,
+    TableBody,
+    TableCell,
+    TableContainer,
+    TableHead,
+    TableRow,
+    Paper,
+    CircularProgress,
+    TextField,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogContentText,
+    DialogTitle,
+    ThemeProvider,
+    createTheme,
+    CssBaseline,
+    Box,
+    IconButton,
+    Tooltip, Divider
 } from '@mui/material';
 import {
   RestartAlt,
@@ -320,74 +320,83 @@ function App() {
                 </CardContent>
             </Card>
 
-            <Card sx={{ mb: 3 }}>
-                <CardContent>
-                    <Typography variant="h5" component="div" gutterBottom>Client Dashboard</Typography>
-                    <TableContainer component={Paper}>
-                        <Table>
-                            <TableHead>
-                                <TableRow>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Client</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Hashrate</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Temp</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Threads</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Power</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Cost</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Last Seen</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Shares</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>GPU</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Difficulty</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Height</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Algo</TableCell>
-                                    <TableCell sx={{ backgroundColor: 'rgb(73,71,71)' }}>Pool IP</TableCell>
-                                    <TableCell align="center"sx={{ backgroundColor: 'rgb(73,71,71)' }}>Actions</TableCell>
-                                </TableRow>
-                            </TableHead>
-                            <TableBody>
-                                {clients.hashrates && Object.keys(clients.hashrates).length > 0 ? (
-                                    Object.keys(clients.hashrates).map(cid => (
-                                        <TableRow key={cid} hover>
-                                            <TableCell>
-                                                <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                                                    <Box component="span" sx={{ width: 10, height: 10, borderRadius: '50%', mr: 1, bgcolor: clients.status?.[cid] === 'Started' ? 'success.main' : 'error.main' }} />
-                                                    {cid}
-                                                </Box>
-                                            </TableCell>
-                                            <TableCell><strong>{clients.hashrates?.[cid]?.toFixed(2) || 'N/A'} H/s</strong></TableCell>
-                                            <TableCell>{clients.temps?.[cid] || 'N/A'}</TableCell>
-                                            <TableCell>{clients.threads?.[cid] || 'N/A'}</TableCell>
-                                            <TableCell>{clients.power_draws?.[cid] || 'N/A'} W</TableCell>
-                                            <TableCell>${clients.costs?.[cid]?.toFixed(4) || '0.0000'}</TableCell>
-                                            <TableCell>{lastSeenData.client_last_seen_formatted?.[cid] || 'N/A'}</TableCell>
-                                            <TableCell>{clients.cpu_shares?.[cid] || 0} / {clients.nvidia_shares?.[cid] || 0}</TableCell>
-                                            <TableCell>{clients.gpu_stats?.[cid]?.temp || 'N/A'} | {clients.gpu_stats?.[cid]?.fan || 'N/A'}</TableCell>
-                                            <TableCell>{clients.newjobs?.[cid]?.difficulty || '—'}</TableCell>
-                                            <TableCell>{clients.newjobs?.[cid]?.height || '—'}</TableCell>
-                                            <TableCell>{clients.newjobs?.[cid]?.algo || '—'}</TableCell>
-                                            <TableCell>{clients.newjobs?.[cid]?.ip || '—'}</TableCell>
-                                            <TableCell>
-                                                <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
-                                                    <form onSubmit={(e) => handleSetThreads(e, cid)} style={{ display: 'flex', alignItems: 'center' }}>
-                                                        <TextField size="small" type="number" variant="outlined" sx={{ width: '70px', mr: 1 }} placeholder={String(clients.threads?.[cid] || '1')} onChange={e => setThreadInputs({...threadInputs, [cid]: e.target.value})} />
-                                                        <Button type="submit" size="small" variant="contained">Set</Button>
-                                                    </form>
-                                                    {clients.status?.[cid] === 'Started' ?
-                                                        <Button variant="contained" color="error" size="small" onClick={() => handleStopMiner(cid)} startIcon={<Stop />}>Stop</Button> :
-                                                        <Button variant="contained" color="success" size="small" onClick={() => openStartModal(cid)} startIcon={<PlayArrow />}>Start</Button>
-                                                    }
-                                                    <Button variant="outlined" color="secondary" size="small" onClick={() => handleUpdateClient(cid)} startIcon={<Update />}>Update</Button>
-                                                </Box>
-                                            </TableCell>
-                                        </TableRow>
-                                    ))
-                                ) : (
-                                    <TableRow><TableCell colSpan={14} align="center">No clients have connected yet.</TableCell></TableRow>
-                                )}
-                            </TableBody>
-                        </Table>
-                    </TableContainer>
-                </CardContent>
-            </Card>
+            <Box sx={{ mb: 3 }} >
+                <Typography variant="h5" component="div" gutterBottom textAlign={"center"}>Client Dashboard</Typography>
+                <Grid container spacing={3} display={"flex"} justifyContent={"center"} flexWrap={"wrap"}>
+                    {clients.hashrates && Object.keys(clients.hashrates).length > 0 ? (
+                        Object.keys(clients.hashrates).map(cid => (
+                            <Grid item xs={12} md={6} lg={4} key={cid}>
+                                <Card sx={{ display: 'flex', flexDirection: 'column' }}>
+                                    <CardContent sx={{ flexGrow: 1 }}>
+                                        {/* Client Header */}
+                                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                                                <Box component="span" sx={{ width: 12, height: 12, borderRadius: '50%', bgcolor: clients.status?.[cid] === 'Started' ? 'success.main' : 'error.main', boxShadow: `0 0 8px ${clients.status?.[cid] === 'Started' ? 'green' : 'red'}` }} />
+                                                <Typography variant="h6" component="div" noWrap title={cid}>{cid}</Typography>
+                                            </Box>
+                                            <Button variant="outlined" color="secondary" size="small" onClick={() => handleUpdateClient(cid)} startIcon={<Update />}>Update</Button>
+                                        </Box>
+                                        <Divider sx={{ mb: 2 }} />
+
+                                        {/* Primary Stats */}
+                                        <Grid container spacing={2} sx={{ mb: 2 }}>
+                                            <Grid item xs={4} sx={{ textAlign: 'center' }}>
+                                                <Typography variant="h5" component="div"><strong>{clients.hashrates?.[cid]?.toFixed(1) || 'N/A'}</strong></Typography>
+                                                <Typography variant="caption" color="text.secondary">H/s</Typography>
+                                            </Grid>
+                                            <Grid item xs={4} sx={{ textAlign: 'center' }}>
+                                                <Typography variant="h5" component="div">{clients.temps?.[cid] || 'N/A'}</Typography>
+                                                <Typography variant="caption" color="text.secondary">CPU Temp</Typography>
+                                            </Grid>
+                                            <Grid item xs={4} sx={{ textAlign: 'center' }}>
+                                                <Typography variant="h5" component="div">{clients.power_draws?.[cid] || 'N/A'}W</Typography>
+                                                <Typography variant="caption" color="text.secondary">Power</Typography>
+                                            </Grid>
+                                        </Grid>
+
+                                        {/* Secondary Info */}
+                                        <Paper variant="outlined" sx={{ display: 'flex', justifyContent: 'space-around', mb: 2, p: 1, borderRadius: 1 }}>
+                                            <Typography variant="body2" title="CPU / GPU Shares">Shares: {clients.cpu_shares?.[cid] || 0}/{clients.nvidia_shares?.[cid] || 0}</Typography>
+                                            <Typography variant="body2">Cost: ${clients.costs?.[cid]?.toFixed(3) || '0.00'}</Typography>
+                                            <Typography variant="body2">Seen: {lastSeenData.client_last_seen_formatted?.[cid] || 'N/A'}</Typography>
+                                        </Paper>
+
+                                        {/* Job Details */}
+                                        <Box>
+                                            <Typography variant="overline" color="text.secondary">Current Job</Typography>
+                                            <Paper variant="outlined" sx={{ p: 1.5, fontSize: '0.8rem' }}>
+                                                <Typography variant="body2">Pool: {clients.newjobs?.[cid]?.ip || '—'}</Typography>
+                                                <Typography variant="body2">Difficulty: {clients.newjobs?.[cid]?.difficulty || '—'}</Typography>
+                                                <Typography variant="body2">Height: {clients.newjobs?.[cid]?.height || '—'}</Typography>
+                                                <Typography variant="body2">Algo: {clients.newjobs?.[cid]?.algo || "-"}</Typography>
+                                                <Typography variant="body2">Tx Count (ms): {clients.newjobs?.[cid]?.tx_count || "-"}</Typography>
+                                            </Paper>
+                                        </Box>
+                                    </CardContent>
+
+                                    {/* Actions */}
+                                    <Box sx={{ p: 2, pt: 1, borderTop: '1px solid rgba(255, 255, 255, 0.12)' }}>
+                                        <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', justifyContent: 'space-between' }}>
+                                            <form onSubmit={(e) => handleSetThreads(e, cid)} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                <TextField size="small" type="number" variant="outlined" sx={{ width: '85px' }} label="Threads" InputLabelProps={{ shrink: true }} placeholder={String(clients.threads?.[cid] || '1')} onChange={e => setThreadInputs({...threadInputs, [cid]: e.target.value})} />
+                                                <Button type="submit" size="small" variant="contained">Set</Button>
+                                            </form>
+                                            {clients.status?.[cid] === 'Started' ?
+                                                <Button variant="contained" color="error" size="small" onClick={() => handleStopMiner(cid)} startIcon={<Stop />}>Stop</Button> :
+                                                <Button variant="contained" color="success" size="small" onClick={() => openStartModal(cid)} startIcon={<PlayArrow />}>Start</Button>
+                                            }
+                                        </Box>
+                                    </Box>
+                                </Card>
+                            </Grid>
+                        ))
+                    ) : (
+                        <Grid item xs={12}>
+                            <Typography sx={{ textAlign: 'center', p: 4, color: 'text.secondary' }}>No clients have connected yet.</Typography>
+                        </Grid>
+                    )}
+                </Grid>
+            </Box>
 
             <Card sx={{ mb: 3 }}>
                 <CardContent>
