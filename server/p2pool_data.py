@@ -149,19 +149,22 @@ class P2poolData:
             days = int(seconds / 86400)
             return f"{days} day{'s' if days > 1 else ''} ago"
 
-    def log_writer(self,):
-        # 'a' mode creates the file if it doesn't exist
+    def log_writer(self, ):
+        """
+        Waits for log entries in the queue and writes them to the event log file.
+        This function will block efficiently until a log is available.
+        """
         with open(self.EVENT_LOG, "a", encoding="utf-8") as evlog:
             while True:
-                # Continuously try to get items from the queue without blocking indefinitely
                 try:
-                    log_entry = self.log_queue.get(timeout=0.5)  # Wait up to 0.5 seconds
+                    # block=True makes it wait indefinitely until an item is available.
+                    # This is more efficient than polling with a timeout.
+                    log_entry = self.log_queue.get(block=True)
                     evlog.write(log_entry + "\n")
                     evlog.flush()
-                except queue.Empty:
-                    self.log_event_now("P2Pool Process", "P2Pool log queue empty")
-                    pass  # No logs in queue, continue loop
-                time.sleep(0.1)  # Short delay to prevent busy-waiting
+                except Exception as e:
+                    # Log an error if writing fails for some reason
+                    print(f"[!] Log writer failed: {e}")
 
     def strip_ansi_codes(self, text):
         ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')

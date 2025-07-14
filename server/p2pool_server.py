@@ -5,7 +5,7 @@ import os
 import threading
 import re
 from flask import Flask, request, jsonify, redirect, url_for, render_template, send_from_directory
-from waitress import serve
+
 from p2pool_data import P2poolData
 from client_data import ClientData
 
@@ -490,8 +490,8 @@ def serve_react(path):
     else:
         return send_from_directory(app.static_folder, 'index.html')
 def start_flask():
-    print("[+] Starting Flask server with Waitress on port 5000...")
-    serve(app, host="0.0.0.0", port=5000)
+
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
 
 def clear_file_contents(filepath):

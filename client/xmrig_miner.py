@@ -171,6 +171,14 @@ class XmrigMiner:
             stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
+        # --- Add this section to set priority ---
+        try:
+            p = psutil.Process(self.xmrig_data.xmrig_process.pid)
+            p.nice(psutil.HIGH_PRIORITY_CLASS)  # For Windows
+            # On Linux, you might use: p.nice(-10) # Lower number is higher priority
+            self.logger.log_message(f"[+] Set XMRig process (PID: {p.pid}) to high priority.")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            self.logger.log_message("[!] Could not set XMRig process priority. Run as admin/root for best results.")
 
         await asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
 
