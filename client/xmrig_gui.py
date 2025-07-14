@@ -4,6 +4,8 @@ import subprocess
 import sys
 import shutil
 import textwrap
+import json
+import time
 
 import psutil
 import tempfile
@@ -12,10 +14,11 @@ import aiohttp
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
-                             QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox)
+                             QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
+                             QSystemTrayIcon, QMenu, QAction)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QPixmap
 
 
 # Note: The XmrigData and XmrigMiner classes are imported by main.py and
@@ -158,170 +161,70 @@ class StatsDisplay(QWidget):
 
 
 class MinerGui(QWidget):
-    """The main GUI window for the application."""
-    # New signal to safely update stats on the GUI thread
     stats_update_signal = pyqtSignal(dict)
     force_update_signal = pyqtSignal(str)
 
     def __init__(self, xmrig_data, xmrig_miner, logger):
         super().__init__()
-        # --- Initialize Core Components ---
         self.xmrig_data = xmrig_data
         self.xmrig_miner = xmrig_miner
         self.logger = logger
         self.async_worker = None
+        self.gui_settings_path = os.path.join(os.path.dirname(sys.executable), "gui_settings.json")
 
-        # --- Build the UI ---
         self.init_ui()
+        self.init_tray_icon()
         self.connect_signals()
-        self.logger.log_message("Welcome! Please enter server details and click 'Connect'.")
+        self.load_settings()
+        self.show()
+        self.logger.log_message("Welcome! GUI Initialized. Please connect to the server.")
 
     def init_ui(self):
-        """Sets up all the widgets and layouts in the window."""
         self.setWindowTitle("Nate's Mining Client")
         self.setGeometry(100, 100, 1000, 700)
-        self.resize(1000, 700)
-        # --- Apply High-Contrast Black and White Stylesheet ---
         stylesheet = """
-                    /* Main Window and General Widget Styling */
-                    QWidget {
-                        background-color: #0D0D0D;  /* deep black */
-                        color: #FFFFFF;             /* white text */
-                        font-family: Segoe UI, sans-serif;
-                        font-size: 10pt;
-                    }
-
-                    /* Labels */
-                    QLabel {
-                        color: #FFFFFF;  /* white */
-                        background-color: transparent; /* Ensure labels don't have a background */
-                    }
-
-                    /* Buttons - Embossed Effect */
-                    QPushButton {
-                        background-color: #8B0000;  /* dark red */
-                        color: #FFFFFF;
-                        /* Emboss Effect: light top/left, dark bottom/right */
-                        border-top: 1px solid #B22222;    /* Lighter red for highlight */
-                        border-left: 1px solid #B22222;
-                        border-bottom: 1px solid #660000; /* Darker red for shadow */
-                        border-right: 1px solid #660000;
-                        padding: 8px 16px;
-                        border-radius: 4px;
-                        font-weight: bold;
-                    }
-
-                    QPushButton:hover {
-                        background-color: #9B111E; /* Slightly brighter red on hover */
-                        /* Maintain emboss effect on hover */
-                        border-top: 1px solid #C83C3C;
-                        border-left: 1px solid #C83C3C;
-                        border-bottom: 1px solid #7C0A0A;
-                        border-right: 1px solid #7C0A0A;
-                    }
-
-                    QPushButton:pressed {
-                        background-color: #660000;  /* darker red */
-                        /* Inset/Debossed Effect on press */
-                        border-top: 1px solid #550000;    /* Darker border on top */
-                        border-left: 1px solid #550000;
-                        border-bottom: 1px solid #B22222; /* Lighter border on bottom */
-                        border-right: 1px solid #B22222;
-                        padding-top: 9px; /* Shift text down to enhance pressed feel */
-                        padding-left: 17px;/* Shift text right */
-                    }
-
-                    QPushButton:disabled {
-                        background-color: #2A2A2A;
-                        color: #888888;
-                        /* Flat border for disabled state */
-                        border: 1px solid #444444;
-                    }
-
-                    /* Input Fields - Inset/Debossed Effect */
-                    QLineEdit, QPlainTextEdit {
-                        background-color: #1A1A1A;
-                        padding: 6px;
-                        border-radius: 4px;
-                        color: #FFFFFF;
-                        /* Inset Effect: dark top/left, light bottom/right */
-                        border-top: 1px solid #000000;   /* Black for shadow */
-                        border-left: 1px solid #000000;
-                        border-bottom: 1px solid #2E2E2E;/* Gray for highlight */
-                        border-right: 1px solid #2E2E2E;
-                    }
-
-                    /* Frames and Separators */
-                    QFrame {
-                        /* Made slightly darker to blend with the inset inputs */
-                        border: 1px solid #252525;
-                    }
-
-                    /* Collapsible Box Headers */
-                    QToolButton {
-                        color: #FF4C4C;  /* bright red */
-                        font-size: 12pt;
-                        font-weight: bold;
-                        background-color: transparent; /* Ensure no background conflicts */
-                        border: none;
-                    }
-
-                    /* Form Layout Label Styling */
-                    QFormLayout QLabel {
-                        font-weight: bold;
-                        color: #FFFFFF;
-                    }
-
-                    /* Console Title */
-                    #consoleTitle {
-                        font-size: 11pt;
-                        font-weight: bold;
-                        padding-top: 10px;
-                        color: #FF4C4C;
-                    }
-
-                    /* Scrollbar (optional for better visual consistency) */
-                    QScrollBar:vertical {
-                        border: none;
-                        background: #1A1A1A;
-                        width: 8px;
-                        margin: 0px 0px 0px 0px;
-                    }
-                    QScrollBar::handle:vertical {
-                        background: #FF4C4C;
-                        min-height: 20px;
-                        border-radius: 4px;
-                    }
+            QWidget { background-color: #0D0D0D; color: #FFFFFF; font-family: Segoe UI, sans-serif; font-size: 10pt; }
+            QLabel { color: #FFFFFF; background-color: transparent; }
+            QPushButton { background-color: #8B0000; color: #FFFFFF; border-top: 1px solid #B22222; border-left: 1px solid #B22222; border-bottom: 1px solid #660000; border-right: 1px solid #660000; padding: 8px 16px; border-radius: 4px; font-weight: bold; }
+            QPushButton:hover { background-color: #9B111E; border-top: 1px solid #C83C3C; border-left: 1px solid #C83C3C; border-bottom: 1px solid #7C0A0A; border-right: 1px solid #7C0A0A; }
+            QPushButton:pressed { background-color: #660000; border-top: 1px solid #550000; border-left: 1px solid #550000; border-bottom: 1px solid #B22222; border-right: 1px solid #B22222; padding-top: 9px; padding-left: 17px; }
+            QPushButton:disabled { background-color: #2A2A2A; color: #888888; border: 1px solid #444444; }
+            QLineEdit, QPlainTextEdit { background-color: #1A1A1A; padding: 6px; border-radius: 4px; color: #FFFFFF; border-top: 1px solid #000000; border-left: 1px solid #000000; border-bottom: 1px solid #2E2E2E; border-right: 1px solid #2E2E2E; }
+            QFrame { border: 1px solid #252525; }
+            QToolButton { color: #FF4C4C; font-size: 12pt; font-weight: bold; background-color: transparent; border: none; }
+            QFormLayout QLabel { font-weight: bold; color: #FFFFFF; }
+            #consoleTitle { font-size: 11pt; font-weight: bold; padding-top: 10px; color: #FF4C4C; }
+            QScrollBar:vertical { border: none; background: #1A1A1A; width: 8px; margin: 0px; }
+            QScrollBar::handle:vertical { background: #FF4C4C; min-height: 20px; border-radius: 4px; }
         """
         self.setStyleSheet(stylesheet)
-
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(15)
-
-        # --- Stats Display ---
         main_layout.addWidget(QLabel("<b>Live Statistics</b>"))
         self.stats_display = StatsDisplay()
         main_layout.addWidget(self.stats_display)
         main_layout.addWidget(QFrame(self, frameShape=QFrame.HLine, frameShadow=QFrame.Sunken))
-
-        # --- Collapsible Connection Box ---
         connection_box = CollapsibleBox("Connection Settings", start_expanded=True)
         connection_form = QFormLayout()
-        self.server_url_input = QLineEdit("http://192.168.0.10:5000")
-        self.client_id_input = QLineEdit("Nate's Miner")
+        self.server_url_input = QLineEdit()
+        self.client_id_input = QLineEdit()
         self.connect_button = QPushButton("Connect to Server")
+        self.save_button = QPushButton("Save Settings")
+        self.load_button = QPushButton("Load Settings")
         connection_form.addRow("Server URL:", self.server_url_input)
         connection_form.addRow("Client ID:", self.client_id_input)
-        connection_form.addRow(self.connect_button)
+        conn_button_layout = QHBoxLayout()
+        conn_button_layout.addWidget(self.connect_button)
+        conn_button_layout.addWidget(self.save_button)
+        conn_button_layout.addWidget(self.load_button)
+        connection_form.addRow(conn_button_layout)
         connection_box.setContentLayout(connection_form)
         main_layout.addWidget(connection_box)
-
-        # --- Collapsible Mining Box ---
         mining_box = CollapsibleBox("Mining Configuration", start_expanded=True)
         mining_form = QFormLayout()
-        self.pool_ip_input = QLineEdit("192.168.0.10:3333")
-        self.thread_count_input = QLineEdit("4")
+        self.pool_ip_input = QLineEdit()
+        self.thread_count_input = QLineEdit()
         self.mine_button = QPushButton("Start Mining")
         self.stop_button = QPushButton("Stop Mining")
         self.mine_button.setEnabled(False)
@@ -334,67 +237,143 @@ class MinerGui(QWidget):
         mining_form.addRow(button_layout)
         mining_box.setContentLayout(mining_form)
         main_layout.addWidget(mining_box)
-
-        # --- Console Output ---
         console_label = QLabel("<b>Console Output:</b>")
         console_label.setObjectName("consoleTitle")
-        console_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)  # Keep label small but flexible
         main_layout.addWidget(console_label)
-
         self.console_output = QPlainTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setMinimumHeight(150)  # Set fixed height for the console box
         self.console_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.console_output)
-
-        # Add a spacer at the end to push everything up
         main_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
-        # Set stretch factors to give more space to the console
-        main_layout.setStretch(6, 1)  # Console
+    def resource_path(self, relative_path):
+        """ Get absolute path to resource, works for dev and for PyInstaller """
+        try:
+            # PyInstaller creates a temp folder and stores path in _MEIPASS
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+        return os.path.join(base_path, relative_path)
+    def init_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+
+        icon_path = self.resource_path("icon.png")
+        if os.path.exists(icon_path):
+            self.tray_icon.setIcon(QIcon(icon_path))
+        else:
+            self.logger.log_message("[!] icon.png not found. Using default fallback icon.")
+            pixmap = QPixmap(32, 32)
+            pixmap.fill(Qt.transparent)
+            from PyQt5.QtGui import QPainter, QBrush
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setBrush(QBrush(Qt.red))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(0, 0, 32, 32)
+            painter.end()
+            self.tray_icon.setIcon(QIcon(pixmap))
+
+        self.tray_icon.setToolTip("Nate's Mining Client")
+        tray_menu = QMenu()
+        self.show_action = QAction("Show Window", self)
+        self.show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(self.show_action)
+        tray_menu.addSeparator()
+        self.start_action = QAction("Start Mining", self)
+        self.start_action.triggered.connect(self.handle_start_mining)
+        tray_menu.addAction(self.start_action)
+        self.stop_action = QAction("Stop Mining", self)
+        self.stop_action.triggered.connect(self.handle_stop_mining)
+        tray_menu.addAction(self.stop_action)
+        tray_menu.addSeparator()
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(self.exit_action)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+        self.tray_icon.activated.connect(self.handle_tray_activated)
+    def handle_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def connect_signals(self):
-        """Connects button clicks and logger signals to their handler methods."""
-        self.connect_button.clicked.connect(self.handle_connect)
+        self.connect_button.clicked.connect(lambda: self.handle_connect(start_mining_on_success=False))
+        self.save_button.clicked.connect(self.save_settings)
+        self.load_button.clicked.connect(self.load_settings)
         self.mine_button.clicked.connect(self.handle_start_mining)
         self.stop_button.clicked.connect(self.handle_stop_mining)
         self.logger.message_signal.connect(self.update_console)
         self.stats_update_signal.connect(self.stats_display.update_stats)
         self.force_update_signal.connect(self.handle_force_update)
 
+    def save_settings(self):
+        settings = {
+            "server_url": self.server_url_input.text(),
+            "client_id": self.client_id_input.text(),
+            "pool_ip": self.pool_ip_input.text(),
+            "thread_count": self.thread_count_input.text()
+        }
+        try:
+            with open(self.gui_settings_path, 'w') as f:
+                json.dump(settings, f, indent=4)
+            self.logger.log_message("[+] GUI settings saved successfully.")
+        except Exception as e:
+            self.logger.log_message(f"[!] Error saving GUI settings: {e}")
+
+    def load_settings(self):
+        try:
+            if os.path.exists(self.gui_settings_path):
+                with open(self.gui_settings_path, 'r') as f:
+                    settings = json.load(f)
+                self.server_url_input.setText(settings.get("server_url", "http://127.0.0.1:5000"))
+                self.client_id_input.setText(settings.get("client_id", "DefaultMiner"))
+                self.pool_ip_input.setText(settings.get("pool_ip", "127.0.0.1:3333"))
+                self.thread_count_input.setText(settings.get("thread_count", "4"))
+                self.logger.log_message("[+] GUI settings loaded successfully.")
+            else:
+                self.logger.log_message("[+] No GUI settings file found, using default values.")
+                self.server_url_input.setText("http://127.0.0.1:5000")
+                self.client_id_input.setText("DefaultMiner")
+                self.pool_ip_input.setText("127.0.0.1:3333")
+                self.thread_count_input.setText("4")
+        except (json.JSONDecodeError, Exception) as e:
+            self.logger.log_message(f"[!] Error loading GUI settings, using defaults: {e}")
+            self.server_url_input.setText("http://127.0.0.1:5000")
+            self.client_id_input.setText("DefaultMiner")
+            self.pool_ip_input.setText("127.0.0.1:3333")
+            self.thread_count_input.setText("4")
+
     @pyqtSlot(str)
     def update_console(self, message):
-        """Appends a message to the console widget in a thread-safe way."""
         self.console_output.appendPlainText(message)
 
     @pyqtSlot(str)
     def handle_force_update(self, download_url):
-        """Handles a forced update command from the server, skipping the user prompt."""
-        self.logger.log_message("[UPDATE] Forced update triggered by server.")
+        self.logger.log_message(f"[UPDATE] Forced update triggered by server from URL: {download_url}")
         self.progress_dialog = QProgressDialog("Downloading forced update...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowTitle("Downloading Update")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.show()
-        # Start the download process
         asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url),
                                          self.async_worker.loop)
 
-    def handle_connect(self):
-        """Handles the 'Connect' button click by starting the async worker."""
+    def handle_connect(self, start_mining_on_success=False):
         server_url = self.server_url_input.text().strip()
         client_id = self.client_id_input.text().strip()
         if not (server_url and client_id):
             self.logger.log_message("[!] Please provide both Server URL and Client ID.")
             return
-
         self.xmrig_data.FLASK_SERVER_URL = server_url
         self.xmrig_data.client_id = client_id
-
         if not self.async_worker or not self.async_worker.isRunning():
             self.logger.log_message("[+] Starting background services...")
-            self.async_worker = AsyncWorker(self.run_async_tasks())
+            self.async_worker = AsyncWorker(self.run_async_tasks(start_mining_on_success))
             self.async_worker.start()
-
             self.connect_button.setEnabled(False)
             self.server_url_input.setDisabled(True)
             self.client_id_input.setDisabled(True)
@@ -402,7 +381,6 @@ class MinerGui(QWidget):
             self.stop_button.setEnabled(True)
 
     def handle_start_mining(self):
-        """Validates inputs and schedules the start_miner coroutine."""
         try:
             threads = int(self.thread_count_input.text().strip())
             pool = self.pool_ip_input.text().strip()
@@ -410,128 +388,173 @@ class MinerGui(QWidget):
         except ValueError:
             self.logger.log_message("[!] Invalid thread count or pool address.")
             return
-
         if self.async_worker and self.async_worker.isRunning():
-            asyncio.run_coroutine_threadsafe(
-                self.xmrig_miner.start_miner(pool, threads),
-                self.async_worker.loop
-            )
+            self.logger.log_message("[+] Start mining command issued from GUI.")
+            asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(pool, threads), self.async_worker.loop)
 
     def handle_stop_mining(self):
-        """Schedules the stop_miner coroutine."""
         if self.async_worker and self.async_worker.isRunning():
-            asyncio.run_coroutine_threadsafe(
-                self.xmrig_miner.stop_miner(),
-                self.async_worker.loop
-            )
+            self.logger.log_message("[+] Stop mining command issued from GUI.")
+            asyncio.run_coroutine_threadsafe(self.xmrig_miner.stop_miner(), self.async_worker.loop)
 
-    async def run_async_tasks(self):
-        """The main async function that orchestrates all background tasks."""
+    async def run_async_tasks(self, start_mining_on_success=False):
         self.logger.log_message(f"[+] Connecting to {self.xmrig_data.FLASK_SERVER_URL} as {self.xmrig_data.client_id}")
-        self.xmrig_data.aiohttp_client_session = aiohttp.ClientSession()
-
-        polling_task = asyncio.create_task(
-            self.xmrig_miner.poll_server(self.xmrig_data.aiohttp_client_session, self.force_update_signal))
-        reporter_task = asyncio.create_task(
-            self.xmrig_miner.periodic_reporter(self.xmrig_data.aiohttp_client_session, self.stats_update_signal))
-
-        self.logger.log_message("[+] Background services running. Ready to mine.")
-        await asyncio.gather(polling_task, reporter_task)
+        async with aiohttp.ClientSession() as session:
+            self.xmrig_data.aiohttp_client_session = session
+            if start_mining_on_success:
+                self.logger.log_message("[+] Silent mode: Auto-starting miner in 3 seconds...")
+                await asyncio.sleep(3)
+                pool = self.pool_ip_input.text().strip()
+                threads = int(self.thread_count_input.text().strip())
+                await self.xmrig_miner.start_miner(pool, threads)
+            polling_task = asyncio.create_task(self.xmrig_miner.poll_server(session, self.force_update_signal))
+            reporter_task = asyncio.create_task(self.xmrig_miner.periodic_reporter(session, self.stats_update_signal))
+            self.logger.log_message("[+] Background services running.")
+            await asyncio.gather(polling_task, reporter_task)
 
     def closeEvent(self, event):
-        """Ensures a clean shutdown when the window is closed."""
-        self.logger.log_message("[!] Shutting down application...")
-        if self.async_worker and self.async_worker.isRunning():
-            self.handle_stop_mining()
-            if self.xmrig_data.aiohttp_client_session:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.xmrig_data.aiohttp_client_session.close(),
-                    self.async_worker.loop
-                )
-                try:
-                    future.result(timeout=5)
-                except (asyncio.TimeoutError, Exception) as e:
-                    self.logger.log_message(f"[!] Error closing session: {e}")
-
-            self.async_worker.loop.call_soon_threadsafe(self.async_worker.loop.stop)
-            self.async_worker.wait(5000)
-        event.accept()
-
-    def create_and_run_updater_script(self, new_exe_path: str) -> None:
-        """
-        Creates and runs a Windows batch script to replace the current executable with a new one.
-        """
-        self.logger.log_message("[+] Started updater script")
-
-        current_exe = os.path.basename(sys.executable)
-        base_dir = os.path.dirname(sys.executable)
-        new_exe = os.path.basename(new_exe_path)
-
-        # Create a .bat script
-        script_content = textwrap.dedent(f"""\
-            @echo off
-            echo Waiting for application to close...
-            timeout /t 2 /nobreak >nul
-
-            echo Killing process {current_exe}...
-            taskkill /f /im "{current_exe}" >nul 2>&1
-
-            echo Waiting for file to unlock...
-            ping 127.0.0.1 -n 4 >nul
-
-            echo Replacing executable...
-            del "{current_exe}" >nul 2>&1
-            move /Y "{new_exe}" "{current_exe}"
-
-            echo Relaunching application...
-            start "" "{current_exe}"
-
-            echo Cleaning up updater...
-            del "%~f0"
-        """)
-
-        # Save the .bat file in the same directory as the EXE
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bat", dir=base_dir, mode='w', encoding='utf-8') as tmp:
-            tmp.write(script_content)
-            updater_bat_path = os.path.normpath(tmp.name)
-
-        # Copy the downloaded new exe into the base directory (if not already there)
-        if os.path.dirname(new_exe_path) != base_dir:
-            shutil.copy2(new_exe_path, os.path.join(base_dir, new_exe))
-
-        # Run the updater script
-        self.logger.log_message(f"[+] Running updater batch file: {updater_bat_path}")
-        subprocess.Popen(
-            ["cmd.exe", "/c", updater_bat_path],
-            cwd=base_dir,
-            creationflags=subprocess.CREATE_NEW_CONSOLE
+        event.ignore()
+        self.hide()
+        self.tray_icon.showMessage(
+            "Still Running",
+            "The mining client is still running in the background.",
+            QSystemTrayIcon.Information,
+            2000
         )
 
-        self.logger.log_message("[+] Exiting current process for updater...")
-        os._exit(0)
+    def quit_application(self):
+        self.logger.log_message("[!] Exiting application from tray menu...")
+        self.tray_icon.hide()
+        if self.async_worker and self.async_worker.isRunning():
+            self.handle_stop_mining()
+            if self.xmrig_data.aiohttp_client_session and not self.xmrig_data.aiohttp_client_session.closed:
+                future = asyncio.run_coroutine_threadsafe(self.xmrig_data.aiohttp_client_session.close(),
+                                                          self.async_worker.loop)
+                try:
+                    future.result(timeout=2)
+                except (asyncio.TimeoutError, Exception) as e:
+                    self.logger.log_message(f"[!] Error closing session: {e}")
+            if self.async_worker.loop.is_running():
+                self.async_worker.loop.call_soon_threadsafe(self.async_worker.loop.stop)
+            self.async_worker.wait(3000)
+        QApplication.instance().quit()
+
+    def create_and_run_updater_script(self, new_exe_path: str) -> None:
+        self.logger.log_message("[+] Initializing application update process...")
+        try:
+            current_exe = os.path.basename(sys.executable)
+            base_dir = os.path.dirname(sys.executable)
+            new_exe_name = "client_new.exe"
+            new_exe_temp_path = os.path.join(base_dir, new_exe_name)
+
+            if not os.path.exists(new_exe_path):
+                self.logger.log_message(f"[!] CRITICAL: Downloaded update file not found at {new_exe_path}. Aborting.")
+                return
+            if os.path.normpath(new_exe_path) != os.path.normpath(new_exe_temp_path):
+                self.logger.log_message(f"[+] Staging update file to {new_exe_temp_path}...")
+                shutil.copy2(new_exe_path, new_exe_temp_path)
+
+            script_content = textwrap.dedent(f"""\
+                @echo off
+                title Application Updater
+                echo =================================================
+                echo.
+                echo       THIS SCRIPT IS UPDATING THE APPLICATION
+                echo.
+                echo =================================================
+                echo.
+                echo [+] Waiting for the main application to close (3 seconds)...
+                %SystemRoot%\\System32\\timeout.exe /t 3 /nobreak >nul
+                echo.
+                echo [STEP 1] Terminating the running application: {current_exe}
+                %SystemRoot%\\System32\\taskkill.exe /f /im "{current_exe}"
+                echo      Result Code: %errorlevel% (0=Success, 128=Not Found)
+                echo.
+                echo [+] Waiting for file locks to be released (5 seconds)...
+                %SystemRoot%\\System32\\timeout.exe /t 5 /nobreak >nul
+                echo.
+                echo [STEP 2] Deleting the old executable...
+                del /F /Q "{current_exe}"
+                echo      Result Code: %errorlevel% (0=Success)
+                echo.
+                echo [STEP 3] Verifying new update file exists...
+                if not exist "{new_exe_name}" (
+                    echo [!!!] ERROR: New update file '{new_exe_name}' not found!
+                    goto:fail
+                )
+                echo      Update file found.
+                echo.
+                echo [STEP 4] Renaming new version to '{current_exe}'...
+                move /Y "{new_exe_name}" "{current_exe}"
+                echo      Result Code: %errorlevel% (0=Success)
+                echo.
+                echo [STEP 5] Relaunching the application...
+                start "" "{os.path.join(base_dir, current_exe)}"
+                echo.
+                echo =================================================
+                echo  UPDATE COMPLETE! This window will self-destruct.
+                echo =================================================
+                goto:end
+                :fail
+                echo.
+                echo [!!!] UPDATE FAILED! Please report the error codes above.
+                pause
+                :end
+                (goto) 2>nul & del "%~f0"
+            """)
+            updater_bat_path = os.path.join(base_dir, "updater.bat")
+            with open(updater_bat_path, "w", encoding="utf-8") as f:
+                f.write(script_content)
+            self.logger.log_message(f"[+] Updater script created at: {updater_bat_path}")
+
+            self.logger.log_message("[+] Attempting to launch updater via os.startfile...")
+            os.startfile(updater_bat_path)
+
+            self.logger.log_message("[+] Exiting current process to allow the update to proceed.")
+            time.sleep(0.5)
+            os._exit(0)
+        except Exception as e:
+            self.logger.log_message(f"[!] CRITICAL: Failed to create or run updater script: {e}")
+            QMessageBox.critical(self, "Update Error",
+                                 f"Could not create the updater script: {e}\n\nPlease check logs and antivirus settings.")
 
     async def download_update(self, session, url):
+        save_path = os.path.join(os.path.dirname(sys.executable), "client_new.exe")
         try:
+            self.logger.log_message(f"[+] Starting download from {url}...")
             async with session.get(url) as response:
                 response.raise_for_status()
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded_size = 0
-
-                base_dir = os.path.dirname(sys.executable)  # ✅ FIX
-                save_path = os.path.join(base_dir, "client_new.exe")
-
                 with open(save_path, 'wb') as f:
                     async for chunk in response.content.iter_chunked(8192):
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        self.logger.log_message(f"[+] Downloaded {downloaded_size} bytes / {total_size} bytes")
-
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            if hasattr(self, 'progress_dialog'):
+                                progress = int((downloaded_size / total_size) * 100) if total_size > 0 else 0
+                                self.progress_dialog.setValue(progress)
                 self.logger.log_message(f"[+] Download complete: {save_path}")
+                if hasattr(self, 'progress_dialog'):
+                    self.progress_dialog.setLabelText("Download complete. Starting update...")
                 self.create_and_run_updater_script(save_path)
-
+        except aiohttp.ClientError as e:
+            self.logger.log_message(f"[!] Network error during download: {e}")
+            if hasattr(self, 'progress_dialog'): self.progress_dialog.close()
+            QMessageBox.critical(self, "Download Error",
+                                 f"Could not download the update.\nCheck connection and server URL.\n\nError: {e}")
+        except IOError as e:
+            self.logger.log_message(f"[!] File error saving update: {e}. Check permissions.")
+            if hasattr(self, 'progress_dialog'): self.progress_dialog.close()
+            QMessageBox.critical(self, "File Error",
+                                 f"Could not save the update file.\nCheck write permissions.\n\nError: {e}")
         except Exception as e:
-            self.logger.log_message(f"[!] Download failed: {e}")
-            if self.progress_dialog:
-                self.progress_dialog.setValue(0)
-                self.progress_dialog.setLabelText("Download Failed!")
-                QMessageBox.critical(self, "Error", f"Failed to download update: {e}")
+            self.logger.log_message(f"[!] An unexpected error occurred during update: {e}")
+            if hasattr(self, 'progress_dialog'): self.progress_dialog.close()
+            QMessageBox.critical(self, "Update Failed", f"An unexpected error occurred: {e}")
+        finally:
+            if os.path.exists(save_path) and 'self.create_and_run_updater_script' not in sys.exc_info():
+                try:
+                    os.remove(save_path)
+                except OSError as e:
+                    self.logger.log_message(f"Error cleaning up failed download: {e}")

@@ -26,23 +26,5 @@ pre {
   word-break: break-all; /* Breaks long strings that might overflow */
 }
 
-/*
-  General container styling if needed, though MUI's <Container> component handles this well.
-  You can add padding or other global layout styles here.
-*/
-.container {
-  padding: 20px;
-}
 
-/*
-  The following rules from your original CSS have been removed because they
-  were forcing a white background and black text, which conflicts with the
-  Material-UI dark theme.
 
-  - body { background-color, color }
-  - h2 { color }
-  - table, th, td, tr styles related to background-color and color
-
-  By removing them, the styles from the `darkTheme` object in your App.js
-  (like `background.paper` and `text.primary`) can now apply correctly.
-*/

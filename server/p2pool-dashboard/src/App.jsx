@@ -222,7 +222,7 @@ function App() {
 
     const titles = { sidechain: "SideChain Status", stratum: "Stratum Server Status", p2p: "P2P Server Status" };
     return (
-        <Grid container spacing={2}>
+        <Grid container spacing={2} display={"flex"} justifyContent={"center"}>
             {Object.entries(data).map(([sectionKey, sectionData]) => (
                 Object.keys(sectionData).length > 0 && (
                     <Grid item xs={12} md={4} key={sectionKey}>
@@ -289,7 +289,7 @@ function App() {
   return (
     <ThemeProvider theme={darkTheme}>
         <CssBaseline />
-        <Container maxWidth="xl" sx={{ py: 3 }}>
+        <div>
             <Typography variant="h3" gutterBottom component="h1" sx={{ fontWeight: 'bold', textAlign: 'center', mb: 4 }}>
                 Miner Dashboard
             </Typography>
@@ -392,11 +392,12 @@ function App() {
             <Card sx={{ mb: 3 }}>
                 <CardContent>
                     <Typography variant="h5" component="div" gutterBottom>System Control</Typography>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, flexWrap: 'wrap' }}>
                         <Button variant="contained" onClick={handleRestartP2Pool} startIcon={<RestartAlt />} disabled={loading['/restart_p2pool']}>
                             {loading['/restart_p2pool'] ? 'Restarting...' : 'Restart P2Pool'}
                         </Button>
-                        <form onSubmit={handleConnectToWifi} style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                        <Typography variant="h5" component="div" gutterBottom>Connect to Wifi</Typography>
+                        <form onSubmit={handleConnectToWifi} style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
                             <TextField label="Network SSID" variant="outlined" size="small" value={wifi.ssid} onChange={e => setWifi({...wifi, ssid: e.target.value})} />
                             <TextField label="Password" type="password" variant="outlined" size="small" value={wifi.password} onChange={e => setWifi({...wifi, password: e.target.value})} />
                             <Button type="submit" variant="contained" startIcon={<Wifi />} disabled={loading['/connect_wifi']}>{loading['/connect_wifi'] ? 'Connecting...' : 'Connect'}</Button>
@@ -406,7 +407,7 @@ function App() {
             </Card>
 
             <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', mt: 4 }}>Event Logs</Typography>
-            <Grid container spacing={3}>
+            <Grid container spacing={3} sx={{display: "flex", justifyContent: "center"}}>
                 <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found} /></Grid>
                 <Grid item xs={12} lg={6}><EventTable title="Blocks Found" events={events.blocks_found} /></Grid>
                 <Grid item xs={12} lg={6}><EventTable title="New Miner Data" events={events.miner_data} /></Grid>
@@ -439,7 +440,7 @@ function App() {
                 </DialogActions>
             </Dialog>
 
-        </Container>
+        </div>
     </ThemeProvider>
   );
 }
