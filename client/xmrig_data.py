@@ -141,6 +141,12 @@ class HardwareMonitor(Thread):
         """Signals the thread to stop."""
         self._stop_event.set()
 
+    def deinitialize(self):
+        """Public method to stop and clean up the hardware monitor thread."""
+        self.logger.log_message("[*] Deinitializing hardware monitor...")
+        self.stop()
+        self.join(timeout=5)  # Ensure cleanup finishes
+        self.logger.log_message("[+] Hardware monitor shut down cleanly.")
 
 class XmrigData:
     def __init__(self, Logger):

@@ -43,7 +43,7 @@ if __name__ == "__main__":
         # Format the exception traceback
         error_msg = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
         print(f"[!] Fatal startup crash:\n{error_msg}")
-
+        xmrig_data.hardware_monitor.deinitialize()
         # Try to log the crash to a file
         try:
             with open("fatal_boot_crash.log", "w", encoding="utf-8") as f:

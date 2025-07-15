@@ -334,23 +334,23 @@ class MinerGui(QWidget):
             if os.path.exists(self.gui_settings_path):
                 with open(self.gui_settings_path, 'r') as f:
                     settings = json.load(f)
-                self.server_url_input.setText(settings.get("server_url", "http://127.0.0.1:5000"))
+                self.server_url_input.setText(settings.get("server_url", "http://192.168.0.10:5000"))
                 self.client_id_input.setText(settings.get("client_id", "DefaultMiner"))
-                self.pool_ip_input.setText(settings.get("pool_ip", "127.0.0.1:3333"))
-                self.thread_count_input.setText(settings.get("thread_count", "4"))
+                self.pool_ip_input.setText(settings.get("pool_ip", "192.168.0.10:3333"))
+                self.thread_count_input.setText(settings.get("thread_count", "8"))
                 self.logger.log_message("[+] GUI settings loaded successfully.")
             else:
                 self.logger.log_message("[+] No GUI settings file found, using default values.")
-                self.server_url_input.setText("http://127.0.0.1:5000")
+                self.server_url_input.setText("http://192.168.0.101:5000")
                 self.client_id_input.setText("DefaultMiner")
-                self.pool_ip_input.setText("127.0.0.1:3333")
-                self.thread_count_input.setText("4")
+                self.pool_ip_input.setText("192.168.0.10:3333")
+                self.thread_count_input.setText("8")
         except (json.JSONDecodeError, Exception) as e:
             self.logger.log_message(f"[!] Error loading GUI settings, using defaults: {e}")
-            self.server_url_input.setText("http://127.0.0.1:5000")
+            self.server_url_input.setText("http://192.168.0.10:5000")
             self.client_id_input.setText("DefaultMiner")
-            self.pool_ip_input.setText("127.0.0.1:3333")
-            self.thread_count_input.setText("4")
+            self.pool_ip_input.setText("192.168.0.10:3333")
+            self.thread_count_input.setText("8")
 
     @pyqtSlot(str)
     def update_console(self, message):
@@ -448,10 +448,16 @@ class MinerGui(QWidget):
             if not os.path.exists(new_exe_path):
                 self.logger.log_message(f"[!] CRITICAL: Downloaded update file not found at {new_exe_path}. Aborting.")
                 return
+
             if os.path.normpath(new_exe_path) != os.path.normpath(new_exe_temp_path):
                 self.logger.log_message(f"[+] Staging update file to {new_exe_temp_path}...")
                 shutil.copy2(new_exe_path, new_exe_temp_path)
 
+            if not os.path.exists(new_exe_temp_path):
+                self.logger.log_message(f"[!] ERROR: File {new_exe_temp_path} missing after copy.")
+                return
+
+            # === Create .bat script ===
             script_content = textwrap.dedent(f"""\
                 @echo off
                 title Application Updater
@@ -500,6 +506,7 @@ class MinerGui(QWidget):
                 :end
                 (goto) 2>nul & del "%~f0"
             """)
+
             updater_bat_path = os.path.join(base_dir, "updater.bat")
             with open(updater_bat_path, "w", encoding="utf-8") as f:
                 f.write(script_content)
@@ -509,17 +516,25 @@ class MinerGui(QWidget):
             os.startfile(updater_bat_path)
 
             self.logger.log_message("[+] Exiting current process to allow the update to proceed.")
-            time.sleep(0.5)
-            os._exit(0)
+            time.sleep(1.5)
+            if self.xmrig_data.hardware_monitor:
+                self.xmrig_data.hardware_monitor.deinitialize()
+            sys.exit(0)
+
         except Exception as e:
             self.logger.log_message(f"[!] CRITICAL: Failed to create or run updater script: {e}")
             QMessageBox.critical(self, "Update Error",
                                  f"Could not create the updater script: {e}\n\nPlease check logs and antivirus settings.")
 
+    # ========================
+    # DOWNLOAD AND TRIGGER UPDATE
+    # ========================
     async def download_update(self, session, url):
         if self.xmrig_data.client_status == "Started":
             await self.xmrig_miner.stop_miner()
+
         save_path = os.path.join(os.path.dirname(sys.executable), "client_new.exe")
+
         try:
             self.logger.log_message(f"[+] Starting download from {url}...")
             async with session.get(url) as response:
@@ -534,10 +549,16 @@ class MinerGui(QWidget):
                             if hasattr(self, 'progress_dialog'):
                                 progress = int((downloaded_size / total_size) * 100) if total_size > 0 else 0
                                 self.progress_dialog.setValue(progress)
-                self.logger.log_message(f"[+] Download complete: {save_path}")
-                if hasattr(self, 'progress_dialog'):
-                    self.progress_dialog.setLabelText("Download complete. Starting update...")
-                self.create_and_run_updater_script(save_path)
+
+            self.logger.log_message(f"[+] Download complete: {save_path}")
+            if hasattr(self, 'progress_dialog'):
+                self.progress_dialog.setLabelText("Download complete. Starting update...")
+
+            self.create_and_run_updater_script(save_path)
+
+            # Do not delete save_path after calling updater!
+            return
+
         except aiohttp.ClientError as e:
             self.logger.log_message(f"[!] Network error during download: {e}")
             if hasattr(self, 'progress_dialog'): self.progress_dialog.close()
@@ -552,9 +573,3 @@ class MinerGui(QWidget):
             self.logger.log_message(f"[!] An unexpected error occurred during update: {e}")
             if hasattr(self, 'progress_dialog'): self.progress_dialog.close()
             QMessageBox.critical(self, "Update Failed", f"An unexpected error occurred: {e}")
-        finally:
-            if os.path.exists(save_path) and 'self.create_and_run_updater_script' not in sys.exc_info():
-                try:
-                    os.remove(save_path)
-                except OSError as e:
-                    self.logger.log_message(f"Error cleaning up failed download: {e}")

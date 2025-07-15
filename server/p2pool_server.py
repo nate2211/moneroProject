@@ -6,11 +6,13 @@ import threading
 import re
 from flask import Flask, request, jsonify, redirect, url_for, render_template, send_from_directory
 from flask_cors import CORS
-from p2pool_data import P2poolData
+from p2pool_data import P2poolData, EventProcessor, RawLogProcessor
 from client_data import ClientData
 
 p2pooldata = P2poolData()
 clientdata = ClientData()
+event_processor = EventProcessor(p2pooldata)
+raw_log_processor = RawLogProcessor(p2pooldata)
 ELECTRICITY_RATE_PER_KWH = 0.13
 COMMAND_QUEUE = {}
 
@@ -365,40 +367,18 @@ def get_totals():
     return jsonify({"total_hashrate":total_hashrate, "total_cpu_shares":total_cpu_shares,"total_gpu_shares":total_gpu_shares, "total_temp":average_temp, "total_cost":total_cost, "total_power_draw":total_power_draw})
 @app.route("/api/events", methods=["GET"])
 def get_events():
-    shares_found = []
-    jobs_sent = []
-    miner_data = []
-    blocks_found = []
-    other_events = []
+    """
+    Efficiently gets the latest events from the in-memory cache
+    managed by the EventProcessor.
+    """
+    # Allow the client to request a different number of events
+    try:
+        limit = int(request.args.get('limit', 10))
+    except (ValueError, TypeError):
+        limit = 10
 
-    if os.path.exists(p2pooldata.EVENT_LOG):  # Check if the event log file exists
-        with open(p2pooldata.EVENT_LOG, "r", encoding="utf-8") as f:
-            for line in list(f.readlines()):
-                match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
-                if match:
-                    event = {
-                        "time": match.group(1),
-                        "type": match.group(2),
-                        "message": match.group(3).strip()
-                    }
-                    if event["type"] == "Found Share":
-                        shares_found.insert(0, event)
-                    elif event["type"] == "Sent Jobs":
-                        jobs_sent.insert(0, event)
-                    elif event["type"] == "New Miner Data":
-                        miner_data.insert(0, event)
-                    elif event["type"] == "Found Block":  # This is where "Found Block" is classified
-                        blocks_found.insert(0, event)
-                    else:
-                        other_events.insert(0, event)
-    limit = 10
-    return jsonify({
-        "shares_found": shares_found[-limit:],
-        "jobs_sent": jobs_sent[-limit:],
-        "miner_data": miner_data[-limit:],
-        "blocks_found": blocks_found[-limit:],
-        "other_events": other_events[-limit:]
-    })
+    events = event_processor.get_all_events(limit=limit)
+    return jsonify(events)
 @app.route("/hashrate", methods=["POST"])
 def receive_hashrate():
     data = request.get_json()
@@ -552,42 +532,57 @@ def clear_all_client_data():
 
 
 if __name__ == "__main__":
-    # --- Startup ---
-    clear_all_client_data()
+    print("[+] Initializing application...")
+
+    # --- Startup Tasks ---
     clear_file_contents(p2pooldata.EVENT_LOG)
     clear_file_contents(p2pooldata.RAW_LOG)
 
     # --- Start Background Services ---
-    threading.Thread(target=start_flask, daemon=True).start()
-    threading.Thread(target=p2pooldata.log_writer, daemon=True).start()
+    # IMPORTANT: Pass the function reference (without parentheses) to the target.
 
-    # --- P2Pool Handling ---
-    time.sleep(1)  # Give server thread a moment to initialize
-    p2pool_proc = None  # Define p2pool_proc in the main scope
+    # 1. Thread to process the raw p2pool output
+    raw_log_thread = threading.Thread(target=raw_log_processor.run_in_background, daemon=True)
+    raw_log_thread.start()
+    print("[+] Raw log processor thread started.")
 
+    # 2. Thread to write processed logs to event_log.txt
+    log_writer_thread = threading.Thread(target=p2pooldata.log_writer, daemon=True)
+    log_writer_thread.start()
+    print("[+] Log writer thread started.")
+
+    # 3. Thread to read event_log.txt and populate data for the API
+    event_processor_thread = threading.Thread(target=event_processor.run_in_background, daemon=True)
+    event_processor_thread.start()
+    print("[+] Event processor thread started.")
+
+    # 4. Thread for the Flask web server
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    print("[+] Flask server thread started.")
+
+    # --- P2Pool Process Handling ---
     if p2pooldata.start_p2pool_direct():
-        p2pool_proc = p2pooldata.p2pool_proc
-        threading.Thread(target=p2pooldata.tail_p2pool_log, daemon=True).start()
-        threading.Thread(target=p2pooldata.handle_user_input, args=(p2pool_proc,), daemon=True).start()
-        print("[+] Server fully initialized.")
+        print("[+] P2Pool process started successfully.")
+        # Optional: Start a thread to handle terminal input for P2Pool if needed
+        # input_thread = threading.Thread(target=p2pooldata.handle_user_input, daemon=True)
+        # input_thread.start()
     else:
         print("[!] CRITICAL: Could not start P2Pool.")
 
     # --- Main Loop to Keep Server Running ---
+    print("[+] Server is running. Press CTRL+C to shut down.")
     try:
-        print("[+] Server is running. Press CTRL+C to shut down.")
-        # This loop keeps the main thread alive, allowing the background server to run.
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal (Ctrl+C) received...")
     finally:
-        # --- Shutdown Sequence ---
-        if p2pool_proc and p2pool_proc.poll() is None:
+        if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None:
             print("[!] Terminating P2Pool process...")
-            p2pool_proc.terminate()
+            p2pooldata.p2pool_proc.terminate()
             try:
-                p2pool_proc.wait(timeout=5)
+                p2pooldata.p2pool_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                p2pool_proc.kill()
-        print("[+] Shutdown complete. ✅")
+                p2pooldata.p2pool_proc.kill()
+        print("[+] Shutdown complete.")
