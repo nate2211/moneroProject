@@ -25,26 +25,30 @@ import {
     CssBaseline,
     Box,
     IconButton,
-    Tooltip, Divider
+    Tooltip, Divider,
+    Accordion,
+    AccordionSummary,
+    AccordionDetails
 } from '@mui/material';
 import {
-  RestartAlt,
-  Wifi,
-  PlayArrow,
-  Stop,
-  Update,
-  Settings,
-  Info,
-  BarChart,
-  Lan,
-  Memory,
-  Speed,
-  Power,
-  AttachMoney,
-  Thermostat,
-  Share,
-  Dns,
-  EventNote // Icon for Other Events
+    RestartAlt,
+    Wifi,
+    PlayArrow,
+    Stop,
+    Update,
+    Settings,
+    Info,
+    BarChart,
+    Lan,
+    Memory,
+    Speed,
+    Power,
+    AttachMoney,
+    Thermostat,
+    Share,
+    Dns,
+    EventNote, Article, Pool, Pages, FirstPage, DataUsage, ExpandMore // Icon for Other Events
+
 } from '@mui/icons-material';
 import './App.css';
 
@@ -86,7 +90,7 @@ function App() {
   const [clients, setClients] = useState({});
   const [events, setEvents] = useState({});
   const [lastSeenData, setLastSeenData] = useState({});
-
+  const [memoryData, setMemoryData] = useState({});
   // State for UI interactions
   const [loading, setLoading] = useState({});
   const [isStartModalOpen, setIsStartModalOpen] = useState(false);
@@ -118,16 +122,18 @@ function App() {
   // === Data Fetching ===
   const fetchData = useCallback(async () => {
     try {
-      const [totalsData, clientsData, eventsData, lastSeenData] = await Promise.all([
+      const [totalsData, clientsData, eventsData, lastSeenData, memoryData] = await Promise.all([
         apiCall('/api/totals'),
         apiCall('/api/clients'),
         apiCall('/api/events'),
-        apiCall('/api/lastseen')
+        apiCall('/api/lastseen'),
+        apiCall('/api/memory')
       ]);
       if (totalsData) setSystemTotals(totalsData);
       if (clientsData) setClients(clientsData);
       if (eventsData) setEvents(eventsData);
       if (lastSeenData) setLastSeenData(lastSeenData);
+      if(memoryData) setMemoryData(memoryData);
     } catch (error) {
       console.error("Failed to fetch primary dashboard data:", error);
     }
@@ -242,37 +248,53 @@ function App() {
     );
   };
 
-  const EventTable = ({ title, events = [] }) => (
-    <Card sx={{ mb: 3 }}>
-        <CardContent>
-            <Typography variant="h5" component="div" gutterBottom>{title}</Typography>
-            <TableContainer component={Paper}>
-                <Table size="small">
-                    <TableHead>
-                        <TableRow sx={{ backgroundColor: 'rgba(255, 255, 255, 0.08)' }}>
-                            <TableCell>Time</TableCell>
-                            {events[0] && events[0].type && <TableCell>Type</TableCell>}
-                            <TableCell>Message</TableCell>
-                        </TableRow>
-                    </TableHead>
-                    <TableBody>
-                        {events.length > 0 ? (
-                            events.map((event, index) => (
-                                <TableRow key={index} hover>
-                                    <TableCell>{event.time}</TableCell>
-                                    {event.type && <TableCell>{event.type}</TableCell>}
-                                    <TableCell><pre>{event.message}</pre></TableCell>
-                                </TableRow>
-                            ))
-                        ) : (
-                            <TableRow><TableCell colSpan={3} align="center">No events to show.</TableCell></TableRow>
-                        )}
-                    </TableBody>
-                </Table>
-            </TableContainer>
-        </CardContent>
-    </Card>
-  );
+const EventTable = ({ title, events = [] }) => {
+    const hasTypeColumn = events.length > 0 && events[0].hasOwnProperty('type');
+
+    return (
+      <Card sx={{ mb: 3 }}>
+          <CardContent>
+              <Typography variant="h5" component="div" gutterBottom>{title}</Typography>
+              <TableContainer component={Paper}>
+                  <Table size="small" sx={{ tableLayout: 'fixed' }}>
+                      <TableHead>
+                          <TableRow sx={{ backgroundColor: 'rgba(255, 255, 255, 0.08)' }}>
+                              <TableCell sx={{ width: hasTypeColumn ? '25%' : '35%' }}>Time</TableCell>
+                              {hasTypeColumn && <TableCell sx={{ width: '20%' }}>Type</TableCell>}
+                              <TableCell>Message</TableCell> {/* This column will fill the remaining space */}
+                          </TableRow>
+                      </TableHead>
+                      <TableBody>
+                          {events.length > 0 ? (
+                              events.map((event, index) => (
+                                  <TableRow key={index} hover>
+                                      <TableCell>{event.time}</TableCell>
+                                      {hasTypeColumn && <TableCell>{event.type}</TableCell>}
+                                      <TableCell>
+                                          <Box
+                                            component="pre"
+                                            sx={{
+                                              whiteSpace: 'pre-wrap',
+                                              wordBreak: 'break-word',
+                                              margin: 0,
+                                              fontFamily: 'inherit'
+                                            }}
+                                          >
+                                            {event.message}
+                                          </Box>
+                                      </TableCell>
+                                  </TableRow>
+                              ))
+                          ) : (
+                              <TableRow><TableCell colSpan={hasTypeColumn ? 3 : 2} align="center">No events to show.</TableCell></TableRow>
+                          )}
+                      </TableBody>
+                  </Table>
+              </TableContainer>
+          </CardContent>
+      </Card>
+    );
+  };
 
   const StatCard = ({ icon, title, value, unit }) => (
       <Grid item xs={6} sm={4} md={2}>
@@ -319,6 +341,30 @@ function App() {
                     </Grid>
                 </CardContent>
             </Card>
+            <Card sx={{ mb: 3 }}>
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                    <Accordion defaultExpanded={false} sx={{ boxShadow: 'none', backgroundImage: 'none', '&:before': { display: 'none' } }}>
+                        <AccordionSummary
+                            expandIcon={<ExpandMore />}
+                            aria-controls="p2pool-stats-content"
+                            id="p2pool-stats-header"
+                            sx={{ p: 0 }}
+                        >
+                            <Typography variant="h5" component="div">P2Pool Process</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails sx={{ p: 0, pt: "1rem", pb: "1rem" }}>
+                            <Grid container spacing={2} justifyContent="center">
+                                <StatCard icon={<DataUsage/>} title="Cpu Usage" value={memoryData.cpu_usage}/>
+                                <StatCard icon={<Memory />} title="Ram Usage" value={memoryData.ram_usage} unit={"MB"} />
+                                <StatCard icon={<Dns />} title="VMS Usage" value={memoryData.vms_usage} unit={"MB"} />
+                                <StatCard icon={<Article />} title="Page File" value={memoryData.page_file} unit={"MB"}/>
+                                <StatCard icon={<FirstPage/>} title={"Number of Page Faults"} value={memoryData.num_page_faults}/>
+                                <StatCard icon={<Pool/>} title={"Paged Pool"} value={memoryData.paged_pool} unit={"MB"}/>
+                            </Grid>
+                           ]</AccordionDetails>
+                    </Accordion>
+                </CardContent>
+            </Card>
 
             <Box sx={{ mb: 3 }} >
                 <Typography variant="h5" component="div" gutterBottom textAlign={"center"}>Client Dashboard</Typography>
@@ -363,14 +409,25 @@ function App() {
 
                                         {/* Job Details */}
                                         <Box>
-                                            <Typography variant="overline" color="text.secondary">Current Job</Typography>
-                                            <Paper variant="outlined" sx={{ p: 1.5, fontSize: '0.8rem' }}>
-                                                <Typography variant="body2">Pool: {clients.newjobs?.[cid]?.ip || '—'}</Typography>
-                                                <Typography variant="body2">Difficulty: {clients.newjobs?.[cid]?.difficulty || '—'}</Typography>
-                                                <Typography variant="body2">Height: {clients.newjobs?.[cid]?.height || '—'}</Typography>
-                                                <Typography variant="body2">Algo: {clients.newjobs?.[cid]?.algo || "-"}</Typography>
-                                                <Typography variant="body2">Tx Count (ms): {clients.newjobs?.[cid]?.tx_count || "-"}</Typography>
-                                            </Paper>
+                                           <Accordion sx={{ mt: 2, boxShadow: 'none', backgroundImage: 'none', '&:before': { display: 'none' } }}>
+                                                <AccordionSummary
+                                                    expandIcon={<ExpandMore />}
+                                                    aria-controls={`panel-${cid}-content`}
+                                                    id={`panel-${cid}-header`}
+                                                    sx={{ minHeight: 0, p: 0, '& .MuiAccordionSummary-content': { m: 0 } }}
+                                                >
+                                                    <Typography variant="overline" color="text.secondary">Current Job</Typography>
+                                                </AccordionSummary>
+                                                <AccordionDetails sx={{ p: 1.5, pt: 1, fontSize: '0.8rem', border: '1px solid rgba(255, 255, 255, 0.12)', borderRadius: 1 }}>
+                                                    <Paper>
+                                                        <Typography variant="body2">Pool: {clients.newjobs?.[cid]?.ip || '—'}</Typography>
+                                                        <Typography variant="body2">Difficulty: {clients.newjobs?.[cid]?.difficulty || '—'}</Typography>
+                                                        <Typography variant="body2">Height: {clients.newjobs?.[cid]?.height || '—'}</Typography>
+                                                        <Typography variant="body2">Algo: {clients.newjobs?.[cid]?.algo || "-"}</Typography>
+                                                        <Typography variant="body2">Tx Count (ms): {clients.newjobs?.[cid]?.tx_count || "-"}</Typography>
+                                                    </Paper>
+                                                </AccordionDetails>
+                                            </Accordion>
                                         </Box>
                                     </CardContent>
 
@@ -404,6 +461,7 @@ function App() {
                 <Grid item xs={12} lg={6}><EventTable title="Blocks Found" events={events.blocks_found} /></Grid>
                 <Grid item xs={12} lg={6}><EventTable title="New Miner Data" events={events.miner_data} /></Grid>
                 <Grid item xs={12} lg={6}><EventTable title="Jobs Sent" events={events.jobs_sent} /></Grid>
+                <Grid item xs={12}><EventTable title="Sidechain Events" events={events.sidechain_events} /></Grid>
                 <Grid item xs={12}><EventTable title="Other Events" events={events.other_events} /></Grid>
             </Grid>
 
