@@ -565,8 +565,8 @@ if __name__ == "__main__":
     if p2pooldata.start_p2pool_direct():
         print("[+] P2Pool process started successfully.")
         # Optional: Start a thread to handle terminal input for P2Pool if needed
-        # input_thread = threading.Thread(target=p2pooldata.handle_user_input, daemon=True)
-        # input_thread.start()
+        input_thread = threading.Thread(target=p2pooldata.handle_user_input, daemon=True)
+        input_thread.start()
     else:
         print("[!] CRITICAL: Could not start P2Pool.")
 
