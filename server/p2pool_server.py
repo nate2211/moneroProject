@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import sys
 import time
@@ -6,13 +7,16 @@ import threading
 import re
 from flask import Flask, request, jsonify, redirect, url_for, render_template, send_from_directory
 from flask_cors import CORS
-from p2pool_data import P2poolData, EventProcessor, RawLogProcessor
+from p2pool_data import P2poolData, EventProcessor, RawLogProcessor, P2PoolProcessor, AsyncEventLogger
 from client_data import ClientData
+from waitress import serve
 
+asyncio_main_loop = None
 p2pooldata = P2poolData()
 clientdata = ClientData()
 event_processor = EventProcessor(p2pooldata)
 raw_log_processor = RawLogProcessor(p2pooldata)
+processor = P2PoolProcessor(p2pooldata)
 ELECTRICITY_RATE_PER_KWH = 0.13
 COMMAND_QUEUE = {}
 
@@ -136,33 +140,42 @@ def connect_wifi():
 
 @app.route("/restart_p2pool", methods=["POST"])
 def restart_p2pool():
-    if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None:
-        print("[!] Attempting to restart P2Pool: Terminating existing process...")
+    global asyncio_main_loop
+
+    async def restart_async():
+        if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.returncode is None:
+            print("[!] Attempting to restart P2Pool: Terminating existing process...")
+            try:
+                await processor.stop_p2pool()
+                print("[+] Existing P2Pool process terminated.")
+                clear_file_contents(p2pooldata.RAW_LOG)
+            except Exception as e:
+                print(f"[!] Error terminating P2Pool process: {e}")
+
         try:
-            # Send SIGTERM to allow for graceful shutdown
-            p2pooldata.p2pool_proc.terminate()
-            p2pooldata.p2pool_proc.wait(timeout=10)  # Wait for process to terminate
-            print("[+] Existing P2Pool process terminated.")
-        except subprocess.TimeoutExpired:
-            print("[!] P2Pool process did not terminate gracefully, forcing kill.")
-            p2pooldata.p2pool_proc.kill()
+            success = await processor.start_p2pool()
+            if success:
+                print("[+] P2Pool restarted successfully.")
+                return jsonify({"status": "success", "message": "P2Pool restarted successfully."})
+            else:
+                raise RuntimeError("start_p2pool returned False")
         except Exception as e:
-            print(f"[!] Error terminating P2Pool process: {e}")
+            print(f"[!] Failed to restart P2Pool: {e}")
+            p2pooldata.log_event_now("P2Pool Control", f"Failed to restart P2Pool process: {e}")
+            return jsonify({"status": "error", "message": f"Failed to restart P2Pool: {e}"}), 500
 
-    # Clear previous status to indicate restart
-    p2pool_status_output = {"message": "P2Pool is restarting..."}
+    try:
+        asyncio_main_loop.create_task(restart_async())
+        return jsonify({"status": "pending", "message": "Restart initiated in background."})
+    except RuntimeError:
+        # fallback for sync-only environment (rare in your case)
+        asyncio_main_loop.run(restart_async())
+        return jsonify({"status": "success", "message": "Restart completed synchronously."})
 
-    # Attempt to start a new P2Pool process
-    success = p2pooldata.start_p2pool_direct()
-    if success:
-        print("[+] P2Pool restarted successfully.")
-        p2pooldata.log_event_now("P2Pool Control", "P2Pool process restarted.")
-        return jsonify({"status": "success", "message": "P2Pool restarted successfully."})
-    else:
-        print("[!] Failed to restart P2Pool.")
-        p2pool_status_output = {"error": "Failed to restart P2Pool. Check logs."}
-        p2pooldata.log_event_now("P2Pool Control", "Failed to restart P2Pool process.")
-        return jsonify({"status": "error", "message": "Failed to restart P2Pool."}), 500
+@app.route("/api/memory", methods=["GET"])
+def get_memory():
+
+    return jsonify({"cpu_usage": processor.cpu_usage, "ram_usage": processor.ram_usage_mb, "vms_usage": processor.vms_usage_mb, "num_page_faults": processor.num_page_faults, "paged_pool": processor.paged_pool_mb, "page_file": processor.page_file_mb})
 
 
 @app.route("/api/clients", methods=["GET"])
@@ -258,6 +271,7 @@ def get_command(client_id):
     if client_id in COMMAND_QUEUE and COMMAND_QUEUE[client_id]:
         # Pop the oldest command (at index 0) from the list
         command = COMMAND_QUEUE[client_id].pop(0)
+        p2pooldata.log_event_now("Command", f"sent command to '{client_id}': {command}")
         print(f"[-] De-queued and sent command to '{client_id}': {command}")
         return jsonify(command)
 
@@ -300,38 +314,39 @@ def parse_p2pool_status(raw_text):
 
 @app.route("/status", methods=["POST"])
 def get_status_output():
-    if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None and p2pooldata.p2pool_proc.stdin:
+    global asyncio_main_loop
+
+    # Check if the process is running using the processor instance
+    if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.returncode is None:
         try:
-            p2pooldata.p2pool_proc.stdin.write("status\n")
-            p2pooldata.p2pool_proc.stdin.flush()
+            # Asynchronously send the 'status' command.
+            # The processor.write_to_stdin method handles the encoding.
+            future = asyncio.run_coroutine_threadsafe(processor.write_to_stdin("status"), asyncio_main_loop)
+            success = future.result(timeout=5) # Wait for the command to be sent
 
-            time.sleep(0.5)  # Give the redirect_output thread a moment to write
+            if not success:
+                raise Exception("Failed to write to P2Pool stdin. Pipe may be closed.")
 
+            time.sleep(0.5)  # Give redirect thread time to write to log
+
+            # The rest of your file-reading logic is correct
             if not os.path.exists(p2pooldata.RAW_LOG):
-                p2pool_status_output = {"error": "P2Pool raw log file does not exist yet."}
-                return jsonify(p2pool_status_output), 503
+                return jsonify({"error": "P2Pool raw log file does not exist yet."}), 503
 
             with open(p2pooldata.RAW_LOG, "r", encoding="utf-8") as f:
                 log_content = f.read()
 
             last_status_pos = log_content.rfind("SideChain status")
             if last_status_pos == -1:
-                p2pool_status_output = {"error": "Status report not found in logs yet. P2Pool might be starting up."}
-                return jsonify(p2pool_status_output), 404
+                return jsonify({"error": "Status not found in logs. P2Pool may be starting."}), 404
 
             raw_text = log_content[last_status_pos:]
-            p2pool_status_output = parse_p2pool_status(raw_text)
-            return jsonify(p2pool_status_output)
+            return jsonify(parse_p2pool_status(raw_text))
 
-        except FileNotFoundError:
-            p2pool_status_output = {"error": f"P2Pool raw log file '{p2pooldata.RAW_LOG}' not found."}
-            return jsonify(p2pool_status_output), 500
         except Exception as e:
-            p2pool_status_output = {"error": str(e)}
-            return jsonify(p2pool_status_output), 500
+            return jsonify({"error": str(e)}), 500
     else:
-        p2pool_status_output = {"error": "P2Pool is not running or its stdin pipe is closed."}
-        return jsonify(p2pool_status_output), 503
+        return jsonify({"error": "P2Pool is not running."}), 503
 
 
 
@@ -497,7 +512,7 @@ def serve_react(path):
         return send_from_directory(app.static_folder, 'index.html')
 def start_flask():
 
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    serve(app, host="0.0.0.0", port=5000)
 
 
 def clear_file_contents(filepath):
@@ -531,58 +546,58 @@ def clear_all_client_data():
     print("[+] Client data cleared successfully.")
 
 
-if __name__ == "__main__":
+async def main():
+    global asyncio_main_loop
+    """Main async function to run the application."""
     print("[+] Initializing application...")
 
     # --- Startup Tasks ---
     clear_file_contents(p2pooldata.EVENT_LOG)
     clear_file_contents(p2pooldata.RAW_LOG)
 
-    # --- Start Background Services ---
-    # IMPORTANT: Pass the function reference (without parentheses) to the target.
-
-    # 1. Thread to process the raw p2pool output
+    asyncio_main_loop = asyncio.get_running_loop()
+    async_event_logger = AsyncEventLogger(p2pooldata, asyncio_main_loop)
+    # --- Start Background Services (Threads) ---
+    # These can remain as standard threads
     raw_log_thread = threading.Thread(target=raw_log_processor.run_in_background, daemon=True)
     raw_log_thread.start()
     print("[+] Raw log processor thread started.")
 
-    # 2. Thread to write processed logs to event_log.txt
-    log_writer_thread = threading.Thread(target=p2pooldata.log_writer, daemon=True)
+    log_writer_thread = threading.Thread(target=async_event_logger.start, daemon=True)
     log_writer_thread.start()
     print("[+] Log writer thread started.")
 
-    # 3. Thread to read event_log.txt and populate data for the API
     event_processor_thread = threading.Thread(target=event_processor.run_in_background, daemon=True)
     event_processor_thread.start()
     print("[+] Event processor thread started.")
 
-    # 4. Thread for the Flask web server
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     print("[+] Flask server thread started.")
 
-    # --- P2Pool Process Handling ---
-    if p2pooldata.start_p2pool_direct():
-        print("[+] P2Pool process started successfully.")
-        # Optional: Start a thread to handle terminal input for P2Pool if needed
-        input_thread = threading.Thread(target=p2pooldata.handle_user_input, daemon=True)
-        input_thread.start()
-    else:
-        print("[!] CRITICAL: Could not start P2Pool.")
+    # --- P2Pool Process Handling using the new async class ---
+
+    if not await processor.start_p2pool():
+        print("[!] CRITICAL: Could not start P2Pool. Shutting down.")
+        return # Exit if P2Pool fails to start
 
     # --- Main Loop to Keep Server Running ---
     print("[+] Server is running. Press CTRL+C to shut down.")
     try:
         while True:
-            time.sleep(1)
+            # Use asyncio.sleep to prevent blocking the event loop
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal (Ctrl+C) received...")
     finally:
-        if p2pooldata.p2pool_proc and p2pooldata.p2pool_proc.poll() is None:
-            print("[!] Terminating P2Pool process...")
-            p2pooldata.p2pool_proc.terminate()
-            try:
-                p2pooldata.p2pool_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p2pooldata.p2pool_proc.kill()
+        # Gracefully stop the P2Pool process
+        await processor.stop_p2pool()
         print("[+] Shutdown complete.")
+
+if __name__ == "__main__":
+    # Use asyncio.run() to start the main async function
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # This handles Ctrl+C if it happens during initial setup before the main loop
+        print("\n[!] Application startup interrupted.")

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import subprocess
@@ -8,7 +9,207 @@ import re
 import time
 from collections import deque
 
+import psutil
 
+
+class AsyncEventLogger:
+    def __init__(self, P2poolData, asyncio_main_loop):
+        self.p2pool_data = P2poolData
+        self.asyncio_main_loop = asyncio_main_loop
+
+    async def writer_loop(self):
+        os.makedirs(os.path.dirname(self.p2pool_data.EVENT_LOG), exist_ok=True)
+        try:
+            with open(self.p2pool_data.EVENT_LOG, "a", encoding="utf-8") as f:
+                while True:
+                    line = await self.p2pool_data.log_queue.get()
+                    f.write(line + "\n")
+                    f.flush()
+        except asyncio.CancelledError:
+            print("[AsyncEventLogger] Logging task cancelled.")
+        except Exception as e:
+            print(f"[AsyncEventLogger] Failed to write log: {e}")
+
+    def start(self):
+        asyncio.run_coroutine_threadsafe(self.writer_loop(), self.asyncio_main_loop)
+
+
+class P2PoolProcessor:
+    """
+    Manages the P2Pool subprocess asynchronously, including resource monitoring.
+    """
+
+    def __init__(self, p2pooldata_instance):
+        self.p2pool_data = p2pooldata_instance
+        self.cpu_usage = 0
+        self.ram_usage_mb = 0
+        self.vms_usage_mb = 0
+        self.num_page_faults = 0
+        self.paged_pool_mb = 0
+        self.page_file_mb = 0
+        self.psutil_proc = None
+        self.redirect_task = None
+        self.monitor_task = None  # Task for the new stats monitor
+
+    def strip_ansi_codes(self, text: str) -> str:
+        """Removes ANSI escape codes from a string."""
+        ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+        return ansi_escape.sub('', text)
+
+    async def start_p2pool(self) -> bool:
+        """
+        Starts the P2Pool process and begins redirecting its output and monitoring its stats.
+        """
+        exe_path = os.path.join(self.p2pool_data.P2POOL_DIR, self.p2pool_data.P2POOL_EXE)
+        if not os.path.exists(exe_path):
+            print(f"[!] Executable not found at: {exe_path}")
+            return False
+
+        args = [
+            exe_path, "--host", "127.0.0.1", "--wallet", self.p2pool_data.WALLET,
+            "--mini", "--stratum", "0.0.0.0:3333", "--no-upnp", "--no-color", "--p2p", "0.0.0.0:37888"
+        ]
+
+        try:
+            self.p2pool_data.p2pool_proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=self.p2pool_data.P2POOL_DIR,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags = subprocess.CREATE_NO_WINDOW
+            )
+            print(f"[+] P2Pool process started successfully with PID: {self.p2pool_data.p2pool_proc.pid}")
+            self.p2pool_data.log_event_now("P2Pool Process", "P2Pool process started successfully")
+
+            # --- ✅ Attach psutil for monitoring ---
+            try:
+                pid = self.p2pool_data.p2pool_proc.pid
+                self.psutil_proc = psutil.Process(pid)
+                self.psutil_proc.nice(psutil.HIGH_PRIORITY_CLASS)
+                # This initializes the cpu_percent calculation.
+                self.psutil_proc.cpu_percent(interval=None)
+            except psutil.NoSuchProcess:
+                print(f"[!] Failed to attach psutil to PID {pid}. Stats will not be monitored.")
+                self.psutil_proc = None
+
+            # --- Start background tasks ---
+            self.redirect_task = asyncio.create_task(self._redirect_output())
+            if self.psutil_proc:
+                self.monitor_task = asyncio.create_task(self._monitor_stats())
+
+            return True
+        except Exception as e:
+            print(f"[!] Failed to launch P2Pool: {e}")
+            return False
+
+    async def _monitor_stats(self):
+        """Asynchronously monitors the process's CPU and RAM usage."""
+        p = self.psutil_proc
+        print("[+] Stats monitor started.")
+        try:
+            while True:
+                with p.oneshot():
+                    # Get stats from psutil object
+                    cpu = p.cpu_percent(interval=None)
+                    memoryinfo = p.memory_info()
+                    # RSS: Resident Set Size (non-swapped physical memory)
+                    ram_mb = memoryinfo.rss / (1024 * 1024)
+                    vms_usage_mb = memoryinfo.vms / (1024 * 1024)
+                    num_page_faults = memoryinfo.num_page_faults / (1024 * 1024)
+                    paged_pool_mb = memoryinfo.paged_pool / (1024 * 1024)
+                    page_file_mb = memoryinfo.pagefile / (1024 * 1024)
+
+                # Update the central data object (assuming these attributes exist)
+                self.cpu_usage = round(cpu, 2)
+                self.ram_usage_mb = round(ram_mb, 2)
+                self.vms_usage_mb = round(vms_usage_mb, 2)
+                self.num_page_faults = round(num_page_faults, 5)
+                self.paged_pool_mb = round(paged_pool_mb, 2)
+                self.page_file_mb = round(page_file_mb, 2)
+                # Update stats every 5 seconds without blocking the event loop
+                await asyncio.sleep(5)
+        except psutil.NoSuchProcess:
+            print("[!] Stats monitor: P2Pool process not found. Stopping monitor.")
+        except asyncio.CancelledError:
+            print("[+] Stats monitor task was cancelled.")
+        except Exception as e:
+            print(f"[!] An error occurred in the stats monitor: {e}")
+        finally:
+            print("[-] Stats monitor stopped.")
+            # Clear stats on exit
+            self.cpu_usage = 0.0
+            self.ram_usage_mb = 0.0
+            self.vms_usage_mb = 0.0
+            self.num_page_faults = 0
+            self.paged_pool_mb = 0
+            self.page_file_mb = 0
+
+    async def stop_p2pool(self):
+        """
+        Stops the P2Pool process gracefully and cleans up monitoring tasks.
+        """
+        if not self.p2pool_data.p2pool_proc or self.p2pool_data.p2pool_proc.returncode is not None:
+            print("[!] P2Pool is not running.")
+            return
+
+        print("[!] Attempting to terminate P2Pool process...")
+        try:
+            self.p2pool_data.p2pool_proc.terminate()
+            await asyncio.wait_for(self.p2pool_data.p2pool_proc.wait(), timeout=5.0)
+            self.p2pool_data.log_event_now("P2Pool Process", "P2Pool process ended successfully")
+            print("[+] P2Pool process terminated gracefully.")
+        except asyncio.TimeoutError:
+            print("[!] P2Pool did not terminate gracefully, forcing kill.")
+            self.p2pool_data.p2pool_proc.kill()
+            await self.p2pool_data.p2pool_proc.wait()
+        except Exception as e:
+            print(f"[!] Error stopping P2Pool: {e}")
+        finally:
+            # Cancel all background tasks associated with the process
+            if self.redirect_task and not self.redirect_task.done():
+                self.redirect_task.cancel()
+            if self.monitor_task and not self.monitor_task.done():
+                self.monitor_task.cancel()
+
+            self.p2pool_data.p2pool_psutil_proc = None
+            self.p2pool_data.p2pool_proc = None
+
+    async def _redirect_output(self):
+        """Asynchronously reads stdout and writes it to the raw log file."""
+        if not self.p2pool_data.p2pool_proc or not self.p2pool_data.p2pool_proc.stdout:
+            return
+
+        try:
+            with open(self.p2pool_data.RAW_LOG, "a", encoding="utf-8") as log_file:
+                while True:
+                    line_bytes = await self.p2pool_data.p2pool_proc.stdout.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode('utf-8', errors='ignore').strip()
+                    clean_line = self.strip_ansi_codes(line)
+                    log_file.write(clean_line + "\n")
+                    log_file.flush()
+                    print("[P2Pool]", clean_line)
+        except asyncio.CancelledError:
+            print("[P2Pool] Output redirection task was cancelled.")
+        except Exception as e:
+            self.p2pool_data.log_event_now("P2pool Process", f"Redirect output error: {e}")
+        finally:
+            self.p2pool_data.log_event_now("P2Pool Process", "P2Pool stdout stream ended.")
+
+    async def write_to_stdin(self, command: str) -> bool:
+        """Asynchronously writes a command to the process's stdin."""
+        if self.p2pool_data.p2pool_proc and self.p2pool_data.p2pool_proc.stdin:
+            try:
+                self.p2pool_data.p2pool_proc.stdin.write(f"{command}\n".encode('utf-8'))
+                await self.p2pool_data.p2pool_proc.stdin.drain()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                # FIX: Corrected typo from p2pool_data.p2pool_data to p2pool_data
+                self.p2pool_data.log_event_now("P2Pool Process", f"Error writing to stdin: {e}")
+                return False
+        return False
 class RawLogProcessor:
     """
     Tails the raw P2Pool log file, parses its output, and queues structured
@@ -107,7 +308,7 @@ class EventProcessor:
         self.miner_data = deque(maxlen=self.max_events)
         self.blocks_found = deque(maxlen=self.max_events)
         self.other_events = deque(maxlen=self.max_events)
-
+        self.sidechain_events = deque(maxlen=self.max_events)
     def _parse_and_categorize_line(self, line):
         """Parses a single log line and adds it to the correct category deque."""
         match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
@@ -131,6 +332,8 @@ class EventProcessor:
                 self.miner_data.appendleft(event)
             elif event_type == "Found Block":
                 self.blocks_found.appendleft(event)
+            elif "Sidechain" in event_type:
+                self.sidechain_events.appendleft(event)
             else:
                 self.other_events.appendleft(event)
 
@@ -167,6 +370,7 @@ class EventProcessor:
                 "jobs_sent": list(self.jobs_sent)[:limit],
                 "miner_data": list(self.miner_data)[:limit],
                 "blocks_found": list(self.blocks_found)[:limit],
+                "sidechain_events": list(self.sidechain_events)[:limit],
                 "other_events": list(self.other_events)[:limit]
             }
 
@@ -178,71 +382,9 @@ class P2poolData:
         self.P2POOL_EXE = "p2pool.exe"
         self.WALLET = "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk"
         self.p2pool_proc = None
-        self.p2pool_status_output = {"message": "P2Pool status not yet available."}  # Initialize with a message
         self.EVENT_LOG = os.path.join(self.P2POOL_DIR, "event_log.txt")
         self.RAW_LOG = os.path.join(self.P2POOL_DIR, "p2pool_raw_output.txt")
-        self.log_queue = queue.Queue()
-
-    def start_p2pool_direct(self):
-
-        exe_path = os.path.join(self.P2POOL_DIR, self.P2POOL_EXE)
-        if not os.path.exists(exe_path):
-            print(f"[!] Executable not found at: {exe_path}")
-            return None
-
-        args = [
-            exe_path, "--host", "127.0.0.1", "--wallet", self.WALLET,
-            "--mini", "--stratum", "192.168.0.10:3333", "--no-upnp", "--no-color", "--p2p", "0.0.0.0:37888"
-        ]
-
-        try:
-            self.p2pool_proc = subprocess.Popen(
-                args,
-                cwd=self.P2POOL_DIR,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-
-            def redirect_output(proc):
-                # 'a' mode creates the file if it doesn't exist
-                with open(self.RAW_LOG, "a", encoding="utf-8") as log_file:
-                    for line in proc.stdout:
-                        try:
-                            clean_line = self.strip_ansi_codes(line.strip())
-                            log_file.write(clean_line + "\n")
-                            log_file.flush()
-                            print("[P2Pool]", clean_line)
-                        except Exception as e:
-                            self.log_event_now("P2pool Process", "Failed to redirect output to log file")
-                # Log that the process ended, if this function exits
-                self.log_event_now("P2Pool Process", "P2Pool stdout stream ended.")
-
-            threading.Thread(target=redirect_output, args=(self.p2pool_proc,), daemon=True).start()
-            return True
-        except Exception as e:
-            print(f"[!] Failed to launch P2Pool: {e}")
-            return False
-
-    # In the P2poolData class
-    def handle_user_input(self, proc):
-        """
-        Waits for user input in a dedicated thread and forwards it to the p2pool process.
-        """
-        while proc.poll() is None:  # Loop only while the process is running
-            try:
-                user_input = input()
-                if proc.poll() is None:  # Check again before writing
-                    proc.stdin.write(user_input + '\n')
-                    proc.stdin.flush()
-                else:
-                    break  # Exit loop if process has stopped
-            except (IOError, OSError, ValueError):
-                break
-            except Exception as e:
-                break
+        self.log_queue = asyncio.Queue()
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
@@ -264,27 +406,8 @@ class P2poolData:
             days = int(seconds / 86400)
             return f"{days} day{'s' if days > 1 else ''} ago"
 
-    def log_writer(self, ):
-        """
-        Waits for log entries in the queue and writes them to the event log file.
-        This function will block efficiently until a log is available.
-        """
-        with open(self.EVENT_LOG, "a", encoding="utf-8") as evlog:
-            while True:
-                try:
-                    # block=True makes it wait indefinitely until an item is available.
-                    # This is more efficient than polling with a timeout.
-                    log_entry = self.log_queue.get(block=True)
-                    evlog.write(log_entry + "\n")
-                    evlog.flush()
-                except Exception as e:
-                    # Log an error if writing fails for some reason
-                    print(f"[!] Log writer failed: {e}")
 
-    def strip_ansi_codes(self, text):
-        ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-        return ansi_escape.sub('', text)
 
     def log_event_now(self, event_type, message):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_queue.put(f"[{timestamp}] [{event_type}] {message}")
+        self.log_queue.put_nowait(f"[{timestamp}] [{event_type}] {message}")
