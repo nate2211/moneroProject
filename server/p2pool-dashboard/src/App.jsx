@@ -398,23 +398,6 @@ function App() {
                 </Grid>
             </Box>
 
-            <Card sx={{ mb: 3 }}>
-                <CardContent>
-                    <Typography variant="h5" component="div" gutterBottom>System Control</Typography>
-                    <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, flexWrap: 'wrap' }}>
-                        <Button variant="contained" onClick={handleRestartP2Pool} startIcon={<RestartAlt />} disabled={loading['/restart_p2pool']}>
-                            {loading['/restart_p2pool'] ? 'Restarting...' : 'Restart P2Pool'}
-                        </Button>
-                        <Typography variant="h5" component="div" gutterBottom>Connect to Wifi</Typography>
-                        <form onSubmit={handleConnectToWifi} style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-                            <TextField label="Network SSID" variant="outlined" size="small" value={wifi.ssid} onChange={e => setWifi({...wifi, ssid: e.target.value})} />
-                            <TextField label="Password" type="password" variant="outlined" size="small" value={wifi.password} onChange={e => setWifi({...wifi, password: e.target.value})} />
-                            <Button type="submit" variant="contained" startIcon={<Wifi />} disabled={loading['/connect_wifi']}>{loading['/connect_wifi'] ? 'Connecting...' : 'Connect'}</Button>
-                        </form>
-                    </Box>
-                </CardContent>
-            </Card>
-
             <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', mt: 4 }}>Event Logs</Typography>
             <Grid container spacing={3} sx={{display: "flex", justifyContent: "center"}}>
                 <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found} /></Grid>
@@ -449,6 +432,22 @@ function App() {
                 </DialogActions>
             </Dialog>
 
+            <Card sx={{ mb: 3 }}>
+                <CardContent>
+                    <Typography variant="h5" component="div" gutterBottom>System Control</Typography>
+                    <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, flexWrap: 'wrap' }}>
+                        <Button variant="contained" onClick={handleRestartP2Pool} startIcon={<RestartAlt />} disabled={loading['/restart_p2pool']}>
+                            {loading['/restart_p2pool'] ? 'Restarting...' : 'Restart P2Pool'}
+                        </Button>
+                        <Typography variant="h5" component="div" gutterBottom>Connect to Wifi</Typography>
+                        <form onSubmit={handleConnectToWifi} style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
+                            <TextField label="Network SSID" variant="outlined" size="small" value={wifi.ssid} onChange={e => setWifi({...wifi, ssid: e.target.value})} />
+                            <TextField label="Password" type="password" variant="outlined" size="small" value={wifi.password} onChange={e => setWifi({...wifi, password: e.target.value})} />
+                            <Button type="submit" variant="contained" startIcon={<Wifi />} disabled={loading['/connect_wifi']}>{loading['/connect_wifi'] ? 'Connecting...' : 'Connect'}</Button>
+                        </form>
+                    </Box>
+                </CardContent>
+            </Card>
         </div>
     </ThemeProvider>
   );

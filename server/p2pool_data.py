@@ -6,6 +6,170 @@ import queue
 import datetime
 import re
 import time
+from collections import deque
+
+
+class RawLogProcessor:
+    """
+    Tails the raw P2Pool log file, parses its output, and queues structured
+    events to be written to the main event log by the log_writer.
+    """
+
+    def __init__(self, p2pooldata_instance):
+        """
+        Initializes the raw log processor.
+
+        Args:
+            p2pooldata_instance (P2poolData): The main data object.
+        """
+        self.p2pool_data = p2pooldata_instance
+
+    def run_in_background(self):
+        """
+        The main loop for this thread. Tails the raw P2Pool log file continuously.
+        """
+        raw_log_path = self.p2pool_data.RAW_LOG
+        print(f"[*] RawLogProcessor thread started. Tailing: {raw_log_path}")
+
+        while not os.path.exists(raw_log_path):
+            print("[!] Raw log file does not exist yet, waiting...")
+            time.sleep(2)
+
+        try:
+            with open(raw_log_path, "r", encoding="utf-8") as f:
+                f.seek(0, os.SEEK_END)
+                miner_data_block = []
+                in_miner_data = False
+
+                while True:
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.1)  # Wait for new content
+                        continue
+
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
+
+                    lower_line = clean_line.lower()
+
+                    if "p2pool new miner data" in lower_line:
+                        in_miner_data = True
+                        miner_data_block = [clean_line]
+                        continue
+
+                    if in_miner_data:
+                        if clean_line == "" or clean_line.startswith("-"):
+                            full_block = "\n".join(miner_data_block).strip()
+                            self.p2pool_data.log_event_now("New Miner Data", full_block)
+                            in_miner_data = False
+                        else:
+                            miner_data_block.append(clean_line)
+                        continue
+
+                    if "sent new job" in lower_line:
+                        self.p2pool_data.log_event_now("Sent Jobs", clean_line)
+                    elif "share found" in lower_line:
+                        self.p2pool_data.log_event_now("Found Share", clean_line)
+                    elif "block found" in lower_line:
+                        self.p2pool_data.log_event_now("Found Block", clean_line)
+                    elif "sidechain add_block" in lower_line:
+                        self.p2pool_data.log_event_now("Sidechain Block Added", clean_line)
+                    elif "p2pool caught sigint" in lower_line or "p2pool stopping" in lower_line:
+                        self.p2pool_data.log_event_now("P2Pool Stopped", clean_line)
+
+        except Exception as e:
+            error_msg = f"RawLogProcessor thread terminated with error: {e}"
+            print(f"[!] {error_msg}")
+            self.p2pool_data.log_event_now("RawLogProcessor Error", error_msg)
+
+
+class EventProcessor:
+    """
+    Tails the event log file in a background thread, parsing and categorizing
+    events into in-memory deques for fast API access.
+    """
+    def __init__(self, P2poolData, max_events_per_category=50):
+        """
+        Initializes the event processor.
+
+        Args:
+            p2pooldata_instance (P2poolData): The main data object.
+            max_events_per_category (int): Max number of events to keep for each category.
+        """
+        self.p2pool_data = P2poolData
+        self.max_events = max_events_per_category
+        self.lock = threading.Lock()
+
+        # Use deque with maxlen for efficient, automatically capped lists
+        self.shares_found = deque(maxlen=self.max_events)
+        self.jobs_sent = deque(maxlen=self.max_events)
+        self.miner_data = deque(maxlen=self.max_events)
+        self.blocks_found = deque(maxlen=self.max_events)
+        self.other_events = deque(maxlen=self.max_events)
+
+    def _parse_and_categorize_line(self, line):
+        """Parses a single log line and adds it to the correct category deque."""
+        match = re.match(r"\[(.*?)\] \[(.*?)\] (.*)", line, re.DOTALL)
+        if not match:
+            return
+
+        event = {
+            "time": match.group(1),
+            "type": match.group(2),
+            "message": match.group(3).strip()
+        }
+
+        # Use a lock to ensure thread-safe writes to the deques
+        with self.lock:
+            event_type = event["type"]
+            if event_type == "Found Share":
+                self.shares_found.appendleft(event)
+            elif event_type == "Sent Jobs":
+                self.jobs_sent.appendleft(event)
+            elif event_type == "New Miner Data":
+                self.miner_data.appendleft(event)
+            elif event_type == "Found Block":
+                self.blocks_found.appendleft(event)
+            else:
+                self.other_events.appendleft(event)
+
+    def run_in_background(self):
+        """
+        The main loop for this thread. Tails the event log file continuously.
+        """
+        event_log_path = self.p2pool_data.EVENT_LOG
+        print(f"[*] EventProcessor thread started. Tailing: {event_log_path}")
+
+        while not os.path.exists(event_log_path):
+            print("[!] Event log does not exist yet, waiting...")
+            time.sleep(2)
+
+        try:
+            with open(event_log_path, "r", encoding="utf-8") as f:
+                f.seek(0, os.SEEK_END)  # Start at the end of the file
+                while True:
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.2)  # No new lines, wait a bit
+                        continue
+                    self._parse_and_categorize_line(line)
+        except Exception as e:
+            error_msg = f"EventProcessor thread terminated with error: {e}"
+            print(f"[!] {error_msg}")
+            self.p2pool_data.log_event_now("EventProcessor Error", error_msg)
+
+    def get_all_events(self, limit=10):
+        """Returns a snapshot of the current events for the API."""
+        with self.lock:
+            return {
+                "shares_found": list(self.shares_found)[:limit],
+                "jobs_sent": list(self.jobs_sent)[:limit],
+                "miner_data": list(self.miner_data)[:limit],
+                "blocks_found": list(self.blocks_found)[:limit],
+                "other_events": list(self.other_events)[:limit]
+            }
+
 
 class P2poolData:
 
@@ -79,55 +243,6 @@ class P2poolData:
                 break
             except Exception as e:
                 break
-
-    def tail_p2pool_log(self,):
-        try:
-            with open(self.RAW_LOG, "r", encoding="utf-8") as f:
-                f.seek(0, os.SEEK_END)  # Start reading from the end
-
-                miner_data_block = []
-                in_miner_data = False
-
-                while True:
-                    line = f.readline()
-                    if not line:
-                        time.sleep(0.1)  # Wait for new content
-                        continue
-
-                    clean_line = line.strip()
-                    lower_line = clean_line.lower()
-
-                    if "p2pool new miner data" in lower_line:
-                        in_miner_data = True
-                        miner_data_block = [clean_line]
-                        continue
-
-                    if in_miner_data:
-                        if clean_line == "" or clean_line.startswith("-"):
-                            full_block = "\n".join(miner_data_block).strip()
-                            self.log_event_now("New Miner Data", full_block)
-                            in_miner_data = False
-                        else:
-                            miner_data_block.append(clean_line)
-                        continue
-
-                    if "sent new job" in lower_line:
-                        self.log_event_now("Sent Jobs", clean_line)
-                    elif "share found" in lower_line:
-                        self.log_event_now("Found Share", clean_line)
-                    elif "block found" in lower_line:
-                        self.log_event_now("Found Block", clean_line)
-                    # NEW: Specific classification for sidechain add_block messages
-                    elif "sidechain add_block" in lower_line:
-                        self.log_event_now("Sidechain Block Added", clean_line)
-                    # FIX: Corrected boolean logic for "p2pool stopping"
-                    elif "p2pool caught sigint" in lower_line or "p2pool stopping" in lower_line:
-                        self.log_event_now("P2Pool Stopped", clean_line)
-                    else:  # Fallback for any other messages
-                        self.log_event_now("Other P2Pool Event", clean_line)
-        except Exception as e:
-            self.log_event_now("P2pool Process","Failed to tail p2pool log")
-            pass
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
