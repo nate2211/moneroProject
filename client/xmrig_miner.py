@@ -5,10 +5,10 @@ import subprocess
 import re
 import traceback
 from typing import Callable
-
 import aiohttp
 import psutil
 from typing_extensions import Awaitable
+
 
 REPORT_INTERVAL_SECONDS = 5
 
@@ -227,6 +227,7 @@ class XmrigMiner:
         self.periodic_reporter = PeriodicReporter(self, self.xmrig_data, self.logger)
         self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
         self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
+        self.priority = False
     async def start_miner(self, pool_url="", thread_count=None):
 
         await self.kill_all_xmrig_processes()
@@ -285,10 +286,11 @@ class XmrigMiner:
         )
         # --- Add this section to set priority ---
         try:
-            p = psutil.Process(self.xmrig_data.xmrig_process.pid)
-            p.nice(psutil.HIGH_PRIORITY_CLASS)  # For Windows
-            # On Linux, you might use: p.nice(-10) # Lower number is higher priority
-            self.logger.log_message(f"[+] Set XMRig process (PID: {p.pid}) to high priority.")
+            if self.priority:
+                p = psutil.Process(self.xmrig_data.xmrig_process.pid)
+                p.nice(psutil.HIGH_PRIORITY_CLASS)  # For Windows
+                # On Linux, you might use: p.nice(-10) # Lower number is higher priority
+                self.logger.log_message(f"[+] Set XMRig process (PID: {p.pid}) to high priority.")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             self.logger.log_message("[!] Could not set XMRig process priority. Run as admin/root for best results.")
 
@@ -350,6 +352,25 @@ class XmrigMiner:
             if "randomx" in config:
                 config["randomx"]["algo"] = "rx"
 
+            from cpuinfo import get_cpu_info
+            cpu_info = get_cpu_info()
+            flags = cpu_info.get("flags", [])
+
+            supports_avx2 = "avx2" in flags
+            supports_aes = "aes" in flags
+            supports_sse2 = "sse2" in flags or "sse3" in flags
+
+            config["cpu"]["asm"] = supports_avx2 or supports_sse2
+            config["cpu"]["hw-aes"] = supports_aes
+            config["cpu"]["priority"] = 4 if supports_avx2 else 1
+            config["cpu"]["yield"] = not supports_avx2
+
+            self.logger.log_message(f"[+] ASM optimization: {'enabled' if config['cpu']['asm'] else 'disabled'}")
+            self.logger.log_message(
+                f"[+] AES-NI hardware acceleration: {'enabled' if config['cpu']['hw-aes'] else 'disabled'}")
+            self.logger.log_message(f"[+] Miner thread priority set to: {config['cpu']['priority']}")
+            self.logger.log_message(f"[+] Thread yielding: {'enabled' if config['cpu']['yield'] else 'disabled'}")
+
 
             has_nvidia_gpu = False
             if self.xmrig_data.hardware_monitor:
@@ -357,7 +378,21 @@ class XmrigMiner:
 
             config.setdefault("cuda", {})
             config["cuda"]["enabled"] = has_nvidia_gpu  # Set CUDA enabled based on internal detection
-
+            if has_nvidia_gpu:
+                tuning = self.xmrig_data.hardware_monitor.get_rx_cuda_config()
+                if tuning:
+                    config["cuda"]["rx"] = [{
+                        "index": 0,
+                        "threads": tuning["threads"],
+                        "blocks": tuning["blocks"],
+                        "bfactor": tuning["bfactor"],
+                        "bsleep": tuning["bsleep"],
+                        "affinity": -1,
+                        "dataset_host": False
+                    }]
+                    self.logger.log_message(f"[+] Auto CUDA tuning applied: {tuning}")
+                else:
+                    self.logger.log_message("[!] Failed to determine optimal CUDA tuning")
             if "cpu" in config:
                 config["cpu"]["enabled"] = True
                 config["cpu"]["rx"] = list(range(thread_count))
