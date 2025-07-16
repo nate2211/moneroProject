@@ -1,3 +1,4 @@
+import multiprocessing
 import sys
 import os
 import ctypes
@@ -38,6 +39,7 @@ def main():
 # Top-level exception handler to catch critical errors on startup
 if __name__ == "__main__":
     try:
+        multiprocessing.freeze_support()
         main()
     except Exception as e:
         # Format the exception traceback

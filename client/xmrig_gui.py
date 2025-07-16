@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
                              QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
                              QSystemTrayIcon, QMenu, QAction, QApplication, QDialogButtonBox, QListWidget, QDialog,
-                             QInputDialog)
+                             QInputDialog, QCheckBox, QGridLayout)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -108,7 +108,7 @@ class CollapsibleBox(QWidget):
         super(CollapsibleBox, self).__init__(parent)
 
         self.toggle_button = QToolButton(text=title, checkable=True, checked=start_expanded)
-        self.toggle_button.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 14px; }")
+        self.toggle_button.setObjectName("collapsibleHeader") # Use stylesheet for styling
         self.toggle_button.setToolButtonStyle(3)  # Qt.ToolButtonTextBesideIcon
         self.toggle_button.setArrowType(1 if start_expanded else 2)  # Set initial arrow direction
 
@@ -136,9 +136,9 @@ class CollapsibleBox(QWidget):
     def setContentLayout(self, layout):
         self.content_area_layout.addLayout(layout)
 
-        collapsed_height = self.toggle_button.sizeHint().height()
+        collapsed_height = self.toggle_button.sizeHint().height() + 10
         # Use a fixed height to ensure it's predictable on startup
-        content_height = 200
+        content_height = 225
 
         for i in range(self.toggle_animation.animationCount()):
             self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
@@ -165,26 +165,43 @@ class CollapsibleBox(QWidget):
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
 
+
 class StatsDisplay(QWidget):
-    """A widget to display real-time miner statistics."""
+    """A widget to display real-time miner statistics in columns."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QFormLayout(self)
+        layout = QGridLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
+        layout.setHorizontalSpacing(30)
+
+        # Labels
         self.hashrate_label = QLabel("N/A")
         self.cpu_temp_label = QLabel("N/A")
-        self.gpu_temp_label = QLabel("N/A")
-        self.power_draw_label = QLabel("N/A")
         self.cpu_shares_label = QLabel("0")
+        self.gpu_temp_label = QLabel("N/A")
         self.gpu_shares_label = QLabel("0")
+        self.power_draw_label = QLabel("N/A")
 
-        layout.addRow("<b>Hashrate:</b>", self.hashrate_label)
-        layout.addRow("<b>CPU Temp:</b>", self.cpu_temp_label)
-        layout.addRow("<b>GPU Temp / Fan:</b>", self.gpu_temp_label)
-        layout.addRow("<b>Power Draw:</b>", self.power_draw_label)
-        layout.addRow("<b>CPU Shares:</b>", self.cpu_shares_label)
-        layout.addRow("<b>GPU Shares:</b>", self.gpu_shares_label)
+        # --- Column 1 (CPU + General) ---
+        layout.addWidget(QLabel("<b>Hashrate:</b>"), 0, 0)
+        layout.addWidget(self.hashrate_label, 0, 1)
+
+        layout.addWidget(QLabel("<b>CPU Temp:</b>"), 1, 0)
+        layout.addWidget(self.cpu_temp_label, 1, 1)
+
+        layout.addWidget(QLabel("<b>CPU Shares:</b>"), 2, 0)
+        layout.addWidget(self.cpu_shares_label, 2, 1)
+
+        # --- Column 2 (GPU) ---
+        layout.addWidget(QLabel("<b>GPU Temp / Fan:</b>"), 0, 2)
+        layout.addWidget(self.gpu_temp_label, 0, 3)
+
+        layout.addWidget(QLabel("<b>GPU Shares:</b>"), 1, 2)
+        layout.addWidget(self.gpu_shares_label, 1, 3)
+
+        layout.addWidget(QLabel("<b>Power Draw:</b>"), 2, 2)
+        layout.addWidget(self.power_draw_label, 2, 3)
 
     @pyqtSlot(dict)
     def update_stats(self, stats_payload):
@@ -233,12 +250,38 @@ class MinerGui(QWidget):
             #consoleTitle { font-size: 11pt; font-weight: bold; padding-top: 10px; color: #FF4C4C; }
             QScrollBar:vertical { border: none; background: #1A1A1A; width: 8px; margin: 0px; }
             QScrollBar::handle:vertical { background: #FF4C4C; min-height: 20px; border-radius: 4px; }
+            
+            /* --- UNIFIED SECTION HEADER STYLES --- */
+            QLabel#sectionHeader, #consoleTitle {
+                font-size: 11pt;
+                font-weight: bold;
+                color: #CCCCCC;
+                padding-top: 10px;
+                padding-bottom: 4px;
+                margin-bottom: 4px;
+                border-bottom: 1px solid #333333;
+            }
+            QToolButton#collapsibleHeader {
+                font-size: 11pt;
+                font-weight: bold;
+                color: #CCCCCC;
+                padding: 6px 0px;
+                margin-bottom: 1px;
+                border: none;
+                border-bottom: 1px solid #333333;
+                text-align: left;
+            }
+            QToolButton#collapsibleHeader:hover {
+                color: #FFFFFF;
+            }
         """
         self.setStyleSheet(stylesheet)
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(15)
-        main_layout.addWidget(QLabel("<b>Live Statistics</b>"))
+        stats_header = QLabel("Live Statistics")
+        stats_header.setObjectName("sectionHeader")
+        main_layout.addWidget(stats_header)
         self.stats_display = StatsDisplay()
         main_layout.addWidget(self.stats_display)
         main_layout.addWidget(QFrame(self, frameShape=QFrame.HLine, frameShadow=QFrame.Sunken))
@@ -261,6 +304,8 @@ class MinerGui(QWidget):
         mining_box = CollapsibleBox("Mining Configuration", start_expanded=True)
         mining_form = QFormLayout()
         self.pool_ip_input = QLineEdit()
+        self.high_priority_checkbox = QCheckBox("Run Miner with High Priority")
+        self.high_priority_checkbox.setChecked(True)  # default to enabled
         self.thread_count_input = QLineEdit()
         self.mine_button = QPushButton("Start Mining")
         self.stop_button = QPushButton("Stop Mining")
@@ -268,14 +313,16 @@ class MinerGui(QWidget):
         self.stop_button.setEnabled(False)
         mining_form.addRow("Pool Address:", self.pool_ip_input)
         mining_form.addRow("CPU Threads:", self.thread_count_input)
+        mining_form.addRow("Priority:", self.high_priority_checkbox)
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
         mining_form.addRow(button_layout)
         mining_box.setContentLayout(mining_form)
         main_layout.addWidget(mining_box)
-        console_label = QLabel("<b>Console Output:</b>")
+        console_label = QLabel("Console Output")
         console_label.setObjectName("consoleTitle")
+        main_layout.addWidget(console_label)
         main_layout.addWidget(console_label)
         # --- CONSOLE WIDGET SETUP ---
         self.console_output = QPlainTextEdit()
@@ -475,6 +522,7 @@ class MinerGui(QWidget):
 
     def handle_start_mining(self):
         try:
+            high_priority = self.high_priority_checkbox.isChecked()
             threads = int(self.thread_count_input.text().strip())
             pool = self.pool_ip_input.text().strip()
             if threads <= 0 or not pool: raise ValueError
@@ -483,6 +531,7 @@ class MinerGui(QWidget):
             return
         if self.async_worker and self.async_worker.isRunning():
             self.logger.log_message("[+] Start mining command issued from GUI.")
+            self.xmrig_miner.priority = high_priority
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(pool, threads), self.async_worker.loop)
 
     def handle_stop_mining(self):
