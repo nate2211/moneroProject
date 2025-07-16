@@ -53,12 +53,19 @@ class AsyncWorker(QThread):
         self.loop = None
 
     def run(self):
-        """Initializes and runs the asyncio event loop for all background tasks."""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        # The main async task (run_async_tasks) is run until it completes.
-        self.loop.run_until_complete(self.coro)
-        self.loop.close()
+
+        try:
+            self.loop.run_until_complete(self.coro)
+        except Exception as e:
+            print(f"[!] AsyncWorker exception: {e}")
+        finally:
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                task.cancel()
+            self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self.loop.close()
 
 
 # ==============================================================================
@@ -335,7 +342,7 @@ class MinerGui(QWidget):
         main_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
     def connect_signals(self):
-        self.connect_button.clicked.connect(lambda: self.handle_connect(start_mining_on_success=False))
+        self.connect_button.clicked.connect(lambda: self.handle_connect())
         self.save_button.clicked.connect(self.save_settings)
         self.load_button.clicked.connect(self.load_settings)
         self.mine_button.clicked.connect(self.handle_start_mining)
@@ -502,7 +509,7 @@ class MinerGui(QWidget):
         asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url),
                                          self.async_worker.loop)
 
-    def handle_connect(self, start_mining_on_success=False):
+    def handle_connect(self):
         server_url = self.server_url_input.text().strip()
         client_id = self.client_id_input.text().strip()
         if not (server_url and client_id):
@@ -561,6 +568,8 @@ class MinerGui(QWidget):
     def quit_application(self):
         self.logger.log_message("[!] Exiting application from tray menu...")
         self.tray_icon.hide()
+
+        # Shut down the asyncio worker thread
         if self.async_worker and self.async_worker.isRunning():
             self.handle_stop_mining()
             if self.xmrig_data.aiohttp_client_session and not self.xmrig_data.aiohttp_client_session.closed:
@@ -573,6 +582,13 @@ class MinerGui(QWidget):
             if self.async_worker.loop.is_running():
                 self.async_worker.loop.call_soon_threadsafe(self.async_worker.loop.stop)
             self.async_worker.wait(3000)
+
+        # --- ADD THIS BLOCK ---
+        # Gracefully shut down the hardware monitor thread before exiting
+        if self.xmrig_data.hardware_monitor and self.xmrig_data.hardware_monitor.is_alive():
+            self.xmrig_data.hardware_monitor.deinitialize()
+        # ----------------------
+
         QApplication.instance().quit()
 
     def create_and_run_updater_script(self, new_exe_path: str) -> None:
