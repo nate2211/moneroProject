@@ -361,7 +361,7 @@ const EventTable = ({ title, events = [] }) => {
                                 <StatCard icon={<FirstPage/>} title={"Number of Page Faults"} value={memoryData.num_page_faults}/>
                                 <StatCard icon={<Pool/>} title={"Paged Pool"} value={memoryData.paged_pool} unit={"MB"}/>
                             </Grid>
-                           ]</AccordionDetails>
+                           </AccordionDetails>
                     </Accordion>
                 </CardContent>
             </Card>

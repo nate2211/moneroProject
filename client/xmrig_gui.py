@@ -15,7 +15,8 @@ import aiohttp
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
                              QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
-                             QSystemTrayIcon, QMenu, QAction, QApplication)
+                             QSystemTrayIcon, QMenu, QAction, QApplication, QDialogButtonBox, QListWidget, QDialog,
+                             QInputDialog)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -63,7 +64,43 @@ class AsyncWorker(QThread):
 # ==============================================================================
 # NEW & UPDATED GUI WIDGETS
 # ==============================================================================
+class SettingsDialog(QDialog):
+    """A dialog window to select a settings profile from a list."""
 
+    def __init__(self, profiles, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load Settings Profile")
+        self.setMinimumWidth(350)
+
+        self.profiles = profiles
+        layout = QVBoxLayout(self)
+
+        # Instruction Label
+        layout.addWidget(QLabel("Select a profile to load:"))
+
+        # List Widget
+        self.list_widget = QListWidget()
+        for profile in self.profiles:
+            self.list_widget.addItem(profile.get("name", "Unnamed Profile"))
+
+        # Auto-select the first item
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+        layout.addWidget(self.list_widget)
+
+        # Dialog Buttons (OK/Cancel)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_selected_profile(self):
+        """Returns the full dictionary of the selected profile."""
+        current_row = self.list_widget.currentRow()
+        if current_row >= 0:
+            return self.profiles[current_row]
+        return None
 class CollapsibleBox(QWidget):
     """A collapsible box widget."""
 
@@ -175,7 +212,7 @@ class MinerGui(QWidget):
         self.init_ui()
         self.init_tray_icon()
         self.connect_signals()
-        self.load_settings()
+        self.load_initial_settings()
         self.show()
         self.logger.log_message("Welcome! GUI Initialized. Please connect to the server.")
 
@@ -250,6 +287,15 @@ class MinerGui(QWidget):
         main_layout.addWidget(self.console_output, 1)
         main_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
+    def connect_signals(self):
+        self.connect_button.clicked.connect(lambda: self.handle_connect(start_mining_on_success=False))
+        self.save_button.clicked.connect(self.save_settings)
+        self.load_button.clicked.connect(self.load_settings)
+        self.mine_button.clicked.connect(self.handle_start_mining)
+        self.stop_button.clicked.connect(self.handle_stop_mining)
+        self.logger.message_signal.connect(self.update_console)
+        self.stats_update_signal.connect(self.stats_display.update_stats)
+        self.force_update_signal.connect(self.handle_force_update)
     def resource_path(self, relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
         try:
@@ -261,7 +307,7 @@ class MinerGui(QWidget):
     def init_tray_icon(self):
         self.tray_icon = QSystemTrayIcon(self)
 
-        icon_path = self.resource_path("icon.png")
+        icon_path = self.resource_path("icons/icon.png")
         if os.path.exists(icon_path):
             self.tray_icon.setIcon(QIcon(icon_path))
         else:
@@ -300,57 +346,100 @@ class MinerGui(QWidget):
         if reason == QSystemTrayIcon.Trigger:
             self.show_window()
 
-    def show_window(self):
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def connect_signals(self):
-        self.connect_button.clicked.connect(lambda: self.handle_connect(start_mining_on_success=False))
-        self.save_button.clicked.connect(self.save_settings)
-        self.load_button.clicked.connect(self.load_settings)
-        self.mine_button.clicked.connect(self.handle_start_mining)
-        self.stop_button.clicked.connect(self.handle_stop_mining)
-        self.logger.message_signal.connect(self.update_console)
-        self.stats_update_signal.connect(self.stats_display.update_stats)
-        self.force_update_signal.connect(self.handle_force_update)
+    def _get_profiles(self):
+        """Helper to safely load profiles from the JSON file."""
+        if not os.path.exists(self.gui_settings_path):
+            return []
+        try:
+            with open(self.gui_settings_path, 'r') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except (IOError, json.JSONDecodeError):
+            return []
 
     def save_settings(self):
-        settings = {
+        """Saves the current GUI settings as a named profile."""
+        profile_name, ok = QInputDialog.getText(self, "Save Profile", "Enter a name for this profile:")
+        if not (ok and profile_name):
+            self.logger.log_message("[!] Save cancelled.")
+            return
+
+        current_settings = {
             "server_url": self.server_url_input.text(),
             "client_id": self.client_id_input.text(),
             "pool_ip": self.pool_ip_input.text(),
             "thread_count": self.thread_count_input.text()
         }
+
+        new_profile = {"name": profile_name, "settings": current_settings}
+        profiles = self._get_profiles()
+
+        # Check if profile with the same name exists and ask to overwrite
+        existing_index = -1
+        for i, p in enumerate(profiles):
+            if p.get("name") == profile_name:
+                existing_index = i
+                break
+
+        if existing_index != -1:
+            reply = QMessageBox.question(self, 'Overwrite Profile?',
+                                         f"A profile named '{profile_name}' already exists. Do you want to overwrite it?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                self.logger.log_message("[!] Overwrite cancelled.")
+                return
+            profiles[existing_index] = new_profile
+        else:
+            profiles.append(new_profile)
+
         try:
             with open(self.gui_settings_path, 'w') as f:
-                json.dump(settings, f, indent=4)
-            self.logger.log_message("[+] GUI settings saved successfully.")
-        except Exception as e:
-            self.logger.log_message(f"[!] Error saving GUI settings: {e}")
+                json.dump(profiles, f, indent=4)
+            self.logger.log_message(f"[+] Profile '{profile_name}' saved successfully.")
+        except IOError as e:
+            self.logger.log_message(f"[!] Error saving profiles: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save settings file: {e}")
 
     def load_settings(self):
-        try:
-            if os.path.exists(self.gui_settings_path):
-                with open(self.gui_settings_path, 'r') as f:
-                    settings = json.load(f)
-                self.server_url_input.setText(settings.get("server_url", "http://192.168.0.10:5000"))
-                self.client_id_input.setText(settings.get("client_id", "DefaultMiner"))
-                self.pool_ip_input.setText(settings.get("pool_ip", "192.168.0.10:3333"))
-                self.thread_count_input.setText(settings.get("thread_count", "8"))
-                self.logger.log_message("[+] GUI settings loaded successfully.")
-            else:
-                self.logger.log_message("[+] No GUI settings file found, using default values.")
-                self.server_url_input.setText("http://192.168.0.101:5000")
-                self.client_id_input.setText("DefaultMiner")
-                self.pool_ip_input.setText("192.168.0.10:3333")
-                self.thread_count_input.setText("8")
-        except (json.JSONDecodeError, Exception) as e:
-            self.logger.log_message(f"[!] Error loading GUI settings, using defaults: {e}")
-            self.server_url_input.setText("http://192.168.0.10:5000")
-            self.client_id_input.setText("DefaultMiner")
-            self.pool_ip_input.setText("192.168.0.10:3333")
-            self.thread_count_input.setText("8")
+        """Opens a dialog to load a chosen settings profile."""
+        profiles = self._get_profiles()
+        if not profiles:
+            QMessageBox.information(self, "No Profiles", "There are no saved setting profiles to load.")
+            return
+
+        dialog = SettingsDialog(profiles, self)
+        if dialog.exec_() == QDialog.Accepted:
+            selected_profile = dialog.get_selected_profile()
+            if selected_profile:
+                self.apply_settings(selected_profile["settings"])
+                self.logger.log_message(f"[+] Loaded profile: '{selected_profile.get('name')}'.")
+
+    def load_initial_settings(self):
+        """Loads the first profile on startup or sets defaults."""
+        profiles = self._get_profiles()
+        if profiles:
+            self.logger.log_message("[+] Loading first saved profile on startup.")
+            self.apply_settings(profiles[0]["settings"])
+        else:
+            self.logger.log_message("[+] No settings file found, using default values.")
+            defaults = {
+                "server_url": "http://192.168.0.101:5000",
+                "client_id": "DefaultMiner",
+                "pool_ip": "192.168.0.10:3333",
+                "thread_count": "8"
+            }
+            self.apply_settings(defaults)
+
+    def apply_settings(self, settings):
+        """Applies a settings dictionary to the GUI inputs."""
+        self.server_url_input.setText(settings.get("server_url", ""))
+        self.client_id_input.setText(settings.get("client_id", ""))
+        self.pool_ip_input.setText(settings.get("pool_ip", ""))
+        self.thread_count_input.setText(settings.get("thread_count", ""))
+    def show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     @pyqtSlot(str)
     def update_console(self, message):
@@ -405,8 +494,8 @@ class MinerGui(QWidget):
         self.logger.log_message(f"[+] Connecting to {self.xmrig_data.FLASK_SERVER_URL} as {self.xmrig_data.client_id}")
         async with aiohttp.ClientSession() as session:
             self.xmrig_data.aiohttp_client_session = session
-            polling_task = asyncio.create_task(self.xmrig_miner.poll_server(session, self.force_update_signal))
-            reporter_task = asyncio.create_task(self.xmrig_miner.periodic_reporter(session, self.stats_update_signal))
+            polling_task = asyncio.create_task(self.xmrig_miner.server_poller.run(self.force_update_signal, session))
+            reporter_task = asyncio.create_task(self.xmrig_miner.periodic_reporter.run(self.stats_update_signal, session))
             self.logger.log_message("[+] Background services running.")
             await asyncio.gather(polling_task, reporter_task)
 
