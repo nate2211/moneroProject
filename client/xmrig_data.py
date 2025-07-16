@@ -29,7 +29,11 @@ class HardwareMonitor(Thread):
         self.cpu_temperature_formatted = "N/A"
         self.total_power_draw = "N/A"
         self.has_nvidia_gpu = False  # Flag for GPU detection
-
+        self.tuner = {
+                        "index": 0,
+                        "affinity": -1,
+                        "dataset_host": False
+                    }
         # Internal state
         self.computer = None
         self._cpu_temp_sensors = []
@@ -50,7 +54,8 @@ class HardwareMonitor(Thread):
             self._power_sensors.clear()
             self._unique_hardware.clear()
             self.has_nvidia_gpu = False  # Reset flag on re-initialization
-
+            self.gpu_name = None
+            self.vram_mb = 0
             # Find sensors and their parent hardware
             for hardware in self.computer.Hardware:
                 hardware.Update()
@@ -58,6 +63,35 @@ class HardwareMonitor(Thread):
                 # Consolidated check for NVIDIA GPU
                 if "nvidia" in str(hardware.HardwareType).lower():
                     self.has_nvidia_gpu = True
+                    self.gpu_name = hardware.Name.lower()
+                    hardware.Update()
+                    for sensor in hardware.Sensors:
+                        if sensor.SensorType == SensorType.SmallData and "memory total" in sensor.Name.lower():
+                            if sensor.Value is not None:
+                                self.vram_mb = int(sensor.Value)  # Usually reported in MB
+                    self.logger.log_message(f"[+] Detected GPU: {self.gpu_name}, VRAM: {self.vram_mb}MB")
+
+                    # Heuristic logic
+                    if "1050" in self.gpu_name:
+                        self.tuner.update(dict(threads=1, blocks=32, bfactor=7, bsleep=30))
+                    elif "2060" in self.gpu_name or "3050" in self.gpu_name:
+                        self.tuner.update(dict(threads=2, blocks=40, bfactor=6, bsleep=25))
+                    elif "3060" in self.gpu_name:
+                        self.tuner.update(dict(threads=1, blocks=44, bfactor=5, bsleep=15))
+                    elif "3070" in self.gpu_name or "3080" in self.gpu_name:
+                        self.tuner.update(dict(threads=2, blocks=56, bfactor=5, bsleep=20))
+                    elif "1660" in self.gpu_name:
+                        self.tuner.update(dict(threads=2, blocks=40, bfactor=6, bsleep=20))
+                    elif self.vram_mb >= 16000:
+                        self.tuner.update(dict(threads=2, blocks=72, bfactor=4, bsleep=10))
+                    elif self.vram_mb >= 12000:
+                        self.tuner.update(dict(threads=2, blocks=64, bfactor=5, bsleep=12))
+                    elif self.vram_mb >= 8000:
+                        self.tuner.update(dict(threads=2, blocks=48, bfactor=5, bsleep=15))
+                    elif self.vram_mb >= 6000:
+                        self.tuner.update(dict(threads=2, blocks=40, bfactor=6, bsleep=20))
+                    else:
+                        self.tuner.update(dict(threads=1, blocks=32, bfactor=6, bsleep=30))
 
                 for sensor in hardware.Sensors:
                     if sensor.SensorType == SensorType.Temperature and "cpu" in str(hardware.HardwareType).lower():
@@ -146,63 +180,8 @@ class HardwareMonitor(Thread):
         self.stop()
         self.join(timeout=5)  # Ensure cleanup finishes
         self.logger.log_message("[+] Hardware monitor shut down cleanly.")
-    def get_rx_cuda_config(self):
-        """
-        Returns CUDA config for XMRig's RandomX tuning based on detected NVIDIA GPU
-        using only data from LibreHardwareMonitorLib (no NVML/gpuinfo).
-        """
-        gpu_name = None
-        vram_mb = 0
 
-        try:
-            for hardware in self.computer.Hardware:
-                if hardware.HardwareType == HardwareType.GpuNvidia:
-                    gpu_name = hardware.Name.lower()
-                    hardware.Update()
-                    for sensor in hardware.Sensors:
-                        if sensor.SensorType == SensorType.SmallData and "memory total" in sensor.Name.lower():
-                            if sensor.Value is not None:
-                                vram_mb = int(sensor.Value)  # Usually reported in MB
-                    break
-        except Exception as e:
-            self.logger.log_message(f"[!] Failed to extract GPU info from LibreHardwareMonitor: {e}")
-            return None
 
-        if not gpu_name:
-            self.logger.log_message("[!] No NVIDIA GPU found for CUDA config tuning.")
-            return None
-
-        self.logger.log_message(f"[+] Detected GPU: {gpu_name}, VRAM: {vram_mb}MB")
-
-        config = {
-            "index": 0,
-            "affinity": -1,
-            "dataset_host": False
-        }
-
-        # Heuristic logic
-        if "1050" in gpu_name:
-            config.update(dict(threads=1, blocks=32, bfactor=7, bsleep=30))
-        elif "2060" in gpu_name or "3050" in gpu_name:
-            config.update(dict(threads=2, blocks=40, bfactor=6, bsleep=25))
-        elif "3060" in gpu_name:
-            config.update(dict(threads=1, blocks=44, bfactor=5, bsleep=15))
-        elif "3070" in gpu_name or "3080" in gpu_name:
-            config.update(dict(threads=2, blocks=56, bfactor=5, bsleep=20))
-        elif "1660" in gpu_name:
-            config.update(dict(threads=2, blocks=40, bfactor=6, bsleep=20))
-        elif vram_mb >= 16000:
-            config.update(dict(threads=2, blocks=72, bfactor=4, bsleep=10))
-        elif vram_mb >= 12000:
-            config.update(dict(threads=2, blocks=64, bfactor=5, bsleep=12))
-        elif vram_mb >= 8000:
-            config.update(dict(threads=2, blocks=48, bfactor=5, bsleep=15))
-        elif vram_mb >= 6000:
-            config.update(dict(threads=2, blocks=40, bfactor=6, bsleep=20))
-        else:
-            config.update(dict(threads=1, blocks=32, bfactor=6, bsleep=30))
-
-        return config
 
 
 class XmrigData:
@@ -228,7 +207,7 @@ class XmrigData:
         self.logger = Logger
 
         self.hardware_monitor = HardwareMonitor(self.logger)
-        self.hardware_monitor.start()
+
 
     async def get_power_draw_async(self):
         """Async wrapper to get total power draw from the monitor thread."""

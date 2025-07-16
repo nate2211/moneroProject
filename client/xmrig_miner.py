@@ -6,9 +6,10 @@ import re
 import traceback
 from typing import Callable
 import aiohttp
+import anyio
 import psutil
 from typing_extensions import Awaitable
-
+import re
 
 REPORT_INTERVAL_SECONDS = 5
 
@@ -147,9 +148,16 @@ class OutputMonitor:
 
         async for line_bytes in process.stdout:
             decoded = line_bytes.decode("utf-8", errors="ignore").strip()
-            if not decoded:
+            if not decoded or decoded.isspace() or len(decoded.strip()) == 0:
                 continue
 
+            lines = re.split(r'\r\n|\r|\n', decoded)
+
+            for line in lines:
+                clean_line = line.strip()
+                if not clean_line:
+                    continue
+                decoded = clean_line
             self.logger.log_message(f"[XMRIG] {decoded}")
 
             # --- Handle Error and Restart Conditions ---
@@ -228,16 +236,24 @@ class XmrigMiner:
         self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
         self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
         self.priority = False
-    async def start_miner(self, pool_url="", thread_count=None):
+        self.cpu_info_flags = set()
+        try:
+            from cpuinfo import get_cpu_info
+            self.cpu_info_flags = set(get_cpu_info().get("flags", []))
+        except Exception:
+            self.logger.log_message("[!] Failed to detect CPU features")
 
+
+    async def start_miner(self, pool_url="", thread_count=None):
         await self.kill_all_xmrig_processes()
+
         if self.xmrig_data.xmrig_process is not None and self.xmrig_data.xmrig_process.returncode is None:
             self.logger.log_message("[!] Miner already running.")
             return
 
         if thread_count is None:
             try:
-                input_threads = await asyncio.to_thread(input, "Enter thread count (e.g., 4): ")
+                input_threads = await anyio.to_thread.run_sync(input, "Enter thread count (e.g., 4): ")
                 self.xmrig_data.threads = int(input_threads.strip())
                 if self.xmrig_data.threads <= 0:
                     raise ValueError
@@ -247,8 +263,8 @@ class XmrigMiner:
         else:
             self.xmrig_data.threads = thread_count
 
-        if pool_url == "":
-            input_pool_url = await asyncio.to_thread(input, "Enter custom pool URL (e.g., 192.168.0.10:3333): ")
+        if not pool_url:
+            input_pool_url = await anyio.to_thread.run_sync(input, "Enter custom pool URL (e.g., 192.168.0.10:3333): ")
             self.xmrig_data.custom_pool_url = input_pool_url.strip()
             if not self.xmrig_data.custom_pool_url:
                 self.logger.log_message("[!] No pool URL provided.")
@@ -261,40 +277,51 @@ class XmrigMiner:
             return
 
         try:
-            await asyncio.to_thread(self.update_config_file_sync, self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
-
+            await anyio.to_thread.run_sync(
+                self.update_config_file_sync,
+                self.xmrig_data.custom_pool_url,
+                self.xmrig_data.threads
+            )
         except Exception as e:
             self.logger.log_message(f"[!] Failed to update config.json: {e}")
             return
 
         self.xmrig_data.client_status = "Started"
-        payload = {"status": self.xmrig_data.client_status}
-
         self.logger.log_message("[+] Starting miner...")
+
+        payload = {"status": self.xmrig_data.client_status}
         try:
-            # Use the shared session here
-            await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
-                                              timeout=aiohttp.ClientTimeout(total=10))
+            await self.xmrig_data.aiohttp_client_session.post(
+                f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
         except aiohttp.ClientError as e:
             self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
-        self.xmrig_data.xmrig_process = await asyncio.create_subprocess_exec(
-            self.xmrig_data.XMRIG_PATH,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        # --- Start miner process using anyio ---
+        try:
+            self.xmrig_data.xmrig_process = await anyio.open_process(
+                [self.xmrig_data.XMRIG_PATH],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        # --- Add this section to set priority ---
+            )
+        except Exception as e:
+            self.logger.log_message(f"[!] Failed to start XMRig: {e}")
+            return
+
+        # --- Set priority if needed ---
         try:
             if self.priority:
                 p = psutil.Process(self.xmrig_data.xmrig_process.pid)
-                p.nice(psutil.HIGH_PRIORITY_CLASS)  # For Windows
-                # On Linux, you might use: p.nice(-10) # Lower number is higher priority
+                p.nice(psutil.HIGH_PRIORITY_CLASS)
                 self.logger.log_message(f"[+] Set XMRig process (PID: {p.pid}) to high priority.")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            self.logger.log_message("[!] Could not set XMRig process priority. Run as admin/root for best results.")
+            self.logger.log_message("[!] Could not set process priority. Try running as admin/root.")
 
-        await asyncio.create_task(self.monitor.monitor_process(self.xmrig_data.xmrig_process))
+        # Start monitoring
+        await self.monitor.monitor_process(self.xmrig_data.xmrig_process)
 
     async def stop_miner(self):
 
@@ -304,13 +331,13 @@ class XmrigMiner:
         payload = {"status": self.xmrig_data.client_status}
         try:
             # Use the shared session here
-            await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
-                                              timeout=aiohttp.ClientTimeout(total=10))
+            await self.xmrig_data.aiohttp_client_session.post(
+                f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}", json=payload,
+                timeout=aiohttp.ClientTimeout(total=10))
         except aiohttp.ClientError as e:
             self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
             self.xmrig_data.xmrig_process = None
-
 
     async def get_current_threads_from_config_async(self):
         async with self.xmrig_data.miner_lock:
@@ -352,9 +379,8 @@ class XmrigMiner:
             if "randomx" in config:
                 config["randomx"]["algo"] = "rx"
 
-            from cpuinfo import get_cpu_info
-            cpu_info = get_cpu_info()
-            flags = cpu_info.get("flags", [])
+
+            flags = self.cpu_info_flags
 
             supports_avx2 = "avx2" in flags
             supports_aes = "aes" in flags
@@ -379,18 +405,18 @@ class XmrigMiner:
             config.setdefault("cuda", {})
             config["cuda"]["enabled"] = has_nvidia_gpu  # Set CUDA enabled based on internal detection
             if has_nvidia_gpu:
-                tuning = self.xmrig_data.hardware_monitor.get_rx_cuda_config()
-                if tuning:
+
+                if self.xmrig_data.hardware_monitor.tuner:
                     config["cuda"]["rx"] = [{
                         "index": 0,
-                        "threads": tuning["threads"],
-                        "blocks": tuning["blocks"],
-                        "bfactor": tuning["bfactor"],
-                        "bsleep": tuning["bsleep"],
+                        "threads": self.xmrig_data.hardware_monitor.tuner["threads"],
+                        "blocks": self.xmrig_data.hardware_monitor.tuner["blocks"],
+                        "bfactor": self.xmrig_data.hardware_monitor.tuner["bfactor"],
+                        "bsleep": self.xmrig_data.hardware_monitor.tuner["bsleep"],
                         "affinity": -1,
                         "dataset_host": False
                     }]
-                    self.logger.log_message(f"[+] Auto CUDA tuning applied: {tuning}")
+                    self.logger.log_message(f"[+] Auto CUDA tuning applied: {self.xmrig_data.hardware_monitor.tuner}")
                 else:
                     self.logger.log_message("[!] Failed to determine optimal CUDA tuning")
             if "cpu" in config:
