@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
                              QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
                              QSystemTrayIcon, QMenu, QAction, QApplication, QDialogButtonBox, QListWidget, QDialog,
-                             QInputDialog, QCheckBox, QGridLayout)
+                             QInputDialog, QCheckBox, QGridLayout, QComboBox)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -145,7 +145,7 @@ class CollapsibleBox(QWidget):
 
         collapsed_height = self.toggle_button.sizeHint().height() + 10
         # Use a fixed height to ensure it's predictable on startup
-        content_height = 225
+        content_height = 250
 
         for i in range(self.toggle_animation.animationCount()):
             self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
@@ -171,7 +171,197 @@ class CollapsibleBox(QWidget):
             self.content_area.setMaximumHeight(0)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
+    def setContentWidget(self, widget: QWidget):
+        # Clear old layout
+        for i in reversed(range(self.content_area_layout.count())):
+            old_widget = self.content_area_layout.itemAt(i).widget()
+            if old_widget:
+                old_widget.setParent(None)
+            self.content_area_layout.removeItem(self.content_area_layout.itemAt(i))
 
+        self.content_area_layout.addWidget(widget)
+
+        collapsed_height = self.toggle_button.sizeHint().height() + 10
+        content_height = widget.sizeHint().height() + 20
+
+        # Remove existing animations
+        for i in range(self.toggle_animation.animationCount()):
+            self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
+
+        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
+        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
+        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
+
+        for i in range(self.toggle_animation.animationCount()):
+            animation = self.toggle_animation.animationAt(i)
+            animation.setDuration(300)
+            animation.setStartValue(collapsed_height)
+            animation.setEndValue(collapsed_height + content_height)
+
+        content_animation = self.toggle_animation.animationAt(2)
+        content_animation.setStartValue(0)
+        content_animation.setEndValue(content_height)
+
+        # Set initial state
+        if self.toggle_button.isChecked():
+            self.content_area.setMaximumHeight(content_height)
+        else:
+            self.content_area.setMaximumHeight(0)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+class ConnectionSettingsBox(QWidget):
+    """A widget for managing connection settings."""
+    # Signal emitted when the connect button is clicked
+    connect_clicked = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QFormLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setVerticalSpacing(15)
+
+        # Create widgets
+        self.server_url_input = QLineEdit()
+        self.client_id_input = QLineEdit()
+        self.connect_button = QPushButton("Connect to Server")
+        self.save_button = QPushButton("Save Settings")
+        self.load_button = QPushButton("Load Settings")
+
+        # Connect internal signal
+        self.connect_button.clicked.connect(self._on_connect)
+
+        # Layout
+        layout.addRow("Server URL:", self.server_url_input)
+        layout.addRow("Client ID:", self.client_id_input)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.connect_button)
+        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.load_button)
+        layout.addRow(button_layout)
+
+    def _on_connect(self):
+        """Internal handler to gather data and emit the public signal."""
+        server_url = self.server_url_input.text().strip()
+        client_id = self.client_id_input.text().strip()
+        self.connect_clicked.emit(server_url, client_id)
+
+    def get_settings(self):
+        """Returns the current settings from this widget as a dict."""
+        return {
+            "server_url": self.server_url_input.text(),
+            "client_id": self.client_id_input.text(),
+        }
+
+    def apply_settings(self, settings):
+        """Applies a settings dictionary to this widget."""
+        self.server_url_input.setText(settings.get("server_url", ""))
+        self.client_id_input.setText(settings.get("client_id", ""))
+
+    def set_enabled(self, enabled):
+        """Disables or enables input widgets after connection."""
+        self.server_url_input.setEnabled(enabled)
+        self.client_id_input.setEnabled(enabled)
+        self.connect_button.setEnabled(enabled)
+
+
+class MiningConfigBox(QWidget):
+    """A widget for managing mining configuration using a grid layout."""
+    start_mining_clicked = pyqtSignal()
+    stop_mining_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Use QGridLayout for more control over rows and columns
+        layout = QGridLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setVerticalSpacing(15)
+
+        # --- Create Widgets ---
+        self.pool_ip_input = QLineEdit()
+        self.thread_count_input = QLineEdit()
+
+        # --- ADD THIS WIDGET ---
+        self.high_priority_checkbox = QCheckBox("Run as High Priority Process")
+        self.high_priority_checkbox.setToolTip("Gives the miner process higher priority in the OS scheduler.\nCan make the system less responsive.")
+        self.high_priority_checkbox.setChecked(False) # Default to OFF for safety
+
+        self.cpu_priority = QComboBox()
+        self.cpu_priority.addItem("Idle (1)", 1)
+        self.cpu_priority.addItem("Normal (2)", 2)
+        self.cpu_priority.addItem("High (3)", 3)
+        self.cpu_priority.addItem("Higher (4)", 4)
+        self.cpu_priority.addItem("Realtime (5)", 5)
+        self.cpu_priority.setCurrentIndex(1)
+
+        self.yield_checkbox = QCheckBox("Yield CPU to other processes")
+        self.yield_checkbox.setToolTip("Recommended. Improves system responsiveness.")
+        self.yield_checkbox.setChecked(True)
+
+        self.mine_button = QPushButton("Start Mining")
+        self.stop_button = QPushButton("Stop Mining")
+        self.mine_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+
+        # Connect internal signals
+        self.mine_button.clicked.connect(self.start_mining_clicked.emit)
+        self.stop_button.clicked.connect(self.stop_mining_clicked.emit)
+
+        # --- Arrange Widgets in a Grid ---
+        # Row 0
+        layout.addWidget(QLabel("Pool Address:"), 0, 0)
+        layout.addWidget(self.pool_ip_input, 0, 1)
+
+        # Row 1
+        layout.addWidget(QLabel("CPU Threads:"), 1, 0)
+        layout.addWidget(self.thread_count_input, 1, 1)
+
+        # Row 2
+        layout.addWidget(QLabel("CPU Priority:"), 2, 0)
+        layout.addWidget(self.cpu_priority, 2, 1)
+
+        layout.addWidget(QLabel("OS Priority:"), 3, 0)
+        layout.addWidget(self.high_priority_checkbox, 3, 1)
+        # Row 3
+        layout.addWidget(self.yield_checkbox, 4, 1)
+
+        # Row 4 (Buttons)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.mine_button)
+        button_layout.addWidget(self.stop_button)
+        layout.addLayout(button_layout, 4, 1)
+
+    def get_values(self):
+        """Returns all mining parameters in a dictionary."""
+        try:
+            return {
+                "pool": self.pool_ip_input.text().strip(),
+                "threads": int(self.thread_count_input.text().strip()),
+                "cpu_priority": self.cpu_priority.currentData(),
+                "cpu_yield": self.yield_checkbox.isChecked(),
+                "high_priority": self.high_priority_checkbox.isChecked(),
+            }
+        except (ValueError, TypeError):
+            return None  # Indicates invalid input
+
+    def get_settings(self):
+        """Returns the current settings from this widget as a dict."""
+        values = self.get_values()
+        return {
+            "pool_ip": values.get("pool") if values else "",
+            "thread_count": str(values.get("threads")) if values else "",
+            "priority_index": self.cpu_priority.currentIndex(),
+            "yield_cpu": self.yield_checkbox.isChecked(),
+            "high_priority": self.high_priority_checkbox.isChecked(),
+        }
+
+    def apply_settings(self, settings):
+        """Applies a settings dictionary to this widget."""
+        self.pool_ip_input.setText(settings.get("pool_ip", "192.168.0.10:3333"))
+        self.thread_count_input.setText(settings.get("thread_count", "8"))
+        self.cpu_priority.setCurrentIndex(settings.get("priority_index", 1))
+        self.yield_checkbox.setChecked(settings.get("yield_cpu", True))
+        self.high_priority_checkbox.setChecked(settings.get("high_priority", True))
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -242,114 +432,116 @@ class MinerGui(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("Nate's Mining Client")
-        self.setGeometry(100, 100, 1000, 700)
-        stylesheet = """
-            QWidget { background-color: #0D0D0D; color: #FFFFFF; font-family: Segoe UI, sans-serif; font-size: 10pt; }
-            QLabel { color: #FFFFFF; background-color: transparent; }
-            QPushButton { background-color: #8B0000; color: #FFFFFF; border-top: 1px solid #B22222; border-left: 1px solid #B22222; border-bottom: 1px solid #660000; border-right: 1px solid #660000; padding: 8px 16px; border-radius: 4px; font-weight: bold; }
-            QPushButton:hover { background-color: #9B111E; border-top: 1px solid #C83C3C; border-left: 1px solid #C83C3C; border-bottom: 1px solid #7C0A0A; border-right: 1px solid #7C0A0A; }
-            QPushButton:pressed { background-color: #660000; border-top: 1px solid #550000; border-left: 1px solid #550000; border-bottom: 1px solid #B22222; border-right: 1px solid #B22222; padding-top: 9px; padding-left: 17px; }
-            QPushButton:disabled { background-color: #2A2A2A; color: #888888; border: 1px solid #444444; }
-            QLineEdit, QPlainTextEdit { background-color: #1A1A1A; padding: 6px; border-radius: 4px; color: #FFFFFF; border-top: 1px solid #000000; border-left: 1px solid #000000; border-bottom: 1px solid #2E2E2E; border-right: 1px solid #2E2E2E; }
-            QFrame { border: 1px solid #252525; }
-            QToolButton { color: #FF4C4C; font-size: 12pt; font-weight: bold; background-color: transparent; border: none; }
-            QFormLayout QLabel { font-weight: bold; color: #FFFFFF; }
-            #consoleTitle { font-size: 11pt; font-weight: bold; padding-top: 10px; color: #FF4C4C; }
-            QScrollBar:vertical { border: none; background: #1A1A1A; width: 8px; margin: 0px; }
-            QScrollBar::handle:vertical { background: #FF4C4C; min-height: 20px; border-radius: 4px; }
-            
-            /* --- UNIFIED SECTION HEADER STYLES --- */
-            QLabel#sectionHeader, #consoleTitle {
-                font-size: 11pt;
-                font-weight: bold;
-                color: #CCCCCC;
-                padding-top: 10px;
-                padding-bottom: 4px;
-                margin-bottom: 4px;
-                border-bottom: 1px solid #333333;
-            }
-            QToolButton#collapsibleHeader {
-                font-size: 11pt;
-                font-weight: bold;
-                color: #CCCCCC;
-                padding: 6px 0px;
-                margin-bottom: 1px;
-                border: none;
-                border-bottom: 1px solid #333333;
-                text-align: left;
-            }
-            QToolButton#collapsibleHeader:hover {
-                color: #FFFFFF;
-            }
-        """
-        self.setStyleSheet(stylesheet)
+        self.setGeometry(100, 100, 800, 750)
+        self.setStyleSheet("""
+                QWidget { 
+                    background-color: #121212; 
+                    color: #E0E0E0; 
+                    font-family: Segoe UI, sans-serif; 
+                    font-size: 10pt; 
+                }
+                QLabel { 
+                    color: #E0E0E0; 
+                    background-color: transparent; 
+                }
+
+                /* --- THE FIX IS HERE --- */
+                QLineEdit, QComboBox {
+                    min-height: 32px; /* Set a taller minimum height */
+                    background-color: #212121; 
+                    padding-left: 10px; /* Add some left padding for text */
+                    border-radius: 4px; 
+                    border: 1px solid #333333;
+                }
+
+                QPushButton { 
+                    min-height: 32px; /* Make buttons the same height as inputs */
+                    background-color: #B71C1C; 
+                    color: #FFFFFF; 
+                    border: none; 
+                    padding: 0 20px; /* Adjust horizontal padding */
+                    border-radius: 4px; 
+                    font-weight: bold; 
+                }
+                /* --- END OF FIX --- */
+
+                QPushButton:hover { background-color: #C62828; } 
+                QPushButton:pressed { background-color: #A61A1A; }
+                QPushButton:disabled { background-color: #333333; color: #888888; }
+
+                QComboBox::drop-down { border: none; } 
+                QComboBox::down-arrow { image: url(no_img); } /* Hides default arrow */
+
+                QPlainTextEdit {
+                    background-color: #212121; 
+                    padding: 6px; 
+                    border-radius: 4px; 
+                    color: #E0E0E0; 
+                    border: 1px solid #333333;
+                }
+
+                QFrame[frameShape="4"] { border-top: 1px solid #333333; }
+
+                QToolButton#collapsibleHeader { 
+                    color: #E53935; 
+                    font-size: 12pt; 
+                    font-weight: bold; 
+                    background-color: transparent; 
+                    border: none; 
+                    text-align: left; 
+                    padding: 8px 4px; /* Added more padding for spacing */
+                    border-bottom: 1px solid #333333;
+                }
+                QFormLayout QLabel { font-weight: bold; }
+
+                #consoleTitle, QLabel#sectionHeader { 
+                    font-size: 11pt; 
+                    font-weight: bold; 
+                    color: #CCCCCC; 
+                    padding-top: 10px; 
+                    padding-bottom: 4px; 
+                    margin-bottom: 4px; 
+                    border-bottom: 1px solid #333333;
+                }
+            """)
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(15)
-        stats_header = QLabel("Live Statistics")
+        main_layout.setSpacing(10)
+
+        stats_header = QLabel("Live Statistics");
         stats_header.setObjectName("sectionHeader")
         main_layout.addWidget(stats_header)
         self.stats_display = StatsDisplay()
         main_layout.addWidget(self.stats_display)
-        main_layout.addWidget(QFrame(self, frameShape=QFrame.HLine, frameShadow=QFrame.Sunken))
-        connection_box = CollapsibleBox("Connection Settings", start_expanded=True)
-        connection_form = QFormLayout()
-        self.server_url_input = QLineEdit()
-        self.client_id_input = QLineEdit()
-        self.connect_button = QPushButton("Connect to Server")
-        self.save_button = QPushButton("Save Settings")
-        self.load_button = QPushButton("Load Settings")
-        connection_form.addRow("Server URL:", self.server_url_input)
-        connection_form.addRow("Client ID:", self.client_id_input)
-        conn_button_layout = QHBoxLayout()
-        conn_button_layout.addWidget(self.connect_button)
-        conn_button_layout.addWidget(self.save_button)
-        conn_button_layout.addWidget(self.load_button)
-        connection_form.addRow(conn_button_layout)
-        connection_box.setContentLayout(connection_form)
-        main_layout.addWidget(connection_box)
-        mining_box = CollapsibleBox("Mining Configuration", start_expanded=True)
-        mining_form = QFormLayout()
-        self.pool_ip_input = QLineEdit()
-        self.high_priority_checkbox = QCheckBox("Run Miner with High Priority")
-        self.high_priority_checkbox.setChecked(True)  # default to enabled
-        self.thread_count_input = QLineEdit()
-        self.mine_button = QPushButton("Start Mining")
-        self.stop_button = QPushButton("Stop Mining")
-        self.mine_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-        mining_form.addRow("Pool Address:", self.pool_ip_input)
-        mining_form.addRow("CPU Threads:", self.thread_count_input)
-        mining_form.addRow("Priority:", self.high_priority_checkbox)
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.mine_button)
-        button_layout.addWidget(self.stop_button)
-        mining_form.addRow(button_layout)
-        mining_box.setContentLayout(mining_form)
-        main_layout.addWidget(mining_box)
-        console_label = QLabel("Console Output")
+
+        # --- Create and add the new self-contained widgets ---
+        self.connection_box = ConnectionSettingsBox()
+        connection_collapsible = CollapsibleBox("Connection Settings", start_expanded=True)
+        connection_collapsible.setContentWidget(self.connection_box)
+        main_layout.addWidget(connection_collapsible)
+
+        self.mining_box = MiningConfigBox()
+        mining_collapsible = CollapsibleBox("Mining Configuration", start_expanded=True)
+        mining_collapsible.setContentWidget(self.mining_box)
+        main_layout.addWidget(mining_collapsible)
+
+        console_label = QLabel("Console Output");
         console_label.setObjectName("consoleTitle")
         main_layout.addWidget(console_label)
-        main_layout.addWidget(console_label)
-        # --- CONSOLE WIDGET SETUP ---
         self.console_output = QPlainTextEdit()
         self.console_output.setReadOnly(True)
-        # The Expanding size policy is still good practice.
-        self.console_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # THE FIX: Add the console widget with a stretch factor of 1.
-        # This tells the layout to give all available vertical space to the console.
-        main_layout.addWidget(self.console_output, 1)
-        main_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        main_layout.addWidget(self.console_output, 1)  # Add stretch factor
 
     def connect_signals(self):
-        self.connect_button.clicked.connect(lambda: self.handle_connect())
-        self.save_button.clicked.connect(self.save_settings)
-        self.load_button.clicked.connect(self.load_settings)
-        self.mine_button.clicked.connect(self.handle_start_mining)
-        self.stop_button.clicked.connect(self.handle_stop_mining)
+        self.connection_box.connect_clicked.connect(self.handle_connect)
+        self.mining_box.start_mining_clicked.connect(self.handle_start_mining)
+        self.mining_box.stop_mining_clicked.connect(self.handle_stop_mining)
+        self.connection_box.save_button.clicked.connect(self.save_settings)
+        self.connection_box.load_button.clicked.connect(self.load_settings)
         self.logger.message_signal.connect(self.update_console)
         self.stats_update_signal.connect(self.stats_display.update_stats)
         self.force_update_signal.connect(self.handle_force_update)
+
     def resource_path(self, relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
         try:
@@ -401,95 +593,45 @@ class MinerGui(QWidget):
             self.show_window()
 
     def _get_profiles(self):
-        """Helper to safely load profiles from the JSON file."""
-        if not os.path.exists(self.gui_settings_path):
-            return []
+        if not os.path.exists(self.gui_settings_path): return []
         try:
-            with open(self.gui_settings_path, 'r') as f:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-        except (IOError, json.JSONDecodeError):
-            return []
+            with open(self.gui_settings_path, 'r') as f: return json.load(f)
+        except (IOError, json.JSONDecodeError): return []
 
     def save_settings(self):
-        """Saves the current GUI settings as a named profile."""
         profile_name, ok = QInputDialog.getText(self, "Save Profile", "Enter a name for this profile:")
-        if not (ok and profile_name):
-            self.logger.log_message("[!] Save cancelled.")
-            return
-
-        current_settings = {
-            "server_url": self.server_url_input.text(),
-            "client_id": self.client_id_input.text(),
-            "pool_ip": self.pool_ip_input.text(),
-            "thread_count": self.thread_count_input.text()
-        }
-
-        new_profile = {"name": profile_name, "settings": current_settings}
+        if not (ok and profile_name): return
         profiles = self._get_profiles()
-
-        # Check if profile with the same name exists and ask to overwrite
-        existing_index = -1
-        for i, p in enumerate(profiles):
-            if p.get("name") == profile_name:
-                existing_index = i
-                break
-
-        if existing_index != -1:
-            reply = QMessageBox.question(self, 'Overwrite Profile?',
-                                         f"A profile named '{profile_name}' already exists. Do you want to overwrite it?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.No:
-                self.logger.log_message("[!] Overwrite cancelled.")
-                return
-            profiles[existing_index] = new_profile
-        else:
-            profiles.append(new_profile)
-
+        current_settings = {**self.connection_box.get_settings(), **self.mining_box.get_settings()}
+        new_profile = {"name": profile_name, "settings": current_settings}
+        existing_indices = [i for i, p in enumerate(profiles) if p.get("name") == profile_name]
+        if existing_indices:
+            reply = QMessageBox.question(self, 'Overwrite Profile?', f"A profile named '{profile_name}' already exists. Overwrite?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No: return
+            profiles[existing_indices[0]] = new_profile
+        else: profiles.append(new_profile)
         try:
-            with open(self.gui_settings_path, 'w') as f:
-                json.dump(profiles, f, indent=4)
+            with open(self.gui_settings_path, 'w') as f: json.dump(profiles, f, indent=4)
             self.logger.log_message(f"[+] Profile '{profile_name}' saved successfully.")
-        except IOError as e:
-            self.logger.log_message(f"[!] Error saving profiles: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to save settings file: {e}")
+        except IOError as e: self.logger.log_message(f"[!] Error saving profiles: {e}")
 
     def load_settings(self):
-        """Opens a dialog to load a chosen settings profile."""
         profiles = self._get_profiles()
         if not profiles:
-            QMessageBox.information(self, "No Profiles", "There are no saved setting profiles to load.")
-            return
-
+            QMessageBox.information(self, "No Profiles", "No saved profiles found."); return
         dialog = SettingsDialog(profiles, self)
         if dialog.exec_() == QDialog.Accepted:
-            selected_profile = dialog.get_selected_profile()
-            if selected_profile:
-                self.apply_settings(selected_profile["settings"])
-                self.logger.log_message(f"[+] Loaded profile: '{selected_profile.get('name')}'.")
+            selected = dialog.get_selected_profile()
+            if selected: self.apply_settings(selected["settings"]); self.logger.log_message(f"[+] Loaded profile: '{selected.get('name')}'.")
 
     def load_initial_settings(self):
-        """Loads the first profile on startup or sets defaults."""
         profiles = self._get_profiles()
-        if profiles:
-            self.logger.log_message("[+] Loading first saved profile on startup.")
-            self.apply_settings(profiles[0]["settings"])
-        else:
-            self.logger.log_message("[+] No settings file found, using default values.")
-            defaults = {
-                "server_url": "http://192.168.0.10:5000",
-                "client_id": "DefaultMiner",
-                "pool_ip": "192.168.0.10:3333",
-                "thread_count": "8"
-            }
-            self.apply_settings(defaults)
+        if profiles: self.apply_settings(profiles[0]["settings"]); self.logger.log_message("[+] Loaded first saved profile on startup.")
+        else: self.apply_settings({}); self.logger.log_message("[+] No settings file found, using default values.")
 
     def apply_settings(self, settings):
-        """Applies a settings dictionary to the GUI inputs."""
-        self.server_url_input.setText(settings.get("server_url", ""))
-        self.client_id_input.setText(settings.get("client_id", ""))
-        self.pool_ip_input.setText(settings.get("pool_ip", ""))
-        self.thread_count_input.setText(settings.get("thread_count", ""))
+        self.connection_box.apply_settings(settings)
+        self.mining_box.apply_settings(settings)
     def show_window(self):
         self.show()
         self.raise_()
@@ -509,37 +651,34 @@ class MinerGui(QWidget):
         asyncio.run_coroutine_threadsafe(self.download_update(self.xmrig_data.aiohttp_client_session, download_url),
                                          self.async_worker.loop)
 
-    def handle_connect(self):
-        server_url = self.server_url_input.text().strip()
-        client_id = self.client_id_input.text().strip()
-        if not (server_url and client_id):
-            self.logger.log_message("[!] Please provide both Server URL and Client ID.")
-            return
-        self.xmrig_data.FLASK_SERVER_URL = server_url
-        self.xmrig_data.client_id = client_id
+    @pyqtSlot(str, str)
+    def handle_connect(self, server_url, client_id):
+        if not (server_url and client_id): self.logger.log_message(
+            "[!] Please provide both Server URL and Client ID."); return
+        self.xmrig_data.FLASK_SERVER_URL, self.xmrig_data.client_id = server_url, client_id
         if not self.async_worker or not self.async_worker.isRunning():
             self.logger.log_message("[+] Starting background services...")
             self.async_worker = AsyncWorker(self.run_async_tasks())
             self.async_worker.start()
-            self.connect_button.setEnabled(False)
-            self.server_url_input.setDisabled(True)
-            self.client_id_input.setDisabled(True)
-            self.mine_button.setEnabled(True)
-            self.stop_button.setEnabled(True)
+            self.connection_box.set_enabled(False)
+            self.mining_box.mine_button.setEnabled(True)
+            self.mining_box.stop_button.setEnabled(True)
 
     def handle_start_mining(self):
         try:
-            high_priority = self.high_priority_checkbox.isChecked()
-            threads = int(self.thread_count_input.text().strip())
-            pool = self.pool_ip_input.text().strip()
-            if threads <= 0 or not pool: raise ValueError
+
+            params = self.mining_box.get_values()
+
+            if params["threads"] <= 0 or not params["pool"]: raise ValueError
         except ValueError:
             self.logger.log_message("[!] Invalid thread count or pool address.")
             return
         if self.async_worker and self.async_worker.isRunning():
             self.logger.log_message("[+] Start mining command issued from GUI.")
-            self.xmrig_miner.priority = high_priority
-            asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(pool, threads), self.async_worker.loop)
+            self.xmrig_miner.priority = params["high_priority"]
+            self.xmrig_miner.cpu_priority = params["cpu_priority"]
+            self.xmrig_miner.cpu_yield = params["cpu_yield"]
+            asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
 
     def handle_stop_mining(self):
         if self.async_worker and self.async_worker.isRunning():

@@ -236,6 +236,8 @@ class XmrigMiner:
         self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
         self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
         self.priority = False
+        self.cpu_priority = 2
+        self.cpu_yield = False
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
@@ -388,8 +390,8 @@ class XmrigMiner:
 
             config["cpu"]["asm"] = supports_avx2 or supports_sse2
             config["cpu"]["hw-aes"] = supports_aes
-            config["cpu"]["priority"] = 4 if supports_avx2 else 1
-            config["cpu"]["yield"] = not supports_avx2
+            config["cpu"]["priority"] = self.cpu_priority
+            config["cpu"]["yield"] = self.cpu_yield
 
             self.logger.log_message(f"[+] ASM optimization: {'enabled' if config['cpu']['asm'] else 'disabled'}")
             self.logger.log_message(
