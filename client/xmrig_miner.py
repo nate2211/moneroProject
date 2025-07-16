@@ -3,118 +3,230 @@ import json
 import os
 import subprocess
 import re
+import traceback
+from typing import Callable
+
 import aiohttp
 import psutil
+from typing_extensions import Awaitable
 
 REPORT_INTERVAL_SECONDS = 5
 
-class XmrigMiner:
 
-    def __init__(self, XmrigData, Logger):
-        self.xmrig_data = XmrigData
-        self.logger = Logger
+class PeriodicReporter:
+    """
+    Handles the periodic reporting of miner statistics to a remote server.
+    """
 
-    async def monitor_output(self, process):
-        async for line_bytes in process.stdout:
-            decoded = line_bytes.decode("utf-8", errors="ignore").strip()
+    def __init__(self,
+                 xmrig_miner,
+                 xmrig_data,
+                 logger,):
 
-            self.logger.log_message(f"[XMRIG] {decoded}")
-            if "error" in decoded.lower():
-                await self.stop_miner()
-                await asyncio.sleep(30)
-                await self.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
-
-            if "cpu" in decoded.lower() and "accepted" in decoded.lower():
-                match = re.search(r"accepted\s+\((\d+)/\d+\)", decoded.lower())
-                if match:
-                    self.xmrig_data._latest_cpu_accepted_shares = int(match.group(1))
-
-            if "nvidia" in decoded.lower() and "accepted" in decoded.lower():
-                match = re.search(r"accepted\s+\((\d+)/\d+\)", decoded.lower())
-                if match:
-                    self.xmrig_data._latest_nvidia_accepted_shares = int(match.group(1))
-
-            if "nvidia" in decoded.lower() and "c" in decoded.lower():
-                temp_match = re.search(r"(\d+c)", decoded.lower())
-                fan_match = re.search(r"fan\d+:(\d+%)", decoded.lower())
-                if temp_match:
-                    self.xmrig_data._latest_gpu_temp = temp_match.group(1)
-                if fan_match:
-                    self.xmrig_data._latest_gpu_fan = fan_match.group(1)
-
-            if "miner" in decoded.lower() and "speed" in decoded.lower():
-                match = re.search(r"speed\s+\d+s/\d+s/\d+m\s+([\d.]+)\s+", decoded)
-                if match:
-                    self.xmrig_data._latest_hashrate = float(match.group(1))
-            elif "gpu" in decoded.lower() and "compute error" in decoded.lower():
-                await self.stop_miner()
-                await asyncio.sleep(30)
-                await self.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
-            elif "new job from" in decoded.lower():
-                try:
-                    match = re.search(
-                        r"new job from ([\d.:]+).*?diff (\d+).*?algo ([^\s]+).*?height (\d+).*?\((\d+) tx\)",
-                        decoded)
-                    if match:
-                        job_info = {
-                            "client_id": self.xmrig_data.client_id,
-                            "ip": match.group(1),
-                            "difficulty": int(match.group(2)),
-                            "algo": match.group(3),
-                            "height": int(match.group(4)),
-                            "tx_count": int(match.group(5))
-                        }
-                        # Use the shared session here
-                        await self.xmrig_data.aiohttp_client_session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/newjob",
-                                                                     json=job_info,
-                                                                     timeout=aiohttp.ClientTimeout(total=10))
-                except Exception as e:
-                    self.logger.log_message(f"[!] Error sending new job info: {e}")
-                    pass
-
-    async def periodic_reporter(self, session: aiohttp.ClientSession, ui_signal):
-
+        self.xmrig_data = xmrig_data
+        self.logger = logger
+        self.xmrig_miner = xmrig_miner
+    async def run(self, update_signal, session: aiohttp.ClientSession):
         while True:
+            # This outer try/except block protects the entire loop
+            try:
                 await asyncio.sleep(REPORT_INTERVAL_SECONDS)
 
+                # --- Data Gathering ---
                 current_cpu_temp = await self.xmrig_data.get_cpu_temperature_async()
                 current_power_draw = await self.xmrig_data.get_power_draw_async()
-                current_threads = await self.get_current_threads_from_config_async()
-                payload = {}
+                current_threads = await self.xmrig_miner.get_current_threads_from_config_async()
+
+                # --- Payload Creation ---
                 if self.xmrig_data.client_status == "Started":
                     payload = {
-                        "client_id": self.xmrig_data.client_id,
-                        "hashrate": self.xmrig_data._latest_hashrate,
-                        "threads": current_threads,
-                        "cpu_temp": current_cpu_temp,
-                        "gpu_temp": self.xmrig_data._latest_gpu_temp,
-                        "gpu_fan": self.xmrig_data._latest_gpu_fan,
+                        "client_id": self.xmrig_data.client_id, "hashrate": self.xmrig_data._latest_hashrate,
+                        "threads": current_threads, "cpu_temp": current_cpu_temp,
+                        "gpu_temp": self.xmrig_data._latest_gpu_temp, "gpu_fan": self.xmrig_data._latest_gpu_fan,
                         "cpu_accepted_shares": self.xmrig_data._latest_cpu_accepted_shares,
                         "nvidia_accepted_shares": self.xmrig_data._latest_nvidia_accepted_shares,
                         "power_draw": current_power_draw
                     }
                 else:
                     payload = {
-                        "client_id": self.xmrig_data.client_id,
-                        "hashrate": 0,
-                        "threads": current_threads,
-                        "cpu_temp": current_cpu_temp,
-                        "gpu_temp": self.xmrig_data._latest_gpu_temp,
-                        "gpu_fan": self.xmrig_data._latest_gpu_fan,
-                        "cpu_accepted_shares": 0,
-                        "nvidia_accepted_shares": 0,
-                        "power_draw": current_power_draw
+                        "client_id": self.xmrig_data.client_id, "hashrate": 0, "threads": current_threads,
+                        "cpu_temp": current_cpu_temp, "gpu_temp": self.xmrig_data._latest_gpu_temp,
+                        "gpu_fan": self.xmrig_data._latest_gpu_fan, "cpu_accepted_shares": 0,
+                        "nvidia_accepted_shares": 0, "power_draw": current_power_draw
                     }
-                ui_signal.emit(payload)
-                try:
 
-                    await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate", json=payload,
-                                       timeout=aiohttp.ClientTimeout(total=10))
-                except aiohttp.ClientError as e:
-                    self.logger.log_message(f"[!] Error sending periodic hashrate report: {e}")
-                except Exception as e:
-                    self.logger.log_message(f"[!] Unexpected error during periodic hashrate report send: {e}")
+                # --- GUI and Network ---
+                update_signal.emit(payload)
+                await session.post(
+                    f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
 
+            except aiohttp.ClientError as e:
+                self.logger.log_message(f"[!] Network error in PeriodicReporter: {e}")
+            except Exception as e:
+                # This will now catch any error, including from data gathering
+                self.logger.log_message("[!] CRITICAL ERROR IN PERIODIC REPORTER:")
+                self.logger.log_message(traceback.format_exc())
+
+
+class ServerPoller:
+
+    def __init__(self,
+                 xmrig_miner,
+                 xmrig_data,
+                 logger):
+        self.xmrig_data = xmrig_data
+        self.xmrig_miner = xmrig_miner
+        self.logger = logger
+    async def run(self, force_update_signal, session: aiohttp.ClientSession):
+        while True:
+            try:
+                # Report current status
+                if self.xmrig_data.xmrig_process is not None and self.xmrig_data.xmrig_process.returncode is None:
+                    self.xmrig_data.client_status = "Started"
+                else:
+                    self.xmrig_data.client_status = "Stopped"
+                payload = {"status": self.xmrig_data.client_status}
+                await session.post(
+                    f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+
+                # Get command
+                async with session.get(
+                        f"{self.xmrig_data.FLASK_SERVER_URL}/get_command/{self.xmrig_data.client_id}",
+                        timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    response.raise_for_status()  # Raises an exception for bad status codes (4xx or 5xx)
+                    command = await response.json()
+
+                # Process command
+                if command:
+                    self.logger.log_message(f"\n[+] Received command from server: '{command.get('command')}'")
+                    cmd = command.get("command")
+                    if cmd == "start":
+                        pool = command.get("pool", self.xmrig_data.custom_pool_url)
+                        threads = command.get("threads", self.xmrig_data.threads)
+                        await self.xmrig_miner.stop_miner()
+                        await self.xmrig_miner.start_miner(pool, threads)
+                    elif cmd == "stop":
+                        await self.xmrig_miner.stop_miner()
+                    elif cmd == "set_threads":
+                        new_threads = int(command["threads"])  # This can cause KeyError or ValueError
+                        await self.xmrig_miner.update_config_threads_async(new_threads)
+                    elif cmd == "update":
+                        update_url = command.get("url")
+                        if update_url:
+                            force_update_signal.emit(update_url)
+
+            # --- MODIFIED ERROR HANDLING ---
+            except json.JSONDecodeError:
+                self.logger.log_message("[!] ServerPoller Error: Received invalid JSON from server.")
+            except (KeyError, ValueError) as e:
+                self.logger.log_message(
+                    f"[!] ServerPoller Error: Received malformed command from server. Details: {e}")
+            except aiohttp.ClientError as e:
+                self.logger.log_message(f"[!] ServerPoller Network Error: Cannot connect to server. Details: {e}")
+            except Exception as e:
+                self.logger.log_message("[!] An unexpected critical error occurred in ServerPoller:")
+                self.logger.log_message(traceback.format_exc())
+
+            await asyncio.sleep(5)
+class OutputMonitor:
+
+    def __init__(self, xmrig_miner, xmrig_data, logger):
+
+        self.xmrig_data = xmrig_data
+        self.logger = logger
+        self.xmrig_miner = xmrig_miner
+
+    async def monitor_process(self, process):
+
+        async for line_bytes in process.stdout:
+            decoded = line_bytes.decode("utf-8", errors="ignore").strip()
+            if not decoded:
+                continue
+
+            self.logger.log_message(f"[XMRIG] {decoded}")
+
+            # --- Handle Error and Restart Conditions ---
+            if "error" in decoded.lower() or "compute error" in decoded.lower():
+                self.logger.log_message("[!] Error detected in miner output. Restarting miner...")
+                await self.xmrig_miner.stop_miner()
+                await asyncio.sleep(30)
+                await self.xmrig_miner.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
+                break # Stop monitoring the old, dead process
+
+            # --- Parse Statistics ---
+            if "accepted" in decoded.lower():
+                self._parse_accepted_shares(decoded)
+
+            if "nvidia" in decoded.lower() and "c" in decoded.lower():
+                self._parse_gpu_stats(decoded)
+
+            if "miner" in decoded.lower() and "speed" in decoded.lower():
+                self._parse_hashrate(decoded)
+
+            # --- Parse New Job Information ---
+            if "new job from" in decoded.lower():
+                await self._handle_new_job(decoded)
+
+    def _parse_accepted_shares(self, line):
+        if "cpu" in line.lower():
+            match = re.search(r"accepted\s+\((\d+)/\d+\)", line.lower())
+            if match:
+                self.xmrig_data._latest_cpu_accepted_shares = int(match.group(1))
+        if "nvidia" in line.lower():
+            match = re.search(r"accepted\s+\((\d+)/\d+\)", line.lower())
+            if match:
+                self.xmrig_data._latest_nvidia_accepted_shares = int(match.group(1))
+
+    def _parse_gpu_stats(self, line):
+        temp_match = re.search(r"(\d+c)", line.lower())
+        fan_match = re.search(r"fan\d+:(\d+%)", line.lower())
+        if temp_match:
+            self.xmrig_data._latest_gpu_temp = temp_match.group(1)
+        if fan_match:
+            self.xmrig_data._latest_gpu_fan = fan_match.group(1)
+
+    def _parse_hashrate(self, line):
+        match = re.search(r"speed\s+\d+s/\d+s/\d+m\s+([\d.]+)\s+", line)
+        if match:
+            self.xmrig_data._latest_hashrate = float(match.group(1))
+
+    async def _handle_new_job(self, line):
+        try:
+            match = re.search(
+                r"new job from ([\d.:]+).*?diff (\d+).*?algo ([^\s]+).*?height (\d+).*?\((\d+) tx\)",
+                line
+            )
+            if match:
+                job_info = {
+                    "client_id": self.xmrig_data.client_id,
+                    "ip": match.group(1),
+                    "difficulty": int(match.group(2)),
+                    "algo": match.group(3),
+                    "height": int(match.group(4)),
+                    "tx_count": int(match.group(5))
+                }
+                await self.xmrig_data.aiohttp_client_session.post(
+                    f"{self.xmrig_data.FLASK_SERVER_URL}/newjob",
+                    json=job_info,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+        except Exception as e:
+            self.logger.log_message(f"[!] Error sending new job info: {e}")
+class XmrigMiner:
+
+    def __init__(self, XmrigData, Logger):
+        self.xmrig_data = XmrigData
+        self.logger = Logger
+        self.periodic_reporter = PeriodicReporter(self, self.xmrig_data, self.logger)
+        self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
+        self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
     async def start_miner(self, pool_url="", thread_count=None):
 
         await self.kill_all_xmrig_processes()
@@ -180,8 +292,7 @@ class XmrigMiner:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             self.logger.log_message("[!] Could not set XMRig process priority. Run as admin/root for best results.")
 
-        asyncio.create_task(self.monitor_output(self.xmrig_data.xmrig_process))
-
+        await asyncio.create_task(self.monitor.monitor_process(self.xmrig_data.xmrig_process))
 
     async def stop_miner(self):
 
@@ -198,47 +309,6 @@ class XmrigMiner:
 
             self.xmrig_data.xmrig_process = None
 
-    async def poll_server(self, session: aiohttp.ClientSession, force_update_signal):
-
-        while True:
-            try:
-                if self.xmrig_data.xmrig_process is not None and self.xmrig_data.xmrig_process.returncode is None:
-                    self.xmrig_data.client_status = "Started"
-                else:
-                    self.xmrig_data.client_status = "Stopped"
-                payload = {"status": self.xmrig_data.client_status}
-                # Use the shared session here
-                await session.post(f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
-                                         json=payload,
-                                         timeout=aiohttp.ClientTimeout(total=10))
-
-
-                async with session.get(f"{self.xmrig_data.FLASK_SERVER_URL}/get_command/{self.xmrig_data.client_id}",
-                                       timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    response.raise_for_status()
-                    command = await response.json()
-                if command:
-                    self.logger.log_message(f"\n[+] Received command from server: '{command.get('command')}'")
-                    if command.get("command") == "start":
-                        await self.stop_miner()
-                        self.xmrig_data.custom_pool_url = command.get("pool", self.xmrig_data.custom_pool_url)
-                        self.xmrig_data.threads = command.get("threads", self.xmrig_data.threads)
-                        await self.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
-                    elif command.get("command") == "stop":
-                        await self.stop_miner()
-                    elif command.get("command") == "set_threads":
-                        new_threads = int(command["threads"])
-                        await self.update_config_threads_async(new_threads)
-                    elif command.get("command") == "update":
-                        update_url = command.get("url")
-                        if update_url:
-                            force_update_signal.emit(update_url)
-            except aiohttp.ClientError as e:
-                self.logger.log_message(f"[!] Cannot connect to server at {self.xmrig_data.FLASK_SERVER_URL} or HTTP error: {e}. Retrying...")
-            except Exception as e:
-                self.logger.log_message(f"[!] An unexpected error occurred during polling: {e}")
-
-            await asyncio.sleep(5)
 
     async def get_current_threads_from_config_async(self):
         async with self.xmrig_data.miner_lock:

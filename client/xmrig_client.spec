@@ -9,6 +9,7 @@ a = Analysis(
     ('xmrig_client.py', '.'),
     ('xmrig_data.py', '.'),
     ('xmrig_miner.py', '.'),
+    ('icons', 'icons'),
     ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'),
     ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\HidSharp.dll', '.')
     ],
