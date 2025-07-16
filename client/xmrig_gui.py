@@ -423,7 +423,7 @@ class MinerGui(QWidget):
         else:
             self.logger.log_message("[+] No settings file found, using default values.")
             defaults = {
-                "server_url": "http://192.168.0.101:5000",
+                "server_url": "http://192.168.0.10:5000",
                 "client_id": "DefaultMiner",
                 "pool_ip": "192.168.0.10:3333",
                 "thread_count": "8"
