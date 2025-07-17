@@ -238,6 +238,8 @@ class XmrigMiner:
         self.priority = False
         self.cpu_priority = 2
         self.cpu_yield = False
+        self.cpu_affinity = 1
+        self.psutil_xmrig = None
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
@@ -309,6 +311,7 @@ class XmrigMiner:
                 stderr=asyncio.subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW
             )
+            self.psutil_xmrig = psutil.Process(self.xmrig_data.xmrig_process.pid)
         except Exception as e:
             self.logger.log_message(f"[!] Failed to start XMRig: {e}")
             return
@@ -316,9 +319,12 @@ class XmrigMiner:
         # --- Set priority if needed ---
         try:
             if self.priority:
-                p = psutil.Process(self.xmrig_data.xmrig_process.pid)
-                p.nice(psutil.HIGH_PRIORITY_CLASS)
-                self.logger.log_message(f"[+] Set XMRig process (PID: {p.pid}) to high priority.")
+                self.psutil_xmrig.nice(psutil.HIGH_PRIORITY_CLASS)
+                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to high priority.")
+            if self.cpu_affinity > 0:
+                self.psutil_xmrig.cpu_affinity(list(range(self.cpu_affinity)))
+                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to affinity level {self.cpu_affinity}.")
+
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             self.logger.log_message("[!] Could not set process priority. Try running as admin/root.")
 
