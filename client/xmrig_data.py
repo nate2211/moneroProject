@@ -13,6 +13,131 @@ except Exception as e:
     print(f"[!] FATAL: Could not load LibreHardwareMonitorLib: {e}")
     sys.exit(1)
 
+class MSRManager:
+    """
+    Provides access to MSR registers using WinRing0x64.dll for Intel chips.
+    If the DLL cannot be found or initialized, the manager will be disabled.
+    """
+
+    def __init__(self, logger):
+        self.logger = logger
+        self.wr0 = None
+        self.initialized = False
+
+        try:
+            if getattr(sys, 'frozen', False):
+                # Running from a PyInstaller bundle
+                base_bath = sys._MEIPASS
+            else:
+                # Running in a development environment
+                base_path = os.path.dirname(os.path.abspath(__file__))
+
+            self.dll_path = os.path.join(base_path, "WinRing0x64.dll")
+            if not os.path.exists(self.dll_path):
+                # Raise an exception to be caught by the outer block
+                raise FileNotFoundError(f"WinRing0x64.dll not found at {self.dll_path}")
+            else:
+                self.logger.log_message("WinRing0x64.dll Found")
+            self.wr0 = ctypes.WinDLL(self.dll_path)
+
+            # Check driver status
+            if not self.wr0.InitializeOls():
+                self.logger.log_message("[!] Failed to initialize WinRing0 driver. MSRManager is disabled.")
+                # No need to raise, just leave self.initialized as False
+            else:
+                self.logger.log_message("[+] WinRing0 driver initialized successfully.")
+                self.initialized = True
+
+        except FileNotFoundError as e:
+            self.logger.log_message(f"[!] {e}. MSR functionality will be disabled.")
+        except Exception as e:
+            self.logger.log_message(f"[!] An unexpected error occurred during MSRManager setup: {e}. MSRManager is disabled.")
+
+
+    def __del__(self):
+        # Only deinitialize if the driver was successfully loaded
+        if self.initialized:
+            self.wr0.DeinitializeOls()
+
+    def write_msr(self, index, low, high):
+        """
+        Writes to a Model-Specific Register.
+        :param index: MSR index (e.g., 0x610 for RAPL power limits)
+        :param low: Lower 32 bits of the value
+        :param high: Upper 32 bits of the value
+        :return: True if successful, False otherwise
+        """
+        if not self.initialized:
+            self.logger.log_message("[!] MSR write aborted: driver not initialized.")
+            return False
+
+        success = self.wr0.WriteMsr(index, ctypes.c_ulong(low), ctypes.c_ulong(high))
+        if not success:
+            self.logger.log_message(f"[!] Failed to write MSR 0x{index:X}")
+        return bool(success)
+
+    def read_msr(self, index):
+        """
+        Reads a Model-Specific Register.
+        :return: A tuple (low, high) of 32-bit values, or (None, None) on failure.
+        """
+        if not self.initialized:
+            self.logger.log_message("[!] MSR read aborted: driver not initialized.")
+            return None, None
+
+        low = ctypes.c_ulong()
+        high = ctypes.c_ulong()
+        if self.wr0.ReadMsr(index, ctypes.byref(low), ctypes.byref(high)):
+            return low.value, high.value
+
+        self.logger.log_message(f"[!] Failed to read MSR 0x{index:X}")
+        return None, None
+
+    def set_pl1_pl2(self, power_watts):
+        """
+        Sets PL1 and PL2 to the same value using the MSR 0x610 register.
+        This method also enables both power limits. A more advanced implementation
+        would first read the MSR to preserve existing time window settings.
+
+        :param power_watts: Desired power limit in watts
+        :return: True if successful, False otherwise
+        """
+        if not self.initialized:
+            # No need to log here, as write_msr will handle it.
+            return False
+
+        MSR_RAPL_POWER_LIMIT = 0x610
+
+        # NOTE: The power unit is typically 0.125W, but this is not guaranteed.
+        # A fully robust solution would first read MSR 0x606 (MSR_RAPL_POWER_UNIT)
+        # to determine the actual power unit, which is 1.0 / (2^power_unit_bits).
+        power_unit = 0.125  # Watts per unit (typical for Intel)
+
+        # Calculate the raw limit value based on the power unit
+        limit_raw = int(power_watts / power_unit)
+
+        # The power limit value is a 15-bit field
+        power_limit_val = limit_raw & 0x7FFF
+
+        # Construct the 64-bit value for MSR 0x610 (MSR_PKG_POWER_LIMIT)
+        # MSR Layout:
+        # [14:0]  -> Power Limit 1 (PL1)
+        # [15]    -> PL1 Enable
+        # [46:32] -> Power Limit 2 (PL2)
+        # [47]    -> PL2 Enable
+
+        value = power_limit_val         # Set PL1 value
+        value |= (1 << 15)              # Enable PL1
+        value |= (power_limit_val << 32)# Set PL2 value
+        value |= (1 << 47)              # Enable PL2
+
+        low = value & 0xFFFFFFFF
+        high = (value >> 32) & 0xFFFFFFFF
+
+        self.logger.log_message(f"[*] Setting PL1 and PL2 to {power_watts}W")
+        return self.write_msr(MSR_RAPL_POWER_LIMIT, low, high)
+
+
 
 class ProcessManager:
     """A helper class to manage Windows process attributes using the Windows API."""
@@ -299,7 +424,45 @@ class HardwareMonitor(Thread):
         self.join(timeout=5)  # Ensure cleanup finishes
         self.logger.log_message("[+] Hardware monitor shut down cleanly.")
 
+    def get_max_power_draw(self):
+        """
+        Attempts to find the CPU's power limit from sensors.
+        If not found, falls back to a heuristic based on the CPU name.
+        Returns an integer value in Watts.
+        """
+        if not self.computer:
+            self.logger.log_message("[!] Cannot get max power draw: Hardware monitor not initialized.")
+            return 125  # Return a safe default if not initialized
 
+        # --- Fallback Method: Heuristic based on CPU name ---
+        cpu_name = ""
+        try:
+            for hardware in self.computer.Hardware:
+                if "cpu" in str(hardware.HardwareType).lower():
+                    cpu_name = hardware.Name.lower()
+                    break
+        except Exception:
+            # If LHM fails, try cpuinfo as a backup
+            try:
+                import cpuinfo
+                cpu_name = cpuinfo.get_cpu_info().get('brand_raw', '').lower()
+            except Exception as e:
+                self.logger.log_message(f"[!] Could not determine CPU name for power heuristic: {e}")
+                return 125 # Fallback to default
+
+        self.logger.log_message(f"[*] No power limit sensor found. Using heuristic for CPU: '{cpu_name}'")
+
+        if "i9" in cpu_name or "ryzen 9" in cpu_name:
+            return 170
+        if "i7" in cpu_name or "ryzen 7" in cpu_name:
+            return 120
+        if "i5" in cpu_name or "ryzen 5" in cpu_name:
+            return 80
+        if "i3" in cpu_name or "ryzen 3" in cpu_name:
+            return 45
+
+        self.logger.log_message("[!] CPU model not recognized for power heuristic, returning default.")
+        return 125 # Default for unknown CPUs
 
 
 class XmrigData:
@@ -326,6 +489,7 @@ class XmrigData:
 
         self.hardware_monitor = HardwareMonitor(self.logger)
         self.process_manager = ProcessManager(self.logger)
+        self.msr_manager = MSRManager(self.logger)
 
     async def get_power_draw_async(self):
         """Async wrapper to get total power draw from the monitor thread."""
