@@ -66,6 +66,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
+    uac_admin=True,
     codesign_identity=None,
     entitlements_file=None,
 )
