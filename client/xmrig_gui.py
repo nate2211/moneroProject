@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
                              QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
                              QSystemTrayIcon, QMenu, QAction, QApplication, QDialogButtonBox, QListWidget, QDialog,
-                             QInputDialog, QCheckBox, QGridLayout, QComboBox)
+                             QInputDialog, QCheckBox, QGridLayout, QComboBox, QSlider)
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -286,6 +286,21 @@ class MiningConfigBox(QWidget):
         self.high_priority_checkbox.setToolTip("Gives the miner process higher priority in the OS scheduler.\nCan make the system less responsive.")
         self.high_priority_checkbox.setChecked(False) # Default to OFF for safety
 
+        self._total_logical_cpus = psutil.cpu_count(logical=True) or 1
+        self.cpu_affinity_slider = QSlider(Qt.Horizontal)
+        self.cpu_affinity_slider.setMinimum(1)
+        self.cpu_affinity_slider.setMaximum(self._total_logical_cpus)
+        self.cpu_affinity_slider.setValue(self._total_logical_cpus)  # default: all CPUs
+        self.cpu_affinity_slider.setTickPosition(QSlider.TicksBelow)
+        self.cpu_affinity_slider.setTickInterval(1)
+
+        self.cpu_affinity_label = QLabel()
+        self.cpu_affinity_label.setText(f"Use {self.cpu_affinity_slider.value()} / {self._total_logical_cpus} CPUs")
+        self.cpu_affinity_slider.valueChanged.connect(
+            lambda v, lbl=self.cpu_affinity_label, total=self._total_logical_cpus:
+            lbl.setText(f"Use {v} / {total} CPUs")
+        )
+
         self.cpu_priority = QComboBox()
         self.cpu_priority.addItem("Idle (1)", 1)
         self.cpu_priority.addItem("Normal (2)", 2)
@@ -294,42 +309,54 @@ class MiningConfigBox(QWidget):
         self.cpu_priority.addItem("Realtime (5)", 5)
         self.cpu_priority.setCurrentIndex(1)
 
+        # ---- Yield checkbox ----
         self.yield_checkbox = QCheckBox("Yield CPU to other processes")
         self.yield_checkbox.setToolTip("Recommended. Improves system responsiveness.")
         self.yield_checkbox.setChecked(True)
 
+        # ---- Buttons ----
         self.mine_button = QPushButton("Start Mining")
         self.stop_button = QPushButton("Stop Mining")
         self.mine_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
-        # Connect internal signals
         self.mine_button.clicked.connect(self.start_mining_clicked.emit)
         self.stop_button.clicked.connect(self.stop_mining_clicked.emit)
 
-        # --- Arrange Widgets in a Grid ---
-        # Row 0
+        # --- Layout rows ---
+
+        # Row 0: Pool
         layout.addWidget(QLabel("Pool Address:"), 0, 0)
         layout.addWidget(self.pool_ip_input, 0, 1)
 
-        # Row 1
+        # Row 1: Threads
         layout.addWidget(QLabel("CPU Threads:"), 1, 0)
         layout.addWidget(self.thread_count_input, 1, 1)
 
-        # Row 2
-        layout.addWidget(QLabel("CPU Priority:"), 2, 0)
-        layout.addWidget(self.cpu_priority, 2, 1)
+        # Row 2: CPU Affinity slider
+        layout.addWidget(QLabel("CPU Affinity:"), 2, 0)
+        affinity_row = QHBoxLayout()
+        affinity_row.addWidget(self.cpu_affinity_slider, stretch=1)
+        affinity_row.addWidget(self.cpu_affinity_label)
+        layout.addLayout(affinity_row, 2, 1)
 
-        layout.addWidget(QLabel("OS Priority:"), 3, 0)
-        layout.addWidget(self.high_priority_checkbox, 3, 1)
-        # Row 3
-        layout.addWidget(self.yield_checkbox, 4, 1)
+        # Row 3: Internal miner CPU priority
+        layout.addWidget(QLabel("CPU Priority:"), 3, 0)
+        layout.addWidget(self.cpu_priority, 3, 1)
 
-        # Row 4 (Buttons)
+        # Row 4: OS process priority
+        layout.addWidget(QLabel("OS Priority:"), 4, 0)
+        layout.addWidget(self.high_priority_checkbox, 4, 1)
+
+        # Row 5: Yield
+        layout.addWidget(QLabel("CPU Yield:"), 5, 0)
+        layout.addWidget(self.yield_checkbox, 5, 1)
+
+        # Row 6: Buttons
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, 4, 1)
+        layout.addLayout(button_layout, 6, 1)
 
     def get_values(self):
         """Returns all mining parameters in a dictionary."""
@@ -340,6 +367,7 @@ class MiningConfigBox(QWidget):
                 "cpu_priority": self.cpu_priority.currentData(),
                 "cpu_yield": self.yield_checkbox.isChecked(),
                 "high_priority": self.high_priority_checkbox.isChecked(),
+                "cpu_affinity":self.cpu_affinity_slider.value(),
             }
         except (ValueError, TypeError):
             return None  # Indicates invalid input
@@ -353,6 +381,7 @@ class MiningConfigBox(QWidget):
             "priority_index": self.cpu_priority.currentIndex(),
             "yield_cpu": self.yield_checkbox.isChecked(),
             "high_priority": self.high_priority_checkbox.isChecked(),
+            "cpu_affinity": self.cpu_affinity_slider.value(),
         }
 
     def apply_settings(self, settings):
@@ -362,6 +391,7 @@ class MiningConfigBox(QWidget):
         self.cpu_priority.setCurrentIndex(settings.get("priority_index", 1))
         self.yield_checkbox.setChecked(settings.get("yield_cpu", True))
         self.high_priority_checkbox.setChecked(settings.get("high_priority", True))
+        self.cpu_affinity_slider.setValue(settings.get("cpu_affinity", self._total_logical_cpus))
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -678,6 +708,7 @@ class MinerGui(QWidget):
             self.xmrig_miner.priority = params["high_priority"]
             self.xmrig_miner.cpu_priority = params["cpu_priority"]
             self.xmrig_miner.cpu_yield = params["cpu_yield"]
+            self.xmrig_miner.cpu_affinity = params["cpu_affinity"]
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
 
     def handle_stop_mining(self):
