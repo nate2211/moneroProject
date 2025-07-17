@@ -270,8 +270,9 @@ class MiningConfigBox(QWidget):
     start_mining_clicked = pyqtSignal()
     stop_mining_clicked = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, xmrig_data, parent=None):
         super().__init__(parent)
+        self.xmrig_data = xmrig_data
         # Use QGridLayout for more control over rows and columns
         layout = QGridLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -301,13 +302,32 @@ class MiningConfigBox(QWidget):
             lbl.setText(f"Use {v} / {total} CPUs")
         )
 
+
+        self.memory_usage_slider = QSlider(Qt.Horizontal)
+        self.memory_usage_slider.setMinimum(1)
+        self.memory_usage_slider.setMaximum(self.xmrig_data.process_manager.recommend_max_memory())
+        self.memory_usage_slider.setValue(self.xmrig_data.process_manager.recommend_max_memory())  # default: all CPUs
+        self.memory_usage_slider.setTickPosition(QSlider.TicksBelow)
+        self.memory_usage_slider.setTickInterval(1)
+        self.memory_usage_label = QLabel()
+        self.memory_usage_label.setText(f"Use {self.memory_usage_slider.value()} / {self.xmrig_data.process_manager.recommend_max_memory()} Memory")
+        self.memory_usage_slider.valueChanged.connect(
+            lambda v, lbl=self.memory_usage_label, total=self.xmrig_data.process_manager.recommend_max_memory():
+            lbl.setText(f"Use {v} / {total} Memory")
+        )
+
+        self.io_priority = QComboBox()
+        self.io_priority.addItem("Very Low", psutil.IOPRIO_VERYLOW)
+        self.io_priority.addItem("Low", psutil.IOPRIO_LOW)
+        self.io_priority.addItem("Normal", psutil.IOPRIO_NORMAL)
+
+
         self.cpu_priority = QComboBox()
         self.cpu_priority.addItem("Idle (1)", 1)
         self.cpu_priority.addItem("Normal (2)", 2)
         self.cpu_priority.addItem("High (3)", 3)
         self.cpu_priority.addItem("Higher (4)", 4)
         self.cpu_priority.addItem("Realtime (5)", 5)
-        self.cpu_priority.setCurrentIndex(1)
 
         # ---- Yield checkbox ----
         self.yield_checkbox = QCheckBox("Yield CPU to other processes")
@@ -322,6 +342,14 @@ class MiningConfigBox(QWidget):
 
         self.mine_button.clicked.connect(self.start_mining_clicked.emit)
         self.stop_button.clicked.connect(self.stop_mining_clicked.emit)
+
+        # ---- Priority Boost checkbox ----
+        self.priority_boost_checkbox = QCheckBox("Priority Boost")
+        self.priority_boost_checkbox.setToolTip(
+            "Allows the OS to give threads temporary priority boosts to improve responsiveness.\n"
+            "This is ideal for desktop apps but not recommended for background tasks like mining."
+        )
+        self.priority_boost_checkbox.setChecked(False)
 
         # --- Layout rows ---
 
@@ -351,12 +379,23 @@ class MiningConfigBox(QWidget):
         # Row 5: Yield
         layout.addWidget(QLabel("CPU Yield:"), 5, 0)
         layout.addWidget(self.yield_checkbox, 5, 1)
+        # Row 5: Yield
+        layout.addWidget(QLabel("I/O Priority:"), 6, 0)
+        layout.addWidget(self.io_priority, 6, 1)
 
+        layout.addWidget(QLabel("Memory Usage:"), 7, 0)
+        affinity_row = QHBoxLayout()
+        affinity_row.addWidget(self.memory_usage_slider, stretch=1)
+        affinity_row.addWidget(self.memory_usage_label)
+        layout.addLayout(affinity_row, 7, 1)
+
+        layout.addWidget(QLabel("Priority Boost:"), 8, 0)
+        layout.addWidget(self.priority_boost_checkbox, 8, 1)
         # Row 6: Buttons
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, 6, 1)
+        layout.addLayout(button_layout, 9, 1)
 
     def get_values(self):
         """Returns all mining parameters in a dictionary."""
@@ -368,6 +407,9 @@ class MiningConfigBox(QWidget):
                 "cpu_yield": self.yield_checkbox.isChecked(),
                 "high_priority": self.high_priority_checkbox.isChecked(),
                 "cpu_affinity":self.cpu_affinity_slider.value(),
+                "io_priority": self.io_priority.currentData(),
+                "memory_usage": self.memory_usage_slider.value(),
+                "priority_boost": self.priority_boost_checkbox.isChecked(),
             }
         except (ValueError, TypeError):
             return None  # Indicates invalid input
@@ -382,6 +424,9 @@ class MiningConfigBox(QWidget):
             "yield_cpu": self.yield_checkbox.isChecked(),
             "high_priority": self.high_priority_checkbox.isChecked(),
             "cpu_affinity": self.cpu_affinity_slider.value(),
+            "io_priority": self.io_priority.currentData(),
+            "memory_usage": self.memory_usage_slider.value(),
+            "priority_boost": self.priority_boost_checkbox.isChecked(),
         }
 
     def apply_settings(self, settings):
@@ -392,6 +437,9 @@ class MiningConfigBox(QWidget):
         self.yield_checkbox.setChecked(settings.get("yield_cpu", True))
         self.high_priority_checkbox.setChecked(settings.get("high_priority", True))
         self.cpu_affinity_slider.setValue(settings.get("cpu_affinity", self._total_logical_cpus))
+        self.io_priority.setCurrentIndex(settings.get("io_priority", psutil.IOPRIO_NORMAL))
+        self.memory_usage_slider.setValue(settings.get("memory_usage", self.xmrig_data.process_manager.recommend_max_memory()))
+        self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -550,7 +598,7 @@ class MinerGui(QWidget):
         connection_collapsible.setContentWidget(self.connection_box)
         main_layout.addWidget(connection_collapsible)
 
-        self.mining_box = MiningConfigBox()
+        self.mining_box = MiningConfigBox(self.xmrig_data)
         mining_collapsible = CollapsibleBox("Mining Configuration", start_expanded=True)
         mining_collapsible.setContentWidget(self.mining_box)
         main_layout.addWidget(mining_collapsible)
@@ -709,6 +757,12 @@ class MinerGui(QWidget):
             self.xmrig_miner.cpu_priority = params["cpu_priority"]
             self.xmrig_miner.cpu_yield = params["cpu_yield"]
             self.xmrig_miner.cpu_affinity = params["cpu_affinity"]
+            self.xmrig_miner.io_priority = params["io_priority"]
+
+            self.xmrig_miner.memory_usage_min = max(256, params["memory_usage"] * 0.25)
+            self.xmrig_miner.memory_usage_max = params["memory_usage"]
+
+            self.xmrig_miner.priority_boost = params["priority_boost"]
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
 
     def handle_stop_mining(self):

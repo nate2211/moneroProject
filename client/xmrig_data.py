@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import subprocess
 import sys
 import clr
@@ -12,6 +13,123 @@ except Exception as e:
     print(f"[!] FATAL: Could not load LibreHardwareMonitorLib: {e}")
     sys.exit(1)
 
+
+class ProcessManager:
+    """A helper class to manage Windows process attributes using the Windows API."""
+
+    def __init__(self, logger):
+        self.logger = logger
+        # Define necessary Windows API components
+        self.kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.PROCESS_SET_QUOTA = 0x0100
+        self.PROCESS_QUERY_INFORMATION = 0x0400
+        self.PROCESS_SET_INFORMATION = 0x0200
+
+    def recommend_max_memory(self):
+        """
+        Calculates a recommended max working set size based on total system RAM.
+        Returns the recommended size in megabytes (MB).
+        """
+        # Prepare a variable to hold the result from the API call
+        total_ram_kb = ctypes.c_ulonglong()
+
+        # Call GetPhysicallyInstalledSystemMemory to get total RAM in kilobytes
+        if not self.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_ram_kb)):
+            self.logger.log_message(f"[!] Could not get total system memory. Error: {ctypes.get_last_error()}")
+            return None # Return None on failure
+
+        total_ram_mb = total_ram_kb.value / 1024
+        self.logger.log_message(f"[*] Total system RAM detected: {total_ram_mb:.0f} MB")
+
+        # --- Recommendation Logic ---
+        # A safe heuristic to avoid system instability.
+        if total_ram_mb > 16000: # Over 16GB
+            # Recommend 50% of total RAM
+            recommended_mb = total_ram_mb * 0.50
+        elif total_ram_mb > 8000: # Over 8GB
+            # Recommend 40% of total RAM
+            recommended_mb = total_ram_mb * 0.40
+        else: # 8GB or less
+            # Recommend a more conservative 25% for low-memory systems
+            recommended_mb = total_ram_mb * 0.25
+
+        return int(recommended_mb)
+
+    def set_priority_boost(self, pid, enable_boost):
+        """
+        Enables or disables dynamic priority boosting for a process's threads.
+        :param pid: The process ID.
+        :param enable_boost: Set to True to enable boosting, False to disable it.
+        """
+        if not pid:
+            self.logger.log_message("[!] Cannot set priority boost: Invalid PID.")
+            return False
+
+        h_process = self.kernel32.OpenProcess(self.PROCESS_SET_INFORMATION, False, pid)
+
+        if not h_process:
+            self.logger.log_message(
+                f"[!] Set priority boost: Failed to get handle for PID {pid}. Error: {ctypes.get_last_error()}")
+            return False
+
+        success = False
+        try:
+            # Determine the state for logging purposes based on the new parameter
+            state = "enabled" if enable_boost else "disabled"
+            self.logger.log_message(f"[*] Setting priority boost for PID {pid} to {state}.")
+
+            # Call the API with the inverse of the enable_boost flag
+            if self.kernel32.SetProcessPriorityBoost(h_process, not enable_boost):
+                self.logger.log_message(f"[+] Successfully {state} priority boost for PID {pid}.")
+                success = True
+            else:
+                self.logger.log_message(
+                    f"[!] Failed to set priority boost for PID {pid}. Error: {ctypes.get_last_error()}")
+        finally:
+            self.kernel32.CloseHandle(h_process)
+
+        return success
+
+    def set_working_set_size(self, pid, min_size_mb, max_size_mb):
+        """
+        Suggests a memory working set size for a given process ID.
+        This is a suggestion to the kernel, not a strict limit.
+        """
+        if not pid:
+            self.logger.log_message("[!] Cannot set working set: Invalid PID.")
+            return False
+
+        min_bytes = int(min_size_mb * 1024 * 1024)
+        max_bytes = int(max_size_mb * 1024 * 1024)
+
+        # Get a handle to the process with the required permissions
+        h_process = self.kernel32.OpenProcess(
+            self.PROCESS_SET_QUOTA | self.PROCESS_QUERY_INFORMATION,
+            False,
+            pid
+        )
+
+        if not h_process:
+            self.logger.log_message(f"[!] Failed to get handle for PID {pid}. Error: {ctypes.get_last_error()}")
+            return False
+
+        success = False
+        try:
+            self.logger.log_message(f"[*] Suggesting working set for PID {pid}: Min {min_size_mb}MB, Max {max_size_mb}MB.")
+            # Call the SetProcessWorkingSetSizeEx API function
+            if self.kernel32.SetProcessWorkingSetSizeEx(h_process,
+                                                      ctypes.c_size_t(min_bytes),
+                                                      ctypes.c_size_t(max_bytes),
+                                                      0): # Flags=0 for soft limits
+                self.logger.log_message(f"[+] Successfully sent working set size suggestion for PID {pid}.")
+                success = True
+            else:
+                self.logger.log_message(f"[!] Failed to set working set size for PID {pid}. Error: {ctypes.get_last_error()}")
+        finally:
+            # Always ensure the handle is closed
+            self.kernel32.CloseHandle(h_process)
+
+        return success
 
 class HardwareMonitor(Thread):
     """
@@ -207,7 +325,7 @@ class XmrigData:
         self.logger = Logger
 
         self.hardware_monitor = HardwareMonitor(self.logger)
-
+        self.process_manager = ProcessManager(self.logger)
 
     async def get_power_draw_async(self):
         """Async wrapper to get total power draw from the monitor thread."""

@@ -11,6 +11,7 @@ import psutil
 from typing_extensions import Awaitable
 import re
 
+
 REPORT_INTERVAL_SECONDS = 5
 
 
@@ -240,6 +241,10 @@ class XmrigMiner:
         self.cpu_yield = False
         self.cpu_affinity = 1
         self.psutil_xmrig = None
+        self.io_priority = None
+        self.memory_usage_min = None
+        self.memory_usage_max = None
+        self.priority_boost = False
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
@@ -324,9 +329,18 @@ class XmrigMiner:
             if self.cpu_affinity > 0:
                 self.psutil_xmrig.cpu_affinity(list(range(self.cpu_affinity)))
                 self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to affinity level {self.cpu_affinity}.")
+            if self.io_priority and self.priority == False and self.cpu_priority < 3:
+                self.psutil_xmrig.ionice(self.io_priority)
+                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to io priority level {str(self.io_priority)}.")
+            if self.memory_usage_max:
+                self.xmrig_data.process_manager.set_working_set_size(self.psutil_xmrig.pid, self.memory_usage_min, self.memory_usage_max)
+                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to memory usage Min: {str(self.memory_usage_min)} Max:{str(self.memory_usage_max)}.")
+            self.xmrig_data.process_manager.set_priority_boost(self.psutil_xmrig.pid, self.priority_boost)
+            self.logger.log_message(
+                f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to priority boost {self.priority_boost}.")
 
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            self.logger.log_message("[!] Could not set process priority. Try running as admin/root.")
+        except psutil.Error as e:
+            self.logger.log_message(f"[!] Could not set psutils process settings. Try running as admin/root. {e}")
 
         # Start monitoring
         await self.monitor.monitor_process(self.xmrig_data.xmrig_process)
