@@ -6,7 +6,7 @@ import shutil
 import textwrap
 import json
 import time
-
+import cpuinfo
 import psutil
 import tempfile
 
@@ -278,6 +278,9 @@ class MiningConfigBox(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setVerticalSpacing(15)
 
+        cpu_info = cpuinfo.get_cpu_info()
+        self.is_intel_cpu = 'GenuineIntel' in cpu_info.get('vendor_id_raw', '')
+
         # --- Create Widgets ---
         self.pool_ip_input = QLineEdit()
         self.thread_count_input = QLineEdit()
@@ -351,6 +354,23 @@ class MiningConfigBox(QWidget):
         )
         self.priority_boost_checkbox.setChecked(False)
 
+
+        # --- NEW WIDGET: Intel Power Limit (PL1/PL2) Slider ---
+        self.power_limit_desc_label = QLabel("Power Limit (PL1/PL2):")
+        self.power_limit_slider = QSlider(Qt.Horizontal)
+        self.power_limit_slider.setMinimum(15)   # 15W Minimum
+        self.power_limit_slider.setMaximum(self.xmrig_data.hardware_monitor.get_max_power_draw())  # 250W Maximum
+        self.power_limit_slider.setValue(45)    # 125W Default
+        self.power_limit_slider.setToolTip("Sets CPU power limits (PL1/PL2) in Watts.\nRequires admin/root privileges.")
+        self.power_limit_value_label = QLabel(f"{self.power_limit_slider.value()} W")
+        self.power_limit_slider.valueChanged.connect(
+            lambda v: self.power_limit_value_label.setText(f"{v} W")
+        )
+        # We will hide/show these widgets based on CPU vendor
+        self.power_limit_desc_label.setVisible(self.is_intel_cpu)
+        self.power_limit_slider.setVisible(self.is_intel_cpu)
+        self.power_limit_value_label.setVisible(self.is_intel_cpu)
+
         # --- Layout rows ---
 
         # Row 0: Pool
@@ -389,13 +409,22 @@ class MiningConfigBox(QWidget):
         affinity_row.addWidget(self.memory_usage_label)
         layout.addLayout(affinity_row, 7, 1)
 
+
         layout.addWidget(QLabel("Priority Boost:"), 8, 0)
         layout.addWidget(self.priority_boost_checkbox, 8, 1)
+        row = 9
+        if self.is_intel_cpu:
+            layout.addWidget(self.power_limit_desc_label, row, 0)
+            power_limit_row = QHBoxLayout()
+            power_limit_row.addWidget(self.power_limit_slider)
+            power_limit_row.addWidget(self.power_limit_value_label)
+            layout.addLayout(power_limit_row, row, 1)
+            row += 1
         # Row 6: Buttons
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, 9, 1)
+        layout.addLayout(button_layout, row, 1)
 
     def get_values(self):
         """Returns all mining parameters in a dictionary."""
@@ -410,6 +439,7 @@ class MiningConfigBox(QWidget):
                 "io_priority": self.io_priority.currentData(),
                 "memory_usage": self.memory_usage_slider.value(),
                 "priority_boost": self.priority_boost_checkbox.isChecked(),
+                "pl1_pl2": self.power_limit_slider.value(),
             }
         except (ValueError, TypeError):
             return None  # Indicates invalid input
@@ -427,6 +457,7 @@ class MiningConfigBox(QWidget):
             "io_priority": self.io_priority.currentData(),
             "memory_usage": self.memory_usage_slider.value(),
             "priority_boost": self.priority_boost_checkbox.isChecked(),
+            "pl1_pl2": self.power_limit_slider.value(),
         }
 
     def apply_settings(self, settings):
@@ -440,6 +471,7 @@ class MiningConfigBox(QWidget):
         self.io_priority.setCurrentIndex(settings.get("io_priority", psutil.IOPRIO_NORMAL))
         self.memory_usage_slider.setValue(settings.get("memory_usage", self.xmrig_data.process_manager.recommend_max_memory()))
         self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
+        self.power_limit_slider.setValue(settings.get("pl1_pl2", self.xmrig_data.hardware_monitor.get_max_power_draw()))
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -763,6 +795,8 @@ class MinerGui(QWidget):
             self.xmrig_miner.memory_usage_max = params["memory_usage"]
 
             self.xmrig_miner.priority_boost = params["priority_boost"]
+
+            self.xmrig_miner.pl1_pl2 = params["pl1_pl2"]
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
 
     def handle_stop_mining(self):

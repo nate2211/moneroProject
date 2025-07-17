@@ -245,6 +245,7 @@ class XmrigMiner:
         self.memory_usage_min = None
         self.memory_usage_max = None
         self.priority_boost = False
+        self.pl1_pl2 = None
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
@@ -338,6 +339,10 @@ class XmrigMiner:
             self.xmrig_data.process_manager.set_priority_boost(self.psutil_xmrig.pid, self.priority_boost)
             self.logger.log_message(
                 f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to priority boost {self.priority_boost}.")
+            if self.pl1_pl2:
+                self.xmrig_data.msr_manager.set_pl1_pl2(self.pl1_pl2)
+                self.logger.log_message(
+                    f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2}.")
 
         except psutil.Error as e:
             self.logger.log_message(f"[!] Could not set psutils process settings. Try running as admin/root. {e}")
