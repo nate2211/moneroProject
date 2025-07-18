@@ -25,16 +25,16 @@ class MSRManager:
         self.logger = logger
         self.initialized = False
         self.is_intel_cpu = is_intel
-
+        self.base_path = ""
         try:
             if getattr(sys, 'frozen', False):
-                # PyInstaller bundle: use folder containing executable
-                base_path = os.path.dirname(sys.executable)
+                # PyInstaller bundle: use extracted tools directory inside _MEIPASS
+                self.base_path = os.path.join(sys._MEIPASS, 'tools')
             else:
-                # Dev environment: use folder containing .py file
-                base_path = os.path.dirname(os.path.abspath(__file__))
+                # Dev environment: use tools directory relative to script
+                self.base_path = os.path.join(os.path.dirname(__file__), 'tools')
 
-            self.cmd_path = os.path.join(base_path, "msr-cmd.exe")
+            self.cmd_path = os.path.join(self.base_path, "msr-cmd.exe")
 
             if not os.path.exists(self.cmd_path):
                 raise FileNotFoundError(f"msr-cmd.exe not found at {self.cmd_path}")
@@ -51,7 +51,7 @@ class MSRManager:
         if not self.initialized:
             return None
         try:
-            result = subprocess.run([self.cmd_path] + args, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            result = subprocess.run([self.cmd_path] + args, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, cwd=self.base_path)
             if result.returncode != 0:
                 self.logger.log_message(f"[!] msr-cmd failed: {result.stderr.strip()}")
                 return None
@@ -78,8 +78,11 @@ class MSRManager:
         return self._run(["write", hex(index), hex(high), hex(low)]) is not None
 
     def set_pl1_pl2(self, power_watts):
-        if not self.initialized or not self.is_intel_cpu:
-            self.logger.log_message(f"[!] PL1/PL2 set failed (not initialized or not Intel).")
+        if not self.initialized:
+            self.logger.log_message(f"[!] PL1/PL2 set failed (not initialized).")
+            return False
+        if not self.is_intel_cpu:
+            self.logger.log_message(f"[!] PL1/PL2 set failed (not Intel).")
             return False
 
         MSR_RAPL_POWER_LIMIT = 0x610
@@ -148,11 +151,10 @@ class ProcessManager:
         try:
             # Determine the state for logging purposes based on the new parameter
             state = "enabled" if enable_boost else "disabled"
-            self.logger.log_message(f"[*] Setting priority boost for PID {pid} to {state}.")
+
 
             # Call the API with the inverse of the enable_boost flag
             if self.kernel32.SetProcessPriorityBoost(h_process, not enable_boost):
-                self.logger.log_message(f"[+] Successfully {state} priority boost for PID {pid}.")
                 success = True
             else:
                 self.logger.log_message(
