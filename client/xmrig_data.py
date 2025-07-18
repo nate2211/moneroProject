@@ -6,6 +6,8 @@ import clr
 import os
 from threading import Thread, Event
 
+from cpuinfo import cpuinfo
+
 try:
     clr.AddReference("LibreHardwareMonitorLib")
     from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
@@ -19,10 +21,11 @@ class MSRManager:
     If the DLL cannot be found or initialized, the manager will be disabled.
     """
 
-    def __init__(self, logger):
+    def __init__(self, logger, is_intel):
         self.logger = logger
         self.wr0 = None
         self.initialized = False
+        self.is_intel_cpu = is_intel
 
         try:
             if getattr(sys, 'frozen', False):
@@ -102,8 +105,9 @@ class MSRManager:
         :param power_watts: Desired power limit in watts
         :return: True if successful, False otherwise
         """
-        if not self.initialized:
-            # No need to log here, as write_msr will handle it.
+        if not self.initialized or not self.is_intel_cpu:
+            self.logger.log_message(f"[*] Setting PL1 and PL2 to {power_watts}W Failed")
+
             return False
 
         MSR_RAPL_POWER_LIMIT = 0x610
@@ -137,8 +141,6 @@ class MSRManager:
         self.logger.log_message(f"[*] Setting PL1 and PL2 to {power_watts}W")
         return self.write_msr(MSR_RAPL_POWER_LIMIT, low, high)
 
-
-
 class ProcessManager:
     """A helper class to manage Windows process attributes using the Windows API."""
 
@@ -149,6 +151,7 @@ class ProcessManager:
         self.PROCESS_SET_QUOTA = 0x0100
         self.PROCESS_QUERY_INFORMATION = 0x0400
         self.PROCESS_SET_INFORMATION = 0x0200
+
 
     def recommend_max_memory(self):
         """
@@ -166,17 +169,8 @@ class ProcessManager:
         total_ram_mb = total_ram_kb.value / 1024
         self.logger.log_message(f"[*] Total system RAM detected: {total_ram_mb:.0f} MB")
 
-        # --- Recommendation Logic ---
-        # A safe heuristic to avoid system instability.
-        if total_ram_mb > 16000: # Over 16GB
-            # Recommend 50% of total RAM
-            recommended_mb = total_ram_mb * 0.50
-        elif total_ram_mb > 8000: # Over 8GB
-            # Recommend 40% of total RAM
-            recommended_mb = total_ram_mb * 0.40
-        else: # 8GB or less
-            # Recommend a more conservative 25% for low-memory systems
-            recommended_mb = total_ram_mb * 0.25
+        recommended_mb = total_ram_mb
+
 
         return int(recommended_mb)
 
@@ -486,10 +480,11 @@ class XmrigData:
         self.XMRIG_PATH = os.path.join(os.path.dirname(sys.executable), "xmrig.exe")
         self.CONFIG_PATH = os.path.join(os.path.dirname(sys.executable), "config.json")
         self.logger = Logger
-
+        cpu_info = cpuinfo.get_cpu_info()
+        self.is_intel_cpu = 'GenuineIntel' in cpu_info.get('vendor_id_raw', '')
         self.hardware_monitor = HardwareMonitor(self.logger)
         self.process_manager = ProcessManager(self.logger)
-        self.msr_manager = MSRManager(self.logger)
+        self.msr_manager = MSRManager(self.logger, self.is_intel_cpu)
 
     async def get_power_draw_async(self):
         """Async wrapper to get total power draw from the monitor thread."""

@@ -278,8 +278,7 @@ class MiningConfigBox(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setVerticalSpacing(15)
 
-        cpu_info = cpuinfo.get_cpu_info()
-        self.is_intel_cpu = 'GenuineIntel' in cpu_info.get('vendor_id_raw', '')
+
 
         # --- Create Widgets ---
         self.pool_ip_input = QLineEdit()
@@ -367,9 +366,9 @@ class MiningConfigBox(QWidget):
             lambda v: self.power_limit_value_label.setText(f"{v} W")
         )
         # We will hide/show these widgets based on CPU vendor
-        self.power_limit_desc_label.setVisible(self.is_intel_cpu)
-        self.power_limit_slider.setVisible(self.is_intel_cpu)
-        self.power_limit_value_label.setVisible(self.is_intel_cpu)
+        self.power_limit_desc_label.setVisible(self.xmrig_data.is_intel_cpu)
+        self.power_limit_slider.setVisible(self.xmrig_data.is_intel_cpu)
+        self.power_limit_value_label.setVisible(self.xmrig_data.is_intel_cpu)
 
         # --- Layout rows ---
 
@@ -413,7 +412,7 @@ class MiningConfigBox(QWidget):
         layout.addWidget(QLabel("Priority Boost:"), 8, 0)
         layout.addWidget(self.priority_boost_checkbox, 8, 1)
         row = 9
-        if self.is_intel_cpu:
+        if self.xmrig_data.is_intel_cpu:
             layout.addWidget(self.power_limit_desc_label, row, 0)
             power_limit_row = QHBoxLayout()
             power_limit_row.addWidget(self.power_limit_slider)
