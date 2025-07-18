@@ -84,6 +84,7 @@ def main():
     log_to_file("Step 10: ConsoleLogger initialized.")
 
     xmrig_data = XmrigData(logger)
+
     log_to_file("Step 11: XmrigData initialized.")
 
     xmrig_miner = XmrigMiner(xmrig_data, logger)

@@ -10,9 +10,8 @@ a = Analysis(
     ('xmrig_data.py', '.'),
     ('xmrig_miner.py', '.'),
     ('icons', 'icons'),
-    ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'),
-    ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\HidSharp.dll', '.'),
-    ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\WinRing0x64.dll', '.')
+    ('C:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'),
+    ('C:\\Users\\natem\\PycharmProjects\\moneroProject\\HidSharp.dll', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
