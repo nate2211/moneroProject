@@ -51,7 +51,7 @@ class MSRManager:
         if not self.initialized:
             return None
         try:
-            result = subprocess.run([self.cmd_path] + args, capture_output=True, text=True)
+            result = subprocess.run([self.cmd_path] + args, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode != 0:
                 self.logger.log_message(f"[!] msr-cmd failed: {result.stderr.strip()}")
                 return None
