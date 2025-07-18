@@ -246,6 +246,7 @@ class XmrigMiner:
         self.memory_usage_max = None
         self.priority_boost = False
         self.pl1_pl2 = None
+        self.xmrig_msr = False
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
@@ -456,6 +457,8 @@ class XmrigMiner:
                     pool["algo"] = "rx/0"
                     pool["coin"] = "XMR"
                     pool["keepalive"] = True
+
+            config["randomx"]["wrmsr"] = self.xmrig_msr
 
             f.seek(0)
             json.dump(config, f, indent=4)

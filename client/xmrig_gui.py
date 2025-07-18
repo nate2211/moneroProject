@@ -353,6 +353,12 @@ class MiningConfigBox(QWidget):
         )
         self.priority_boost_checkbox.setChecked(False)
 
+        # ---- Xmrig MSR checkbox ----
+        self.xmrig_msr_checkbox = QCheckBox("Xmrig MSR")
+        self.xmrig_msr_checkbox.setToolTip(
+            "Set the config for xmrig to use or not use MSR Presets."
+        )
+        self.xmrig_msr_checkbox.setChecked(False)
 
         # --- NEW WIDGET: Intel Power Limit (PL1/PL2) Slider ---
         self.power_limit_desc_label = QLabel("Power Limit (PL1/PL2):")
@@ -372,58 +378,59 @@ class MiningConfigBox(QWidget):
 
         # --- Layout rows ---
 
-        # Row 0: Pool
+        # Row 0: Pool Address + CPU Threads
         layout.addWidget(QLabel("Pool Address:"), 0, 0)
         layout.addWidget(self.pool_ip_input, 0, 1)
+        layout.addWidget(QLabel("CPU Threads:"), 0, 2)
+        layout.addWidget(self.thread_count_input, 0, 3)
 
-        # Row 1: Threads
-        layout.addWidget(QLabel("CPU Threads:"), 1, 0)
-        layout.addWidget(self.thread_count_input, 1, 1)
+        # Row 1: CPU Affinity + CPU Priority
+        layout.addWidget(QLabel("CPU Affinity:"), 1, 0)
+        affinity_layout = QHBoxLayout()
+        affinity_layout.addWidget(self.cpu_affinity_slider)
+        affinity_layout.addWidget(self.cpu_affinity_label)
+        layout.addLayout(affinity_layout, 1, 1)
 
-        # Row 2: CPU Affinity slider
-        layout.addWidget(QLabel("CPU Affinity:"), 2, 0)
-        affinity_row = QHBoxLayout()
-        affinity_row.addWidget(self.cpu_affinity_slider, stretch=1)
-        affinity_row.addWidget(self.cpu_affinity_label)
-        layout.addLayout(affinity_row, 2, 1)
+        layout.addWidget(QLabel("CPU Priority:"), 1, 2)
+        layout.addWidget(self.cpu_priority, 1, 3)
 
-        # Row 3: Internal miner CPU priority
-        layout.addWidget(QLabel("CPU Priority:"), 3, 0)
-        layout.addWidget(self.cpu_priority, 3, 1)
+        # Row 2: OS Priority + CPU Yield
+        layout.addWidget(QLabel("OS Priority:"), 2, 0)
+        layout.addWidget(self.high_priority_checkbox, 2, 1)
+        layout.addWidget(QLabel("CPU Yield:"), 2, 2)
+        layout.addWidget(self.yield_checkbox, 2, 3)
 
-        # Row 4: OS process priority
-        layout.addWidget(QLabel("OS Priority:"), 4, 0)
-        layout.addWidget(self.high_priority_checkbox, 4, 1)
+        # Row 3: I/O Priority + Memory Usage
+        layout.addWidget(QLabel("I/O Priority:"), 3, 0)
+        layout.addWidget(self.io_priority, 3, 1)
 
-        # Row 5: Yield
-        layout.addWidget(QLabel("CPU Yield:"), 5, 0)
-        layout.addWidget(self.yield_checkbox, 5, 1)
-        # Row 5: Yield
-        layout.addWidget(QLabel("I/O Priority:"), 6, 0)
-        layout.addWidget(self.io_priority, 6, 1)
+        layout.addWidget(QLabel("Memory Usage:"), 3, 2)
+        mem_layout = QHBoxLayout()
+        mem_layout.addWidget(self.memory_usage_slider)
+        mem_layout.addWidget(self.memory_usage_label)
+        layout.addLayout(mem_layout, 3, 3)
 
-        layout.addWidget(QLabel("Memory Usage:"), 7, 0)
-        affinity_row = QHBoxLayout()
-        affinity_row.addWidget(self.memory_usage_slider, stretch=1)
-        affinity_row.addWidget(self.memory_usage_label)
-        layout.addLayout(affinity_row, 7, 1)
+        # Row 4: Priority Boost + Xmrig MSR
+        layout.addWidget(QLabel("Priority Boost:"), 4, 0)
+        layout.addWidget(self.priority_boost_checkbox, 4, 1)
+        layout.addWidget(QLabel("Xmrig MSR:"), 4, 2)
+        layout.addWidget(self.xmrig_msr_checkbox, 4, 3)
 
-
-        layout.addWidget(QLabel("Priority Boost:"), 8, 0)
-        layout.addWidget(self.priority_boost_checkbox, 8, 1)
-        row = 9
+        # Row 5 (Intel Only): Power Limit slider
+        row = 5
         if self.xmrig_data.is_intel_cpu:
             layout.addWidget(self.power_limit_desc_label, row, 0)
-            power_limit_row = QHBoxLayout()
-            power_limit_row.addWidget(self.power_limit_slider)
-            power_limit_row.addWidget(self.power_limit_value_label)
-            layout.addLayout(power_limit_row, row, 1)
+            power_layout = QHBoxLayout()
+            power_layout.addWidget(self.power_limit_slider)
+            power_layout.addWidget(self.power_limit_value_label)
+            layout.addLayout(power_layout, row, 1, 1, 3)
             row += 1
-        # Row 6: Buttons
+
+        # Row 6: Buttons (mine + stop)
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, row, 1)
+        layout.addLayout(button_layout, row, 0, 1, 4)  # Span across all 4 columns
 
     def get_values(self):
         """Returns all mining parameters in a dictionary."""
@@ -439,6 +446,7 @@ class MiningConfigBox(QWidget):
                 "memory_usage": self.memory_usage_slider.value(),
                 "priority_boost": self.priority_boost_checkbox.isChecked(),
                 "pl1_pl2": self.power_limit_slider.value(),
+                "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
             }
         except (ValueError, TypeError):
             return None  # Indicates invalid input
@@ -457,6 +465,7 @@ class MiningConfigBox(QWidget):
             "memory_usage": self.memory_usage_slider.value(),
             "priority_boost": self.priority_boost_checkbox.isChecked(),
             "pl1_pl2": self.power_limit_slider.value(),
+            "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
         }
 
     def apply_settings(self, settings):
@@ -471,6 +480,7 @@ class MiningConfigBox(QWidget):
         self.memory_usage_slider.setValue(settings.get("memory_usage", self.xmrig_data.process_manager.recommend_max_memory()))
         self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
         self.power_limit_slider.setValue(settings.get("pl1_pl2", self.xmrig_data.hardware_monitor.get_max_power_draw()))
+        self.xmrig_msr_checkbox.setChecked(settings.get("xmrig_msr", False))
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -789,13 +799,11 @@ class MinerGui(QWidget):
             self.xmrig_miner.cpu_yield = params["cpu_yield"]
             self.xmrig_miner.cpu_affinity = params["cpu_affinity"]
             self.xmrig_miner.io_priority = params["io_priority"]
-
             self.xmrig_miner.memory_usage_min = max(256, params["memory_usage"] * 0.25)
             self.xmrig_miner.memory_usage_max = params["memory_usage"]
-
             self.xmrig_miner.priority_boost = params["priority_boost"]
-
             self.xmrig_miner.pl1_pl2 = params["pl1_pl2"]
+            self.xmrig_miner.xmrig_msr = params["xmrig_msr"]
             asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
 
     def handle_stop_mining(self):
