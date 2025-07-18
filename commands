@@ -1,3 +1,12 @@
 pyinstaller --onefile --console --add-data "X:\Users\natem\PycharmProjects\moneroProject\LibreHardwareMonitorLib.dll;." --add-data "X:\Users\natem\PycharmProjects\moneroProject\HidSharp.dll;." client.py
 pyinstaller --onefile --hidden-import flask --hidden-import psutil server.py
 
+
+
+
+sc create WinRing0_1_2_0 binPath= "C:\Path\To\WinRing0x64.sys" type= kernel start= demand
+sc start WinRing0_1_2_0
+sc query WinRing0_1_2_0
+
+sc stop WinRing0_1_2_0
+sc delete WinRing0_1_2_0

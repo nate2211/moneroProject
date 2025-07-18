@@ -15,131 +15,84 @@ except Exception as e:
     print(f"[!] FATAL: Could not load LibreHardwareMonitorLib: {e}")
     sys.exit(1)
 
-class MSRManager:
-    """
-    Provides access to MSR registers using WinRing0x64.dll for Intel chips.
-    If the DLL cannot be found or initialized, the manager will be disabled.
-    """
+import subprocess
+import os
+import sys
 
+
+class MSRManager:
     def __init__(self, logger, is_intel):
         self.logger = logger
-        self.wr0 = None
         self.initialized = False
         self.is_intel_cpu = is_intel
 
         try:
             if getattr(sys, 'frozen', False):
-                # Running from a PyInstaller bundle
-                base_bath = sys._MEIPASS
+                # PyInstaller bundle: use folder containing executable
+                base_path = os.path.dirname(sys.executable)
             else:
-                # Running in a development environment
+                # Dev environment: use folder containing .py file
                 base_path = os.path.dirname(os.path.abspath(__file__))
 
-            self.dll_path = os.path.join(base_path, "WinRing0x64.dll")
-            if not os.path.exists(self.dll_path):
-                # Raise an exception to be caught by the outer block
-                raise FileNotFoundError(f"WinRing0x64.dll not found at {self.dll_path}")
-            else:
-                self.logger.log_message("WinRing0x64.dll Found")
-            self.wr0 = ctypes.WinDLL(self.dll_path)
+            self.cmd_path = os.path.join(base_path, "msr-cmd.exe")
 
-            # Check driver status
-            if not self.wr0.InitializeOls():
-                self.logger.log_message("[!] Failed to initialize WinRing0 driver. MSRManager is disabled.")
-                # No need to raise, just leave self.initialized as False
+            if not os.path.exists(self.cmd_path):
+                raise FileNotFoundError(f"msr-cmd.exe not found at {self.cmd_path}")
             else:
-                self.logger.log_message("[+] WinRing0 driver initialized successfully.")
-                self.initialized = True
+                self.logger.log_message("[+] msr-cmd.exe found")
 
-        except FileNotFoundError as e:
-            self.logger.log_message(f"[!] {e}. MSR functionality will be disabled.")
+            self.initialized = True
+
         except Exception as e:
-            self.logger.log_message(f"[!] An unexpected error occurred during MSRManager setup: {e}. MSRManager is disabled.")
+            self.logger.log_message(f"[!] MSRManager init failed: {e}")
+            self.initialized = False
 
-
-    def __del__(self):
-        # Only deinitialize if the driver was successfully loaded
-        if self.initialized:
-            self.wr0.DeinitializeOls()
-
-    def write_msr(self, index, low, high):
-        """
-        Writes to a Model-Specific Register.
-        :param index: MSR index (e.g., 0x610 for RAPL power limits)
-        :param low: Lower 32 bits of the value
-        :param high: Upper 32 bits of the value
-        :return: True if successful, False otherwise
-        """
+    def _run(self, args):
         if not self.initialized:
-            self.logger.log_message("[!] MSR write aborted: driver not initialized.")
-            return False
+            return None
+        try:
+            result = subprocess.run([self.cmd_path] + args, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.log_message(f"[!] msr-cmd failed: {result.stderr.strip()}")
+                return None
+            return result.stdout.strip()
+        except Exception as e:
+            self.logger.log_message(f"[!] msr-cmd execution error: {e}")
+            return None
 
-        success = self.wr0.WriteMsr(index, ctypes.c_ulong(low), ctypes.c_ulong(high))
-        if not success:
-            self.logger.log_message(f"[!] Failed to write MSR 0x{index:X}")
-        return bool(success)
-
-    def read_msr(self, index):
-        """
-        Reads a Model-Specific Register.
-        :return: A tuple (low, high) of 32-bit values, or (None, None) on failure.
-        """
-        if not self.initialized:
-            self.logger.log_message("[!] MSR read aborted: driver not initialized.")
-            return None, None
-
-        low = ctypes.c_ulong()
-        high = ctypes.c_ulong()
-        if self.wr0.ReadMsr(index, ctypes.byref(low), ctypes.byref(high)):
-            return low.value, high.value
-
-        self.logger.log_message(f"[!] Failed to read MSR 0x{index:X}")
+    def read_to_msr(self, index):
+        output = self._run(["read", hex(index)])
+        if output:
+            try:
+                # Expecting something like: "MSR[0x610]=0x0000823000008230"
+                hex_val = output.split('=')[-1].strip()
+                value = int(hex_val, 16)
+                low = value & 0xFFFFFFFF
+                high = (value >> 32) & 0xFFFFFFFF
+                return low, high
+            except Exception as e:
+                self.logger.log_message(f"[!] Failed to parse MSR read output: {output}")
         return None, None
 
+    def write_to_msr(self, index, low, high):
+        return self._run(["write", hex(index), hex(high), hex(low)]) is not None
+
     def set_pl1_pl2(self, power_watts):
-        """
-        Sets PL1 and PL2 to the same value using the MSR 0x610 register.
-        This method also enables both power limits. A more advanced implementation
-        would first read the MSR to preserve existing time window settings.
-
-        :param power_watts: Desired power limit in watts
-        :return: True if successful, False otherwise
-        """
         if not self.initialized or not self.is_intel_cpu:
-            self.logger.log_message(f"[*] Setting PL1 and PL2 to {power_watts}W Failed")
-
+            self.logger.log_message(f"[!] PL1/PL2 set failed (not initialized or not Intel).")
             return False
 
         MSR_RAPL_POWER_LIMIT = 0x610
+        power_unit = 0.125
+        raw_limit = int(power_watts / power_unit) & 0x7FFF
 
-        # NOTE: The power unit is typically 0.125W, but this is not guaranteed.
-        # A fully robust solution would first read MSR 0x606 (MSR_RAPL_POWER_UNIT)
-        # to determine the actual power unit, which is 1.0 / (2^power_unit_bits).
-        power_unit = 0.125  # Watts per unit (typical for Intel)
-
-        # Calculate the raw limit value based on the power unit
-        limit_raw = int(power_watts / power_unit)
-
-        # The power limit value is a 15-bit field
-        power_limit_val = limit_raw & 0x7FFF
-
-        # Construct the 64-bit value for MSR 0x610 (MSR_PKG_POWER_LIMIT)
-        # MSR Layout:
-        # [14:0]  -> Power Limit 1 (PL1)
-        # [15]    -> PL1 Enable
-        # [46:32] -> Power Limit 2 (PL2)
-        # [47]    -> PL2 Enable
-
-        value = power_limit_val         # Set PL1 value
-        value |= (1 << 15)              # Enable PL1
-        value |= (power_limit_val << 32)# Set PL2 value
-        value |= (1 << 47)              # Enable PL2
-
+        value = raw_limit | (1 << 15) | (raw_limit << 32) | (1 << 47)
         low = value & 0xFFFFFFFF
         high = (value >> 32) & 0xFFFFFFFF
 
-        self.logger.log_message(f"[*] Setting PL1 and PL2 to {power_watts}W")
-        return self.write_msr(MSR_RAPL_POWER_LIMIT, low, high)
+        self.logger.log_message(f"[*] Setting PL1/PL2 to {power_watts}W → EDX={high:#010x}, EAX={low:#010x}")
+        return self.write_to_msr(MSR_RAPL_POWER_LIMIT, low, high)
+
 
 class ProcessManager:
     """A helper class to manage Windows process attributes using the Windows API."""
