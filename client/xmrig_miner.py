@@ -2,13 +2,10 @@ import asyncio
 import json
 import os
 import subprocess
-import re
 import traceback
-from typing import Callable
 import aiohttp
 import anyio
 import psutil
-from typing_extensions import Awaitable
 import re
 
 
@@ -250,6 +247,7 @@ class XmrigMiner:
         self.cpu_info_flags = set()
         try:
             from cpuinfo import get_cpu_info
+
             self.cpu_info_flags = set(get_cpu_info().get("flags", []))
         except Exception:
             self.logger.log_message("[!] Failed to detect CPU features")
@@ -335,15 +333,19 @@ class XmrigMiner:
                 self.psutil_xmrig.ionice(self.io_priority)
                 self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to io priority level {str(self.io_priority)}.")
             if self.memory_usage_max:
-                self.xmrig_data.process_manager.set_working_set_size(self.psutil_xmrig.pid, self.memory_usage_min, self.memory_usage_max)
-                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to memory usage Min: {str(self.memory_usage_min)} Max:{str(self.memory_usage_max)}.")
-            self.xmrig_data.process_manager.set_priority_boost(self.psutil_xmrig.pid, self.priority_boost)
-            self.logger.log_message(
-                f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to priority boost {self.priority_boost}.")
-            if self.xmrig_data.is_intel_cpu and self.pl1_pl2:
-                self.xmrig_data.msr_manager.set_pl1_pl2(self.pl1_pl2)
-                self.logger.log_message(
-                    f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2}.")
+                if self.xmrig_data.process_manager.set_working_set_size(self.psutil_xmrig.pid, self.memory_usage_min, self.memory_usage_max):
+                    self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to memory usage Min: {str(self.memory_usage_min)} Max:{str(self.memory_usage_max)}.")
+            if self.xmrig_data.process_manager.set_priority_boost(self.psutil_xmrig.pid, self.priority_boost):
+                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to priority boost {self.priority_boost}.")
+            if self.pl1_pl2:
+                if self.xmrig_data.brand == "intel":
+                    if self.xmrig_data.msr_manager.set_pl1_pl2(self.pl1_pl2):
+                        self.logger.log_message(
+                            f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2} for INTEL.")
+                else:
+                    if self.xmrig_data.ryzen_manager.set_ppt_limit(self.pl1_pl2):
+                        self.logger.log_message(
+                            f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2} for AMD.")
 
         except psutil.Error as e:
             self.logger.log_message(f"[!] Could not set psutils process settings. Try running as admin/root. {e}")
@@ -410,16 +412,14 @@ class XmrigMiner:
 
             flags = self.cpu_info_flags
 
-            supports_avx2 = "avx2" in flags
             supports_aes = "aes" in flags
-            supports_sse2 = "sse2" in flags or "sse3" in flags
 
-            config["cpu"]["asm"] = supports_avx2 or supports_sse2
+            config["cpu"]["asm"] = self.xmrig_data.brand
             config["cpu"]["hw-aes"] = supports_aes
             config["cpu"]["priority"] = self.cpu_priority
             config["cpu"]["yield"] = self.cpu_yield
 
-            self.logger.log_message(f"[+] ASM optimization: {'enabled' if config['cpu']['asm'] else 'disabled'}")
+            self.logger.log_message(f"[+] ASM optimization: {self.xmrig_data.brand}")
             self.logger.log_message(
                 f"[+] AES-NI hardware acceleration: {'enabled' if config['cpu']['hw-aes'] else 'disabled'}")
             self.logger.log_message(f"[+] Miner thread priority set to: {config['cpu']['priority']}")
