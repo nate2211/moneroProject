@@ -1,9 +1,10 @@
 import asyncio
 import ctypes
-import subprocess
 import sys
+import time
+from typing import Optional
+
 import clr
-import os
 from threading import Thread, Event
 
 from cpuinfo import cpuinfo
@@ -20,32 +21,197 @@ import os
 import sys
 
 
+
+class RyzenSMUManager:
+    # ─── MSR addresses ───────────────────────────────────────────────────────
+    SMU_MSR_CMD  = 0xC001_0304
+    SMU_MSR_ARG0 = 0xC001_0305
+    SMU_MSR_RSP  = 0xC001_0308
+
+    # ─── MP1 message IDs ─────────────────────────────────────────────────────
+    SMC_MSG_SetSustainedPptLimit = 0x1A
+    SMC_MSG_SetFastPptLimit      = 0x1B
+    SMC_MSG_SetSlowPptLimit      = 0x1C
+    SMC_MSG_EnableFeatures       = 0x05          # new
+    PPT_FEATURE_BIT              = 1 << 3        # new (0x8)
+
+    EXECUTE_BIT = 1 << 31
+
+    # ─── status codes ────────────────────────────────────────────────────────
+    SMU_RSP_OK            = (0x00, 0x01)
+    SMU_RSP_UNKNOWN_CMD   = 0xFF
+    SMU_RSP_CMD_REJECTED  = 0xFE
+    SMU_RSP_CMD_PREREQ    = 0xFD   # “rejected – prereq not met”
+
+    # ─── init ────────────────────────────────────────────────────────────────
+
+
+    def __init__(self, logger, tools_dir: str = "tools"):
+        self.logger = logger
+        self.core0  = ["-p", "0"]    # mailbox lives on core 0
+
+        root = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+        self.cmd_path = os.path.join(root, tools_dir, "msr-cmd.exe")
+
+        self.initialized     = os.path.isfile(self.cmd_path)
+        self.ppt_feature_on  = False   # track EnableFeatures state
+
+        if self.initialized:
+            logger.log_message(f"[+] msr‑cmd found → {self.cmd_path}")
+        else:
+            logger.log_message(f"[!] msr‑cmd not found at {self.cmd_path}")
+
+    # ─── low‑level helpers ───────────────────────────────────────────────────
+    def _run_msr(self, extra_args, *args) -> Optional[str]:
+        if not self.initialized:
+            return None
+        cmd = [self.cmd_path] + extra_args + list(args)
+        try:
+            res = subprocess.run(
+                cmd, text=True, capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=2.0
+            )
+            if res.returncode:
+                self.logger.log_message(f"[!] msr‑cmd exit {res.returncode}: {res.stderr.strip()}")
+                return None
+            return res.stdout.strip()
+        except Exception as e:
+            self.logger.log_message(f"[!] msr‑cmd exception: {e}")
+            return None
+
+    def _write_msr(self, addr: int, val: int) -> bool:
+        lo, hi = val & 0xFFFFFFFF, (val >> 32) & 0xFFFFFFFF
+        return self._run_msr(self.core0, "write", hex(addr), hex(hi), hex(lo)) is not None
+
+    def _read_msr(self, addr: int) -> Optional[int]:
+        out = self._run_msr(self.core0 + ["-d"], "read", hex(addr))
+        if not out:
+            return None
+        try:
+            edx, eax = out.split()[-2:]
+            return (int(edx, 16) << 32) | int(eax, 16)
+        except Exception:
+            return None
+
+    # ─── mailbox helpers ─────────────────────────────────────────────────────
+    def _force_clear_mailbox(self) -> bool:
+        """Write 0 to SMU_MSR_CMD and verify EXECUTE_BIT is clear."""
+        if not self._write_msr(self.SMU_MSR_CMD, 0):
+            return False
+        time.sleep(0.001)          # give SMU a tick
+        status = self._read_msr(self.SMU_MSR_CMD)
+        return status is not None and not (status & self.EXECUTE_BIT)
+
+    def _wait_for_smu(self, timeout_ms: int = 100) -> bool:
+        """Poll until EXECUTE_BIT clears; auto‑clear if it never does."""
+        for _ in range(timeout_ms):
+            status = self._read_msr(self.SMU_MSR_CMD)
+            if status is None:
+                return False
+            if not (status & self.EXECUTE_BIT):
+                return True
+            time.sleep(0.001)
+
+        # timed out → try hard reset once
+        self.logger.log_message("[*] Mailbox stuck → forcing clear")
+        return self._force_clear_mailbox()
+
+    def _enable_ppt_feature(self) -> bool:
+        """Send EnableFeatures(PPT) once per boot."""
+        if self.ppt_feature_on:
+            return True
+        rsp = self._send_mp1(self.SMC_MSG_EnableFeatures,
+                             self.PPT_FEATURE_BIT)
+        self.logger.log_message(f"[!]SMU RSP:{rsp}")
+        ok = rsp is not None and (rsp & 0xFF) in self.SMU_RSP_OK
+        if ok:
+            self.ppt_feature_on = True
+        else:
+            self.logger.log_message("[!] Could not enable PPT feature")
+        return ok
+
+    def _send_mp1(self, msg_id: int, arg0: int = 0) -> Optional[int]:
+        if not self._wait_for_smu():
+            self.logger.log_message("[!] SMU busy – giving up")
+            return None
+
+        if not (self._write_msr(self.SMU_MSR_RSP, 0) and
+                self._write_msr(self.SMU_MSR_ARG0, arg0) and
+                self._write_msr(self.SMU_MSR_CMD, msg_id)):
+            self.logger.log_message("[!] MSR write sequence failed")
+            return None
+
+        if not self._wait_for_smu():
+            self.logger.log_message("[!] SMU never cleared EXECUTE_BIT")
+            return None
+
+
+        cmd_val = self._read_msr(self.SMU_MSR_RSP)
+        return (cmd_val & 0xFF) if cmd_val is not None else None
+
+    # ─── public API ──────────────────────────────────────────────────────────
+    def set_ppt_limit(self, watts: int, kind: str = "fast") -> bool:
+        if not self.initialized:
+            self.logger.log_message("[!] SMU Manager not initialized")
+            return False
+
+        ids = {
+            "sustained": self.SMC_MSG_SetSustainedPptLimit,
+            "fast":      self.SMC_MSG_SetFastPptLimit,
+            "slow":      self.SMC_MSG_SetSlowPptLimit,
+        }
+        msg = ids.get(kind.lower())
+        if msg is None:
+            self.logger.log_message("[!] PPT kind must be fast/slow/sustained")
+            return False
+
+        if not self._enable_ppt_feature():
+            return False
+
+        mw  = watts * 1000
+        self.logger.log_message(f"[*] Setting {kind} PPT → {watts} W")
+
+        rsp = self._send_mp1(msg, mw)
+        if rsp in self.SMU_RSP_OK:
+            self.logger.log_message(f"[+] {kind.capitalize()} PPT now {watts} W")
+            return True
+
+        errmsg = {
+            self.SMU_RSP_UNKNOWN_CMD:  "Unknown command",
+            self.SMU_RSP_CMD_REJECTED: "Rejected (locked in BIOS)",
+            self.SMU_RSP_CMD_PREREQ:   "Prerequisite missing",
+        }.get(rsp, f"SMU responded 0x{rsp:02X}" if rsp is not None else "timeout")
+        self.logger.log_message(f"[!] PPT write failed: {errmsg}")
+        return False
 class MSRManager:
     def __init__(self, logger, is_intel):
         self.logger = logger
         self.initialized = False
         self.is_intel_cpu = is_intel
         self.base_path = ""
-        try:
-            if getattr(sys, 'frozen', False):
-                # PyInstaller bundle: use extracted tools directory inside _MEIPASS
-                self.base_path = os.path.join(sys._MEIPASS, 'tools')
-            else:
-                # Dev environment: use tools directory relative to script
-                self.base_path = os.path.join(os.path.dirname(__file__), 'tools')
+        if self.is_intel_cpu:
+            try:
+                if getattr(sys, 'frozen', False):
+                    # PyInstaller bundle: use extracted tools directory inside _MEIPASS
+                    self.base_path = os.path.join(sys._MEIPASS, 'tools')
+                else:
+                    # Dev environment: use tools directory relative to script
+                    self.base_path = os.path.join(os.path.dirname(__file__), 'tools')
 
-            self.cmd_path = os.path.join(self.base_path, "msr-cmd.exe")
+                self.cmd_path = os.path.join(self.base_path, "msr-cmd.exe")
 
-            if not os.path.exists(self.cmd_path):
-                raise FileNotFoundError(f"msr-cmd.exe not found at {self.cmd_path}")
-            else:
-                self.logger.log_message("[+] msr-cmd.exe found")
+                if not os.path.exists(self.cmd_path):
+                    raise FileNotFoundError(f"msr-cmd.exe not found at {self.cmd_path}")
+                else:
+                    self.logger.log_message("[+] msr-cmd.exe found")
 
-            self.initialized = True
+                self.initialized = True
 
-        except Exception as e:
-            self.logger.log_message(f"[!] MSRManager init failed: {e}")
-            self.initialized = False
+            except Exception as e:
+                self.logger.log_message(f"[!] MSRManager init failed: {e}")
+                self.initialized = False
+        else:
+            self.logger.log_message("[+] msr-cmd.exe not initialized non intel")
 
     def _run(self, args):
         if not self.initialized:
@@ -411,7 +577,7 @@ class HardwareMonitor(Thread):
             return 45
 
         self.logger.log_message("[!] CPU model not recognized for power heuristic, returning default.")
-        return 125 # Default for unknown CPUs
+        return 220 # Default for unknown CPUs
 
 
 class XmrigData:
@@ -435,11 +601,15 @@ class XmrigData:
         self.XMRIG_PATH = os.path.join(os.path.dirname(sys.executable), "xmrig.exe")
         self.CONFIG_PATH = os.path.join(os.path.dirname(sys.executable), "config.json")
         self.logger = Logger
-        cpu_info = cpuinfo.get_cpu_info()
-        self.is_intel_cpu = 'GenuineIntel' in cpu_info.get('vendor_id_raw', '')
+        self.brand = ""
+        if 'intel' in cpuinfo.get_cpu_info().get('brand_raw', '').lower():
+            self.brand = "intel"
+        else:
+            self.brand = "ryzen"
         self.hardware_monitor = HardwareMonitor(self.logger)
         self.process_manager = ProcessManager(self.logger)
-        self.msr_manager = MSRManager(self.logger, self.is_intel_cpu)
+        self.msr_manager = MSRManager(self.logger, self.brand == "intel")
+        self.ryzen_manager = RyzenSMUManager(self.logger, )
 
     async def get_power_draw_async(self):
         """Async wrapper to get total power draw from the monitor thread."""

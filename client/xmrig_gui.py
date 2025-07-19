@@ -363,18 +363,15 @@ class MiningConfigBox(QWidget):
         # --- NEW WIDGET: Intel Power Limit (PL1/PL2) Slider ---
         self.power_limit_desc_label = QLabel("Power Limit (PL1/PL2):")
         self.power_limit_slider = QSlider(Qt.Horizontal)
-        self.power_limit_slider.setMinimum(15)   # 15W Minimum
-        self.power_limit_slider.setMaximum(self.xmrig_data.hardware_monitor.get_max_power_draw())  # 250W Maximum
-        self.power_limit_slider.setValue(45)    # 125W Default
+        self.power_limit_slider.setMinimum(15)
+        self.power_limit_slider.setMaximum(self.xmrig_data.hardware_monitor.get_max_power_draw())
+        self.power_limit_slider.setValue(45)
         self.power_limit_slider.setToolTip("Sets CPU power limits (PL1/PL2) in Watts.\nRequires admin/root privileges.")
         self.power_limit_value_label = QLabel(f"{self.power_limit_slider.value()} W")
         self.power_limit_slider.valueChanged.connect(
             lambda v: self.power_limit_value_label.setText(f"{v} W")
         )
-        # We will hide/show these widgets based on CPU vendor
-        self.power_limit_desc_label.setVisible(self.xmrig_data.is_intel_cpu)
-        self.power_limit_slider.setVisible(self.xmrig_data.is_intel_cpu)
-        self.power_limit_value_label.setVisible(self.xmrig_data.is_intel_cpu)
+
 
         # --- Layout rows ---
 
@@ -418,13 +415,12 @@ class MiningConfigBox(QWidget):
 
         # Row 5 (Intel Only): Power Limit slider
         row = 5
-        if self.xmrig_data.is_intel_cpu:
-            layout.addWidget(self.power_limit_desc_label, row, 0)
-            power_layout = QHBoxLayout()
-            power_layout.addWidget(self.power_limit_slider)
-            power_layout.addWidget(self.power_limit_value_label)
-            layout.addLayout(power_layout, row, 1, 1, 3)
-            row += 1
+        layout.addWidget(self.power_limit_desc_label, row, 0)
+        power_layout = QHBoxLayout()
+        power_layout.addWidget(self.power_limit_slider)
+        power_layout.addWidget(self.power_limit_value_label)
+        layout.addLayout(power_layout, row, 1, 1, 3)
+        row += 1
 
         # Row 6: Buttons (mine + stop)
         button_layout = QHBoxLayout()
@@ -479,7 +475,7 @@ class MiningConfigBox(QWidget):
         self.io_priority.setCurrentIndex(settings.get("io_priority", psutil.IOPRIO_NORMAL))
         self.memory_usage_slider.setValue(settings.get("memory_usage", self.xmrig_data.process_manager.recommend_max_memory()))
         self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
-        self.power_limit_slider.setValue(settings.get("pl1_pl2", self.xmrig_data.hardware_monitor.get_max_power_draw()))
+        self.power_limit_slider.setValue(settings.get("pl1_pl2", int(self.xmrig_data.hardware_monitor.get_max_power_draw() / 2)))
         self.xmrig_msr_checkbox.setChecked(settings.get("xmrig_msr", False))
 
 class StatsDisplay(QWidget):

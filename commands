@@ -4,7 +4,7 @@ pyinstaller --onefile --hidden-import flask --hidden-import psutil server.py
 
 
 
-sc create WinRing0_1_2_0 binPath= "C:\Path\To\WinRing0x64.sys" type= kernel start= demand
+sc create WinRing0_1_2_0 binPath= "X:\Downloads\xmrig-6.23.0\WinRing0x64.sys" type= kernel start= demand
 sc start WinRing0_1_2_0
 sc query WinRing0_1_2_0
 
