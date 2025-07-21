@@ -15,3 +15,4 @@ class ClientData:
         self.client_power_draws = {}
         self.client_start_times = {}
         self.client_costs = {}
+        self.client_pl1_pl2s = {}

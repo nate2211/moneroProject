@@ -28,7 +28,7 @@ import {
     Tooltip, Divider,
     Accordion,
     AccordionSummary,
-    AccordionDetails
+    AccordionDetails, Stack, Slider, Input
 } from '@mui/material';
 import {
     RestartAlt,
@@ -101,7 +101,7 @@ function App() {
   const [wifi, setWifi] = useState({ ssid: 'ARRIS-7D41-5G', password: '535102108332' });
   const [startMinerForm, setStartMinerForm] = useState({ pool: '', threads: '' });
   const [threadInputs, setThreadInputs] = useState({});
-
+  const [pl1pl2Inputs, setPl1Pl2Inputs] = useState({});
   // === API Abstraction ===
   const apiCall = async (endpoint, options = {}) => {
     setLoading(prev => ({ ...prev, [endpoint]: true }));
@@ -204,6 +204,16 @@ function App() {
     await apiCall(`/set_threads/${clientId}`, { method: 'POST', body: formData });
     fetchData();
   };
+  const handleSetPl1Pl2 = async (e, clientId) => {
+    e.preventDefault();
+    const pl1_pl2 = pl1pl2Inputs[clientId];
+    if (!pl1_pl2|| pl1_pl2< 1) return;
+    const formData = new FormData();
+    formData.append('pl1_pl2', pl1_pl2);
+    await apiCall(`/set_pl1_pl2/${clientId}`, { method: 'POST', body: formData });
+    fetchData();
+  };
+
 
   const handleStartMiner = async (e) => {
     e.preventDefault();
@@ -247,7 +257,55 @@ function App() {
         </Grid>
     );
   };
+  const Pl1Pl2Slider = ({ cid, clients, pl1pl2Inputs, setPl1Pl2Inputs, handleSetPl1Pl2 }) => {
 
+    // Determine the current value from either the controlled input state or the initial client data.
+    // Defaults to 0 if no value is present.
+    const value = pl1pl2Inputs[cid] ?? clients.pl1_pl2s?.[cid] ?? 0;
+
+    // Handles changes from the slider or the input field, updating the local state.
+    const handleValueChange = (newValue) => {
+        // Clamp the value between 0 and 300.
+        const clampedValue = Math.max(0, Math.min(300, Number(newValue) || 0));
+        setPl1Pl2Inputs(prev => ({
+            ...prev,
+            [cid]: clampedValue,
+        }));
+    };
+
+    // This function will now be the form's submission handler.
+    const handleSubmit = (event) => {
+        event.preventDefault(); // Prevent the browser from reloading the page
+        handleSetPl1Pl2(event, cid); // Call the parent submission handler
+    };
+
+    return (
+        <Box component="form" onSubmit={handleSubmit} sx={{ width: '100%', maxWidth: 300, mt: 1 }}>
+            <Typography id={`slider-label-for-${cid}`} gutterBottom>
+                Pl1/Pl2
+            </Typography>
+            <Stack direction="row" spacing={2} alignItems="center">
+                <Slider
+                    value={typeof value === 'number' ? value : 0}
+                    onClicke={(e, newValue) => handleValueChange(newValue)}
+                    aria-labelledby={`slider-label-for-${cid}`}
+                    min={0}
+                    max={300}
+                    step={1}
+                />
+                <Typography
+                  variant="h5"
+                  sx={{ fontWeight: 'bold', color: 'text.primary', minWidth: 52 }}
+                >
+                  {value}
+                </Typography>
+                <Button type="submit" variant="contained" size="small" sx={{ mt: 2 }}>
+                    Set
+                </Button>
+            </Stack>
+        </Box>
+    );
+};
 const EventTable = ({ title, events = [] }) => {
     const hasTypeColumn = events.length > 0 && events[0].hasOwnProperty('type');
 
@@ -432,34 +490,68 @@ const EventTable = ({ title, events = [] }) => {
                                     </CardContent>
 
                                     {/* Actions */}
-                                    <Box sx={{ p: 2, pt: 1, borderTop: '1px solid rgba(255, 255, 255, 0.12)' }}>
-                                        <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', justifyContent: 'space-between' }}>
-                                            <form onSubmit={(e) => handleSetThreads(e, cid)} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                <TextField size="small" type="number" variant="outlined" sx={{ width: '85px' }} label="Threads" InputLabelProps={{ shrink: true }} placeholder={String(clients.threads?.[cid] || '1')} onChange={e => setThreadInputs({...threadInputs, [cid]: e.target.value})} />
-                                                <Button type="submit" size="small" variant="contained">Set</Button>
-                                            </form>
-                                            {clients.status?.[cid] === 'Started' ?
-                                                <Button variant="contained" color="error" size="small" onClick={() => handleStopMiner(cid)} startIcon={<Stop />}>Stop</Button> :
-                                                <Button variant="contained" color="success" size="small" onClick={() => openStartModal(cid)} startIcon={<PlayArrow />}>Start</Button>
-                                            }
-                                        </Box>
-                                    </Box>
+                                    <Accordion>
+                                        <AccordionSummary
+                                            expandIcon={<ExpandMore />}
+                                            aria-controls="actions-panel-content"
+                                            id="actions-panel-header"
+                                        >
+                                            <Typography sx={{ fontWeight: 'medium' }}>Actions</Typography>
+                                        </AccordionSummary>
+                                        <AccordionDetails>
+                                            <Box sx={{
+                                                display: 'flex',
+                                                flexDirection: "column",
+                                                gap: 1,
+                                                alignItems: 'center',
+                                                justifyContent: 'space-between'
+                                            }}>
+                                                <form onSubmit={(e) => handleSetThreads(e, cid)}
+                                                      style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                                                    <TextField
+                                                        size="small"
+                                                        type="number"
+                                                        variant="outlined"
+                                                        sx={{width: '85px'}}
+                                                        label="Threads"
+                                                        InputLabelProps={{shrink: true}}
+                                                        placeholder={String(clients.threads?.[cid] || '1')}
+                                                        onChange={e => setThreadInputs({
+                                                            ...threadInputs,
+                                                            [cid]: e.target.value
+                                                        })}
+                                                    />
+                                                    <Button type="submit" size="small" variant="contained">Set</Button>
+                                                </form>
+                                                <Pl1Pl2Slider cid={cid} pl1pl2Inputs={pl1pl2Inputs} clients={clients}  handleSetPl1Pl2={handleSetPl1Pl2} setPl1Pl2Inputs={setPl1Pl2Inputs}/>
+                                                {clients.status?.[cid] === 'Started' ?
+                                                    <Button variant="contained" color="error" size="small"
+                                                            onClick={() => handleStopMiner(cid)}
+                                                            startIcon={<Stop/>}>Stop</Button> :
+                                                    <Button variant="contained" color="success" size="small"
+                                                            onClick={() => openStartModal(cid)}
+                                                            startIcon={<PlayArrow/>}>Start</Button>
+                                                }
+                                            </Box>
+                                        </AccordionDetails>
+                                    </Accordion>
                                 </Card>
                             </Grid>
                         ))
                     ) : (
                         <Grid item xs={12}>
-                            <Typography sx={{ textAlign: 'center', p: 4, color: 'text.secondary' }}>No clients have connected yet.</Typography>
+                            <Typography sx={{textAlign: 'center', p: 4, color: 'text.secondary'}}>No clients have
+                                connected yet.</Typography>
                         </Grid>
                     )}
                 </Grid>
             </Box>
 
-            <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', mt: 4 }}>Event Logs</Typography>
+            <Typography variant="h4" gutterBottom sx={{textAlign: 'center', mt: 4}}>Event Logs</Typography>
             <Grid container spacing={3} sx={{display: "flex", justifyContent: "center"}}>
-                <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found} /></Grid>
-                <Grid item xs={12} lg={6}><EventTable title="Blocks Found" events={events.blocks_found} /></Grid>
-                <Grid item xs={12} lg={6}><EventTable title="New Miner Data" events={events.miner_data} /></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="Shares Found" events={events.shares_found}/></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="Blocks Found" events={events.blocks_found}/></Grid>
+                <Grid item xs={12} lg={6}><EventTable title="New Miner Data" events={events.miner_data}/></Grid>
                 <Grid item xs={12} lg={6}><EventTable title="Jobs Sent" events={events.jobs_sent} /></Grid>
                 <Grid item xs={12}><EventTable title="Sidechain Events" events={events.sidechain_events} /></Grid>
                 <Grid item xs={12}><EventTable title="Other Events" events={events.other_events} /></Grid>

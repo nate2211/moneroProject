@@ -8,6 +8,7 @@ import anyio
 import psutil
 import re
 
+from xmrig_managers import AsyncPsutilManager, AsyncTSharkManager
 
 REPORT_INTERVAL_SECONDS = 5
 
@@ -48,7 +49,7 @@ class PeriodicReporter:
                     }
                 else:
                     payload = {
-                        "client_id": self.xmrig_data.client_id, "hashrate": 0, "threads": current_threads,
+                        "client_id": self.xmrig_data.client_id, "hashrate": 0, "threads": 0,
                         "cpu_temp": current_cpu_temp, "gpu_temp": self.xmrig_data._latest_gpu_temp,
                         "gpu_fan": self.xmrig_data._latest_gpu_fan, "cpu_accepted_shares": 0,
                         "nvidia_accepted_shares": 0, "power_draw": current_power_draw
@@ -79,6 +80,18 @@ class ServerPoller:
         self.xmrig_data = xmrig_data
         self.xmrig_miner = xmrig_miner
         self.logger = logger
+
+
+    async def post_gui_settings(self, session: aiohttp.ClientSession):
+        try:
+            payload = {"pl1_pl2": self.xmrig_miner.pl1_pl2}
+            await session.post(
+                f"{self.xmrig_data.FLASK_SERVER_URL}/miners_gui_settings/{self.xmrig_data.client_id}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+        except Exception as e:
+            self.logger.log_message(f"[!] Exception in post gui settings {e}")
     async def run(self, force_update_signal, session: aiohttp.ClientSession):
         while True:
             try:
@@ -116,10 +129,23 @@ class ServerPoller:
                     elif cmd == "set_threads":
                         new_threads = int(command["threads"])  # This can cause KeyError or ValueError
                         await self.xmrig_miner.update_config_threads_async(new_threads)
+                    elif cmd == "set_pl1_pl2":
+                        new_pl1_pl2 = int(command["pl1_pl2"])
+                        self.xmrig_miner.pl1_pl2 = new_pl1_pl2
+                        if self.xmrig_data.brand == "intel":
+                            if await self.xmrig_data.msr_manager.set_pl1_pl2(new_pl1_pl2):
+                                self.logger.log_message(
+                                    f"[+] Set XMRig process (PID: {self.xmrig_miner.psutil_xmrig.pid}) to pl1 and pl2 {new_pl1_pl2} for INTEL.")
+                        else:
+                            if await self.xmrig_data.ryzen_manager.set_ppt_limit(new_pl1_pl2):
+                                self.logger.log_message(
+                                    f"[+] Set XMRig process (PID: {self.xmrig_miner.psutil_xmrig.pid}) to pl1 and pl2 {new_pl1_pl2} for AMD.")
+                        await self.post_gui_settings(session)
                     elif cmd == "update":
                         update_url = command.get("url")
                         if update_url:
                             force_update_signal.emit(update_url)
+
 
             # --- MODIFIED ERROR HANDLING ---
             except json.JSONDecodeError:
@@ -228,6 +254,7 @@ class OutputMonitor:
 class XmrigMiner:
 
     def __init__(self, XmrigData, Logger):
+        self.psutil_xmrig_manager = None
         self.xmrig_data = XmrigData
         self.logger = Logger
         self.periodic_reporter = PeriodicReporter(self, self.xmrig_data, self.logger)
@@ -314,9 +341,9 @@ class XmrigMiner:
                 [self.xmrig_data.XMRIG_PATH],
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
-            self.psutil_xmrig = psutil.Process(self.xmrig_data.xmrig_process.pid)
+            self.psutil_xmrig_manager = AsyncPsutilManager(self.xmrig_data.xmrig_process.pid, self.logger)
         except Exception as e:
             self.logger.log_message(f"[!] Failed to start XMRig: {e}")
             return
@@ -324,29 +351,33 @@ class XmrigMiner:
         # --- Set priority if needed ---
         try:
             if self.priority:
-                self.psutil_xmrig.nice(psutil.HIGH_PRIORITY_CLASS)
-                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to high priority.")
+                await self.psutil_xmrig_manager.set_high_priority()
             if self.cpu_affinity > 0:
-                self.psutil_xmrig.cpu_affinity(list(range(self.cpu_affinity)))
-                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to affinity level {self.cpu_affinity}.")
+                await self.psutil_xmrig_manager.set_cpu_affinity(self.cpu_affinity)
             if self.io_priority and self.priority == False and self.cpu_priority < 3:
-                self.psutil_xmrig.ionice(self.io_priority)
-                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to io priority level {str(self.io_priority)}.")
-            if self.memory_usage_max:
-                if self.xmrig_data.process_manager.set_working_set_size(self.psutil_xmrig.pid, self.memory_usage_min, self.memory_usage_max):
-                    self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to memory usage Min: {str(self.memory_usage_min)} Max:{str(self.memory_usage_max)}.")
-            if self.xmrig_data.process_manager.set_priority_boost(self.psutil_xmrig.pid, self.priority_boost):
-                self.logger.log_message(f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to priority boost {self.priority_boost}.")
+                await self.psutil_xmrig_manager.set_io_priority(self.io_priority)
+
+            ok = await self.xmrig_data.process_manager.set_working_set_size_async(
+                self.psutil_xmrig_manager.proc.pid, self.memory_usage_min, self.memory_usage_max)
+            if ok:
+                self.logger.log_message(
+                    f"[+] Set XMRig (PID {self.psutil_xmrig_manager.proc.pid}) working‑set min={self.memory_usage_min} MB "
+                    f"max={self.memory_usage_max} MB.")
+            ok = await self.xmrig_data.process_manager.set_priority_boost_async(
+                self.psutil_xmrig_manager.proc.pid, self.priority_boost)
+            if ok:
+                self.logger.log_message(
+                    f"[+] Priority‑boost for PID {self.psutil_xmrig_manager.proc.pid} set to {self.priority_boost}.")
             if self.pl1_pl2:
                 if self.xmrig_data.brand == "intel":
-                    if self.xmrig_data.msr_manager.set_pl1_pl2(self.pl1_pl2):
+                    if await self.xmrig_data.msr_manager.set_pl1_pl2(self.pl1_pl2):
                         self.logger.log_message(
-                            f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2} for INTEL.")
+                            f"[+] Set XMRig process (PID: {self.psutil_xmrig_manager.proc.pid}) to pl1 and pl2 {self.pl1_pl2} for INTEL.")
                 else:
-                    if self.xmrig_data.ryzen_manager.set_ppt_limit(self.pl1_pl2):
+                    if await self.xmrig_data.ryzen_manager.set_ppt_limit(self.pl1_pl2):
                         self.logger.log_message(
-                            f"[+] Set XMRig process (PID: {self.psutil_xmrig.pid}) to pl1 and pl2 {self.pl1_pl2} for AMD.")
-
+                            f"[+] Set XMRig process (PID: {self.psutil_xmrig_manager.proc.pid}) to pl1 and pl2 {self.pl1_pl2} for AMD.")
+            await self.server_poller.post_gui_settings(self.xmrig_data.aiohttp_client_session)
         except psutil.Error as e:
             self.logger.log_message(f"[!] Could not set psutils process settings. Try running as admin/root. {e}")
 

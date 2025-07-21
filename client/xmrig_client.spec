@@ -9,6 +9,8 @@ a = Analysis(
     ('xmrig_client.py', '.'),
     ('xmrig_data.py', '.'),
     ('xmrig_miner.py', '.'),
+    ('xmrig_managers.py', '.'),
+    ('xmrig_gui_elements.py', '.'),
     ('icons', 'icons'),
     ('tools', 'tools'),
     ('X:\\Users\\natem\\PycharmProjects\\moneroProject\\LibreHardwareMonitorLib.dll', '.'),
