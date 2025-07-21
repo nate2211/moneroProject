@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.23">
+<title>Wireshark 4.4.8 Release Notes</title>
+<link rel="stylesheet" href="./ws.css">
+</head>
+<body class="article">
+<div id="header">
+<h1>Wireshark 4.4.8 Release Notes</h1>
+</div>
+<div id="content">
+<div class="sect1">
+<h2 id="_what_is_wireshark">What is Wireshark?</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Wireshark is the world’s most popular network protocol analyzer.
+It is used for troubleshooting, analysis, development and education.</p>
+</div>
+<div class="paragraph">
+<p>Wireshark is hosted by the Wireshark Foundation, a nonprofit which promotes protocol analysis education.
+Wireshark and the foundation depend on your contributions in order to do their work!
+If you or your organization would like to contribute or become a sponsor, please visit <a href="https://wiresharkfoundation.org">wiresharkfoundation.org</a>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_whats_new">What’s New</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_bug_fixes">Bug Fixes</h3>
+<div class="paragraph">
+<p>The following bugs have been fixed:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>Renegotiated DTLS session is not being decrypted. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20362">Issue 20362</a>.</p>
+</li>
+<li>
+<p>Wireshark is completely stuck in initialization because androiddump recv() is blocked. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20526">Issue 20526</a>.</p>
+</li>
+<li>
+<p>Fuzz job UTF-8 encoding issue: fuzz-2025-06-20-7318.pcap. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20585">Issue 20585</a>.</p>
+</li>
+<li>
+<p>Crash when showing packet in new window after reloading Lua plugins with a certain gui.column.format preference. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20588">Issue 20588</a>.</p>
+</li>
+<li>
+<p>Bug in UDS dissector with Service ReadDataByPeriodicIdentifier Response. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20589">Issue 20589</a>.</p>
+</li>
+<li>
+<p>Packet diagram doesn&#8217;t show non-standard field value representations. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20590">Issue 20590</a>.</p>
+</li>
+<li>
+<p>Packet diagram shows representation twice when field type is FT_NONE. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20601">Issue 20601</a>.</p>
+</li>
+<li>
+<p>application/x-www-form-urlencoded key parsed incorrectly following a name-value byte sequence with no '=' <a href="https://gitlab.com/wireshark/wireshark/-/issues/20615">Issue 20615</a>.</p>
+</li>
+<li>
+<p>DNP3 time stamp was unable to work after epoch time(year 2038) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20618">Issue 20618</a>.</p>
+</li>
+</ul>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_new_and_updated_features">New and Updated Features</h3>
+
+</div>
+<div class="sect2">
+<h3 id="_new_protocol_support">New Protocol Support</h3>
+<div class="paragraph">
+<p>There are no new protocols in this release.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_updated_protocol_support">Updated Protocol Support</h3>
+<div class="paragraph">
+<p>ASTERIX, DLT, DNP 3.0, DOF, DTLS, ETSI CAT, Gryphon, IPsec, ISObus VT, KRB5, MBIM, RTCP, SLL, STCSIG, TETRA, UDS, and URL Encoded Form Data</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_new_and_updated_capture_file_support">New and Updated Capture File Support</h3>
+<div class="paragraph">
+<p>pcapng</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_updated_file_format_decoding_support">Updated File Format Decoding Support</h3>
+<div class="paragraph">
+<p>There is no updated file format support in this release.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_prior_versions">Prior Versions</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Wireshark 4.4.7 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.7.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2025-02">wnpa-sec-2025-02</a>
+Dissection engine crash.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20509">Issue 20509</a>.
+<a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-5601">CVE-2025-5601</a>.</p>
+</li>
+<li>
+<p>Wireshark does not correctly decode LIN "go to sleep" in TECMP and CMP. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20463">Issue 20463</a>.</p>
+</li>
+<li>
+<p>Dissector bug, Protocol CIGI. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20496">Issue 20496</a>.</p>
+</li>
+<li>
+<p>Green power packets are not dissected when proto_version == ZBEE_VERSION_GREEN_POWER. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20497">Issue 20497</a>.</p>
+</li>
+<li>
+<p>Packet diagrams misalign or drop bitfields. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20507">Issue 20507</a>.</p>
+</li>
+<li>
+<p>Corruption when setting heuristic dissector table UI name from Lua. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20523">Issue 20523</a>.</p>
+</li>
+<li>
+<p>LDAP dissector incorrectly displays filters with singleton "&amp;" <a href="https://gitlab.com/wireshark/wireshark/-/issues/20527">Issue 20527</a>.</p>
+</li>
+<li>
+<p>WebSocket per-message compression extentions: fail to decompress server messages (from the 2nd) due to parameter handling. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20531">Issue 20531</a>.</p>
+</li>
+<li>
+<p>The LL_PERIODIC_SYNC_WR_IND packet is not properly dissected (packet-btle.c) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20554">Issue 20554</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.6 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.6.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>Bug in EtherCAT dissector with ECS order. <a href="https://gitlab.com/wireshark/wireshark/-/issues/13718">Issue 13718</a>.</p>
+</li>
+<li>
+<p>Conversation dialog columns return to default width on each new packet in live capture. <a href="https://gitlab.com/wireshark/wireshark/-/issues/15978">Issue 15978</a>.</p>
+</li>
+<li>
+<p>Tests fail in LTO-enabled builds in Ubuntu/Debian. <a href="https://gitlab.com/wireshark/wireshark/-/issues/18216">Issue 18216</a>.</p>
+</li>
+<li>
+<p>Incorrect conditions in BFCP dissector. <a href="https://gitlab.com/wireshark/wireshark/-/issues/18717">Issue 18717</a>.</p>
+</li>
+<li>
+<p>Static build fails on Ubuntu 24.04 because the c-ares library isn&#8217;t found. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20343">Issue 20343</a>.</p>
+</li>
+<li>
+<p>Flutter&#8217;s Image Picker Generated JPEG Files Detected as Malformed Packet. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20355">Issue 20355</a>.</p>
+</li>
+<li>
+<p>QUIC dissector breaks when src and dst change. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20371">Issue 20371</a>.</p>
+</li>
+<li>
+<p>s390x: build fail on Ubuntu PPA nighty build. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20372">Issue 20372</a>.</p>
+</li>
+<li>
+<p>Trailing octet after IPv4 packet end is not detected or displayed in raw bytes. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20423">Issue 20423</a>.</p>
+</li>
+<li>
+<p>[packet-ax25-nol3.c] Only call APRS dissector on UI Frames. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20429">Issue 20429</a>.</p>
+</li>
+<li>
+<p>Wireshark hangs when refreshing interfaces with the debug console preference set to "always" and a file open (Windows) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20434">Issue 20434</a>.</p>
+</li>
+<li>
+<p>BGP EVPN - Type-8 route not correctly read after addition of Max. Response Time field. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20459">Issue 20459</a>.</p>
+</li>
+<li>
+<p>Wireshark does not correctly decode LIN "go to sleep" in TECMP and CMP. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20463">Issue 20463</a>.</p>
+</li>
+<li>
+<p>MQTT-SN: WILLTOPIC message not decoded correctly (missing some flags) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20476">Issue 20476</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.5 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.5.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>GRPC: protobuf_json only displays the truncated string value. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20392">Issue 20392</a>.</p>
+</li>
+<li>
+<p>Wireshark crashes when clicking on a column title/header. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20403">Issue 20403</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.4 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.4.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2025-01">wnpa-sec-2025-01</a>
+Bundle Protocol and CBOR dissector {crash,infinite loop,memory leak}.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20373">Issue 20373</a>.</p>
+</li>
+<li>
+<p>Crash when sorting columns during capture with display filter active. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20263">Issue 20263</a>.</p>
+</li>
+<li>
+<p>OSS-Fuzz 384757274: Invalid-bool-value in dissect_tcp. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20300">Issue 20300</a>.</p>
+</li>
+<li>
+<p>Test failure in 4.4.2/4.4.3: test_sharkd_req_follow_http2. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20330">Issue 20330</a>.</p>
+</li>
+<li>
+<p>Regression in extcap interface toolbar. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20354">Issue 20354</a>.</p>
+</li>
+<li>
+<p>Clicking outside columns in TCP tab of Statistics &#8594; Conversations window causes crash. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20357">Issue 20357</a>.</p>
+</li>
+<li>
+<p>FTBFS with Ubuntu development (25.04) release. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20359">Issue 20359</a>.</p>
+</li>
+<li>
+<p>DNS enable_qname_stats crash Wireshark when QDCOUNT == 0. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20367">Issue 20367</a>.</p>
+</li>
+<li>
+<p>Windows: Android extcap plugin fails with "Broken socket connection" if there are no new packets for 2sec. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20386">Issue 20386</a>.</p>
+</li>
+<li>
+<p>TECMP: Calculation of lifecycle start in Status message is wrong. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20387">Issue 20387</a>.</p>
+</li>
+<li>
+<p>MQTT v5.0 properties total length presentation is incorrect. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20389">Issue 20389</a>.</p>
+</li>
+<li>
+<p>TShark doesn&#8217;t resolve addresses in custom "hosts" files. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20391">Issue 20391</a>.</p>
+</li>
+<li>
+<p>Incorrect JA4 fingerprint with empty ciphers. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20394">Issue 20394</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.3 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.3.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>Potential mis-match in GSM MAP dissector for uncertainty radius and its filter key. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20247">Issue 20247</a>.</p>
+</li>
+<li>
+<p>Macro eNodeB ID and Extended Macro eNodeB ID not decoded by User Location Information. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20276">Issue 20276</a>.</p>
+</li>
+<li>
+<p>The NFSv2 Dissector appears to be swapping Character Special File and Directory in mode decoding. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20290">Issue 20290</a>.</p>
+</li>
+<li>
+<p>CMake discovers Strawberry Perl&#8217;s zlib DLL when it shouldn&#8217;t. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20304">Issue 20304</a>.</p>
+</li>
+<li>
+<p>VOIP Calls call flow displaying hours. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20311">Issue 20311</a>.</p>
+</li>
+<li>
+<p>Fuzz job issue: fuzz-2024-12-26-7898.pcap. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20313">Issue 20313</a>.</p>
+</li>
+<li>
+<p>sFlow: Incorrect length passed to header sample dissector. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20320">Issue 20320</a>.</p>
+</li>
+<li>
+<p>wsutil: Should link against -lm due to missing fabs() when built with -fno-builtin. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20326">Issue 20326</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.2 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.2.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2024-14">wnpa-sec-2024-14</a>
+FiveCo RAP dissector infinite loop.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20176">Issue 20176</a>.</p>
+</li>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2024-15">wnpa-sec-2024-15</a>
+ECMP dissector crash.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20214">Issue 20214</a>.</p>
+</li>
+<li>
+<p>CIP I/O is not detected by "enip" filter anymore. <a href="https://gitlab.com/wireshark/wireshark/-/issues/19517">Issue 19517</a>.</p>
+</li>
+<li>
+<p>Fuzz job issue: fuzz-2024-09-03-7550.pcap. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20041">Issue 20041</a>.</p>
+</li>
+<li>
+<p>OSS-Fuzz 71476: wireshark:fuzzshark_ip_proto-udp: Index-out-of-bounds in DOFObjectID_Create_Unmarshal. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20065">Issue 20065</a>.</p>
+</li>
+<li>
+<p>JA4_c hashes an empty field to e3b0c44298fc when it should be 000000000000. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20066">Issue 20066</a>.</p>
+</li>
+<li>
+<p>Opening Wireshark 4.4.0 on macOS 15.0 disconnects iPhone Mirroring. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20082">Issue 20082</a>.</p>
+</li>
+<li>
+<p>PTP analysis loses track of message associations in case of sequence number resets. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20099">Issue 20099</a>.</p>
+</li>
+<li>
+<p>USB CCID: response packet in case SetParameters command is unsupported is flagged as malformed. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20107">Issue 20107</a>.</p>
+</li>
+<li>
+<p>dumpcap crashes when run from TShark with a capture filter. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20108">Issue 20108</a>.</p>
+</li>
+<li>
+<p>SRT dissector: The StreamID (SID) in the handshake extension is displayed without regarding the control characters and with NUL as terminating. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20113">Issue 20113</a>.</p>
+</li>
+<li>
+<p>Ghost error message on POP3 packets. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20124">Issue 20124</a>.</p>
+</li>
+<li>
+<p>Building against c-ares 1.34 fails. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20125">Issue 20125</a>.</p>
+</li>
+<li>
+<p>D-Bus is not optional anymore. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20126">Issue 20126</a>.</p>
+</li>
+<li>
+<p>macOS Intel DMGs aren&#8217;t fully notarized. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20129">Issue 20129</a>.</p>
+</li>
+<li>
+<p>Incorrect name for MLD Capabilities and Operations Present flag in dissection of MLD Capabilities for MLO wifi-7 capture. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20134">Issue 20134</a>.</p>
+</li>
+<li>
+<p>CQL Malformed Packet v4 S &#8594; C Type RESULT: Prepared[Malformed Packet] <a href="https://gitlab.com/wireshark/wireshark/-/issues/20142">Issue 20142</a>.</p>
+</li>
+<li>
+<p>Wi-Fi: 256 Block Ack (BA) is not parsed properly. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20156">Issue 20156</a>.</p>
+</li>
+<li>
+<p>BACnet ReadPropertyMultiple request Maximum allowed recursion depth reached. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20159">Issue 20159</a>.</p>
+</li>
+<li>
+<p>Statistics&#8594;I/O Graph crashes when using simple moving average. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20163">Issue 20163</a>.</p>
+</li>
+<li>
+<p>HTTP2 body decompression fails on DATA with a single padded frame. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20167">Issue 20167</a>.</p>
+</li>
+<li>
+<p>Compiler warning for ui/tap-rtp-common.c (ignoring return value) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20169">Issue 20169</a>.</p>
+</li>
+<li>
+<p>SIP dissector bug due to "be-route" param in VIA header. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20173">Issue 20173</a>.</p>
+</li>
+<li>
+<p>Coredump after trying to open 'Follow TCP stream' <a href="https://gitlab.com/wireshark/wireshark/-/issues/20174">Issue 20174</a>.</p>
+</li>
+<li>
+<p>Protobuf JSON mapping error. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20182">Issue 20182</a>.</p>
+</li>
+<li>
+<p>Display filter "!stp.pvst.origvlan in { vlan.id }" causes a crash (Version 4.4.1) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20183">Issue 20183</a>.</p>
+</li>
+<li>
+<p>Extcap plugins shipped with Wireshark Portable are not found in version 4.4.1. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20184">Issue 20184</a>.</p>
+</li>
+<li>
+<p>IEEE 802.11be: Wrong regulatory info in HE Operation IE in Beacon frame. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20187">Issue 20187</a>.</p>
+</li>
+<li>
+<p>Wireshark 4.4.1 does not decode RTCP packets. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20188">Issue 20188</a>.</p>
+</li>
+<li>
+<p>Qt: Display filter sub-menu can only be opened on the triangle, not the full name. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20190">Issue 20190</a>.</p>
+</li>
+<li>
+<p>Qt: Changing the display filter does not update the Conversations or Endpoints dialogs. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20191">Issue 20191</a>.</p>
+</li>
+<li>
+<p>MODBUS Dissector bug. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20192">Issue 20192</a>.</p>
+</li>
+<li>
+<p>Modbus dissector bug - Field Occurence and Layer Operator modbus.bitval field. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20193">Issue 20193</a>.</p>
+</li>
+<li>
+<p>Wireshark crashes when a field is dragged  from packet details towards the find input. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20204">Issue 20204</a>.</p>
+</li>
+<li>
+<p>Lua DissectorTable("") : set ("10,11") unexpected behavior in locales with comma as decimal separator. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20216">Issue 20216</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>The TCP dissector no longer falls back to using the client port as a criterion for selecting a payload dissector when the server port does not select a payload dissector (except for port 20, active FTP).
+This behavior can be changed using the "Client port dissectors" preference.</p>
+</div>
+<div class="paragraph">
+<p>Display filters now correctly handle floating point conversion errors.</p>
+</div>
+<div class="paragraph">
+<p>The Lua API now has better support for comma-separated ranges in different locales.</p>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.1 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.1.html">release notes</a>
+for details:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2024-12">wnpa-sec-2024-12</a>
+ITS dissector crash.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20026">Issue 20026</a>.</p>
+</li>
+<li>
+<p><a href="https://www.wireshark.org/security/wnpa-sec-2024-13">wnpa-sec-2024-13</a>
+AppleTalk and RELOAD Framing dissector crashes.
+<a href="https://gitlab.com/wireshark/wireshark/-/issues/20114">Issue 20114</a>.</p>
+</li>
+<li>
+<p>Refresh interface during live-capture leads to corrupt interface handling. <a href="https://gitlab.com/wireshark/wireshark/-/issues/11176">Issue 11176</a>.</p>
+</li>
+<li>
+<p>Media type "application/octet-stream" registered for both Thread and UASIP. <a href="https://gitlab.com/wireshark/wireshark/-/issues/14729">Issue 14729</a>.</p>
+</li>
+<li>
+<p>Extcap toolbar stops working when new interface is added. <a href="https://gitlab.com/wireshark/wireshark/-/issues/19854">Issue 19854</a>.</p>
+</li>
+<li>
+<p>Decoding error ITS CPM version 2.1.1. <a href="https://gitlab.com/wireshark/wireshark/-/issues/19886">Issue 19886</a>.</p>
+</li>
+<li>
+<p>Build error in 4.3.0: sync_pipe_run_command_actual error: argument 2 is null but the corresponding size argument 3 value is 512004 [-Werror=nonnull] <a href="https://gitlab.com/wireshark/wireshark/-/issues/19930">Issue 19930</a>.</p>
+</li>
+<li>
+<p>html2text.py doesn&#8217;t handle the <code>&lt;sup&gt;</code> tag. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20020">Issue 20020</a>.</p>
+</li>
+<li>
+<p>Incorrect NetFlow v8 TOS AS aggregation dissection. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20021">Issue 20021</a>.</p>
+</li>
+<li>
+<p>The Windows packages don&#8217;t ship with the IP address plugin. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20030">Issue 20030</a>.</p>
+</li>
+<li>
+<p>O_PATH is Linux-and-FreeBSD-specific. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20031">Issue 20031</a>.</p>
+</li>
+<li>
+<p>Wireshark 4.4.0 doesn&#8217;t install USBcap USBcapCMD.exe in the correct directory. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20040">Issue 20040</a>.</p>
+</li>
+<li>
+<p>OER dissector is not considering the preamble if ASN.1 SEQUENCE definition includes extension marker but no OPTIONAL items. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20044">Issue 20044</a>.</p>
+</li>
+<li>
+<p>Bluetooth classic L2CAP incorrect dissection with connectionless reception channel. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20047">Issue 20047</a>.</p>
+</li>
+<li>
+<p>Profile auto switch filters : Grayed Display Filter Expression dialog box when opened from Configuration Profiles dialog box. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20049">Issue 20049</a>.</p>
+</li>
+<li>
+<p>Wireshark 4.4.0 / macOS 14.6.1 wifi if monitor mode. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20051">Issue 20051</a>.</p>
+</li>
+<li>
+<p>TECMP Data Type passes too much data to sub dissectors. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20052">Issue 20052</a>.</p>
+</li>
+<li>
+<p>Wireshark and tshark 4.4.0 ignore extcap options specified on the command line. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20054">Issue 20054</a>.</p>
+</li>
+<li>
+<p>Cannot open release notes due to incorrect path with duplicated directory components. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20055">Issue 20055</a>.</p>
+</li>
+<li>
+<p>Unable to open "Release Notes" from the "Help" menu. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20056">Issue 20056</a>.</p>
+</li>
+<li>
+<p>No capture interfaces if Wireshark is started from command line with certain paths. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20057">Issue 20057</a>.</p>
+</li>
+<li>
+<p>Wireshark 4.4.0 extcap path change breaks third party extcap installers. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20069">Issue 20069</a>.</p>
+</li>
+<li>
+<p>Fuzz job UTF-8 encoding issue: fuzz-2024-09-10-7618.pcap. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20071">Issue 20071</a>.</p>
+</li>
+<li>
+<p>Unable to create larger files than 99 size units. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20079">Issue 20079</a>.</p>
+</li>
+<li>
+<p>Opening Wireshark 4.4.0 on macOS 15.0 disconnects iPhone Mirroring. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20082">Issue 20082</a>.</p>
+</li>
+<li>
+<p>PRP trailer not shown for L2 IEC 61850 GOOSE packets in 4.4.0 (was working in 4.2.7) <a href="https://gitlab.com/wireshark/wireshark/-/issues/20088">Issue 20088</a>.</p>
+</li>
+<li>
+<p>GUI lags because NetworkManager keeps turning 802.11 monitor mode off. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20090">Issue 20090</a>.</p>
+</li>
+<li>
+<p>Error while getting Bluetooth application process id by &lt;shell:ps -A | grep com.*android.bluetooth&gt; <a href="https://gitlab.com/wireshark/wireshark/-/issues/20100">Issue 20100</a>.</p>
+</li>
+<li>
+<p>Fuzz job assertion: randpkt-2024-10-05-7200.pcap. <a href="https://gitlab.com/wireshark/wireshark/-/issues/20110">Issue 20110</a>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Wireshark 4.4.0 included the following changes.
+See the
+<a href="https://www.wireshark.org/docs/relnotes/wireshark-4.4.0.html">release notes</a>
+for details:</p>
+</div>
+<div class="paragraph">
+<p>Many improvements and fixes to the graphing dialogs, including
+I/O Graphs, Flow Graph / VoIP Calls, and TCP Stream Graphs.</p>
+</div>
+<div class="paragraph">
+<p>Wireshark now supports automatic profile switching.
+You can associate a display filter with a configuration profile, and when you open a capture file that matches the filter, Wireshark will automatically switch to that profile.</p>
+</div>
+<div class="paragraph">
+<p>Support for Lua 5.3 and 5.4 has been added, and support for Lua 5.1 and 5.2 has been removed.
+The Windows and macOS installers now ship with Lua 5.4.6.</p>
+</div>
+<div class="paragraph">
+<p>Improved display filter support for value strings (optional string representations for numeric fields).</p>
+</div>
+<div class="paragraph">
+<p>Display filter functions can be implemented as plugins, similar to protocol dissectors and file parsers.</p>
+</div>
+<div class="paragraph">
+<p>Display filters can be translated to pcap filters using <span class="menuseq"><b class="menu">Edit</b>&#160;<b class="caret">&#8250;</b> <b class="submenu">Copy</b>&#160;<b class="caret">&#8250;</b> <b class="menuitem">Display filter as pcap filter</b></span> if each display filter field has a corresponding pcap filter equivalent.</p>
+</div>
+<div class="paragraph">
+<p>Custom columns can be defined using any valid field expression, such as
+display filter functions, packet slices, arithmetic calculations, logical tests,
+raw byte addressing, and protocol layer modifiers.</p>
+</div>
+<div class="paragraph">
+<p>Custom output fields for <code>tshark -e</code> can also be defined using any
+valid field expression.</p>
+</div>
+<div class="paragraph">
+<p>Wireshark can be built with the zlib-ng instead of zlib for compressed file support.
+Zlib-ng is substantially faster than zlib.
+The official Windows and macOS packages include this feature.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_getting_wireshark">Getting Wireshark</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Wireshark source code and installation packages are available from
+<a href="https://www.wireshark.org/download.html" class="bare">https://www.wireshark.org/download.html</a>.</p>
+</div>
+<div class="sect2">
+<h3 id="_vendor_supplied_packages">Vendor-supplied Packages</h3>
+<div class="paragraph">
+<p>Most Linux and Unix vendors supply their own Wireshark packages.
+You can usually install or upgrade Wireshark using the package management system specific to that platform.
+A list of third-party packages can be found on the
+<a href="https://www.wireshark.org/download.html">download page</a>
+on the Wireshark web site.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_file_locations">File Locations</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Wireshark and TShark look in several different locations for preference files, plugins, SNMP MIBS, and RADIUS dictionaries.
+These locations vary from platform to platform.
+You can use <span class="menuseq"><b class="menu">Help</b>&#160;<b class="caret">&#8250;</b> <b class="submenu">About Wireshark</b>&#160;<b class="caret">&#8250;</b> <b class="menuitem">Folders</b></span> or <code>tshark -G folders</code> to find the default locations on your system.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_getting_help">Getting Help</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The User’s Guide, manual pages and various other documentation can be found at
+<a href="https://www.wireshark.org/docs/" class="bare">https://www.wireshark.org/docs/</a></p>
+</div>
+<div class="paragraph">
+<p>Community support is available on
+<a href="https://ask.wireshark.org/">Wireshark’s Q&amp;A site</a>
+and on the wireshark-users mailing list.
+Subscription information and archives for all of Wireshark’s mailing lists can be found on <a href="https://lists.wireshark.org/lists/">the mailing list site</a>.</p>
+</div>
+<div class="paragraph">
+<p>Bugs and feature requests can be reported on
+<a href="https://gitlab.com/wireshark/wireshark/-/issues">the issue tracker</a>.</p>
+</div>
+<div class="paragraph">
+<p>You can learn protocol analysis and meet Wireshark’s developers at
+<a href="https://sharkfest.wireshark.org">SharkFest</a>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_getting_certified">Getting Certified</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You can become a Wireshark Certified Analyst!
+Learn more at <a href="https://www.wireshark.org/certifications" class="bare">https://www.wireshark.org/certifications</a></p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_how_you_can_help">How You Can Help</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The Wireshark Foundation helps as many people as possible understand their networks as much as possible.
+You can find out more and donate at <a href="https://wiresharkfoundation.org">wiresharkfoundation.org</a>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_frequently_asked_questions">Frequently Asked Questions</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A complete FAQ is available on the
+<a href="https://www.wireshark.org/faq.html">Wireshark web site</a>.</p>
+</div>
+</div>
+</div>
+</div>
+</body>
+</html>
