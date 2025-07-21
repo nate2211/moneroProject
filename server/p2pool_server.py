@@ -195,6 +195,7 @@ def get_clients():
         "nvidia_shares": clientdata.client_nvidia_shares,
         "gpu_stats": clientdata.client_gpu_stats,
         "last_seen": client_last_seen_formatted,
+        "pl1_pl2s": clientdata.client_pl1_pl2s,
         "newjobs": {
             cid: {
                 "difficulty": j.get("difficulty"),
@@ -207,6 +208,18 @@ def get_clients():
     }
     return jsonify(data)
 
+
+@app.route("/miners_gui_settings/<client_id>", methods=["POST"])
+def update_miner_gui_settings(client_id):
+    """
+    Endpoint for clients to post their GUI settings, such as Pl1/Pl2 values.
+    """
+    data = request.get_json()
+    pl1_pl2_value = data['pl1_pl2']
+    print(f"[+] Received gui settings from '{client_id}': pl1_pl2 = {pl1_pl2_value}")
+    # Store the received value in the new dictionary
+    clientdata.client_pl1_pl2s[client_id] = pl1_pl2_value
+    return jsonify({"message": "Received GUI settings"}), 200
 
 @app.route("/miners/<client_id>", methods=["POST"])
 def update_miner_status(client_id):
@@ -261,6 +274,18 @@ def set_threads(client_id):
     queue_command(client_id, command_data)
     print(f"[+] Command queued for '{client_id}': Set threads to {new_threads}")
     return jsonify({"status": "ok", "message": f"Set thread command queued for {client_id}"})
+
+@app.route("/set_pl1_pl2/<client_id>", methods=["POST"])
+def set_pl1_pl2(client_id):
+    try:
+        new_pl1_pl2 = int(request.form["pl1_pl2"])
+    except (ValueError, KeyError):
+        return jsonify({"status": "error", "message": "Invalid thread count provided"}), 400
+
+    command_data = {"command": "set_pl1_pl2", "pl1_pl2": new_pl1_pl2}
+    queue_command(client_id, command_data)
+    print(f"[+] Command queued for '{client_id}': Set threads to {new_pl1_pl2}")
+    return jsonify({"status": "ok", "message": f"Set pl1pl2 command queued for {client_id}"})
 
 
 @app.route("/get_command/<client_id>", methods=["GET"])

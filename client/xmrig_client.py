@@ -6,6 +6,8 @@ import traceback
 import signal
 from datetime import datetime
 
+from xmrig_managers import WinRingManager
+
 # ==============================================================================
 #  SIMPLE FILE LOGGER FOR STARTUP DEBUGGING
 # ==============================================================================
@@ -39,7 +41,7 @@ try:
 
     log_to_file("Step 2: PyQt5 imported successfully.")
 
-    from xmrig_gui import MinerGui, ConsoleLogger
+    from xmrig_gui import MinerGui, ConsoleLogger, NetworkLogger, LinuxLogger
 
     log_to_file("Step 3: xmrig_gui imported successfully.")
 
@@ -48,7 +50,6 @@ try:
     log_to_file("Step 4: xmrig_miner imported successfully.")
 
     from xmrig_data import XmrigData
-
     log_to_file("Step 5: xmrig_data imported successfully.")
 
 except Exception as import_error:
@@ -81,24 +82,28 @@ def main():
 
     # We now initialize components inside main() after QApplication is up
     logger = ConsoleLogger()
-    log_to_file("Step 10: ConsoleLogger initialized.")
+    network_logger = NetworkLogger()
+    linux_logger = LinuxLogger()
+    log_to_file("Step 10: ConsoleLogger, NetworkLogger and LinuxLogger initialized.")
 
     xmrig_data = XmrigData(logger)
 
     log_to_file("Step 11: XmrigData initialized.")
 
     xmrig_miner = XmrigMiner(xmrig_data, logger)
-    log_to_file("Step 12: XmrigMiner initialized.")
+    log_to_file("Step 13: XmrigMiner initialized.")
 
-    log_to_file("Step 13: Starting HardwareMonitor thread...")
+    log_to_file("Step 14: Starting HardwareMonitor thread...")
     xmrig_data.hardware_monitor.start()
-    log_to_file("Step 14: HardwareMonitor thread started.")
+    log_to_file("Step 15: HardwareMonitor thread started.")
 
-    gui = MinerGui(xmrig_data=xmrig_data, xmrig_miner=xmrig_miner, logger=logger)
-    log_to_file("Step 15: MinerGui initialized.")
+    gui = MinerGui(xmrig_data=xmrig_data, xmrig_miner=xmrig_miner, logger=logger, network_logger=network_logger, linux_logger=linux_logger)
+    log_to_file("Step 16: MinerGui initialized.")
     gui.show()
-    log_to_file("Step 16: GUI shown. Entering event loop.")
+    log_to_file("Step 17: GUI shown. Entering event loop.")
 
+
+    xmrig_data.winring_manager = WinRingManager(os.path.join(xmrig_data.tools_dir, "WinRing0x64.sys"), logger)
     # Graceful shutdown for Ctrl+C in console
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 

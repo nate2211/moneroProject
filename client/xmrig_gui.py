@@ -1,25 +1,25 @@
 import asyncio
 import os
-import subprocess
+
 import sys
 import shutil
 import textwrap
 import json
 import time
-import cpuinfo
-import psutil
-import tempfile
 
 import aiohttp
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                             QLineEdit, QPushButton, QPlainTextEdit, QLabel, QFormLayout,
-                             QFrame, QToolButton, QSizePolicy, QSpacerItem, QProgressDialog, QMessageBox,
-                             QSystemTrayIcon, QMenu, QAction, QApplication, QDialogButtonBox, QListWidget, QDialog,
-                             QInputDialog, QCheckBox, QGridLayout, QComboBox, QSlider)
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
-    QAbstractAnimation, Qt
+                             QPushButton, QPlainTextEdit, QLabel,
+                             QProgressDialog, QMessageBox,
+                             QSystemTrayIcon, QMenu, QAction, QApplication, QDialog,
+                             QInputDialog, QStackedWidget)
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, Qt
 from PyQt5.QtGui import QIcon, QPixmap
+
+from xmrig_managers import AsyncTSharkManager, AsyncLinuxManager
+from xmrig_gui_elements import StatsDisplay, ConnectionSettingsBox, CollapsibleBox, MiningConfigBox, NetworkPage, \
+    SettingsDialog, LinuxPage
 
 
 # Note: The XmrigData and XmrigMiner classes are imported by main.py and
@@ -28,6 +28,13 @@ from PyQt5.QtGui import QIcon, QPixmap
 # ==============================================================================
 # PYQT5 & ASYNCIO INTEGRATION COMPONENTS
 # ==============================================================================
+
+class LinuxLogger(QObject):
+    """Logs command output from the WSL Linux environment."""
+    message_signal = pyqtSignal(str)
+
+    def log_message(self, msg): self.message_signal.emit(str(msg))
+
 
 class ConsoleLogger(QObject):
     """
@@ -38,6 +45,18 @@ class ConsoleLogger(QObject):
 
     def log_message(self, msg):
         """Emits a signal containing the log message."""
+        self.message_signal.emit(str(msg))
+
+
+class NetworkLogger(QObject):
+    """
+    A dedicated logger for network-related messages to keep them
+    separate from the main application/miner console.
+    """
+    message_signal = pyqtSignal(str)
+
+    def log_message(self, msg):
+        """Emits a signal containing the network log message."""
         self.message_signal.emit(str(msg))
 
 
@@ -68,473 +87,17 @@ class AsyncWorker(QThread):
             self.loop.close()
 
 
-# ==============================================================================
-# NEW & UPDATED GUI WIDGETS
-# ==============================================================================
-class SettingsDialog(QDialog):
-    """A dialog window to select a settings profile from a list."""
-
-    def __init__(self, profiles, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Load Settings Profile")
-        self.setMinimumWidth(350)
-
-        self.profiles = profiles
-        layout = QVBoxLayout(self)
-
-        # Instruction Label
-        layout.addWidget(QLabel("Select a profile to load:"))
-
-        # List Widget
-        self.list_widget = QListWidget()
-        for profile in self.profiles:
-            self.list_widget.addItem(profile.get("name", "Unnamed Profile"))
-
-        # Auto-select the first item
-        if self.list_widget.count() > 0:
-            self.list_widget.setCurrentRow(0)
-
-        layout.addWidget(self.list_widget)
-
-        # Dialog Buttons (OK/Cancel)
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def get_selected_profile(self):
-        """Returns the full dictionary of the selected profile."""
-        current_row = self.list_widget.currentRow()
-        if current_row >= 0:
-            return self.profiles[current_row]
-        return None
-class CollapsibleBox(QWidget):
-    """A collapsible box widget."""
-
-    def __init__(self, title="", parent=None, start_expanded=False):
-        super(CollapsibleBox, self).__init__(parent)
-
-        self.toggle_button = QToolButton(text=title, checkable=True, checked=start_expanded)
-        self.toggle_button.setObjectName("collapsibleHeader") # Use stylesheet for styling
-        self.toggle_button.setToolButtonStyle(3)  # Qt.ToolButtonTextBesideIcon
-        self.toggle_button.setArrowType(1 if start_expanded else 2)  # Set initial arrow direction
-
-        self.content_area = QWidget()
-        self.content_area.setMaximumHeight(0)
-        self.content_area.setMinimumHeight(0)
-        self.content_area_layout = QVBoxLayout(self.content_area)
-
-        self.toggle_animation = QParallelAnimationGroup(self)
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(0)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(self.toggle_button)
-        main_layout.addWidget(self.content_area)
-
-        self.toggle_button.clicked.connect(self.toggle)
-
-    @pyqtSlot(bool)
-    def toggle(self, checked):
-        self.toggle_button.setArrowType(1 if checked else 2)  # DownArrow or RightArrow
-        self.toggle_animation.setDirection(QAbstractAnimation.Forward if checked else QAbstractAnimation.Backward)
-        self.toggle_animation.start()
-
-    def setContentLayout(self, layout):
-        self.content_area_layout.addLayout(layout)
-
-        collapsed_height = self.toggle_button.sizeHint().height() + 10
-        # Use a fixed height to ensure it's predictable on startup
-        content_height = 250
-
-        for i in range(self.toggle_animation.animationCount()):
-            self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
-
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
-
-        for i in range(self.toggle_animation.animationCount()):
-            animation = self.toggle_animation.animationAt(i)
-            animation.setDuration(300)
-            animation.setStartValue(collapsed_height)
-            animation.setEndValue(collapsed_height + content_height)
-
-        content_animation = self.toggle_animation.animationAt(2)
-        content_animation.setStartValue(0)
-        content_animation.setEndValue(content_height)
-
-        # Set initial state without animation
-        if self.toggle_button.isChecked():
-            self.content_area.setMaximumHeight(content_height)
-        else:
-            self.content_area.setMaximumHeight(0)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-
-    def setContentWidget(self, widget: QWidget):
-        # Clear old layout
-        for i in reversed(range(self.content_area_layout.count())):
-            old_widget = self.content_area_layout.itemAt(i).widget()
-            if old_widget:
-                old_widget.setParent(None)
-            self.content_area_layout.removeItem(self.content_area_layout.itemAt(i))
-
-        self.content_area_layout.addWidget(widget)
-
-        collapsed_height = self.toggle_button.sizeHint().height() + 10
-        content_height = widget.sizeHint().height() + 20
-
-        # Remove existing animations
-        for i in range(self.toggle_animation.animationCount()):
-            self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
-
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
-
-        for i in range(self.toggle_animation.animationCount()):
-            animation = self.toggle_animation.animationAt(i)
-            animation.setDuration(300)
-            animation.setStartValue(collapsed_height)
-            animation.setEndValue(collapsed_height + content_height)
-
-        content_animation = self.toggle_animation.animationAt(2)
-        content_animation.setStartValue(0)
-        content_animation.setEndValue(content_height)
-
-        # Set initial state
-        if self.toggle_button.isChecked():
-            self.content_area.setMaximumHeight(content_height)
-        else:
-            self.content_area.setMaximumHeight(0)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-
-class ConnectionSettingsBox(QWidget):
-    """A widget for managing connection settings."""
-    # Signal emitted when the connect button is clicked
-    connect_clicked = pyqtSignal(str, str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QFormLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setVerticalSpacing(15)
-
-        # Create widgets
-        self.server_url_input = QLineEdit()
-        self.client_id_input = QLineEdit()
-        self.connect_button = QPushButton("Connect to Server")
-        self.save_button = QPushButton("Save Settings")
-        self.load_button = QPushButton("Load Settings")
-
-        # Connect internal signal
-        self.connect_button.clicked.connect(self._on_connect)
-
-        # Layout
-        layout.addRow("Server URL:", self.server_url_input)
-        layout.addRow("Client ID:", self.client_id_input)
-
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.connect_button)
-        button_layout.addWidget(self.save_button)
-        button_layout.addWidget(self.load_button)
-        layout.addRow(button_layout)
-
-    def _on_connect(self):
-        """Internal handler to gather data and emit the public signal."""
-        server_url = self.server_url_input.text().strip()
-        client_id = self.client_id_input.text().strip()
-        self.connect_clicked.emit(server_url, client_id)
-
-    def get_settings(self):
-        """Returns the current settings from this widget as a dict."""
-        return {
-            "server_url": self.server_url_input.text(),
-            "client_id": self.client_id_input.text(),
-        }
-
-    def apply_settings(self, settings):
-        """Applies a settings dictionary to this widget."""
-        self.server_url_input.setText(settings.get("server_url", ""))
-        self.client_id_input.setText(settings.get("client_id", ""))
-
-    def set_enabled(self, enabled):
-        """Disables or enables input widgets after connection."""
-        self.server_url_input.setEnabled(enabled)
-        self.client_id_input.setEnabled(enabled)
-        self.connect_button.setEnabled(enabled)
-
-
-class MiningConfigBox(QWidget):
-    """A widget for managing mining configuration using a grid layout."""
-    start_mining_clicked = pyqtSignal()
-    stop_mining_clicked = pyqtSignal()
-
-    def __init__(self, xmrig_data, parent=None):
-        super().__init__(parent)
-        self.xmrig_data = xmrig_data
-        # Use QGridLayout for more control over rows and columns
-        layout = QGridLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setVerticalSpacing(15)
-
-
-
-        # --- Create Widgets ---
-        self.pool_ip_input = QLineEdit()
-        self.thread_count_input = QLineEdit()
-
-        # --- ADD THIS WIDGET ---
-        self.high_priority_checkbox = QCheckBox("Run as High Priority Process")
-        self.high_priority_checkbox.setToolTip("Gives the miner process higher priority in the OS scheduler.\nCan make the system less responsive.")
-        self.high_priority_checkbox.setChecked(False) # Default to OFF for safety
-
-        self._total_logical_cpus = psutil.cpu_count(logical=True) or 1
-        self.cpu_affinity_slider = QSlider(Qt.Horizontal)
-        self.cpu_affinity_slider.setMinimum(1)
-        self.cpu_affinity_slider.setMaximum(self._total_logical_cpus)
-        self.cpu_affinity_slider.setValue(self._total_logical_cpus)  # default: all CPUs
-        self.cpu_affinity_slider.setTickPosition(QSlider.TicksBelow)
-        self.cpu_affinity_slider.setTickInterval(1)
-
-        self.cpu_affinity_label = QLabel()
-        self.cpu_affinity_label.setText(f"Use {self.cpu_affinity_slider.value()} / {self._total_logical_cpus} CPUs")
-        self.cpu_affinity_slider.valueChanged.connect(
-            lambda v, lbl=self.cpu_affinity_label, total=self._total_logical_cpus:
-            lbl.setText(f"Use {v} / {total} CPUs")
-        )
-
-
-        self.memory_usage_slider = QSlider(Qt.Horizontal)
-        self.memory_usage_slider.setMinimum(1)
-        self.memory_usage_slider.setMaximum(self.xmrig_data.process_manager.recommend_max_memory())
-        self.memory_usage_slider.setValue(self.xmrig_data.process_manager.recommend_max_memory())  # default: all CPUs
-        self.memory_usage_slider.setTickPosition(QSlider.TicksBelow)
-        self.memory_usage_slider.setTickInterval(1)
-        self.memory_usage_label = QLabel()
-        self.memory_usage_label.setText(f"Use {self.memory_usage_slider.value()} / {self.xmrig_data.process_manager.recommend_max_memory()} Memory")
-        self.memory_usage_slider.valueChanged.connect(
-            lambda v, lbl=self.memory_usage_label, total=self.xmrig_data.process_manager.recommend_max_memory():
-            lbl.setText(f"Use {v} / {total} Memory")
-        )
-
-        self.io_priority = QComboBox()
-        self.io_priority.addItem("Very Low", psutil.IOPRIO_VERYLOW)
-        self.io_priority.addItem("Low", psutil.IOPRIO_LOW)
-        self.io_priority.addItem("Normal", psutil.IOPRIO_NORMAL)
-
-
-        self.cpu_priority = QComboBox()
-        self.cpu_priority.addItem("Idle (1)", 1)
-        self.cpu_priority.addItem("Normal (2)", 2)
-        self.cpu_priority.addItem("High (3)", 3)
-        self.cpu_priority.addItem("Higher (4)", 4)
-        self.cpu_priority.addItem("Realtime (5)", 5)
-
-        # ---- Yield checkbox ----
-        self.yield_checkbox = QCheckBox("Yield CPU to other processes")
-        self.yield_checkbox.setToolTip("Recommended. Improves system responsiveness.")
-        self.yield_checkbox.setChecked(True)
-
-        # ---- Buttons ----
-        self.mine_button = QPushButton("Start Mining")
-        self.stop_button = QPushButton("Stop Mining")
-        self.mine_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-
-        self.mine_button.clicked.connect(self.start_mining_clicked.emit)
-        self.stop_button.clicked.connect(self.stop_mining_clicked.emit)
-
-        # ---- Priority Boost checkbox ----
-        self.priority_boost_checkbox = QCheckBox("Priority Boost")
-        self.priority_boost_checkbox.setToolTip(
-            "Allows the OS to give threads temporary priority boosts to improve responsiveness.\n"
-            "This is ideal for desktop apps but not recommended for background tasks like mining."
-        )
-        self.priority_boost_checkbox.setChecked(False)
-
-        # ---- Xmrig MSR checkbox ----
-        self.xmrig_msr_checkbox = QCheckBox("Xmrig MSR")
-        self.xmrig_msr_checkbox.setToolTip(
-            "Set the config for xmrig to use or not use MSR Presets."
-        )
-        self.xmrig_msr_checkbox.setChecked(False)
-
-        # --- NEW WIDGET: Intel Power Limit (PL1/PL2) Slider ---
-        self.power_limit_desc_label = QLabel("Power Limit (PL1/PL2):")
-        self.power_limit_slider = QSlider(Qt.Horizontal)
-        self.power_limit_slider.setMinimum(15)
-        self.power_limit_slider.setMaximum(self.xmrig_data.hardware_monitor.get_max_power_draw())
-        self.power_limit_slider.setValue(45)
-        self.power_limit_slider.setToolTip("Sets CPU power limits (PL1/PL2) in Watts.\nRequires admin/root privileges.")
-        self.power_limit_value_label = QLabel(f"{self.power_limit_slider.value()} W")
-        self.power_limit_slider.valueChanged.connect(
-            lambda v: self.power_limit_value_label.setText(f"{v} W")
-        )
-
-
-        # --- Layout rows ---
-
-        # Row 0: Pool Address + CPU Threads
-        layout.addWidget(QLabel("Pool Address:"), 0, 0)
-        layout.addWidget(self.pool_ip_input, 0, 1)
-        layout.addWidget(QLabel("CPU Threads:"), 0, 2)
-        layout.addWidget(self.thread_count_input, 0, 3)
-
-        # Row 1: CPU Affinity + CPU Priority
-        layout.addWidget(QLabel("CPU Affinity:"), 1, 0)
-        affinity_layout = QHBoxLayout()
-        affinity_layout.addWidget(self.cpu_affinity_slider)
-        affinity_layout.addWidget(self.cpu_affinity_label)
-        layout.addLayout(affinity_layout, 1, 1)
-
-        layout.addWidget(QLabel("CPU Priority:"), 1, 2)
-        layout.addWidget(self.cpu_priority, 1, 3)
-
-        # Row 2: OS Priority + CPU Yield
-        layout.addWidget(QLabel("OS Priority:"), 2, 0)
-        layout.addWidget(self.high_priority_checkbox, 2, 1)
-        layout.addWidget(QLabel("CPU Yield:"), 2, 2)
-        layout.addWidget(self.yield_checkbox, 2, 3)
-
-        # Row 3: I/O Priority + Memory Usage
-        layout.addWidget(QLabel("I/O Priority:"), 3, 0)
-        layout.addWidget(self.io_priority, 3, 1)
-
-        layout.addWidget(QLabel("Memory Usage:"), 3, 2)
-        mem_layout = QHBoxLayout()
-        mem_layout.addWidget(self.memory_usage_slider)
-        mem_layout.addWidget(self.memory_usage_label)
-        layout.addLayout(mem_layout, 3, 3)
-
-        # Row 4: Priority Boost + Xmrig MSR
-        layout.addWidget(QLabel("Priority Boost:"), 4, 0)
-        layout.addWidget(self.priority_boost_checkbox, 4, 1)
-        layout.addWidget(QLabel("Xmrig MSR:"), 4, 2)
-        layout.addWidget(self.xmrig_msr_checkbox, 4, 3)
-
-        # Row 5 (Intel Only): Power Limit slider
-        row = 5
-        layout.addWidget(self.power_limit_desc_label, row, 0)
-        power_layout = QHBoxLayout()
-        power_layout.addWidget(self.power_limit_slider)
-        power_layout.addWidget(self.power_limit_value_label)
-        layout.addLayout(power_layout, row, 1, 1, 3)
-        row += 1
-
-        # Row 6: Buttons (mine + stop)
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.mine_button)
-        button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, row, 0, 1, 4)  # Span across all 4 columns
-
-    def get_values(self):
-        """Returns all mining parameters in a dictionary."""
-        try:
-            return {
-                "pool": self.pool_ip_input.text().strip(),
-                "threads": int(self.thread_count_input.text().strip()),
-                "cpu_priority": self.cpu_priority.currentData(),
-                "cpu_yield": self.yield_checkbox.isChecked(),
-                "high_priority": self.high_priority_checkbox.isChecked(),
-                "cpu_affinity":self.cpu_affinity_slider.value(),
-                "io_priority": self.io_priority.currentData(),
-                "memory_usage": self.memory_usage_slider.value(),
-                "priority_boost": self.priority_boost_checkbox.isChecked(),
-                "pl1_pl2": self.power_limit_slider.value(),
-                "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
-            }
-        except (ValueError, TypeError):
-            return None  # Indicates invalid input
-
-    def get_settings(self):
-        """Returns the current settings from this widget as a dict."""
-        values = self.get_values()
-        return {
-            "pool_ip": values.get("pool") if values else "",
-            "thread_count": str(values.get("threads")) if values else "",
-            "priority_index": self.cpu_priority.currentIndex(),
-            "yield_cpu": self.yield_checkbox.isChecked(),
-            "high_priority": self.high_priority_checkbox.isChecked(),
-            "cpu_affinity": self.cpu_affinity_slider.value(),
-            "io_priority": self.io_priority.currentData(),
-            "memory_usage": self.memory_usage_slider.value(),
-            "priority_boost": self.priority_boost_checkbox.isChecked(),
-            "pl1_pl2": self.power_limit_slider.value(),
-            "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
-        }
-
-    def apply_settings(self, settings):
-        """Applies a settings dictionary to this widget."""
-        self.pool_ip_input.setText(settings.get("pool_ip", "192.168.0.10:3333"))
-        self.thread_count_input.setText(settings.get("thread_count", "8"))
-        self.cpu_priority.setCurrentIndex(settings.get("priority_index", 1))
-        self.yield_checkbox.setChecked(settings.get("yield_cpu", True))
-        self.high_priority_checkbox.setChecked(settings.get("high_priority", True))
-        self.cpu_affinity_slider.setValue(settings.get("cpu_affinity", self._total_logical_cpus))
-        self.io_priority.setCurrentIndex(settings.get("io_priority", psutil.IOPRIO_NORMAL))
-        self.memory_usage_slider.setValue(settings.get("memory_usage", self.xmrig_data.process_manager.recommend_max_memory()))
-        self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
-        self.power_limit_slider.setValue(settings.get("pl1_pl2", int(self.xmrig_data.hardware_monitor.get_max_power_draw() / 2)))
-        self.xmrig_msr_checkbox.setChecked(settings.get("xmrig_msr", False))
-
-class StatsDisplay(QWidget):
-    """A widget to display real-time miner statistics in columns."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QGridLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setHorizontalSpacing(30)
-
-        # Labels
-        self.hashrate_label = QLabel("N/A")
-        self.cpu_temp_label = QLabel("N/A")
-        self.cpu_shares_label = QLabel("0")
-        self.gpu_temp_label = QLabel("N/A")
-        self.gpu_shares_label = QLabel("0")
-        self.power_draw_label = QLabel("N/A")
-
-        # --- Column 1 (CPU + General) ---
-        layout.addWidget(QLabel("<b>Hashrate:</b>"), 0, 0)
-        layout.addWidget(self.hashrate_label, 0, 1)
-
-        layout.addWidget(QLabel("<b>CPU Temp:</b>"), 1, 0)
-        layout.addWidget(self.cpu_temp_label, 1, 1)
-
-        layout.addWidget(QLabel("<b>CPU Shares:</b>"), 2, 0)
-        layout.addWidget(self.cpu_shares_label, 2, 1)
-
-        # --- Column 2 (GPU) ---
-        layout.addWidget(QLabel("<b>GPU Temp / Fan:</b>"), 0, 2)
-        layout.addWidget(self.gpu_temp_label, 0, 3)
-
-        layout.addWidget(QLabel("<b>GPU Shares:</b>"), 1, 2)
-        layout.addWidget(self.gpu_shares_label, 1, 3)
-
-        layout.addWidget(QLabel("<b>Power Draw:</b>"), 2, 2)
-        layout.addWidget(self.power_draw_label, 2, 3)
-
-    @pyqtSlot(dict)
-    def update_stats(self, stats_payload):
-        """Updates the labels with new data from the stats payload."""
-        self.hashrate_label.setText(f"{stats_payload.get('hashrate', 0.0):.2f} H/s")
-        self.cpu_temp_label.setText(stats_payload.get('cpu_temp', "N/A"))
-        self.gpu_temp_label.setText(f"{stats_payload.get('gpu_temp', 'N/A')} / {stats_payload.get('gpu_fan', 'N/A')}")
-        self.power_draw_label.setText(str(stats_payload.get('power_draw', "N/A")))
-        self.cpu_shares_label.setText(str(stats_payload.get('cpu_accepted_shares', 0)))
-        self.gpu_shares_label.setText(str(stats_payload.get('nvidia_accepted_shares', 0)))
-
-
 class MinerGui(QWidget):
     stats_update_signal = pyqtSignal(dict)
     force_update_signal = pyqtSignal(str)
 
-    def __init__(self, xmrig_data, xmrig_miner, logger):
+    def __init__(self, xmrig_data, xmrig_miner, logger, network_logger, linux_logger):
         super().__init__()
         self.xmrig_data = xmrig_data
         self.xmrig_miner = xmrig_miner
         self.logger = logger
+        self.network_logger = network_logger
+        self.linux_logger = linux_logger
         self.async_worker = None
         self.gui_settings_path = os.path.join(os.path.dirname(sys.executable), "gui_settings.json")
 
@@ -623,39 +186,90 @@ class MinerGui(QWidget):
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(10)
 
+        # --- Page Navigation ---
+        page_nav_layout = QHBoxLayout()
+        self.miner_page_button = QPushButton("Miner");
+        self.miner_page_button.setObjectName("pageButton");
+        self.miner_page_button.setCheckable(True);
+        self.miner_page_button.setChecked(True)
+        self.network_page_button = QPushButton("Network");
+        self.network_page_button.setObjectName("pageButton");
+        self.network_page_button.setCheckable(True)
+        self.linux_page_button = QPushButton("Linux (WSL)");
+        self.linux_page_button.setObjectName("pageButton");
+        self.linux_page_button.setCheckable(True)
+        page_nav_layout.addWidget(self.miner_page_button);
+        page_nav_layout.addWidget(self.network_page_button);
+        page_nav_layout.addWidget(self.linux_page_button);
+        page_nav_layout.addStretch()
+        main_layout.addLayout(page_nav_layout)
+
+        # Main Content Stack
+        self.main_stack = QStackedWidget()
+
+        # --- Miner Page ---
+        miner_page_widget = QWidget()
+        miner_page_layout = QVBoxLayout(miner_page_widget)
         stats_header = QLabel("Live Statistics");
-        stats_header.setObjectName("sectionHeader")
-        main_layout.addWidget(stats_header)
-        self.stats_display = StatsDisplay()
-        main_layout.addWidget(self.stats_display)
-
-        # --- Create and add the new self-contained widgets ---
+        stats_header.setObjectName("sectionHeader");
+        miner_page_layout.addWidget(stats_header)
+        self.stats_display = StatsDisplay();
+        miner_page_layout.addWidget(self.stats_display)
         self.connection_box = ConnectionSettingsBox()
-        connection_collapsible = CollapsibleBox("Connection Settings", start_expanded=True)
-        connection_collapsible.setContentWidget(self.connection_box)
-        main_layout.addWidget(connection_collapsible)
-
+        connection_collapsible = CollapsibleBox("Connection Settings", start_expanded=True);
+        connection_collapsible.setContentWidget(self.connection_box);
+        miner_page_layout.addWidget(connection_collapsible)
         self.mining_box = MiningConfigBox(self.xmrig_data)
-        mining_collapsible = CollapsibleBox("Mining Configuration", start_expanded=True)
-        mining_collapsible.setContentWidget(self.mining_box)
-        main_layout.addWidget(mining_collapsible)
-
-        console_label = QLabel("Console Output");
-        console_label.setObjectName("consoleTitle")
-        main_layout.addWidget(console_label)
-        self.console_output = QPlainTextEdit()
+        mining_collapsible = CollapsibleBox("Mining Configuration", start_expanded=True);
+        mining_collapsible.setContentWidget(self.mining_box);
+        miner_page_layout.addWidget(mining_collapsible)
+        miner_page_layout.addWidget(QLabel("<b>Main Console</b>"))
+        self.console_output = QPlainTextEdit();
         self.console_output.setReadOnly(True)
-        main_layout.addWidget(self.console_output, 1)  # Add stretch factor
+        miner_page_layout.addWidget(self.console_output, 1)
+
+        # --- Network Page ---
+        self.network_page = NetworkPage()
+
+        # --- Linux Page ---
+        self.linux_page = LinuxPage()
+
+        self.main_stack.addWidget(miner_page_widget)
+        self.main_stack.addWidget(self.network_page)
+        self.main_stack.addWidget(self.linux_page)
+        main_layout.addWidget(self.main_stack, 1)
 
     def connect_signals(self):
+        # ---------------- existing wiring (unchanged) ----------------
         self.connection_box.connect_clicked.connect(self.handle_connect)
         self.mining_box.start_mining_clicked.connect(self.handle_start_mining)
         self.mining_box.stop_mining_clicked.connect(self.handle_stop_mining)
         self.connection_box.save_button.clicked.connect(self.save_settings)
         self.connection_box.load_button.clicked.connect(self.load_settings)
         self.logger.message_signal.connect(self.update_console)
+        self.network_logger.message_signal.connect(self.update_network_console)
+        self.linux_logger.message_signal.connect(self.update_linux_console)
         self.stats_update_signal.connect(self.stats_display.update_stats)
         self.force_update_signal.connect(self.handle_force_update)
+
+        # ---------------- page‑switch buttons ------------------------
+        self.miner_page_button.clicked.connect(lambda: self.switch_main_page(0))
+        self.network_page_button.clicked.connect(lambda: self.switch_main_page(1))
+        self.linux_page_button.clicked.connect(lambda: self.switch_main_page(2))
+
+        # ---------------- NetworkPage actions ------------------------
+        self.network_page.scan_button.clicked.connect(self.handle_scan_button_toggled)
+
+        # ---------------- LinuxPage actions (mirrors Network) --------
+        self.linux_page.initialize_wsl_clicked.connect(self.handle_wsl_initialize)
+        self.linux_page.shutdown_wsl_clicked.connect(self.handle_wsl_shutdown)
+        self.linux_page.command_entered.connect(self.handle_linux_command)
+
+    def switch_main_page(self, index):
+        self.main_stack.setCurrentIndex(index)
+        self.miner_page_button.setChecked(index == 0)
+        self.network_page_button.setChecked(index == 1)
+        self.linux_page_button.setChecked(index == 2)
 
     def resource_path(self, relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -665,6 +279,7 @@ class MinerGui(QWidget):
         except Exception:
             base_path = os.path.abspath(".")
         return os.path.join(base_path, relative_path)
+
     def init_tray_icon(self):
         self.tray_icon = QSystemTrayIcon(self)
 
@@ -703,6 +318,7 @@ class MinerGui(QWidget):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.show()
         self.tray_icon.activated.connect(self.handle_tray_activated)
+
     def handle_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
             self.show_window()
@@ -710,8 +326,10 @@ class MinerGui(QWidget):
     def _get_profiles(self):
         if not os.path.exists(self.gui_settings_path): return []
         try:
-            with open(self.gui_settings_path, 'r') as f: return json.load(f)
-        except (IOError, json.JSONDecodeError): return []
+            with open(self.gui_settings_path, 'r') as f:
+                return json.load(f)
+        except (IOError, json.JSONDecodeError):
+            return []
 
     def save_settings(self):
         profile_name, ok = QInputDialog.getText(self, "Save Profile", "Enter a name for this profile:")
@@ -721,40 +339,123 @@ class MinerGui(QWidget):
         new_profile = {"name": profile_name, "settings": current_settings}
         existing_indices = [i for i, p in enumerate(profiles) if p.get("name") == profile_name]
         if existing_indices:
-            reply = QMessageBox.question(self, 'Overwrite Profile?', f"A profile named '{profile_name}' already exists. Overwrite?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            reply = QMessageBox.question(self, 'Overwrite Profile?',
+                                         f"A profile named '{profile_name}' already exists. Overwrite?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.No: return
             profiles[existing_indices[0]] = new_profile
-        else: profiles.append(new_profile)
+        else:
+            profiles.append(new_profile)
         try:
-            with open(self.gui_settings_path, 'w') as f: json.dump(profiles, f, indent=4)
+            with open(self.gui_settings_path, 'w') as f:
+                json.dump(profiles, f, indent=4)
             self.logger.log_message(f"[+] Profile '{profile_name}' saved successfully.")
-        except IOError as e: self.logger.log_message(f"[!] Error saving profiles: {e}")
+        except IOError as e:
+            self.logger.log_message(f"[!] Error saving profiles: {e}")
 
     def load_settings(self):
         profiles = self._get_profiles()
         if not profiles:
-            QMessageBox.information(self, "No Profiles", "No saved profiles found."); return
+            QMessageBox.information(self, "No Profiles", "No saved profiles found.");
+            return
         dialog = SettingsDialog(profiles, self)
         if dialog.exec_() == QDialog.Accepted:
             selected = dialog.get_selected_profile()
-            if selected: self.apply_settings(selected["settings"]); self.logger.log_message(f"[+] Loaded profile: '{selected.get('name')}'.")
+            if selected: self.apply_settings(selected["settings"]); self.logger.log_message(
+                f"[+] Loaded profile: '{selected.get('name')}'.")
 
     def load_initial_settings(self):
         profiles = self._get_profiles()
-        if profiles: self.apply_settings(profiles[0]["settings"]); self.logger.log_message("[+] Loaded first saved profile on startup.")
-        else: self.apply_settings({}); self.logger.log_message("[+] No settings file found, using default values.")
+        if profiles:
+            self.apply_settings(profiles[0]["settings"]); self.logger.log_message(
+                "[+] Loaded first saved profile on startup.")
+        else:
+            self.apply_settings({}); self.logger.log_message("[+] No settings file found, using default values.")
 
     def apply_settings(self, settings):
         self.connection_box.apply_settings(settings)
         self.mining_box.apply_settings(settings)
+
     def show_window(self):
         self.show()
         self.raise_()
         self.activateWindow()
 
+    def handle_wsl_initialize(self):
+
+        async def task():
+
+            if self.xmrig_data.linux_manager == None:
+                self.xmrig_data.linux_manager = AsyncLinuxManager(self.linux_logger)
+                await self.xmrig_data.linux_manager.initialize()
+                self.linux_page.set_controls_enabled(self.xmrig_data.linux_manager.is_initialized)
+        if self.async_worker and self.async_worker.isRunning():
+            asyncio.run_coroutine_threadsafe(task(), self.async_worker.loop)
+
+    def handle_wsl_shutdown(self):
+        async def task():
+            if self.xmrig_data.linux_manager and self.xmrig_data.linux_manager.is_initialized:
+                await self.xmrig_data.linux_manager.close()
+                self.xmrig_data.linux_manager.is_initialized = False
+                self.linux_page.set_controls_enabled(False)
+                self.xmrig_data.linux_manager = None
+
+        if self.async_worker and self.async_worker.isRunning():
+            asyncio.run_coroutine_threadsafe(task(), self.async_worker.loop)
+
+    def handle_linux_command(self, command: str):
+        async def task():
+            if self.xmrig_data.linux_manager and self.xmrig_data.linux_manager.is_initialized:
+                await self.xmrig_data.linux_manager.run_command(command)
+            else:
+                self.linux_logger.log_message(
+                    "❌ Cannot execute command: Linux Manager not initialized or WSL requires restart.")
+
+        if self.async_worker and self.async_worker.isRunning():
+            asyncio.run_coroutine_threadsafe(task(), self.async_worker.loop)
+
+    @pyqtSlot(str)
+    def update_linux_console(self, message):
+        self.linux_page.add_output(message)
+
+    @pyqtSlot(str)
+    def update_network_console(self, message):
+        self.network_page.network_console_output.appendPlainText(message)
+
     @pyqtSlot(str)
     def update_console(self, message):
         self.console_output.appendPlainText(message)
+
+    def handle_scan_button_toggled(self, checked):
+        # This async wrapper is needed because the slot itself cannot be async
+        async def task():
+            if checked:
+                # Ensure the manager exists and is initialized
+                if not hasattr(self.xmrig_data, 'tshark_manager') or self.xmrig_data.tshark_manager is None:
+                    self.network_logger.log_message("[!] No tshark manager found creating one.")
+                    from xmrig_managers import AsyncTSharkManager  # Lazy import
+                    self.xmrig_data.tshark_manager = AsyncTSharkManager(
+                        self.network_logger,
+                        self.connection_box.server_url_input.text().strip(),
+                        self.mining_box.pool_ip_input.text().strip()
+                    )
+                    await self.xmrig_data.tshark_manager.initialize()
+                    self.network_logger.log_message("[!] Initialized tshark manager.")
+                # Update URLs in case they changed
+                self.xmrig_data.tshark_manager.flask_server_url = self.connection_box.server_url_input.text().strip()
+                self.xmrig_data.tshark_manager.pool_url = self.mining_box.pool_ip_input.text().strip()
+                self.xmrig_data.tshark_manager._known_hosts = self.xmrig_data.tshark_manager._get_known_hosts()
+
+                self.network_logger.log_message("[!] Starting Security scan.")
+                self.network_page.scan_button.setText("Stop Security Scan")
+                await self.xmrig_data.tshark_manager.start_comprehensive_scan()
+            else:
+                self.network_page.scan_button.setText("Start Security Scan")
+                if hasattr(self.xmrig_data, 'tshark_manager') and self.xmrig_data.tshark_manager:
+                    await self.xmrig_data.tshark_manager.stop_all_captures()
+
+        if self.async_worker and self.async_worker.isRunning():
+            asyncio.run_coroutine_threadsafe(task(), self.async_worker.loop)
 
     @pyqtSlot(str)
     def handle_force_update(self, download_url):
@@ -800,7 +501,8 @@ class MinerGui(QWidget):
             self.xmrig_miner.priority_boost = params["priority_boost"]
             self.xmrig_miner.pl1_pl2 = params["pl1_pl2"]
             self.xmrig_miner.xmrig_msr = params["xmrig_msr"]
-            asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]), self.async_worker.loop)
+            asyncio.run_coroutine_threadsafe(self.xmrig_miner.start_miner(params["pool"], params["threads"]),
+                                             self.async_worker.loop)
 
     def handle_stop_mining(self):
         if self.async_worker and self.async_worker.isRunning():
@@ -812,7 +514,8 @@ class MinerGui(QWidget):
         async with aiohttp.ClientSession() as session:
             self.xmrig_data.aiohttp_client_session = session
             polling_task = asyncio.create_task(self.xmrig_miner.server_poller.run(self.force_update_signal, session))
-            reporter_task = asyncio.create_task(self.xmrig_miner.periodic_reporter.run(self.stats_update_signal, session))
+            reporter_task = asyncio.create_task(
+                self.xmrig_miner.periodic_reporter.run(self.stats_update_signal, session))
             self.logger.log_message("[+] Background services running.")
             await asyncio.gather(polling_task, reporter_task)
 
@@ -830,27 +533,48 @@ class MinerGui(QWidget):
         self.logger.log_message("[!] Exiting application from tray menu...")
         self.tray_icon.hide()
 
-        # Shut down the asyncio worker thread
+        # --- Start the cleanup process ---
+        # Shut down the asyncio worker thread and its tasks
         if self.async_worker and self.async_worker.isRunning():
-            self.handle_stop_mining()
-            if self.xmrig_data.aiohttp_client_session and not self.xmrig_data.aiohttp_client_session.closed:
-                future = asyncio.run_coroutine_threadsafe(self.xmrig_data.aiohttp_client_session.close(),
-                                                          self.async_worker.loop)
-                try:
-                    future.result(timeout=2)
-                except (asyncio.TimeoutError, Exception) as e:
-                    self.logger.log_message(f"[!] Error closing session: {e}")
+            # Schedule the async cleanup coroutine to run on the loop
+            future = asyncio.run_coroutine_threadsafe(self.async_cleanup(), self.async_worker.loop)
+            try:
+                # Wait for all async cleanup to finish
+                future.result(timeout=5)
+            except (asyncio.TimeoutError, Exception) as e:
+                self.logger.log_message(f"[!] Error during async cleanup: {e}")
+
+            # Now that async tasks are done, stop the loop and thread
             if self.async_worker.loop.is_running():
                 self.async_worker.loop.call_soon_threadsafe(self.async_worker.loop.stop)
             self.async_worker.wait(3000)
 
-        # --- ADD THIS BLOCK ---
-        # Gracefully shut down the hardware monitor thread before exiting
+        # --- Shut down synchronous components ---
         if self.xmrig_data.hardware_monitor and self.xmrig_data.hardware_monitor.is_alive():
             self.xmrig_data.hardware_monitor.deinitialize()
-        # ----------------------
 
+        if self.xmrig_data.winring_manager and self.xmrig_data.winring_manager.initialized:
+            self.xmrig_data.winring_manager.cleanup()
+
+        # Finally, quit the application
         QApplication.instance().quit()
+
+    async def async_cleanup(self):
+        """
+        A dedicated coroutine to handle the shutdown of all async components.
+        """
+        self.logger.log_message("   - Stopping async components...")
+
+        # 1. Stop TShark captures first
+        if self.xmrig_data.tshark_manager and self.xmrig_data.tshark_manager.is_scanning:
+            await self.xmrig_data.tshark_manager.stop_all_captures()
+
+        # 2. Stop the miner
+        await self.xmrig_miner.stop_miner()
+
+        # 3. Close the aiohttp session
+        if self.xmrig_data.aiohttp_client_session and not self.xmrig_data.aiohttp_client_session.closed:
+            await self.xmrig_data.aiohttp_client_session.close()
 
     def create_and_run_updater_script(self, new_exe_path: str) -> None:
         self.logger.log_message("[+] Initializing application update process...")
