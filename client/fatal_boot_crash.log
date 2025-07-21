@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "X:\Users\natem\PycharmProjects\moneroProject\client\xmrig_client.py", line 117, in <module>
+    main()
+  File "X:\Users\natem\PycharmProjects\moneroProject\client\xmrig_client.py", line 106, in main
+    xmrig_data.winring_manager = WinRingManager(os.path.join(xmrig_data.tools_dir, "WinRing0x64.sys"), logger)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "X:\Users\natem\PycharmProjects\moneroProject\client\xmrig_managers.py", line 465, in __init__
+    if self._install_service() and self._start_service():
+                                   ^^^^^^^^^^^^^^^^^^^^^
+  File "X:\Users\natem\PycharmProjects\moneroProject\client\xmrig_managers.py", line 555, in _start_service
+    self.logger.log_message(f"   - Start failed with race condition. Retrying... (Attempt {attempt + 1}/5) Error: {e}")
+                                                                                                                   ^
+NameError: name 'e' is not defined
