@@ -8,6 +8,7 @@ import sys
 import threading
 from socket import AF_INET, SOCK_DGRAM, socket
 
+import psutil
 from PyQt5.QtWidgets import QApplication
 from waitress import serve
 from flask import Flask, send_from_directory
@@ -50,17 +51,37 @@ def log_to_file(message):
 
 
 def get_local_ip():
-    """Finds the primary local IP address of the machine."""
-    s = socket(AF_INET, SOCK_DGRAM)
+    """Find the local static IP address, preferring Wi-Fi and avoiding VPNs like ProtonVPN."""
+    interfaces = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+
+    for interface_name, addresses in interfaces.items():
+        if not stats.get(interface_name) or not stats[interface_name].isup:
+            continue
+
+        # Skip virtual and VPN interfaces
+        lower_name = interface_name.lower()
+        if any(v in lower_name for v in ['protonvpn', 'vpn', 'zerotier', 'tunnel', 'loopback', 'virtual']):
+            continue
+
+        # Prefer Wi-Fi or known interface names
+        if not any(w in lower_name for w in ['wi-fi', 'wlan', 'wireless']):
+            continue
+
+        for addr in addresses:
+            if addr.family == AF_INET:
+                return addr.address
+
+    # Fallback: default route detection
     try:
+        s = socket.socket(AF_INET,SOCK_DGRAM)
         s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
+        ip = s.getsockname()[0]
     except Exception:
-        IP = '127.0.0.1'
+        ip = '127.0.0.1'
     finally:
         s.close()
-    return IP
-
+    return ip
 
 async def application_main_loop(stop_event=None):
     """The main async logic for the application's background services."""
