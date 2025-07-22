@@ -4,13 +4,9 @@ import asyncio
 import atexit
 import datetime
 import os
+import subprocess
 import sys
 import threading
-import time
-from socket import AF_INET, SOCK_DGRAM, socket
-
-import psutil
-import requests
 from PyQt5.QtWidgets import QApplication
 from waitress import serve
 from flask import Flask, send_from_directory
@@ -20,14 +16,15 @@ from p2pool_data import AsyncEventLogger
 # --- Import components ---
 from p2pool_helper import p2pool_helper, ProcessManager
 from p2pool_endpoints import api_b
-from p2pool_gui import P2PoolGUI, ConsoleLogger, NetworkLogger  # Import NetworkLogger
-
+from p2pool_gui import P2PoolGUI, ConsoleLogger, WiresharkLogger, PacketLogger, RouterLogger  # Import NetworkLogger
+from p2pool_managers import PythonRouterManager
 
 # === FLASK APP SETUP ===
 app = Flask(__name__, static_folder='p2pool-dashboard/dist')
 CORS(app)
 app.register_blueprint(api_b)
 
+router_logger = RouterLogger()
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
@@ -68,8 +65,8 @@ async def application_main_loop(stop_event=None):
 
     threading.Thread(target=async_event_logger.start, daemon=True).start()
     threading.Thread(target=start_flask, daemon=True).start()
-
-    # Start ProcessManager
+    p2pool_helper.router_manager = PythonRouterManager(router_logger)
+    p2pool_helper.set_router_logger(router_logger)
     p2pool_helper.process_manager = ProcessManager(
         p2pool_helper.p2pooldata,
         start_flask,
@@ -77,7 +74,6 @@ async def application_main_loop(stop_event=None):
         p2pool_helper.logger
     )
     p2pool_helper.process_manager.start()
-
     local_ip = p2pool_helper.get_local_ip()
     public_ip_at_start = p2pool_helper.get_public_ip()
     port = 5000
@@ -96,22 +92,39 @@ async def application_main_loop(stop_event=None):
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal (Ctrl+C) received...")
     finally:
+        p2pool_helper.router_manager.stop_routing()
         p2pool_helper.p2pool_stop_event.set()
         await p2pool_helper.processor.stop_p2pool()
         print("[+] Shutdown complete.")
 
 
 def cleanup_on_exit():
-    print("Running final cleanup on application exit...")
-    proc = p2pool_helper.p2pooldata.p2pool_proc
-    if proc and proc.returncode is None:
-        print(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
-        proc.terminate()
+    # Use p2pool_helper.logger for consistency
+    if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
+        p2pool_helper.logger.log_message("Running final cleanup on application exit...")
+    else:
+        print("Running final cleanup on application exit...")
 
-    wireshark_proc = p2pool_helper.wireshark_manager.tshark_proc
-    if wireshark_proc and wireshark_proc.poll() is None:
-        print(f"[atexit] Failsafe: Terminating Wireshark process (PID: {wireshark_proc.pid}).")
-        wireshark_proc.terminate()
+    if hasattr(p2pool_helper, 'p2pooldata') and p2pool_helper.p2pooldata and p2pool_helper.p2pooldata.p2pool_proc:
+        proc = p2pool_helper.p2pooldata.p2pool_proc
+        if proc and proc.returncode is None:
+            if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
+                p2pool_helper.logger.log_message(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
+            else:
+                print(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    # Correctly stop WiresharkManager by calling its method
+    if hasattr(p2pool_helper, 'wireshark_manager') and p2pool_helper.wireshark_manager:
+        p2pool_helper.wireshark_manager.stop_capture()
+        if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
+            p2pool_helper.logger.log_message("[atexit] Wireshark capture stopped via manager.")
+        else:
+            print("[atexit] Wireshark capture stopped via manager.")
 
 
 if __name__ == "__main__":
@@ -120,12 +133,12 @@ if __name__ == "__main__":
         qapp = QApplication(sys.argv)
 
         gui_logger = ConsoleLogger()
-        network_logger = NetworkLogger()
-
+        wireshark_logger = WiresharkLogger()
+        packet_logger = PacketLogger()
         p2pool_helper.set_gui_logger(gui_logger)
-        p2pool_helper.set_network_logger(network_logger)
-
-        window = P2PoolGUI(gui_logger, network_logger, application_main_loop, p2pool_helper)
+        p2pool_helper.set_wireshark_logger(wireshark_logger)
+        p2pool_helper.set_packet_logger(packet_logger)
+        window = P2PoolGUI(gui_logger, wireshark_logger, packet_logger, router_logger, application_main_loop, p2pool_helper)
 
         window.show()
         sys.exit(qapp.exec_())
