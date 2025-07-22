@@ -1,8 +1,7 @@
 
-
 class ClientData:
 
-    def __init__(self):
+    def __init__(self, logger):
         self.client_hashrates = {}
         self.client_newjobs = {}
         self.client_threads = {}
