@@ -44,7 +44,7 @@ class WiresharkManager:
             # Assumes the database is in a standard location within the project
             server_dir = Path(__file__).resolve().parent
             project_root = server_dir.parent
-            db_path = project_root / "tools" / "GeoIP" / "GeoLite2-City.mmdb"
+            db_path = project_root / "server" / "tools" / "GeoLite2-City.mmdb.gz"
 
             if not db_path.exists():
                 self.logger.log_message(f"[GeoIP] Warning: Database not found at {db_path}. GeoIP lookups disabled.")
