@@ -1,23 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# The main entry point for your application.
-# This should be 'main.py' as it's the script that starts your Flask app and threads.
 block_cipher = None
 
-
 a = Analysis(
-    ['p2pool_server.py'], # <--- Changed to 'main.py' as the primary entry point
-    pathex=['.'], # The current directory where your Python files reside
+    ['p2pool_server.py'],
+    pathex=['.'],
     binaries=[],
     datas=[
         ('icons', 'icons'),
+        ('tools', 'tools'),
+        ('X:/Users/natem/PycharmProjects/moneroProject/client/tools/Wireshark', 'tools/Wireshark'),
         ('p2pool-dashboard/dist', 'p2pool-dashboard/dist'),
-        ('client_data.py', '.'),            # Include app.py
-        ('p2pool_data.py', '.'), # Include p2pool_handler.py
+        ('client_data.py', '.'),
+        ('p2pool_data.py', '.'),
+        ('p2pool_helper.py', '.'),
+        ('p2pool_gui.py', '.'),
+        ('p2pool_endpoints.py', '.'),
     ],
     hiddenimports=[
-        'flask',          # Explicitly include Flask
-        'psutil',         # Explicitly include psutil
+        'flask',
+        'psutil',
+        'waitress', # Added waitress as it's used to serve the Flask app
+        'flask_cors', # Added Flask-Cors
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -42,7 +46,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False, # Set to False for a GUI application
     uac_admin=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
