@@ -6,9 +6,11 @@ import datetime
 import os
 import sys
 import threading
+import time
 from socket import AF_INET, SOCK_DGRAM, socket
 
 import psutil
+import requests
 from PyQt5.QtWidgets import QApplication
 from waitress import serve
 from flask import Flask, send_from_directory
@@ -16,9 +18,10 @@ from flask_cors import CORS
 from p2pool_data import AsyncEventLogger
 
 # --- Import components ---
-from p2pool_helper import p2pool_helper
+from p2pool_helper import p2pool_helper, ProcessManager
 from p2pool_endpoints import api_b
 from p2pool_gui import P2PoolGUI, ConsoleLogger, NetworkLogger  # Import NetworkLogger
+
 
 # === FLASK APP SETUP ===
 app = Flask(__name__, static_folder='p2pool-dashboard/dist')
@@ -33,7 +36,6 @@ def serve_react(path):
         return send_from_directory(app.static_folder, path)
     else:
         return send_from_directory(app.static_folder, 'index.html')
-
 
 def start_flask():
     """Starts the Flask server using Waitress."""
@@ -50,38 +52,6 @@ def log_to_file(message):
         print(f"File logging failed: {e}")
 
 
-def get_local_ip():
-    """Find the local static IP address, preferring Wi-Fi and avoiding VPNs like ProtonVPN."""
-    interfaces = psutil.net_if_addrs()
-    stats = psutil.net_if_stats()
-
-    for interface_name, addresses in interfaces.items():
-        if not stats.get(interface_name) or not stats[interface_name].isup:
-            continue
-
-        # Skip virtual and VPN interfaces
-        lower_name = interface_name.lower()
-        if any(v in lower_name for v in ['protonvpn', 'vpn', 'zerotier', 'tunnel', 'loopback', 'virtual']):
-            continue
-
-        # Prefer Wi-Fi or known interface names
-        if not any(w in lower_name for w in ['wi-fi', 'wlan', 'wireless']):
-            continue
-
-        for addr in addresses:
-            if addr.family == AF_INET:
-                return addr.address
-
-    # Fallback: default route detection
-    try:
-        s = socket.socket(AF_INET,SOCK_DGRAM)
-        s.connect(('10.255.255.255', 1))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
-        s.close()
-    return ip
 
 async def application_main_loop(stop_event=None):
     """The main async logic for the application's background services."""
@@ -96,45 +66,48 @@ async def application_main_loop(stop_event=None):
 
     async_event_logger = AsyncEventLogger(p2pool_helper.p2pooldata, asyncio_main_loop, p2pool_helper.logger)
 
-    # Start core background threads (Web Server, etc.)
     threading.Thread(target=async_event_logger.start, daemon=True).start()
     threading.Thread(target=start_flask, daemon=True).start()
 
-    local_ip = get_local_ip()
+    # Start ProcessManager
+    p2pool_helper.process_manager = ProcessManager(
+        p2pool_helper.p2pooldata,
+        start_flask,
+        p2pool_helper.processor,
+        p2pool_helper.logger
+    )
+    p2pool_helper.process_manager.start()
+
+    local_ip = p2pool_helper.get_local_ip()
+    public_ip_at_start = p2pool_helper.get_public_ip()
     port = 5000
     print("=======================================================================")
     print(f"[*] Dashboard running. Access it at:")
     print(f"    - On this machine: http://127.0.0.1:{port}")
     print(f"    - On your local network: http://{local_ip}:{port}")
+    if public_ip_at_start:
+        print(f"    - On the internet (if port forwarded): http://{public_ip_at_start}:{port}")
     print("=======================================================================")
     print("[+] Background services are running. Use the GUI to start P2Pool.")
 
     try:
-        # This loop now just keeps the background services alive until shutdown.
         while not (stop_event and stop_event.is_set()):
             await asyncio.sleep(1)
     except KeyboardInterrupt:
         print("\n[!] Shutdown signal (Ctrl+C) received...")
     finally:
-        # Signal P2Pool-related threads to stop
         p2pool_helper.p2pool_stop_event.set()
-        # Stop the P2Pool process if it's running
         await p2pool_helper.processor.stop_p2pool()
         print("[+] Shutdown complete.")
 
 
 def cleanup_on_exit():
-    """
-    This function is registered to run when the application exits.
-    It ensures that all subprocesses are terminated.
-    """
     print("Running final cleanup on application exit...")
     proc = p2pool_helper.p2pooldata.p2pool_proc
     if proc and proc.returncode is None:
         print(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
         proc.terminate()
 
-    # Also terminate Wireshark if it's running
     wireshark_proc = p2pool_helper.wireshark_manager.tshark_proc
     if wireshark_proc and wireshark_proc.poll() is None:
         print(f"[atexit] Failsafe: Terminating Wireshark process (PID: {wireshark_proc.pid}).")
@@ -146,15 +119,12 @@ if __name__ == "__main__":
         atexit.register(cleanup_on_exit)
         qapp = QApplication(sys.argv)
 
-        # Create both the main and network loggers
         gui_logger = ConsoleLogger()
         network_logger = NetworkLogger()
 
-        # Inject both loggers into the helper
         p2pool_helper.set_gui_logger(gui_logger)
         p2pool_helper.set_network_logger(network_logger)
 
-        # Pass the p2pool_helper instance to the GUI
         window = P2PoolGUI(gui_logger, network_logger, application_main_loop, p2pool_helper)
 
         window.show()

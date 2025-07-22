@@ -1,18 +1,17 @@
+
 import ipaddress
-import os
+
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import json
-import time
-from collections import deque
+
 from pathlib import Path
-# NEW: Import the geoip2 library
+
 import geoip2.database
 import geoip2.errors
-
 
 class WiresharkManager:
     """
