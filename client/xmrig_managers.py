@@ -472,7 +472,6 @@ class WinRingManager:
             self.logger.log_message(f"[!] Driver not found at '{self.driver_path}'")
             return
 
-        # --- KEY LOGIC CHANGE ---
         # First, check if the service is already up and running.
         if self._is_service_running():
             self.logger.log_message(f"[*] Found existing '{self.service_name}' service is already running.")
@@ -481,7 +480,6 @@ class WinRingManager:
             # We did not start it, so we will not manage its lifecycle.
             self.managed_by_this_instance = False
             return
-        # --- END OF KEY LOGIC CHANGE ---
 
         # If not running, proceed with our own installation.
         self._force_cleanup_existing_service()
@@ -491,6 +489,11 @@ class WinRingManager:
             # We successfully started it, so we are responsible for cleanup.
             self.managed_by_this_instance = True
             self.logger.log_message(f"[+] Driver '{self.service_name}' loaded successfully by this instance.")
+        else:
+            # If installation or start failed, ensure we clean up if we tried to install.
+            self.logger.log_message(f"[!] Failed to initialize '{self.service_name}' driver. Attempting cleanup.")
+            self._uninstall_service() # Attempt to clean up the failed installation
+
 
     def cleanup(self) -> None:
         """
@@ -597,16 +600,34 @@ class WinRingManager:
                 continue
 
             self.logger.log_message(f"[!] Failed to start service: {output}")
-            return False
+            # If we reach here, it means the start command failed for a reason other than race condition.
+            # No need to retry for this specific failure.
+            break # Exit the loop if it's not a race condition retryable error.
 
         self.logger.log_message("[!] Failed to start service after multiple retries.")
+        # --- NEW LOGIC ADDED HERE ---
+        # If we failed to start after all retries, attempt to delete the service.
+        self.logger.log_message(f"[*] Attempting to delete service '{self.service_name}' due to failed start.")
+        self._uninstall_service()
+        # --- END NEW LOGIC ---
         return False
 
     def _stop_service(self) -> None:
-        self._run_command(['sc', 'stop', self.service_name])
+        self.logger.log_message(f"[*] Stopping service '{self.service_name}'...")
+        success, output = self._run_command(['sc', 'stop', self.service_name])
+        if success:
+            self.logger.log_message("[+] Service stopped successfully.")
+        else:
+            self.logger.log_message(f"[!] Failed to stop service: {output}")
 
     def _uninstall_service(self) -> None:
-        self._run_command(['sc', 'delete', self.service_name])
+        self.logger.log_message(f"[*] Deleting service '{self.service_name}'...")
+        success, output = self._run_command(['sc', 'delete', self.service_name])
+        if success:
+            self.logger.log_message("[+] Service deleted successfully.")
+        else:
+            self.logger.log_message(f"[!] Failed to delete service: {output}")
+
 
 class AsyncPsutilManager:
 

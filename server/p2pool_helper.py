@@ -10,7 +10,9 @@ import requests
 
 from p2pool_data import P2poolData, EventProcessor, RawLogProcessor, P2PoolProcessor
 from client_data import ClientData
-from p2pool_managers import WiresharkManager
+from p2pool_managers import WiresharkManager, PacketManager, PythonRouterManager
+
+
 
 class _PrintLogger:
     """A simple, GUI-agnostic fallback logger that uses the standard print() function."""
@@ -36,8 +38,9 @@ class P2PoolHelper:
 
         # --- Instantiate with safe, temporary loggers FIRST ---
         self.logger = _PrintLogger()
-        self.network_logger = _PrintNetworkLogger()
-
+        self.wireshark_logger = _PrintNetworkLogger()
+        self.packet_logger = _PrintLogger()
+        self.router_logger = _PrintLogger()
         # Event to signal P2Pool-related threads to stop
         self.p2pool_stop_event = threading.Event()
 
@@ -49,8 +52,10 @@ class P2PoolHelper:
         self.processor = P2PoolProcessor(self.p2pooldata, self.logger)
 
         # --- Pass the dedicated network logger to the Wireshark Manager ---
-        self.wireshark_manager = WiresharkManager(self.p2pooldata, self.network_logger)
+        self.wireshark_manager = WiresharkManager(self.p2pooldata, self.wireshark_logger)
         self.process_manager = None
+        self.packet_manager = PacketManager(self.packet_logger)
+        self.router_manager = None
 
     def set_gui_logger(self, gui_logger):
         """Replaces the temporary main logger with the real GUI logger."""
@@ -63,12 +68,25 @@ class P2PoolHelper:
         self.raw_log_processor.logger = gui_logger
         self.processor.logger = gui_logger
 
-    def set_network_logger(self, network_logger):
+    def set_wireshark_logger(self, wireshark_logger):
         """Replaces the temporary network logger with the real GUI network logger."""
         print("[+] GUI Network Logger activated.")
-        self.network_logger = network_logger
+        self.wireshark_logger = wireshark_logger
         # Propagate the real network logger to the Wireshark Manager
-        self.wireshark_manager.logger = network_logger
+        self.wireshark_manager.logger = wireshark_logger
+    def set_packet_logger(self, packet_logger):
+        """Replaces the temporary network logger with the real GUI network logger."""
+        print("[+] GUI Network Logger activated.")
+        self.packet_logger = packet_logger
+        # Propagate the real network logger to the Wireshark Manager
+        self.packet_manager.logger = packet_logger
+
+    def set_router_logger(self, router_logger):
+        """Replaces the temporary network logger with the real GUI network logger."""
+        print("[+] GUI Network Logger activated.")
+        self.router_logger = router_logger
+        # Propagate the real network logger to the Wireshark Manager
+        self.router_manager.logger = router_logger
 
     def queue_command(self, client_id, command_data):
         if client_id not in self.COMMAND_QUEUE:
