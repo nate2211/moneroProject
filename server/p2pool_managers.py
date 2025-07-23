@@ -113,7 +113,7 @@ class PythonRouterManager:
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
         if getattr(sys, "frozen", False):
-            tshark_exe = Path(sys._MEIPASS) / "Wireshark" / "tshark.exe"
+            tshark_exe = Path(sys._MEIPASS) / "tools" / "Wireshark" / "tshark.exe"
             if tshark_exe.exists():
                 return str(tshark_exe)
 
@@ -1064,7 +1064,7 @@ class PacketManager:
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe."""
         if getattr(sys, "frozen", False):
-            tshark_exe = Path(sys._MEIPASS) / "Wireshark" / "tshark.exe"
+            tshark_exe = Path(sys._MEIPASS) / "tools" / "Wireshark" / "tshark.exe"
             if tshark_exe.exists():
                 return str(tshark_exe)
 
