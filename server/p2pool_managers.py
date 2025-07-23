@@ -1033,7 +1033,7 @@ class PythonRouterManager:
         self.router_logger.log_message(
             f"[RouterManager] Cleaning up IP for '{iface_friendly_name}' (setting to DHCP)...")
 
-        netsh_args = ["set", "address", f'name="{iface_friendly_name}"', "source=dhcp"]
+        netsh_args = ["set", "address", f'name={iface_friendly_name}', "source=dhcp"]
 
         if self._execute_netsh(netsh_args):
             self.router_logger.log_message(f"[RouterManager] Successfully set '{iface_friendly_name}' to DHCP.")
