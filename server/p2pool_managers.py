@@ -19,7 +19,32 @@ from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, IP, ICMP, UDP
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp, sendp, sniff
+from scapy.packet import Packet, bind_layers
+from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField
+from scapy.layers.inet import IP, UDP        # (already imported elsewhere, keep only one copy)
+class RIPEntry(Packet):
+    name = "RIPEntry"
+    fields_desc = [
+        ShortField("addr_family", 2),          # IPv4
+        ShortField("route_tag",   0),
+        IPField  ("address",     "0.0.0.0"),   # Network address
+        IPField  ("subnet_mask", "0.0.0.0"),
+        IPField  ("next_hop",    "0.0.0.0"),
+        IntField ("metric",      1)            # 1–15 valid, 16 = infinity
+    ]
 
+class SimpleRIP(Packet):
+    name = "SimpleRIP"
+    fields_desc = [
+        ByteField ("command", 2),              # 1 = request, 2 = response
+        ByteField ("version", 2),              # RIPv2
+        ShortField("unused",  0),
+        PacketListField("entries", [], RIPEntry)
+    ]
+
+# Bind to UDP/520 so Scapy can dissect/construct automatically
+bind_layers(UDP, SimpleRIP, dport=520)
+bind_layers(UDP, SimpleRIP, sport=520)
 
 class PythonRouterManager:
     """
@@ -65,6 +90,23 @@ class PythonRouterManager:
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
 
+
+        self.RIP_PORT                = 520
+        self.RIP_MCAST_ADDR          = "224.0.0.9"    # std. RIPv2
+        self.RIP_UPDATE_INTERVAL     = 10             # seconds
+        self._routing_table          = {}             # {IPv4Network: {...}}
+        self._rt_lock                = threading.Lock()
+        self._rip_stop_event         = threading.Event()
+        self._rip_thread             = None
+
+        # --- NAT Attributes (NEW) ---
+        self.NAT_PORT_MIN = 49152  # Recommended ephemeral port start
+        self.NAT_PORT_MAX = 65535  # Max TCP/UDP port
+        self._nat_table = {}  # Maps (internal_ip, internal_port) -> external_port
+        self._nat_reverse_table = {} # Maps external_port -> (internal_ip, internal_port)
+        self._nat_lock = threading.Lock()
+        self._next_nat_port = self.NAT_PORT_MIN
+
         self.router_logger.log_message("[RouterManager] Initializing Python Router Manager (self-contained).")
 
 
@@ -90,6 +132,143 @@ class PythonRouterManager:
             "[RouterManager] Error: tshark.exe not found. Cannot discover interfaces via tshark -D.")
         return None
 
+    def _initialize_routing_table(self):
+        """Seed the table with directly connected nets + default route."""
+        with self._rt_lock:
+            self._routing_table.clear()
+            # directly connected
+            for ifname, cfg in self._interfaces_config.items():
+                net = cfg["network"]
+                self._routing_table[net] = {
+                    "next_hop": str(cfg["ip_addr"]),
+                    "cost": 1,
+                    "interface": ifname,
+                    "advertised_by": "self",
+                    "last_update": time.time(),
+                }
+            # default route (if WAN gw known)
+            if self.router_gateway_out_ip and self.interface_out_full_name:
+                default_net = ipaddress.ip_network("0.0.0.0/0")
+                self._routing_table[default_net] = {
+                    "next_hop": self.router_gateway_out_ip,
+                    "cost": 1,
+                    "interface": self.interface_out_full_name,
+                    "advertised_by": "self",
+                    "last_update": time.time(),
+                }
+
+    def _get_next_nat_port(self) -> int:
+        """
+        Allocates the next available port for a new NAT entry.
+        NOTE: Must be called inside self._nat_lock.
+        """
+        # A more robust implementation would check for port collisions,
+        # but for this simulation, a simple increment-and-wrap is sufficient.
+        port = self._next_nat_port
+        self._next_nat_port += 1
+        if self._next_nat_port > self.NAT_PORT_MAX:
+            self._next_nat_port = self.NAT_PORT_MIN
+        return port
+
+    def _un_nat_and_forward(self, packet, original_client_info):
+        """
+        Handles an incoming packet from the WAN that matches a NAT entry.
+        It translates the packet back to its original destination and forwards it.
+        """
+        original_ip, original_port = original_client_info
+        ip_layer = packet.getlayer(IP)
+        transport_layer = packet.getlayer(TCP) or packet.getlayer(UDP)
+
+        self.router_logger.log_message(
+            f"[NAT] ⬅️  Return packet for {original_ip}:{original_port} (from {ip_layer.src}:{transport_layer.sport})")
+
+        # --- Modify Packet (Reverse NAT) ---
+        ip_layer.dst = original_ip
+        transport_layer.dport = original_port
+
+        # --- Forward to Internal Client ---
+        # The modified packet is now treated like any other packet needing forwarding.
+        self._forward_general_ip_packet(packet, self.interface_out_full_name)
+
+    def _send_rip_advertisement(self):
+        with self._rt_lock:
+            table_snapshot = list(self._routing_table.items())
+
+        for ifname, cfg in self._interfaces_config.items():
+            if cfg["ip_addr"] is None:  # skip un‑IPed
+                continue
+
+            entries = []
+            for net, det in table_snapshot:
+                # Split‑horizon with poison reverse
+                metric = 16 if det["interface"] == ifname and det["advertised_by"] != "self" else det["cost"]
+                entries.append(
+                    RIPEntry(address=str(net.network_address),
+                             subnet_mask=str(net.netmask),
+                             metric=metric)
+                )
+
+            if not entries:
+                continue
+
+            pkt = (
+                    IP(src=cfg["ip_addr"], dst=self.RIP_MCAST_ADDR) /
+                    UDP(sport=self.RIP_PORT, dport=self.RIP_PORT) /
+                    SimpleRIP(command=2, version=2, entries=entries)
+            )
+            try:
+                sendp(pkt, iface=ifname, verbose=0)
+                self.router_logger.log_message(
+                    f"[RIP] ⬆  advertised {len(entries)} routes on {ifname}"
+                )
+            except Exception as e:
+                self.router_logger.log_message(f"[RIP] send failed on {ifname}: {e}")
+    def _rip_advertisement_loop(self):
+        while not self._rip_stop_event.is_set():
+            self._send_rip_advertisement()
+            self._rip_stop_event.wait(self.RIP_UPDATE_INTERVAL)
+        self.router_logger.log_message("[RIP] advertisement thread exit.")
+
+    def _handle_rip_update(self, pkt, inbound_ifname):
+        rip = pkt.getlayer(SimpleRIP)
+        if rip.command != 2:               # only RESPONSES
+            return
+        src_router = pkt[IP].src
+        changed = False
+
+        with self._rt_lock:
+            for entry in rip.entries:
+                net  = ipaddress.ip_network(f"{entry.address}/{entry.subnet_mask}", strict=False)
+                cost = min(entry.metric + 1, 16)    # hop through src_router
+                cur  = self._routing_table.get(net)
+
+                if cur is None and cost < 16:
+                    self._routing_table[net] = {
+                        "next_hop"     : src_router,
+                        "cost"         : cost,
+                        "interface"    : inbound_ifname,
+                        "advertised_by": src_router,
+                        "last_update"  : time.time(),
+                    }
+                    changed = True
+                elif cur and cur["advertised_by"] == src_router:
+                    if cost != cur["cost"]:
+                        cur["cost"] = cost
+                        cur["last_update"] = time.time()
+                        changed = True
+                elif cur and cost < cur["cost"]:
+                    # better path from different neighbor
+                    self._routing_table[net] = {
+                        "next_hop"     : src_router,
+                        "cost"         : cost,
+                        "interface"    : inbound_ifname,
+                        "advertised_by": src_router,
+                        "last_update"  : time.time(),
+                    }
+                    changed = True
+
+        if changed:
+            self.router_logger.log_message(f"[RIP] table updated from {src_router}")
     def _initialize_interface_discovery(self):
         """Discover network interfaces using tshark -D and store them internally."""
         self._tshark_path = self._get_tshark_path()
@@ -511,6 +690,17 @@ class PythonRouterManager:
         self.router_logger.log_message(
             f"\n[{threading.current_thread().name}] Packet: {src_ip} -> {dst_ip} (In: {inbound_iface_name})")
 
+        # --- 1. Handle NAT Return Traffic (WAN -> LAN) ---
+        if dst_ip == self.router_ip_out and (packet.haslayer(TCP) or packet.haslayer(UDP)):
+            transport_layer = packet.getlayer(TCP) or packet.getlayer(UDP)
+            with self._nat_lock:
+                original_client_info = self._nat_reverse_table.get(transport_layer.dport)
+
+            if original_client_info:
+                # This is a return packet for a NAT'd connection.
+                self._un_nat_and_forward(packet, original_client_info)
+                return  # Packet handled
+
         # --- NEW: Handle DNS Queries (UDP on port 53) ---
         if packet.haslayer(UDP) and packet.getlayer(UDP).dport == 53 and packet.haslayer(DNS):
             self._handle_dns_query(packet, inbound_iface_name, ip_layer, packet.getlayer(UDP), packet.getlayer(DNS))
@@ -521,6 +711,9 @@ class PythonRouterManager:
             self._handle_dns_response(packet, inbound_iface_name, ip_layer, packet.getlayer(UDP), packet.getlayer(DNS))
             return  # DNS handled, don't pass to general forwarding logic
 
+        if packet.haslayer(SimpleRIP):
+            self._handle_rip_update(packet, inbound_iface_name)
+            return
         # 1. Check if packet is for the router itself
         # This includes packets originating from the host and destined for its own IP
         is_for_router = False
@@ -656,15 +849,12 @@ class PythonRouterManager:
 
     def _forward_general_ip_packet(self, packet, inbound_iface_name: str):
         """
-        Generic forwarding logic for IP packets not handled by specific rules (like DNS).
-        This combines traffic passing through and host-originated traffic.
+        Handles all packet forwarding using the RIP routing table.
+        Applies NAT for traffic going from the LAN to the WAN.
         """
         ip_layer = packet.getlayer(IP)
         dst_ip = ip_layer.dst
         src_ip = ip_layer.src
-
-        outbound_iface_name = None
-        next_hop_ip = None
 
         try:
             dst_ip_obj = ipaddress.ip_address(dst_ip)
@@ -672,66 +862,91 @@ class PythonRouterManager:
             self.router_logger.log_message(f"  -> Invalid destination IP '{dst_ip}'. Dropping.")
             return
 
-        # Prioritize directly connected networks
-        for iface_name, iface_config in self._interfaces_config.items():
-            if dst_ip_obj in iface_config['network']:
-                if iface_name == inbound_iface_name:
-                    # Packet already on this segment, not our job to route between same segment devices for this simple router
-                    # UNLESS it's host-originated traffic, which we already processed before this point.
-                    # So, if it reaches here and is same-segment, it's likely a drop.
-                    self.router_logger.log_message(
-                        f"  -> Dest {dst_ip} is on same segment as inbound interface {inbound_iface_name}. Dropping.")
-                    return
-                else:
-                    outbound_iface_name = iface_name
-                    next_hop_ip = dst_ip  # Direct delivery
-                    self.router_logger.log_message(
-                        f"  -> Routing to directly connected network {iface_config['network']} via {outbound_iface_name}")
-                    break
+        # --- 1. Route Lookup (Longest-prefix match using the RIP table) ---
+        best_match = None
+        best_prefix = -1
 
-        # If not directly connected, use default gateway (if configured)
-        if not outbound_iface_name and self.router_gateway_out_ip:
-            for iface_name, iface_config in self._interfaces_config.items():
-                if iface_config.get('is_default_gateway_iface'):
-                    outbound_iface_name = iface_name
-                    next_hop_ip = self.router_gateway_out_ip
-                    self.router_logger.log_message(
-                        f"  -> Routing to Internet via default gateway {self.router_gateway_out_ip} (via {outbound_iface_name})")
-                    break
+        with self._rt_lock:
+            # Find the most specific matching route in our table
+            for net, rt_details in self._routing_table.items():
+                if dst_ip_obj in net:
+                    if net.prefixlen > best_prefix and rt_details["cost"] < 16:  # Ensure route is reachable
+                        best_prefix = net.prefixlen
+                        best_match = rt_details
 
-        if not outbound_iface_name:
-            self.router_logger.log_message(f"  -> No route found for {dst_ip}. Dropping.")
+        if not best_match:
+            self.router_logger.log_message(f"  -> No route in table for {dst_ip}. Dropping.")
             return
 
-        outbound_iface_config = self._interfaces_config[outbound_iface_name]
-        our_mac_for_outbound = outbound_iface_config['mac']
+        # --- 2. Determine Outbound Interface and Next Hop IP from the Route ---
+        outbound_iface_name = best_match["interface"]
+
+        # If the next_hop in the table is "0.0.0.0", it means the destination is on a
+        # directly connected network. The actual next hop is the packet's final destination.
+        # Otherwise, the next hop is the gateway/router specified in the table.
+        if best_match["next_hop"] == "0.0.0.0":
+            next_hop_ip = dst_ip
+        else:
+            next_hop_ip = best_match["next_hop"]
+
+        # --- 3. Apply NAT (if traffic is crossing from LAN to WAN) ---
+        is_lan_to_wan = (inbound_iface_name == self.interface_in_full_name and
+                         outbound_iface_name == self.interface_out_full_name)
+
+        if is_lan_to_wan and (packet.haslayer(TCP) or packet.haslayer(UDP)):
+            transport_layer = packet.getlayer(TCP) or packet.getlayer(UDP)
+            key = (src_ip, transport_layer.sport)
+            new_entry_created = False
+
+            with self._nat_lock:
+                if key not in self._nat_table:
+                    # Create a new NAT entry if one doesn't exist
+                    new_port = self._get_next_nat_port()
+                    self._nat_table[key] = new_port
+                    self._nat_reverse_table[new_port] = key
+                    new_entry_created = True
+
+                # Get the assigned external port
+                new_port = self._nat_table[key]
+
+            if new_entry_created:
+                self.router_logger.log_message(
+                    f"[NAT] ➡️  New mapping: {src_ip}:{transport_layer.sport} -> {self.router_ip_out}:{new_port}")
+                # self.log_nat_table() # Optional: uncomment to log the table on each new entry
+
+            # Modify the packet's source IP and port for NAT
+            ip_layer.src = self.router_ip_out
+            transport_layer.sport = new_port
+
+        # --- 4. L2 Resolution and Packet Rewrite ---
         target_mac = self._get_mac_address(next_hop_ip, outbound_iface_name)
-
         if not target_mac:
-            self.router_logger.log_message(f"  -> Could not determine next hop MAC for {next_hop_ip}. Dropping.")
+            self.router_logger.log_message(f"  -> Could not resolve MAC for next hop {next_hop_ip}. Dropping.")
             return
 
-        # 4. Modify the packet for forwarding
+        # Decrement TTL; drop if it's expired
         if ip_layer.ttl <= 1:
-            self.router_logger.log_message(f"  -> TTL expired ({ip_layer.ttl}). Dropping packet.")
+            self.router_logger.log_message("  -> TTL expired. Dropping.")
             return
         ip_layer.ttl -= 1
 
-        packet[Ether].src = our_mac_for_outbound
+        # Set the new Ethernet source and destination MAC addresses
+        packet[Ether].src = self._interfaces_config[outbound_iface_name]["mac"]
         packet[Ether].dst = target_mac
 
+        # Delete checksums so Scapy recalculates them upon sending
         del ip_layer.chksum
-        if packet.haslayer(TCP): del packet.getlayer(TCP).chksum
-        if packet.haslayer(UDP): del packet.getlayer(UDP).chksum
+        if packet.haslayer(TCP): del packet[TCP].chksum
+        if packet.haslayer(UDP): del packet[UDP].chksum
 
-        # 5. Send the packet
+        # --- 5. Send the Packet ---
         try:
             sendp(packet, iface=outbound_iface_name, verbose=0)
             self.router_logger.log_message(
                 f"  -> Forwarded: {src_ip} -> {dst_ip} (Out: {outbound_iface_name}, Next MAC: {target_mac})")
         except Exception as e:
             self.router_logger.log_message(
-                f"  -> ERROR sending packet via {outbound_iface_name}: {e}. Dropping. (Check permissions again!)")
+                f"  -> ERROR sending packet via {outbound_iface_name}: {e}. Dropping.")
 
     def start_routing(self):
         """Starts sniffing on all configured interfaces to begin routing."""
