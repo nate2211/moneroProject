@@ -15,6 +15,7 @@ a = Analysis(
         ('p2pool_data.py', '.'),
         ('p2pool_helper.py', '.'),
         ('p2pool_gui.py', '.'),
+        ('p2pool_gui_elements.py', '.'),
         ('p2pool_endpoints.py', '.'),
     ],
     hiddenimports=[
