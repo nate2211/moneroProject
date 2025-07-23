@@ -467,15 +467,8 @@ class P2PoolGUI(QMainWindow):
         self.send_tcp_button.setEnabled(True)
         self.send_udp_button.setEnabled(True)
         self.send_dns_button.setEnabled(True)
-
-        # Enable Router buttons only if auto-configuration was successful
-        if self.helper.router_manager and self.helper.router_manager.interface_in_full_name and self.helper.router_manager.interface_out_full_name:
-            self.start_router_button.setEnabled(True)
-            self.stop_router_button.setEnabled(False)
-        else:
-            self.logger.log_message("[RouterUI] Router auto-configuration failed. Router buttons disabled.")
-            self.start_router_button.setEnabled(False)
-            self.stop_router_button.setEnabled(False)
+        self.start_router_button.setEnabled(True)
+        self.stop_router_button.setEnabled(True)
 
     def on_services_stopped(self):
         self.logger.log_message("\n--- Background Services Stopped ---")
