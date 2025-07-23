@@ -135,6 +135,8 @@ if __name__ == "__main__":
         gui_logger = ConsoleLogger()
         wireshark_logger = WiresharkLogger()
         packet_logger = PacketLogger()
+        sys.stdout = gui_logger
+        sys.stderr = gui_logger
         p2pool_helper.set_gui_logger(gui_logger)
         p2pool_helper.set_wireshark_logger(wireshark_logger)
         p2pool_helper.set_packet_logger(packet_logger)

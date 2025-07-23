@@ -217,7 +217,7 @@ class P2PoolProcessor:
         except Exception as e:
             self.logger.log_message(f"[!] Error stopping P2Pool: {e}")
         finally:
-            self.p2pool_data.p2pool_psutil_proc = None
+            self.psutil_proc = None  # Corrected line
             self.p2pool_data.p2pool_proc = None
 
     async def _redirect_output(self, stop_event: threading.Event):  # Added stop_event parameter
@@ -254,12 +254,16 @@ class P2PoolProcessor:
 
     async def write_to_stdin(self, command: str) -> bool:
         """Asynchronously writes a command to the process's stdin."""
-        if self.p2pool_data.p2pool_proc and self.p2pool_data.p2pool_proc.stdin:
+        # Get a local, stable reference to the process object
+        proc = self.p2pool_data.p2pool_proc
+
+        if proc and proc.stdin:
             try:
-                self.p2pool_data.p2pool_proc.stdin.write(f"{command}\n".encode('utf-8'))
-                await self.p2pool_data.p2pool_proc.stdin.drain()
+                proc.stdin.write(f"{command}\n".encode('utf-8'))
+                await proc.stdin.drain()
                 return True
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Catch AttributeError in case 'proc' becomes None after the initial check
+            except (BrokenPipeError, ConnectionResetError, OSError, AttributeError) as e:
                 self.p2pool_data.log_event_now("P2Pool Process", f"Error writing to stdin: {e}")
                 return False
         return False
