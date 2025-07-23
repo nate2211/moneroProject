@@ -9,7 +9,7 @@ a = Analysis(
     datas=[
         ('icons', 'icons'),
         ('tools', 'tools'),
-        ('X:/Users/natem/PycharmProjects/moneroProject/client/tools/Wireshark', 'tools/Wireshark'),
+        ('../client/tools/Wireshark', 'tools/Wireshark'),
         ('p2pool-dashboard/dist', 'p2pool-dashboard/dist'),
         ('client_data.py', '.'),
         ('p2pool_data.py', '.'),
