@@ -54,6 +54,7 @@ async def application_main_loop(stop_event=None):
     """The main async logic for the application's background services."""
     print("[+] Initializing background services...")
 
+    p2pool_helper.set_p2pool_stop_event(stop_event)
     p2pool_helper.clear_all_client_data()
     p2pool_helper.clear_file_contents(p2pool_helper.p2pooldata.EVENT_LOG)
     p2pool_helper.clear_file_contents(p2pool_helper.p2pooldata.RAW_LOG)
@@ -77,6 +78,8 @@ async def application_main_loop(stop_event=None):
     local_ip = p2pool_helper.get_local_ip()
     public_ip_at_start = p2pool_helper.get_public_ip()
     port = 5000
+
+
     print("=======================================================================")
     print(f"[*] Dashboard running. Access it at:")
     print(f"    - On this machine: http://127.0.0.1:{port}")
@@ -86,6 +89,11 @@ async def application_main_loop(stop_event=None):
     print("=======================================================================")
     print("[+] Background services are running. Use the GUI to start P2Pool.")
 
+
+    # Start the RawLogProcessor and EventProcessor threads
+    threading.Thread(target=p2pool_helper.raw_log_processor.run_in_background, daemon=True).start()
+    threading.Thread(target=p2pool_helper.event_processor.run_in_background, daemon=True).start()
+    p2pool_helper.logger.log_message("[+] RawLogProcessor and EventProcessor threads started.")
     try:
         while not (stop_event and stop_event.is_set()):
             await asyncio.sleep(1)
