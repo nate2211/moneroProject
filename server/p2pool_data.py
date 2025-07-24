@@ -41,7 +41,7 @@ class P2PoolProcessor:
     Manages the P2Pool subprocess asynchronously, including resource monitoring.
     """
 
-    def __init__(self, p2pooldata_instance, logger):
+    def __init__(self, p2pooldata_instance, logger, stop_event):
         self.p2pool_data = p2pooldata_instance
         self.cpu_usage = 0
         self.ram_usage_mb = 0
@@ -55,6 +55,7 @@ class P2PoolProcessor:
         self.logger = logger
         # Store the IP P2Pool is currently bound to
         self.current_stratum_bind_ip = None
+        self.stop_event = stop_event
 
     def strip_ansi_codes(self, text: str) -> str:
         """Removes ANSI escape codes from a string."""
@@ -131,13 +132,13 @@ class P2PoolProcessor:
                 self.psutil_proc = None
 
             # Start background tasks, respecting the main stop event
-            if self.p2pool_data.p2pool_stop_event:  # Check if the event is set
+            if self.stop_event:  # Check if the event is set
                 self.redirect_task = asyncio.create_task(
-                    self._redirect_output(self.p2pool_data.p2pool_stop_event)
+                    self._redirect_output(self.stop_event)
                 )
                 if self.psutil_proc:
                     self.monitor_task = asyncio.create_task(
-                        self._monitor_stats(self.p2pool_data.p2pool_stop_event)
+                        self._monitor_stats(self.stop_event)
                     )
             else:
                 self.logger.log_message(
@@ -458,7 +459,7 @@ class P2poolData:
         self.RAW_LOG = os.path.join(self.P2POOL_DIR, "p2pool_raw_output.txt")
         self.log_queue = asyncio.Queue()
         self.logger = logger
-        self.p2pool_stop_event = threading.Event()  # NEW: Initialize the stop event attribute
+
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
