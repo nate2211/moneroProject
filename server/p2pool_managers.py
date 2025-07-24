@@ -1,4 +1,5 @@
 import queue
+import random
 import socket
 import ssl
 from pathlib import Path
@@ -199,91 +200,187 @@ class ICMPManager:
         )
         return True
 
-HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED"]
+HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
+
+def _get_canonical_session_key(ip1: str, port1: int, ip2: str, port2: int) -> Tuple[str, int, str, int]:
+    """Returns a canonical key for a connection regardless of which end is src/dst."""
+    return tuple(sorted([(ip1, port1), (ip2, port2)])) # type: ignore
+
+
 class HandshakeManager:
     """
-    Tracks TCP 3-way handshakes:
-      SYN (client→server) →
-      SYN-ACK (server→client) →
-      ACK (client→server),
-    and logs when ESTABLISHED.
+    Tracks TCP 3-way handshakes and connection teardowns based on observed packets.
+    It can be initialized with references to network managers (ARP, NAT, RIP)
+    to provide broader network context, though its core function remains passive
+    TCP state tracking.
     """
-    def __init__(self, router_logger, timeout: int = 60):
+    def __init__(self, router_logger,
+                 arp_manager,      # Kept: Provides ARP context
+                 nat_manager,      # Kept: Provides NAT context
+                 rip_manager,      # Kept: Provides routing table context
+                 timeout_half_open: int = 60, timeout_established: int = 300):
         self.logger = router_logger
-        # key: (client_ip, client_port, server_ip, server_port) -> (state, last_seen_ts)
-        self._sessions: Dict[Tuple[str,int,str,int], Tuple[HandshakeState, float]] = {}
-        self._lock = threading.Lock()
-        self.timeout = timeout
 
-        # Start a cleanup thread to expire half-open handshakes
+        # Key: canonical_key -> (state, last_seen_ts, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+        self._sessions: Dict[Tuple[str,int,str,int], Tuple[HandshakeState, float, str, int, str, int]] = {}
+        self._lock = threading.Lock()
+        self.timeout_half_open = timeout_half_open
+        self.timeout_established = timeout_established
+
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeManager")
-        self._thread.start()
-        self.logger.log_message("[Handshake] Manager started.")
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
+        # Start cleanup thread immediately as it's purely passive
+        self._cleanup_thread.start()
+
+        # Stored for contextual awareness, but not directly used in passive state tracking logic
+        self.arp_manager = arp_manager
+        self.nat_manager = nat_manager
+        self.rip_manager = rip_manager
+
+        self.logger.log_message("[Handshake] Manager initialized (passive mode, with network context).")
+
+    def start(self):
+        """Ensures the cleanup thread is running. No active scan thread in passive mode."""
+        if not (self._cleanup_thread and self._cleanup_thread.is_alive()):
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
+            self._cleanup_thread.start()
+            self.logger.log_message("[Handshake] Cleanup thread started.")
+        else:
+            self.logger.log_message("[Handshake] Manager already running.")
 
     def stop(self):
+        """Stops the HandshakeManager's cleanup thread gracefully."""
         self._stop_event.set()
-        self._thread.join(timeout=2)
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=2)
         self.logger.log_message("[Handshake] Manager stopped.")
 
+
     def _cleanup_loop(self):
+        """
+        Periodically removes stale TCP sessions based on their state and last seen timestamp.
+        """
         while not self._stop_event.is_set():
             now = time.time()
             with self._lock:
-                stale = [
-                    key for key, (_, ts) in self._sessions.items()
-                    if now - ts > self.timeout
-                ]
-                for key in stale:
-                    self.logger.log_message(f"[Handshake] ❌ Session {key} timed out in state {self._sessions[key][0]}")
+                stale_keys = []
+                for key, (state, ts, _, _, _, _) in self._sessions.items():
+                    current_timeout = self.timeout_half_open if state in ["SYN_SENT", "SYN_ACK_RECEIVED"] else self.timeout_established
+                    if now - ts > current_timeout:
+                        stale_keys.append(key)
+
+                for key in stale_keys:
+                    state_at_timeout, _, src_ip, src_port, dst_ip, dst_port = self._sessions[key]
+                    self.logger.log_message(
+                        f"[Handshake] ❌ Session ({src_ip}, {src_port}, {dst_ip}, {dst_port}) timed out "
+                        f"in state {state_at_timeout}"
+                    )
                     del self._sessions[key]
-            time.sleep(self.timeout / 2)
+            # Sleep for the minimum of half-open timeout or 1/10th of established timeout
+            time.sleep(min(self.timeout_half_open / 2, self.timeout_established / 10))
 
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
         """
-        Inspect a TCP packet, update handshake state if it has SYN/ACK flags.
-        Returns True if this packet was part of a handshake (so caller can short-circuit).
+        Processes an incoming packet to update TCP session states.
+        Returns True if the packet was a TCP packet and potentially updated a session.
         """
-        if not pkt.haslayer(TCP):
+        # Ensure it's a TCP packet with an IP layer
+        if not pkt.haslayer(TCP) or not pkt.haslayer(IP):
             return False
 
-        ip = pkt[IP]; tcp = pkt[TCP]
+        ip = pkt[IP]
+        tcp = pkt[TCP]
         flags = tcp.flags
 
-        # Identify client/server tuple always as (client, server)
-        # SYN with no ACK is client→server
-        if flags == 0x02:  # SYN
-            key = (ip.src, tcp.sport, ip.dst, tcp.dport)
-            with self._lock:
-                self._sessions[key] = ("SYN_SENT", time.time())
-            self.logger.log_message(f"[Handshake] SYN from {ip.src}:{tcp.sport} to {ip.dst}:{tcp.dport}")
-            return True
+        # Use canonical key for lookup
+        canonical_key = _get_canonical_session_key(ip.src, tcp.sport, ip.dst, tcp.dport)
 
-        # SYN|ACK is server→client, so flip the tuple
-        if flags == 0x12:  # SYN+ACK
-            key = (ip.dst, tcp.dport, ip.src, tcp.sport)
-            with self._lock:
-                state = self._sessions.get(key)
-                if state and state[0] == "SYN_SENT":
-                    self._sessions[key] = ("SYN_ACK_RECEIVED", time.time())
+        with self._lock:
+            current_session = self._sessions.get(canonical_key)
+            session_state = current_session[0] if current_session else None
+            # Extract original roles for logging consistency or new session creation
+            # If current_session is None, these default to packet's src/dst
+            original_src_ip = current_session[2] if current_session else ip.src
+            original_src_port = current_session[3] if current_session else tcp.sport
+            original_dst_ip = current_session[4] if current_session else ip.dst
+            original_dst_port = current_session[5] if current_session else tcp.dport
+
+            # Get current timestamp for updating last_seen_ts
+            now = time.time()
+
+            # --- TCP State Machine Logic ---
+
+            # SYN (New connection initiation or retransmission)
+            if flags == 0x02: # SYN (just SYN flag)
+                if session_state is None:
+                    # New session: store original src/dst based on this SYN packet
+                    self._sessions[canonical_key] = ("SYN_SENT", now, ip.src, tcp.sport, ip.dst, tcp.dport)
+                    self.logger.log_message(f"[Handshake] SYN from {ip.src}:{tcp.sport} to {ip.dst}:{tcp.dport}")
+                elif session_state == "SYN_SENT": # SYN retransmission
+                    # Update timestamp to keep half-open session alive
+                    self._sessions[canonical_key] = (session_state, now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self.logger.log_message(f"[Handshake] SYN retransmission from {ip.src}:{tcp.sport}") # Optional: detailed logging
+                # No other state should receive a plain SYN that advances state
+                return True
+
+            # SYN+ACK (Server response to SYN)
+            elif flags == 0x12: # SYN+ACK (SYN and ACK flags set)
+                if session_state == "SYN_SENT":
+                    self._sessions[canonical_key] = ("SYN_ACK_RECEIVED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
                     self.logger.log_message(f"[Handshake] SYN-ACK from {ip.src}:{tcp.sport} to {ip.dst}:{tcp.dport}")
-                    return True
+                elif session_state == "SYN_ACK_RECEIVED": # SYN+ACK retransmission
+                    # Update timestamp to keep half-open session alive
+                    self._sessions[canonical_key] = (session_state, now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self.logger.log_message(f"[Handshake] SYN-ACK retransmission from {ip.src}:{tcp.sport}") # Optional: detailed logging
+                return True
 
-        # Final ACK from client
-        if flags == 0x10:  # ACK only
-            key = (ip.src, tcp.sport, ip.dst, tcp.dport)
-            with self._lock:
-                state = self._sessions.get(key)
-                if state and state[0] == "SYN_ACK_RECEIVED":
-                    self._sessions[key] = ("ESTABLISHED", time.time())
+            # ACK (Client completing handshake, data ACK, or final ACK for FIN)
+            elif flags == 0x10: # Pure ACK (only ACK flag)
+                if session_state == "SYN_ACK_RECEIVED":
+                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ✅ Connection ESTABLISHED: {ip.src}:{tcp.sport} ↔ {ip.dst}:{tcp.dport}"
+                        f"[Handshake] ✅ Connection ESTABLISHED: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}"
                     )
-                    # Optionally remove it if you only care about first-time
-                    del self._sessions[key]
-                    return True
+                elif session_state == "ESTABLISHED":
+                    # Crucially, update timestamp for ESTABLISHED data flow
+                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    # self.logger.log_message(f"[Handshake] Data packet seen on ESTABLISHED session {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}") # Optional: verbose data logging
+                elif session_state == "CLOSING":
+                    # This ACK completes a graceful close after a FIN
+                    self._sessions[canonical_key] = ("CLOSED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self.logger.log_message(f"[Handshake] ❎ Connection CLOSED (ACK after FIN): {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                    del self._sessions[canonical_key] # Remove fully closed session
+                return True
 
-        return False
+            # FIN (Initiating graceful close)
+            # Check for FIN flag being set (0x01) along with other flags (e.g., ACK)
+            elif flags & 0x01: # FIN flag is set (can be FIN, FIN+ACK, PSH+FIN+ACK, etc.)
+                if session_state == "ESTABLISHED":
+                    self._sessions[canonical_key] = ("CLOSING", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self.logger.log_message(f"[Handshake] 🔻 CLOSING initiated by {ip.src}:{tcp.sport} on {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                elif session_state == "CLOSING": # Second FIN in the exchange
+                    self._sessions[canonical_key] = ("CLOSED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self.logger.log_message(f"[Handshake] ❎ Connection CLOSED (Second FIN): {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                    del self._sessions[canonical_key] # Remove fully closed session
+                return True
+
+            # RST (Abrupt close)
+            # Check for RST flag being set (0x04)
+            elif flags & 0x04: # RST flag is set (can be RST, RST+ACK, etc.)
+                if current_session: # If we are tracking it, remove it
+                    self.logger.log_message(f"[Handshake] ❌ RST received on session {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}. Forcibly closing.")
+                    del self._sessions[canonical_key] # Remove abruptly closed session
+                return True
+
+            # For any other TCP packet on an ESTABLISHED connection (e.g., PSH|ACK for data)
+            # Ensure the timestamp is updated even if no state change occurs.
+            if current_session and current_session[0] == "ESTABLISHED":
+                self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                # self.logger.log_message(f"[Handshake] Data packet seen on ESTABLISHED session {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}") # Optional: verbose data logging
+                return True # Packet processed as part of an existing session
+
+        return False # Packet was TCP/IP but not part of a tracked state change or existing session.
+
 
 class IGMPManager:
     """
@@ -327,22 +424,16 @@ class IGMPManager:
         self.router_logger.log_message(f"[IGMP] Received {igmp_layer.type} packet on {inbound_ifname} from {src_ip} for group {group_ip}")
 
         with self._group_lock:
-            if igmp_layer.type == 0x11:  # IGMPv2 Membership Query (type 17)
-                # Routers send queries, hosts respond with reports.
-                # When receiving a query, we typically don't update our group state
-                # unless it's a specific query that confirms an existing member.
-                # For simplicity, we primarily react to reports/leaves.
+            if igmp_layer.type == 0x11:
                 self.router_logger.log_message(f"[IGMP] Received Query (Type 0x11) for {group_ip} from {src_ip}. (No state change from query itself).")
 
-            elif igmp_layer.type == 0x16: # IGMPv2 Membership Report (type 22)
-                # A host wants to join/confirm membership in a group
+            elif igmp_layer.type == 0x16:
                 key = (group_ip, inbound_ifname)
                 self._multicast_groups[key] = time.time()
                 self.router_logger.log_message(
                     f"[IGMP] ✅ Host {src_ip} reported membership in {group_ip} on {inbound_ifname}. Table updated.")
 
-            elif igmp_layer.type == 0x17: # IGMPv2 Leave Group (type 23)
-                # A host is explicitly leaving a group
+            elif igmp_layer.type == 0x17:
                 key = (group_ip, inbound_ifname)
                 if key in self._multicast_groups:
                     del self._multicast_groups[key]
@@ -359,20 +450,10 @@ class IGMPManager:
         Determines if a multicast packet for `multicast_ip` should be forwarded
         to `outbound_ifname`.
         """
-        # Always forward if the destination is the all-hosts multicast group (224.0.0.1)
-        # or if it's a specific control plane multicast like RIP (224.0.0.9).
-        # These are usually consumed locally by all devices.
-        if multicast_ip in [self.IGMP_ALL_HOSTS_GROUP, "224.0.0.9"]:
-            # If the destination is 224.0.0.1, it should be sent to all interfaces that need it,
-            # but *not* through the normal forwarding path to the WAN.
-            # For our router, if it's internal traffic for all hosts, just let it pass to the LAN,
-            # if it's for RIP, RIPManager will handle it.
-            # This method is primarily for *data plane* multicast traffic.
-            return True # Or, more nuanced: only if it's the LAN interface
 
-        # Check if this router itself is configured to receive this multicast (e.g., for RIP)
-        # This is already handled in _process_packet by RIPManager.
-        # This function focuses on forwarding to *other hosts* on an interface.
+        if multicast_ip in [self.IGMP_ALL_HOSTS_GROUP, "224.0.0.9"]:
+            return True
+
 
         with self._group_lock:
             key = (multicast_ip, outbound_ifname)
@@ -401,10 +482,6 @@ class IGMPManager:
             if cfg.get("ip_addr") is None: # Skip interfaces without an IP
                 continue
 
-            # IGMP General Query packet: Destination IP 224.0.0.1 (All Hosts)
-            # Destination MAC 01:00:5e:00:00:01 (for 224.0.0.1)
-            # Source IP should be the interface's IP
-            # IGMP type 0x11 (Query), Max Resp Code (MRC) typically 100 (10 seconds)
             igmp_packet = Ether(src=cfg["mac"], dst="01:00:5e:00:00:01") / \
                           IP(src=cfg["ip_addr"], dst=self.IGMP_ALL_HOSTS_GROUP, ttl=1) / \
                           IGMP(type=0x11, mrcode=100, gaddr="0.0.0.0") # gaddr=0.0.0.0 for General Query
@@ -741,9 +818,7 @@ class RIPManager:
             self._thread.join(timeout=2)
 
 
-import threading
-from scapy.layers.inet import IP, TCP, UDP
-from scapy.packet import Packet
+
 
 class NATManager:
     """
@@ -1124,9 +1199,9 @@ class PythonRouterManager:
         self.nat_manager = None  # Initialized after public IP is known
         self.tls_proxy_manager = TLSProxyManager(router_logger)
         self.arp_manager = ARPManager(router_logger)
-        self.handshake_manager = HandshakeManager(router_logger)
 
         self.packet_writer = PacketWriter(router_logger)
+        self.handshake_manager = None
         self.igmp_manager = IGMPManager(router_logger, self.packet_writer) # NEW: IGMP Manager
         self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self._interfaces_config)
         self.router_logger.log_message("[RouterManager] Orchestrator Initialized.")
@@ -1552,9 +1627,12 @@ class PythonRouterManager:
         """Starts a single sniffer thread for a given interface."""
         def sniffer_loop(name=iface_name):
             self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[1]} starting...")
+            capture_filter = "icmp or arp or udp or tcp"
+
             try:
                 sniff(
                     iface=name,
+                    filter=capture_filter,
                     prn=lambda pkt: self._process_packet(pkt, name),
                     store=0,
                     promisc=True,
@@ -1708,10 +1786,11 @@ class PythonRouterManager:
         self.nat_manager = NATManager(self.router_logger, self.router_ip_out)
         self.rip_manager.initialize_routes(self._interfaces_config, self.router_gateway_out_ip,
                                            self.interface_out_full_name)
-
+        self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager, self.rip_manager)
         self.rip_manager.start()
         self.tls_proxy_manager.start()
         self.packet_writer.start()
+        self.handshake_manager.start()
         self.igmp_manager.set_interfaces_config(self._interfaces_config)
         self.igmp_manager.start()
         self.router_logger.log_message("\n--- Python Router Starting Services ---")
@@ -1731,7 +1810,6 @@ class PythonRouterManager:
         for thread in self._sniff_threads.values():
             if thread.is_alive():
                 thread.join(timeout=2)
-                sel
         self._sniff_threads.clear()
         self.igmp_manager.stop()
         self.handshake_manager.stop()

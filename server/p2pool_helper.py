@@ -49,13 +49,19 @@ class P2PoolHelper:
         self.clientdata = ClientData(self.logger)
         self.event_processor = EventProcessor(self.p2pooldata, self.logger, self.p2pool_stop_event)
         self.raw_log_processor = RawLogProcessor(self.p2pooldata, self.logger, self.p2pool_stop_event)
-        self.processor = P2PoolProcessor(self.p2pooldata, self.logger)
+        self.processor = P2PoolProcessor(self.p2pooldata, self.logger, self.p2pool_stop_event)
 
         # --- Pass the dedicated network logger to the Wireshark Manager ---
         self.wireshark_manager = WiresharkManager(self.p2pooldata, self.wireshark_logger)
         self.process_manager = None
         self.packet_manager = PacketManager(self.packet_logger)
         self.router_manager = None
+
+    def set_p2pool_stop_event(self, stop_event):
+        self.p2pool_stop_event = stop_event
+        self.event_processor.stop_event = self.p2pool_stop_event
+        self.raw_log_processor.stop_event = self.p2pool_stop_event
+        self.processor.stop_event = self.p2pool_stop_event
 
     def set_gui_logger(self, gui_logger):
         """Replaces the temporary main logger with the real GUI logger."""
