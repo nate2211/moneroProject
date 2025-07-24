@@ -458,7 +458,7 @@ class P2poolData:
         self.RAW_LOG = os.path.join(self.P2POOL_DIR, "p2pool_raw_output.txt")
         self.log_queue = asyncio.Queue()
         self.logger = logger
-        self.p2pool_stop_event = None  # NEW: Initialize the stop event attribute
+        self.p2pool_stop_event = threading.Event()  # NEW: Initialize the stop event attribute
 
     def time_ago(self, timestamp):
         """Converts a Unix timestamp into a 'time ago' string."""
