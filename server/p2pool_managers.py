@@ -31,7 +31,7 @@ from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp, sendp, sniff
 from scapy.packet import Packet, bind_layers, Raw
 from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField
-from scapy.layers.inet import IP, UDP        # (already imported elsewhere, keep only one copy)
+from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict, Literal
 
 
