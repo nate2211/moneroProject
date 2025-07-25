@@ -5,7 +5,7 @@ import queue
 import threading
 import asyncio
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
-    QVBoxLayout, QHBoxLayout
+    QVBoxLayout, QHBoxLayout, QTextEdit
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer
 from p2pool_managers import PacketManager
 from p2pool_ai import GeminiChatBot
@@ -48,7 +48,7 @@ class GeminiChatWorker(QObject):
     # It can be used for other purposes if needed, or removed if strictly not required.
     finished = pyqtSignal()
 
-    def __init__(self, logger_instance: QObject, chatbot: GeminiChatBot):  # Accepts logger_instance and chatbot
+    def __init__(self, logger_instance, chatbot: GeminiChatBot):  # Accepts logger_instance and chatbot
         super().__init__()
         self.chatbot = chatbot
         self.logger = logger_instance  # Store the provided logger instance
@@ -82,7 +82,7 @@ class GeminiChatTab(QWidget):
     """
     send_message_requested = pyqtSignal(str)  # Signal to send user input to the worker
 
-    def __init__(self, gemini_logger: QObject, parent=None):  # Accepts gemini_logger instance
+    def __init__(self, gemini_logger, parent=None):  # Accepts gemini_logger instance
         super().__init__(parent)
         self.gemini_logger = gemini_logger  # Store the logger instance
 
@@ -109,11 +109,10 @@ class GeminiChatTab(QWidget):
         self._setup_worker_thread()  # This now happens AFTER chatbot_backend is initialized
 
         # Initial message for Gemini tab, logged via the consistent log_message method
-        self.log_message("[GUI] Gemini Chat Initialized. Enter your query below.", message_type="info")
 
     def _create_widgets(self):
         """Creates all the widgets for the tab."""
-        self.chat_output = QPlainTextEdit()
+        self.chat_output = QTextEdit()
         self.chat_output.setReadOnly(True)
         self.chat_output.setPlaceholderText("Gemini's responses will appear here...")
 
@@ -177,7 +176,7 @@ class GeminiChatTab(QWidget):
         # Connect GUI signal to worker slot
         self.send_message_requested.connect(self.worker.process_message)
 
-        self.worker_thread.started.connect(lambda: logger.info("GeminiChatWorker thread started."))
+        self.worker_thread.started.connect(lambda: self.gemini_logger.log_message("GeminiChatWorker thread started."))
         self.worker_thread.start()
 
     @pyqtSlot()
@@ -186,24 +185,25 @@ class GeminiChatTab(QWidget):
         user_message = self.user_input.toPlainText().strip()  # Use toPlainText() for QPlainTextEdit
         if user_message:
             # Pass only the raw message, log_message will add prefixes/styling
-            self.log_message(user_message, message_type="user")
+            self.log_message(user_message, "user")
             self.user_input.clear()
             self.send_message_requested.emit(user_message)
         else:
-            self.log_message("Please enter a non-empty message.", message_type="error")
+            self.gemini_loggerlog_message("Please enter a non-empty message.")
 
     @pyqtSlot()
     def _on_clear_history_clicked(self):
         """Clears the chat output and the chatbot's internal history."""
         self.chat_output.clear()
         self.chatbot_backend.clear_chat_history()
-        self.log_message("Chat history cleared.", message_type="info")
+        self.gemini_logger.log_message("Chat history cleared.")
 
     @pyqtSlot(str)
     def _handle_gemini_response(self, response: str):
         """
         Receives and displays Gemini's response, parsing for code blocks.
         """
+
         code_block_pattern = re.compile(r"```(?P<lang>\w*)\n(?P<code>.*?)\n```", re.DOTALL)
 
         last_idx = 0
@@ -224,7 +224,7 @@ class GeminiChatTab(QWidget):
             formatted_response_parts.append(
                 f"<div style='margin-top:10px; margin-bottom:10px;'>"  # Add vertical spacing around code block
                 f"<pre style='background-color:#2a2a2a; color:#f8f8f2; padding:15px; border-radius:8px; overflow-x:auto; border:1px solid #444;'>"
-                f"<code style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{self._escape_html(code)}</code>"
+                f"<div style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{self._escape_html(code)}</div>"
                 f"</pre>"
                 f"</div>"
             )
@@ -244,12 +244,12 @@ class GeminiChatTab(QWidget):
 
         # Join all parts and log them. log_message will now add the "Gemini:" prefix and color.
         full_html_content = "".join(formatted_response_parts)
-        self.log_message(full_html_content, message_type="gemini")
+        self.gemini_logger.log_message(full_html_content, "gemini")
 
     @pyqtSlot(str)
     def _handle_gemini_error(self, error_message: str):
         """Receives and displays error messages from the worker."""
-        self.log_message(error_message, message_type="error")
+        self.gemini_loggerlog_message(error_message, "error")
 
     # NEW: Slot for handling the timer's timeout signal to animate text
     @pyqtSlot()
@@ -313,18 +313,20 @@ class GeminiChatTab(QWidget):
         elif message_type == "error":
             prefix = "<b>ERROR:</b> "
             color = "#FF6347"  # Red
-        else:  # "info" or any other type
-            prefix = "<b>[GUI]</b> "
-            color = "#dcdcdc"  # Default light gray
 
         # Combine prefix and content.
         # The 'content' is expected to be already HTML formatted (e.g., from _handle_gemini_response)
         # or plain text that needs to be part of a larger HTML structure.
-        final_html = f"<div style='color:{color}; margin-bottom: 5px;'>{prefix}{content}</div>"
+        final_html = (
+            f"<div style='color:{color}; margin-bottom: 5px;'>{prefix}{content}</div>"
+            f"<div style='height:10px;'></div>"  # Add vertical space after each message
+        )
 
-        self.gemini_logger.log_message(final_html)
+        self.chat_output.insertHtml(final_html)
         # Scroll to the bottom after adding message
         self.chat_output.verticalScrollBar().setValue(self.chat_output.verticalScrollBar().maximum())
+
+
 class PacketSenderWorker(QObject):
     """
     This QObject worker now acts as a bridge. It receives signals from the GUI

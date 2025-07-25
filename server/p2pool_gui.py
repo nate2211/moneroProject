@@ -125,11 +125,10 @@ class RouterLogger(QObject):
 
 class GeminiLogger(QObject):
     """A dedicated logger for Gemini chat messages."""
-    message_signal = pyqtSignal(str)
+    message_signal = pyqtSignal(str, str)  # Now emits content and message_type
 
-    def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
-
-
+    def log_message(self, msg: str, message_type: str = "info"):
+        self.message_signal.emit(msg.rstrip(), message_type)
 class P2PoolGUI(QMainWindow):
     # Signals to trigger the worker thread's slots
     trigger_send_ping = pyqtSignal(str, str, str, int)
@@ -219,10 +218,9 @@ class P2PoolGUI(QMainWindow):
         self.wireshark_logger.message_signal.connect(self.wireshark_tab.log_message)
         self.packet_logger.message_signal.connect(self.packet_sender_tab.log_message)
         self.router_logger.message_signal.connect(self.router_tab.log_message)
-        # Connect GeminiLogger's signal to GeminiChatTab's chat_output.appendHtml
-        self.gemini_logger.message_signal.connect(self.gemini_chat_tab.chat_output.appendHtml)
-        # The GeminiChatTab's internal log_message method now emits to gemini_logger,
-        # which then triggers the appendHtml.
+
+        self.gemini_logger.message_signal.connect(self.gemini_chat_tab.log_message)
+
 
         self.p2pool_tab.start_p2pool_button.clicked.connect(self.start_p2pool)
         self.p2pool_tab.stop_p2pool_button.clicked.connect(self.stop_p2pool)
