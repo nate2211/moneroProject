@@ -2,15 +2,14 @@ import ctypes
 import queue
 import threading
 import asyncio
-from PyQt5.QtWidgets import QMainWindow, QTabWidget
-from PyQt5.QtCore import QObject, pyqtSignal, QThread
-from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
-    PacketSenderWorker
+from PyQt5.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
+from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, PacketSenderWorker, GeminiChatTab
 
 def is_admin():
     """Checks if the script is running with administrator privileges on Windows."""
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
+        return ctypes.windll.shell32.IsUserAdmin()
     except:
         return False
 
@@ -74,6 +73,22 @@ DARK_STYLESHEET = """
     #stop_button:hover, #stop_wireshark_button:hover, #stop_router_button:hover {
         background-color: #990000;
     }
+    #send_button, #clear_history_button { /* Styling for Gemini Chat buttons */
+        background-color: #6a5acd; /* Slate Blue */
+        color: #dcdcdc;
+        border: 1px solid #7b68ee;
+    }
+    #send_button:hover, #clear_history_button:hover {
+        background-color: #7b68ee;
+    }
+    #send_button:pressed, #clear_history_button:pressed {
+        background-color: #5a4b9c;
+    }
+    #send_button:disabled {
+        background-color: #333333;
+        color: #777777;
+        border-color: #444444;
+    }
 """
 
 
@@ -108,6 +123,12 @@ class RouterLogger(QObject):
 
     def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
 
+class GeminiLogger(QObject):
+    """A dedicated logger for Gemini chat messages."""
+    message_signal = pyqtSignal(str)
+
+    def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
+
 
 class P2PoolGUI(QMainWindow):
     # Signals to trigger the worker thread's slots
@@ -116,13 +137,14 @@ class P2PoolGUI(QMainWindow):
     trigger_send_udp_packet = pyqtSignal(str, int, bytes, str, str, int)
     trigger_send_dns_query = pyqtSignal(str, str, str, str, str, int)
 
-    def __init__(self, logger, wireshark_logger, packet_logger, router_logger, application_main_loop, p2pool_helper):
+    def __init__(self, logger, wireshark_logger, packet_logger, router_logger, gemini_logger, application_main_loop, p2pool_helper):
         super().__init__()
         # --- Core Components ---
         self.logger = logger
         self.wireshark_logger = wireshark_logger
         self.packet_logger = packet_logger
         self.router_logger = router_logger
+        self.gemini_logger = gemini_logger # Instantiate GeminiLogger
         self.helper = p2pool_helper
         self.packet_manager = self.helper.packet_manager
         self.application_main_loop = application_main_loop
@@ -155,6 +177,8 @@ class P2PoolGUI(QMainWindow):
         self.wireshark_logger.log_message("[GUI] Wireshark Log Initialized.")
         self.packet_logger.log_message("[GUI] Packet Sender Log Initialized.")
         self.router_logger.log_message("[GUI] Router Log Initialized.")
+        self.gemini_logger.log_message("<b>[GUI]</b> Gemini Chat Log Initialized.") # Initial message for Gemini tab
+
 
     def _start_main_application_worker(self):
         """Initializes and starts the background worker for the main asyncio loop."""
@@ -176,14 +200,18 @@ class P2PoolGUI(QMainWindow):
         """Creates the main tab widget and adds the modular tab widgets."""
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
+
         self.p2pool_tab = P2PoolTab()
         self.wireshark_tab = WiresharkTab()
         self.packet_sender_tab = PacketSenderTab()
         self.router_tab = RouterTab()
+        self.gemini_chat_tab = GeminiChatTab(self.gemini_logger) # Pass GeminiLogger to GeminiChatTab
+
         self.tabs.addTab(self.p2pool_tab, "P2Pool")
         self.tabs.addTab(self.wireshark_tab, "Wireshark Capture")
         self.tabs.addTab(self.packet_sender_tab, "Send Packets")
         self.tabs.addTab(self.router_tab, "Router")
+        self.tabs.addTab(self.gemini_chat_tab, "Gemini Chat") # Add the Gemini Chat tab
 
     def connect_signals(self):
         """Connects signals from UI elements to backend logic."""
@@ -191,17 +219,26 @@ class P2PoolGUI(QMainWindow):
         self.wireshark_logger.message_signal.connect(self.wireshark_tab.log_message)
         self.packet_logger.message_signal.connect(self.packet_sender_tab.log_message)
         self.router_logger.message_signal.connect(self.router_tab.log_message)
+        # Connect GeminiLogger's signal to GeminiChatTab's chat_output.appendHtml
+        self.gemini_logger.message_signal.connect(self.gemini_chat_tab.chat_output.appendHtml)
+        # The GeminiChatTab's internal log_message method now emits to gemini_logger,
+        # which then triggers the appendHtml.
+
         self.p2pool_tab.start_p2pool_button.clicked.connect(self.start_p2pool)
         self.p2pool_tab.stop_p2pool_button.clicked.connect(self.stop_p2pool)
+
         self.wireshark_tab.start_wireshark_button.clicked.connect(self.start_wireshark)
         self.wireshark_tab.stop_wireshark_button.clicked.connect(self.stop_wireshark)
+
         self.router_tab.start_router_button.clicked.connect(self.start_router)
         self.router_tab.stop_router_button.clicked.connect(self.stop_router)
+
         self.packet_sender_tab.send_ping_requested.connect(self.trigger_send_ping)
         self.packet_sender_tab.send_tcp_syn_requested.connect(self.trigger_send_tcp_syn)
         self.packet_sender_tab.send_udp_requested.connect(self.trigger_send_udp_packet)
         self.packet_sender_tab.send_dns_requested.connect(self.trigger_send_dns_query)
         self.packet_sender_tab.populate_interfaces(self.packet_manager.get_interfaces())
+
 
     def _start_packet_sender_system(self):
         """Initializes and starts the entire packet sending system."""
@@ -239,7 +276,8 @@ class P2PoolGUI(QMainWindow):
         else:
             self.packet_logger.log_message("=" * 60)
             self.packet_logger.log_message("WARNING: Application not running as Administrator.")
-            self.packet_logger.log_message("Packet sending functionality has been disabled to prevent crashes.")
+            self.packet_logger.log_message(
+                "Packet sending functionality has been disabled to prevent crashes.")
             self.packet_logger.log_message(
                 "Please restart the application with 'Run as Administrator' to use this tab.")
             self.packet_logger.log_message("=" * 60)
@@ -305,23 +343,38 @@ class P2PoolGUI(QMainWindow):
             self.router_logger.log_message("[GUI] Router manager not available.")
 
     def closeEvent(self, event):
-        """Ensures all worker threads are cleaned up on exit."""
+        """Ensures all worker threads are cleanly shut down on application exit."""
         self.logger.log_message("[GUI] Closing. Signaling all services to shut down...")
 
-        # Stop main background worker
+        # 1. Signal the main application's async loop to stop
         if self.main_worker_stop_event:
             self.main_worker_stop_event.set()
+            self.logger.log_message("[GUI] Main application stop event signaled.")
 
-        # Stop packet sending system
-        if self.packet_sending_thread:
-            self.packet_request_queue.put((None, None))  # Send sentinel to stop the thread
-            self.packet_sending_thread.join(timeout=2)
-        if self.packet_sender_qthread:
+        # 2. Stop Packet Sending System threads
+        if self.packet_sending_thread and self.packet_sending_thread.is_alive():
+            self.packet_request_queue.put((None, None))  # Send sentinel to stop the blocking thread
+            self.packet_sending_thread.join(timeout=5) # Give it 5 seconds to finish
+            if self.packet_sending_thread.is_alive():
+                self.logger.warning("[GUI] Packet sending thread did not terminate gracefully.")
+        if self.packet_sender_qthread and self.packet_sender_qthread.isRunning():
             self.packet_sender_qthread.quit()
-            self.packet_sender_qthread.wait()
+            self.packet_sender_qthread.wait(5000) # Wait up to 5 seconds
+            if self.packet_sender_qthread.isRunning():
+                self.logger.warning("[GUI] Packet sender QThread did not terminate gracefully.")
 
-        # Wait for main background thread to finish
+        # 3. Stop Gemini Chat worker thread
+        if self.gemini_chat_tab.worker_thread and self.gemini_chat_tab.worker_thread.isRunning():
+            self.gemini_chat_tab.worker_thread.quit()
+            self.gemini_chat_tab.worker_thread.wait(5000) # Wait up to 5 seconds for thread to finish
+            if self.gemini_chat_tab.worker_thread.isRunning():
+                self.logger.warning("[GUI] Gemini Chat worker thread did not terminate gracefully.")
+
+        # 4. Wait for the main background thread (AsyncWorker) to finish
         if self.background_thread and self.background_thread.isRunning():
-            self.background_thread.wait()
+            self.background_thread.wait(5000) # Wait up to 5 seconds
+            if self.background_thread.isRunning():
+                self.logger.warning("[GUI] Main application background thread did not terminate gracefully.")
 
+        self.logger.log_message("[GUI] All GUI-managed threads cleanup attempted.")
         event.accept()
