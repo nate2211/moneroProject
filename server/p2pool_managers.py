@@ -30,10 +30,172 @@ from scapy.layers.inet import TCP, IP, ICMP, UDP
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp, sendp, sniff
 from scapy.packet import Packet, bind_layers, Raw
-from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField
+from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, Field, BitField, XByteField, \
+    FieldLenField, StrFixedLenField, FlagsField
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict, Literal
 
+
+
+class IP6Field(Field):
+    """Custom Scapy field for handling IPv6 addresses."""
+
+    def __init__(self, name, default):
+        Field.__init__(self, name, default, "16s")
+
+    def i2m(self, pkt, x):
+        if x is None:
+            return b"\0" * 16
+        return socket.inet_pton(socket.AF_INET6, x)
+
+    def m2i(self, pkt, x):
+        return socket.inet_ntop(socket.AF_INET6, x)
+
+
+class IPv6(Packet):
+    name = "IPv6"
+    fields_desc = [
+        BitField("version", 6, 4),
+        BitField("tc", 0, 8),  # Traffic Class
+        BitField("fl", 0, 20),  # Flow Label
+        ShortField("plen", None),  # Payload Length
+        XByteField("nh", 0),  # Next Header
+        ByteField("hlim", 64),  # Hop Limit
+        IP6Field("src", "::1"),
+        IP6Field("dst", "::1"),
+    ]
+
+    def post_build(self, p, pay):
+        # Calculate payload length if not specified
+        if self.plen is None:
+            self.plen = len(pay)
+        return p + pay
+
+
+# --- ICMPv6 Base and Common Types ---
+class ICMPv6(Packet):
+    name = "ICMPv6"
+    fields_desc = [
+        ByteField("type", 128),  # Echo Request
+        ByteField("code", 0),
+        ShortField("cksum", None),
+    ]
+
+    def post_build(self, p, pay):
+        # ICMPv6 checksum calculation requires a pseudo-header
+        if self.cksum is None and self.underlayer and isinstance(self.underlayer, IPv6):
+            ip = self.underlayer
+            # Pseudo-header: src, dst, upper-layer packet length, 3 bytes zero, next header
+            psd_hdr = ip.src.encode() + ip.dst.encode() + len(p).to_bytes(4, 'big') + b'\x00\x00\x00' + ip.nh.to_bytes(1,
+                                                                                                                    'big')
+            # Scapy's in4_chksum can be used for the calculation logic
+            from scapy.layers.inet import in4_chksum
+            cksum = in4_chksum(psd_hdr + p + pay)
+            p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
+        return p + pay
+
+
+class ICMPv6EchoRequest(Packet):
+    name = "ICMPv6 Echo Request"
+    fields_desc = [
+        ShortField("id", 0),
+        ShortField("seq", 0),
+        Raw("data", b"")
+    ]
+
+
+class ICMPv6EchoReply(ICMPv6EchoRequest):
+    name = "ICMPv6 Echo Reply"
+
+
+# --- ICMPv6 Neighbor Discovery Protocol (NDP) ---
+class ICMPv6ND_Option(Packet):
+    name = "ICMPv6 ND Option"
+    fields_desc = [
+        ByteField("type", 1),  # 1: Source Link-Layer, 2: Target Link-Layer
+        FieldLenField("len", None, length_of="lladdr", fmt="B"),
+        StrFixedLenField("lladdr", "", length=6)  # Link-Layer Address (MAC)
+    ]
+
+
+class ICMPv6ND_NS(Packet):
+    name = "ICMPv6 Neighbor Solicitation"
+    fields_desc = [
+        IntField("res", 0),  # Reserved
+        IP6Field("tgt", "::"),  # Target Address
+        PacketListField("options", [], ICMPv6ND_Option, length_from=lambda pkt: pkt.underlayer.plen - 24)
+    ]
+
+
+class ICMPv6ND_NA(Packet):
+    name = "ICMPv6 Neighbor Advertisement"
+    fields_desc = [
+        FlagsField("flags", 0, 32, "RSO"),  # R:Router, S:Solicited, O:Override
+        IP6Field("tgt", "::"),  # Target Address
+        PacketListField("options", [], ICMPv6ND_Option, length_from=lambda pkt: pkt.underlayer.plen - 24)
+    ]
+
+
+class ICMPv6ND_RA_Option(Packet):
+    name = "ICMPv6 ND RA Option"
+    fields_desc = [
+        ByteField("type", 3),  # 3: Prefix Information
+        FieldLenField("len", None, length_of="prefix", fmt="B"),
+        ByteField("prefixlen", 64),
+        FlagsField("flags", 0, 8, "LA"),  # L:On-Link, A:Autonomous
+        IntField("validlifetime", 2592000),  # 30 days
+        IntField("preflifetime", 604800),  # 7 days
+        IntField("res2", 0),
+        IP6Field("prefix", "::")
+    ]
+
+
+class ICMPv6ND_RA(Packet):
+    name = "ICMPv6 Router Advertisement"
+    fields_desc = [
+        ByteField("chlim", 64),  # Current Hop Limit
+        FlagsField("flags", 0, 8, "MOP"),  # M:Managed, O:Other, P:Proxy
+        ShortField("routerlifetime", 1800),  # seconds
+        IntField("reachtime", 0),
+        IntField("retranstimer", 0),
+        PacketListField("options", [], ICMPv6ND_RA_Option, length_from=lambda pkt: pkt.underlayer.plen - 16)
+    ]
+
+
+# --- RIPng (for IPv6) ---
+class RIPngEntry(Packet):
+    name = "RIPng Entry"
+    fields_desc = [
+        IP6Field("prefix", "::"),
+        ShortField("route_tag", 0),
+        ByteField("prefix_len", 0),
+        ByteField("metric", 1)
+    ]
+
+
+class RIPng(Packet):
+    name = "RIPng"
+    fields_desc = [
+        ByteField("command", 2),  # 1=request, 2=response
+        ByteField("version", 1),
+        ShortField("unused", 0),
+        PacketListField("entries", [], RIPngEntry)
+    ]
+
+# --- Layer Bindings ---
+bind_layers(Ether, IPv6, type=0x86DD)
+bind_layers(IPv6, ICMPv6, nh=58)
+bind_layers(IPv6, TCP, nh=6)
+bind_layers(IPv6, UDP, nh=17)
+bind_layers(ICMPv6, ICMPv6EchoRequest, type=128)
+bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
+bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
+bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
+bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
+bind_layers(UDP, RIPng, dport=521)
+bind_layers(UDP, RIPng, sport=521)
+
+# endregion
 
 
 class RIPEntry(Packet):
@@ -128,8 +290,11 @@ class PacketWriter:
             # Special handling for loopback: Scapy might not need Ether layer or dst MAC
             is_loopback_iface = "loopback" in interface.lower() or "lo" == interface.lower()  # More precise check for 'lo'
 
-            if packet.haslayer(IP):
-                dst_ip_obj = ipaddress.ip_address(packet[IP].dst)
+            if packet.haslayer(IP) or packet.haslayer(IPv6):
+                if packet.haslayer(IP):
+                    dst_ip_obj = ipaddress.ip_address(packet[IP].dst)
+                else:
+                    dst_ip_obj = ipaddress.ip_address(packet[IPv6].dst)
 
                 if not (
                         dst_ip_obj.is_global or dst_ip_obj.is_private or dst_ip_obj.is_multicast or dst_ip_obj.is_loopback):
@@ -390,10 +555,10 @@ class HandshakeManager:
         Returns True if the packet was a TCP packet and potentially updated a session.
         """
         # Ensure it's a TCP packet with an IP layer
-        if not pkt.haslayer(TCP) or not pkt.haslayer(IP):
+        if not pkt.haslayer(TCP) or not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
             return False
 
-        ip = pkt[IP]
+        ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
         tcp = pkt[TCP]
         flags = tcp.flags
 
@@ -2243,7 +2408,8 @@ class OutboundLoadBalancer:
                 return self._outbound_interfaces[0]
 
             # Hash based on source IP, destination IP, and optionally ports for TCP/UDP
-            hash_components = [packet[IP].src, packet[IP].dst]
+            ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+            hash_components = [ip_layer.src, ip_layer.dst]
             if packet.haslayer(TCP):
                 hash_components.extend([packet[TCP].sport, packet[TCP].dport])
             elif packet.haslayer(UDP):
@@ -2255,7 +2421,7 @@ class OutboundLoadBalancer:
             selected_iface = self._outbound_interfaces[selected_index]
 
             self.logger.log_message(
-                f"[OutboundLB] Selected interface {selected_iface.split('_')[-1]} for flow {packet[IP].src} -> {packet[IP].dst}.")
+                f"[OutboundLB] Selected interface {selected_iface.split('_')[-1]} for flow {ip_layer.src} -> {ip_layer.dst}.")
             return selected_iface
 
     def get_configured_interfaces(self) -> List[str]:
@@ -2343,7 +2509,8 @@ class LinkAggregationManager:
                 return active_members[0]
 
             # Hash based on source IP, destination IP, and optionally ports for TCP/UDP
-            hash_components = [packet[IP].src, packet[IP].dst]
+            ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+            hash_components = [ip_layer.src, ip_layer.dst]
             if packet.haslayer(TCP):
                 hash_components.extend([packet[TCP].sport, packet[TCP].dport])
             elif packet.haslayer(UDP):
@@ -2354,7 +2521,7 @@ class LinkAggregationManager:
             selected_member = active_members[selected_index]
 
             self.logger.log_message(
-                f"[LAG] Selected member {selected_member.split('_')[-1]} for LAG '{lag_name}' flow {packet[IP].src} -> {packet[IP].dst}.")
+                f"[LAG] Selected member {selected_member.split('_')[-1]} for LAG '{lag_name}' flow {ip_layer.src} -> {ip_layer.dst}.")
             return selected_member
 
     def get_lag_members(self) -> Dict[str, List[str]]:
@@ -2475,10 +2642,10 @@ class FirewallManager:
         Processes a packet against the firewall rules.
         Returns True if the packet is permitted, False if denied.
         """
-        if not packet.haslayer(IP):
+        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
             return True  # Non-IP packets are not filtered by this firewall (e.g., ARP)
 
-        ip_layer = packet[IP]
+        ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
 
@@ -3145,7 +3312,7 @@ class PythonRouterManager:
         """Main packet processing pipeline."""
         try:  # Added try-except block for general packet processing errors
             # 0. Initial check for IP layer and ARP
-            if not packet.haslayer(IP) and not packet.haslayer(ARP):
+            if not (packet.haslayer(IP) or packet.haslayer(IPv6) or packet.haslayer(ARP)):
                 return  # Not an IP or ARP packet, ignore
 
             # 1. ARP Snooping/Inspection (early drop if malicious)
@@ -3160,7 +3327,7 @@ class PythonRouterManager:
                 return
 
             # From here on, we expect an IP packet
-            if not packet.haslayer(IP):
+            if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
                 return  # Should not happen if previous check passed, but defensive
 
             self.router_logger.log_message(f"CAPTURED on {inbound_iface.split('_')[-1]}: {packet.summary()}")
@@ -3202,7 +3369,8 @@ class PythonRouterManager:
                     return  # IGMP packets are usually processed locally, not forwarded
 
             # If not for the router, it's transit traffic to be forwarded
-            dst_ip = packet[IP].dst
+            ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+            dst_ip = ip_layer.dst
             router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
             is_for_router = any(dst_ip == ip for ip in router_ips)
 
@@ -3229,7 +3397,7 @@ class PythonRouterManager:
 
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT and other rules."""
-        ip_layer = packet.getlayer(IP)
+        ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
         dst_ip = ip_layer.dst
 
         if ip_layer.ttl <= 1:
