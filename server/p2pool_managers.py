@@ -7,6 +7,7 @@ import random
 import socket
 import ssl
 import traceback
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Set
 from pathlib import Path
@@ -3060,7 +3061,7 @@ class FirewallManager:
                         self.logger.log_message(f"[Firewall] ✅ Packet permitted by rule {i}: {rule}")
                         return True
                     else:  # deny
-                        self.logger.log_message(f"[Firewall] 🚫 Packet DENIED by rule {i}: {rule}")
+                        self.logger.log_message(f"[Firewall] 🔥 Packet DENIED by rule {i}: {rule}")
                         return False
 
             return True
@@ -3260,10 +3261,14 @@ class PythonRouterManager:
             action='permit', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr,
             src_port='any', dst_port='1024-65535'
         )
-        # Rule 6: Deny all other inbound traffic to the LAN (deny by default)
         self.firewall_manager.add_rule(
-            action='deny', protocol='any', src_ip='any', dst_ip=lan_network_cidr,
-            src_port='any', dst_port='any'
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=22,
+        )
+        self.firewall_manager.add_rule(
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=3389,
+        )
+        self.firewall_manager.add_rule(
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=445,
         )
     def _remove_firewall_rules(self):
         """Removes any firewall rules added by this router."""
@@ -3649,19 +3654,21 @@ class PythonRouterManager:
 
     def _enable_nat_forwarding(self):
         """
-        Enables NAT forwarding using PowerShell's New-NetNat.
-        This allows traffic from the IN network to be translated and sent out the OUT interface.
+        Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
+        This makes the operation idempotent and resilient to crashes.
         """
         if not self.router_network_in:
             self.router_logger.log_message("[NAT Setup] ⚠️ Cannot enable NAT: IN network is not configured.")
             return
 
+        # --- Step 1: Unconditionally clean up any previous NAT rules ---
+        # This prevents errors caused by stale configurations from a previous run.
+        self._disable_nat_forwarding()
+
+        # --- Step 2: Create the new NAT rule ---
         lan_network_cidr = str(self.router_network_in)
         self.router_logger.log_message(f"[NAT Setup] 🚀 Enabling NAT for network {lan_network_cidr}...")
 
-        # The PowerShell command to create the NAT rule.
-        # -Name is a unique identifier for our rule.
-        # -InternalIPInterfaceAddressPrefix is the LAN subnet that needs internet access.
         ps_command = [
             "powershell.exe",
             "-Command",
@@ -3669,21 +3676,18 @@ class PythonRouterManager:
         ]
 
         try:
-            # We run this command. It requires administrator privileges.
+            # Run the command. It requires administrator privileges.
             result = subprocess.run(ps_command, capture_output=True, text=True, check=True,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
             self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding enabled successfully.")
             if result.stdout:
                 self.router_logger.log_message(f"[NAT Setup] PowerShell output: {result.stdout.strip()}")
+
         except subprocess.CalledProcessError as e:
-            # This error often happens if the rule already exists from a previous crashed run.
-            # We can try to remove it and re-add it.
-            if "already exists" in e.stderr:
-                self.router_logger.log_message("[NAT Setup] ⚠️ NAT rule already exists. Cleaning up and recreating...")
-                self._disable_nat_forwarding()  # Clean up the old rule
-                self._enable_nat_forwarding()  # Try again
-            else:
-                self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT: {e.stderr.strip()}")
+            # After the cleanup step, an error here indicates a more serious problem.
+            self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
+            self.router_logger.log_message(
+                "[NAT Setup] ℹ️ Please ensure this script is run with Administrator privileges.")
         except FileNotFoundError:
             self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
         except Exception as e:
@@ -3793,7 +3797,7 @@ class PythonRouterManager:
             # 4. Firewall Check
             self.router_logger.log_message(f"[Firewall] 🔍 Inspecting packet on {iface_short}")
             if not self.firewall_manager.process_packet(packet):
-                self.router_logger.log_message(f"[Firewall] ❌ Blocked packet on {iface_short}")
+                self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
 
             # 5. ICMP Handling
@@ -3927,7 +3931,7 @@ class PythonRouterManager:
         if ipaddress.ip_address(dst_ip).is_multicast:
             if not self.igmp_manager.should_forward_multicast(dst_ip, actual_outbound_iface):
                 self.router_logger.log_message(
-                    f"-> Dropping multicast {dst_ip} on {actual_outbound_iface.split('_')[-1]}: No active members.")
+                    f"[Router] -> Dropping multicast {dst_ip} on {actual_outbound_iface.split('_')[-1]}: No active members.")
                 return  # Do not forward if no members
 
         self.router_logger.log_message(
@@ -5207,35 +5211,62 @@ class AsyncNmapManager:
             self.stdout_capture.append(line)
         stream.close()
 
-    async def _run_scan(self, targets, arguments):
-        self.logger.log_message("[Nmap] 🚀 Preparing interactive scan with captured output...")
+    async def _run_scan(self, targets: List[str], arguments: List[str]) -> str:
+        """
+        Runs an Nmap scan asynchronously within WSL, allowing for interactive sudo password entry.
 
-        # Resolve Nmap path inside WSL
-        self.nmap_wsl_path = await self._get_wsl_path_for_windows_path(
-            Path(self.tools_dir) / "usr" / "bin" / "nmap"
-        )
+        Args:
+            targets: A list of target IP addresses or hostnames.
+            arguments: A list of Nmap command-line arguments.
+
+        Returns:
+            A string containing the Nmap XML output or an <error> tag on failure.
+        """
+        self.logger.log_message("[Nmap] 🚀 Preparing interactive scan...")
+
+        # 1. Resolve Nmap path.
         if not self.nmap_wsl_path:
-            return "<error>Could not resolve Nmap path inside WSL.</error>"
+            nmap_windows_path = self.tools_dir / "usr" / "bin" / "nmap"
+            self.nmap_wsl_path = await self._get_wsl_path_for_windows_path(nmap_windows_path)
+            if not self.nmap_wsl_path:
+                error_msg = "Could not resolve Nmap path inside WSL."
+                self.logger.log_message(f"[Nmap] ❌ {error_msg}")
+                return f"<error>{error_msg}</error>"
 
-        output_path = "/tmp/nmap_output.xml"
+        # 2. Prepare commands for interactive session.
+        # Use a unique filename in /tmp for the output to avoid collisions.
+        output_filename = f"nmap_output_{uuid.uuid4()}.xml"
+        output_path = f"/tmp/{output_filename}"
         all_targets = " ".join(targets)
-        nmap_cmd = f"sudo {self.nmap_wsl_path} {' '.join(arguments)} -oX {output_path} {all_targets}"
-        script_cmd = f"script -q -c \"{nmap_cmd}\" /dev/tty"
 
-        command = [self.wsl_path, "bash", "-c", script_cmd]
-        self.logger.log_message(f"[Nmap] 🚀 Full WSL command: {' '.join(command)}")
+        # The Nmap command saves output to the temp file.
+        nmap_cmd = f"sudo {self.nmap_wsl_path} {' '.join(arguments)} -oX {output_path} {all_targets}"
+
+        # 'script' is used to force TTY allocation, which sudo requires for password prompts.
+        # The output of 'script' itself is sent to /dev/null.
+        script_cmd = f"script -q -c '{nmap_cmd}' /dev/null"
+
+        # The final command to be run in a new console window.
+        interactive_command = [self.wsl_path, "bash", "-c", script_cmd]
+        self.logger.log_message(f"[Nmap] 🚀 Launching interactive console for command: {script_cmd}")
 
         try:
-            self._scan_process = subprocess.Popen(
-                command,
+            # 3. Launch the interactive scan in a new console window.
+            # We don't pipe stdio, allowing direct user interaction.
+            self._scan_process = await asyncio.create_subprocess_exec(
+                *interactive_command,
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
+            return_code = await self._scan_process.wait()
 
+            if return_code != 0:
+                error_msg = f"Scan process exited with code {return_code}. Check the console window for details."
+                self.logger.log_message(f"[Nmap] ❌ {error_msg}")
+                return f"<error>{error_msg}</error>"
 
+            self.logger.log_message("[Nmap] ✅ Interactive scan completed. Fetching results...")
 
-            self._scan_process.wait()
-
-
+            # 4. Read the XML output from the temporary file in WSL.
             read_command = [self.wsl_path, "cat", output_path]
             read_proc = await asyncio.create_subprocess_exec(
                 *read_command,
@@ -5245,27 +5276,35 @@ class AsyncNmapManager:
             stdout, stderr = await read_proc.communicate()
 
             if read_proc.returncode != 0:
-                error_msg = stderr.decode().strip()
-                self.logger.log_message(f"[Nmap] ❌ Failed to read output: {error_msg}")
-                return f"<error>Failed to read output file: {error_msg}</error>"
+                error_msg = stderr.decode(errors='ignore').strip()
+                self.logger.log_message(f"[Nmap] ❌ Failed to read output file: {error_msg}")
+                return f"<error>Failed to read Nmap output file: {error_msg}</error>"
 
             xml_output = stdout.decode()
-            self.logger.log_message(f"[Nmap-DBG] XML output size: {len(xml_output)}")
+            self.logger.log_message(f"[Nmap-DBG] XML output size: {len(xml_output)} bytes.")
 
+            # 5. Validate XML.
             try:
                 ET.fromstring(xml_output)
                 self.logger.log_message("[Nmap] ✅ XML output successfully validated.")
             except ET.ParseError as e:
                 self.logger.log_message(f"[Nmap] ⚠️ XML parse error: {e}")
-                return f"<error>Malformed XML output: {e}</error>"
+                return f"<error>Malformed XML output received from Nmap: {e}</error>"
 
             return xml_output
 
+        except FileNotFoundError:
+            self.logger.log_message("[Nmap] 💥 Critical Error: wsl.exe not found.")
+            return "<error>wsl.exe not found. Please ensure WSL is installed and in your PATH.</error>"
         except Exception as e:
-            self.logger.log_message(f"[Nmap] 💥 Exception during scan: {e}")
-            return f"<error>Scan failed with exception: {e}</error>"
-
+            self.logger.log_message(f"[Nmap] 💥 An unexpected exception occurred: {e}")
+            return f"<error>Scan failed with an unexpected exception: {e}</error>"
         finally:
+            # 6. Clean up the temporary file from WSL.
+            self.logger.log_message(f"[Nmap] 🧹 Cleaning up temporary file: {output_path}")
+            cleanup_command = [self.wsl_path, "rm", "-f", output_path]
+            await asyncio.create_subprocess_exec(*cleanup_command)
+
             self._scan_process = None
             self.logger.log_message("[Nmap] ✅ Scan complete.")
     def _find_wsl_executable(self):

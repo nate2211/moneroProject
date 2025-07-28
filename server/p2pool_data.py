@@ -56,7 +56,7 @@ class P2PoolProcessor:
         # Store the IP P2Pool is currently bound to
         self.current_stratum_bind_ip = None
         self.stop_event = stop_event
-
+        self.proc_lock = asyncio.Lock()
     def strip_ansi_codes(self, text: str) -> str:
         """Removes ANSI escape codes from a string."""
         ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
@@ -195,31 +195,34 @@ class P2PoolProcessor:
         """
         Stops the P2Pool process gracefully and cleans up monitoring tasks.
         """
-        if not self.p2pool_data.p2pool_proc or self.p2pool_data.p2pool_proc.returncode is not None:
-            self.logger.log_message("[!] P2Pool is not running.")
-            return
+        # Acquire the lock to ensure atomicity
+        async with self.proc_lock:
+            if not self.p2pool_data.p2pool_proc or self.p2pool_data.p2pool_proc.returncode is not None:
+                self.logger.log_message("[!] P2Pool is not running.")
+                return
 
-        self.logger.log_message("[!] Attempting to terminate P2Pool process...")
-        try:
-            # Signal background tasks to stop
-            if self.redirect_task and not self.redirect_task.done():
-                self.redirect_task.cancel()
-            if self.monitor_task and not self.monitor_task.done():
-                self.monitor_task.cancel()
+            self.logger.log_message("[!] Attempting to terminate P2Pool process...")
+            try:
+                # Signal background tasks to stop
+                if self.redirect_task and not self.redirect_task.done():
+                    self.redirect_task.cancel()
+                if self.monitor_task and not self.monitor_task.done():
+                    self.monitor_task.cancel()
 
-            self.p2pool_data.p2pool_proc.terminate()
-            await asyncio.wait_for(self.p2pool_data.p2pool_proc.wait(), timeout=5.0)
-            self.p2pool_data.log_event_now("P2Pool Process", "P2Pool process ended successfully")
-            self.logger.log_message("[+] P2Pool process terminated gracefully.")
-        except asyncio.TimeoutError:
-            self.logger.log_message("[!] P2Pool did not terminate gracefully, forcing kill.")
-            self.p2pool_data.p2pool_proc.kill()
-            await self.p2pool_data.p2pool_proc.wait()
-        except Exception as e:
-            self.logger.log_message(f"[!] Error stopping P2Pool: {e}")
-        finally:
-            self.psutil_proc = None  # Corrected line
-            self.p2pool_data.p2pool_proc = None
+                self.p2pool_data.p2pool_proc.terminate()
+                await asyncio.wait_for(self.p2pool_data.p2pool_proc.wait(), timeout=5.0)
+                self.p2pool_data.log_event_now("P2Pool Process", "P2Pool process ended successfully")
+                self.logger.log_message("[+] P2Pool process terminated gracefully.")
+            except asyncio.TimeoutError:
+                self.logger.log_message("[!] P2Pool did not terminate gracefully, forcing kill.")
+                self.p2pool_data.p2pool_proc.kill()
+                await self.p2pool_data.p2pool_proc.wait()
+            except Exception as e:
+                self.logger.log_message(f"[!] Error stopping P2Pool: {e}")
+            finally:
+                # Clean up resources
+                self.psutil_proc = None
+                self.p2pool_data.p2pool_proc = None
 
     async def _redirect_output(self, stop_event: threading.Event):  # Added stop_event parameter
         """Asynchronously reads stdout and writes it to the raw log file."""
@@ -255,18 +258,16 @@ class P2PoolProcessor:
 
     async def write_to_stdin(self, command: str) -> bool:
         """Asynchronously writes a command to the process's stdin."""
-        # Get a local, stable reference to the process object
-        proc = self.p2pool_data.p2pool_proc
-
-        if proc and proc.stdin:
-            try:
-                proc.stdin.write(f"{command}\n".encode('utf-8'))
-                await proc.stdin.drain()
-                return True
-            # Catch AttributeError in case 'proc' becomes None after the initial check
-            except (BrokenPipeError, ConnectionResetError, OSError, AttributeError) as e:
-                self.p2pool_data.log_event_now("P2Pool Process", f"Error writing to stdin: {e}")
-                return False
+        async with self.proc_lock:
+            proc = self.p2pool_data.p2pool_proc
+            if proc and proc.stdin and not proc.stdin.is_closing():
+                try:
+                    proc.stdin.write(f"{command}\n".encode('utf-8'))
+                    await proc.stdin.drain()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    self.p2pool_data.log_event_now("P2Pool Process", f"Error writing to stdin: {e}")
+                    return False
         return False
 
 
