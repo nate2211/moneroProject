@@ -1,0 +1,13 @@
+[2025-07-22 23:58:58.177] --- Application Starting ---
+[2025-07-22 23:58:58.177] Step 1: Initial imports processed.
+[2025-07-22 23:58:58.192] Step 2: PyQt5 imported successfully.
+[2025-07-22 23:58:58.285] Step 3: xmrig_gui imported successfully.
+[2025-07-22 23:58:58.303] Step 4: xmrig_miner imported successfully.
+[2025-07-22 23:58:58.568] Step 5: xmrig_data imported successfully.
+[2025-07-22 23:58:58.568] Step 6: Configuring Windows sleep prevention.
+[2025-07-22 23:58:58.568] Step 7: Windows sleep prevention set.
+[2025-07-22 23:59:00.132] Step 13: XmrigMiner initialized.
+[2025-07-22 23:59:00.132] Step 14: Starting HardwareMonitor thread...
+[2025-07-22 23:59:00.141] Step 15: HardwareMonitor thread started.
+[2025-07-22 23:59:00.451] Step 16: MinerGui initialized.
+[2025-07-22 23:59:00.452] Step 17: GUI shown. Entering event loop.

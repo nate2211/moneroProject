@@ -26,7 +26,7 @@ class GeminiChatBot:
         url_context_tool = Tool(
             url_context=types.UrlContext()
         )
-        code_execution = types.Tool(code_execution=types.ToolCodeExecution())
+
         grounding_tool = types.Tool(
             google_search=types.GoogleSearch()
         )
@@ -37,7 +37,7 @@ class GeminiChatBot:
                     top_k=40,  # Limits number of tokens to sample from
                     max_output_tokens=65536,  # Max length of response
                     stop_sequences=[],  # List of strings where generation should stop
-                    tools=[url_context_tool, code_execution, grounding_tool],
+                    tools=[url_context_tool, grounding_tool],
                     response_modalities=["TEXT"],
                 )
 

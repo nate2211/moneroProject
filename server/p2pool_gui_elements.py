@@ -1,16 +1,25 @@
 import logging
+import os
 import re
+import webbrowser
 from typing import List
 import queue
 import threading
 import asyncio
+from urllib.parse import urljoin, urlparse
+
+import requests
+from PyQt5.QtGui import QTextCursor, QIcon
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
-    QVBoxLayout, QHBoxLayout, QTextEdit
-from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer
-from p2pool_managers import PacketManager
+    QVBoxLayout, QHBoxLayout, QTextEdit, QListWidget, QCheckBox, QTreeWidgetItem, QTreeWidget, QTabWidget, QHeaderView, \
+    QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem
+from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer, Qt
+from p2pool_managers import PacketManager, AsyncNmapManager, AsyncGobusterManager, AsyncScrapingManager
 from p2pool_ai import GeminiChatBot
-
-
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name, guess_lexer
+from pygments.formatters import HtmlFormatter
+import xml.etree.ElementTree as ET
 class AsyncWorker(QObject):
     finished = pyqtSignal()
     started = pyqtSignal()
@@ -19,17 +28,961 @@ class AsyncWorker(QObject):
         super().__init__()
         self.stop_event = stop_event
         self.main_loop = main_loop
-
+        self.loop = None
     def run(self):
         self.started.emit()
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.main_loop(self.stop_event))
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self.main_loop(self.stop_event))
         except Exception as e:
             print(f"CRITICAL ERROR in application thread: {e}")
         finally:
             self.finished.emit()
+class ScrapingTab(QWidget):
+    """
+    A PyQt widget for a web scraping tool, integrating with AsyncScrapingManager.
+    Includes interactive features for extracted links.
+    """
+    initialization_finished_signal = pyqtSignal()
+    scraping_finished_signal = pyqtSignal(dict)
+    scraping_progress_signal = pyqtSignal(str)
+
+    def __init__(self, logger, async_worker_loop, parent=None):
+        super().__init__(parent)
+        self.logger = logger
+        self.async_loop = async_worker_loop
+
+
+        self.scraping_manager = AsyncScrapingManager(self.logger, self.async_loop)
+
+        self._init_ui()
+        self._setup_logging_and_signals()
+        self._update_controls_enabled(False)
+
+        self._on_initialize_manager()
+
+    def _init_ui(self):
+        main_layout = QGridLayout(self)
+        self.setLayout(main_layout)
+
+        # Status
+        status_groupbox = QGroupBox("Scraper Status")
+        status_layout = QVBoxLayout(status_groupbox)
+        self.status_label = QLabel("Status: Initializing...")
+        self.progress_label = QLabel("Progress: Idle")
+        status_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.progress_label)
+        main_layout.addWidget(status_groupbox, 0, 0, 1, 2)
+
+        # URL Input
+        url_input_groupbox = QGroupBox("Target URL")
+        url_input_layout = QHBoxLayout(url_input_groupbox)
+        self.url_input = QLineEdit("https://www.google.com")
+        self.scrape_button = QPushButton("🚀 Start Scrape")
+        self.stop_button = QPushButton("⏹️ Stop Scrape")
+        url_input_layout.addWidget(self.url_input)
+        url_input_layout.addWidget(self.scrape_button)
+        url_input_layout.addWidget(self.stop_button)
+        main_layout.addWidget(url_input_groupbox, 0, 2, 1, 2)
+
+        # Output
+        self.output_tabs = QTabWidget()
+        self.output_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.rendered_view_display = QTextEdit()
+        self.rendered_view_display.setReadOnly(True)
+        self.raw_html_display = QTextEdit()
+        self.raw_html_display.setReadOnly(True)
+        self.raw_html_display.setFontFamily("monospace")
+        self.extracted_text_display = QTextEdit()
+        self.extracted_text_display.setReadOnly(True)
+        self.extracted_links_list = QListWidget()
+        self.output_tabs.addTab(self.rendered_view_display, "🌐 Rendered View (Simulated)")
+        self.output_tabs.addTab(self.raw_html_display, "📝 Raw HTML")
+        self.output_tabs.addTab(self.extracted_text_display, "📄 Extracted Text")
+        self.output_tabs.addTab(self.extracted_links_list, "🔗 Extracted Links")
+        main_layout.addWidget(self.output_tabs, 1, 0, 1, 4)
+
+        # Logging Console
+        log_groupbox = QGroupBox("Application Log")
+        log_layout = QVBoxLayout(log_groupbox)
+        self.raw_log_display = QTextEdit()
+        self.raw_log_display.setReadOnly(True)
+        self.raw_log_display.setFontFamily("monospace")
+        log_layout.addWidget(self.raw_log_display)
+        main_layout.addWidget(log_groupbox, 2, 0, 1, 4)
+
+        main_layout.setRowStretch(1, 2)
+        main_layout.setRowStretch(2, 1)
+
+    def _setup_logging_and_signals(self):
+        self.log_timer = QTimer(self)
+        self.log_timer.setInterval(100)
+        self.log_timer.timeout.connect(self._flush_log)
+        self._buffered_log_lines = []
+
+        if hasattr(self.logger, 'message_signal'):
+            self.logger.message_signal.connect(self.log_message)
+
+        self.scraping_manager.scraping_started_signal.connect(self._handle_scraping_started)
+        self.scraping_manager.scraping_finished_signal.connect(self._handle_scraping_finished)
+        self.scraping_manager.scraping_progress_signal.connect(self._handle_scraping_progress)
+
+        self.scrape_button.clicked.connect(self._on_start_scrape)
+        self.stop_button.clicked.connect(self._on_stop_scrape)
+
+        self.extracted_links_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.extracted_links_list.customContextMenuRequested.connect(self._show_link_context_menu)
+        self.extracted_links_list.itemDoubleClicked.connect(self._open_link_in_browser)
+
+    @pyqtSlot(str)
+    def log_message(self, msg: str):
+        self._buffered_log_lines.append(msg)
+        if not self.log_timer.isActive():
+            self.log_timer.start()
+
+    def _flush_log(self):
+        if self._buffered_log_lines:
+            cursor = self.raw_log_display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText("\n".join(self._buffered_log_lines) + "\n")
+            self._buffered_log_lines.clear()
+            self.raw_log_display.setTextCursor(cursor)
+            self.raw_log_display.ensureCursorVisible()
+
+    def _update_controls_enabled(self, enabled: bool):
+        self.url_input.setEnabled(enabled)
+        self.scrape_button.setEnabled(enabled)
+        self.stop_button.setEnabled(False)
+
+    def _on_initialize_manager(self):
+        self.status_label.setText("Status: Initializing...")
+        self.progress_label.setText("Progress: Starting manager...")
+        self.log_timer.start()
+        self.initialization_finished_signal.connect(self._handle_manager_initialized)
+        asyncio.run_coroutine_threadsafe(
+            self.scraping_manager.initialize(
+                on_complete_callback=lambda: self.initialization_finished_signal.emit()
+            ),
+            self.async_loop
+        )
+
+    @pyqtSlot()
+    def _handle_manager_initialized(self):
+        self.status_label.setText(f"Status: {self.scraping_manager.status.capitalize()}")
+        self.progress_label.setText("Progress: Ready to scrape.")
+        self._update_controls_enabled(True)
+        self.log_timer.stop()
+        self._flush_log()
+
+    @pyqtSlot()
+    def _on_start_scrape(self):
+        url = self.url_input.text().strip()
+        if not url:
+            self.logger.log_message("[GUI] ❌ Please enter a URL.")
+            return
+
+        self.rendered_view_display.clear()
+        self.raw_html_display.clear()
+        self.extracted_text_display.clear()
+        self.extracted_links_list.clear()
+        self.scrape_button.setEnabled(False)
+
+        asyncio.run_coroutine_threadsafe(
+            self.scraping_manager.start_scrape(
+                url,
+                on_complete_callback=lambda data: self.scraping_finished_signal.emit(data)
+            ),
+            self.async_loop
+        )
+
+    @pyqtSlot()
+    def _handle_scraping_started(self):
+        self.status_label.setText("Status: Scraping...")
+        self.progress_label.setText("Progress: Initiating scrape...")
+        self.stop_button.setEnabled(True)
+        self.log_timer.start()
+
+    @pyqtSlot(str)
+    def _handle_scraping_progress(self, message: str):
+        self.progress_label.setText(f"Progress: {message}")
+
+    @pyqtSlot(dict)
+    def _handle_scraping_finished(self, scraped_data: dict):
+        self.status_label.setText(f"Status: {self.scraping_manager.status.capitalize()}")
+        self.scrape_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.log_timer.stop()
+        self._flush_log()
+
+        if "error" in scraped_data:
+            self.progress_label.setText(f"Progress: Error - {scraped_data['error']}")
+            self.raw_html_display.setText(f"Error: {scraped_data['error']}")
+        else:
+            self.progress_label.setText("Progress: Scrape completed successfully.")
+            self._display_scraped_results(scraped_data)
+
+    def _display_scraped_results(self, data: dict):
+        self.rendered_view_display.setHtml(data.get("html_content", "No HTML content."))
+        self.raw_html_display.setText(data.get("html_content", "No raw HTML content."))
+        self.extracted_text_display.setText(data.get("extracted_text", "No extracted text."))
+
+        self.extracted_links_list.clear()
+        links = data.get("extracted_links", [])
+        if links:
+            link_icon = QIcon.fromTheme("text-html", QIcon("🌐"))
+            for link in links:
+                href = link.get('href', '#')
+                text = link.get('text', href) or href
+                item = QListWidgetItem(f"{text}")
+                item.setIcon(link_icon)
+                item.setData(Qt.UserRole, link)
+                item.setToolTip(f"URL: {href}")
+                self.extracted_links_list.addItem(item)
+        else:
+            self.extracted_links_list.addItem("No links extracted.")
+        self.output_tabs.setCurrentIndex(3)
+
+    @pyqtSlot()
+    def _on_stop_scrape(self):
+        self.scraping_manager.stop_scrape()
+        self.status_label.setText("Status: Stopping...")
+        self.progress_label.setText("Progress: Stopping scrape...")
+        self.stop_button.setEnabled(False)
+        self.scrape_button.setEnabled(True)
+
+    @pyqtSlot(QListWidgetItem)
+    def _open_link_in_browser(self, item):
+        link_data = item.data(Qt.UserRole)
+        if link_data and 'href' in link_data:
+            url = link_data['href']
+            try:
+                webbrowser.open_new_tab(url)
+                self.logger.log_message(f"[GUI] Opening link: {url}")
+            except Exception as e:
+                self.logger.log_message(f"[GUI] ❌ Failed to open link: {e}")
+
+    @pyqtSlot("QPoint")
+    def _show_link_context_menu(self, position):
+        item = self.extracted_links_list.itemAt(position)
+        if not item or not item.data(Qt.UserRole):
+            return
+
+        menu = QMenu()
+        copy_action = menu.addAction("📋 Copy Link URL")
+        action = menu.exec_(self.extracted_links_list.mapToGlobal(position))
+        if action == copy_action:
+            self._copy_link_url(item)
+
+    def _copy_link_url(self, item):
+        link_data = item.data(Qt.UserRole)
+        if link_data and 'href' in link_data:
+            url = link_data['href']
+            clipboard = QApplication.clipboard()
+            clipboard.setText(url)
+            self.logger.log_message(f"[GUI] ✅ Copied to clipboard: {url}")
+class GobusterTab(QWidget):
+    initialization_finished_signal = pyqtSignal()
+    # Removed scan_progress_signal
+    # scan_finished_signal is still used for final status/error message from manager
+    scan_finished_signal = pyqtSignal(str)
+
+    def __init__(self, logger, async_worker_loop, parent=None):
+        super().__init__(parent)
+        self.logger = logger
+        self.async_loop = async_worker_loop
+        self.gobuster_manager = AsyncGobusterManager(self.logger, async_worker_loop, "tools/Linux/gobuster")
+        # Connect manager signals to local slots
+        self.gobuster_manager.gobuster_process_started_signal.connect(self._on_gobuster_process_started_notification)
+        # Connect new_result_signal for real-time updates
+        self.gobuster_manager.gobuster_new_result_signal.connect(self._display_new_result)
+        # Connect scan_finished_signal from manager for final status
+        self.gobuster_manager.gobuster_scan_finished_signal.connect(self._handle_scan_update)
+        self._init_ui()
+
+    def _init_ui(self):
+        main_layout = QGridLayout(self)
+        self.setLayout(main_layout)
+
+        # Row 0: Controls
+        wsl_status_groupbox = QGroupBox("WSL Status (Gobuster)")
+        wsl_status_layout = QHBoxLayout(wsl_status_groupbox)
+        self.wsl_status_label = QLabel("Click 'Initialize' to begin setup.")
+        self.init_wsl_button = QPushButton("🚀 Initialize")
+        wsl_status_layout.addWidget(self.wsl_status_label, 1)
+        wsl_status_layout.addWidget(self.init_wsl_button)
+        main_layout.addWidget(wsl_status_groupbox, 0, 0)
+
+        scan_control_groupbox = QGroupBox("Scan Control (Gobuster)")
+        scan_control_layout = QVBoxLayout(scan_control_groupbox)
+        self.status_label = QLabel("Status: Idle")
+        # Removed self.progress_bar and its related setup
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Gobuster Scan")
+        self.stop_button = QPushButton("Stop Gobuster Scan")
+        self.download_button = QPushButton("💾 Save Results")
+        self.download_files_button = QPushButton("⬇️ Download Discovered Files")
+        self.download_files_button.setEnabled(False)
+        button_layout.addWidget(self.download_files_button)
+        self.download_files_button.clicked.connect(self._on_download_discovered_files)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        scan_control_layout.addWidget(self.status_label)
+        scan_control_layout.addLayout(button_layout)
+        main_layout.addWidget(scan_control_groupbox, 0, 1)
+
+        options_groupbox = QGroupBox("Gobuster Options")
+        options_layout = QFormLayout(options_groupbox)
+        self.target_url_input = QLineEdit()
+        self.target_url_input.setPlaceholderText("e.g., http://example.com")
+        self.arguments_input = QLineEdit()
+        self.arguments_input.setPlaceholderText("e.g., -x php,html -k") # -k to disable SSL cert verification
+        options_layout.addRow("Target URL:", self.target_url_input)
+        options_layout.addRow("Gobuster Args:", self.arguments_input)
+        main_layout.addWidget(options_groupbox, 0, 2, 1, 2) # Span across two columns
+
+        # Row 1: Results and Raw Log
+        self.output_tabs = QTabWidget()
+        self.results_list = QListWidget() # Using QListWidget for simpler Gobuster output
+        self.raw_log_display = QTextEdit()
+        self.raw_log_display.setReadOnly(True)
+        self.output_tabs.addTab(self.results_list, "📊 Found Assets")
+        self.output_tabs.addTab(self.raw_log_display, "📝 Raw Log")
+        main_layout.addWidget(self.output_tabs, 1, 0, 1, 4) # Span across all columns
+        main_layout.setRowStretch(1, 1) # Make results/log section expandable
+
+        self._populate_defaults()
+        self._setup_logging_and_signals()
+        self._update_all_controls_enabled(False) # Disable controls initially
+
+    def _populate_defaults(self):
+        self.target_url_input.setText("http://localhost:5000")
+        # Default wordlist path (common in Kali/WSL)
+        firefox_user_agent = "Mozilla/5.0 Windows NT 10.0; Win64; x64; rv:128.0 Gecko/20100101 Firefox/128.0"
+
+        common_extensions = "html,php,txt,js,css,json,xml,asp,aspx,jsp,do,action,cgi,pl,rb,py,bak,old,zip,tar.gz,tgz,rar,7z,sql,db,mdb,sqlite,log,conf,config,env,sh,bash,ini,yml,yaml,md,pdf,doc,docx,xls,xlsx,ppt,pptx,jpg,jpeg,png,gif,bmp,svg,ico"
+        self.arguments_input.setText(f"--exclude-length 466 --threads 100 --no-error --expanded --add-slash --follow-redirect --extensions {common_extensions} --useragent \"{firefox_user_agent}\" --timeout 15s --hide-length --no-progress -q")
+
+    def _setup_logging_and_signals(self):
+        self.timer = QTimer(self)
+        self.timer.setInterval(250)
+        self.timer.timeout.connect(self._flush_log)
+        self._buffered_lines = []
+        if hasattr(self.logger, 'message_signal'):
+            self.logger.message_signal.connect(self.log_message)
+
+        self.init_wsl_button.clicked.connect(self._on_initialize)
+        self.start_button.clicked.connect(self._on_start)
+        self.stop_button.clicked.connect(self._on_stop)
+
+    @pyqtSlot(str)
+    def log_message(self, msg: str):
+        self._buffered_lines.append(msg)
+
+    def _flush_log(self):
+        if self._buffered_lines:
+            self.raw_log_display.append("\n".join(self._buffered_lines))
+            self._buffered_lines.clear()
+            self.raw_log_display.verticalScrollBar().setValue(self.raw_log_display.verticalScrollBar().maximum())
+
+    def _on_initialize(self):
+        self.init_wsl_button.setEnabled(False)
+        self.wsl_status_label.setText("Initializing...")
+        self.timer.start() # Start flushing logs during initialization
+
+        asyncio.run_coroutine_threadsafe(
+            self.gobuster_manager.initialize(on_complete_callback=lambda: self.initialization_finished_signal.emit()),
+            self.async_loop
+        )
+        # Connect the initialization finished signal from GobusterManager to this tab's handler
+        self.initialization_finished_signal.connect(self._handle_initialization_update)
+
+    @pyqtSlot()
+    def _handle_initialization_update(self):
+        is_ready = self.gobuster_manager.is_ready
+        self.wsl_status_label.setText(self.gobuster_manager.setup_message)
+        self._update_all_controls_enabled(is_ready) # Enable/disable based on readiness
+        self.init_wsl_button.setVisible(not is_ready) # Hide if ready
+        self.timer.stop() # Stop log flushing timer
+        self._flush_log() # Flush any remaining logs
+
+    def _update_all_controls_enabled(self, enabled: bool):
+        self.start_button.setEnabled(enabled and self.gobuster_manager.status != "running")
+        self.stop_button.setEnabled(enabled and self.gobuster_manager.status == "running")
+        self.target_url_input.setEnabled(enabled and self.gobuster_manager.status != "running")
+        self.arguments_input.setEnabled(enabled and self.gobuster_manager.status != "running")
+
+
+    def _on_start(self):
+        try:
+            target_url = self.target_url_input.text().strip()
+            arguments = self.arguments_input.text().strip().split()
+            print(arguments)
+            if not target_url:
+                self.logger.log_message("[Gobuster-GUI] ❌ No target URL provided.")
+                return
+
+            self.results_list.clear() # Clear previous results
+            self.status_label.setText("Status: Scanning...")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.target_url_input.setEnabled(False) # Disable input during scan
+            self.arguments_input.setEnabled(False) # Disable input during scan
+            self.timer.start() # Start log flushing during scan
+
+            asyncio.run_coroutine_threadsafe(
+                self.gobuster_manager.start_scan(target_url, "tools/Linux/SecLists", arguments,
+                                                  on_complete_callback=lambda output: self.scan_finished_signal.emit(output)),
+                self.async_loop
+            )
+        except Exception as e:
+            self.logger.log_message(f"Error starting scan: {e}")
+            self.status_label.setText("Status: Error")
+            self.start_button.setEnabled(True) # Re-enable start button on error
+            self.stop_button.setEnabled(False)
+            self.target_url_input.setEnabled(True)
+            self.arguments_input.setEnabled(True)
+
+    @pyqtSlot(str)
+    def _handle_scan_update(self, final_message: str):
+        self.status_label.setText(f"Status: {self.gobuster_manager.status.capitalize()}.")
+        self.start_button.setEnabled(True) # Re-enable start button
+        self.stop_button.setEnabled(False) # Disable stop button
+        self.target_url_input.setEnabled(True) # Re-enable input
+        self.arguments_input.setEnabled(True) # Re-enable input
+        self.timer.stop() # Stop log flushing
+        self._flush_log() # Flush any remaining logs
+        self.download_files_button.setEnabled(self.results_list.count() > 0)
+        if final_message.startswith("<error>"):
+            self.results_list.addItem(f"Gobuster Scan Error: {final_message.replace('<error>', '').replace('</error>', '')}")
+            self.output_tabs.setCurrentWidget(self.results_list)
+        else:
+            self.logger.log_message(f"[Gobuster] {final_message}")
+
+    @pyqtSlot()
+    def _on_download_discovered_files(self):
+        base_url = self.target_url_input.text().strip()
+        if not base_url:
+            QMessageBox.warning(self, "Missing Base URL", "Please enter a valid base URL.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "Choose Folder to Save Files")
+        if not folder:
+            return
+
+        session = requests.Session()
+
+        for i in range(self.results_list.count()):
+            path = self.results_list.item(i).text().strip()
+
+            # Skip status-only lines that aren't actual paths, or if they are just base URLs with no sub-path
+            if not path.startswith('/') and not path.startswith("http"):
+                continue
+
+            full_url = urljoin(base_url, path)
+            try:
+                self.logger.log_message(f"[Downloader] Attempting to download: {full_url}")
+                response = session.get(full_url, timeout=15, allow_redirects=True)  # Added timeout and allow_redirects
+                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
+                # Determine filename and extension
+                filename_parts = urlparse(full_url).path.split('/')
+                filename = filename_parts[-1] if filename_parts[-1] else "index"  # Use last part or "index" for root
+                if not filename:  # If it's a directory like /foo/
+                    filename = "index"
+
+                ext = ""
+                content_type = response.headers.get('Content-Type', '').split(';')[
+                    0].strip().lower()  # Get main type, strip charset etc.
+
+                # Comprehensive Content-Type to Extension Mapping
+                if "text/html" in content_type:
+                    ext = ".html"
+                elif "application/json" in content_type:
+                    ext = ".json"
+                elif "text/plain" in content_type:
+                    ext = ".txt"
+                elif "application/xml" in content_type or "text/xml" in content_type:
+                    ext = ".xml"
+                elif "application/javascript" in content_type or "text/javascript" in content_type:
+                    ext = ".js"
+                elif "text/css" in content_type:
+                    ext = ".css"
+                elif "image/jpeg" in content_type:
+                    ext = ".jpg"
+                elif "image/png" in content_type:
+                    ext = ".png"
+                elif "image/gif" in content_type:
+                    ext = ".gif"
+                elif "image/svg+xml" in content_type:
+                    ext = ".svg"
+                elif "image/x-icon" in content_type:
+                    ext = ".ico"
+                elif "application/pdf" in content_type:
+                    ext = ".pdf"
+                elif "application/zip" in content_type:
+                    ext = ".zip"
+                elif "application/x-gzip" in content_type or "application/gzip" in content_type:
+                    ext = ".gz"
+                elif "application/x-tar" in content_type:  # Common for .tar.gz or .tgz
+                    ext = ".tar"
+                elif "application/x-rar-compressed" in content_type:
+                    ext = ".rar"
+                elif "application/x-7z-compressed" in content_type:
+                    ext = ".7z"
+                elif "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type:
+                    ext = ".docx"
+                elif "application/msword" in content_type:
+                    ext = ".doc"
+                elif "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in content_type:
+                    ext = ".xlsx"
+                elif "application/vnd.ms-excel" in content_type:
+                    ext = ".xls"
+                elif "application/vnd.openxmlformats-officedocument.presentationml.presentation" in content_type:
+                    ext = ".pptx"
+                elif "application/vnd.ms-powerpoint" in content_type:
+                    ext = ".ppt"
+                elif "application/octet-stream" in content_type:
+                    # Generic binary, try to infer from original path or just leave blank
+                    # This is tricky, often it's a fallback for unrecognised types
+                    pass
+                # Add more as needed
+
+                # Fallback: If no content-type match, check if original path already has an extension
+                if not ext and '.' in filename:
+                    # Extract last part after dot and check if it looks like a common extension
+                    potential_ext = "." + filename.rsplit('.', 1)[-1].lower()
+                    # You can maintain a list of known extensions if you want to be strict,
+                    # or just accept any if you're lenient.
+                    # For example: if potential_ext in {".html", ".php", ".txt", ...}
+                    ext = potential_ext
+                elif not ext and 'common.txt' in path:  # Special case for your default wordlist
+                    ext = '.txt'
+                elif not ext and 'index' in filename:  # If it's an index page, assume HTML
+                    ext = '.html'
+
+                # Ensure filename doesn't end with a dot if no extension was found/added
+                if filename.endswith('.') and not ext:
+                    filename = filename.rstrip('.')
+
+                # If no extension found and filename doesn't suggest one, and it's not "index", add a generic .bin or .dat
+                if not ext and 'index' not in filename.lower() and not '.' in filename:
+                    ext = '.bin'  # Or '.dat', or don't add one at all. Depends on preference.
+
+                file_path = os.path.join(folder, f"{filename}{ext}")
+
+                # Handle potential duplicate filenames gracefully
+                counter = 1
+                original_file_path = file_path
+                while os.path.exists(file_path):
+                    name, ext_part = os.path.splitext(original_file_path)
+                    file_path = f"{name}_{counter}{ext_part}"
+                    counter += 1
+
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+
+                self.logger.log_message(f"[Downloader] Saved: {file_path}")
+            except requests.exceptions.HTTPError as errh:
+                self.logger.log_message(f"[Downloader] HTTP Error for {full_url}: {errh}")
+            except requests.exceptions.ConnectionError as errc:
+                self.logger.log_message(f"[Downloader] Error Connecting for {full_url}: {errc}")
+            except requests.exceptions.Timeout as errt:
+                self.logger.log_message(f"[Downloader] Timeout Error for {full_url}: {errt}")
+            except requests.exceptions.RequestException as err:
+                self.logger.log_message(f"[Downloader] General Request Error for {full_url}: {err}")
+            except Exception as e:
+                self.logger.log_message(f"[Downloader] Failed to download {full_url}: {e}")
+
+        QMessageBox.information(self, "Download Complete", f"All downloadable files saved to:\n{folder}")
+    @pyqtSlot(str)
+    def _display_new_result(self, result_line: str):
+        """Adds a new found result to the results list."""
+        self.results_list.addItem(result_line.strip())
+        # Ensure the results tab is active if you want immediate user feedback there
+        if self.output_tabs.currentIndex() != self.output_tabs.indexOf(self.results_list):
+            self.output_tabs.setCurrentWidget(self.results_list)
+
+    def _on_stop(self):
+        self.status_label.setText("Status: Stopping...")
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False) # Disable stop button while stopping
+        self.gobuster_manager.stop_scan()
+
+    @pyqtSlot()
+    def _on_gobuster_process_started_notification(self):
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText("Gobuster Scan Process Started!")
+        msg_box.setInformativeText("The Gobuster process has successfully launched in WSL.")
+        msg_box.setWindowTitle("Scan Notification")
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
+
+
+
+class NmapTab(QWidget):
+    initialization_finished_signal = pyqtSignal()
+    scan_finished_signal = pyqtSignal(str)
+
+    def __init__(self, logger, async_worker_loop, parent=None):
+        super().__init__(parent)
+        self.logger = logger
+        self.async_loop = async_worker_loop
+        self.nmap_manager = AsyncNmapManager(self.logger, async_worker_loop)
+
+        # --- MODIFIED: Profiles now control both args and ports for reliability ---
+        self.scan_profiles = {
+            "Quick Scan (Top 100 ports)": {
+                "args": "-sS -T3 --max-retries 2 --max-rate 100 --open",  # TCP connect scan, low timing
+                "ports": "-F"
+            },
+            "Moderate Scan (Top 1000 ports)": {
+                "args": "-sS -T3 --max-retries 2 --max-rate 100 --open",  # Avoid version detection or OS detection
+                "ports": ""
+            },
+            "Full SYN Scan (All 65k ports)": {
+                "args": "-sS -T3 --max-retries 2 --max-rate 100 --open",  # Still low timing, but large port range
+                "ports": "-p-"
+            },
+        }
+        self._init_ui()
+
+    def _init_ui(self):
+        main_layout = QGridLayout(self)
+        self.setLayout(main_layout)
+
+        # Row 0: Controls
+        wsl_status_groupbox = QGroupBox("WSL Status");
+        wsl_status_layout = QHBoxLayout(wsl_status_groupbox);
+        self.wsl_status_label = QLabel("Click 'Initialize' to begin setup.");
+        self.init_wsl_button = QPushButton("🚀 Initialize");
+        wsl_status_layout.addWidget(self.wsl_status_label, 1);
+        wsl_status_layout.addWidget(self.init_wsl_button);
+        main_layout.addWidget(wsl_status_groupbox, 0, 0)
+        scan_control_groupbox = QGroupBox("Scan Control");
+        scan_control_layout = QVBoxLayout(scan_control_groupbox);
+        self.status_label = QLabel("Status: Idle");
+        button_layout = QHBoxLayout();
+        self.start_button = QPushButton("Start Scan");
+        self.stop_button = QPushButton("Stop Scan");
+        button_layout.addWidget(self.start_button);
+        button_layout.addWidget(self.stop_button);
+        scan_control_layout.addWidget(self.status_label);
+        scan_control_layout.addLayout(button_layout);
+        main_layout.addWidget(scan_control_groupbox, 0, 1)
+        self.wsl_shell_groupbox = QGroupBox("Interactive WSL Shell");
+        wsl_shell_layout = QVBoxLayout(self.wsl_shell_groupbox);
+        session_control_layout = QHBoxLayout();
+        self.session_button = QPushButton("▶️ Start Session");
+        self.session_button.setCheckable(True);
+        session_control_layout.addWidget(self.session_button);
+        session_control_layout.addStretch();
+        command_layout = QHBoxLayout();
+        self.wsl_input = QLineEdit();
+        self.wsl_input.setPlaceholderText("Enter command...");
+        self.wsl_send_button = QPushButton("Send");
+        command_layout.addWidget(self.wsl_input, 1);
+        command_layout.addWidget(self.wsl_send_button);
+        wsl_shell_layout.addLayout(session_control_layout);
+        wsl_shell_layout.addLayout(command_layout);
+        main_layout.addWidget(self.wsl_shell_groupbox, 0, 2)
+        options_groupbox = QGroupBox("Scan Options");
+        options_layout = QFormLayout(options_groupbox);
+        self.profile_combo = QComboBox();
+        self.ports_input = QLineEdit();
+        self.arguments_input = QLineEdit();
+        options_layout.addRow("Scan Profile:", self.profile_combo);
+        options_layout.addRow("Ports:", self.ports_input);
+        options_layout.addRow("Nmap Arguments:", self.arguments_input);
+        main_layout.addWidget(options_groupbox, 0, 3)
+
+        # Row 1: Targets
+        target_groupbox = QGroupBox("Scan Targets");
+        target_layout = QVBoxLayout(target_groupbox);
+        self.target_list_widget = QListWidget();
+        target_layout.addWidget(self.target_list_widget);
+        add_target_layout = QHBoxLayout();
+        self.target_input = QLineEdit();
+        self.target_input.setPlaceholderText("Enter IP, hostname, or CIDR range...");
+        self.add_target_button = QPushButton("Add Target");
+        add_target_layout.addWidget(self.target_input, 1);
+        add_target_layout.addWidget(self.add_target_button);
+        target_layout.addLayout(add_target_layout);
+        manage_targets_layout = QHBoxLayout();
+        self.remove_target_button = QPushButton("Remove Selected");
+        self.clear_targets_button = QPushButton("Clear All");
+        manage_targets_layout.addStretch();
+        manage_targets_layout.addWidget(self.remove_target_button);
+        manage_targets_layout.addWidget(self.clear_targets_button);
+        target_layout.addLayout(manage_targets_layout);
+        main_layout.addWidget(target_groupbox, 1, 0, 1, 4)
+
+        # Row 2: Console
+        self.output_tabs = QTabWidget();
+        self.results_tree = QTreeWidget();
+        self.results_tree.setHeaderLabels(["Host / Port", "State", "Service", "Version"]);
+        self.results_tree.header().setSectionResizeMode(QHeaderView.ResizeToContents);
+        self.raw_log_display = QTextEdit();
+        self.raw_log_display.setReadOnly(True);
+        self.output_tabs.addTab(self.results_tree, "📊 Parsed Results");
+        self.output_tabs.addTab(self.raw_log_display, "📝 Raw Log");
+        main_layout.addWidget(self.output_tabs, 2, 0, 1, 4)
+
+        main_layout.setRowStretch(2, 1)
+
+        self._populate_defaults()
+        self._setup_logging_and_signals()
+        self._update_all_controls_enabled(False)
+
+    def _setup_logging_and_signals(self):
+        self.timer = QTimer(self);
+        self.timer.setInterval(250);
+        self.timer.timeout.connect(self._flush_log);
+        self._buffered_lines = []
+        if hasattr(self.logger, 'message_signal'): self.logger.message_signal.connect(self.log_message)
+        self.init_wsl_button.clicked.connect(self._on_initialize)
+        self.start_button.clicked.connect(self._on_start)
+        self.stop_button.clicked.connect(self._on_stop)
+        self.session_button.toggled.connect(self._on_session_toggled)
+        self.wsl_send_button.clicked.connect(self._on_wsl_send)
+        self.wsl_input.returnPressed.connect(self._on_wsl_send)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        self.add_target_button.clicked.connect(self._on_add_target)
+        self.target_input.returnPressed.connect(self._on_add_target)
+        self.remove_target_button.clicked.connect(self._on_remove_target)
+        self.clear_targets_button.clicked.connect(self._on_clear_targets)
+        self.initialization_finished_signal.connect(self._handle_initialization_update)
+        self.scan_finished_signal.connect(self._handle_scan_update)
+
+    @pyqtSlot(str)
+    def log_message(self, msg: str):
+        self._buffered_lines.append(msg)
+
+    def _flush_log(self):
+        if self._buffered_lines: self.raw_log_display.append("\n".join(
+            self._buffered_lines)); self._buffered_lines.clear(); self.raw_log_display.verticalScrollBar().setValue(
+            self.raw_log_display.verticalScrollBar().maximum())
+
+    def _populate_defaults(self):
+        self.target_list_widget.addItems(["localhost"])
+        self.profile_combo.addItems(self.scan_profiles.keys())
+        self.profile_combo.currentText()
+        profile_name = self.profile_combo.currentText()
+        profile_data = self.scan_profiles.get(profile_name, {})
+        self.arguments_input.setText(profile_data.get("args", ""))
+
+    @pyqtSlot()
+    def _on_profile_changed(self):
+        """When a profile is selected, update BOTH arguments and ports."""
+        profile_name = self.profile_combo.currentText()
+        profile_data = self.scan_profiles.get(profile_name, {})
+        self.arguments_input.setText(profile_data.get("args", ""))
+        self.ports_input.setText(profile_data.get("ports", ""))
+
+    def _on_initialize(self):
+        self.init_wsl_button.setEnabled(False);
+        self.wsl_status_label.setText("Initializing...");
+        self.timer.start()
+        asyncio.run_coroutine_threadsafe(
+            self.nmap_manager.initialize(on_complete_callback=lambda: self.initialization_finished_signal.emit()),
+            self.async_loop)
+
+    @pyqtSlot()
+    def _handle_initialization_update(self):
+        is_ready = self.nmap_manager.is_ready;
+        self.wsl_status_label.setText(self.nmap_manager.setup_message);
+        self._update_all_controls_enabled(is_ready);
+        self.wsl_shell_groupbox.setVisible(is_ready);
+        self.init_wsl_button.setVisible(not is_ready);
+        self.timer.stop();
+        self._flush_log()
+
+    def _update_all_controls_enabled(self, enabled: bool):
+        self.start_button.setEnabled(enabled);
+        self.stop_button.setEnabled(False);
+        self.target_list_widget.setEnabled(enabled);
+        self.profile_combo.setEnabled(enabled);
+        self.ports_input.setEnabled(enabled);
+        self.arguments_input.setEnabled(enabled);
+        self.wsl_shell_groupbox.setVisible(enabled);
+        self.wsl_input.setEnabled(False);
+        self.wsl_send_button.setEnabled(False);
+        self.target_input.setEnabled(enabled);
+        self.add_target_button.setEnabled(enabled);
+        self.remove_target_button.setEnabled(enabled);
+        self.clear_targets_button.setEnabled(enabled)
+
+    def _on_start(self):
+        try:
+            """ --- CORRECTED: This method now builds the argument list reliably --- """
+            targets = [self.target_list_widget.item(i).text().strip() for i in range(self.target_list_widget.count())]
+            targets = [t for t in targets if t]
+            if not targets:
+                self.logger.log_message("[GUI] ❌ No valid targets to scan.")
+                return
+
+            # Start with the arguments from the text box
+            args = self.arguments_input.text().strip().split()
+            ports_spec = self.ports_input.text().strip()
+
+            # This logic correctly handles the -F flag vs. a specific port list.
+            if ports_spec:
+                if ports_spec.upper() == '-F':
+                    # If -F is the port spec, ensure it's in the args list and -p is not.
+                    args = [arg for arg in args if arg != '-p']
+                    if '-F' not in args:
+                        args.append('-F')
+                else:
+                    # If a specific port list is given, ensure -F is not present
+                    # and add the port list with the -p flag.
+                    args = [arg for arg in args if arg.upper() != '-F']
+                    if '-p' not in args:
+                        args.extend(['-p', ports_spec])
+
+            if not args:
+                self.logger.log_message("[GUI] ❌ No scan arguments provided.")
+                return
+
+            self.results_tree.clear()
+            self.status_label.setText("Status: Scanning...")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.timer.start()
+
+            asyncio.run_coroutine_threadsafe(
+                self.nmap_manager.start_scan(targets, args,
+                                             on_complete_callback=lambda xml: self.scan_finished_signal.emit(xml)),
+                self.async_loop
+            )
+        except Exception as e:
+            self.logger.log_message(str(e))
+    @pyqtSlot(str)
+    def _handle_scan_update(self, xml_data: str):
+        self.logger.log_message(xml_data)
+        self.status_label.setText(f"Status: {self.nmap_manager.status.capitalize()}.");
+        self.start_button.setEnabled(True);
+        self.stop_button.setEnabled(False);
+        self.timer.stop();
+        self._flush_log()
+        self._parse_and_display_results(xml_data)
+
+    def _on_stop(self):
+        self.nmap_manager.stop_scan()
+
+    @pyqtSlot(bool)
+    def _on_session_toggled(self, checked: bool):
+        if checked:
+            self.session_button.setText("⏹️ Stop Session");
+            self.wsl_input.setEnabled(True);
+            self.wsl_send_button.setEnabled(True);
+            self.timer.start()
+            asyncio.run_coroutine_threadsafe(self.nmap_manager.start_interactive_session(), self.async_loop)
+        else:
+            self.session_button.setText("▶️ Start Session");
+            self.wsl_input.setEnabled(False);
+            self.wsl_send_button.setEnabled(False);
+            self.timer.stop();
+            self._flush_log()
+            asyncio.run_coroutine_threadsafe(self.nmap_manager.stop_interactive_session(), self.async_loop)
+
+    @pyqtSlot()
+    def _on_wsl_send(self):
+        command = self.wsl_input.text().strip()
+        if command: asyncio.run_coroutine_threadsafe(self.nmap_manager.send_command_to_session(command),
+                                                     self.async_loop); self.wsl_input.clear()
+
+    @pyqtSlot()
+    def _on_add_target(self):
+        target = self.target_input.text().strip()
+        if target and not self.target_list_widget.findItems(target, Qt.MatchExactly): self.target_list_widget.addItem(
+            target)
+        self.target_input.clear()
+
+    @pyqtSlot()
+    def _on_remove_target(self):
+        for item in self.target_list_widget.selectedItems(): self.target_list_widget.takeItem(
+            self.target_list_widget.row(item))
+
+    @pyqtSlot()
+    def _on_clear_targets(self):
+        self.target_list_widget.clear()
+
+    def _parse_and_display_results(self, xml_data: str):
+        self.results_tree.clear()
+
+        if not xml_data or xml_data.startswith("<error>"):
+            QTreeWidgetItem(self.results_tree, ["Scan Error", xml_data or "No XML data received."])
+            return
+
+        try:
+            root = ET.fromstring(xml_data)
+
+            # --- Primary parsing for detailed host/port results ---
+            hosts_found_in_xml = False
+            for host in root.findall('host'):
+                hosts_found_in_xml = True
+                address_element = host.find('address')
+                addr = address_element.get('addr') if address_element is not None else 'Unknown'
+
+                status_element = host.find('status')
+                host_state = status_element.get('state', 'unknown') if status_element is not None else 'unknown'
+
+                host_item = QTreeWidgetItem(self.results_tree, [f"Host: {addr} ({host_state})"])
+
+                ports_element = host.find('ports')
+                if ports_element is not None:
+                    ports = ports_element.findall('port')
+                    if ports:
+                        for port in ports:
+                            port_id = port.get('portid') or 'unknown'
+                            protocol = port.get('protocol') or 'unknown'
+
+                            state_element = port.find('state')
+                            state = state_element.get('state', '') if state_element is not None else ''
+
+                            service_element = port.find('service')
+                            name = service_element.get('name', '') if service_element is not None else ''
+                            version = service_element.get('version', '') if service_element is not None else ''
+
+                            QTreeWidgetItem(host_item, [f"  Port: {port_id}/{protocol}", state, name, version])
+                    else:
+                        QTreeWidgetItem(host_item, ["  No open ports found for this host.", "", "", ""])
+                else:
+                    QTreeWidgetItem(host_item, ["  No port information available for this host.", "", "", ""])
+
+            # --- Secondary parsing for scan summary if no detailed host data ---
+            if not hosts_found_in_xml:
+                runstats_element = root.find('runstats')
+                if runstats_element is not None:
+                    finished = runstats_element.find('finished')
+                    summary_text = finished.get('summary') if finished is not None else "No summary available"
+
+                    hosts_element = runstats_element.find('hosts')
+                    hosts_up = hosts_element.get('up') if hosts_element is not None else "0"
+                    hosts_total = hosts_element.get('total') if hosts_element is not None else "0"
+
+                    summary_item = QTreeWidgetItem(self.results_tree, [f"Scan Summary: {summary_text}"])
+                    QTreeWidgetItem(summary_item, [f"Hosts Up: {hosts_up}", f"Total Hosts: {hosts_total}", "", ""])
+
+                    if int(hosts_up) > 0:
+                        QTreeWidgetItem(summary_item, ["Note: No open ports were found for live hosts.", "", "", ""])
+                    elif int(hosts_total) > 0 and int(hosts_up) == 0:
+                        QTreeWidgetItem(summary_item, ["All targets appear to be down.", "", "", ""])
+                    else:
+                        QTreeWidgetItem(summary_item, ["No scan results reported in detail.", "", "", ""])
+                else:
+                    QTreeWidgetItem(self.results_tree, ["No hosts found and no runstats summary in XML.", "", "", ""])
+
+            self.results_tree.expandAll()
+            self.output_tabs.setCurrentWidget(self.results_tree)
+
+        except ET.ParseError as e:
+            self.logger.log_message(f"XML Parse Error: {e}")
+            QTreeWidgetItem(self.results_tree, ["XML Parse Error", "Could not parse Nmap output."])
+        except Exception as e:
+            self.logger.log_message(f"Unhandled XML parsing error: {e}")
+            QTreeWidgetItem(self.results_tree, ["Unhandled Parsing Error", str(e)])
 
 
 logger = logging.getLogger(__name__) # This logger is for this module's internal debug, not for GUI display
@@ -109,6 +1062,7 @@ class GeminiChatTab(QWidget):
         self._setup_worker_thread()  # This now happens AFTER chatbot_backend is initialized
 
         # Initial message for Gemini tab, logged via the consistent log_message method
+        self.pygments_formatter = HtmlFormatter(noclasses=True, style="monokai", nowrap=True)
 
     def _create_widgets(self):
         """Creates all the widgets for the tab."""
@@ -185,11 +1139,11 @@ class GeminiChatTab(QWidget):
         user_message = self.user_input.toPlainText().strip()  # Use toPlainText() for QPlainTextEdit
         if user_message:
             # Pass only the raw message, log_message will add prefixes/styling
-            self.log_message(user_message, "user")
+            self.gemini_logger.log_message(user_message, "user")
             self.user_input.clear()
             self.send_message_requested.emit(user_message)
         else:
-            self.gemini_loggerlog_message("Please enter a non-empty message.")
+            self.gemini_logger.log_message("Please enter a non-empty message.")
 
     @pyqtSlot()
     def _on_clear_history_clicked(self):
@@ -219,22 +1173,27 @@ class GeminiChatTab(QWidget):
             # Add the code block
             lang = match.group('lang')
             code = match.group('code')
+            try:
+                lexer = get_lexer_by_name(lang) if lang else guess_lexer(code)
+            except Exception:
+                lexer = get_lexer_by_name("text")
             # Using <pre><code> for code blocks for better formatting and copy-pasteability
             # Added inline styles for code block appearance, and extra margin for spacing
+            highlighted_code = highlight(code, lexer, self.pygments_formatter)
             formatted_response_parts.append(
                 f"<div style='margin-top:10px; margin-bottom:10px;'>"  # Add vertical spacing around code block
                 f"<pre style='background-color:#2a2a2a; color:#f8f8f2; padding:15px; border-radius:8px; overflow-x:auto; border:1px solid #444;'>"
-                f"<div style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{self._escape_html(code)}</div>"
+                f"<div style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{highlighted_code}</div>"
                 f"</pre>"
                 f"</div>"
             )
             last_idx = match.end()
 
-        # Add any remaining text after the last code block
-        if last_idx < len(response):
-            text_after = response[last_idx:].strip()
-            if text_after:
-                formatted_response_parts.append(f"<p>{self._escape_html(text_after)}</p>")
+            # Add any remaining text after the last code block
+            if last_idx < len(response):
+                text_after = response[last_idx:].strip()
+                if text_after:
+                    formatted_response_parts.append(f"<p>{self._escape_html(text_after)}</p>")
 
         # If no code blocks were found, treat the entire response as plain text
         if not formatted_response_parts and response.strip():
@@ -249,7 +1208,7 @@ class GeminiChatTab(QWidget):
     @pyqtSlot(str)
     def _handle_gemini_error(self, error_message: str):
         """Receives and displays error messages from the worker."""
-        self.gemini_loggerlog_message(error_message, "error")
+        self.gemini_logger.log_message(error_message, "error")
 
     # NEW: Slot for handling the timer's timeout signal to animate text
     @pyqtSlot()

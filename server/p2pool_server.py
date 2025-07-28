@@ -15,7 +15,8 @@ from p2pool_data import AsyncEventLogger
 from p2pool_helper import p2pool_helper, ProcessManager
 from p2pool_endpoints import api_b
 # Import all loggers, including the new GeminiLogger
-from p2pool_gui import P2PoolGUI, ConsoleLogger, WiresharkLogger, PacketLogger, RouterLogger, GeminiLogger # Ensure GeminiLogger is imported
+from p2pool_gui import P2PoolGUI, ConsoleLogger, WiresharkLogger, PacketLogger, RouterLogger, GeminiLogger, \
+    NmapLogger, GobusterLogger, ScrapingLogger  # Ensure GeminiLogger is imported
 from p2pool_managers import PythonRouterManager
 
 # Global variable to hold references to non-Qt background threads for cleanup
@@ -29,7 +30,9 @@ CORS(app)
 app.register_blueprint(api_b)
 
 router_logger = RouterLogger()  # Global instance for router logging
-
+gui_logger = ConsoleLogger()
+sys.stdout = gui_logger
+sys.stderr = gui_logger
 # --- Routes for serving the React frontend ---
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
@@ -62,7 +65,7 @@ def log_to_file(message):
 
 async def application_main_loop(stop_event=None):
     """The main async logic for the application's background services."""
-    print("[+] Initializing background services...")
+
 
     p2pool_helper.set_p2pool_stop_event(stop_event)
     p2pool_helper.clear_all_client_data()
@@ -107,20 +110,6 @@ async def application_main_loop(stop_event=None):
     event_processor_thread.start()
     _non_qt_background_threads.append((event_processor_thread, p2pool_helper.event_processor))
 
-    p2pool_helper.logger.log_message("[+] RawLogProcessor and EventProcessor threads started.") # Moved this line
-
-    local_ip = p2pool_helper.get_local_ip()
-    public_ip_at_start = p2pool_helper.get_public_ip()
-    port = 5000
-
-    print("=======================================================================")
-    print(f"[*] Dashboard running. Access it at:")
-    print(f"    - On this machine: http://127.0.0.1:{port}")
-    print(f"    - On your local network: http://{local_ip}:{port}")
-    if public_ip_at_start:
-        print(f"    - On the internet (if port forwarded): http://{public_ip_at_start}:{port}")
-    print("=======================================================================")
-    print("[+] Background services are running. Use the GUI to start P2Pool.")
 
     try:
         while not (stop_event and stop_event.is_set()):
@@ -227,15 +216,16 @@ if __name__ == "__main__":
         atexit.register(cleanup_on_exit)
         qapp = QApplication(sys.argv)
 
-        gui_logger = ConsoleLogger()
+
         wireshark_logger = WiresharkLogger()
         packet_logger = PacketLogger()
         router_logger = RouterLogger()  # Ensure router_logger is instantiated
         gemini_logger = GeminiLogger()  # Instantiate GeminiLogger here
-
+        nmap_logger = NmapLogger()
+        scraping_logger = ScrapingLogger()
+        gobuster_logger = GobusterLogger()
         # Redirect stdout/stderr to the GUI console logger
-        sys.stdout = gui_logger
-        sys.stderr = gui_logger
+
 
         # Set loggers in p2pool_helper
         p2pool_helper.set_gui_logger(gui_logger)
@@ -244,7 +234,7 @@ if __name__ == "__main__":
         # Note: router_logger is set via p2pool_helper.set_router_logger in application_main_loop
         # GeminiLogger is passed directly to P2PoolGUI and then to GeminiChatTab/Bot
 
-        window = P2PoolGUI(gui_logger, wireshark_logger, packet_logger, router_logger, gemini_logger, application_main_loop,
+        window = P2PoolGUI(gui_logger, wireshark_logger, packet_logger, router_logger, gemini_logger, nmap_logger, gobuster_logger, scraping_logger, application_main_loop,
                            p2pool_helper)
 
         window.show()
