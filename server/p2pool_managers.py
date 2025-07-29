@@ -28,6 +28,7 @@ import time
 
 import psutil
 import requests
+import scapy
 import select
 from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
@@ -38,48 +39,24 @@ from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dns import DNSQR, DNS, DNSRR
 from scapy.layers.inet import TCP, IP, ICMP, UDP, IPerror
+from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import ARP, Ether
+from scapy.layers.rip import RIP
+from scapy.layers.tls.handshake import TLSClientHello
+from scapy.layers.tls.record import TLS
+from scapy.libs.rfc3961 import Key
+from scapy.main import load_layer
 from scapy.sendrecv import srp, sendp, sniff
 from scapy.packet import Packet, bind_layers, Raw
 from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, Field, BitField, XByteField, \
-    FieldLenField, StrFixedLenField, FlagsField
+    FieldLenField, StrFixedLenField, FlagsField, IP6Field
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict, Literal
 import xml.etree.ElementTree as ET
-
-class IP6Field(Field):
-    """Custom Scapy field for handling IPv6 addresses."""
-
-    def __init__(self, name, default):
-        Field.__init__(self, name, default, "16s")
-
-    def i2m(self, pkt, x):
-        if x is None:
-            return b"\0" * 16
-        return socket.inet_pton(socket.AF_INET6, x)
-
-    def m2i(self, pkt, x):
-        return socket.inet_ntop(socket.AF_INET6, x)
-
-
-class IPv6(Packet):
-    name = "IPv6"
-    fields_desc = [
-        BitField("version", 6, 4),
-        BitField("tc", 0, 8),  # Traffic Class
-        BitField("fl", 0, 20),  # Flow Label
-        ShortField("plen", None),  # Payload Length
-        XByteField("nh", 0),  # Next Header
-        ByteField("hlim", 64),  # Hop Limit
-        IP6Field("src", "::1"),
-        IP6Field("dst", "::1"),
-    ]
-
-    def post_build(self, p, pay):
-        # Calculate payload length if not specified
-        if self.plen is None:
-            self.plen = len(pay)
-        return p + pay
+from scapy.layers.kerberos import (
+    Kerberos, KRB_AS_REQ, KRB_AS_REP, KRB_TGS_REQ, KRB_TGS_REP, KRB_ERROR,
+    EncryptedData, PrincipalName, EncryptionKey, PADATA
+)
 
 
 # --- ICMPv6 Base and Common Types ---
@@ -144,8 +121,6 @@ class ICMPv6ND_NA(Packet):
         IP6Field("tgt", "::"),  # Target Address
         PacketListField("options", [], ICMPv6ND_Option, length_from=lambda pkt: pkt.underlayer.plen - 24)
     ]
-
-
 class ICMPv6ND_RA_Option(Packet):
     name = "ICMPv6 ND RA Option"
     fields_desc = [
@@ -158,8 +133,6 @@ class ICMPv6ND_RA_Option(Packet):
         IntField("res2", 0),
         IP6Field("prefix", "::")
     ]
-
-
 class ICMPv6ND_RA(Packet):
     name = "ICMPv6 Router Advertisement"
     fields_desc = [
@@ -171,8 +144,6 @@ class ICMPv6ND_RA(Packet):
         PacketListField("options", [], ICMPv6ND_RA_Option, length_from=lambda pkt: pkt.underlayer.plen - 16)
     ]
 
-
-# --- RIPng (for IPv6) ---
 class RIPngEntry(Packet):
     name = "RIPng Entry"
     fields_desc = [
@@ -181,7 +152,6 @@ class RIPngEntry(Packet):
         ByteField("prefix_len", 0),
         ByteField("metric", 1)
     ]
-
 
 class RIPng(Packet):
     name = "RIPng"
@@ -197,6 +167,7 @@ bind_layers(Ether, IPv6, type=0x86DD)
 bind_layers(IPv6, ICMPv6, nh=58)
 bind_layers(IPv6, TCP, nh=6)
 bind_layers(IPv6, UDP, nh=17)
+bind_layers(IPv6, Raw)
 bind_layers(ICMPv6, ICMPv6EchoRequest, type=128)
 bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
 bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
@@ -233,6 +204,10 @@ class SimpleRIP(Packet):
 # Bind to UDP/520 so Scapy can dissect/construct automatically
 bind_layers(UDP, SimpleRIP, dport=520)
 bind_layers(UDP, SimpleRIP, sport=520)
+load_layer("tls")
+load_layer("kerberos")
+load_layer("rip")
+load_layer("dns")
 
 # Custom Scapy Layer for IGMPv2 (if not already defined by Scapy's core)
 # Scapy usually has IGMP, but defining explicitly for clarity/customization if needed
@@ -250,6 +225,273 @@ except ImportError:
 
 
     bind_layers(IP, IGMP, proto=2)  # IP protocol 2 is IGMP
+
+class HTTPSManager:
+    """
+    Manages passive monitoring of HTTPS/TLS traffic.
+    Primarily focuses on extracting information from TLS handshakes like SNI.
+    Does NOT perform decryption of application data.
+    """
+
+    def __init__(self, router_logger):
+        self.router_logger = router_logger
+        self.router_logger.log_message("🔒 [HTTPSManager] Initialized for passive TLS monitoring.")
+
+
+    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
+        """
+        Processes an incoming packet to detect TLS/HTTPS traffic and extract SNI.
+        Args:
+            packet: The Scapy packet.
+            inbound_iface (str): The full Scapy name of the interface the packet was sniffed on.
+            interfaces_config (dict): The router's internal interfaces configuration.
+        Returns:
+            bool: True if the packet contained a TLS layer and was processed, False otherwise.
+        """
+        if not packet.haslayer(TLS):
+            return False
+
+        iface_short = inbound_iface.split('_')[-1]
+        self.router_logger.log_message(f"🌐 [HTTPSManager] TLS packet detected on {iface_short}.")
+
+        try:
+            # Check for TLS ClientHello message which contains SNI
+            # A TLS packet can contain multiple records, and a record can contain multiple handshakes
+            if packet.haslayer(TLSClientHello):
+                client_hello = packet[TLSClientHello]
+                # SNI is in the extensions field
+                if hasattr(client_hello, 'extensions') and client_hello.extensions:
+                    for ext in client_hello.extensions:
+                        # Server Name Indication extension has type 0
+                        # The SNI value is typically in ext.servername.names[0].servername
+                        if hasattr(ext, 'servername') and hasattr(ext.servername, 'names') and ext.servername.names:
+                            sni_name = ext.servername.names[0].servername.decode('utf-8')
+                            self.router_logger.log_message(f"🔍 [HTTPSManager] ClientHello SNI: {sni_name}")
+
+                            return True
+                else:
+                    self.router_logger.log_message("ℹ️ [HTTPSManager] ClientHello without SNI extension.")
+            else:
+                self.router_logger.log_message("ℹ️ [HTTPSManager] TLS packet is not a ClientHello (or SNI not found).")
+
+
+            return True
+
+        except Exception as e:
+            self.router_logger.log_message(f"🔥 [HTTPSManager] Error processing TLS packet: {e}")
+            return False
+
+class KerberosManager:
+    """
+    Manages Kerberos protocol traffic within the router.
+    Can be used for passive analysis, logging, or active intervention/proxying.
+    """
+
+    def __init__(self, router_logger, packet_writer):
+        self.router_logger = router_logger
+        self.packet_writer = packet_writer # For sending crafted responses if needed
+        self.kerberos_sessions = {} # Tracks ongoing Kerberos exchanges (e.g., for correlating requests/responses)
+        self._keytab_entries = {} # Stores principal keys (e.g., from a 'keytab' file or configuration)
+        self._stop_event = threading.Event()
+        self._cleanup_thread: Optional[threading.Thread] = None
+
+        self.router_logger.log_message("[KerberosManager] Initialized.")
+
+    def start(self):
+        """Starts background threads for session management, if any."""
+        self._stop_event.clear()
+        self._cleanup_thread = threading.Thread(target=self._session_cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+        self.router_logger.log_message("[KerberosManager] Started session cleanup thread.")
+
+    def stop(self):
+        """Stops all background threads."""
+        self._stop_event.set()
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=2)
+        self.router_logger.log_message("[KerberosManager] Stopped.")
+
+    def add_keytab_entry(self, principal_name: str, key_type: int, key_value_hex: str):
+        """
+        Adds a key for a specific principal to be used for decryption/encryption.
+        Args:
+            principal_name (str): The Kerberos principal (e.g., "host/router.domain.com@DOMAIN.COM").
+            key_type (int): The encryption type (etype) as an integer (e.g., 23 for AES256-CTS-HMAC-SHA1-96).
+            key_value_hex (str): The hexadecimal string of the raw key value.
+        """
+        try:
+            key_bytes = bytes.fromhex(key_value_hex)
+            self._keytab_entries[principal_name.lower()] = Key(key_type, key=key_bytes)
+            self.router_logger.log_message(f"[KerberosManager] Added key for principal: {principal_name}")
+        except ValueError as e:
+            self.router_logger.log_message(f"[KerberosManager] ❌ Error adding key for {principal_name}: Invalid hex string. {e}")
+        except Exception as e:
+            self.router_logger.log_message(f"[KerberosManager] ❌ Unexpected error adding key for {principal_name}: {e}")
+
+
+    def _session_cleanup_loop(self):
+        """Background thread to clean up old Kerberos sessions."""
+        while not self._stop_event.is_set():
+            # Implement logic to clean up old sessions based on timestamp or other criteria
+            # For simplicity, we'll just log and sleep here.
+            self.router_logger.log_message("[KerberosManager] Performing session cleanup...")
+            # Placeholder for actual cleanup logic:
+            # Iterate self.kerberos_sessions and remove entries older than a certain threshold.
+            # Example: for session_id, session_data in list(self.kerberos_sessions.items()):
+            #              if time.time() - session_data['timestamp'] > SOME_TIMEOUT:
+            #                  del self.kerberos_sessions[session_id]
+
+            self._stop_event.wait(60) # Check every 60 seconds
+
+    def handle_kerberos_packet(self, packet: Packet, inbound_iface: str, interfaces_config: Dict[str, Any]):
+        """
+        Processes an incoming Kerberos packet.
+        Args:
+            packet: The Scapy packet containing the Kerberos layer.
+            inbound_iface (str): The full Scapy name of the interface the packet was sniffed on.
+            interfaces_config (dict): The router's internal interfaces configuration.
+        Returns:
+            bool: True if the packet was handled by the Kerberos manager, False otherwise.
+        """
+        kerb_layer = packet[Kerberos]
+        iface_short = inbound_iface.split('_')[-1]
+        self.router_logger.log_message(f"[KerberosManager] 🔑 Kerberos packet detected on {iface_short}.")
+
+        try:
+            # Identify the Kerberos message type
+            msg_type = kerb_layer.root.msgType.val
+
+            if msg_type == KRB_AS_REQ.msgType.val:
+                self._handle_as_req(kerb_layer, packet, inbound_iface)
+            elif msg_type == KRB_AS_REP.msgType.val:
+                self._handle_as_rep(kerb_layer, packet, inbound_iface)
+            elif msg_type == KRB_TGS_REQ.msgType.val:
+                self._handle_tgs_req(kerb_layer, packet, inbound_iface)
+            elif msg_type == KRB_TGS_REP.msgType.val:
+                self._handle_tgs_rep(kerb_layer, packet, inbound_iface)
+            elif msg_type == KRB_ERROR.msgType.val:
+                self._handle_error(kerb_layer, packet, inbound_iface)
+            else:
+                self.router_logger.log_message(f"[KerberosManager] Unhandled Kerberos message type: {msg_type}")
+
+            return True
+
+        except Exception as e:
+            self.router_logger.log_message(f"[KerberosManager] ❌ Error processing Kerberos packet: {e}")
+            return False
+
+    def _handle_as_req(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles an AS-REQ packet."""
+        as_req = kerb_layer.root
+        cname = as_req.reqBody.cname.nameString[0] if as_req.reqBody.cname and as_req.reqBody.cname.nameString else "UNKNOWN"
+        crealm = as_req.reqBody.realm if as_req.reqBody.realm else "UNKNOWN"
+        etype_str = ", ".join([str(e.val) for e in as_req.reqBody.etype]) if as_req.reqBody.etype else "None"
+
+        self.router_logger.log_message(f"[KerberosManager] AS-REQ from {cname}@{crealm} (ETypes: {etype_str})")
+
+        # Example: Try to decrypt pre-authentication data if present (e.g., PA-ENC-TIMESTAMP)
+        for pa_data_item in as_req.padata:
+            if pa_data_item.padataType.val == PADATA:
+                enc_data = pa_data_item.padataValue
+                self.router_logger.log_message(f"[KerberosManager] Attempting to decrypt PA-ENC-TIMESTAMP...")
+                # To decrypt, you'd need the client's long-term key, which is usually not available on the router.
+                # This is why client AS-REQs are hard to decrypt without the password/keytab.
+                # If you *had* the key (e.g., from a known test client), you could do:
+                # client_key = self._keytab_entries.get(f"{cname}@{crealm}".lower())
+                # if client_key and isinstance(enc_data, EncryptedData):
+                #     try:
+                #         decrypted_timestamp = enc_data.decrypt(client_key, cls=PA_ENC_TIMESTAMP)
+                #         self.router_logger.log_message(f"[KerberosManager] Decrypted PA-ENC-TIMESTAMP: {decrypted_timestamp.patimestamp.ctime}")
+                #     except Exception as e:
+                #         self.router_logger.log_message(f"[KerberosManager] Failed to decrypt PA-ENC-TIMESTAMP: {e}")
+                break # Only try to decrypt the first one
+
+        # Store session info if tracking needed (e.g., for replay detection)
+        # self.kerberos_sessions[nonce] = {"client": f"{cname}@{crealm}", "timestamp": time.time(), ...}
+
+    def _handle_as_rep(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles an AS-REP packet."""
+        as_rep = kerb_layer.root
+        crealm = as_rep.crealm if as_rep.crealm else "UNKNOWN"
+        cname = as_rep.cname.nameString[0] if as_rep.cname and as_rep.cname.nameString else "UNKNOWN"
+        sname = as_rep.ticket.sname.nameString[0] if as_rep.ticket.sname and as_rep.ticket.sname.nameString else "UNKNOWN"
+        srealm = as_rep.ticket.realm if as_rep.ticket.realm else "UNKNOWN"
+
+        self.router_logger.log_message(f"[KerberosManager] AS-REP for {cname}@{crealm} from {sname}@{srealm}")
+
+        # The AS-REP `encPart` contains the EncASRepPart, encrypted with the client's long-term key.
+        # This is hard to decrypt passively without the client's password.
+        # However, the `ticket.encPart` is encrypted with the KDC's master key (TGT key).
+        # If the router holds the TGT key (unlikely in a real scenario, but possible for a test KDC), it could decrypt.
+        encrypted_ticket_part = as_rep.ticket.encPart
+        if isinstance(encrypted_ticket_part, EncryptedData):
+            # Example: Decrypt the TGT if the KDC's master key is known to the manager
+            # KDC_TGT_PRINCIPAL = f"krbtgt/{srealm}@{srealm}".lower()
+            # tgt_key = self._keytab_entries.get(KDC_TGT_PRINCIPAL)
+            # if tgt_key:
+            #     try:
+            #         decrypted_tgt = encrypted_ticket_part.decrypt(tgt_key, cls=EncTicketPart)
+            #         self.router_logger.log_message(f"[KerberosManager] Decrypted TGT for {decrypted_tgt.cname.nameString[0]}@{decrypted_tgt.crealm}")
+            #         self.router_logger.log_message(f"[KerberosManager] TGT Session Key Type: {decrypted_tgt.key.keytype.val}")
+            #     except Exception as e:
+            #         self.router_logger.log_message(f"[KerberosManager] Failed to decrypt TGT: {e}")
+            # else:
+            #     self.router_logger.log_message(f"[KerberosManager] No KDC TGT key found for {KDC_TGT_PRINCIPAL}.")
+            pass # Placeholder for actual decryption logic
+
+    def _handle_tgs_req(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a TGS-REQ packet."""
+        tgs_req = kerb_layer.root
+        sname = tgs_req.reqBody.sname.nameString[0] if tgs_req.reqBody.sname and tgs_req.reqBody.sname.nameString else "UNKNOWN"
+        realm = tgs_req.reqBody.realm if tgs_req.reqBody.realm else "UNKNOWN"
+        self.router_logger.log_message(f"[KerberosManager] TGS-REQ requesting service ticket for {sname}@{realm}")
+
+        # The TGS-REQ contains an Authenticator encrypted with the TGT session key.
+        # To decrypt this, you'd need the session key from the previously seen AS-REP's EncASRepPart.
+        # This requires robust session tracking.
+
+    def _handle_tgs_rep(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a TGS-REP packet."""
+        tgs_rep = kerb_layer.root
+        crealm = tgs_rep.crealm if tgs_rep.crealm else "UNKNOWN"
+        cname = tgs_rep.cname.nameString[0] if tgs_rep.cname and tgs_rep.cname.nameString else "UNKNOWN"
+        sname = tgs_rep.ticket.sname.nameString[0] if tgs_rep.ticket.sname and tgs_rep.ticket.sname.nameString else "UNKNOWN"
+        srealm = tgs_rep.ticket.realm if tgs_rep.ticket.realm else "UNKNOWN"
+
+        self.router_logger.log_message(f"[KerberosManager] TGS-REP for {cname}@{crealm} from {sname}@{srealm}")
+
+        # Similar to AS-REP, the `encPart` is encrypted with the TGT session key (for the EncTGSRepPart).
+        # The `ticket.encPart` is encrypted with the service principal's long-term key.
+        # If your router acts as that service or has access to the service's keytab, it could decrypt this.
+        encrypted_service_ticket_part = tgs_rep.ticket.encPart
+        if isinstance(encrypted_service_ticket_part, EncryptedData):
+            # Example: Decrypt the service ticket if the service principal's key is known
+            # SERVICE_PRINCIPAL = f"{sname}@{srealm}".lower()
+            # service_key = self._keytab_entries.get(SERVICE_PRINCIPAL)
+            # if service_key:
+            #     try:
+            #         decrypted_service_ticket = encrypted_service_ticket_part.decrypt(service_key, cls=EncTicketPart)
+            #         self.router_logger.log_message(f"[KerberosManager] Decrypted Service Ticket for {decrypted_service_ticket.cname.nameString[0]}@{decrypted_service_ticket.crealm}")
+            #     except Exception as e:
+            #         self.router_logger.log_message(f"[KerberosManager] Failed to decrypt Service Ticket: {e}")
+            pass # Placeholder
+
+    def _handle_error(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a KRB-ERROR packet."""
+        error_msg = kerb_layer.root
+        error_code = error_msg.errorCode.val
+        e_text = error_msg.eText if error_msg.eText else ""
+        sname = error_msg.sname.nameString[0] if error_msg.sname and error_msg.sname.nameString else "UNKNOWN"
+        srealm = error_msg.realm if error_msg.realm else "UNKNOWN"
+
+        self.router_logger.log_message(f"[KerberosManager] ⚠️ KRB-ERROR (Code: {error_code}) from {sname}@{srealm}: {e_text}")
+
+        # You can map error codes to meanings for better logging/alerting
+        # e.g., if error_code == 6 (KDC_ERR_C_PRINCIPAL_UNKNOWN) log a specific alert.
+        # Check RFC 4120 for a full list of error codes.
+
+    # Additional methods could be added here for active Kerberos proxying,
+    # or for initiating Kerberos requests from the router itself.
 
 class NotificationManager:
     """Sends simple UDP notifications for network events."""
@@ -406,6 +648,19 @@ class ForwardingManager:
             self.logger.log_message(f"[Forwarding] 🔁 Duplicate flow expired: {key}")
             self._forwarded_set.discard(key)
 
+    def record_flow(self, src_ip: str, dst_ip: str, sport: int, dport: int, proto: str):
+        """
+        Manually records a flow into the forwarded cache to prevent future duplication.
+        Useful for preemptively suppressing known loops or rerouted flows.
+        """
+        key = (src_ip, dst_ip, sport, dport, proto)
+        now = time.time()
+        with self._lock:
+            self._prune_expired()
+            if key not in self._forwarded_set:
+                self._forwarded_cache.append((key, now))
+                self._forwarded_set.add(key)
+                self.logger.log_message(f"[Forwarding] 🧾 Flow recorded manually: {key}")
     def is_duplicate(self, src_ip: str, dst_ip: str, sport: int, dport: int, proto: str) -> bool:
         """
         Returns True if the flow has been seen recently and should be considered a duplicate.
@@ -600,6 +855,36 @@ class EthernetBridgeManager:
             self._stop_event.set()
             self._cleanup_thread.join(timeout=2)
             self.logger.log_message("[Bridge] Cleanup thread stopped.")
+
+class EthernetL2Manager:
+    """
+    Handles non-IP Ethernet (Layer 2) packets such as 802.3 frames, STP, LLDP, and malformed traffic.
+    Logs or filters low-level packets that do not include IP/IPv6 layers.
+    """
+
+    def __init__(self, router_logger):
+        self.logger = router_logger
+
+    def handle_packet(self, packet, iface_name: str) -> bool:
+        """
+        Inspect and optionally handle non-IP packets.
+        Returns True if handled; False otherwise.
+        """
+        if packet.haslayer(IP) or packet.haslayer(IPv6):
+            return False  # This manager only handles non-IP
+
+        summary = packet.summary()
+        ether_type = hex(packet[Ether].type) if packet.haslayer(Ether) else "N/A"
+
+        self.logger.log_message(f"[L2] 📡 Non-IP Packet on {iface_name}: EtherType={ether_type} | {summary}")
+
+        # Example: Drop STP or LLDP by default
+        if ether_type in ("0x0026", "0x88cc"):  # STP or LLDP
+            self.logger.log_message(f"[L2] ❌ Dropping known Layer 2 protocol (type {ether_type})")
+            return True
+
+        # You could forward it to a debug queue, store, or stats counter
+        return True
 
 class SYNScanner:
     """
@@ -815,7 +1100,7 @@ class ICMPManager:
         src_ip = pkt[IP].src
         dst_ip = pkt[IP].dst
         icmp_type = pkt[ICMP].type
-        icmp_code = pkt[ICMP].code if pkt[ICMP].hasfield("code") else 0  # Some ICMP types don't have codes
+        icmp_code = pkt[ICMP].code if hasattr(pkt[ICMP], 'code') else 0  # Some ICMP types don't have codes
 
         # Ensure the packet's destination IP is one of our router's IPs
         is_for_router = False
@@ -1372,7 +1657,7 @@ class RIPManager:
         self._thread = None
         self._interfaces_config = {}
         self.authentication_key = None  # For RIP authentication
-
+        self.interface_loopback_full_name = None
     def set_authentication_key(self, key: str):
         """Sets a shared secret for RIP authentication (plaintext for simplicity)."""
         self.authentication_key = key
@@ -1506,8 +1791,7 @@ class RIPManager:
                     # For loopback IPs, if we have a loopback direct route, it's usually preferred.
                     # This implicitly handles the 127.0.0.0/8 network for local traffic.
                     if dest_ip_obj.is_loopback and rt_details["type"] == "direct" and \
-                            rt_details["interface"] == self._interfaces_config.get(
-                        self.router_logger.interface_loopback_full_name, {}).get('full_name'):
+                            rt_details["interface"] == self.interface_loopback_full_name:
                         # If a packet's destination is loopback and we have a direct loopback route
                         # This means it's for the local host's services.
                         return rt_details  # Directly return the loopback interface route
@@ -1829,6 +2113,49 @@ class RIPManager:
         # Example: if you had an OSPF manager, it would call this to inject OSPF routes into RIP.
         # This would then trigger RIP updates.
         # For now, it's just logs. Actual implementation would involve adding to _routing_table with type "redistributed_rip" or similar.
+
+    def find_alternate_route(self, dest_ip_str: str, exclude_iface: str):
+        """
+        Finds the best alternate route for a destination IP, avoiding the specified interface.
+        Used for rerouting in routing loop scenarios.
+        """
+        try:
+            dest_ip_obj = ipaddress.ip_address(dest_ip_str)
+            best_match = None
+            best_prefix = -1
+
+            with self._rt_lock:
+                for net, rt_details in self._routing_table.items():
+                    iface = rt_details.get("interface")
+                    if iface == exclude_iface:
+                        continue  # Skip the looping interface
+
+                    # Prioritize direct loopback if applicable
+                    if dest_ip_obj.is_loopback and rt_details["type"] == "direct" and \
+                            iface == self.interface_loopback_full_name:
+                        return rt_details
+
+                    if dest_ip_obj in net:
+                        current_match_is_better = False
+
+                        if best_match is None:
+                            current_match_is_better = True
+                        elif net.prefixlen > best_prefix:
+                            current_match_is_better = True
+                        elif net.prefixlen == best_prefix:
+                            if rt_details["cost"] < best_match["cost"]:
+                                current_match_is_better = True
+                            elif rt_details["cost"] == best_match["cost"]:
+                                if rt_details["type"] == "static" and best_match["type"] != "static":
+                                    current_match_is_better = True
+
+                        if current_match_is_better and rt_details["cost"] < 16:
+                            best_prefix = net.prefixlen
+                            best_match = rt_details
+
+            return best_match
+        except ValueError:
+            return None
 
 
 class NATManager:
@@ -2182,9 +2509,8 @@ class DNSManager:
         self.DNS_CACHE_TTL_MIN = 60
         self.DNS_CACHE_MAX_ENTRIES = 1000
         self._conditional_forwarders = {}
-        self._dns_blacklist = {}
+        self._dns_blacklist = set()
 
-    # ... (all other methods like add_blacklist, _get_from_cache, etc., are correct and remain the same) ...
     def add_conditional_forwarder(self, domain_suffix: str, dns_server_ip: str):
         """Adds a conditional DNS forwarder."""
         self._conditional_forwarders[domain_suffix.lower()] = dns_server_ip
@@ -2255,31 +2581,39 @@ class DNSManager:
                     del self._dns_cache[qname]
         return None
 
-    # --- FIX 1: Update the function signature ---
     def handle_query(self, packet, inbound_iface: str, router_interfaces: dict, get_mac_function, find_route_function,
-                     packet_writer, router_lan_network: ipaddress.IPv4Network):
+                     packet_writer, router_lan_network: ipaddress._BaseNetwork):
         if not (packet.haslayer(DNS) and packet[DNS].qr == 0):
             return False
 
-        ip_layer = packet.getlayer(IP)
+        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        if ip_layer is None:
+            self.router_logger.log_message("[DNS] ❌ No IP layer found in DNS packet.")
+            return False
+
+        layer_name = "IP" if packet.haslayer(IP) else "IPv6"
         udp_layer = packet.getlayer(UDP)
         dns_layer = packet.getlayer(DNS)
         qname = dns_layer.qd.qname.decode() if dns_layer.qd else "unknown"
 
         if self._is_blacklisted(qname):
-            blocked_response = Ether(src=packet[Ether].dst, dst=packet[Ether].src) / IP(src=ip_layer.dst, dst=ip_layer.src) / UDP(sport=udp_layer.dport, dport=udp_layer.sport) / DNS(id=dns_layer.id, qr=1, ra=1, rcode=3, qd=dns_layer.qd)
-            packet_writer.queue_packet(blocked_response, inbound_iface)
+            response = Ether(src=packet[Ether].dst, dst=packet[Ether].src) / \
+                       packet.getlayer(type(ip_layer)).__class__(src=ip_layer.dst, dst=ip_layer.src) / \
+                       UDP(sport=udp_layer.dport, dport=udp_layer.sport) / \
+                       DNS(id=dns_layer.id, qr=1, ra=1, rcode=3, qd=dns_layer.qd)
+            packet_writer.queue_packet(response, inbound_iface)
             return True
 
         cached_response = self._get_from_cache(qname)
         if cached_response:
             response_pkt = cached_response.copy()
-            response_pkt[IP].dst = ip_layer.src
+            response_pkt[layer_name].dst = ip_layer.src
             response_pkt[UDP].dport = udp_layer.sport
             response_pkt[DNS].id = dns_layer.id
             if response_pkt.haslayer(Ether):
                 response_pkt[Ether].dst = packet[Ether].src
-            del response_pkt[IP].chksum; del response_pkt[UDP].chksum
+            del response_pkt[layer_name].chksum
+            del response_pkt[UDP].chksum
             packet_writer.queue_packet(response_pkt, inbound_iface)
             return True
 
@@ -2292,11 +2626,10 @@ class DNSManager:
         if not outbound_iface_name:
             return False
 
-        # --- FIX 2: Implement more intelligent loop prevention ---
         is_from_lan = ipaddress.ip_address(ip_layer.src) in router_lan_network
-
         if inbound_iface == outbound_iface_name and not is_from_lan:
-            self.router_logger.log_message(f"[DNS] Not proxying DNS query from external source {ip_layer.src} to prevent loop.")
+            self.router_logger.log_message(
+                f"[DNS] 🔁 Not proxying DNS query from external source {ip_layer.src} to prevent loop.")
             return False
 
         outbound_iface_config = router_interfaces.get(outbound_iface_name)
@@ -2310,13 +2643,14 @@ class DNSManager:
                 "inbound_iface": inbound_iface
             }
 
-        self.router_logger.log_message(f"[DNS] ➡️  Proxying query for {qname} from {ip_layer.src} to {target_dns_server}")
+        self.router_logger.log_message(
+            f"[DNS] ➡️ Proxying query for {qname} from {ip_layer.src} to {target_dns_server}")
 
         modified_packet = packet.copy()
-        modified_packet[IP].src = outbound_iface_config['ip_addr']
-        modified_packet[IP].dst = target_dns_server
+        modified_packet[layer_name].src = outbound_iface_config['ip_addr']
+        modified_packet[layer_name].dst = target_dns_server
 
-        if packet.haslayer(Ether):
+        if modified_packet.haslayer(Ether):
             modified_packet[Ether].src = outbound_iface_config['mac']
             gateway_ip = default_route.get("next_hop") or target_dns_server
             target_mac = get_mac_function(gateway_ip, outbound_iface_name)
@@ -2325,13 +2659,16 @@ class DNSManager:
                 return True
             modified_packet[Ether].dst = target_mac
 
-        del modified_packet[IP].chksum
-        del modified_packet[UDP].chksum
+        # Remove checksum to allow Scapy to recalculate
+        if hasattr(modified_packet[layer_name], "chksum"):
+            del modified_packet[layer_name].chksum
+        if hasattr(modified_packet[UDP], "chksum"):
+            del modified_packet[UDP].chksum
+
         packet_writer.queue_packet(modified_packet, outbound_iface_name)
         return True
 
     def handle_response(self, packet, router_interfaces: dict, packet_writer):
-        # This method is correct and remains unchanged
         if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
             return False
 
@@ -3170,15 +3507,18 @@ class PythonRouterManager:
         self.handshake_manager = None
         self.igmp_manager = IGMPManager(router_logger, self.packet_writer)
         self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self._interfaces_config)
-        self.dhcp_server = None
+        self.dhcp_server_in = None
+        self.dhcp_server_out = None
         self.outbound_load_balancer = OutboundLoadBalancer(router_logger)  # New: Outbound Load Balancer
         self.lag_manager = LinkAggregationManager(router_logger)  # New: Link Aggregation Manager
         self.firewall_manager = FirewallManager(router_logger)  # New: Firewall Manager
         self.syn_scanner = None
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
         self.forwarding_manager = ForwardingManager(router_logger=self.router_logger)
+        self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
+        self.https_manager = HTTPSManager(router_logger)
+        self.ethernet_l2_manager = EthernetL2Manager(router_logger)
         self.router_logger.log_message("[RouterManager] Orchestrator Initialized.")
-
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
         if getattr(sys, "frozen", False):
@@ -3382,17 +3722,30 @@ class PythonRouterManager:
         try:
             self.router_logger.log_message(f"[Netsh] Executing: {' '.join(full_command)}")
             result = subprocess.run(
-                full_command, capture_output=True, text=True, check=True,
+                full_command, capture_output=True, text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-            if result.stdout: self.router_logger.log_message(f"[Netsh] STDOUT: {result.stdout.strip()}")
-            return True
-        except subprocess.CalledProcessError as e:
-            self.router_logger.log_message(f"[Netsh] ERROR executing netsh (Return Code: {e.returncode}):")
-            if e.stdout: self.router_logger.log_message(f"[Netsh] STDOUT: {e.stdout.strip()}")
-            if e.stderr: self.router_logger.log_message(f"[Netsh] STDERR: {e.stderr.strip()}")
-            self.router_logger.log_message(f"[Netsh] Command was: {' '.join(full_command)}")
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+
+            if result.returncode == 0:
+                if stdout:
+                    self.router_logger.log_message(f"[Netsh] STDOUT: {stdout}")
+                return True
+
+            # Handle benign error: DHCP already enabled
+            if "DHCP is already enabled" in stdout:
+                self.router_logger.log_message(f"[Netsh] ⚠️ DHCP already enabled — continuing.")
+                return True
+
+            # Otherwise treat as real error
+            self.router_logger.log_message(f"[Netsh] ERROR executing netsh (Return Code: {result.returncode}):")
+            if stdout:
+                self.router_logger.log_message(f"[Netsh] STDOUT: {stdout}")
+            if stderr:
+                self.router_logger.log_message(f"[Netsh] STDERR: {stderr}")
             return False
+
         except FileNotFoundError:
             self.router_logger.log_message("[Netsh] ERROR: 'netsh' command not found. Is Windows installed correctly?")
             return False
@@ -3512,7 +3865,7 @@ class PythonRouterManager:
                 f"[RouterManager] Error discovering gateway for '{iface_friendly_name}': {e}")
             return None
 
-    def _auto_configure_interfaces(self):
+    def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in):
         """
         Automatically finds and configures IN, OUT, and Loopback interfaces.
         Sets their IP addresses dynamically (for IN/OUT) and determines default gateway.
@@ -3526,7 +3879,8 @@ class PythonRouterManager:
 
         for iface_info in self._discovered_tshark_interfaces:
             # Check for IN interface
-            if self.DEFAULT_IN_IFACE_FRIENDLY_NAME.lower() == iface_info['friendly_name'].lower() and in_iface_info is None:
+            if self.DEFAULT_IN_IFACE_FRIENDLY_NAME.lower() == iface_info[
+                'friendly_name'].lower() and in_iface_info is None:
                 in_iface_info = iface_info
                 self.router_logger.log_message(
                     f"[RouterManager] Found IN interface: {self.DEFAULT_IN_IFACE_FRIENDLY_NAME} as {in_iface_info['full_name']}")
@@ -3640,31 +3994,34 @@ class PythonRouterManager:
             "[RouterManager] Assigning IPs to interfaces via OS commands (Requires Admin). This may cause temporary network disruption.")
 
         # Assign IN interface IP (using its friendly name for netsh)
-        if not self._assign_ip_to_interface(self.interface_in_friendly_name, self.router_ip_in, self.router_netmask_in):
-            self.router_logger.log_message(
-                f"[RouterManager] CRITICAL ERROR: Failed to assign IP to IN interface. Routing may not work.")
-            return False
+
+        if(not use_dhcp_in):
+            if not self._assign_ip_to_interface(self.interface_in_friendly_name, self.router_ip_in, self.router_netmask_in):
+                self.router_logger.log_message(
+                    f"[RouterManager] CRITICAL ERROR: Failed to assign IP to IN interface. Routing may not work.")
+                return False
 
         # Assign OUT interface IP with its (discovered/fallback) gateway (using its friendly name for netsh)
-        if not self._assign_ip_to_interface(self.interface_out_friendly_name, self.router_ip_out,
-                                            self.router_netmask_out,
-                                            self.router_gateway_out_ip):
-            self.router_logger.log_message(
-                f"[RouterManager] CRITICAL ERROR: Failed to assign IP to OUT interface. Routing may not work.")
-            return False
+        if(not use_dhcp_out):
+            if not self._assign_ip_to_interface(self.interface_out_friendly_name, self.router_ip_out,
+                                                self.router_netmask_out,
+                                                self.router_gateway_out_ip):
+                self.router_logger.log_message(
+                    f"[RouterManager] CRITICAL ERROR: Failed to assign IP to OUT interface. Routing may not work.")
+                return False
 
         # Step 4: Update internal _interfaces_config with assigned IPs and MACs
         # Store configurations by full Scapy name
         self._interfaces_config[self.interface_in_full_name] = {
             'ip_addr': self.router_ip_in,
             'network': self.router_network_in,
-            'mac': get_if_hwaddr(self.interface_in_full_name)
+            'mac': get_if_hwaddr(self.interface_in_full_name),
         }
         self._interfaces_config[self.interface_out_full_name] = {
             'ip_addr': self.router_ip_out,
             'network': self.router_network_out,
             'mac': get_if_hwaddr(self.interface_out_full_name),
-            'is_default_gateway_iface': True
+            'is_default_gateway_iface': True,
         }
         self.default_gateway_ip = self.router_gateway_out_ip
         bridge_members = [self.interface_in_full_name]
@@ -3683,13 +4040,13 @@ class PythonRouterManager:
                     self._interfaces_config[ethernet_2_info["full_name"]] = {
                         "ip_addr": eth2_ip,
                         "network": eth2_network,
-                        "mac": eth2_mac
+                        "mac": eth2_mac,
                     }
                 else:
                     self._interfaces_config[ethernet_2_info["full_name"]] = {
                         "ip_addr": "0.0.0.0",
                         "network": None,
-                        "mac": eth2_mac
+                        "mac": eth2_mac,
                     }
                 self.router_logger.log_message(
                     f"[RouterManager] Added Ethernet 2 to config: {ethernet_2_info['full_name']}, MAC: {eth2_mac}")
@@ -3701,7 +4058,8 @@ class PythonRouterManager:
         self.create_l2_bridge("MyLANBridge", bridge_members)
         self.create_link_aggregation_group("MyLanAggregation", bridge_members)
         self.add_outbound_load_balancing_interface(self.interface_in_full_name)
-        self.router_logger.log_message("[RouterManager][ARP] 🔒 Configuring trusted ARP interfaces and static entries...")
+        self.router_logger.log_message(
+            "[RouterManager][ARP] 🔒 Configuring trusted ARP interfaces and static entries...")
 
         # Trust the IN interface
         self.add_trusted_arp_port(self.interface_in_full_name)
@@ -3738,8 +4096,9 @@ class PythonRouterManager:
             self._interfaces_config[self.interface_loopback_full_name] = {
                 'ip_addr': loopback_ip,
                 'network': loopback_network,
-                'mac': loopback_mac
+                'mac': loopback_mac,
             }
+            self.rip_manager.interface_loopback_full_name = self.interface_loopback_full_name
             self.router_logger.log_message(
                 f"  Loopback Interface: '{self.interface_loopback_full_name}' (IP: {loopback_ip}/{loopback_netmask}, MAC: {loopback_mac})")
 
@@ -3761,7 +4120,6 @@ class PythonRouterManager:
             f"  External Gateway: {self.router_gateway_out_ip} via '{self.interface_out_friendly_name}'")
         self.router_logger.log_message(f"----------------------------------------------------------------")
         return True
-
     def _enable_nat_forwarding(self):
         """
         Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
@@ -3802,7 +4160,6 @@ class PythonRouterManager:
             self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
         except Exception as e:
             self.router_logger.log_message(f"[NAT Setup] ❌ An unexpected error occurred while enabling NAT: {e}")
-
     def _disable_nat_forwarding(self):
         """
         Removes the NAT forwarding rule created by the router.
@@ -3842,7 +4199,9 @@ class PythonRouterManager:
         return True
 
     def _start_single_sniffer(self, iface_name: str):
-        """Starts a single sniffer thread for a given interface."""
+        """Starts a sniffer thread + processing worker pool for a given interface."""
+
+        packet_queue = queue.Queue(maxsize=5000)  # Adjustable based on memory
 
         def sniffer_loop(name=iface_name):
             self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[-1]} starting...")
@@ -3850,32 +4209,82 @@ class PythonRouterManager:
             try:
                 sniff(
                     iface=name,
-                    prn=lambda pkt: self._process_packet(pkt, name),
+                    prn=lambda pkt: packet_queue.put(pkt, block=False),
                     store=0,
                     promisc=True,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set()
                 )
             except Exception as e:
-                # If a thread crashes, this will log it!
                 self.router_logger.log_message(f"‼️ CRITICAL ERROR in sniffer thread for {name.split('_')[-1]}: {e}")
             finally:
                 self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[-1]} has exited.")
 
-        thread = threading.Thread(target=sniffer_loop, name=f"Sniffer-{iface_name.split('_')[-1]}", daemon=True)
-        self._sniff_threads[iface_name] = thread
-        thread.start()
-        self.router_logger.log_message(f"[Router] Sniffing started on {iface_name.split('_')[-1]}.")
+        def packet_worker():
+            while not self._stop_sniffing_event.is_set():
+                try:
+                    pkt = packet_queue.get(timeout=1)
+                    self._process_packet(pkt, iface_name)
+                except queue.Empty:
+                    continue  # Normal timeout behavior
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.router_logger.log_message(f"[Worker] ❌ Error processing packet:\n{tb}")
+
+        # Start sniffing thread
+        sniffer_thread = threading.Thread(target=sniffer_loop, name=f"Sniffer-{iface_name.split('_')[-1]}", daemon=True)
+        self._sniff_threads[iface_name] = sniffer_thread
+        sniffer_thread.start()
+
+        # Start a few worker threads
+        self._worker_threads = getattr(self, "_worker_threads", {})
+        self._worker_threads[iface_name] = []
+        for i in range(4):  # Start 4 workers per interface (configurable)
+            worker = threading.Thread(target=packet_worker, name=f"Worker-{iface_name}-{i}", daemon=True)
+            worker.start()
+            self._worker_threads[iface_name].append(worker)
+
+        self.router_logger.log_message(f"[Router] Sniffing + workers started on {iface_name.split('_')[-1]}.")
+
+    def _start_dhcp_servers(self):
+        if self.router_network_in:
+            dhcp_start_in_ip = str(self.router_network_in.network_address + 100)
+            dhcp_end_in_ip = str(self.router_network_in.network_address + 200)
+            dhcp_start_out_ip = str(self.router_network_out.network_address + 100)
+            dhcp_end_out_ip = str(self.router_network_out.network_address + 200)
+
+            self.dhcp_server_in = DHCPServer(
+                self.router_logger,
+                self.packet_writer,
+                self.interface_in_full_name,
+                dhcp_start_in_ip,
+                dhcp_end_in_ip,
+                self._interfaces_config
+            )
+            self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in)
+            self.dhcp_server_out = DHCPServer(
+                self.router_logger,
+                self.packet_writer,
+                self.interface_out_full_name,
+                dhcp_start_out_ip,
+                dhcp_end_out_ip,
+                self._interfaces_config
+            )
+        else:
+            self.router_logger.log_message("[DHCP] DHCP Server not initialized: Router IN network not configured.")
+        if self.dhcp_server_in:
+            self.dhcp_server_in.start()
+        if self.dhcp_server_out:
+            self.dhcp_server_out.start()
 
     def _process_packet(self, packet, inbound_iface: str):
         """Main packet processing pipeline with verbose logging."""
         try:
             iface_short = inbound_iface.split('_')[-1]
 
-            # 0. Initial validation
-            if not (packet.haslayer(IP) or packet.haslayer(IPv6) or packet.haslayer(ARP)):
 
+            if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
-
             # 1. Duplicate Flow Check
             if packet.haslayer(IP):
                 ip_layer = packet[IP]
@@ -3886,25 +4295,10 @@ class PythonRouterManager:
                 if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
 
                     return
-            # 2. DHCP Early Handling
-            if packet.haslayer(UDP) and {packet[UDP].sport, packet[UDP].dport} & {67, 68}:
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short}")
-                if self.dhcp_server and self.dhcp_server.handle_packet(
-                        packet, inbound_iface, self.rip_manager.find_route):
-                    self.router_logger.log_message(f"[DHCP] ✅ Handled DHCP packet on {iface_short}")
-                    return
 
-            # 3. ARP Inspection
-            if packet.haslayer(ARP):
-                self.router_logger.log_message(f"[ARP] 🧠 Inspecting ARP packet on {iface_short}")
-                if not self.arp_manager._perform_arp_inspection(packet, inbound_iface):
-                    self.router_logger.log_message(f"[ARP] 🚫 Dropped ARP packet after inspection on {iface_short}")
-                    return
-                self.router_logger.log_message(f"[ARP] ✅ Passed inspection on {iface_short}")
-                return
 
-            # 4. DNS Handling
-            if packet.haslayer(UDP) and {packet[UDP].sport, packet[UDP].dport} & {53}:
+                # 4. DNS Handling
+            if packet.haslayer(DNS):
                 self.router_logger.log_message(f"[DNS] 🗺️ Intercepting DNS packet on {iface_short}")
 
                 # --- FIX 3: Add self.router_network_in to the call ---
@@ -3918,6 +4312,43 @@ class PythonRouterManager:
                     self.router_logger.log_message(f"[DNS] 🌐 Handled DNS response on {iface_short}")
                     return
 
+            if packet.haslayer(TLS):
+                self.router_logger.log_message(f"[TLS] 🔐 TLS packet detected on {iface_short}")
+                if self.https_manager and self.https_manager.handle_packet(packet):
+                    self.router_logger.log_message(f"[TLS] 🛡️ TLS packet successfully handled on {iface_short}")
+                    return
+
+            if packet.haslayer(Kerberos):
+                self.router_logger.log_message(f"[Kerberos] 🎟️ Kerberos packet detected on {iface_short}")
+                if self.kerberos_manager and self.kerberos_manager.handle_kerberos_packet(packet):
+                    self.router_logger.log_message(f"[Kerberos] 🧾 Kerberos packet authenticated on {iface_short}")
+                    return
+
+            # 2. DHCP Early Handling
+            if packet.haslayer(DHCP):
+                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short}")
+                handled = False
+                if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,self.rip_manager.find_route):
+                    self.router_logger.log_message(
+                        f"[DHCP] 📗 DHCP packet handled successfully by IN server on {iface_short}")
+                    handled = True
+                if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,self.rip_manager.find_route):
+                    self.router_logger.log_message(
+                        f"[DHCP] 📘 DHCP packet handled successfully by OUT server on {iface_short}")
+                    handled = True
+                if handled:
+                    return
+            # 3. ARP Inspection
+            if packet.haslayer(ARP):
+                self.router_logger.log_message(f"[ARP] 🧠 Inspecting ARP packet on {iface_short}")
+                if not self.arp_manager._perform_arp_inspection(packet, inbound_iface):
+                    self.router_logger.log_message(f"[ARP] 🚫 Dropped ARP packet after inspection on {iface_short}")
+                    return
+                self.router_logger.log_message(f"[ARP] 🧩 ARP inspection passed on {iface_short}")
+                return
+
+
+
 
             # 5. Firewall Check
             self.router_logger.log_message(f"[Firewall] 🔍 Inspecting packet on {iface_short}")
@@ -3926,9 +4357,11 @@ class PythonRouterManager:
                 return
 
             # 6. ICMP Handling
-            if self.icmp_manager.handle_packet(packet, inbound_iface):
-                self.router_logger.log_message(f"[ICMP] 📬 Handled ICMP packet on {iface_short}")
-                return
+            if packet.haslayer(scapy.layers.inet.ICMP):
+                self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP packet {iface_short}")
+                if self.icmp_manager.handle_packet(packet, inbound_iface):
+                    self.router_logger.log_message(f"[ICMP] 📬 Handled ICMP packet on {iface_short}")
+                    return
 
 
             # 7. IGMP Handling
@@ -3947,7 +4380,7 @@ class PythonRouterManager:
             is_for_router = dst_ip in router_ips
 
             if is_for_router:
-                if packet.haslayer(SimpleRIP):
+                if packet.haslayer(RIP):
                     self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
                     self.rip_manager.handle_packet(packet, inbound_iface)
                     return
@@ -3987,10 +4420,18 @@ class PythonRouterManager:
         ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
         dst_ip = ip_layer.dst
 
-        # --- [0] TTL Check ---
-        if ip_layer.ttl <= 1:
-            self.router_logger.log_message(f"[Router] ⌛ TTL expired for {dst_ip}. Dropping.")
+        ip_layer = None
+        if packet.haslayer(IP):
+            ip_layer = packet[IP]
+        elif packet.haslayer(IPv6):
+            ip_layer = packet[IPv6]
+
+        if not ip_layer:
+            self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
             return
+
+
+
 
         # --- [1] Routing Lookup ---
         route = self.rip_manager.find_route(dst_ip)
@@ -4009,13 +4450,30 @@ class PythonRouterManager:
                 ipaddress.ip_address(dst_ip) in inbound_network and
                 dst_ip != inbound_config.get("ip_addr")
         )
+        src_ip = ip_layer.src
+        proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
+        sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(
+            UDP) else 0
+        dport = packet[TCP].dport if packet.haslayer(TCP) else packet[UDP].dport if packet.haslayer(
+            UDP) else 0
 
+        if self.forwarding_manager.is_duplicate(src_ip, dst_ip, sport, dport, proto):
+            return
         if inbound_iface == initial_outbound_iface:
             if not is_intra_lan:
-                self.router_logger.log_message(
-                    f"[Router] 🔁 Routing loop detected! Traffic for {dst_ip} bounced back on {iface_short}. Dropping."
-                )
-                return
+                alternate_route = self.rip_manager.find_alternate_route(dst_ip, exclude_iface=inbound_iface)
+                if alternate_route:
+                    actual_outbound_iface = alternate_route["interface"]
+                    self.router_logger.log_message(
+                        f"[Router] 🛣️ Routing loop on {inbound_iface} for {dst_ip} — rerouting via {actual_outbound_iface.split('_')[-1]}"
+                    )
+                    self.forwarding_manager.record_flow(src_ip, dst_ip, sport, dport, proto)
+
+                    initial_outbound_iface = actual_outbound_iface
+                else:
+                    self.router_logger.log_message(
+                        f"[Router] ❌ Routing loop on {inbound_iface} and no alternate route for {dst_ip}. Dropping.")
+                    return
             else:
                 self.router_logger.log_message(
                     f"[Router] 🏠 Intra-LAN forwarding: {packet.summary()} | In:{iface_short} -> Out:{iface_short}"
@@ -4027,6 +4485,8 @@ class PythonRouterManager:
                 initial_outbound_iface == self.interface_out_full_name
         )
         actual_outbound_iface = initial_outbound_iface
+        if ipaddress.ip_address(dst_ip).is_global:
+            self.router_logger.log_message(f"[Internet] 🌍 Internet-bound packet to {dst_ip} via {actual_outbound_iface.split('_')[-1]}")
 
         if is_lan_to_wan and len(self.outbound_load_balancer.get_configured_interfaces()) > 1:
             selected_iface = self.outbound_load_balancer.get_next_interface(packet)
@@ -4090,6 +4550,7 @@ class PythonRouterManager:
         # --- [8] MAC Resolution ---
         if is_loopback:
             target_mac = "00:00:00:00:00:00"
+
             self.router_logger.log_message(
                 f"[Router] 🌀 Loopback forwarding for {dst_ip}. No ARP needed."
             )
@@ -4106,8 +4567,27 @@ class PythonRouterManager:
             return
 
         # --- [9] TTL Decrement ---
-        packet.ttl -= 1
+        # --- [0] Loopback Check (Crucial for your error) ---
+        is_loopback_dest = ipaddress.ip_address(dst_ip).is_loopback
 
+        # Only decrement TTL/HLIM if it's NOT a loopback destination
+        # and if the packet is actually meant to be forwarded.
+        if not is_loopback_dest:
+            ttl_or_hlim = getattr(ip_layer, "ttl", None)
+            if ttl_or_hlim is None:
+                ttl_or_hlim = getattr(ip_layer, "hlim", None)
+
+            if ttl_or_hlim is None:
+                self.router_logger.log_message(f"[Router] ❗ Cannot find TTL/Hop Limit field for {dst_ip}. Dropping.")
+                return
+
+            if ttl_or_hlim <= 1:
+                self.router_logger.log_message(f"[Router] ⌛ TTL/Hop Limit expired for {dst_ip}. Dropping.")
+                return
+            if hasattr(ip_layer, "ttl"):
+                packet[IP].ttl -= 1
+            elif hasattr(ip_layer, "hlim"):
+                packet[IPv6].hlim -= 1
         # --- [10] Adjust or Apply Ether Layer ---
         if is_loopback:
             if packet.haslayer(Ether):
@@ -4132,57 +4612,35 @@ class PythonRouterManager:
             f"[Router] 📤 Packet queued to {final_outbound_iface.split('_')[-1]}"
         )
 
-    def start_routing(self):
+    def start_routing(self, use_dhcp_out, use_dhcp_in):
         """Configures interfaces and starts all manager threads."""
-        self._initialize_interface_discovery()
-        if not self._auto_configure_interfaces():
-            self.router_logger.log_message("[Router] Auto-configuration failed. Aborting start.")
-            return
+        try:
+            self._initialize_interface_discovery()
+            if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in):
+                self.router_logger.log_message("[RouterManager] ❌ Failed to auto-configure interfaces.")
+        except Exception as e:
+            self.router_logger.log_message(f"[RouterManager] ❌ Crash in start_routing: {e}")
+
         self._enable_nat_forwarding()
         self.nat_manager = NATManager(self.router_logger, self.router_ip_out)
-        self.nat_manager.start()  # Start NAT cleanup thread
+        self.nat_manager.start()
         self.notification_manager = NotificationManager(
             self.router_logger,
             self.NOTIFICATION_TARGET_IP,
             self.NOTIFICATION_TARGET_PORT,
-            self.interface_in_full_name # Send notifications from the IN interface
+            self.interface_in_full_name
         )
-        # Assign the fully configured notifier to the ARP manager
-        self.arp_manager.notification_manager = self.notification_manager
-        # Initialize DHCP server (can be configured as relay agent or standalone server)
-        if self.router_network_in:
-            dhcp_start_ip = str(self.router_network_in.network_address + 100)
-            dhcp_end_ip = str(self.router_network_in.network_address + 200)
-            # Example: To enable DHCP relay, pass self.router_gateway_out_ip as dhcp_relay_target_ip
-            # self.dhcp_server = DHCPServer(
-            #     self.router_logger, self.packet_writer, self.interface_in_full_name,
-            #     dhcp_start_ip, dhcp_end_ip, self._interfaces_config, dhcp_relay_target_ip="10.0.0.1" # Example relay target
-            # )
-            self.dhcp_server = DHCPServer(
-                self.router_logger,
-                self.packet_writer,
-                self.interface_in_full_name,  # The full Scapy name for the IN interface
-                dhcp_start_ip,
-                dhcp_end_ip,
-                self._interfaces_config  # Pass the full interfaces configuration
-            )
-            self.arp_manager.set_dhcp_server_reference(self.dhcp_server)
-        else:
-            self.router_logger.log_message("[DHCP] DHCP Server not initialized: Router IN network not configured.")
-        if self.dhcp_server:  # Start DHCP server if it was initialized
-            self.dhcp_server.start()
 
-        # Initialize RIP routes with all known interfaces, including loopback for direct connection
+        self.arp_manager.notification_manager = self.notification_manager
+
+        self._start_dhcp_servers()
+
         self.rip_manager.initialize_routes(self._interfaces_config, self.router_gateway_out_ip,
                                            self.interface_out_full_name)
         self.ethernet_manager.start()
-        # Example: Set RIP authentication key
-        # self.rip_manager.set_authentication_key("mysecretkey")
 
-        # NEW: Add a default static route to 8.8.8.8 via the WAN interface, if not already present
-        # This gives direct control over a specific route without RIP
         google_dns_route_network = ipaddress.ip_network("8.8.8.8/32")
-        # Check if the route exists AND if its type is static. If not, add/update it as static.
+
         current_route_details = self.rip_manager.find_route("8.8.8.8")
         if not current_route_details or current_route_details.get("type") != "static":
             self.router_logger.log_message("[Router] Adding/Updating static route for 8.8.8.8/32.")
@@ -4192,6 +4650,14 @@ class PythonRouterManager:
                 next_hop=self.router_gateway_out_ip,
                 interface=self.interface_out_full_name,
                 cost=1
+            )
+            loopback_network = ipaddress.IPv6Network("::1/128")
+
+            self.rip_manager.add_static_route(
+                network_str=str(loopback_network),
+                next_hop="::1",
+                interface=self.interface_in_full_name,  # fallback to your IN interface
+                cost=2
             )
         else:
             self.router_logger.log_message("[Router] Static route for 8.8.8.8/32 already exists.")
@@ -4216,14 +4682,14 @@ class PythonRouterManager:
         self._stop_sniffing_event.clear()
         self.syn_scanner = SYNScanner(
             router_logger=self.router_logger,
-            packet_writer=self.packet_writer, # Pass your packet_writer instance
-            interfaces_config=self._interfaces_config, # Pass the populated config
+            packet_writer=self.packet_writer,
+            interfaces_config=self._interfaces_config,
             scan_targets=[
                 ("8.8.8.8", [53, 80]),
                 ("1.1.1.1", [443]),
             ],scan_interval=300)
         self.syn_scanner.start()
-        # Start sniffing on ALL configured interfaces, including loopback
+
         for iface_name in self._interfaces_config.keys():
             self._start_single_sniffer(iface_name)
 
@@ -4231,9 +4697,10 @@ class PythonRouterManager:
         """Stops all manager threads and cleans up network interfaces."""
         self.router_logger.log_message("\n--- Python Router Stopping Services ---")
         self._stop_sniffing_event.set()
-        if self.dhcp_server:  # Stop DHCP server if it was initialized
-            self.dhcp_server.stop()
-        # Stop all manager threads
+        if self.dhcp_server_in:
+            self.dhcp_server_in.stop()
+        if self.dhcp_server_out:
+            self.dhcp_server_out.stop()
         self.rip_manager.stop()
         self.ethernet_manager.stop()
         self.tls_proxy_manager.stop()
@@ -4241,9 +4708,11 @@ class PythonRouterManager:
         self._disable_nat_forwarding()
         if self.nat_manager:
             self.nat_manager.stop()
-        for thread in self._sniff_threads.values():
-            if thread.is_alive():
-                thread.join(timeout=2)
+        for workers in getattr(self, "_worker_threads", {}).values():
+            for worker in workers:
+                if worker.is_alive():
+                    worker.join(timeout=2)
+        self._worker_threads.clear()
         self._sniff_threads.clear()
         self.igmp_manager.stop()
         self.handshake_manager.stop()
@@ -4366,48 +4835,6 @@ class PythonRouterManager:
         """Removes a static ARP entry from the ARP manager."""
         self.arp_manager.remove_static_arp_entry(ip_address)
 
-    # --- New Methods for DNS Management ---
-    def add_dns_conditional_forwarder(self, domain_suffix: str, dns_server_ip: str):
-        """Adds a conditional DNS forwarder."""
-        self.dns_manager.add_conditional_forwarder(domain_suffix, dns_server_ip)
-
-    def remove_dns_conditional_forwarder(self, domain_suffix: str):
-        """Removes a conditional DNS forwarder."""
-        self.dns_manager.remove_conditional_forwarder(domain_suffix)
-
-    def add_dns_blacklist_entry(self, domain_suffix: str):
-        """Adds a domain suffix to the DNS blacklist."""
-        self.dns_manager.add_dns_blacklist_entry(domain_suffix)
-
-    def remove_dns_blacklist_entry(self, domain_suffix: str):
-        """Removes a domain suffix from the DNS blacklist."""
-        self.dns_manager.remove_dns_blacklist_entry(domain_suffix)
-
-    # --- New Methods for DHCP Management ---
-    def set_dhcp_relay_target(self, target_ip: str):
-        """Configures the DHCP server to act as a relay agent to the specified IP."""
-        if self.dhcp_server:
-            self.dhcp_server.dhcp_relay_target_ip = target_ip
-            self.router_logger.log_message(f"[RouterManager] DHCP server configured as relay to: {target_ip}")
-        else:
-            self.router_logger.log_message("[RouterManager] DHCP server not initialized. Cannot set relay target.")
-
-    def clear_dhcp_relay_target(self):
-        """Disables DHCP relay functionality."""
-        if self.dhcp_server:
-            self.dhcp_server.dhcp_relay_target_ip = None
-            self.router_logger.log_message("[RouterManager] DHCP relay functionality disabled.")
-        else:
-            self.router_logger.log_message("[RouterManager] DHCP server not initialized.")
-
-    # --- New Methods for RIP Management ---
-    def set_rip_authentication_key(self, key: str):
-        """Sets the shared secret for RIP authentication."""
-        self.rip_manager.set_authentication_key(key)
-
-    def clear_rip_authentication_key(self):
-        """Clears the RIP authentication key."""
-        self.rip_manager.set_authentication_key(None)
 
     # --- New Methods for Outbound Load Balancing ---
     def add_outbound_load_balancing_interface(self, iface_full_name: str):

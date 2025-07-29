@@ -1435,6 +1435,7 @@ class WiresharkTab(QWidget):
 class RouterTab(QWidget):
     """
     A QWidget that encapsulates all UI elements and logic for the Router tab.
+    Allows enabling DHCP for IN and OUT interfaces.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1442,7 +1443,6 @@ class RouterTab(QWidget):
         self._configure_layout()
 
     def _create_widgets(self):
-        """Creates all the widgets for the tab."""
         self.start_router_button = QPushButton("Start Router")
         self.start_router_button.setObjectName("start_router_button")
         self.start_router_button.setEnabled(True)
@@ -1451,16 +1451,24 @@ class RouterTab(QWidget):
         self.stop_router_button.setObjectName("stop_router_button")
         self.stop_router_button.setEnabled(False)
 
+        # ✅ DHCP checkboxes for both interfaces
+        self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
+        self.dhcp_out_checkbox.setChecked(False)  # Optional: default OFF
+
+        self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
+        self.dhcp_in_checkbox.setChecked(False)  # Optional: default OFF
+
         self.router_log = QPlainTextEdit()
         self.router_log.setReadOnly(True)
 
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
         layout = QVBoxLayout(self)
         control_layout = QHBoxLayout()
 
         control_layout.addWidget(self.start_router_button)
         control_layout.addWidget(self.stop_router_button)
+        control_layout.addWidget(self.dhcp_out_checkbox)
+        control_layout.addWidget(self.dhcp_in_checkbox)
         control_layout.addStretch(1)
 
         layout.addLayout(control_layout)
@@ -1470,7 +1478,6 @@ class RouterTab(QWidget):
     def log_message(self, message: str):
         """Appends a message to the router console log."""
         self.router_log.appendPlainText(message)
-
 
 class PacketSenderTab(QWidget):
     """
