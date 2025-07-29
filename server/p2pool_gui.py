@@ -377,7 +377,12 @@ class P2PoolGUI(QMainWindow):
     def start_router(self):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
         if self.helper.router_manager:
-            self.helper.router_manager.start_routing()
+            use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
+            use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
+            try:
+                self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in)
+            except Exception as e:
+                self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
             self.router_tab.start_router_button.setEnabled(False)
             self.router_tab.stop_router_button.setEnabled(True)
         else:
