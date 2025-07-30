@@ -38,6 +38,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from _ctypes import sizeof, byref
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from scapy import packet
 from scapy.all import send, sr1, conf, get_if_list
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
@@ -3095,7 +3096,9 @@ class DNSManager:
     def handle_response(self, packet, router_interfaces: dict, packet_writer):
         if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
             return False
-
+        if packet.haslayer(ICMP):
+            self.router_logger.log_message("[DNS] ℹ️ Skipping ICMP encapsulated packet.")
+            return False
         ip_layer = packet.getlayer(IP)
         udp_layer = packet.getlayer(UDP)
         dns_layer = packet[DNS]
@@ -4701,8 +4704,8 @@ class PythonRouterManager:
 
         def safe_enqueue(pkt):
             try:
-                if len(bytes(pkt)) < 14:
-                    self.router_logger.log_message(f"[Sniffer] ⚠️ Dropped malformed packet (too short)")
+                if not pkt.haslayer(Ether) or len(bytes(pkt)) < 14:
+                    self.router_logger.log_message("[Router] ⚠️ Dropping malformed packet (missing Ethernet header)")
                     return
 
                 if not consume_token():
