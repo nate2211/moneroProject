@@ -80090,3 +80090,14 @@ WARNING 2025-07-27 21:17:50.8912 P2Pool get_info RPC request to host 127.0.0.1:R
 WARNING 2025-07-27 21:17:52.9027 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
 WARNING 2025-07-27 21:17:54.9283 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
 WARNING 2025-07-27 21:17:56.9570 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+NOTICE  2025-07-29 02:27:31.9789 Log started
+NOTICE  2025-07-29 02:27:31.9796 P2Pool v4.9 (built with clang/20.1.8_p2pool (https://github.com/llvm/llvm-project.git 87f0227cb60147a26a1eeb4fb06e3b505e9c7261) on 2025-07-20)
+NOTICE  2025-07-29 02:27:31.9798 SideChain network type  = mainnet
+NOTICE  2025-07-29 02:27:31.9799 SideChain using default config
+NOTICE  2025-07-29 02:27:31.9799 SideChain pool name     = mini
+NOTICE  2025-07-29 02:27:31.9799 SideChain block time    = 10 seconds
+NOTICE  2025-07-29 02:27:31.9799 SideChain min diff      = 100000
+NOTICE  2025-07-29 02:27:31.9799 SideChain PPLNS window  = 2160 blocks
+NOTICE  2025-07-29 02:27:31.9799 SideChain uncle penalty = 20%
+NOTICE  2025-07-29 02:27:31.9799 SideChain generating consensus ID
+NOTICE  2025-07-29 02:27:31.9799 SideChain consensus ID = 3982c91a************************************************35187ec4
