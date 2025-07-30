@@ -14,6 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Set
+from ctypes import wintypes
 from pathlib import Path
 from socket import AF_INET
 from typing import Optional, List, Tuple, Any
@@ -34,6 +35,7 @@ import requests
 import scapy
 import select
 from PyQt5.QtCore import QObject, pyqtSignal
+from _ctypes import sizeof, byref
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.all import send, sr1, conf, get_if_list
@@ -42,9 +44,9 @@ from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dns import DNSQR, DNS, DNSRR
 from scapy.layers.inet import TCP, IP, ICMP, UDP, IPerror
-from scapy.layers.inet6 import IPv6
+from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach
 from scapy.layers.l2 import ARP, Ether
-from scapy.layers.rip import RIP
+from scapy.layers.rip import RIP, RIPEntry
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.libs.rfc3961 import Key
@@ -61,6 +63,7 @@ from scapy.layers.kerberos import (
     EncryptedData, PrincipalName, EncryptionKey, PADATA
 )
 from scapy.sessions import TCPSession
+from win32timezone import now
 
 
 def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
@@ -152,23 +155,6 @@ class ICMPv6ND_RA(Packet):
         PacketListField("options", [], ICMPv6ND_RA_Option, length_from=lambda pkt: pkt.underlayer.plen - 16)
     ]
 
-class RIPngEntry(Packet):
-    name = "RIPng Entry"
-    fields_desc = [
-        IP6Field("prefix", "::"),
-        ShortField("route_tag", 0),
-        ByteField("prefix_len", 0),
-        ByteField("metric", 1)
-    ]
-
-class RIPng(Packet):
-    name = "RIPng"
-    fields_desc = [
-        ByteField("command", 2),  # 1=request, 2=response
-        ByteField("version", 1),
-        ShortField("unused", 0),
-        PacketListField("entries", [], RIPngEntry)
-    ]
 
 # --- Layer Bindings ---
 bind_layers(Ether, IPv6, type=0x86DD)
@@ -181,88 +167,344 @@ bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
 bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
 bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
 bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
-bind_layers(UDP, RIPng, dport=521)
-bind_layers(UDP, RIPng, sport=521)
 bind_layers(IP, IGMP, proto=2)  # IP protocol 2 is IGMP
 
-# endregion
 
-
-class RIPEntry(Packet):
-    name = "RIPEntry"
-    fields_desc = [
-        ShortField("addr_family", 2),  # IPv4
-        ShortField("route_tag", 0),
-        IPField("address", "0.0.0.0"),  # Network address
-        IPField("subnet_mask", "0.0.0.0"),
-        IPField("next_hop", "0.0.0.0"),
-        IntField("metric", 1)  # 1–15 valid, 16 = infinity
-    ]
-
-
-class SimpleRIP(Packet):
-    name = "SimpleRIP"
-    fields_desc = [
-        ByteField("command", 2),  # 1 = request, 2 = response
-        ByteField("version", 2),  # RIPv2
-        ShortField("unused", 0),
-        PacketListField("entries", [], RIPEntry)
-    ]
-
-
-# Bind to UDP/520 so Scapy can dissect/construct automatically
-bind_layers(UDP, SimpleRIP, dport=520)
-bind_layers(UDP, SimpleRIP, sport=520)
 load_layer("tls")
 load_layer("kerberos")
 load_layer("rip")
 load_layer("dns")
 
 
+class SendBackManager:
+    """
+    A simplified version that signs and immediately sends a packet back.
+    Supports ICMP Destination Unreachable (Type 3) generation and custom handling.
+    """
 
+    def __init__(self, router_logger, packet_signer, outbound_load_balancer):
+        self.logger = router_logger
+        self.packet_signer = packet_signer
+        self.outbound_load_balancer = outbound_load_balancer
+        self.logger.log_message("[SendBack] Initialized.")
 
+    def send_back(self, packet: Packet, interface_name: str):
+        """
+        Signs and sends a packet immediately on a chosen outbound interface.
+        """
+        time.sleep(0.015)
+        try:
+            self.packet_signer.sign_packet(packet)
+            outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
+            sendp(packet, iface=outbound_interface, verbose=0)
+            self.logger.log_message(
+                f"[SendBack] 🧃 Packet signed and sent on {outbound_interface.split('_')[-1]}"
+            )
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.logger.log_message(f"[SendBack] ❗ Failed to send back packet:\n{tb}")
+
+    def send_icmp_packet(self, original_packet: Packet, icmp_type: int = 3, icmp_code: int = 1,
+                         payload: Optional[bytes] = None):
+        """
+        Constructs and sends a signed ICMP or ICMPv6 packet based on the given type/code.
+
+        Args:
+            original_packet (Packet): The triggering packet.
+            icmp_type (int): ICMP type (e.g., 3 for Destination Unreachable).
+            icmp_code (int): ICMP code (e.g., 1 = host unreachable, 13 = admin prohibited).
+            payload (Optional[bytes]): Optional payload; defaults to 64 bytes of original packet.
+        """
+        try:
+            if IP in original_packet:
+                ip = original_packet[IP]
+                dst = ip.src
+                src = ip.dst
+                if payload is None:
+                    payload = bytes(original_packet)[:64]
+
+                icmp_reply = IP(dst=dst, src=src) / ICMP(type=icmp_type, code=icmp_code) / payload
+                self.packet_signer.sign_packet(icmp_reply)
+                outbound_iface = self.outbound_load_balancer.get_next_interface(icmp_reply)
+                sendp(icmp_reply, iface=outbound_iface, verbose=0)
+                self.logger.log_message(
+                    f"[SendBack] 📮 Sent ICMPv4 type={icmp_type} code={icmp_code} to {dst}"
+                )
+
+            elif IPv6 in original_packet:
+                ip6 = original_packet[IPv6]
+                dst = ip6.src
+                src = ip6.dst
+                if payload is None:
+                    payload = bytes(original_packet)[:64]
+
+                from scapy.layers.inet6 import ICMPv6Unknown
+                icmpv6_reply = IPv6(dst=dst, src=src) / ICMPv6Unknown(type=icmp_type, code=icmp_code) / payload
+                self.packet_signer.sign_packet(icmpv6_reply)
+                outbound_iface = self.outbound_load_balancer.get_next_interface(icmpv6_reply)
+                sendp(icmpv6_reply, iface=outbound_iface, verbose=0)
+                self.logger.log_message(
+                    f"[SendBack] 📬 Sent ICMPv6 type={icmp_type} code={icmp_code} to {dst}"
+                )
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.logger.log_message(f"[SendBack] ❗ Error sending ICMP packet:\n{tb}")
 class PacketSigningManager:
     """
-    Manages the cryptographic signing of network packets.
-    It generates a signing key and uses HMAC to sign packets, embedding a hash
-    fragment into the IP ID field or potentially other header fields.
+    Signs IPv4/IPv6 packets using HMAC and embeds a fragment of the signature
+    into IP ID (IPv4) or Flow Label (IPv6). Automatically verifies the signature
+    before sending to prevent tampered packets and can process incoming packets.
     """
+
 
     def __init__(self, router_logger):
         self.logger = router_logger
         self.signing_key = os.urandom(32)
-        self.logger.log_message("[Signing] Manager initialized.")
-
-    def sign_packet(self, packet: Packet) -> None:
+        self.writing_table = defaultdict(lambda: {"count": 0, "last_seen": 0})
+        self.TRUST_THRESHOLD = 3
+        self.logger.log_message("[Signing] 🧿 Manager initialized.")
+        self.signature_table = {}
+    def _get_signature_data(self, packet: Packet, ip_layer) -> bytes:
         """
-        Signs the packet using HMAC and embeds a hash fragment in the IP ID field.
-        Currently, only supports IPv4 packets.
-
-        Args:
-            packet (Packet): The Scapy packet to sign.
+        Constructs HMAC input from stable, deterministic fields, and updates
+        sigintable with traceable packet fingerprint.
         """
-        if IP not in packet:
-            self.logger.log_message("[Signing] Skipping signing: Not an IPv4 packet.")
-            return
+        try:
+            # Determine src and dst IPs
+            if hasattr(ip_layer, "src") and hasattr(ip_layer.src, "packed"):
+                src = ip_layer.src.packed
+            else:
+                src = socket.inet_pton(socket.AF_INET6 if isinstance(ip_layer, IPv6) else socket.AF_INET, ip_layer.src)
 
-        # Take first 64 bytes of the IP payload for HMAC calculation
-        # This ensures we sign transport layer data if present.
-        raw_data = bytes(packet[IP].payload)[:64]
-        if not raw_data: # Handle cases where there might be no payload or very small
-            self.logger.log_message("[Signing] Skipping signing: No sufficient payload for HMAC.")
-            return
+            if hasattr(ip_layer, "dst") and hasattr(ip_layer.dst, "packed"):
+                dst = ip_layer.dst.packed
+            else:
+                dst = socket.inet_pton(socket.AF_INET6 if isinstance(ip_layer, IPv6) else socket.AF_INET, ip_layer.dst)
+        except Exception:
+            src, dst = b"", b""
 
-        digest = hmac.new(self.signing_key, raw_data, hashlib.sha256).digest()
+        # Protocol byte (fallback to 0)
+        proto = bytes([ip_layer.proto]) if hasattr(ip_layer, "proto") else b"\x00"
 
-        # Embed the first 2 bytes of HMAC into the IP ID field
-        # Use !H for unsigned short in network byte order
-        packet[IP].id = struct.unpack("!H", digest[:2])[0]
+        # Port info
+        ports = b"\x00\x00\x00\x00"
+        try:
+            if TCP in packet:
+                sport = packet[TCP].sport if hasattr(packet[TCP], "sport") else 0
+                dport = packet[TCP].dport if hasattr(packet[TCP], "dport") else 0
+                ports = struct.pack("!HH", sport, dport)
+            elif UDP in packet:
+                sport = packet[UDP].sport if hasattr(packet[UDP], "sport") else 0
+                dport = packet[UDP].dport if hasattr(packet[UDP], "dport") else 0
+                ports = struct.pack("!HH", sport, dport)
+            elif ICMP in packet or ICMPv6EchoRequest in packet:
+                ports = b"\x00\x00\x00\x00"
+        except Exception:
+            pass
 
-        # In Scapy, modifying a field like IP ID usually means the checksum needs
-        # to be recalculated, so we delete it to force Scapy to do so on send/show.
-        del packet[IP].chksum
-        self.logger.log_message(f"[Signing] 🖊️ Packet signed with ID: {packet[IP].id:#06x}")
+        # Payload sampling (first 64 bytes)
+        try:
+            payload = bytes(ip_layer.payload)[:64] if ip_layer.payload else b""
+        except Exception:
+            payload = b""
 
+        # Concatenate all for signature input
+        sig_data = src + dst + proto + ports + payload
+
+        # Optionally: compute a trackable ID or key
+        signature_hash = hashlib.sha1(sig_data).hexdigest()  # compact fingerprint
+
+        # Store in sigintable if applicable
+        if hasattr(self, "sigintable"):
+            self.signature_table[signature_hash] = {
+                "src_ip": str(ip_layer.src),
+                "dst_ip": str(ip_layer.dst),
+                "proto": ip_layer.proto if hasattr(ip_layer, "proto") else None,
+                "ports": struct.unpack("!HH", ports) if len(ports) == 4 else None,
+                "payload_sample": payload.hex(),
+                "timestamp": time.time()
+            }
+
+        return sig_data
+
+    def sign_packet(self, packet: Packet) -> bool:
+        """
+        Signs the packet and embeds signature into appropriate header.
+        Returns True if the signature is valid after signing; otherwise drops.
+        """
+        time.sleep(0.015)
+        if IP in packet:
+            ip = packet[IP]
+            sig_data = self._get_signature_data(packet, ip)
+            if not sig_data:
+                return False
+
+            digest = hmac.new(self.signing_key, sig_data, hashlib.sha256).digest()
+            packet[IP].id = struct.unpack("!H", digest[:2])[0]
+            del packet[IP].chksum
+
+            if self.verify_packet(packet):
+                self.logger.log_message(
+                    RouterRandomMessages("Signing", f"IPv4 signed + verified (ID: {packet[IP].id:#06x})", ["🖊️", "🖋️", "✒️", "📝", "🪶"]))
+                return True
+            else:
+                self.logger.log_message("[Signing] 🧨 Dropped IPv4: Signature mismatch after signing")
+                return False
+
+        elif IPv6 in packet:
+            ip = packet[IPv6]
+            sig_data = self._get_signature_data(packet, ip)
+            if not sig_data:
+                return False
+
+            digest = hmac.new(self.signing_key, sig_data, hashlib.sha256).digest()
+            flow_label = struct.unpack("!I", b'\x00' + digest[:3])[0] & 0xFFFFF
+            packet[IPv6].fl = flow_label
+
+            if self.verify_packet(packet):
+                self.logger.log_message(
+                    RouterRandomMessages("Signing", f"IPv6 signed + verified (Flow Label: {packet[IPv6].fl:#06x})",["📏", "📐", "📓", "📕", "📔"]))
+                return True
+            else:
+                self.logger.log_message("[Signing] 💥 Dropped IPv6: Signature mismatch after signing")
+                return False
+
+        else:
+            self.logger.log_message("[Signing] 👻 Skipped non-IP packet")
+        expired_keys = [k for k, v in self.signature_table.items() if now - v["last_seen"] > 30]
+        for k in expired_keys:
+            del self.signature_table[k]
+
+            return False
+
+    def verify_packet(self, packet: Packet) -> bool:
+        """Verifies that the embedded signature matches a fresh HMAC and removes matching entry from sigintable."""
+        try:
+            ip = None
+            if IP in packet:
+                ip = packet[IP]
+            elif IPv6 in packet:
+                ip = packet[IPv6]
+            else:
+                return False
+
+            sig_data = self._get_signature_data(packet, ip)
+            digest = hmac.new(self.signing_key, sig_data, hashlib.sha256).digest()
+
+            if IP in packet:
+                expected_id = struct.unpack("!H", digest[:2])[0]
+                if ip.id != expected_id:
+                    return False
+
+            elif IPv6 in packet:
+                expected_fl = struct.unpack("!I", b'\x00' + digest[:3])[0] & 0xFFFFF
+                if ip.fl != expected_fl:
+                    return False
+
+            # Signature verified — now remove from sigintable
+            sig_hash = hashlib.sha1(sig_data).hexdigest()
+            if sig_hash in self.signature_table:
+                del self.signature_table[sig_hash]
+
+            return True
+
+        except Exception as e:
+            self.logger.log_message(f"[Signing] ⚠️ Signature verify error: {e}")
+            return False
+
+    def process_packet(self, packet: Packet) -> bool:
+        """
+        Verifies and re-signs incoming packets. If unsigned, tracks sender.
+        On exceeding threshold, sends signed rejection and resets sender counter.
+        Returns True if re-signed, False otherwise.
+        """
+        try:
+            if IP in packet:
+                ip = packet[IP]
+                sig_data = self._get_signature_data(packet, ip)
+                if not sig_data:
+                    return False
+
+                digest = hmac.new(self.signing_key, sig_data, hashlib.sha256).digest()
+                expected_id = struct.unpack("!H", digest[:2])[0]
+
+                if ip.id == expected_id:
+                    self.logger.log_message(f"[Signing] 🛡️ Verified incoming IPv4 packet (ID: {ip.id:#06x})")
+                    new_digest = hmac.new(self.signing_key, sig_data + b"re", hashlib.sha256).digest()
+                    ip.id = struct.unpack("!H", new_digest[:2])[0]
+                    del ip.chksum
+                    self.logger.log_message(f"[Signing] 🖊️ Re-signed IPv4 packet with new ID: {ip.id:#06x}")
+
+                    return True
+                else:
+                    return self._handle_unsigned_packet(packet, ip, str(ip.src))
+
+            elif IPv6 in packet:
+                ip = packet[IPv6]
+                sig_data = self._get_signature_data(packet, ip)
+                if not sig_data:
+                    return False
+
+                digest = hmac.new(self.signing_key, sig_data, hashlib.sha256).digest()
+                expected_fl = struct.unpack("!I", b'\x00' + digest[:3])[0] & 0xFFFFF
+
+                if ip.fl == expected_fl:
+                    self.logger.log_message(f"[Signing] 🔒 Verified incoming IPv6 packet (Flow Label: {ip.fl:#06x})")
+
+                    # Generate new flow label for re-signing
+                    new_digest = hmac.new(self.signing_key, sig_data + b"re", hashlib.sha256).digest()
+                    new_fl = struct.unpack("!I", b'\x00' + new_digest[:3])[0] & 0xFFFFF
+                    ip.fl = new_fl
+
+                    rebuilt = IPv6(bytes(packet))
+                    self.logger.log_message(
+                        f"[Signing] 🧬 Re-signed IPv6 packet and rebuilt layers (Flow Label: {new_fl:#06x})")
+                    return rebuilt
+                else:
+                    return self._handle_unsigned_packet(packet, ip, str(ip.src))
+
+            return False
+
+        except Exception as e:
+            self.logger.log_message(f"[Signing] 💢 Error in processing packet: {e}")
+            return False
+
+    def _handle_unsigned_packet(self, packet, ip_layer, src_ip_str: str):
+        """Handles unsigned packet by updating table and taking action if needed."""
+        entry = self.writing_table[src_ip_str]
+        entry["count"] += 1
+        entry["last_seen"] = int(time.time())
+
+        if entry["count"] >= self.TRUST_THRESHOLD:
+            self.logger.log_message(f"[Signing] 🚨 Threshold exceeded for {src_ip_str}, sending response...")
+
+            self._send_rejection(packet, ip_layer)
+
+            # Reset after action
+            entry["count"] = 0
+            return False
+
+        self.logger.log_message(f"[Signing] 🧱 Unsigned packet from {src_ip_str} (count={entry['count']})")
+        return False
+    def _send_rejection(self, packet: Packet, ip_layer):
+        """Constructs and sends a signed ICMP rejection packet."""
+        try:
+            dst = ip_layer.src
+            if IP in packet:
+                response = IP(dst=dst, src=ip_layer.dst)/ICMP(type=3, code=13)/b"Unsigned packet rejected"
+                self.sign_packet(response)
+                send(response, verbose=False)
+                self.logger.log_message(f"[Signing] 📮 Sent signed IPv4 rejection to {dst}")
+            elif IPv6 in packet:
+                response = IPv6(dst=dst, src=ip_layer.dst)/ICMPv6DestUnreach(code=1)/b"Unsigned IPv6 packet rejected"
+                self.sign_packet(response)
+                send(response, verbose=False)
+                self.logger.log_message(f"[Signing] 📬 Sent signed IPv6 rejection to {dst}")
+        except Exception as e:
+            pass
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -274,7 +516,6 @@ class TransportManager:
         self.logger = router_logger
         self.logger.log_message("[Transport] Manager initialized.")
         self.packet_signer = packet_signer
-
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
         Processes and logs Transport Layer packet details.
@@ -292,6 +533,7 @@ class TransportManager:
         ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
+
 
 
         if packet.haslayer(TCP):
@@ -620,78 +862,111 @@ class PacketWriter:
     """
     A self-contained class that sends Layer 2 network packets on a dedicated
     thread using a queue. This prevents the calling thread from blocking on I/O.
+    Includes per-destination throttling and packet signing support.
     """
 
-    def __init__(self, logger):
+    def __init__(self, logger, packet_signer, outbound_load_balancer):
         """
         Initializes the PacketWriter.
         Args:
-            logger: A logger instance for logging messages.
+            logger: Logger instance for logging.
+            packet_signer: Instance of PacketSigningManager.
         """
         self.logger = logger
+        self.packet_signer = packet_signer
         self.packet_queue = queue.Queue()
         self.worker_thread = None
         self._stop_event = threading.Event()
         self.logger.log_message("[PacketWriter] Initialized.")
+
+        # Destination throttling
+        self.packet_writing_table = defaultdict(lambda: {"count": 0, "last_sent": 0})
+        self.THRESHOLD_PER_DST = 10
+        self.RESET_INTERVAL = 60  # seconds
+        self.outbound_load_balancer = outbound_load_balancer
 
     def _worker_loop(self):
         """The main loop for the worker thread that sends packets."""
         self.logger.log_message("[PacketWriter] Worker thread started.")
         while not self._stop_event.is_set():
             try:
-                # Block until a packet is available or the thread is stopped
                 item = self.packet_queue.get(timeout=1)
-                if item is None:  # Sentinel value to stop the thread
-                    continue
+                if item is None:
+                    continue  # Sentinel
 
-                packet, interface_name = item
-                self._send_raw_packet(packet, interface_name)
+                packet, interface = item
+                self._send_raw_packet(packet, interface)
 
             except queue.Empty:
-                continue  # Loop back and wait for another item
+                continue
 
         self.logger.log_message("[PacketWriter] Worker thread has stopped.")
 
     def _send_raw_packet(self, packet, interface: str):
         """
-        Uses Scapy's sendp to send a Layer 2 packet on a specified interface
-        and logs a detailed summary of the sent packet.
+        Uses Scapy's sendp to send a Layer 2 packet on a specified interface.
+        Also signs the packet and logs summary.
         """
         if not interface:
-            self.logger.log_message("[PacketWriter] ⚠️ Error: Cannot send packet, interface name is not specified.")
+            self.logger.log_message("[PacketWriter] ⚠️ Error: Interface name is not specified.")
             return
-        try:
-            # Special handling for loopback: Scapy might not need Ether layer or dst MAC
-            is_loopback_iface = "loopback" in interface.lower() or "lo" == interface.lower()  # More precise check for 'lo'
 
+        try:
             if packet.haslayer(IP) or packet.haslayer(IPv6):
                 if packet.haslayer(IP):
-                    dst_ip_obj = ipaddress.ip_address(packet[IP].dst)
+                    dst_ip = packet[IP].dst
+                    dst_ip_obj = ipaddress.ip_address(dst_ip)
+                    ip_layer = packet[IP]
                 else:
-                    dst_ip_obj = ipaddress.ip_address(packet[IPv6].dst)
+                    dst_ip = packet[IPv6].dst
+                    dst_ip_obj = ipaddress.ip_address(dst_ip)
+                    ip_layer = packet[IPv6]
 
-                if not (
-                        dst_ip_obj.is_global or dst_ip_obj.is_private or dst_ip_obj.is_multicast or dst_ip_obj.is_loopback):
+                # Throttle check
+                entry = self.packet_writing_table[dst_ip]
+                now = time.time()
+
+                if entry["count"] >= self.THRESHOLD_PER_DST and (now - entry["last_sent"]) < self.RESET_INTERVAL:
                     self.logger.log_message(
-                        f"[PacketWriter] 🚫 Dropped non-unicast/non-multicast/non-loopback/non-private packet to {dst_ip_obj}. Summary: {packet.summary()}"
+                        f"[PacketWriter] ⏱️ Rate limit hit for {dst_ip}. Skipping packet."
                     )
                     return
-                else:
-                    packet_summary = packet.summary()
-                    sendp(packet, iface=interface, verbose=0)
+                elif (now - entry["last_sent"]) >= self.RESET_INTERVAL:
+                    entry["count"] = 0  # reset count after cooldown
+
+                entry["count"] += 1
+                entry["last_sent"] = now
+
+                # Address validity check
+                if not (
+                    dst_ip_obj.is_global or dst_ip_obj.is_private or
+                    dst_ip_obj.is_multicast or dst_ip_obj.is_loopback
+                ):
                     self.logger.log_message(
-                        f"[PacketWriter] 📝 Sent (Len:{len(packet)}) on {interface.split('_')[-1]} -> {packet_summary}"
+                        f"[PacketWriter] 🚫 Dropped invalid destination {dst_ip_obj}. Summary: {packet.summary()}"
                     )
+                    return
+
+                self.packet_signer.sign_packet(packet)
+                outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
+                sendp(packet, iface=outbound_interface, verbose=0)
+                self.logger.log_message(
+                    f"[PacketWriter] 📝 Sent (Len:{len(packet)}) on {interface.split('_')[-1]} -> {packet.summary()}"
+                )
+                self.logger.log_message(
+                    f"[PacketWriter] 📊 Sent {entry['count']}/{self.THRESHOLD_PER_DST} to {dst_ip}"
+                )
+
             else:
-                # For non-IP packets like ARP, etc.
-                packet_summary = packet.summary()
+                # Non-IP packets (ARP, etc.)
+                self.packet_signer.sign_packet(packet)
                 sendp(packet, iface=interface, verbose=0)
                 self.logger.log_message(
-                    f"[PacketWriter] 📝 Sent (Len:{len(packet)}) on {interface.split('_')[-1]} -> {packet_summary}"
+                    f"[PacketWriter] 📝 Sent non-IP (Len:{len(packet)}) on {interface.split('_')[-1]} -> {packet.summary()}"
                 )
 
         except Exception as e:
-            self.logger.log_message(f"[PacketWriter] ❌ Failed to send packet on interface '{interface}': {e}")
+            self.logger.log_message(f"[PacketWriter] ❌ Failed to send packet on '{interface}': {e}")
 
     def start(self):
         """Starts the packet-sending worker thread."""
@@ -710,20 +985,18 @@ class PacketWriter:
 
         self.logger.log_message("[PacketWriter] Stopping...")
         self._stop_event.set()
-        # Add a sentinel value to the queue to unblock the worker's get() call
-        self.packet_queue.put(None)
+        self.packet_queue.put(None)  # Sentinel to unblock queue
         self.worker_thread.join(timeout=2)
 
     def queue_packet(self, packet, interface: str):
         """
-        Public method to add a packet to the sending queue. This is non-blocking.
-
+        Adds a packet to the queue for asynchronous sending.
         Args:
-            packet: The Scapy packet to be sent (must be a Layer 2 packet like Ether).
-            interface (str): The name of the interface to send the packet on.
+            packet: A Scapy packet to send.
+            interface: Interface to send on (e.g., 'eth0').
         """
         if self._stop_event.is_set():
-            self.logger.log_message("[PacketWriter] ⚠️ Warning: Attempted to queue packet while writer is stopping.")
+            self.logger.log_message("[PacketWriter] ⚠️ Warning: Cannot queue packet — writer is stopping.")
             return
 
         self.packet_queue.put((packet, interface))
@@ -732,7 +1005,7 @@ class ForwardingManager:
     """
     Tracks recently forwarded (src, dst, port, proto) flows to prevent looping or repeated forwards.
     """
-    def __init__(self, router_logger=None, timeout: int = 60, max_entries: int = 10000):
+    def __init__(self, router_logger=None, timeout: int = 200, max_entries: int = 10000):
         self.logger = router_logger or (lambda x: None)
         self.timeout = timeout  # seconds
         self._forwarded_cache = deque(maxlen=max_entries)
@@ -1188,7 +1461,7 @@ class ICMPManager:
     Enhanced with rate limiting and handling of other ICMP types.
     """
 
-    def __init__(self, router_logger, packet_writer, interfaces_config: dict, rate_limit_pps: int = 5):
+    def __init__(self, router_logger, packet_writer, sendback_manager, interfaces_config: dict, rate_limit_pps: int = 5):
         self.log = router_logger
         self.pw = packet_writer
         self.ifaces = interfaces_config  # to know MAC & IP
@@ -1197,7 +1470,7 @@ class ICMPManager:
         self.rate_limit_pps = rate_limit_pps
         self._last_reply_time = defaultdict(float)  # Key: (src_ip, dst_ip) -> last_reply_timestamp
         self._rate_limit_lock = threading.Lock()
-
+        self.sendback_manager = sendback_manager
         self.log.log_message("[ICMP] Manager initialized.")
 
     def _is_rate_limited(self, src_ip: str, dst_ip: str) -> bool:
@@ -1222,7 +1495,7 @@ class ICMPManager:
         src_ip = pkt[IP].src
         dst_ip = pkt[IP].dst
         icmp_type = pkt[ICMP].type
-        icmp_code = pkt[ICMP].code if hasattr(pkt[ICMP], 'code') else 0  # Some ICMP types don't have codes
+        icmp_code = pkt[ICMP].code if hasattr(pkt[ICMP], 'code') else 0
 
         # Ensure the packet's destination IP is one of our router's IPs
         is_for_router = False
@@ -1235,26 +1508,24 @@ class ICMPManager:
                 router_ip_for_reply = cfg.get("ip_addr")
                 break
 
-        # If it's not for the router, let the router manager handle forwarding
         if not is_for_router:
             self.log.log_message(
-                f"[ICMP] 📭 Received {icmp_type} for {dst_ip} (not router's IP). Not handled by ICMP Manager directly.")
+                f"[ICMP] 📭 Received {icmp_type} for {dst_ip} (not router's IP). Not handled by ICMP Manager directly."
+            )
             return False
 
         # --- Handle specific ICMP types ---
-        if icmp_type == 8:  # ICMP Echo-Request
+        if icmp_type == 8:  # Echo Request
             self.log.log_message(
                 f"[ICMP] 📨 Echo-Request from {src_ip} to {dst_ip} on {inbound_iface.split('_')[-1]}"
             )
 
             if self._is_rate_limited(src_ip, dst_ip):
-                return True  # Packet handled (rate-limited)
+                return True
 
-            # Build Echo-Reply
-            reply_src_mac = router_mac_for_reply if router_mac_for_reply else "00:00:00:00:00:00"  # Fallback
-            reply_dst_mac = pkt[Ether].src if pkt.haslayer(Ether) else "00:00:00:00:00:00"  # Use sender's MAC for reply
+            reply_src_mac = router_mac_for_reply if router_mac_for_reply else "00:00:00:00:00:00"
+            reply_dst_mac = pkt[Ether].src if pkt.haslayer(Ether) else "00:00:00:00:00:00"
 
-            # Handle potential loopback reply: no Ether layer needed for loopback if it didn't come with one
             if "loopback" in inbound_iface.lower() or "lo" == inbound_iface.lower() or not pkt.haslayer(Ether):
                 reply = IP(src=dst_ip, dst=src_ip) / \
                         ICMP(type=0, id=pkt[ICMP].id, seq=pkt[ICMP].seq) / \
@@ -1273,25 +1544,23 @@ class ICMPManager:
 
         elif icmp_type == 3:  # Destination Unreachable
             self.log.log_message(
-                f"[ICMP] 🚫 Destination Unreachable (Type 3, Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
+                f"[ICMP] 🔌 Destination Unreachable (Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
             )
-            # Log and potentially trigger further action (e.g., update routing table if host unreachable)
-            # For now, just logging.
+            self.sendback_manager.send_icmp_packet(pkt, icmp_type=3, icmp_code=icmp_code)
             return True
 
         elif icmp_type == 11:  # Time Exceeded
             self.log.log_message(
-                f"[ICMP] ⏳ Time Exceeded (Type 11, Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
+                f"[ICMP] ⏳ Time Exceeded (Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
             )
-            # Log and potentially trigger further action (e.g., for traceroute)
-            # For now, just logging.
+            self.sendback_manager.send_icmp_packet(pkt, icmp_type=11, icmp_code=icmp_code)
             return True
 
         else:
             self.log.log_message(
-                f"[ICMP] Received unhandled ICMP type {icmp_type} from {src_ip} on {inbound_iface.split('_')[-1]}. Summary: {pkt.summary()}"
+                f"[ICMP] ❔ Unhandled ICMP type {icmp_type} from {src_ip} on {inbound_iface.split('_')[-1]}. Summary: {pkt.summary()}"
             )
-            return False  # Not specifically handled, but it was an ICMP packet
+            return False
 
 
 HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
@@ -2009,7 +2278,7 @@ class RIPManager:
         """Processes an incoming RIP packet with detailed logging."""
         self.router_logger.log_message(f"[RIP] Received packet on {inbound_ifname.split('_')[-1]}: {pkt.summary()}")
 
-        rip = pkt.getlayer(SimpleRIP)
+        rip = pkt.getlayer(RIP)
         if not rip:
             self.router_logger.log_message("[RIP] Ignored packet with no SimpleRIP layer.")
             return
@@ -2200,7 +2469,7 @@ class RIPManager:
             rip_packet = Ether(src=cfg["mac"], dst="01:00:5e:00:00:09") / \
                          IP(src=cfg["ip_addr"], dst=self.RIP_MCAST_ADDR) / \
                          UDP(sport=self.RIP_PORT, dport=self.RIP_PORT) / \
-                         SimpleRIP(command=2, version=2, entries=entries)
+                         RIP(command=2, version=2, entries=entries)
 
             # Add authentication data if configured (simple append to UDP payload)
             if self.authentication_key:
@@ -2311,7 +2580,7 @@ class NATManager:
     Enhanced with NAT timeouts and a basic ALG placeholder.
     """
 
-    def __init__(self, router_logger, router_public_ip: str, packet_writer,
+    def __init__(self, router_logger, sendback_manager, router_public_ip: str, packet_writer,
                  interfaces_config: Dict[str, Dict[str, Any]],
                  rip_manager_find_route, arp_manager_resolve):  # ADD interfaces_config, rip_manager_find_route
         self.router_logger = router_logger
@@ -2342,12 +2611,11 @@ class NATManager:
             internal_port=88
         )
         self.router_logger.log_message("[NAT] Manager initialized.")
-
+        self.sendback_manager = sendback_manager
     def set_router_internal_ip(self, ip: str):
         self.router_internal_ip_for_self_mapping = ip
         self.router_logger.log_message(f"[NAT] Router's internal IP for self-mapping set to: {ip}")
 
-    # ... (start, stop, _cleanup_loop, add_static_mapping, remove_static_mapping, _get_next_port, _apply_alg, translate_outbound methods are unchanged) ...
     def start(self):
         """Starts the NAT cleanup thread."""
         self._stop_event.clear()
@@ -2589,7 +2857,12 @@ class NATManager:
         next_hop_mac_for_icmp = self._arp_manager_resolve(next_hop_ip_for_icmp, outbound_iface_for_icmp)
         if not next_hop_mac_for_icmp:
             self.router_logger.log_message(
-                f"[NAT] 🕵️ ARP resolution failed for next hop {next_hop_ip_for_icmp} on {outbound_iface_for_icmp.split('_')[-1]} for ICMP. Dropping ICMP.")
+                f"[NAT] 🕵️ ARP resolution failed for next hop {next_hop_ip_for_icmp} on {outbound_iface_for_icmp.split('_')[-1]} for ICMP. Sending back ICMP.")
+            self.sendback_manager.send_icmp_packet(
+                original_packet,
+                icmp_type=3,
+                icmp_code=3,
+            )
             return
         # --- END CRITICAL CHANGE ---
 
@@ -2984,10 +3257,9 @@ class ARPManager:
         """
         ip_address = ip_address.strip()  # Normalize input
 
-        # If destination is loopback, no ARP is needed. Return a dummy MAC or None.
         if ipaddress.ip_address(ip_address).is_loopback:
-            self.router_logger.log_message(f"[ARP] Skipping ARP for loopback IP {ip_address}.")
-            return "00:00:00:00:00:00"  # A placeholder, as L2 isn't strictly needed for loopback
+            self.router_logger.log_message(f"[ARP] Local delivery: Loopback IP {ip_address}. No ARP needed.")
+            return None
 
         # --- Check static ARP entries first ---
         if ip_address in self._static_arp_entries:
@@ -3660,7 +3932,10 @@ class PythonRouterManager:
         self._discovered_tshark_interfaces = []
 
         # Instantiate all specialized managers
-        self.packet_writer = PacketWriter(router_logger)
+        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)  # New: Outbound Load Balancer
+        self.packet_signer = PacketSigningManager(router_logger)
+        self.packet_writer = PacketWriter(router_logger, self.packet_signer, self.outbound_load_balancer)
+        self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
         self.dns_manager = DNSManager(router_logger)
         self.rip_manager = RIPManager(router_logger)
         self.nat_manager = None  # Initialized after public IP is known
@@ -3669,10 +3944,9 @@ class PythonRouterManager:
         self.arp_manager = ARPManager(router_logger, self.packet_writer)
         self.handshake_manager = None
         self.igmp_manager = IGMPManager(router_logger, self.packet_writer)
-        self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self._interfaces_config)
+        self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self.sendback_manager, self._interfaces_config)
         self.dhcp_server_in = None
         self.dhcp_server_out = None
-        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)  # New: Outbound Load Balancer
         self.lag_manager = LinkAggregationManager(router_logger)  # New: Link Aggregation Manager
         self.firewall_manager = FirewallManager(router_logger)  # New: Firewall Manager
         self.syn_scanner = None
@@ -3681,7 +3955,7 @@ class PythonRouterManager:
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
         self.https_manager = HTTPSManager(router_logger)
         self.ethernet_l2_manager = EthernetL2Manager(router_logger)
-        self.packet_signer = PacketSigningManager(router_logger)
+
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.router_logger.log_message("[RouterManager] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
@@ -4241,7 +4515,7 @@ class PythonRouterManager:
         # Example: Add static ARP entry for gateway (if known)
         if self.router_gateway_out_ip:
             try:
-                gateway_mac = self.arp_manager.resolve(self.router_gateway_out_ip)
+                gateway_mac = self.arp_manager.resolve(self.router_gateway_out_ip, self.interface_out_full_name)
                 if gateway_mac:
                     self.add_static_arp_entry(self.router_gateway_out_ip, gateway_mac)
                     self.router_logger.log_message(
@@ -4369,8 +4643,29 @@ class PythonRouterManager:
 
     def _start_single_sniffer(self, iface_name: str):
         """Starts a sniffer thread + processing worker pool for a given interface."""
+        RATE_LIMIT_PACKETS_PER = .25  # Can be any float value
+        TOKEN_BUCKET = {"tokens": RATE_LIMIT_PACKETS_PER, "last_refill": time.time()}
+        TOKEN_BUCKET_LOCK = threading.Lock()
 
-        packet_queue = queue.Queue(maxsize=5000)  # Adjustable based on memory
+        def refill_tokens():
+            with TOKEN_BUCKET_LOCK:
+                now = time.time()
+                elapsed = now - TOKEN_BUCKET["last_refill"]
+                TOKEN_BUCKET["last_refill"] = now
+
+                # Accumulate tokens with float precision
+                TOKEN_BUCKET["tokens"] += elapsed * RATE_LIMIT_PACKETS_PER
+                # Optional: set a max burst limit (e.g., allow up to 5 tokens max)
+                TOKEN_BUCKET["tokens"] = min(TOKEN_BUCKET["tokens"], 5.0)
+
+        def consume_token() -> bool:
+            refill_tokens()
+            with TOKEN_BUCKET_LOCK:
+                if TOKEN_BUCKET["tokens"] >= 1.0:
+                    TOKEN_BUCKET["tokens"] -= 1.0
+                    return True
+                return False
+        packet_queue = queue.Queue(maxsize=10)  # Adjustable based on memory
         friendly_name_for_filter = next((item['friendly_name'] for item in self._discovered_tshark_interfaces if item['full_name'] == iface_name),'DEFAULT')
         filter_clauses = self.BPF_FILTER_BASE_DEFINITIONS.get(friendly_name_for_filter,self.BPF_FILTER_BASE_DEFINITIONS.get("DEFAULT", []))
         filter_str = " or ".join(f"({clause})" for clause in filter_clauses) if filter_clauses else ""
@@ -4382,7 +4677,7 @@ class PythonRouterManager:
                     iface=name,
                     prn=lambda pkt: safe_enqueue(pkt),
                     store=0,
-                    promisc=True,
+                    promisc=False,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     session=TCPSession,
                     filter=filter_str
@@ -4406,12 +4701,31 @@ class PythonRouterManager:
 
         def safe_enqueue(pkt):
             try:
-                if len(bytes(pkt)) < 14:  # 14 bytes = minimum Ethernet frame
+                if len(bytes(pkt)) < 14:
                     self.router_logger.log_message(f"[Sniffer] ⚠️ Dropped malformed packet (too short)")
                     return
-                packet_queue.put(pkt, block=False)
+
+                if not consume_token():
+                    return  # Drop if over limit
+
+                try:
+                    packet_queue.put(pkt, block=False)
+                except queue.Full:
+                    # Pop off the oldest packet and send it back instead
+                    oldest_packet = packet_queue.get(block=False)
+                    selected_iface = self.outbound_load_balancer.get_next_interface(oldest_packet)
+                    self.sendback_manager.send_back(oldest_packet, selected_iface)
+
+                    try:
+                        packet_queue.put(pkt, block=False)
+                    except queue.Full:
+                        pass  # Drop if still full
+
             except Exception as e:
-                self.router_logger.log_message(f"[Sniffer] ❗ Error in prn: {e}")
+                import traceback
+                tb = traceback.format_exc()
+                self.router_logger.log_message(f"[Sniffer] ❗ Error in safe_enqueue(): {e}\n{tb}")
+
         # Start sniffing thread
         # Start sniffing thread
         sniffer_thread = threading.Thread(target=sniffer_loop, name=f"Sniffer-{iface_name.split('_')[-1]}", daemon=True)
@@ -4477,7 +4791,16 @@ class PythonRouterManager:
                 if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
 
                     return
-
+            result = self.packet_signer.process_packet(packet)
+            if isinstance(result, Packet):
+                packet = result  # Replace with rebuilt version
+                selected_iface = self.outbound_load_balancer.get_next_interface(packet)
+                self.router_logger.log_message(
+                    f"[Router] 🔁 Forwarding re-signed packet to {selected_iface }: "
+                    f"{packet.summary()}"
+                )
+                self.sendback_manager.send_back(packet, selected_iface )
+                return True
             self.transport_manager.handle_packet(packet, inbound_iface)
                 # 4. DNS Handling
             if packet.haslayer(DNS):
@@ -4560,16 +4883,13 @@ class PythonRouterManager:
             dst_ip = ip_layer.dst
             router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
             is_for_router = dst_ip in router_ips
-
-            if is_for_router:
-                if packet.haslayer(RIP):
-                    self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
-                    self.rip_manager.handle_packet(packet, inbound_iface)
-                    return
-
-                if self.nat_manager and self.nat_manager.translate_inbound(packet):
-                    self.router_logger.log_message(f"[NAT] 🔄 NAT translated inbound packet on {iface_short}")
-                    self._forward_general_ip_packet(packet, inbound_iface)
+            if packet.haslayer(RIP):
+                self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
+                self.rip_manager.handle_packet(packet, inbound_iface)
+                return
+            if self.nat_manager.translate_inbound(packet):
+                self.router_logger.log_message(f"[NAT] 🔄 NAT translated inbound packet on {iface_short}")
+                self._forward_general_ip_packet(packet, inbound_iface)
                 return
 
             # 9. Handshake
@@ -4720,17 +5040,17 @@ class PythonRouterManager:
 
 
         # --- [7] Prepare L2 Details ---
-        outbound_config = self._interfaces_config.get(final_outbound_iface)
+        outbound_config = self._interfaces_config.get(actual_outbound_iface)
         if not outbound_config:
             self.router_logger.log_message(
-                f"[Router] ⚠️ Interface {final_outbound_iface.split('_')[-1]} not in config. Dropping."
+                f"[Router] ⚠️ Interface {actual_outbound_iface.split('_')[-1]} not in config. Dropping."
             )
             return
 
         is_loopback = (
                 ipaddress.ip_address(dst_ip).is_loopback or
-                "loopback" in final_outbound_iface.lower() or
-                final_outbound_iface.lower() == "lo"
+                "loopback" in actual_outbound_iface.lower() or
+                actual_outbound_iface.lower() == "lo"
         )
         outbound_network = outbound_config["network"]
         target_mac = None
@@ -4746,11 +5066,11 @@ class PythonRouterManager:
             target_mac = "ff:ff:ff:ff:ff:ff"
             self.router_logger.log_message(f"[Router] 📢 Broadcast forwarding to {target_mac}")
         else:
-            target_mac = self.arp_manager.resolve(next_hop_ip, final_outbound_iface)
+            target_mac = self.arp_manager.resolve(next_hop_ip, actual_outbound_iface)
 
         if not target_mac:
             self.router_logger.log_message(
-                f"[Router] 🕵️ ARP failed for {next_hop_ip} on {final_outbound_iface.split('_')[-1]}. Dropping."
+                f"[Router] 🕵️ ARP failed for {next_hop_ip} on {actual_outbound_iface.split('_')[-1]}. Dropping."
             )
             return
 
@@ -4785,7 +5105,7 @@ class PythonRouterManager:
             packet[Ether].dst = target_mac
         else:
             self.router_logger.log_message(
-                f"[Router] ⚠️ Packet missing Ether layer for {final_outbound_iface.split('_')[-1]}. Cannot send."
+                f"[Router] ⚠️ Packet missing Ether layer for {actual_outbound_iface.split('_')[-1]}. Cannot send."
             )
             return
 
@@ -4795,9 +5115,9 @@ class PythonRouterManager:
         if packet.haslayer(UDP): del packet[UDP].chksum
 
         # --- [12] Send Packet ---
-        self.packet_writer.queue_packet(packet, final_outbound_iface)
+        self.packet_writer.queue_packet(packet, actual_outbound_iface)
         self.router_logger.log_message(
-            f"[Router] 📤 Packet queued to {final_outbound_iface.split('_')[-1]}"
+            f"[Router] 📤 Packet queued to {actual_outbound_iface.split('_')[-1]}"
         )
 
     def start_routing(self, use_dhcp_out, use_dhcp_in):
@@ -4810,7 +5130,7 @@ class PythonRouterManager:
             self.router_logger.log_message(f"[RouterManager] ❌ Crash in start_routing: {e}")
 
         self._enable_nat_forwarding()
-        self.nat_manager = NATManager(self.router_logger, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve)
+        self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve)
         self.nat_manager.start()
 
         self.notification_manager = NotificationManager(
