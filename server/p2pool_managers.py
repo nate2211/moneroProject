@@ -3906,10 +3906,10 @@ class PythonRouterManager:
     ]
 
     BPF_FILTER_BASE_DEFINITIONS = {
-        "Ethernet": ["arp", "(ip)","(udp port 67 or udp port 68)","(udp port 520)","(ip multicast)"],
-        "Wi-Fi": ["ip", "(udp port 67 or udp port 68)"],
-        "Loopback": ["host 127.0.0.1","host ::1","ip"],
-        "Ethernet 2": ["arp","(ip)","(udp port 67 or udp port 68)","(udp port 520)","(ip multicast)",],
+        "Ethernet": ["arp", "(ip)","(udp port 67 or udp port 68)","(udp port 520)","(ip multicast and ether[12:2] >= 0x0600)"],
+        "Wi-Fi": ["ip", "(udp port 67 or udp port 68) and ether[12:2] >= 0x0600"],
+        "Loopback": ["host 127.0.0.1","host ::1", "ether[12:2] >= 0x0600"],
+        "Ethernet 2": ["arp","(ip)","(udp port 67 or udp port 68)","(udp port 520)","(ip multicast and ether[12:2] >= 0x0600) ",],
     }
     def __init__(self, router_logger):
 
@@ -4701,10 +4701,10 @@ class PythonRouterManager:
 
         def safe_enqueue(pkt):
             try:
-                if len(bytes(pkt)) < 14:
-                    self.router_logger.log_message(f"[Sniffer] ⚠️ Dropped malformed packet (too short)")
+                if not pkt.haslayer(Ether) or len(pkt.original) < 14:
                     return
-
+                if len(pkt.original) > 65535:
+                    return
                 if not consume_token():
                     return  # Drop if over limit
 
