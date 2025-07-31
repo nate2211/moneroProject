@@ -3,6 +3,7 @@ import ctypes
 import datetime
 import hashlib
 import hmac
+import inspect
 import os
 import queue
 import random
@@ -42,19 +43,25 @@ from scapy.all import send, sr1, conf, get_if_list
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
+from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP6OptDNSServers, DHCP6_Advertise, \
+    DHCP6_Reply
 from scapy.layers.dns import DNSQR, DNS, DNSRR
 from scapy.layers.inet import TCP, IP, ICMP, UDP, IPerror
-from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach
+from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6ND_RS, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, \
+    ICMPv6ND_NA, ICMPv6ND_RA
 from scapy.layers.l2 import ARP, Ether, getmacbyip
 from scapy.layers.rip import RIP, RIPEntry
-from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
-from scapy.layers.tls.record import TLS
+from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished, TLSCertificate, \
+    TLSClientKeyExchange, TLSServerKeyExchange, TLSServerHelloDone, TLSCertificateRequest
+from scapy.layers.tls.record import TLS, TLSAlert, TLSApplicationData
 from scapy.libs.rfc3961 import Key
 from scapy.main import load_layer
 from scapy.sendrecv import srp, sendp, sniff
 from scapy.packet import Packet, bind_layers, Raw
 from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, Field, BitField, XByteField, \
     FieldLenField, StrFixedLenField, FlagsField, IP6Field, ConditionalField
+from scapy.layers.tls.crypto import suites
+from scapy.layers.tls.crypto.suites import _GenericCipherSuite
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict, Literal
 import xml.etree.ElementTree as ET
@@ -66,11 +73,36 @@ from scapy.sessions import TCPSession
 from win32timezone import now
 
 
-packet_queue = queue.Queue(maxsize=10)
+packet_queue = queue.Queue(maxsize=25)
 def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
     emoji = random.choice(emoticons) if emoticons else ''
     return f"[{name}] {emoji} {message}"
 
+
+class MLDQuery(Packet):
+    name = "ICMPv6 MLD Query"
+    fields_desc = [
+        ShortField("mrd", 0),
+        ShortField("res", 0),
+        IP6Field("mcaddr", "::")
+    ]
+
+class MLDReport(Packet):
+    name = "ICMPv6 MLD Report"
+    fields_desc = [
+        ShortField("mrd", 0),
+        ShortField("ngrp", 0),
+        # Real MLDv2 can have a list of group records, but this is a simple start
+        IP6Field("mcaddr", "::")
+    ]
+
+class MLDDone(Packet):
+    name = "ICMPv6 MLD Done"
+    fields_desc = [
+        ShortField("mrd", 0),
+        ShortField("res", 0),
+        IP6Field("mcaddr", "::")
+    ]
 # --- ICMPv6 Base and Common Types ---
 class ICMPv6(Packet):
     name = "ICMPv6"
@@ -93,70 +125,6 @@ class ICMPv6(Packet):
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
 
-
-class ICMPv6EchoRequest(Packet):
-    name = "ICMPv6 Echo Request"
-    fields_desc = [
-        ShortField("id", 0),
-        ShortField("seq", 0),
-        Raw("data", b"")
-    ]
-
-
-class ICMPv6EchoReply(ICMPv6EchoRequest):
-    name = "ICMPv6 Echo Reply"
-
-
-# --- ICMPv6 Neighbor Discovery Protocol (NDP) ---
-class ICMPv6ND_Option(Packet):
-    name = "ICMPv6 ND Option"
-    fields_desc = [
-        ByteField("type", 1),  # 1: Source Link-Layer, 2: Target Link-Layer
-        FieldLenField("len", None, length_of="lladdr", fmt="B"),
-        StrFixedLenField("lladdr", "", length=6)  # Link-Layer Address (MAC)
-    ]
-
-
-class ICMPv6ND_NS(Packet):
-    name = "ICMPv6 Neighbor Solicitation"
-    fields_desc = [
-        IntField("res", 0),  # Reserved
-        IP6Field("tgt", "::"),  # Target Address
-        PacketListField("options", [], ICMPv6ND_Option, length_from=lambda pkt: pkt.underlayer.plen - 24)
-    ]
-
-
-class ICMPv6ND_NA(Packet):
-    name = "ICMPv6 Neighbor Advertisement"
-    fields_desc = [
-        FlagsField("flags", 0, 32, "RSO"),  # R:Router, S:Solicited, O:Override
-        IP6Field("tgt", "::"),  # Target Address
-        PacketListField("options", [], ICMPv6ND_Option, length_from=lambda pkt: pkt.underlayer.plen - 24)
-    ]
-class ICMPv6ND_RA_Option(Packet):
-    name = "ICMPv6 ND RA Option"
-    fields_desc = [
-        ByteField("type", 3),  # 3: Prefix Information
-        FieldLenField("len", None, length_of="prefix", fmt="B"),
-        ByteField("prefixlen", 64),
-        FlagsField("flags", 0, 8, "LA"),  # L:On-Link, A:Autonomous
-        IntField("validlifetime", 2592000),  # 30 days
-        IntField("preflifetime", 604800),  # 7 days
-        IntField("res2", 0),
-        IP6Field("prefix", "::")
-    ]
-class ICMPv6ND_RA(Packet):
-    name = "ICMPv6 Router Advertisement"
-    fields_desc = [
-        ByteField("chlim", 64),  # Current Hop Limit
-        FlagsField("flags", 0, 8, "MOP"),  # M:Managed, O:Other, P:Proxy
-        ShortField("routerlifetime", 1800),  # seconds
-        IntField("reachtime", 0),
-        IntField("retranstimer", 0),
-        PacketListField("options", [], ICMPv6ND_RA_Option, length_from=lambda pkt: pkt.underlayer.plen - 16)
-    ]
-
-
 # --- Layer Bindings ---
 bind_layers(Ether, IPv6, type=0x86DD)
 bind_layers(IPv6, ICMPv6, nh=58)
@@ -168,6 +136,10 @@ bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
 bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
 bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
 bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
+bind_layers(ICMPv6, ICMPv6ND_RS, type=134)
+bind_layers(ICMPv6, MLDQuery, type=130)   # MLD Query
+bind_layers(ICMPv6, MLDReport, type=131)  # MLD Report
+bind_layers(ICMPv6, MLDDone, type=132)    # MLD Done
 bind_layers(IP, IGMP, proto=2)  # IP protocol 2 is IGMP
 bind_layers(Ether, ARP, type=0x0806)
 
@@ -175,6 +147,17 @@ load_layer("tls")
 load_layer("kerberos")
 load_layer("rip")
 load_layer("dns")
+
+tls_alert_level = {1: "warning", 2: "fatal"}
+tls_alert_description = {
+    0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
+    22: "record_overflow", 40: "handshake_failure", 42: "bad_certificate",
+    43: "unsupported_certificate", 46: "certificate_unknown", 47: "illegal_parameter",
+    48: "unknown_ca", 49: "access_denied", 50: "decode_error",
+    51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
+    80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
+
+}
 
 class SendBackManager:
     """
@@ -194,6 +177,11 @@ class SendBackManager:
         """
 
         try:
+            if not hasattr(packet[Ether], "dst") or not packet[Ether].dst or packet[
+                Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+                self.logger.log_message(
+                    f"[Sendback] 💦 Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {packet.summary()}")
+                return
             self.packet_signer.sign_packet(packet)
             outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
             sendp(packet, iface=outbound_interface, verbose=0)
@@ -216,6 +204,11 @@ class SendBackManager:
             icmp_code (int): ICMP code (e.g., 1 = host unreachable, 13 = admin prohibited).
             payload (Optional[bytes]): Optional payload; defaults to 64 bytes of original packet.
         """
+        if not hasattr(original_packet[Ether], "dst") or not original_packet[Ether].dst or original_packet[
+            Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+            self.logger.log_message(
+                f"[Sendback] 💦 Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {original_packet.summary()}")
+            return
         try:
             if IP in original_packet:
                 ip = original_packet[IP]
@@ -253,8 +246,7 @@ class SendBackManager:
             tb = traceback.format_exc()
             self.logger.log_message(f"[SendBack] ❗ Error sending ICMP packet:\n{tb}")
 
-
-class FishingManager:
+class PacketCatcherManager:
     """
     A manager responsible for inspecting packets for unencrypted payloads
     and outputting their content. It uses heuristics to identify potential plaintext.
@@ -263,16 +255,16 @@ class FishingManager:
     the collected packets for that IP.
     """
 
-    def __init__(self, router_logger, fishing_threshold: int = 3, packet_queue_maxlen: int = 3):
+    def __init__(self, router_logger, catching_threshold: int = 3, packet_queue_maxlen: int = 3):
         """
         Initializes the FishingManager.
 
         Args:
             router_logger (RouterLogger): An instance of the router's logger.
-            fishing_threshold (int): The number of unencrypted payloads from a single IP
+            catching_threshold (int): The number of unencrypted payloads from a single IP
                                      that triggers a release of collected packets for that IP.
             packet_queue_maxlen (int): The maximum number of packets to store per IP
-                                       in the fishing table before old ones are dropped.
+                                       in the catching table before old ones are dropped.
         """
         self.logger = router_logger
         self.logger.log_message("[Fishing] 🎣 Manager initialized. Ready to cast nets for plaintext payloads.")
@@ -294,8 +286,8 @@ class FishingManager:
 
         # Fishing table to store packets and counts per IP
         # Each entry is { 'packets': deque, 'count': int }
-        self.fishing_table = defaultdict(lambda: {'packets': deque(maxlen=packet_queue_maxlen), 'count': 0})
-        self.fishing_threshold = fishing_threshold
+        self.catching_table = defaultdict(lambda: {'packets': deque(maxlen=packet_queue_maxlen), 'count': 0})
+        self.catching_threshold = catching_threshold
         self.dry_table = defaultdict(lambda: {'count': 0})
         self.dry_threshold = 5  # You can adjust this threshold
         self.packet_queue_maxlen = packet_queue_maxlen  # Max length for the deque per IP
@@ -303,9 +295,9 @@ class FishingManager:
     def process_packet(self, packet: Packet):
         """
         Inspects a packet for unencrypted (plaintext) payloads.
-        If a potential plaintext payload is found, its content is logged,
-        the packet is stored in the fishing table for its source IP,
-        the per-IP fishing count is incremented, and if the threshold is met,
+        If a potential plaintext payload with an interesting keyword is found, its content is logged,
+        the packet is stored in the catching table for its source IP,
+        the per-IP catching count is incremented, and if the threshold is met,
         the collected packets for that IP are re-sent.
 
         Args:
@@ -315,6 +307,7 @@ class FishingManager:
         protocol_info = "Unknown"
         src_ip = None
         dst_ip = None
+        decoded_payload = ""
 
         # Determine the source IP for per-IP tracking
         if IP in packet:
@@ -324,12 +317,12 @@ class FishingManager:
             src_ip = packet[IPv6].src
             dst_ip = packet[IP].dst
         else:
-            self.logger.log_message("[Fishing] 🐠 Not an IP packet, skipping payload inspection.")
-            return  # Only process IP packets for fishing
+            self.logger.log_message("[PacketCatcher] 🐠 Not an IP packet, skipping payload inspection.")
+            return  # Only process IP packets for catching
 
         try:
             # --- TCP Payload Check ---
-            if TCP in packet:
+            if TCP in packet and packet.haslayer('Raw'):
                 tcp_layer = packet[TCP]
                 sport = tcp_layer.sport
                 dport = tcp_layer.dport
@@ -340,22 +333,18 @@ class FishingManager:
                 elif dport in self.plaintext_ports:
                     protocol_info = self.plaintext_ports[dport]
 
-                # If there's a Raw layer after TCP, it's likely application data
-                if packet.haslayer('Raw'):
-                    payload = packet[Raw].load
-                    try:
-                        decoded_payload = payload.decode('utf-8', errors='ignore')
-                        self.logger.log_message(
-                            f"[Fishing] 🐟 Caught TCP Payload ({protocol_info})."
-                        )
-                        payload_detected_in_this_packet = True
-                    except UnicodeDecodeError:
-                        self.logger.log_message(
-                            f"[Fishing] 🎣 Caught TCP Payload (Binary/Non-UTF8) on {protocol_info} port.")
-                        payload_detected_in_this_packet = True
+                payload = packet[Raw].load
+                decoded_payload = payload.decode('utf-8', errors='ignore')
+
+                # Check for interesting keywords
+                log_payload = decoded_payload[:50] + "..." if len(decoded_payload) > 50 else decoded_payload
+                log_payload = log_payload.replace('\n', '').replace('\r', '')
+                self.logger.log_message(
+                    f"[PacketCatcher] 🐟 Caught interesting TCP Payload ({protocol_info}). Payload snippet:{log_payload}")
+                payload_detected_in_this_packet = True
 
             # --- UDP Payload Check ---
-            elif UDP in packet:
+            elif UDP in packet and packet.haslayer('Raw'):
                 udp_layer = packet[UDP]
                 sport = udp_layer.sport
                 dport = udp_layer.dport
@@ -365,48 +354,41 @@ class FishingManager:
                 elif dport in self.plaintext_ports:
                     protocol_info = self.plaintext_ports[dport]
 
-                if packet.haslayer('Raw'):
-                    payload = packet[Raw].load
-                    try:
-                        decoded_payload = payload.decode('utf-8', errors='ignore')
-                        self.logger.log_message(
-                            f"[Fishing] 🎣 Caught UDP Payload ({protocol_info})."
-                        )
-                        payload_detected_in_this_packet = True
-                    except UnicodeDecodeError:
-                        self.logger.log_message(
-                            f"[Fishing] 🎣 Caught UDP Payload (Binary/Non-UTF8) on {protocol_info} port. Hex dump: {payload.hex()}")
-                        payload_detected_in_this_packet = True
+                payload = packet[Raw].load
+                decoded_payload = payload.decode('utf-8', errors='ignore')
+                # Check for interesting keywords
+                log_payload = decoded_payload[:50] + "..." if len(decoded_payload) > 50 else decoded_payload
+                log_payload = log_payload.replace('\n', '').replace('\r', '')
+                self.logger.log_message(
+                    f"[PacketCatcher] 🎣 Caught interesting UDP Payload ({protocol_info}). Payload snippet:{log_payload}")
+                payload_detected_in_this_packet = True
 
             # For ICMP Echo Replies, which inherently have plaintext data
-            elif (ICMP in packet and packet[ICMP].type == 0) or (IPv6 in packet and ICMPv6EchoReply in packet):
-                if packet.haslayer('Raw'):
-                    payload = packet[Raw].load
-                    try:
-                        decoded_payload = payload.decode('utf-8', errors='ignore')
-                        self.logger.log_message(
-                            f"[Fishing] 🐟 Caught ICMP Echo Reply Payload."
-                        )
-                        payload_detected_in_this_packet = True
-                    except UnicodeDecodeError:
-                        self.logger.log_message(
-                            f"[Fishing] 🎣 Caught ICMP Echo Reply Payload (Binary/Non-UTF8).")
-                        payload_detected_in_this_packet = True
+            elif (ICMP in packet and packet.haslayer('Raw') and (
+                    packet[ICMP].type == 0 or (IPv6 in packet and ICMPv6EchoReply in packet))):
+                payload = packet[Raw].load
+                decoded_payload = payload.decode('utf-8', errors='ignore')
+                # Check for interesting keywords
+                log_payload = decoded_payload[:50] + "..." if len(decoded_payload) > 50 else decoded_payload
+                log_payload = log_payload.replace('\n', '').replace('\r', '')
+                self.logger.log_message(
+                    f"[PacketCatcher] 🐟 Caught interesting ICMP Echo Reply Payload. Payload snippet:{log_payload}")
+                payload_detected_in_this_packet = True
 
             if payload_detected_in_this_packet:
                 # Store the packet and increment count for the specific source IP
-                ip_entry = self.fishing_table[src_ip]
+                ip_entry = self.catching_table[src_ip]
                 ip_entry['packets'].append(packet)
                 ip_entry['count'] += 1
                 self.logger.log_message(
-                    f"[Fishing] 🐠 Stored packet from {src_ip}. Current count for {src_ip}: {ip_entry['count']}/{self.fishing_threshold} ({len(ip_entry['packets'])} in queue)."
+                    f"[PacketCatcher] 🐠 Stored packet from {src_ip}. Current count for {src_ip}: {ip_entry['count']}/{self.catching_threshold} ({len(ip_entry['packets'])} in queue)."
                 )
 
-                # Check if the fishing count for this IP has reached the threshold
-                if ip_entry['count'] >= self.fishing_threshold:
+                # Check if the catching count for this IP has reached the threshold
+                if ip_entry['count'] >= self.catching_threshold:
                     self.logger.log_message(
-                        f"[Fishing] 💰 Unencrypted payload threshold reached for {src_ip}! ({ip_entry['count']} detections)")
-                    self._release_packets_for_ip(src_ip,  packet.sniffed_on)  # Release packets for this specific IP
+                        f"[PacketCatcher] 💰 Unencrypted payload threshold reached for {src_ip}! ({ip_entry['count']} detections)")
+                    self._release_packets_for_ip(src_ip, packet.sniffed_on)  # Release packets for this specific IP
                     self.request_fish(dst_ip)
             else:
                 if dst_ip:
@@ -417,16 +399,17 @@ class FishingManager:
                         self.request_fish(dst_ip)
                         self.dry_table[dst_ip]['count'] = 0  # Reset after trigger
 
-                    if self.dry_table[dst_ip]['count'] >= self.dry_threshold / 2 and self.fishing_table[src_ip]['count'] < self.fishing_threshold:
+                    if self.dry_table[dst_ip]['count'] >= self.dry_threshold / 2 and self.catching_table[src_ip][
+                        'count'] < self.catching_threshold:
                         sender_mac = packet[Ether].src if Ether in packet else "00:00:00:00:00:00"
                         self.notification_manager.send_notification(
-                        {
-                            "event": "Dry Fishing",
-                            "ip": dst_ip,
-                            "mac": sender_mac,
-                            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                            "emojis": ["🚣", "🚣🏻", "🚣🏽", "🚣🏿"]
-                        })
+                            {
+                                "event": "Dry Fishing",
+                                "ip": dst_ip,
+                                "mac": sender_mac,
+                                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                                "emojis": ["🚣", "🚣🏻", "🚣🏽", "🚣🏿"]
+                            })
 
         except Exception as e:
             self.logger.log_message(f"[Fishing] ❗ Error during payload inspection: {e}\n{traceback.format_exc()}")
@@ -441,53 +424,59 @@ class FishingManager:
             payload = b"SEND_FISH"  # This could be anything you define as a trigger
             packet = IP(dst=ip_address) / UDP(sport=55555, dport=55555) / Raw(load=payload)
 
-            self.logger.log_message(f"[Fishing] 🕳️ Sending fish request to {ip_address}")
+            self.logger.log_message(f"[PacketCatcher] 🕳️ Sending fish request to {ip_address}")
             send(packet, verbose=False)
 
         except Exception as e:
-            self.logger.log_message(f"[Fishing] ❌ Failed to send fish request to {ip_address}.")
+            self.logger.log_message(f"[PacketCatcher] ❌ Failed to send fish request to {ip_address}.")
 
     def _release_packets_for_ip(self, ip_address: str, iface: str = None):
         """
-        Re-sends all packets currently stored in the fishing table for a specific IP address.
-        After re-sending, the count for that IP is cleared.
+        Processes packets stored in the catching table for a specific IP by reconstructing them
+        and sending them at Layer 3, then clearing the count for that IP.
 
         Args:
-            ip_address (str): The IP address whose packets should be released.
-            iface (str): The interface to use for sending packets. Optional.
+            ip_address (str): The IP address whose packets should be processed.
+            iface (str): The interface from which the packets were sniffed. This is for logging purposes.
         """
-        if ip_address not in self.fishing_table:
-            self.logger.log_message(f"[Fishing] ℹ️ No packets to release for IP: {ip_address}")
+        if ip_address not in self.catching_table:
+            self.logger.log_message(f"[PacketCatcher] ℹ️ No packets to process for IP: {ip_address}")
             return
 
-        ip_entry = self.fishing_table[ip_address]
-        num_packets_to_release = len(ip_entry['packets'])
-        self.logger.log_message(f"[Fishing] 🏴‍☠️ Re-releasing {num_packets_to_release} packets for IP: {ip_address}.")
-        local_mac_cache = {}
-
-        # Step 2: Resend packets
+        ip_entry = self.catching_table[ip_address]
+        num_packets_to_process = len(ip_entry['packets'])
+        self.logger.log_message(
+            f"[PacketCatcher] 🏴‍☠️ Reconstructing and sending {num_packets_to_process} packets for IP: {ip_address}.")
 
         while ip_entry['packets']:
             pkt = ip_entry['packets'].popleft()
 
-            # Determine actual destination IP
-            dst_ip = None
+            # Reconstruct the packet to send at Layer 3
+            l3_packet = None
             if IP in pkt:
-                dst_ip = pkt[IP].dst
+                l3_packet = pkt.getlayer(IP)
             elif IPv6 in pkt:
-                dst_ip = pkt[IPv6].dst
+                l3_packet = pkt.getlayer(IPv6)
+
+            if l3_packet:
+                try:
+                    # Using the send() function which operates at Layer 3
+                    if not hasattr(pkt[Ether], "dst") or not pkt[Ether].dst or pkt[
+                        Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+                        self.logger.log_message(
+                            f"[PacketCatcher] 💦 Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {pkt.summary()}")
+                        return
+                    send(l3_packet, verbose=False)
+                    self.logger.log_message(
+                        f"[PacketCatcher] 🦜 Reconstructed and sent L3 packet from {l3_packet.src} to {l3_packet.dst}.")
+                except Exception as e:
+                    self.logger.log_message(f"[PacketCatcher] ❌ Failed to send reconstructed packet: {e}")
             else:
-                continue
+                self.logger.log_message(f"[PacketCatcher] ⚠️ Packet for {ip_address} was not a valid L3 packet. Dropping.")
 
-            if not dst_ip:
-                continue
+        # Reset the count for this IP after processing all packets
+        ip_entry['count'] = 0
 
-            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / pkt
-            try:
-                sendp(pkt, iface=iface, verbose=False)
-                self.logger.log_message(f"[Fishing] 🦜 Broadcasting packet")
-            except Exception as e:
-                self.logger.log_message(f"[Fishing] ❌ Failed to send packet to {dst_ip}: {e}")
 class PacketSigningManager:
     """
     Signs IPv4/IPv6 packets using HMAC and embeds a fragment of the signature
@@ -792,7 +781,6 @@ class TransportManager:
                 f"{src_ip}:{tcp_layer.sport} -> {dst_ip}:{tcp_layer.dport} | "
                 f"Flags: {flags} | Payload Length: {length}"
             )
-            self.packet_signer.sign_packet(packet)
             return True
 
         if packet.haslayer(UDP):
@@ -801,16 +789,15 @@ class TransportManager:
                 f"[Transport] 🚀 UDP Packet on {iface_short}: " # Changed 🔀 to 🚀
                 f"{src_ip}:{udp_layer.sport} -> {dst_ip}:{udp_layer.dport} | Length: {udp_layer.len}"
             )
-            self.packet_signer.sign_packet(packet)
             return True
 
 
         elif packet.haslayer(Raw):  # Sometimes raw payload directly after IP indicates higher layer not dissected
+            protocol_number = ip_layer.proto if isinstance(ip_layer, IP) else ip_layer.nh
             self.logger.log_message(
                 f"[Transport] 📦 Raw Payload Packet on {iface_short}: " # Changed 🔀 to 📦
-                f"From {src_ip} -> {dst_ip} | IP Protocol: {ip_layer.proto} | Payload Length: {len(packet[Raw].load)}"
+                f"From {src_ip} -> {dst_ip} | IP Protocol: {protocol_number} | Payload Length: {len(packet[Raw].load)}"
             )
-            self.packet_signer.sign_packet(packet)
             return True
         return False
 
@@ -823,47 +810,155 @@ class HTTPSManager:
 
     def __init__(self, router_logger):
         self.router_logger = router_logger
+        # Build the cipher suite map on initialization for efficiency.
+        self.cipher_map = self.build_cipher_suite_map()
         self.router_logger.log_message("[HTTPSManager] 🔒 Initialized for passive TLS monitoring.")
-
+        self.router_logger.log_message(f"[HTTPSManager] 🗺️  Built map with {len(self.cipher_map)} cipher suites.")
+        self.TLS_VERSIONS = {
+            0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
+            0x0303: "TLS 1.2", 0x0304: "TLS 1.3"
+        }
+    def build_cipher_suite_map(self) -> dict:
+        """
+        Dynamically builds a map of TLS cipher suite IDs to their string names
+        for compatibility with various Scapy versions.
+        """
+        cipher_map = {}
+        # Inspect the 'suites' module to find all cipher suite classes.
+        for name, obj in inspect.getmembers(suites):
+            if inspect.isclass(obj) and issubclass(obj, _GenericCipherSuite) and obj is not _GenericCipherSuite:
+                if hasattr(obj, 'val'):
+                    cipher_map[obj.val] = name
+        return cipher_map
 
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
-        Processes an incoming packet to detect TLS/HTTPS traffic and extract SNI.
-        Args:
-            packet: The Scapy packet.
-            inbound_iface (str): The full Scapy name of the interface the packet was sniffed on.
-            interfaces_config (dict): The router's internal interfaces configuration.
-        Returns:
-            bool: True if the packet contained a TLS layer and was processed, False otherwise.
+        Processes an incoming packet, iterating through each TLS record to detect
+        and process all handshake messages contained within.
         """
         if not packet.haslayer(TLS):
             return False
 
         iface_short = inbound_iface.split('_')[-1]
-        self.router_logger.log_message(f"[HTTPS] 🌐 TLS packet detected on {iface_short}.")
+        processed = False  # Will be set to True if any TLS record is processed
 
         try:
-            # Check for TLS ClientHello message which contains SNI
-            # A TLS packet can contain multiple records, and a record can contain multiple handshakes
-            if packet.haslayer(TLSClientHello):
-                client_hello = packet[TLSClientHello]
-                # SNI is in the extensions field
-                if hasattr(client_hello, 'extensions') and client_hello.extensions:
-                    for ext in client_hello.extensions:
-                        # Server Name Indication extension has type 0
-                        # The SNI value is typically in ext.servername.names[0].servername
-                        if hasattr(ext, 'servername') and hasattr(ext.servername, 'names') and ext.servername.names:
-                            sni_name = ext.servername.names[0].servername.decode('utf-8')
-                            self.router_logger.log_message(f"[HTTPS] 🔍  ClientHello SNI: {sni_name}")
+            # --- CRITICAL CHANGE: Iterate through each TLS record in the packet ---
+            for tls_record in packet[TLS]:
+                # The record's payload is the actual handshake message (e.g., ClientHello)
+                # We check if Scapy successfully dissected it into a Packet object.
+                if not hasattr(tls_record, 'payload') or not isinstance(tls_record.payload, Packet):
+                    continue
 
-                            return True
-                else:
-                    self.router_logger.log_message("[HTTPS] ℹ️  ClientHello without SNI extension.")
-            else:
-                self.router_logger.log_message("[HTTPS] ℹ️ TLS packet is not a ClientHello (or SNI not found).")
+                # --- Now, check each individual record for specific handshake layers ---
 
+                if tls_record.haslayer(TLSClientHello):
+                    processed = True
+                    self.router_logger.log_message(f"[HTTPS] 🌐 ClientHello detected on {iface_short}.")
+                    client_hello = tls_record[TLSClientHello]
+                    version_str = self.TLS_VERSIONS.get(client_hello.version, f"Unknown (0x{client_hello.version:04x})")
+                    self.router_logger.log_message(f"[HTTPS]   - Version Offered: {version_str}")
+                    if hasattr(client_hello, 'ciphersuites'):
+                        self.router_logger.log_message(f"[HTTPS]   - Ciphers Offered: {len(client_hello.ciphersuites)}")
+                    sni_found = False
+                    if hasattr(client_hello, 'extensions') and client_hello.extensions:
+                        for ext in client_hello.extensions:
+                            if hasattr(ext, 'type') and ext.type == 0 and hasattr(ext,
+                                                                                  'servernames') and ext.servernames:
+                                sni_name = ext.servernames[0].servername.decode('utf-8')
+                                self.router_logger.log_message(f"[HTTPS]   - Server Name (SNI): {sni_name}")
+                                sni_found = True
+                                break
+                    if not sni_found:
+                        self.router_logger.log_message("[HTTPS]   - No SNI extension found.")
 
-            return True
+                if tls_record.haslayer(TLSServerHello):
+                    processed = True
+                    self.router_logger.log_message(f"[HTTPS] 🌐 ServerHello detected on {iface_short}.")
+                    server_hello = tls_record[TLSServerHello]
+                    version_str = self.TLS_VERSIONS.get(server_hello.version, f"Unknown (0x{server_hello.version:04x})")
+                    self.router_logger.log_message(f"[HTTPS]   - Version Negotiated: {version_str}")
+                    cipher_suite = server_hello.cipher_suite
+                    cipher_name = self.cipher_map.get(cipher_suite, f"Unknown (ID: 0x{cipher_suite:04x})")
+                    self.router_logger.log_message(f"[HTTPS]   - Cipher Suite Chosen: {cipher_name}")
+
+                if tls_record.haslayer(TLSServerKeyExchange):
+                    processed = True
+                    ske = tls_record[TLSServerKeyExchange]
+                    key_info = "Unknown parameters"
+                    if hasattr(ske, 'dh_p'):
+                        key_len_bits = len(ske.dh_p) * 8
+                        key_info = f"DHE, Public Key Length: {key_len_bits} bits"
+                    elif hasattr(ske, 'ec_pub_k'):
+                        key_len_bytes = len(ske.ec_pub_k)
+                        key_info = f"ECDHE, Public Key Length: {key_len_bytes} bytes"
+                    self.router_logger.log_message(f"[HTTPS] 🔑 ServerKeyExchange detected ({key_info}).")
+
+                if tls_record.haslayer(TLSCertificate):
+                    processed = True
+                    self.router_logger.log_message(f"[HTTPS] 📜 Certificate detected on {iface_short}.")
+                    cert_layer = tls_record[TLSCertificate]
+                    num_certs = len(cert_layer.certs) if hasattr(cert_layer, 'certs') else 0
+                    self.router_logger.log_message(f"[HTTPS]   - Certificate Chain Length: {num_certs}")
+                    if num_certs > 0:
+                        server_cert = cert_layer.certs[0]
+                        if hasattr(server_cert, 'subject') and hasattr(server_cert.subject, 'rdn_seq'):
+                            for rdn_sequence in server_cert.subject.rdn_seq:
+                                for rdn in rdn_sequence:
+                                    if hasattr(rdn, 'type') and rdn.type.val == '2.5.4.3':
+                                        cn = rdn.value.val.decode('utf-8', 'ignore')
+                                        self.router_logger.log_message(f"[HTTPS]   - Certificate CN: {cn}")
+                                        break
+                        if hasattr(server_cert, 'not_before') and hasattr(server_cert, 'not_after'):
+                            valid_from = server_cert.not_before.val.decode('utf-8', 'ignore')
+                            valid_to = server_cert.not_after.val.decode('utf-8', 'ignore')
+                            self.router_logger.log_message(f"[HTTPS]   - Validity: {valid_from} to {valid_to}")
+
+                if tls_record.haslayer(TLSServerHelloDone):
+                    processed = True
+                    self.router_logger.log_message(
+                        f"[HTTPS] ✔️ ServerHelloDone detected. Server is awaiting client response.")
+
+                if tls_record.haslayer(TLSCertificateRequest):
+                    processed = True
+                    self.router_logger.log_message(f"[HTTPS] 🤝 Server requested a client certificate (Mutual TLS).")
+
+                if tls_record.haslayer(TLSClientKeyExchange):
+                    processed = True
+                    cke = tls_record[TLSClientKeyExchange]
+                    key_info = "Encrypted key data"
+                    if hasattr(cke, 'dh_pub_k'):
+                        key_len_bits = len(cke.dh_pub_k) * 8
+                        key_info = f"DHE Public Key, Length: {key_len_bits} bits"
+                    elif hasattr(cke, 'ec_pub_k'):
+                        key_len_bytes = len(cke.ec_pub_k)
+                        key_info = f"ECDHE Public Key, Length: {key_len_bytes} bytes"
+                    elif hasattr(cke, 'rsa_encrypted_pms'):
+                        key_len_bytes = len(cke.rsa_encrypted_pms)
+                        key_info = f"RSA Encrypted PMS, Length: {key_len_bytes} bytes"
+                    self.router_logger.log_message(
+                        f"[HTTPS] 🔑 ClientKeyExchange detected on {iface_short} ({key_info}).")
+
+                if tls_record.haslayer(TLSFinished):
+                    processed = True
+                    finished_msg = tls_record[TLSFinished]
+                    verify_data_len = len(finished_msg.vdata) if hasattr(finished_msg, 'vdata') else 0
+                    self.router_logger.log_message(
+                        f"[HTTPS] ✅ Handshake Finished detected on {iface_short}. Verify Data Length: {verify_data_len} bytes.")
+
+                if tls_record.haslayer(TLSAlert):
+                    processed = True
+                    alert_layer = tls_record[TLSAlert]
+                    level = tls_alert_level.get(alert_layer.level, "Unknown")
+                    description = tls_alert_description.get(alert_layer.descr, "Unknown")
+                    self.router_logger.log_message(
+                        f"[HTTPS] ⚠️  Alert on {iface_short}: Level={level}, Desc='{description}'")
+
+                if tls_record.haslayer(TLSApplicationData):
+                    processed = True
+                    self.router_logger.log_message(f"[HTTPS] 📦 Encrypted Application Data on {iface_short}.")
+
+            return processed
 
         except Exception as e:
             self.router_logger.log_message(f"[HTTPS] 🔥 Error processing TLS packet: {e}")
@@ -1129,8 +1224,8 @@ class PacketWriter:
 
         # Destination throttling
         self.packet_writing_table = defaultdict(lambda: {"count": 0, "last_sent": 0})
-        self.THRESHOLD_PER_DST = 10
-        self.RESET_INTERVAL = 60  # seconds
+        self.THRESHOLD_PER_DST = 5
+        self.RESET_INTERVAL = 1  # seconds
         self.outbound_load_balancer = outbound_load_balancer
 
     def _worker_loop(self):
@@ -1159,6 +1254,13 @@ class PacketWriter:
             self.logger.log_message("[PacketWriter] ⚠️ Error: Interface name is not specified.")
             return
 
+        # Check for the presence of the Ethernet layer before proceeding
+        if not packet.haslayer(Ether):
+            self.logger.log_message(f"[PacketWriter] 🚫 Dropped packet: Missing Ethernet layer (no MAC address). Summary: {packet.summary()}")
+            return
+        if not hasattr(packet[Ether], "dst") or not packet[Ether].dst or packet[Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+            self.logger.log_message(f"[PacketWriter] ☔ Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {packet.summary()}")
+            return
         try:
             if packet.haslayer(IP) or packet.haslayer(IPv6):
                 if packet.haslayer(IP):
@@ -1249,57 +1351,81 @@ class PacketWriter:
         outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
         self.packet_queue.put((packet, outbound_interface))
 
+
 class ForwardingManager:
     """
-    Tracks recently forwarded (src, dst, port, proto) flows to prevent looping or repeated forwards.
+    Tracks recently forwarded flows and considers them duplicates only after
+    a certain threshold has been reached within a timeout period.
     """
-    def __init__(self, router_logger=None, timeout: int = 200, max_entries: int = 10000):
+
+    def __init__(self, router_logger=None, timeout: int = 5, max_entries: int = 10000, duplicate_threshold: int = 5):
         self.logger = router_logger or (lambda x: None)
-        self.timeout = timeout  # seconds
+        self.timeout = timeout
+        self.duplicate_threshold = duplicate_threshold  # NEW: Configurable threshold
         self._forwarded_cache = deque(maxlen=max_entries)
-        self._forwarded_set: Set[Tuple] = set()
+
+        # CHANGED: from a set to a dictionary to store (count, timestamp)
+        self._flow_counts: Dict[Tuple, Tuple[int, float]] = {}
         self._lock = threading.Lock()
 
     def _prune_expired(self):
         now = time.time()
         while self._forwarded_cache and (now - self._forwarded_cache[0][1]) > self.timeout:
             key, _ = self._forwarded_cache.popleft()
-            self.logger.log_message(f"[Forwarding] 🔁 Duplicate flow expired: {key}")
-            self._forwarded_set.discard(key)
+            # UPDATED: Remove from the counts dictionary as well
+            if key in self._flow_counts:
+                del self._flow_counts[key]
+                self.logger.log_message(f"[Forwarding] 🔁 Flow expired from cache: {key}")
 
     def record_flow(self, src_ip: str, dst_ip: str, sport: int, dport: int, proto: str):
-        """
-        Manually records a flow into the forwarded cache to prevent future duplication.
-        Useful for preemptively suppressing known loops or rerouted flows.
-        """
+        """Manually records a flow, setting its count to the threshold to block it immediately."""
         key = (src_ip, dst_ip, sport, dport, proto)
         now = time.time()
         with self._lock:
             self._prune_expired()
-            if key not in self._forwarded_set:
+            if key not in self._flow_counts:
                 self._forwarded_cache.append((key, now))
-                self._forwarded_set.add(key)
-                self.logger.log_message(f"[Forwarding] 🧾 Flow recorded manually: {key}")
+                # Set count to the threshold to ensure the next is_duplicate check will fail
+                self._flow_counts[key] = (self.duplicate_threshold, now)
+                self.logger.log_message(f"[Forwarding] 🧾 Flow pre-emptively recorded as duplicate: {key}")
+
     def is_duplicate(self, src_ip: str, dst_ip: str, sport: int, dport: int, proto: str) -> bool:
         """
-        Returns True if the flow has been seen recently and should be considered a duplicate.
+        Checks if a flow has been seen at least 'duplicate_threshold' times.
+        Returns True if the threshold is met, otherwise increments the count and returns False.
         """
         key = (src_ip, dst_ip, sport, dport, proto)
         now = time.time()
         with self._lock:
             self._prune_expired()
-            if key in self._forwarded_set:
-                if self.logger:
-                    pass
-                return True
-            self._forwarded_cache.append((key, now))
-            self._forwarded_set.add(key)
-            return False
+
+            if key in self._flow_counts:
+                # Flow has been seen before, increment its count
+                count, _ = self._flow_counts[key]
+                new_count = count + 1
+                self._flow_counts[key] = (new_count, now)  # Update count and timestamp
+
+                # Check if the new count meets or exceeds the threshold
+                if new_count >= self.duplicate_threshold:
+                    self.logger.log_message(
+                        f"[Forwarding] 🚫 Duplicate threshold ({self.duplicate_threshold}) hit for flow {key}. Blocking.")
+                    return True
+                else:
+                    # Log the sighting but don't block yet
+                    self.logger.log_message(
+                        f"[Forwarding] Sighting {new_count}/{self.duplicate_threshold} for flow {key}.")
+                    return False
+            else:
+                # This is the first time seeing this flow
+                self._forwarded_cache.append((key, now))
+                self._flow_counts[key] = (1, now)  # Start with a count of 1
+                return False
 
 class EthernetBridgeManager:
     """
     Manages Layer 2 bridging (switching) between a group of interfaces.
     This allows multiple physical ports to act as a single broadcast domain.
+    Enhanced with traffic rate-limiting to prevent network congestion.
     """
 
     def __init__(self, router_logger, packet_writer):
@@ -1314,6 +1440,15 @@ class EthernetBridgeManager:
         # MAC address table: { mac_address: (interface_full_name, expiry_timestamp) }
         self._mac_table: Dict[str, Tuple[str, float]] = {}
         self._mac_table_lock = threading.Lock()
+
+        # --- New Traffic Management Fields ---
+        # _mac_traffic_count: { mac_address: count } for rate limiting
+        self._mac_traffic_count: Dict[str, int] = {}
+        self._traffic_lock = threading.Lock()
+        self.TRAFFIC_RATE_LIMIT = 20  # Max packets per MAC address per interval
+        self.TRAFFIC_CHECK_INTERVAL = 5  # Interval in seconds
+        # A queue for packets that exceed the rate limit
+        self._waiting_queue = deque()
 
         self._stop_event = threading.Event()
         self._cleanup_thread = None
@@ -1389,6 +1524,16 @@ class EthernetBridgeManager:
         dst_mac = frame[Ether].dst
         ether_type = frame[Ether].type
 
+        # --- New Traffic Management Logic ---
+        with self._traffic_lock:
+            self._mac_traffic_count[src_mac] = self._mac_traffic_count.get(src_mac, 0) + 1
+            if self._mac_traffic_count[src_mac] > self.TRAFFIC_RATE_LIMIT:
+                # Place packet in waiting queue instead of processing it
+                self._waiting_queue.append((frame, inbound_iface))
+                self.logger.log_message(
+                    f"[Bridge] 🚦 Rate limit exceeded for {src_mac}. Packet moved to waiting queue.")
+                return
+
         log_this_frame = False
         if ether_type in [0x0800, 0x0806, 0x86DD]:
             log_this_frame = True
@@ -1458,21 +1603,34 @@ class EthernetBridgeManager:
                     self.logger.log_message(f"[Bridge] 🗑️ MAC table entry for {mac} expired.")
             self._stop_event.wait(60)
 
+    def _cleanup_traffic_loop(self):
+        """Periodically resets the traffic counters."""
+        while not self._stop_event.is_set():
+            time.sleep(self.TRAFFIC_CHECK_INTERVAL)
+            with self._traffic_lock:
+                # Clear the counters after each interval
+                self._mac_traffic_count.clear()
+            self.logger.log_message("[Bridge] ⏱️ Traffic counters have been reset.")
+
     def start(self):
-        """Starts the MAC table cleanup thread."""
+        """Starts the MAC table and traffic cleanup threads."""
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._cleanup_mac_table_loop, daemon=True,
                                                 name="BridgeMacCleanup")
         self._cleanup_thread.start()
-        self.logger.log_message("[Bridge] Cleanup thread started.")
+        self._traffic_cleanup_thread = threading.Thread(target=self._cleanup_traffic_loop, daemon=True,
+                                                        name="BridgeTrafficCleanup")
+        self._traffic_cleanup_thread.start()
+        self.logger.log_message("[Bridge] Cleanup threads started.")
 
     def stop(self):
-        """Stops the MAC table cleanup thread."""
+        """Stops the cleanup threads."""
         if self._cleanup_thread and self._cleanup_thread.is_alive():
-            self.logger.log_message("[Bridge] Stopping cleanup thread...")
+            self.logger.log_message("[Bridge] Stopping cleanup threads...")
             self._stop_event.set()
             self._cleanup_thread.join(timeout=2)
-            self.logger.log_message("[Bridge] Cleanup thread stopped.")
+            self._traffic_cleanup_thread.join(timeout=2)
+            self.logger.log_message("[Bridge] Cleanup threads stopped.")
 
 class EthernetL2Manager:
     """
@@ -1939,7 +2097,7 @@ class HandshakeManager:
                     self.logger.log_message(
                         f"[Handshake] 🔁 SYN retransmission from {original_src_ip}:{original_src_port} on {inbound_iface}"
                     )
-                return True
+                return False
 
             elif flags == 0x12: # SYN+ACK
                 if session_state == "SYN_SENT":
@@ -1954,11 +2112,11 @@ class HandshakeManager:
                         f"[Handshake] 🔁 SYN-ACK retransmission from {original_src_ip}:{original_src_port} on {inbound_iface}"
                     )
                 else:
+                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port,
+                                                     original_dst_ip, original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ⚠️ Unexpected SYN-ACK from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} "
-                        f"in state {session_state} on {inbound_iface}"
-                    )
-                return True
+                        f"[Handshake] ✅ Inferred ESTABLISHED session from ACK ACK: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                return False
 
             elif flags == 0x10: # ACK
                 if session_state == "SYN_ACK_RECEIVED":
@@ -2015,11 +2173,11 @@ class HandshakeManager:
                     )
                     del self._sessions[canonical_key]
                 else:
+                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port,
+                                                     original_dst_ip, original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ❓ ACK from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} "
-                        f"in unexpected state {session_state} on {inbound_iface}"
-                    )
-                return True
+                        f"[Handshake] ✅ Inferred ESTABLISHED session from ACK: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                return False
 
             elif flags & 0x01: # FIN
                 if session_state == "ESTABLISHED":
@@ -2038,7 +2196,7 @@ class HandshakeManager:
                         f"[Handshake] ⚠️ Unexpected FIN from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} "
                         f"in state {session_state} on {inbound_iface}"
                     )
-                return True
+                return False
 
             elif flags & 0x04: # RST
                 if current_session_data:
@@ -2046,11 +2204,11 @@ class HandshakeManager:
                         f"[Handshake] ❌ RST received on session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port}. Forcibly closing on {inbound_iface}."
                     )
                     del self._sessions[canonical_key]
-                return True
+                return False
 
             if current_session_data and session_state == "ESTABLISHED":
                 self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
-                return True
+                return False
 
         return False
 
@@ -2083,41 +2241,58 @@ class IGMPManager:
 
     def handle_packet(self, pkt: Packet, inbound_ifname: str):
         """
-        Processes an incoming IGMP packet.
+        Processes an incoming IGMP or MLD packet.
         Updates the multicast group membership table.
         """
-        if not pkt.haslayer(IGMP):
-            return
+        # Check for IGMP (IPv4)
+        if pkt.haslayer(IGMP):
+            igmp_layer = pkt[IGMP]
+            src_ip = pkt[IP].src
+            group_ip = str(igmp_layer.gaddr)
 
-        igmp_layer = pkt[IGMP]
-        src_ip = pkt[IP].src
-        group_ip = str(igmp_layer.gaddr)  # Group address associated with the message
+            self.router_logger.log_message(
+                f"[IGMP] Received IGMPv2 Type {igmp_layer.type} on {inbound_ifname.split('_')[-1]} from {src_ip} for group {group_ip}")
 
-        self.router_logger.log_message(
-            f"[IGMP] Received {igmp_layer.type} packet on {inbound_ifname.split('_')[-1]} from {src_ip} for group {group_ip}")
-
-        with self._group_lock:
-            if igmp_layer.type == 0x11:  # IGMP Membership Query
-                self.router_logger.log_message(
-                    f"[IGMP] Received Query (Type 0x11) for {group_ip} from {src_ip}. (No state change from query itself).")
-
-            elif igmp_layer.type == 0x16:  # IGMPv2 Membership Report
-                key = (group_ip, inbound_ifname)
-                self._multicast_groups[key] = time.time()
-                self.router_logger.log_message(
-                    f"[IGMP] ✅ Host {src_ip} reported membership in {group_ip} on {inbound_ifname.split('_')[-1]}. Table updated.")
-
-            elif igmp_layer.type == 0x17:  # IGMPv2 Leave Group
-                key = (group_ip, inbound_ifname)
-                if key in self._multicast_groups:
-                    del self._multicast_groups[key]
+            with self._group_lock:
+                if igmp_layer.type == 0x16:  # IGMPv2 Membership Report
+                    key = (group_ip, inbound_ifname)
+                    self._multicast_groups[key] = time.time()
                     self.router_logger.log_message(
-                        f"[IGMP] 🗑️ Host {src_ip} left group {group_ip} on {inbound_ifname.split('_')[-1]}. Table updated.")
-                else:
+                        f"[IGMP] ✅ Host {src_ip} joined {group_ip} on {inbound_ifname.split('_')[-1]}.")
+                elif igmp_layer.type == 0x17:  # IGMPv2 Leave Group
+                    key = (group_ip, inbound_ifname)
+                    if key in self._multicast_groups:
+                        del self._multicast_groups[key]
+                        self.router_logger.log_message(
+                            f"[IGMP] 🗑️ Host {src_ip} left {group_ip} on {inbound_ifname.split('_')[-1]}.")
+                    else:
+                        self.router_logger.log_message(
+                            f"[IGMP] Host {src_ip} sent Leave for {group_ip}, but not in table.")
+
+        # NEW: Check for MLD (IPv6)
+        elif pkt.haslayer(MLDReport) or pkt.haslayer(MLDDone):
+            src_ip = pkt[IPv6].src
+            mld_layer = pkt.getlayer(MLDReport) or pkt.getlayer(MLDDone)
+            group_ip = str(mld_layer.mcaddr)
+
+            self.router_logger.log_message(
+                f"[MLD] Received MLD packet on {inbound_ifname.split('_')[-1]} from {src_ip} for group {group_ip}")
+
+            with self._group_lock:
+                if pkt.haslayer(MLDReport):  # Equivalent to Join/Report
+                    key = (group_ip, inbound_ifname)
+                    self._multicast_groups[key] = time.time()
                     self.router_logger.log_message(
-                        f"[IGMP] Host {src_ip} sent Leave for {group_ip} on {inbound_ifname.split('_')[-1]}, but not in table.")
-            else:
-                self.router_logger.log_message(f"[IGMP] Ignored unsupported IGMP type: {igmp_layer.type}")
+                        f"[MLD] ✅ Host {src_ip} joined {group_ip} on {inbound_ifname.split('_')[-1]}.")
+                elif pkt.haslayer(MLDDone):  # Equivalent to Leave
+                    key = (group_ip, inbound_ifname)
+                    if key in self._multicast_groups:
+                        del self._multicast_groups[key]
+                        self.router_logger.log_message(
+                            f"[MLD] 🗑️ Host {src_ip} left {group_ip} on {inbound_ifname.split('_')[-1]}.")
+                    else:
+                        self.router_logger.log_message(
+                            f"[MLD] Host {src_ip} sent Done for {group_ip}, but not in table.")
 
     def should_forward_multicast(self, multicast_ip: str, outbound_ifname: str) -> bool:
         """
@@ -2199,105 +2374,6 @@ class IGMPManager:
         """Returns a copy of the current multicast group membership table for debugging."""
         with self._group_lock:
             return self._multicast_groups.copy()
-
-class TLSProxyManager:
-    """
-    Handles the application-layer TLS proxying of connections handed off by the router.
-    Accepts (client_socket, target_host, target_port) tuples from the router.
-    """
-
-    def __init__(self, router_logger):
-        self.router_logger = router_logger
-        self.connection_queue = queue.Queue()
-        self._stop_event = threading.Event()
-        self.worker_thread = None
-
-    def start(self):
-        """Starts the TLS proxy worker thread."""
-        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self.worker_thread.start()
-        self.router_logger.log_message("[TLSProxy] Worker thread started.")
-
-    def stop(self):
-        """Stops the TLS proxy worker thread."""
-        self._stop_event.set()
-        self.connection_queue.put(None)  # Unblock the queue if it's waiting
-        self.worker_thread.join(timeout=2)
-        self.router_logger.log_message("[TLSProxy] Worker thread stopped.")
-
-    def _worker_loop(self):
-        """Main loop for proxying queued connections."""
-        while not self._stop_event.is_set():
-            try:
-                conn_details = self.connection_queue.get(timeout=1)
-                if conn_details is None:
-                    continue
-                client_socket, target_host, target_port = conn_details
-                self.router_logger.log_message(
-                    f"[TLSProxy] Handling connection to {target_host}:{target_port}"
-                )
-                self._handle_tls_proxy(client_socket, target_host, target_port)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.router_logger.log_message(f"[TLSProxy] Unexpected error: {e}")
-
-    def _handle_tls_proxy(self, client_socket: socket.socket, target_host: str, target_port: int):
-        """Establishes TLS connection to target and relays data between sockets."""
-        server_socket = None
-        try:
-            # Set both sockets to non-blocking
-            client_socket.setblocking(False)
-
-            # Connect to the remote TLS server
-            context = ssl.create_default_context()
-            raw_server_socket = socket.create_connection((target_host, target_port), timeout=10)
-            server_socket = context.wrap_socket(raw_server_socket, server_hostname=target_host)
-            server_socket.setblocking(False)
-
-            self.router_logger.log_message(f"[TLSProxy] TLS handshake with {target_host} complete.")
-
-            # Main relay loop
-            sockets = [client_socket, server_socket]
-            while True:
-                readable, _, exceptional = select.select(sockets, [], sockets, 1)
-                if exceptional:
-                    break
-
-                for sock in readable:
-                    try:
-                        data = sock.recv(4096)
-                        if not data:
-                            raise ConnectionResetError("Connection closed")
-
-                        # Relay to the opposite socket
-                        if sock is client_socket:
-                            server_socket.sendall(data)
-                        else:
-                            client_socket.sendall(data)
-                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
-                        continue
-                    except Exception as e:
-                        self.router_logger.log_message(f"[TLSProxy] Socket relay error: {e}")
-                        return
-
-        except Exception as e:
-            self.router_logger.log_message(f"[TLSProxy] TLS proxy failed: {e}")
-        finally:
-            try:
-                client_socket.close()
-            except:
-                pass
-            try:
-                if server_socket:
-                    server_socket.close()
-            except:
-                pass
-            self.router_logger.log_message(f"[TLSProxy] Connection closed.")
-
-    def queue_connection(self, client_socket: socket.socket, target_host: str, target_port: int):
-        """Enqueue a new connection for TLS proxying."""
-        self.connection_queue.put((client_socket, target_host, target_port))
 
 class RIPManager:
     """
@@ -3087,6 +3163,7 @@ class NATManager:
         if not route_to_sender:
             self.router_logger.log_message(
                 f"[NAT] ⚠️ Could not find route to original sender {icmp_dst_ip} for ICMP response. Dropping ICMP.")
+            self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
             return
 
         outbound_iface_for_icmp = route_to_sender["interface"]
@@ -3680,26 +3757,37 @@ class DHCPServer:
     """
     Acts as a DHCP server for devices on the IN (LAN) interface.
     Assigns IP addresses from a defined pool to requesting clients.
-    Enhanced with lease persistence and DHCP relay agent capabilities.
+    Enhanced with lease persistence and DHCP relay agent capabilities for both IPv4 and IPv6.
     """
     def __init__(self, router_logger, packet_writer, router_in_interface_name: str, dhcp_pool_start: str,
-                 dhcp_pool_end: str, interfaces_config: dict, dhcp_relay_target_ip: str = None):
+                 dhcp_pool_end: str, interfaces_config: dict, dhcp_relay_target_ip: str = None,
+                 dhcp6_prefix: str = None, dhcp6_relay_target_ip: str = None):
         self.logger = router_logger
         self.packet_writer = packet_writer
         self.in_iface = router_in_interface_name
         self._interfaces_config = interfaces_config
 
+        # --- DHCPv4 Configuration ---
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
         self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}
         self._lease_lock = threading.Lock()
         self.LEASE_DURATION_SECONDS = 3600
+        self.dhcp_relay_target_ip = dhcp_relay_target_ip
+
+        # --- DHCPv6 Configuration ---
+        self.dhcp6_prefix = ipaddress.IPv6Network(dhcp6_prefix) if dhcp6_prefix else None
+        self.dhcp6_relay_target_ip = dhcp6_relay_target_ip
+        # Note: For simplicity, this implementation uses stateless DHCPv6.
+        # It does not maintain a lease table for IPv6 addresses.
+        # It only replies with configuration options.
+
         self._stop_event = threading.Event()
         self._cleanup_thread = None
 
-        self.dhcp_relay_target_ip = dhcp_relay_target_ip
         self.logger.log_message(
-            f"[DHCP] Server initialized. Relay target: {self.dhcp_relay_target_ip if self.dhcp_relay_target_ip else 'None'}")
+            f"[DHCP] Server initialized. DHCPv4 Relay target: {self.dhcp_relay_target_ip if self.dhcp_relay_target_ip else 'None'}. "
+            f"DHCPv6 Prefix: {self.dhcp6_prefix if self.dhcp6_prefix else 'None'}. DHCPv6 Relay target: {self.dhcp6_relay_target_ip if self.dhcp6_relay_target_ip else 'None'}")
 
 
     def get_ip_to_mac_bindings(self) -> Dict[str, str]:
@@ -3730,28 +3818,28 @@ class DHCPServer:
         self.logger.log_message("[DHCP] Server stopped.")
 
     def _cleanup_leases_loop(self):
-        """Periodically removes expired DHCP leases."""
+        """Periodically removes expired DHCP leases (IPv4 only)."""
         while not self._stop_event.is_set():
             now = time.time()
             with self._lease_lock:
                 expired_macs = [mac for mac, (ip, expiry) in self._leases.items() if expiry <= now]
                 for mac in expired_macs:
                     ip, _ = self._leases.pop(mac)
-                    self.logger.log_message(f"[DHCP] 🗑️ Lease for {ip} (MAC: {mac}) expired and removed.")
+                    self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired and removed.")
             self._stop_event.wait(60)
 
     def _assign_ip(self, client_mac: str) -> ipaddress.IPv4Address | None:
         """
-        Assigns an available IP address from the pool by checking the internal lease table.
+        Assigns an available IPv4 address from the pool by checking the internal lease table.
         """
-        self.logger.log_message(f"[DHCP] Assigning IP for {client_mac}")
+        self.logger.log_message(f"[DHCPv4] Assigning IP for {client_mac}")
         with self._lease_lock:
             # 1. Check if the client already has an active lease to renew.
             if client_mac in self._leases:
                 assigned_ip, expiry = self._leases[client_mac]
                 if time.time() < expiry:
                     self._leases[client_mac] = (assigned_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCP] 🏠 Renewed lease for {assigned_ip} to {client_mac}")
+                    self.logger.log_message(f"[DHCPv4] 🏠 Renewed lease for {assigned_ip} to {client_mac}")
                     return assigned_ip
 
             # 2. Find the next available IP address in the pool.
@@ -3761,16 +3849,16 @@ class DHCPServer:
                 if potential_ip not in leased_ips:
                     # IP is not in our lease table, so we can assign it.
                     self._leases[client_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCP] 💻 Assigned new IP {potential_ip} to {client_mac}.")
+                    self.logger.log_message(f"[DHCPv4] 💻 Assigned new IP {potential_ip} to {client_mac}.")
                     return potential_ip
 
         # 3. If no IP was found after checking the entire pool.
-        self.logger.log_message(f"[DHCP] ❌ No available IP addresses in pool for {client_mac}.")
+        self.logger.log_message(f"[DHCPv4] ❌ No available IP addresses in pool for {client_mac}.")
         return None
 
     def handle_packet(self, pkt: Packet, inbound_iface: str, find_route_function) -> bool:
         """
-        Handles incoming DHCP packets (DISCOVER, REQUEST).
+        Handles incoming DHCP packets (DISCOVER, REQUEST, SOLICIT, etc.).
         Returns True if the packet was a DHCP packet handled by the server.
         """
         in_iface_config = self._interfaces_config.get(self.in_iface)
@@ -3779,109 +3867,195 @@ class DHCPServer:
             return False
 
         router_in_ip = in_iface_config.get("ip_addr")
+        router_in_ipv6 = in_iface_config.get("ipv6_addr")
         router_in_mac = in_iface_config.get("mac")
         if not router_in_ip or not router_in_mac:
-            self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' missing IP or MAC in configuration.")
+            # IPv6 address is optional for DHCPv4 only environments
+            if pkt.haslayer(DHCP6) and not router_in_ipv6:
+                self.logger.log_message(f"[DHCPv6] Error: IN interface '{self.in_iface}' missing IPv6 address.")
+                return False
+            if pkt.haslayer(DHCP) and (not router_in_ip or not router_in_mac):
+                self.logger.log_message(f"[DHCPv4] Error: IN interface '{self.in_iface}' missing IP or MAC in configuration.")
+                return False
+
+        # --- Check for DHCPv4 or DHCPv6 packets ---
+        is_dhcpv4 = pkt.haslayer(DHCP) and pkt.haslayer(UDP) and pkt[UDP].dport == 67
+        is_dhcpv6 = pkt.haslayer(DHCP6) and pkt.haslayer(UDP) and pkt[UDP].dport == 547
+
+        if not is_dhcpv4 and not is_dhcpv6:
             return False
 
-        if not pkt.haslayer(DHCP) or not pkt.haslayer(UDP) or pkt[UDP].dport != 67:
-            return False
-
-        # --- FIX: Determine if the request is from loopback by checking for an Ethernet layer ---
+        # Determine if the request is from loopback by checking for an Ethernet layer
         is_loopback_request = not pkt.haslayer(Ether)
 
-        bootp_layer = pkt[BOOTP]
-        dhcp_layer = pkt[DHCP]
-        try:
-            raw_mac = bootp_layer.chaddr[:6]
-            client_mac = ":".join(f"{b:02x}" for b in raw_mac)
-        except (TypeError, IndexError):
-            self.logger.log_message("[DHCP] Received malformed DHCP packet with invalid chaddr. Ignoring.")
-            return True
+        # --- DHCPv4 Handling ---
+        if is_dhcpv4:
+            bootp_layer = pkt[BOOTP]
+            dhcp_layer = pkt[DHCP]
+            try:
+                raw_mac = bootp_layer.chaddr[:6]
+                client_mac = ":".join(f"{b:02x}" for b in raw_mac)
+            except (TypeError, IndexError):
+                self.logger.log_message("[DHCPv4] Received malformed DHCP packet with invalid chaddr. Ignoring.")
+                return True
 
-        dhcp_message_type = next(
-            (opt[1] for opt in dhcp_layer.options if isinstance(opt, tuple) and opt[0] == 'message-type'), None)
-        if not dhcp_message_type:
+            dhcp_message_type = next(
+                (opt[1] for opt in dhcp_layer.options if isinstance(opt, tuple) and opt[0] == 'message-type'), None)
+            if not dhcp_message_type:
+                self.logger.log_message(
+                    f"[DHCPv4] Received DHCP packet from {client_mac} but no message-type option. Ignoring.")
+                return True
+
             self.logger.log_message(
-                f"[DHCP] Received DHCP packet from {client_mac} but no message-type option. Ignoring.")
-            return True
+                f"[DHCPv4] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
 
-        self.logger.log_message(
-            f"[DHCP] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
+            # DHCPv4 Relay Agent logic
+            if self.dhcp_relay_target_ip:
+                self.logger.log_message(f"[DHCPv4] Relaying packet from {client_mac} to {self.dhcp_relay_target_ip}.")
+                # Forward the packet to the relay target
+                relay_packet = IP(src=router_in_ip, dst=self.dhcp_relay_target_ip) / \
+                               UDP(sport=67, dport=67) / pkt[BOOTP] / pkt[DHCP]
+                # The DHCP relay packet has a 'giaddr' field to indicate the gateway's IP
+                relay_packet[BOOTP].giaddr = router_in_ip
+                self.packet_writer.queue_packet(relay_packet, self.in_iface)
+                return True
 
-        if self.dhcp_relay_target_ip:
-            return True
+            # DHCPv4 Server Logic
+            if dhcp_message_type == 1:  # DHCP Discover
+                assigned_ip = self._assign_ip(client_mac)
+                if assigned_ip:
+                    dhcp_options = [
+                        ("message-type", "offer"),
+                        ("subnet_mask", str(in_iface_config['network'].netmask)),
+                        ("router", router_in_ip),
+                        ("name_server", router_in_ip),
+                        ("lease_time", self.LEASE_DURATION_SECONDS),
+                        ("server_id", router_in_ip),
+                        "end"
+                    ]
+                    offer_l3 = IP(src=router_in_ip, dst='255.255.255.255') / \
+                               UDP(sport=67, dport=68) / \
+                               BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
+                                     siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
+                               DHCP(options=dhcp_options)
+                    reply_packet = Ether(src=router_in_mac,
+                                         dst="ff:ff:ff:ff:ff:ff") / offer_l3 if not is_loopback_request else offer_l3
+                    self.packet_writer.queue_packet(reply_packet, self.in_iface)
+                    self.logger.log_message(f"[DHCPv4] 📝 Sent DHCP Offer for {assigned_ip} to {client_mac}")
+                else:
+                    self.logger.log_message(f"[DHCPv4] 🚫 No IP available for {client_mac}, dropping Discover.")
+                return True
+            elif dhcp_message_type == 3:  # DHCP Request
+                assigned_ip = self._assign_ip(client_mac)
+                if assigned_ip:
+                    dhcp_options = [
+                        ("message-type", "ack"),
+                        ("subnet_mask", str(in_iface_config['network'].netmask)),
+                        ("router", router_in_ip),
+                        ("name_server", router_in_ip),
+                        ("lease_time", self.LEASE_DURATION_SECONDS),
+                        ("server_id", router_in_ip),
+                        "end"
+                    ]
+                    ack_l3 = IP(src=router_in_ip, dst=str(assigned_ip)) / \
+                             UDP(sport=67, dport=68) / \
+                             BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
+                                   siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
+                             DHCP(options=dhcp_options)
+                    reply_packet = Ether(src=router_in_mac,
+                                         dst=pkt[Ether].src) / ack_l3 if not is_loopback_request else ack_l3
+                    self.packet_writer.queue_packet(reply_packet, self.in_iface)
+                    self.logger.log_message(f"[DHCPv4] 🛰️ Sent DHCP ACK for {assigned_ip} to {client_mac}")
+                else:
+                    nak_l3 = IP(src=router_in_ip, dst='255.255.255.255') / \
+                             UDP(sport=67, dport=68) / \
+                             BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr) / \
+                             DHCP(options=[("message-type", "nak"), "end"])
+                    reply_packet = Ether(src=router_in_mac,
+                                         dst="ff:ff:ff:ff:ff:ff") / nak_l3 if not is_loopback_request else nak_l3
+                    self.packet_writer.queue_packet(reply_packet, self.in_iface)
+                    self.logger.log_message(f"[DHCPv4] 🚫 Sent DHCP NAK to {client_mac} (no IP available or valid).")
+                return True
 
-        # --- DHCP Server Logic ---
-        if dhcp_message_type == 1:  # DHCP Discover
-            assigned_ip = self._assign_ip(client_mac)
-            if assigned_ip:
-                dhcp_options = [
-                    ("message-type", "offer"),
-                    ("subnet_mask", str(in_iface_config['network'].netmask)),
-                    ("router", router_in_ip),
-                    ("name_server", router_in_ip),
-                    ("lease_time", self.LEASE_DURATION_SECONDS),
-                    ("server_id", router_in_ip),
+        # --- DHCPv6 Handling ---
+        elif is_dhcpv6:
+            if not self.dhcp6_prefix:
+                self.logger.log_message("[DHCPv6] DHCPv6 is disabled. Ignoring packet.")
+                return False
+
+            dhcp6_layer = pkt[DHCP6]
+            dhcp6_msg_type = dhcp6_layer.msgtype
+            client_duid = None
+
+            # Look for the client DUID in the options
+            for opt in dhcp6_layer.options:
+                if isinstance(opt, tuple) and opt[0] == 1:  # Assuming Scapy format (type, value)
+                    client_duid = opt[1]
+                    break
+                elif hasattr(opt, 'otype') and opt.otype == 1:
+                    client_duid = opt.duid
+                    break
+
+            if not client_duid:
+                self.logger.log_message("[DHCPv6] Received DHCPv6 packet without a client DUID. Ignoring.")
+                return True
+
+            self.logger.log_message(f"[DHCPv6] 📨 Received DHCPv6 type {dhcp6_msg_type} from DUID: {client_duid.hex()}")
+
+            # DHCPv6 Relay Agent logic
+            if self.dhcp6_relay_target_ip:
+                self.logger.log_message(f"[DHCPv6] Relaying packet from DUID {client_duid.hex()} to {self.dhcp6_relay_target_ip}.")
+                # Construct and forward a DHCP6_RelayForward packet.
+                # This requires more complex parsing of the original packet.
+                relay_forward_packet = DHCP6_RelayForward(
+                    linkaddr=router_in_ipv6,
+                    peeraddr=pkt[IPv6].src,
+                    msg=pkt[DHCP6],
+                )
+                self.packet_writer.queue_packet(relay_forward_packet, self.in_iface)
+                return True
+
+            # DHCPv6 Server Logic (Stateless)
+            if dhcp6_msg_type == 1: # SOLICIT
+                # Respond with a DHCP6 ADVERTISE message
+                # A stateless server provides configuration but does not assign addresses.
+                dhcp6_options = [
+                    # Include the prefix for the client to use for SLAAC
+                    DHCP6OptIAPrefix(prefix=str(self.dhcp6_prefix), plen=self.dhcp6_prefix.prefixlen, preferred_lifetime=3600),
+                    # Provide DNS server information
+                    DHCP6OptDNSServers(dnsservers=[str(router_in_ipv6)]),
+                    # End of options
                     "end"
                 ]
 
-                # --- FIX: Construct L3 packet first, then conditionally add L2 header ---
-                offer_l3 = IP(src=router_in_ip, dst='255.255.255.255') / \
-                           UDP(sport=67, dport=68) / \
-                           BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
-                                 siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
-                           DHCP(options=dhcp_options)
+                advertise_packet = IPv6(src=router_in_ipv6, dst="ff02::1:2") / \
+                                   UDP(sport=547, dport=546) / \
+                                   DHCP6_Advertise(trid=dhcp6_layer.trid, options=dhcp6_options)
 
-                reply_packet = Ether(src=router_in_mac,
-                                     dst="ff:ff:ff:ff:ff:ff") / offer_l3 if not is_loopback_request else offer_l3
+                self.packet_writer.queue_packet(advertise_packet, self.in_iface)
+                self.logger.log_message(f"[DHCPv6] 📝 Sent DHCPv6 Advertise with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
+                return True
 
-                self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                self.logger.log_message(f"[DHCP] 📝 Sent DHCP Offer for {assigned_ip} to {client_mac}")
-            else:
-                self.logger.log_message(f"[DHCP] 🚫 No IP available for {client_mac}, dropping Discover.")
-            return True
-
-        elif dhcp_message_type == 3:  # DHCP Request
-            assigned_ip = self._assign_ip(client_mac)
-            if assigned_ip:
-                dhcp_options = [
-                    ("message-type", "ack"),
-                    ("subnet_mask", str(in_iface_config['network'].netmask)),
-                    ("router", router_in_ip),
-                    ("name_server", router_in_ip),
-                    ("lease_time", self.LEASE_DURATION_SECONDS),
-                    ("server_id", router_in_ip),
+            elif dhcp6_msg_type == 3: # REQUEST
+                # Respond with a DHCP6 REPLY message, confirming the configuration
+                dhcp6_options = [
+                    DHCP6OptIAPrefix(prefix=str(self.dhcp6_prefix), plen=self.dhcp6_prefix.prefixlen, preferred_lifetime=3600),
+                    DHCP6OptDNSServers(dnsservers=[str(router_in_ipv6)]),
                     "end"
                 ]
 
-                # --- FIX: Construct L3 packet first, then conditionally add L2 header ---
-                ack_l3 = IP(src=router_in_ip, dst=str(assigned_ip)) / \
-                         UDP(sport=67, dport=68) / \
-                         BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
-                               siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
-                         DHCP(options=dhcp_options)
-
-                reply_packet = Ether(src=router_in_mac,
-                                     dst=pkt[Ether].src) / ack_l3 if not is_loopback_request else ack_l3
+                reply_packet = IPv6(src=router_in_ipv6, dst="ff02::1:2") / \
+                               UDP(sport=547, dport=546) / \
+                               DHCP6_Reply(trid=dhcp6_layer.trid, options=dhcp6_options)
 
                 self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                self.logger.log_message(f"[DHCP] 🛰️ Sent DHCP ACK for {assigned_ip} to {client_mac}")
-            else:
-                nak_l3 = IP(src=router_in_ip, dst='255.255.255.255') / \
-                         UDP(sport=67, dport=68) / \
-                         BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr) / \
-                         DHCP(options=[("message-type", "nak"), "end"])
-
-                reply_packet = Ether(src=router_in_mac,
-                                     dst="ff:ff:ff:ff:ff:ff") / nak_l3 if not is_loopback_request else nak_l3
-                self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                self.logger.log_message(f"[DHCP] 🚫 Sent DHCP NAK to {client_mac} (no IP available or valid).")
-            return True
+                self.logger.log_message(f"[DHCPv6] 🛰️ Sent DHCPv6 Reply with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
+                return True
 
         return True
 
-class  OutboundLoadBalancer:
+
+class OutboundLoadBalancer:
     """
     Distributes outbound traffic across multiple configured WAN interfaces using a hash-based method.
     Ensures flow consistency (packets from the same source to same destination go via the same interface).
@@ -4243,7 +4417,6 @@ class PythonRouterManager:
     # --- Configuration Defaults (used if dynamic assignment fails or as starting points) ---
     DEFAULT_IN_IFACE_FRIENDLY_NAME = "Ethernet"
     DEFAULT_OUT_IFACE_FRIENDLY_NAME = "Wi-Fi"
-    # Friendly name pattern for loopback, can be 'Loopback' or empty depending on OS/driver
     DEFAULT_LOOPBACK_IFACE_FRIENDLY_NAME = "Loopback"
     NOTIFICATION_TARGET_IP = "127.0.0.1"  # IP of the machine to receive alerts
     NOTIFICATION_TARGET_PORT = 12345  # UDP Port to listen on
@@ -4256,10 +4429,10 @@ class PythonRouterManager:
     ]
 
     BPF_FILTER_BASE_DEFINITIONS = {
-        "Ethernet": ["(arp or ip or (udp port 67 or udp port 68) or udp port 520 or ip multicast) and ether[12:2] >= 0x0600"],
-        "Wi-Fi": ["(arp or ip or ip6)"],
-        "Loopback": ["host 127.0.0.1","host ::1"],
-        "Ethernet 2": ["(arp or ip or (udp port 67 or udp port 68) or udp port 520 or ip multicast) and ether[12:2] >= 0x0600"],
+        "Ethernet": [],
+        "Wi-Fi": [],
+        "Loopback": [],
+        "Ethernet 2": [],
     }
     def __init__(self, router_logger):
 
@@ -4272,6 +4445,10 @@ class PythonRouterManager:
         self.interface_loopback_full_name = None
         self.interface_ethernet_2_full_name = None
         self.interface_ethernet_2_friendly_name = None
+        self.interface_lac_full_name = None
+        self.interface_lac_friendly_name = None
+        self.interface_lac_2_full_name = None
+        self.interface_lac_2_friendly_name = None
         self.router_ip_in = None
         self.router_ip_out = None
         self.router_gateway_out_ip = None
@@ -4289,13 +4466,11 @@ class PythonRouterManager:
         self.packet_signer = PacketSigningManager(router_logger)
         self.packet_writer = PacketWriter(router_logger, self.packet_signer, self.outbound_load_balancer)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
-        self.fishing_manager = FishingManager(router_logger)
         self.dns_manager = DNSManager(router_logger, self.packet_writer)
         self.rip_manager = RIPManager(router_logger)
         self.nat_manager = None  # Initialized after public IP is known
-        self.tls_proxy_manager = TLSProxyManager(router_logger)
         self.notification_manager = None
-
+        self.packet_catcher = PacketCatcherManager(router_logger)
         self.handshake_manager = None
         self.igmp_manager = IGMPManager(router_logger, self.packet_writer)
         self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self.sendback_manager, self._interfaces_config)
@@ -4530,10 +4705,6 @@ class PythonRouterManager:
                     self.router_logger.log_message(f"[Netsh] STDOUT: {stdout}")
                 return True
 
-            # Handle benign error: DHCP already enabled
-            if "DHCP is already enabled" in stdout:
-                self.router_logger.log_message(f"[Netsh] ⚠️ DHCP already enabled — continuing.")
-                return True
 
             # Otherwise treat as real error
             self.router_logger.log_message(f"[Netsh] ERROR executing netsh (Return Code: {result.returncode}):")
@@ -4671,9 +4842,32 @@ class PythonRouterManager:
         out_iface_info = None
         loopback_iface_info = None  # NEW: For loopback interface
         ethernet_2_info = None
+        lac_2_info = None
+        lac_2_info_2 = None
         self.router_logger.log_message(
             "[RouterManager] Attempting to auto-configure IN, OUT, and Loopback interfaces...")
+        lac_candidates = []
+        for iface in self._discovered_tshark_interfaces:
+            if "local area connection" in iface['friendly_name'].lower():
+                # Use regex to find the number at the end of the string
+                match = re.search(r'\d+$', iface['friendly_name'])
+                if match:
+                    num = int(match.group(0))
+                    lac_candidates.append({"number": num, "info": iface})
 
+        # Sort the found interfaces by their number
+        lac_candidates.sort(key=lambda x: x['number'])
+
+        # Assign the lowest and second-lowest numbered interfaces
+        lac_2_info = lac_candidates[0]['info'] if len(lac_candidates) > 0 else None
+        lac_2_info_2 = lac_candidates[1]['info'] if len(lac_candidates) > 1 else None
+
+        if lac_2_info:
+            self.router_logger.log_message(
+                f"[RouterManager] Found lowest-numbered LAC: {lac_2_info['friendly_name']}")
+        if lac_2_info_2:
+            self.router_logger.log_message(
+                f"[RouterManager] Found second-lowest-numbered LAC: {lac_2_info_2['friendly_name']}")
         for iface_info in self._discovered_tshark_interfaces:
             # Check for IN interface
             if self.DEFAULT_IN_IFACE_FRIENDLY_NAME.lower() == iface_info[
@@ -4701,11 +4895,10 @@ class PythonRouterManager:
                 ethernet_2_info = iface_info
                 self.router_logger.log_message(
                     f"[RouterManager] Found Ethernet 2 interface")
-
-            if in_iface_info is not None and out_iface_info is not None and loopback_iface_info is not None:
+            if in_iface_info is not None and out_iface_info is not None and loopback_iface_info is not None and ethernet_2_info is not None:
                 break  # All found, exit loop
-
         # Handle cases where IN or OUT are not found
+
         if in_iface_info is None or out_iface_info is None:
             self.router_logger.log_message(
                 f"[RouterManager] ERROR: Could not auto-configure required interfaces ('{self.DEFAULT_IN_IFACE_FRIENDLY_NAME}' and '{self.DEFAULT_OUT_IFACE_FRIENDLY_NAME}').")
@@ -4722,8 +4915,15 @@ class PythonRouterManager:
             return False
 
         # Assign full and friendly names to instance attributes
-        self.interface_ethernet_2_full_name =  ethernet_2_info['full_name']
-        self.interface_ethernet_2_friendly_name =  ethernet_2_info['friendly_name']
+        if(lac_2_info_2):
+            self.interface_lac_2_full_name = lac_2_info_2["full_name"]
+            self.interface_lac_2_friendly_name = lac_2_info_2["friendly_name"]
+        if(lac_2_info):
+            self.interface_lac_full_name = lac_2_info['full_name']
+            self.interface_lac_friendly_name = lac_2_info['friendly_name']
+        if(ethernet_2_info):
+            self.interface_ethernet_2_full_name =  ethernet_2_info['full_name']
+            self.interface_ethernet_2_friendly_name =  ethernet_2_info['friendly_name']
         self.interface_in_full_name = in_iface_info['full_name']
         self.interface_in_friendly_name = in_iface_info['friendly_name']
         self.interface_out_full_name = out_iface_info['full_name']
@@ -4825,6 +5025,8 @@ class PythonRouterManager:
             'is_default_gateway_iface': True,
         }
         self.default_gateway_ip = self.router_gateway_out_ip
+
+
         bridge_members = [self.interface_in_full_name]
 
 
@@ -4859,16 +5061,90 @@ class PythonRouterManager:
                 bridge_members.append(ethernet_2_info["full_name"])
             except Exception as e:
                 self.router_logger.log_message(f"[RouterManager] ⚠️ Failed to add Ethernet 2 to bridge: {e}")
+        if lac_2_info:
+            try:
+                lac_mac = get_if_hwaddr(self.interface_lac_full_name)
+                lac_ip = None
+                lac_netmask = None
+                # Find the IP configuration for the LAC interface
+                for addr in psutil.net_if_addrs().get(self.interface_lac_friendly_name, []):
+                    if addr.family == socket.AF_INET:
+                        lac_ip = addr.address
+                        lac_netmask = addr.netmask
+                        break
 
+                if lac_ip and lac_netmask:
+                    lac_network = ipaddress.ip_network(f"{lac_ip}/{lac_netmask}", strict=False)
+                    self._interfaces_config[self.interface_lac_full_name] = {
+                        "ip_addr": lac_ip,
+                        "network": lac_network,
+                        "mac": lac_mac,
+                        "broadcast": str(lac_network.broadcast_address)
+                    }
+                    self.router_logger.log_message(
+                        f"[RouterManager] Added LAC interface to config: {self.interface_lac_full_name}, IP: {lac_ip}, MAC: {lac_mac}")
+                else:
+                    # If no IP is found, add it with a placeholder IP
+                    self._interfaces_config[self.interface_lac_full_name] = {
+                        "ip_addr": "0.0.0.0",
+                        "network": None,
+                        "mac": lac_mac,
+                        "broadcast": "255.255.255.255"
+                    }
+                    self.router_logger.log_message(
+                        f"[RouterManager] Added LAC interface to config: {self.interface_lac_full_name} (No IP found), MAC: {lac_mac}")
+
+            except Exception as e:
+                self.router_logger.log_message(
+                    f"[RouterManager] ⚠️ Failed to configure LAC interface {self.interface_lac_full_name}: {e}")
+        if lac_2_info_2:
+            try:
+                # Use the full name for getting hardware address
+                lac_2_mac = get_if_hwaddr(self.interface_lac_2_full_name)
+                lac_2_ip = None
+                lac_2_netmask = None
+
+                # Find the IP configuration for the second LAC interface using its friendly name
+                for addr in psutil.net_if_addrs().get(self.interface_lac_2_friendly_name, []):
+                    if addr.family == socket.AF_INET:
+                        lac_2_ip = addr.address
+                        lac_2_netmask = addr.netmask
+                        break  # Stop after finding the first IPv4 address
+
+                # If an IP and netmask were successfully found, calculate network info
+                if lac_2_ip and lac_2_netmask:
+                    lac_2_network = ipaddress.ip_network(f"{lac_2_ip}/{lac_2_netmask}", strict=False)
+
+                    # Add the interface configuration to your main dictionary
+                    self._interfaces_config[self.interface_lac_2_full_name] = {
+                        "ip_addr": lac_2_ip,
+                        "network": lac_2_network,
+                        "mac": lac_2_mac,
+                        "broadcast": str(lac_2_network.broadcast_address)
+                    }
+                    self.router_logger.log_message(
+                        f"[RouterManager] Added LAC 2 interface to config: {self.interface_lac_2_full_name}, IP: {lac_2_ip}, MAC: {lac_2_mac}")
+                else:
+                    # If no IP is found, add it with a placeholder IP
+                    self._interfaces_config[self.interface_lac_2_full_name] = {
+                        "ip_addr": "0.0.0.0",
+                        "network": None,
+                        "mac": lac_2_mac,
+                        "broadcast": "255.255.255.255"
+                    }
+                    self.router_logger.log_message(
+                        f"[RouterManager] Added LAC 2 interface to config: {self.interface_lac_2_full_name} (No IP found), MAC: {lac_2_mac}")
+
+            except Exception as e:
+                self.router_logger.log_message(
+                    f"[RouterManager] ⚠️ Failed to configure LAC 2 interface {self.interface_lac_2_full_name}: {e}")
         # ✅ Create LAN bridge with discovered members
-        self.create_l2_bridge("MyLANBridge", bridge_members)
-        self.create_link_aggregation_group("MyLANAggregation",bridge_members)
-        self.add_outbound_load_balancing_interface(self.interface_out_full_name)
         self.router_logger.log_message(
             "[RouterManager][ARP] 🔒 Configuring trusted ARP interfaces and static entries...")
 
         # Trust the IN interface
         self.add_trusted_arp_port(self.interface_in_full_name)
+
 
         # Optionally trust Ethernet 2 (if used in bridging)
         if ethernet_2_info:
@@ -4910,18 +5186,28 @@ class PythonRouterManager:
             self.router_logger.log_message(
                 f"  Loopback Interface: '{self.interface_loopback_full_name}' (IP: {loopback_ip}/{loopback_netmask}, MAC: {loopback_mac})")
 
+        self.create_l2_bridge("MyLANBridge", bridge_members)
+        self.create_link_aggregation_group("MyLANAggregation",bridge_members)
+        self.add_outbound_load_balancing_interface(self.interface_out_full_name)
+        if self.interface_lac_full_name:
+            self.add_outbound_load_balancing_interface(self.interface_lac_full_name)
+        if self.interface_lac_2_full_name:
+            self.add_outbound_load_balancing_interface(self.interface_lac_2_full_name)
         # Get our own MAC addresses (re-get after IP assignment for certainty)
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
 
+        conf.route.add(net=str(self.router_network_in), gw=self.router_gateway_out_ip,
+                       dev=self.interface_out_friendly_name)
         conf.route.add(
             host="192.168.0.10",
             gw="192.168.0.1",
-            dev="Ethernet"
+            dev=self.interface_out_friendly_name  # <-- Use the dynamically found name
         )
+        # Do the same for IPv6 if needed
         conf.route6.add(
             dst="2001:db8:cafe:f000::/64",
-            dev="Ethernet"
+            dev=self.interface_out_friendly_name  # <-- Use the dynamically found name
         )
 
         self.router_logger.log_message(f"\n--- Python Router Configuration Summary (Dynamically Assigned) ---")
@@ -4997,6 +5283,8 @@ class PythonRouterManager:
         except Exception as e:
             self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
 
+
+
     def set_default_gateway(self, gateway_ip: str, outbound_iface_name: str) -> bool:
         """
         Sets the default gateway IP and the interface through which to reach it.
@@ -5016,7 +5304,7 @@ class PythonRouterManager:
     def _start_single_sniffer(self, iface_name: str):
         global packet_queue
         """Starts a sniffer thread + processing worker pool for a given interface."""
-        RATE_LIMIT_PACKETS_PER = 20  # Can be any float value
+        RATE_LIMIT_PACKETS_PER = 1  # Can be any float value
         TOKEN_BUCKET = {"tokens": RATE_LIMIT_PACKETS_PER, "last_refill": time.time()}
         TOKEN_BUCKET_LOCK = threading.Lock()
 
@@ -5157,23 +5445,11 @@ class PythonRouterManager:
         """Main packet processing pipeline with verbose logging."""
         try:
             iface_short = inbound_iface.split('_')[-1]
-            ip_layer = packet.haslayer(IP) or packet.haslayer(IPv6)
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
                 return
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
-            # 1. Duplicate Flow Check
-            if packet.haslayer(IP):
-                ip_layer = packet[IP]
-                proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
-                sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(UDP) else 0
-                dport = packet[TCP].dport if packet.haslayer(TCP) else packet[UDP].dport if packet.haslayer(UDP) else 0
-
-                if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
-
-                    return
-
-
             self.transport_manager.handle_packet(packet, inbound_iface)
                 # 4. DNS Handling
             if packet.haslayer(DNS):
@@ -5203,7 +5479,7 @@ class PythonRouterManager:
                     return
 
             # 2. DHCP Early Handling
-            if packet.haslayer(DHCP):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short}")
                 handled = False
                 if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,self.rip_manager.find_route):
@@ -5218,19 +5494,19 @@ class PythonRouterManager:
                     return
             # 3. ARP Inspection
 
-            self.arp_manager._perform_arp_inspection(packet, inbound_iface)
 
 
-            result = self.packet_signer.process_packet(packet)
-
-            if isinstance(result, Packet):
-                pass
-            elif result is False:
-                selected_iface = self.outbound_load_balancer.get_next_interface(packet)
-                self.router_logger.log_message("[Router] 🔏 Packet failed signature verification")
-                self.fishing_manager.process_packet(packet)
+            dst_ip = ip_layer.dst
+            router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
+            is_for_router = dst_ip in router_ips
+            if packet.haslayer(RIP):
+                self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
+                self.rip_manager.handle_packet(packet, inbound_iface)
                 return
-
+            if self.nat_manager.translate_inbound(packet):
+                self.router_logger.log_message(f"[NAT] 🔄 NAT translated inbound packet on {iface_short}")
+                self._forward_general_ip_packet(packet, inbound_iface)
+                return
 
             # 5. Firewall Check
 
@@ -5247,43 +5523,55 @@ class PythonRouterManager:
 
 
             # 7. IGMP Handling
-            if packet.haslayer(IGMP):
-                dst_ip = packet[IP].dst
+            if packet.haslayer(IGMP) or packet.haslayer(MLDReport) or packet.haslayer(MLDDone):
+                dst_ip =packet[IP].dst if packet.haslayer(IP) else packet[IPv6].dst
                 inbound_if_ip = self._interfaces_config.get(inbound_iface, {}).get("ip_addr")
-                if (dst_ip == inbound_if_ip) or (ipaddress.ip_address(dst_ip).is_multicast):
-                    self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short}")
+                # Check if multicast or addressed to the router's interface IP
+                if (inbound_if_ip and dst_ip == inbound_if_ip) or ipaddress.ip_address(dst_ip).is_multicast:
+                    self.router_logger.log_message(f"[IGMP/MLD] 📶 Processing multicast membership on {iface_short}")
                     self.igmp_manager.handle_packet(packet, inbound_iface)
                     return
 
-            # 8. NAT or RIP (if addressed to router)
 
-            dst_ip = ip_layer.dst
-            router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
-            is_for_router = dst_ip in router_ips
-            if packet.haslayer(RIP):
-                self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
-                self.rip_manager.handle_packet(packet, inbound_iface)
-                return
-            if self.nat_manager.translate_inbound(packet):
-                self.router_logger.log_message(f"[NAT] 🔄 NAT translated inbound packet on {iface_short}")
-                self._forward_general_ip_packet(packet, inbound_iface)
-                return
 
             # 9. Handshake
             if packet.haslayer(TCP):
                 self.handshake_manager.handle_packet(packet, inbound_iface)
-                return
 
+            result = self.packet_signer.process_packet(packet)
+
+            if isinstance(result, Packet):
+                pass
+            elif result is False:
+                self.router_logger.log_message("[Router] 🔏 Packet failed signature verification")
+                return
             # 10. Ethernet L2 Bridging
             if self.ethernet_manager.is_bridge_member(inbound_iface):
                 if packet.haslayer(Ether):
                     self.router_logger.log_message(f"[Bridge] 🔗 Processing Layer 2 frame on {iface_short}")
                     self.ethernet_manager.handle_frame(packet, inbound_iface)
+                    self.packet_catcher.process_packet(packet)
                     return
                 else:
                     self.router_logger.log_message(
                         f"[Bridge] ⚠️ Non-Ethernet frame dropped on bridge port {iface_short}")
                     return
+
+            if not hasattr(packet[Ether], "dst") or not packet[Ether].dst or packet[
+                Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+                self.router_logger.log_message(
+                    f"[Router] 💧 Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {packet.summary()}")
+                return
+            self.arp_manager._perform_arp_inspection(packet, inbound_iface)
+
+            # 1. Duplicate Flow Check
+            if packet.haslayer(IP):
+                proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
+                sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(UDP) else 0
+                dport = packet[TCP].dport if packet.haslayer(TCP) else packet[UDP].dport if packet.haslayer(UDP) else 0
+                if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
+                    return
+
             # 11. General Forwarding (Transit)
             self.router_logger.log_message(
                 RouterRandomMessages(
@@ -5314,7 +5602,11 @@ class PythonRouterManager:
         if not ip_layer:
             self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
             return
-
+        if isinstance(ip_layer, IPv6) and ipaddress.ip_address(dst_ip).is_multicast:
+            self.router_logger.log_message(f"[Router] 🚧 Flooding IPv6 multicast packet for {dst_ip} via bridge.")
+            # Use the EthernetBridgeManager to handle L2 flooding
+            self.ethernet_manager.handle_frame(packet, inbound_iface)
+            return # IMPORTANT: Stop further processing to prevent routing attempt
 
         src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
@@ -5498,6 +5790,7 @@ class PythonRouterManager:
             f"[Router] 📤 Packet queued to {actual_outbound_iface.split('_')[-1]}"
         )
 
+
     def start_routing(self, use_dhcp_out, use_dhcp_in):
         """Configures interfaces and starts all manager threads."""
         try:
@@ -5517,8 +5810,7 @@ class PythonRouterManager:
             self.NOTIFICATION_TARGET_PORT,
             self.interface_in_full_name
         )
-        self.fishing_manager.notification_manager = self.notification_manager
-        self.fishing_manager.arp_manager = self.arp_manager
+        self.packet_catcher.notification_manager = self.notification_manager
         self.arp_manager.notification_manager = self.notification_manager
         self.packet_signer.notification_manager = self.notification_manager
 
@@ -5555,7 +5847,6 @@ class PythonRouterManager:
                                                   self.rip_manager)
 
         self.rip_manager.start()
-        self.tls_proxy_manager.start()
         self.packet_writer.start()
         self.handshake_manager.start()
         self.igmp_manager.set_interfaces_config(self._interfaces_config)
@@ -5592,7 +5883,6 @@ class PythonRouterManager:
             self.dhcp_server_out.stop()
         self.rip_manager.stop()
         self.ethernet_manager.stop()
-        self.tls_proxy_manager.stop()
         self.packet_writer.stop()
         self._disable_nat_forwarding()
         if self.nat_manager:
@@ -5786,7 +6076,6 @@ class PythonRouterManager:
     def get_firewall_rules(self) -> List[Dict[str, Any]]:
         """Returns the current list of firewall rules."""
         return self.firewall_manager.get_rules()
-
 
 class PacketManager:
     """
