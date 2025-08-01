@@ -277,9 +277,6 @@ def sniff(iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, 
                         "emojis": ["🚨", "📦", "💥"]
                     }
                     notification_manager.send_notification(event_data)
-
-                sys.stderr.write(
-                    f"[-] Packet parsing error (struct.error): {e}. Dropping malformed packet. Length: {packet_len}.\n")
                 continue
             except Exception as e:
                 sys.stderr.write(f"[-] Packet parsing error: {e}\n")

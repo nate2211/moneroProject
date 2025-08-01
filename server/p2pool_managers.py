@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ctypes
 import datetime
 import hashlib
@@ -11,6 +12,7 @@ import socket
 import ssl
 import string
 import struct
+import tempfile
 import traceback
 import uuid
 from collections import defaultdict, deque
@@ -19,7 +21,6 @@ from ctypes import wintypes
 from pathlib import Path
 from socket import AF_INET
 from typing import Optional, List, Tuple, Any
-
 import geoip2.database
 import geoip2.errors
 import ipaddress
@@ -30,17 +31,10 @@ import sys
 import threading
 import json
 import time
-
 import psutil
 import requests
 import scapy
-import select
 from PyQt5.QtCore import QObject, pyqtSignal
-from _ctypes import sizeof, byref
-from aioquic._buffer import Buffer
-from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection
-from aioquic.quic.packet import pull_quic_header
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.all import send, sr1, conf, get_if_list
@@ -55,17 +49,17 @@ from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6ND_RS, ICMPv6EchoR
     ICMPv6ND_NA, ICMPv6ND_RA
 from scapy.layers.l2 import ARP, Ether, getmacbyip
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished, TLSCertificate, \
-    TLSClientKeyExchange, TLSServerKeyExchange, TLSServerHelloDone, TLSCertificateRequest
+    TLSClientKeyExchange, TLSServerKeyExchange, TLSServerHelloDone, TLSCertificateRequest, TLSNewSessionTicket, \
+    TLSEncryptedExtensions
+from scapy.layers.tls.keyexchange import ServerECDHNamedCurveParams, ServerDHParams, ClientECDiffieHellmanPublic, \
+    ClientDiffieHellmanPublic, EncryptedPreMasterSecret
 from scapy.layers.tls.record import TLS, TLSAlert, TLSApplicationData
 from scapy.layers.tls.tools import TLSPlaintext, TLSCiphertext
 from scapy.libs.rfc3961 import Key
-from scapy.main import load_layer
 from scapy.sendrecv import srp, sendp
 from scapy.packet import Packet, bind_layers, Raw
 from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, Field, BitField, XByteField, \
     FieldLenField, StrFixedLenField, FlagsField, IP6Field, ConditionalField
-from scapy.layers.tls.crypto import suites
-from scapy.layers.tls.crypto.suites import _GenericCipherSuite
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict, Literal
 import xml.etree.ElementTree as ET
@@ -73,16 +67,15 @@ from scapy.layers.kerberos import (
     Kerberos, KRB_AS_REQ, KRB_AS_REP, KRB_TGS_REQ, KRB_TGS_REP, KRB_ERROR,
     EncryptedData, PrincipalName, EncryptionKey, PADATA
 )
+
 from scapy.sessions import TCPSession
 from win32timezone import now
-
 from p2pool_sniffer import sniff
 
 packet_queue = queue.Queue(maxsize=25)
 def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
     emoji = random.choice(emoticons) if emoticons else ''
     return f"[{name}] {emoji} {message}"
-
 
 class MLDQuery(Packet):
     name = "ICMPv6 MLD Query"
@@ -155,29 +148,7 @@ class RIP(Packet):
         ShortField("reserved", 0),
         PacketListField("entries", [], RIPEntry, count_from=lambda pkt: len(pkt.entries)),
     ]
-# --- Layer Bindings ---
-bind_layers(Ether, IPv6, type=0x86DD)
-bind_layers(IPv6, ICMPv6, nh=58)
-bind_layers(IPv6, TCP, nh=6)
-bind_layers(IPv6, UDP, nh=17)
-bind_layers(IPv6, Raw)
-bind_layers(ICMPv6, ICMPv6EchoRequest, type=128)
-bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
-bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
-bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
-bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
-bind_layers(ICMPv6, ICMPv6ND_RS, type=134)
-bind_layers(ICMPv6, MLDQuery, type=130)   # MLD Query
-bind_layers(ICMPv6, MLDReport, type=131)  # MLD Report
-bind_layers(ICMPv6, MLDDone, type=132)    # MLD Done
-bind_layers(IP, IGMP, proto=2)  # IP protocol 2 is IGMP
-bind_layers(Ether, ARP, type=0x0806)
-bind_layers(UDP, RIP, sport=520, dport=520)
 
-load_layer("tls")
-load_layer("kerberos")
-load_layer("dns")
-load_layer("rip")
 
 class SendBackManager:
     """
@@ -287,7 +258,7 @@ class PacketCatcherManager:
                                        in the catching table before old ones are dropped.
         """
         self.logger = router_logger
-        self.logger.log_message("[Fishing] 🎣 Manager initialized. Ready to cast nets for plaintext payloads.")
+        self.logger.log_message("[PacketCatcher] 🎣 Manager initialized. Ready to cast nets for plaintext payloads.")
         self.notification_manager = None
         self.arp_manager = None
         # Common plaintext ports for heuristic checking
@@ -415,7 +386,7 @@ class PacketCatcherManager:
                     self.dry_table[dst_ip]['count'] += 1
 
                     if self.dry_table[dst_ip]['count'] >= self.dry_threshold:
-                        self.logger.log_message(f"[Fishing] 🚰 Too many dry packets to {dst_ip}. Requesting payload.")
+                        self.logger.log_message(f"[PacketCatcher] 🚰 Too many dry packets to {dst_ip}. Requesting payload.")
                         self.request_fish(dst_ip)
                         self.dry_table[dst_ip]['count'] = 0  # Reset after trigger
 
@@ -432,7 +403,7 @@ class PacketCatcherManager:
                             })
 
         except Exception as e:
-            self.logger.log_message(f"[Fishing] ❗ Error during payload inspection: {e}\n{traceback.format_exc()}")
+            self.logger.log_message(f"[PacketCatcher] ❗ Error during payload inspection: {e}\n{traceback.format_exc()}")
 
     def request_fish(self, ip_address: str):
         """
@@ -759,7 +730,6 @@ class PacketSigningManager:
         except Exception as e:
             pass
 
-
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -780,6 +750,9 @@ class TransportManager:
         self.packet_signer = packet_signer
         self.logger.log_message("[Transport] Manager initialized.")
         self.voip_port_range = range(10000, 20001)
+        self.logged_quic_streams = {}
+        self.QUIC_STREAM_TIMEOUT = 300
+        self.last_quic_cleanup_time = time.time()
 
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
@@ -819,6 +792,8 @@ class TransportManager:
                 f"[Transport] 🧵 TCP Packet on {iface_short}: {src_ip}:{tcp.sport} → {dst_ip}:{tcp.dport} | "
                 f"Flags: {','.join(flag_details)} | Payload: {payload_len}"
             )
+            if packet.haslayer(TLS):
+                self._handle_tls_handshake(packet)
             # Example hook: Detect SYN scan
             if "SYN" in flag_details and payload_len == 0:
                 self.logger.log_message(
@@ -883,6 +858,86 @@ class TransportManager:
 
         return False
 
+
+    def _handle_tls_handshake(self, packet: Packet):
+        """
+        Dissects and logs TLS handshake messages, focusing on Key Exchange.
+        """
+        if packet.haslayer(TLSServerKeyExchange):
+            self.logger.log_message("[Transport][🤝 TLS] Server Key Exchange message detected.")
+            self._dissect_server_key_exchange(packet)
+
+        if packet.haslayer(TLSClientKeyExchange):
+            self.logger.log_message("[Transport][🤝 TLS] Client Key Exchange message detected.")
+            self._dissect_client_key_exchange(packet)
+
+    def _dissect_server_key_exchange(self, packet: Packet):
+        """Dissects the parameters within a TLSServerKeyExchange message."""
+        ske = packet[TLSServerKeyExchange]
+
+        # Handle Elliptic Curve Diffie-Hellman (ECDHE) parameters
+        if packet.haslayer(ServerECDHNamedCurveParams):
+            params = packet[ServerECDHNamedCurveParams]
+            self.logger.log_message(
+                f"  [+] Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)"
+            )
+            self.logger.log_message(
+                f"  [+] Curve: {params.named_curve.name} (ID: {params.named_curve})"
+            )
+            self.logger.log_message(
+                f"  [+] Server Public Point (Yc): 0x{params.point.hex()}"
+            )
+
+        # Handle classic Diffie-Hellman (DHE) parameters
+        elif packet.haslayer(ServerDHParams):
+            params = packet[ServerDHParams]
+            self.logger.log_message(
+                f"  [+] Key Exchange: DHE (Diffie-Hellman Ephemeral)"
+            )
+            self.logger.log_message(
+                f"  [+] DH Prime (p) length: {len(params.dh_p)} bytes"
+            )
+            self.logger.log_message(
+                f"  [+] DH Generator (g) length: {len(params.dh_g)} bytes"
+            )
+            self.logger.log_message(
+                f"  [+] Server Public Value (Ys) length: {len(params.dh_Ys)} bytes"
+            )
+
+        # Log the signature data, which authenticates the parameters
+        if ske.sig_len > 0:
+            self.logger.log_message(
+                f"  [+] Signature Algorithm: {ske.sig_hash_alg.name}"
+            )
+            self.logger.log_message(
+                f"  [+] Signature Length: {ske.sig_len} bytes"
+            )
+        else:
+            self.logger.log_message("  [+] No signature present in this message.")
+
+    def _dissect_client_key_exchange(self, packet: Packet):
+        """Dissects the data within a TLSClientKeyExchange message."""
+
+        # Handle Elliptic Curve Diffie-Hellman (ECDHE) public value
+        if packet.haslayer(ClientECDiffieHellmanPublic):
+            params = packet[ClientECDiffieHellmanPublic]
+            self.logger.log_message(
+                f"  [+] Client Public Point (Yc) Length: {len(params.ecdh_Yc)} bytes"
+            )
+
+        # Handle classic Diffie-Hellman (DHE) public value
+        elif packet.haslayer(ClientDiffieHellmanPublic):
+            params = packet[ClientDiffieHellmanPublic]
+            self.logger.log_message(
+                f"  [+] Client Public Value (Yc) Length: {len(params.dh_Yc)} bytes"
+            )
+
+        # Handle RSA key exchange where the Pre-Master Secret is encrypted
+        elif packet.haslayer(EncryptedPreMasterSecret):
+            self.logger.log_message(
+                f"  [+] Encrypted Pre-Master Secret found (RSA Key Exchange)."
+            )
+
     def _bytes_to_str(self, data: bytes) -> str:
         """
         Safely decodes bytes to a string, ignoring any decoding errors.
@@ -933,20 +988,25 @@ class TransportManager:
         """Handles and logs details for QUIC packets."""
         if packet.haslayer(Raw):
             raw_data = bytes(packet[Raw].load)
-            if len(raw_data) >= 6:
+            dcid_len = 0
+            scid_len = 0
+            is_long_header = False
+
+            if len(raw_data) >= 1:
                 first_byte = raw_data[0]
                 is_long_header = (first_byte & 0x80) == 0x80  # MSB is 1 for long header
 
-                if is_long_header:
+                if is_long_header and len(raw_data) >= 6:
                     # Long Header Parsing
                     packet_type = (first_byte & 0x30) >> 4
                     version_bytes = raw_data[1:5]
                     version_hex = version_bytes.hex()
 
                     dcid_len = raw_data[5]
-                    scid_len = raw_data[6 + dcid_len]
+                    # Check if packet is long enough for SCID len and SCID
+                    if len(raw_data) > 6 + dcid_len:
+                        scid_len = raw_data[6 + dcid_len]
 
-                    # Assuming a fixed offset for simplicity, actual parsing is more complex
                     try:
                         dcid = raw_data[6:6 + dcid_len].hex()
                         scid = raw_data[7 + dcid_len:7 + dcid_len + scid_len].hex()
@@ -964,100 +1024,168 @@ class TransportManager:
                             f"[Transport][🌐 QUIC] Malformed Long Header from {src_ip}:{sport}"
                         )
 
-                else:
+                elif not is_long_header:
                     # Short Header Parsing
                     dcid_len = 8  # A common guess, but not explicitly defined in the header
-                    dcid = raw_data[1:1 + dcid_len].hex() if len(raw_data) > 1 else "?"
+                    dcid = raw_data[1:1 + dcid_len].hex() if len(raw_data) > 1 + dcid_len else "?"
                     spin_bit = (first_byte & 0x20) >> 5
-                    key_phase = (first_byte & 0x04) >> 2
+                    key_phase_bit = (first_byte & 0x04) >> 2
 
+                    # --- UPDATED: More descriptive key phase logging ---
+                    key_phase_str = "Updated Keys" if key_phase_bit else "Initial Keys"
                     self.logger.log_message(
                         f"[Transport][🌐 QUIC] Short Header from {src_ip}:{sport} | "
-                        f"DCID: {dcid} | Spin Bit: {spin_bit} | Key Phase: {key_phase}"
+                        f"DCID: {dcid} | Spin Bit: {spin_bit} | Key Phase: {key_phase_str}"
                     )
+                # Determine payload start and inspect frames
+                if is_long_header:
+                    # Approximation: header length is 1 (type) + 4 (version) + 1 (dcid_len) + dcid_len + 1 (scid_len) + scid_len
+                    header_len = 7 + dcid_len + scid_len
+                else:
+                    # Approximation: header is 1 (type) + dcid_len
+                    header_len = 1 + dcid_len
 
-                # Further dissect QUIC frames
-                quic_payload_start = 7 + dcid_len + scid_len if is_long_header else 1 + dcid_len
-                self._inspect_quic_frames(raw_data[quic_payload_start:], src_ip, dport)
+                if len(raw_data) > header_len:
+                    # --- UPDATED: Pass dst_ip to frame inspector ---
+                    self._inspect_quic_frames(raw_data[header_len:], src_ip, dst_ip, dport)
         else:
             self.logger.log_message(
                 f"[Transport][🌐 QUIC] UDP on port 443 detected, but no Raw payload."
             )
 
-    def _inspect_quic_frames(self, data: bytes, src_ip: str, dport: int):
+    def _inspect_quic_frames(self, data: bytes, src_ip: str, dst_ip: str, dport: int):
         """
-        Parses and logs details of QUIC frames within a packet payload.
+        Parses and logs details of QUIC frames within a packet payload. This version
+        prevents spam by only logging new STREAM frames and using a time-based
+        cache to expire old stream entries.
 
         Args:
             data (bytes): The raw QUIC payload (without the header).
             src_ip (str): The source IP of the packet.
+            dst_ip (str): The destination IP of the packet.
             dport (int): The destination port of the packet.
         """
         i = 0
         while i < len(data):
             try:
                 first_byte = data[i]
-                frame_type = first_byte & 0x3F  # Mask for frame type
 
-                # Stream Frame
-                if 0x08 <= first_byte <= 0x0F:
-                    stream_id, = struct.unpack("!Q", data[i + 1:i + 9])
-                    frame_len = len(data) - i  # For simplicity, assume one stream frame per packet
-                    self.logger.log_message(
-                        f"[Transport][🌐 QUIC Frame] STREAM | Stream ID: {stream_id} | Length: {frame_len}"
-                    )
-                    i += frame_len  # Exit loop as we've processed the rest of the payload
+                # --- UPDATED: Reworked STREAM frame handling with time-based cache ---
+                if 0x08 <= first_byte <= 0x0f:
+                    has_len_bit = (first_byte & 0x02)
+                    has_off_bit = (first_byte & 0x04)
 
-                # ACK Frame
-                elif frame_type == 0x02:
-                    # Very simple ACK parsing, not a full implementation
-                    ack_delay, = struct.unpack("!H", data[i + 1:i + 3])
-                    self.logger.log_message(
-                        f"[Transport][🌐 QUIC Frame] ACK | Delay: {ack_delay}"
-                    )
-                    i += 3  # Move past this simple ACK frame
+                    offset = 1
+                    stream_id, bytes_read = self._parse_quic_varint(data[i + offset:])
+                    if bytes_read == 0: break  # Parsing failed
 
-                # CRYPTO Frame
-                elif frame_type == 0x06:
+                    stream_key = (src_ip, dst_ip, stream_id)
+                    current_time = time.time()
+
+                    # Only log if we haven't seen this stream before.
+                    if stream_key not in self.logged_quic_streams:
+                        log_msg = f"[Transport][🌐 QUIC Frame] STREAM | New Stream ID: {stream_id}"
+                        self.logger.log_message(log_msg)
+
+                        # Periodically prune the cache of expired streams.
+                        # This check runs at most once every 60 seconds to be efficient.
+                        if current_time - self.last_quic_cleanup_time > 60:
+                            expired_keys = [
+                                key for key, timestamp in self.logged_quic_streams.items()
+                                if current_time - timestamp > self.QUIC_STREAM_TIMEOUT
+                            ]
+                            if expired_keys:
+                                self.logger.log_message(
+                                    f"[Transport] Pruning {len(expired_keys)} expired QUIC stream entries from cache."
+                                )
+                                for key in expired_keys:
+                                    self.logged_quic_streams.pop(key, None)
+
+                            self.last_quic_cleanup_time = current_time
+
+                    # Add the new stream or update the timestamp of an existing one.
+                    self.logged_quic_streams[stream_key] = current_time
+
+                    # Correctly advance index 'i' past this frame
+                    offset += bytes_read
+                    data_len = 0
+                    if has_off_bit:
+                        _, bytes_read = self._parse_quic_varint(data[i + offset:])
+                        offset += bytes_read
+                    if has_len_bit:
+                        data_len, bytes_read = self._parse_quic_varint(data[i + offset:])
+                        offset += bytes_read
+                    else:  # If no length field, stream data is the rest of the packet
+                        data_len = len(data) - (i + offset)
+
+                    i += offset + data_len
+                    continue  # Continue to next frame
+
+                # --- Handling for other frame types remains the same ---
+                frame_type = first_byte
+                if frame_type == 0x24:  # RESET_STREAM_AT (custom)
+                    self.logger.log_message(f"[Transport][🔄 QUIC Frame] RESET_STREAM_AT")
+                    i = len(data)
+                elif frame_type == 0x14:  # STREAMS_BLOCKED
+                    self.logger.log_message(f"[Transport][🚫 QUIC Frame] STREAMS_BLOCKED")
+                    i = len(data)
+                elif frame_type == 0xa4:  # ACK_FREQUENCY (custom)
+                    self.logger.log_message(f"[Transport][📶 QUIC Frame] ACK_FREQUENCY")
+                    i = len(data)
+                elif frame_type == 0x02 or frame_type == 0x03:  # ACK
+                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] ACK")
+                    i = len(data)
+                elif frame_type == 0x06:  # CRYPTO
                     offset, length = struct.unpack("!II", data[i + 1:i + 9])
-                    self.logger.log_message(
-                        f"[Transport][🌐 QUIC Frame] CRYPTO | Offset: {offset} | Length: {length}"
-                    )
-                    i += 9 + length  # Move past the frame
-
-                # PADDING Frame
-                elif frame_type == 0x00:
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] PADDING")
+                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] CRYPTO | Offset: {offset} | Length: {length}")
+                    i += 9 + length
+                elif frame_type == 0x00:  # PADDING
                     i += 1
-
-                # PING Frame
-                elif frame_type == 0x01:
+                elif frame_type == 0x01:  # PING
                     self.logger.log_message(f"[Transport][🌐 QUIC Frame] PING")
                     i += 1
-
-                # Connection Close
-                elif frame_type == 0x1C or frame_type == 0x1D:
+                elif frame_type == 0x1C or frame_type == 0x1D:  # CONNECTION_CLOSE
                     self.logger.log_message(f"[Transport][🌐 QUIC Frame] CONNECTION_CLOSE")
-                    i += len(data)  # Exit after seeing a close frame
-
+                    i = len(data)
                 else:
-                    self.logger.log_message(
-                        f"[Transport][🌐 QUIC Frame] Unknown frame type: 0x{first_byte:02x}"
-                    )
-                    # To avoid an infinite loop on a malformed packet, we'll exit
+                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] Unknown frame type: 0x{first_byte:02x}")
                     break
-
-            except struct.error:
-                self.logger.log_message(
-                    f"[Transport][🌐 QUIC Frame] Malformed frame detected. Exiting frame inspection."
-                )
-                break
-            except IndexError:
-                self.logger.log_message(
-                    f"[Transport][🌐 QUIC Frame] End of packet data reached while parsing frame."
-                )
+            except (struct.error, IndexError):
+                self.logger.log_message("[Transport][🌐 QUIC Frame] Malformed frame or end of packet reached.")
                 break
 
+    def _parse_quic_varint(self, data: bytes) -> tuple[int, int]:
+        """
+        Parses a QUIC variable-length integer from the beginning of a byte string.
+
+        Returns:
+            A tuple containing (the integer value, number of bytes consumed).
+            Returns (0, 0) if data is invalid or insufficient.
+        """
+        if not data:
+            return 0, 0
+
+        first_byte = data[0]
+        length_bits = first_byte >> 6
+
+        try:
+            if length_bits == 0b00:  # 1-byte
+                return first_byte & 0x3F, 1
+            elif length_bits == 0b01:  # 2-byte
+                if len(data) < 2: return 0, 0
+                val = struct.unpack("!H", data[:2])[0]
+                return val & 0x3FFF, 2
+            elif length_bits == 0b10:  # 4-byte
+                if len(data) < 4: return 0, 0
+                val = struct.unpack("!I", data[:4])[0]
+                return val & 0x3FFFFFFF, 4
+            elif length_bits == 0b11:  # 8-byte
+                if len(data) < 8: return 0, 0
+                val = struct.unpack("!Q", data[:8])[0]
+                return val & 0x3FFFFFFFFFFFFFFF, 8
+        except (struct.error, IndexError):
+            return 0, 0
+        return 0, 0
     def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for NTP packets."""
         raw_data = bytes(packet[Raw].load)
@@ -1184,7 +1312,6 @@ class TransportManager:
             "Likely for dynamic device discovery."
         )
 
-
 class HTTPSManager:
     """
     Manages passive monitoring of HTTPS/TLS and TCP traffic.
@@ -1204,14 +1331,15 @@ class HTTPSManager:
             0x0303: "TLS 1.2", 0x0304: "TLS 1.3"
         }
 
+        # Updated to include TLS 1.2 handshake messages
         self.TLS_HANDSHAKE_TYPES = {
             0: "hello_request_RESERVED", 1: "client_hello", 2: "server_hello",
             3: "hello_verify_request_RESERVED", 4: "new_session_ticket",
-            5: "end_of_early_data", 6: "hello_retry_request",
+            5: "end_of_early_data", 6: "hello_retry_request_RESERVED",
             8: "encrypted_extensions", 11: "certificate",
-            12: "server_key_exchange_RESERVED", 13: "certificate_request",
-            14: "server_hello_done_RESERVED", 15: "certificate_verify",
-            16: "client_key_exchange_RESERVED", 20: "finished",
+            12: "server_key_exchange", 13: "certificate_request",
+            14: "server_hello_done", 15: "certificate_verify",
+            16: "client_key_exchange", 20: "finished",
             21: "certificate_url_RESERVED", 22: "certificate_status_RESERVED",
             23: "supplemental_data_RESERVED", 24: "key_update",
             254: "message_hash"
@@ -1281,12 +1409,23 @@ class HTTPSManager:
         Dynamically builds a map of TLS cipher suite IDs to their string names
         for compatibility with various Scapy versions.
         """
-        cipher_map = {}
-        cipher_map[0x1301] = "TLS_AES_128_GCM_SHA256"
-        cipher_map[0x1302] = "TLS_AES_256_GCM_SHA384"
-        cipher_map[0x1303] = "TLS_CHACHA20_POLY1305_SHA256"
-        cipher_map[0xC02B] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
-        cipher_map[0xC02F] = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        # Primarily focus on modern, secure cipher suites
+        cipher_map = {
+            # TLS 1.3 Cipher Suites
+            0x1301: "TLS_AES_128_GCM_SHA256",
+            0x1302: "TLS_AES_256_GCM_SHA384",
+            0x1303: "TLS_CHACHA20_POLY1305_SHA256",
+            # TLS 1.2 ECDHE Cipher Suites
+            0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        }
+        # Add more cipher suites from Scapy's dictionaries if needed
+        if 'tls_ciphersuites' in globals():
+            cipher_map.update(globals()['tls_ciphersuites'])
         return cipher_map
 
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
@@ -1304,20 +1443,25 @@ class HTTPSManager:
         # Now check for TLS records on top of TCP
         if packet.haslayer(TLS):
             tls_layer = packet.getlayer(TLS)
+            # A single TCP packet can contain multiple TLS records
             while tls_layer:
-                if tls_layer.haslayer(TLSPlaintext):
-                    if tls_layer.type == 22 and tls_layer.payload:
-                        processed = self._handle_tls_handshake_payload(tls_layer.payload, inbound_iface) or processed
-                    elif tls_layer.type == 21:
+                if isinstance(tls_layer, TLS):
+                    # Handle different record types
+                    if tls_layer.type == 22 and tls_layer.payload:  # Handshake
+                        # A single handshake record can contain multiple messages
+                        handshake_payload = tls_layer.payload
+                        while handshake_payload and isinstance(handshake_payload, Packet):
+                            processed = self._handle_tls_handshake_payload(handshake_payload,
+                                                                           inbound_iface) or processed
+                            handshake_payload = handshake_payload.payload
+                    elif tls_layer.type == 21:  # Alert
                         processed = self._handle_tls_alert(tls_layer.payload, inbound_iface) or processed
-                    elif tls_layer.type == 23:
+                    elif tls_layer.type == 23:  # Application Data
                         processed = self._handle_tls_app_data(inbound_iface) or processed
-                elif tls_layer.haslayer(TLSCiphertext):
-                    processed = self._handle_tls_app_data(inbound_iface) or processed
 
-                tls_layer = tls_layer.payload if hasattr(tls_layer, 'payload') else None
-                if not isinstance(tls_layer, Packet):
-                    tls_layer = None
+                # Move to the next potential TLS record in the same TCP packet
+                tls_layer = tls_layer.payload if hasattr(tls_layer, 'payload') and isinstance(tls_layer.payload,
+                                                                                              TLS) else None
 
         return processed
 
@@ -1362,7 +1506,6 @@ class HTTPSManager:
             conn_key = (dst_ip, dst_port, src_ip, src_port)
 
         current_state = self.tcp_state_map.get(conn_key, "CLOSED")
-
         flags = tcp_layer.flags
 
         # Connection Establishment (Three-way handshake)
@@ -1376,36 +1519,18 @@ class HTTPSManager:
                 self.router_logger.log_message(
                     f"[TCP] Handshake Progress: Server {src_ip}:{src_port} replied with SYN-ACK. 🔄 State: SYN-RECEIVED.")
                 self.tcp_state_map[conn_key] = "SYN-RECEIVED"
-        elif flags == 16:  # ACK
-            if current_state == "SYN-RECEIVED":
-                self.router_logger.log_message(
-                    f"[TCP] Handshake Completed: Client {src_ip}:{src_port} sent ACK. ✅ Connection ESTABLISHED.")
-                self.tcp_state_map[conn_key] = "ESTABLISHED"
+        elif flags == 16 and current_state == "SYN-RECEIVED":  # ACK of SYN-ACK
+            self.router_logger.log_message(
+                f"[TCP] Handshake Completed: Client {src_ip}:{src_port} sent ACK. ✅ Connection ESTABLISHED.")
+            self.tcp_state_map[conn_key] = "ESTABLISHED"
 
-        # Connection Termination (Four-way handshake)
-        elif flags == 17:  # FIN-ACK
+        # Connection Termination
+        elif 'F' in str(flags):
             if current_state == "ESTABLISHED":
                 self.router_logger.log_message(
-                    f"[TCP] Termination Started: {src_ip}:{src_port} sent FIN-ACK. ✂️ State: FIN-WAIT-1.")
+                    f"[TCP] Termination Started: {src_ip}:{src_port} sent FIN. ✂️ State: FIN-WAIT-1.")
                 self.tcp_state_map[conn_key] = "FIN-WAIT-1"
-            elif current_state == "CLOSE-WAIT":
-                self.router_logger.log_message(
-                    f"[TCP] Termination Progress: {src_ip}:{src_port} sent FIN-ACK. ⏳ State: LAST-ACK.")
-                self.tcp_state_map[conn_key] = "LAST-ACK"
-        elif flags == 16 and (current_state == "FIN-WAIT-1" or current_state == "LAST-ACK"):  # ACK
-            # A simple ACK in this state means we are acknowledging a FIN
-            if current_state == "FIN-WAIT-1":
-                self.router_logger.log_message(
-                    f"[TCP] Termination Progress: {src_ip}:{src_port} sent ACK. ➡️ State: FIN-WAIT-2.")
-                self.tcp_state_map[conn_key] = "FIN-WAIT-2"
-            elif current_state == "LAST-ACK":
-                self.router_logger.log_message(
-                    f"[TCP] Termination Completed: {src_ip}:{src_port} sent ACK. 🏁 Connection CLOSED.")
-                self.tcp_state_map.pop(conn_key, None)
-        elif flags == 20:  # PSH-ACK (often used with FIN-ACK)
-            # This is a simplification; a full state machine is more complex.
-            pass
-        elif flags == 4:  # RST
+        elif 'R' in str(flags):
             self.router_logger.log_message(
                 f"[TCP] Connection Aborted: {src_ip}:{src_port} sent RST. ⚠️ Connection reset.")
             self.tcp_state_map.pop(conn_key, None)
@@ -1437,157 +1562,119 @@ class HTTPSManager:
                 else:
                     self.router_logger.log_message(f"[TCP]     - Found Unknown Option: {opt_name} ❓")
 
-    def _generate_tls_summary(self, packet: Packet, inbound_iface: str) -> str:
-        """
-        Generates a summary string for a detected TLS packet.
-        """
-        iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        transport_layer = packet.getlayer(TCP) or packet.getlayer(UDP)
-
-        if not ip_layer or not transport_layer:
-            return f"[TLS] 🔐 TLS packet detected on {iface_short}. Cannot determine source/dest."
-
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
-        src_port = transport_layer.sport
-        dst_port = transport_layer.dport
-
-        tls_layer = packet.getlayer(TLS)
-        record_type = "Unknown"
-        if tls_layer and hasattr(tls_layer, "type"):
-            record_type = {
-                20: "ChangeCipherSpec", 21: "Alert", 22: "Handshake",
-                23: "ApplicationData", 24: "Heartbeat"
-            }.get(tls_layer.type, f"Unknown ({tls_layer.type})")
-
-        return (f"[TLS] 🔐 TLS packet detected on {iface_short}: "
-                f"{src_ip}:{src_port} → {dst_ip}:{dst_port} | "
-                f"Record Type: {record_type}")
-
     def _handle_tls_handshake_payload(self, payload: Packet, iface_short: str) -> bool:
         """
-        Processes TLS handshake messages from within a TLSPlaintext payload.
+        Processes a single TLS handshake message from within a TLS record.
         """
         processed = False
-        handshake_type_val = payload.type
-        handshake_type_str = self.TLS_HANDSHAKE_TYPES.get(handshake_type_val, f"Unknown (0x{handshake_type_val:02x})")
+        handshake_type_val = payload.msg_type
+        handshake_type_str = self.TLS_HANDSHAKE_TYPES.get(handshake_type_val, f"Unknown ({handshake_type_val})")
 
         self.router_logger.log_message(
             f"[HTTPS] 🤝 TLS Handshake Message: {handshake_type_str} detected on {iface_short}.")
 
-        if handshake_type_val == 1:  # client_hello
+        if isinstance(payload, TLSClientHello):
             self._handle_client_hello(payload, iface_short)
             processed = True
-        elif handshake_type_val == 2:  # server_hello
+        elif isinstance(payload, TLSServerHello):
             self._handle_server_hello(payload, iface_short)
             processed = True
-        elif handshake_type_val == 4:  # new_session_ticket
-            self.router_logger.log_message("[HTTPS]   - 🎟️ New session ticket issued, enabling session resumption.")
+        elif isinstance(payload, TLSCertificate):
+            self._handle_certificate(payload, iface_short)
             processed = True
-        elif handshake_type_val == 5:  # end_of_early_data:
-            self.router_logger.log_message("[HTTPS]   - ➡️ End of early data signal. Handshake now begins.")
+        elif isinstance(payload, TLSServerKeyExchange):
+            self.router_logger.log_message("[HTTPS]   - 🔑 Server Key Exchange received (parameters for DH/ECDH).")
             processed = True
-        elif handshake_type_val == 6:  # hello_retry_request
-            self.router_logger.log_message(
-                "[HTTPS]   - 🔄 A HelloRetryRequest was received, client will re-send ClientHello.")
+        elif isinstance(payload, TLSCertificateRequest):
+            self.router_logger.log_message("[HTTPS]   - 🤝 Server requested a client certificate (Mutual TLS).")
             processed = True
-        elif handshake_type_val == 8:  # encrypted_extensions
+        elif isinstance(payload, TLSServerHelloDone):
+            self.router_logger.log_message("[HTTPS]   - 👉 Server Hello Done. Server is awaiting client's response.")
+            processed = True
+        elif isinstance(payload, TLSClientKeyExchange):
+            self.router_logger.log_message("[HTTPS]   - 🔑 Client Key Exchange received (contains premaster secret).")
+            processed = True
+        elif isinstance(payload, TLSFinished):
+            self.router_logger.log_message("[HTTPS]   - 🎉 Handshake Finished message. Connection keys established.")
+            processed = True
+        # TLS 1.3 specific messages
+        elif isinstance(payload, TLSEncryptedExtensions):
             self.router_logger.log_message("[HTTPS]   - 📝 Encrypted extensions received. Server's final parameters.")
             self._handle_extensions_from_payload(payload)
             processed = True
-        elif handshake_type_val == 11:  # certificate
-            self._handle_certificate(payload, iface_short)
-            processed = True
-        elif handshake_type_val == 13:  # certificate_request
-            self.router_logger.log_message("[HTTPS]   - 🤝 Server requested a client certificate (Mutual TLS).")
-            processed = True
-        elif handshake_type_val == 15:  # certificate_verify
-            self.router_logger.log_message("[HTTPS]   - ✅ Certificate verify message received.")
-            processed = True
-        elif handshake_type_val == 20:  # finished
-            self.router_logger.log_message("[HTTPS]   - 🎉 Handshake Finished message. Connection keys established.")
-            processed = True
-        elif handshake_type_val == 24:  # key_update
-            self.router_logger.log_message("[HTTPS]   - 🔑 Key Update message received, keys are being renegotiated.")
+        elif isinstance(payload, TLSNewSessionTicket):
+            self.router_logger.log_message("[HTTPS]   - 🎟️ New session ticket issued, enabling session resumption.")
             processed = True
 
         return processed
 
-    def _handle_client_hello(self, client_hello: Packet, iface_short: str):
+    def _handle_client_hello(self, client_hello: TLSClientHello, iface_short: str):
         """Processes and logs details from a TLS ClientHello message."""
         version_str = self.TLS_VERSIONS.get(client_hello.version, f"Unknown (0x{client_hello.version:04x})")
         self.router_logger.log_message(f"[HTTPS]   - Version Offered: {version_str}")
-        if hasattr(client_hello, 'ciphersuites'):
-            self.router_logger.log_message(f"[HTTPS]   - Ciphers Offered: {len(client_hello.ciphersuites)}")
+        if hasattr(client_hello, 'ciphers'):
+            self.router_logger.log_message(f"[HTTPS]   - Ciphers Offered: {len(client_hello.ciphers)}")
 
-        if hasattr(client_hello, 'extensions'):
-            self._handle_extensions_from_payload(client_hello)
-        else:
-            self.router_logger.log_message("[HTTPS]   - No extensions found.")
+        self._handle_extensions_from_payload(client_hello)
 
-    def _handle_server_hello(self, server_hello: Packet, iface_short: str):
+    def _handle_server_hello(self, server_hello: TLSServerHello, iface_short: str):
         """Processes and logs details from a TLS ServerHello message."""
         version_str = self.TLS_VERSIONS.get(server_hello.version, f"Unknown (0x{server_hello.version:04x})")
         self.router_logger.log_message(f"[HTTPS]   - Version Negotiated: {version_str}")
-        cipher_suite = server_hello.cipher_suite
+        cipher_suite = server_hello.cipher
         cipher_name = self.cipher_map.get(cipher_suite, f"Unknown (ID: 0x{cipher_suite:04x})")
         self.router_logger.log_message(f"[HTTPS]   - Cipher Suite Chosen: {cipher_name}")
 
-        if hasattr(server_hello, 'extensions'):
-            self._handle_extensions_from_payload(server_hello)
-        else:
-            self.router_logger.log_message("[HTTPS]   - No extensions found.")
+        self._handle_extensions_from_payload(server_hello)
 
     def _handle_extensions_from_payload(self, payload: Packet):
         """Parses and logs details from TLS extensions in a handshake message."""
-        if hasattr(payload, 'extensions') and payload.extensions:
-            self.router_logger.log_message(f"[HTTPS]   - Extensions ({len(payload.extensions)} total):")
-            for ext in payload.extensions:
+        if hasattr(payload, 'ext') and payload.ext:
+            self.router_logger.log_message(f"[HTTPS]   - Extensions ({len(payload.ext)} total):")
+            for ext in payload.ext:
                 ext_type = getattr(ext, 'type', None)
                 ext_name = self.TLS_EXTENSIONS.get(ext_type, f"Unknown (ID: {ext_type})")
                 self.router_logger.log_message(f"[HTTPS]     - Found Extension: {ext_name}")
 
-                # Special handler for Server Name Indication (SNI)
-                if ext_type == 0 and hasattr(ext, 'servernames'):
+                # Identify specific extensions by their numeric type ID
+                if ext_type == 0 and hasattr(ext, 'servernames'):  # server_name (SNI)
                     sni_name = ext.servernames[0].servername.decode('utf-8', 'ignore')
                     self.router_logger.log_message(f"[HTTPS]       - SNI: {sni_name} 🌐")
-
-                # Special handler for Application Layer Protocol Negotiation (ALPN)
-                if ext_type == 16 and hasattr(ext, 'alpn_protocols'):
-                    alpn_list = [self.ALPN_PROTOCOLS.get(p, p.decode('utf-8', 'ignore')) for p in ext.alpn_protocols]
+                elif ext_type == 16 and hasattr(ext, 'protocols'):  # application_layer_protocol_negotiation (ALPN)
+                    alpn_list = [self.ALPN_PROTOCOLS.get(p, p.decode('utf-8', 'ignore')) for p in ext.protocols]
                     self.router_logger.log_message(f"[HTTPS]       - ALPN Protocols: {', '.join(alpn_list)} 💬")
-
-                # Special handler for Supported Versions
-                if ext_type == 43 and hasattr(ext, 'versions'):
+                elif ext_type == 43 and hasattr(ext, 'versions'):  # supported_versions
                     version_list = [self.TLS_VERSIONS.get(v, f"Unknown (0x{v:04x})") for v in ext.versions]
                     self.router_logger.log_message(f"[HTTPS]       - Supported Versions: {', '.join(version_list)} 📜")
 
-    def _handle_certificate(self, cert_layer: Packet, iface_short: str):
+    def _handle_certificate(self, cert_payload: TLSCertificate, iface_short: str):
         """Processes and logs details from a TLS Certificate message."""
-        num_certs = len(cert_layer.certs) if hasattr(cert_layer, 'certs') else 0
-        self.router_logger.log_message(f"[HTTPS] 📜 Certificate detected on {iface_short}.")
-        self.router_logger.log_message(f"[HTTPS]   - Certificate Chain Length: {num_certs}")
+        num_certs = len(cert_payload.certs)
+        self.router_logger.log_message(
+            f"[HTTPS] 📜 Certificate message detected on {iface_short} with {num_certs} certificate(s).")
         if num_certs > 0:
-            server_cert = cert_layer.certs[0]
-            if hasattr(server_cert, 'subject') and hasattr(server_cert.subject, 'rdn_seq'):
-                for rdn_sequence in server_cert.subject.rdn_seq:
-                    for rdn in rdn_sequence:
-                        if hasattr(rdn, 'type') and rdn.type.val == '2.5.4.3':
-                            cn = rdn.value.val.decode('utf-8', 'ignore')
-                            self.router_logger.log_message(f"[HTTPS]   - Certificate CN: {cn} 👨‍💻")
-                            break
-            if hasattr(server_cert, 'not_before') and hasattr(server_cert, 'not_after'):
-                valid_from = server_cert.not_before.val.decode('utf-8', 'ignore')
-                valid_to = server_cert.not_after.val.decode('utf-8', 'ignore')
+            # Scapy wraps the ASN.1 cert in an X509Cert object
+            server_cert = cert_payload.certs[0].cert
+            # The subject commonName is often a good identifier
+            if hasattr(server_cert, 'tbsCertificate') and hasattr(server_cert.tbsCertificate, 'subject'):
+                subject_rdn = server_cert.tbsCertificate.subject.rdnSequence
+                for rdn in subject_rdn:
+                    # Look for the commonName attribute
+                    if rdn[0].type.val == '2.5.4.3':
+                        cn = rdn[0].value.val.decode('utf-8', 'ignore')
+                        self.router_logger.log_message(f"[HTTPS]   - Certificate CN: {cn} 👨‍💻")
+                        break
+            # Log validity period
+            if hasattr(server_cert, 'tbsCertificate') and hasattr(server_cert.tbsCertificate, 'validity'):
+                valid_from = server_cert.tbsCertificate.validity.notBefore.val
+                valid_to = server_cert.tbsCertificate.validity.notAfter.val
                 self.router_logger.log_message(f"[HTTPS]   - Validity: {valid_from} to {valid_to} 📅")
 
     def _handle_tls_alert(self, alert_payload: Packet, iface_short: str) -> bool:
         """Processes and logs details from a TLS Alert message."""
-        alert_layer = alert_payload.getlayer(TLSAlert)
-        if alert_layer:
-            level = self.TLS_ALERT_LEVEL.get(alert_layer.level, "Unknown")
-            description = self.TLS_ALERT_DESCRIPTION.get(alert_layer.descr, "Unknown")
+        if isinstance(alert_payload, TLSAlert):
+            level = self.TLS_ALERT_LEVEL.get(alert_payload.level, "Unknown")
+            description = self.TLS_ALERT_DESCRIPTION.get(alert_payload.descr, "Unknown")
             self.router_logger.log_message(
                 f"[HTTPS] ⚠️  Alert on {iface_short}: Level={level}, Desc='{description}'")
             return True
@@ -1597,6 +1684,7 @@ class HTTPSManager:
         """Logs the presence of encrypted application data."""
         self.router_logger.log_message(f"[HTTPS] 📦 Encrypted Application Data on {iface_short}.")
         return True
+
 class KerberosManager:
     """
     Manages Kerberos protocol traffic within the router.
@@ -3013,8 +3101,6 @@ class IGMPManager:
         with self._group_lock:
             return self._multicast_groups.copy()
 
-
-
 class RIPManager:
     """
     Manages the routing table and all RIPv2 protocol interactions.
@@ -3536,7 +3622,6 @@ class RIPManager:
         except ValueError:
             return None
 
-
 class NATManager:
     """
     Manages Network Address Translation (NAT) with both:
@@ -3545,14 +3630,28 @@ class NATManager:
     Enhanced with NAT timeouts and a basic ALG placeholder.
     """
 
+    # Dictionary to map common ports to services and emojis
+    PORT_SERVICES = {
+        80: ("HTTP", "🌐"),
+        443: ("HTTPS", "🔒"),
+        21: ("FTP", "📁"),
+        22: ("SSH", "💻"),
+        2222: ("Alternate SSH", "💻"),
+        3389: ("RDP", "🖥️"),
+        53: ("DNS", "❓"),
+        88: ("Kerberos", "🎟️"),
+        520: ("RIP", "🗺️"),
+        25565: ("Minecraft", "🧱")
+    }
+
     def __init__(self, router_logger, sendback_manager, router_public_ip: str, packet_writer,
                  interfaces_config: Dict[str, Dict[str, Any]],
-                 rip_manager_find_route, arp_manager_resolve):  # ADD interfaces_config, rip_manager_find_route
+                 rip_manager_find_route, arp_manager_resolve):
         self.router_logger = router_logger
         self.public_ip = router_public_ip
-        self.packet_writer = packet_writer  # Store the packet writer
-        self._interfaces_config = interfaces_config  # Store interfaces config
-        self._rip_manager_find_route = rip_manager_find_route  # Store the find_route method
+        self.packet_writer = packet_writer
+        self._interfaces_config = interfaces_config
+        self._rip_manager_find_route = rip_manager_find_route
         self._arp_manager_resolve = arp_manager_resolve
         self.NAT_PORT_MIN = 49152
         self.NAT_PORT_MAX = 65535
@@ -3568,32 +3667,37 @@ class NATManager:
         self._stop_event = threading.Event()
         self._cleanup_thread = None
 
-        self.router_internal_ip_for_self_mapping: str = "0.0.0.0"  # Still present, but used differently now
+        self.router_internal_ip_for_self_mapping: str = "0.0.0.0"
 
-        self.add_static_mapping(
-            external_port=65406,
-            internal_ip="192.168.1.50",
-            internal_port=88
-        )
-        self.router_logger.log_message("[NAT] Manager initialized.")
+        # Initialize with predefined static mappings
+        self.add_static_mapping(external_port=65406, internal_ip="192.168.1.50", internal_port=88)
+        self.add_static_mapping(external_port=80, internal_ip="192.168.1.100", internal_port=80)
+        self.add_static_mapping(external_port=443, internal_ip="192.168.1.100", internal_port=443)
+        self.add_static_mapping(external_port=2222, internal_ip="192.168.1.10", internal_port=22)
+        self.add_static_mapping(external_port=3389, internal_ip="192.168.1.25", internal_port=3389)
+        self.add_static_mapping(external_port=25565, internal_ip="192.168.1.75", internal_port=25565)
+        self.add_static_mapping(external_port=520, internal_ip="192.168.1.50", internal_port=520)
+
+        self.router_logger.log_message("[NAT] 🚀 Manager initialized.")
         self.sendback_manager = sendback_manager
+
     def set_router_internal_ip(self, ip: str):
         self.router_internal_ip_for_self_mapping = ip
-        self.router_logger.log_message(f"[NAT] Router's internal IP for self-mapping set to: {ip}")
+        self.router_logger.log_message(f"[NAT] 🏠 Router's internal IP for self-mapping set to: {ip}")
 
     def start(self):
         """Starts the NAT cleanup thread."""
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="NATCleanup")
         self._cleanup_thread.start()
-        self.router_logger.log_message("[NAT] Cleanup thread started.")
+        self.router_logger.log_message("[NAT] ✅ Cleanup thread started.")
 
     def stop(self):
         """Stops the NAT cleanup thread gracefully."""
         self._stop_event.set()
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
-        self.router_logger.log_message("[NAT] Manager stopped.")
+        self.router_logger.log_message("[NAT] 🛑 Manager stopped.")
 
     def _cleanup_loop(self):
         """Periodically removes stale dynamic NAT entries."""
@@ -3607,8 +3711,7 @@ class NATManager:
 
                 for internal_key in stale_internal_keys:
                     external_port, _ = self._nat_table.pop(internal_key)
-                    if external_port in self._nat_reverse_table and self._nat_reverse_table[
-                        external_port] == internal_key:
+                    if external_port in self._nat_reverse_table and self._nat_reverse_table[external_port] == internal_key:
                         del self._nat_reverse_table[external_port]
                     self.router_logger.log_message(
                         f"[NAT] 🗑️ Timed out dynamic port mapping: {internal_key[0]}:{internal_key[1]} → {self.public_ip}:{external_port}"
@@ -3626,8 +3729,10 @@ class NATManager:
                     f"[NAT][STATIC] ⚠️ Static mapping for {self.public_ip}:{external_port} already exists. Overwriting."
                 )
             self._static_mappings[external_port] = (internal_ip, internal_port)
+
+        service_name, service_emoji = self.PORT_SERVICES.get(external_port, ("Custom Service", "✳️"))
         self.router_logger.log_message(
-            f"[NAT][STATIC] ✳️  Added static mapping: {self.public_ip}:{external_port} "
+            f"[NAT][STATIC] {service_emoji} Added static mapping for {service_name}: {self.public_ip}:{external_port} "
             f"→ {internal_ip}:{internal_port}"
         )
 
@@ -3637,13 +3742,11 @@ class NATManager:
             removed = self._static_mappings.pop(external_port, None)
         if removed:
             self.router_logger.log_message(
-                f"[NAT][STATIC] 🗑️  Removed static mapping for "
-                f"{self.public_ip}:{external_port}"
+                f"[NAT][STATIC] 🗑️ Removed static mapping for {self.public_ip}:{external_port}"
             )
         else:
             self.router_logger.log_message(
-                f"[NAT][STATIC] ⚠️  No static mapping found for "
-                f"{self.public_ip}:{external_port} to remove"
+                f"[NAT][STATIC] ❓ No static mapping found for {self.public_ip}:{external_port} to remove"
             )
 
     def _get_next_port(self) -> int:
@@ -3665,29 +3768,29 @@ class NATManager:
     def _apply_alg(self, packet: Packet, direction: str):
         if packet.haslayer(TCP) and (packet[TCP].dport == 21 or packet[TCP].sport == 21):
             self.router_logger.log_message(
-                f"[NAT][ALG] FTP ALG triggered ({direction}). (Placeholder: Actual payload inspection/rewriting needed)")
+                f"[NAT][ALG] 📁 FTP ALG triggered ({direction}). (Placeholder: Actual payload inspection/rewriting needed)")
         if packet.haslayer(UDP) and packet.haslayer(DNS) and (packet[UDP].dport == 53 or packet[UDP].sport == 53):
             self.router_logger.log_message(
-                f"[NAT][ALG] DNS traffic observed ({direction}). (No DNS payload rewriting by NAT.)")
+                f"[NAT][ALG] ❓ DNS traffic observed ({direction}). (No DNS payload rewriting by NAT.)")
 
     def translate_outbound(self, packet: Packet):
         if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            self.router_logger.log_message(f"[NAT] Skipping outbound translation for non-IP packet: {packet.summary()}")
+            self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound translation for non-IP packet: {packet.summary()}")
             return
         ip = packet[IP] if packet.haslayer(IP) else packet[IPv6]
         if not (packet.haslayer(TCP) or packet.haslayer(UDP)):
             if packet.haslayer(ICMP):
                 self.router_logger.log_message(
-                    f"[NAT] Passing outbound ICMP for {ip.src} to {ip.dst} without port NAT.")
+                    f"[NAT] 핑 Passing outbound ICMP for {ip.src} to {ip.dst} without port NAT.")
                 return
             if packet.haslayer(DHCP):
-                self.router_logger.log_message(f"[NAT] Skipping outbound NAT for DHCP packet from {ip.src}.")
+                self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for DHCP packet from {ip.src}.")
                 return
             if packet.haslayer(IGMP):
-                self.router_logger.log_message(f"[NAT] Skipping outbound NAT for IGMP packet from {ip.src}.")
+                self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for IGMP packet from {ip.src}.")
                 return
             self.router_logger.log_message(
-                f"[NAT] Skipping outbound translation for unhandled non-TCP/UDP/ICMP packet: {packet.summary()}")
+                f"[NAT] 🧐 Skipping outbound translation for unhandled non-TCP/UDP/ICMP packet: {packet.summary()}")
             return
 
         t = packet[TCP] if packet.haslayer(TCP) else packet[UDP]
@@ -3697,7 +3800,6 @@ class NATManager:
             if internal_key not in self._nat_table:
                 new_port = self._get_next_port()
                 if new_port == -1:
-                    #self.router_logger.log_message(f"[NAT] 🚫 Dropping outbound packet from {ip.src}:{t.sport} due to no available NAT ports.")
                     return
 
                 self._nat_table[internal_key] = (new_port, time.time())
@@ -3713,8 +3815,8 @@ class NATManager:
                     f"[NAT] 🔄 Reusing dynamic mapping: "
                     f"{ip.src}:{t.sport} → {self.public_ip}:{new_port}"
                 )
+        ip.src = self.public_ip
         t.sport = new_port
-        self._apply_alg(packet, "outbound")
 
     def translate_inbound(self, packet: Packet) -> bool:
         """
@@ -3724,38 +3826,32 @@ class NATManager:
           3. If no mapping, send ICMP Destination Unreachable (Port Unreachable) back.
         Returns True if packet was translated, False if dropped/none.
         """
-        # Ensure IP and TCP/UDP layers are present
         if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            self.router_logger.log_message(f"[NAT] Skipping inbound translation for non-IP packet: {packet.summary()}")
+            self.router_logger.log_message(f"[NAT] ⏭️ Skipping inbound translation for non-IP packet: {packet.summary()}")
             return False
         ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+
         if not (packet.haslayer(TCP) or packet.haslayer(UDP)):
-            if packet.haslayer(ICMP) and (packet[ICMP].type == 3 or packet[ICMP].type == 11):
+            if packet.haslayer(ICMP):
+                 self.router_logger.log_message(f"[NAT] 핑 Skipping NAT for inbound ICMP packet.")
+            elif packet.haslayer(DHCP) or packet.haslayer(IGMP):
+                self.router_logger.log_message(f"[NAT] ⏭️ Skipping NAT for {packet.name} packet.")
+            else:
                 self.router_logger.log_message(
-                    f"[NAT] Inbound ICMP error message to {ip_layer.dst}. Not performing NAT translation.")
-                return False
-            if packet.haslayer(DHCP) and packet.haslayer(UDP) and (packet[UDP].sport == 67 or packet[UDP].dport == 68):
-                self.router_logger.log_message(
-                    f"[NAT] Skipping inbound NAT for DHCP packet to {ip_layer.dst}:{packet[UDP].dport}.")
-                return False
-            if packet.haslayer(IGMP):
-                self.router_logger.log_message(f"[NAT] Skipping inbound NAT for IGMP packet to {ip_layer.dst}.")
-                return False
-            self.router_logger.log_message(
-                f"[NAT] Skipping inbound translation for unhandled non-TCP/UDP packet: {packet.summary()}")
+                    f"[NAT] 🧐 Skipping inbound translation for unhandled non-TCP/UDP packet: {packet.summary()}")
             return False
 
-        # Get relevant layers for translation
         transport_layer = packet[TCP] if packet.haslayer(TCP) else packet[UDP]
         ext_dst_port = transport_layer.dport
 
-        # 1) Check Static port-forwarding
         with self._lock:
             static_mapping = self._static_mappings.get(ext_dst_port)
         if static_mapping:
             internal_ip, internal_port = static_mapping
+            service_name, service_emoji = self.PORT_SERVICES.get(ext_dst_port, ("Custom Service", "🎯"))
+
             self.router_logger.log_message(
-                f"[NAT][STATIC] ⬅️  Static mapping hit: "
+                f"[NAT][STATIC] {service_emoji} Static mapping hit for {service_name}: "
                 f"{self.public_ip}:{ext_dst_port} → {internal_ip}:{internal_port}"
             )
             ip_layer.dst = internal_ip
@@ -3763,10 +3859,6 @@ class NATManager:
             self._apply_alg(packet, "inbound")
             return True
 
-        # 2) Check Dynamic reverse mapping
-        #self.router_logger.log_message(
-        #    f"[NAT] ⬅️  Lookup dynamic mapping for external port {ext_dst_port} "
-        #    f"(from {ip_layer.src}:{transport_layer.sport})")
         with self._lock:
             dynamic_mapping_key = self._nat_reverse_table.get(ext_dst_port)
 
@@ -3779,7 +3871,7 @@ class NATManager:
                     self._nat_table[internal_key_for_nat_table] = (current_ext_port, time.time())
 
             self.router_logger.log_message(
-                f"[NAT] ✅  Dynamic mapping found: "
+                f"[NAT] ✅ Dynamic mapping found: "
                 f"{self.public_ip}:{ext_dst_port} → {internal_ip}:{internal_port}"
             )
             ip_layer.dst = internal_ip
@@ -3787,10 +3879,10 @@ class NATManager:
             self._apply_alg(packet, "inbound")
             return True
         else:
-            # --- NEW: Send ICMP Destination Unreachable (Port Unreachable) ---
-            #self.router_logger.log_message(f"[NAT] 🚫 Unmapped inbound traffic to {self.public_ip}:{ext_dst_port} from {ip_layer.src}:{transport_layer.sport}. Sending ICMP Destination Unreachable (Port Unreachable).")
+            self.router_logger.log_message(
+                f"[NAT] 🚫 Unmapped inbound traffic to {self.public_ip}:{ext_dst_port}. Sending ICMP Port Unreachable.")
             self._send_icmp_destination_unreachable(packet, ip_layer, transport_layer)
-            return False  # Packet was not translated, but handled (by sending ICMP)
+            return False
 
     def _send_icmp_destination_unreachable(self, original_packet: Packet, original_ip_layer: IP | IPv6,
                                            original_transport_layer: TCP | UDP):
@@ -3804,7 +3896,7 @@ class NATManager:
         route_to_sender = self._rip_manager_find_route(icmp_dst_ip)
         if not route_to_sender:
             self.router_logger.log_message(
-                f"[NAT] ⚠️ Could not find route to original sender {icmp_dst_ip} for ICMP response. Dropping ICMP.")
+                f"[NAT] ⚠️ Could not find route to original sender {icmp_dst_ip} for ICMP response. Dropping.")
             self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
             return
 
@@ -3813,40 +3905,26 @@ class NATManager:
         outbound_iface_config = self._interfaces_config.get(outbound_iface_for_icmp)
         if not outbound_iface_config or 'mac' not in outbound_iface_config:
             self.router_logger.log_message(
-                f"[NAT] ⚠️ Missing MAC for router's outbound interface {outbound_iface_for_icmp.split('_')[-1]} for ICMP. Dropping ICMP.")
+                f"[NAT] ⚠️ Missing MAC for router's outbound interface {outbound_iface_for_icmp.split('_')[-1]} for ICMP. Dropping.")
             return
         router_mac_out = outbound_iface_config['mac']
 
         next_hop_ip_for_icmp = route_to_sender["next_hop"] if route_to_sender["next_hop"] != "0.0.0.0" else icmp_dst_ip
 
-        # --- CRITICAL CHANGE: Resolve next-hop MAC using ARPManager ---
         next_hop_mac_for_icmp = self._arp_manager_resolve(next_hop_ip_for_icmp, outbound_iface_for_icmp)
         if not next_hop_mac_for_icmp:
             self.router_logger.log_message(
                 f"[NAT] 🕵️ ARP resolution failed for next hop {next_hop_ip_for_icmp} on {outbound_iface_for_icmp.split('_')[-1]} for ICMP. Sending back ICMP.")
-            self.sendback_manager.send_icmp_packet(
-                original_packet,
-                icmp_type=3,
-                icmp_code=3,
-            )
+            self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
             return
-        # --- END CRITICAL CHANGE ---
-
-        # Construct the ICMP packet
-        # The payload of the ICMP error is the IP header + first 8 bytes of the original packet.
-        # Scapy's ICMP error messages often automatically handle this if you layer correctly.
-        # We'll embed the original IP layer as the payload.
 
         icmp_response = Ether(src=router_mac_out, dst=next_hop_mac_for_icmp) / \
                         IP(src=icmp_src_ip, dst=icmp_dst_ip) / \
                         ICMP(type=3, code=3) / \
-                        original_ip_layer  # Embedding the original IP layer for context
+                        original_ip_layer
 
-        # Scapy should automatically calculate checksums on send, but explicitly deleting them
-        # ensures they are recalculated.
         del icmp_response[IP].chksum
         del icmp_response[ICMP].chksum
-
 
         self.router_logger.log_message(
             f"[NAT] 🔕 Sent ICMP Dest Unreachable (Port) to {icmp_dst_ip} via {outbound_iface_for_icmp.split('_')[-1]}.")
@@ -3854,22 +3932,20 @@ class NATManager:
     def get_internal_from_external(self, external_port: int) -> Optional[Tuple[str, int]]:
         """Returns (internal_ip, internal_port) for a NAT’d external port."""
         with self._lock:
-            # 1. Check static mappings
             static_mapping = self._static_mappings.get(external_port)
             if static_mapping:
                 self.router_logger.log_message(
-                    f"[NAT] get_internal_from_external: Static hit for external port {external_port}.")
+                    f"[NAT] 🎯 get_internal_from_external: Static hit for external port {external_port}.")
                 return static_mapping
 
-            # 2. Check dynamic reverse mappings
             dynamic_mapping = self._nat_reverse_table.get(external_port)
             if dynamic_mapping:
                 self.router_logger.log_message(
-                    f"[NAT] get_internal_from_external: Dynamic hit for external port {external_port}.")
+                    f"[NAT] 🔄 get_internal_from_external: Dynamic hit for external port {external_port}.")
                 return dynamic_mapping
 
         self.router_logger.log_message(
-            f"[NAT] get_internal_from_external: No mapping found for external port {external_port}.")
+            f"[NAT] ❓ get_internal_from_external: No mapping found for external port {external_port}.")
         return None
 
     def get_internal_ip_from_external(self, external_ip: str) -> Optional[str]:
@@ -3879,7 +3955,7 @@ class NATManager:
         """
         if external_ip == self.public_ip:
             self.router_logger.log_message(
-                f"[NAT] Query for internal IP from external {external_ip}. Requires deeper NAT state knowledge.")
+                f"[NAT] 🧐 Query for internal IP from external {external_ip}. Requires deeper NAT state knowledge.")
             return None
         return None
 
@@ -4037,8 +4113,22 @@ class DNSManager:
         is_from_lan = ipaddress.ip_address(ip_layer.src) in router_lan_network
         if inbound_iface == outbound_iface_name and not is_from_lan:
             self.router_logger.log_message(
-                f"[DNS] 🔁 Not proxying DNS query from external source {ip_layer.src} to prevent loop.")
-            return False
+                f"[DNS] ⚠️ Refusing external DNS query from {ip_layer.src} to prevent loop. Sending REFUSED response.")
+
+            # Construct a DNS response with RCODE 5 (Refused)
+            refused_response = Ether(src=packet[Ether].dst, dst=packet[Ether].src) / \
+                               ip_layer.__class__(src=ip_layer.dst, dst=ip_layer.src) / \
+                               UDP(sport=udp_layer.dport, dport=udp_layer.sport) / \
+                               DNS(id=dns_layer.id, qr=1, ra=1, rcode=5, qd=dns_layer.qd)
+
+            # Remove checksums to force recalculation by the packet writer
+            if refused_response.haslayer(IP):
+                del refused_response[IP].chksum
+            if refused_response.haslayer(UDP):
+                del refused_response[UDP].chksum
+
+            self.packet_writer.queue_packet(refused_response, inbound_iface)
+            return True  # T
 
         outbound_iface_config = router_interfaces.get(outbound_iface_name)
         if not outbound_iface_config:
@@ -4223,23 +4313,6 @@ class ARPManager:
         arp_layer = pkt[ARP]
         sender_ip = arp_layer.psrc
         sender_mac = arp_layer.hwsrc
-
-        # --- NEW: First-Use Detection Logic ---
-        # Ensure notification_manager is set before attempting to send notifications
-        if self.notification_manager and (
-            (self.dhcp_server_out and sender_ip in self.dhcp_server_out.get_ip_to_mac_bindings()) or
-            (self.dhcp_server_in and sender_ip in self.dhcp_server_in.get_ip_to_mac_bindings())
-        ):
-            if sender_ip not in self._active_ips: # Only log/notify on first detection
-                self._active_ips.add(sender_ip)
-                self.router_logger.log_message(f"[ARP] ✅ First use of leased IP {sender_ip} by {sender_mac} detected.")
-                self.notification_manager.send_notification({
-                    "event": "ip_in_use",
-                    "ip": sender_ip,
-                    "mac": sender_mac,
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-                })
-        # --- END NEW LOGIC ---
 
         # 1. Check static ARP entries first (highest priority)
         static_mac = self._static_arp_entries.get(sender_ip)
@@ -4696,7 +4769,6 @@ class DHCPServer:
 
         return True
 
-
 class OutboundLoadBalancer:
     """
     Distributes outbound traffic across multiple configured WAN interfaces using a hash-based method.
@@ -5048,6 +5120,7 @@ class FirewallManager:
                         return False
 
             return True
+
 class PythonRouterManager:
 
     """
@@ -5783,12 +5856,14 @@ class PythonRouterManager:
 
         # Trust the IN interface
         self.add_trusted_arp_port(self.interface_in_full_name)
-
-
+        self.add_trusted_arp_port(self.interface_out_full_name)
         # Optionally trust Ethernet 2 (if used in bridging)
         if ethernet_2_info:
             self.add_trusted_arp_port(self.interface_ethernet_2_full_name)
-
+        if self.interface_lac_full_name:
+            self.add_trusted_arp_port(self.interface_lac_full_name)
+        if self.interface_lac_2_full_name:
+            self.add_trusted_arp_port(self.interface_lac_2_full_name)
         # Example: Add static ARP entry for gateway (if known)
         if self.router_gateway_out_ip:
             try:
@@ -6138,17 +6213,7 @@ class PythonRouterManager:
 
 
 
-            dst_ip = ip_layer.dst
-            router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
-            is_for_router = dst_ip in router_ips
-            if packet.haslayer(RIP) or packet.haslayer(RIPEntry):
-                self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
-                self.rip_manager.handle_packet(packet, inbound_iface)
-                return
-            if self.nat_manager.translate_inbound(packet):
-                self.router_logger.log_message(f"[NAT] 🔄 NAT translated inbound packet on {iface_short}")
-                self._forward_general_ip_packet(packet, inbound_iface)
-                return
+
 
             # 5. Firewall Check
 
@@ -6174,8 +6239,17 @@ class PythonRouterManager:
                     self.igmp_manager.handle_packet(packet, inbound_iface)
                     return
 
-
-
+            if inbound_iface == self.interface_out_full_name:
+                if not self.nat_manager.translate_inbound(packet):
+                    return
+            dst_ip = ip_layer.dst
+            router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
+            is_for_router = dst_ip in router_ips
+            if is_for_router:
+                if packet.haslayer(RIP) or packet.haslayer(RIPEntry):
+                    self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
+                    self.rip_manager.handle_packet(packet, inbound_iface)
+                    return
             # 9. Handshake
             if packet.haslayer(TCP):
                 self.handshake_manager.handle_packet(packet, inbound_iface)
@@ -6265,7 +6339,7 @@ class PythonRouterManager:
             self.router_logger.log_message(f"[Router] 🛑 No route to {dst_ip}. Dropping.")
             return
 
-        # --- [3] Load Balancing ---
+
 
 
         if ipaddress.ip_address(dst_ip).is_global:
@@ -6289,7 +6363,11 @@ class PythonRouterManager:
         # --- [2] Link Aggregation Handling ---
         actual_outbound_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
 
-
+        is_from_internal_bridge = self.ethernet_manager.is_bridge_member(inbound_iface)
+        is_to_external_wan = actual_outbound_iface in self.outbound_load_balancer.get_configured_interfaces()
+        if is_from_internal_bridge and is_to_external_wan:
+            self.nat_manager.translate_outbound(packet)
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
 
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)
@@ -6341,20 +6419,6 @@ class PythonRouterManager:
                     f"[Router] 📡 Dropping multicast {dst_ip} on {actual_outbound_iface.split('_')[-1]}: No members."
                 )
                 return
-
-        is_lan_to_wan = (
-                inbound_iface == self.interface_in_full_name and
-                initial_outbound_iface == self.interface_out_full_name
-        )
-
-        # --- [6] Apply NAT (if applicable) ---
-        if is_lan_to_wan and self.nat_manager:
-            self.nat_manager.translate_outbound(packet)
-            # Use the pre-defined ip_layer variable which handles both IP and IPv6
-            if ip_layer.src != self.nat_manager.public_ip:
-                self.router_logger.log_message(f"[NAT] ❌ Packet dropped after NAT failure.")
-                return
-
 
         # --- [7] Prepare L2 Details ---
         outbound_config = self._interfaces_config.get(actual_outbound_iface)
@@ -8481,9 +8545,9 @@ class AsyncScrapingManager(QObject):
         if on_complete_callback:
             self.async_loop.call_soon_threadsafe(on_complete_callback)
 
-    async def start_scrape(self, url: str, on_complete_callback=None):
+    async def start_scrape(self, url: str, delay_seconds: int, on_complete_callback=None):
         if self.status == "running":
-            self.logger.log_message("[Scraper] ⚠️ Scraping already running.")
+            self.logger.log_message("[Scraper] ⚠️ Scraping already in progress.")
             return
 
         self._current_url = url.strip()
@@ -8495,14 +8559,14 @@ class AsyncScrapingManager(QObject):
                 self.async_loop.call_soon_threadsafe(lambda: on_complete_callback({"error": error_msg}))
             return
 
-        self.logger.log_message(f"[Scraper] ▶️ Starting scrape for: {self._current_url}")
+        self.logger.log_message(f"[Scraper] ▶️ Starting scrape for: {self._current_url} with a {delay_seconds}s delay.")
         self.status = "running"
         self.scraping_started_signal.emit()
 
         async def run_and_callback():
             scraped_data = {"error": "Unknown error during scrape."}
             try:
-                scraped_data = await self._perform_scrape(self._current_url)
+                scraped_data = await self._perform_scrape(self._current_url, delay_seconds)
             except asyncio.CancelledError:
                 self.logger.log_message("[Scraper] ⏹️ Scrape task cancelled.")
                 scraped_data = {"error": "Scrape cancelled."}
@@ -8530,41 +8594,120 @@ class AsyncScrapingManager(QObject):
         if self._scrape_task:
             self._scrape_task.cancel()
 
-    async def _perform_scrape(self, url: str) -> dict:
-        self.scraping_progress_signal.emit("Launching headless browser...")
-        self.logger.log_message(f"[Scraper-DBG] Launching Playwright for {url}")
+    async def _perform_scrape(self, url: str, delay_seconds: int) -> dict:
+        self.scraping_progress_signal.emit("Launching browser for interaction...")
+        self.logger.log_message(f"[Scraper-DBG] Launching visible Playwright for {url}")
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ])
-            context = await browser.new_context()
+        playwright = None
+        browser = None
+        headless_browser = None
+
+        try:
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(headless=False,
+                                                       args=[
+                                                           "--disable-blink-features=AutomationControlled",
+                                                           "--no-sandbox",
+                                                           "--disable-dev-shm-usage",
+                                                           "--disable-gpu",
+                                                       ])
+            context = await browser.new_context(accept_downloads=False)
             page = await context.new_page()
 
-            try:
-                await page.goto(url, timeout=60000)
-                self.scraping_progress_signal.emit("Rendering and extracting HTML...")
-                content = await page.content()
-                self.logger.log_message("[Scraper-DBG] Page content loaded. Parsing...")
+            await page.goto(url, timeout=60000)
 
-                scraped_data = await self.async_loop.run_in_executor(
-                    None,
-                    lambda: self._parse_content(content, url)
+            if delay_seconds > 0:
+                self.scraping_progress_signal.emit(f"Waiting for {delay_seconds}s (load/login time)...")
+                await page.wait_for_timeout(delay_seconds * 1000)
+
+            self.scraping_progress_signal.emit("Extracting HTML and session data...")
+            content = await page.content()
+            storage_state = await context.storage_state()
+            await browser.close()
+
+            self.logger.log_message("[Scraper-DBG] Page content loaded. Parsing...")
+
+            scraped_data = await self.async_loop.run_in_executor(
+                None,
+                lambda: self._parse_content(content, url)
+            )
+            scraped_data["html_content"] = content
+
+            hardcoded_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+            }
+
+            self.scraping_progress_signal.emit("Downloading images...")
+            failed_images = []
+            for image_info in scraped_data.get("extracted_images", []):
+                img_url = image_info['src']
+                try:
+                    if img_url.startswith('data:image'):
+                        header, encoded = img_url.split(',', 1)
+                        image_data = base64.b64decode(encoded)
+                        image_info['data'] = image_data
+                    else:
+                        if img_url.startswith('//'):
+                            img_url = 'https:' + img_url
+
+                        headers_for_request = hardcoded_headers.copy()
+                        headers_for_request['Referer'] = url
+
+                        response = requests.get(img_url, headers=headers_for_request, timeout=10)
+                        response.raise_for_status()
+                        image_info['data'] = response.content
+                except Exception:
+                    self.logger.log_message(
+                        f"[ImageDownloader] ⚠️ Request failed for {img_url[:100]}... Falling back to browser screenshot.")
+                    failed_images.append(image_info)
+
+            if failed_images:
+                self.scraping_progress_signal.emit("Retrying failed images with headless browser...")
+                headless_browser = await playwright.chromium.launch(headless=True)
+                headless_context = await headless_browser.new_context(
+                    storage_state=storage_state,
+                    extra_http_headers=hardcoded_headers
                 )
-                scraped_data["html_content"] = content
-                self.status = "completed"
-                return scraped_data
+                for image_info in failed_images:
+                    img_url = image_info['src']
+                    try:
+                        if img_url.startswith('//'):
+                            img_url = 'https:' + img_url
+                        img_page = await headless_context.new_page()
+                        await img_page.goto(img_url, timeout=15000)
 
-            except Exception as e:
-                self.logger.log_message(f"[Scraper] 🚨 Playwright scrape failed: {e}")
-                raise ValueError(f"Playwright error: {e}")
+                        dimensions = await img_page.evaluate('''() => {
+                            const img = document.querySelector('img');
+                            if (!img) return { width: 800, height: 600 }; // Default size
+                            return {
+                                width: img.naturalWidth,
+                                height: img.naturalHeight
+                            };
+                        }''')
 
-            finally:
-                await browser.close()
+                        await img_page.set_viewport_size(dimensions)
+
+                        image_info['data'] = await img_page.screenshot()
+                        await img_page.close()
+                    except Exception as e:
+                        self.logger.log_message(
+                            f"[ImageDownloader] ❌ Failed to process image {img_url[:100]}... with browser: {e}")
+                        image_info['data'] = None
+
+            self.status = "completed"
+            return scraped_data
+
+        except Exception as e:
+            self.logger.log_message(f"[Scraper] 🚨 Playwright scrape failed: {e}")
+            raise ValueError(f"Playwright error: {e}")
+
+        finally:
+            if browser and browser.is_connected(): await browser.close()
+            if headless_browser and headless_browser.is_connected(): await headless_browser.close()
+            if playwright: await playwright.stop()
 
     def _parse_content(self, html_content: str, base_url: str) -> dict:
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -8586,7 +8729,19 @@ class AsyncScrapingManager(QObject):
                     pass
             extracted_links.append({"text": link_text, "href": href})
 
+        extracted_images = []
+        for img_tag in soup.find_all('img', src=True):
+            src = img_tag['src']
+            if not src.startswith('http') and not src.startswith('//'):
+                try:
+                    from requests.compat import urljoin
+                    src = urljoin(base_url, src)
+                except Exception:
+                    pass
+            extracted_images.append({"src": src, "alt": img_tag.get('alt', '')})
+
         return {
             "extracted_text": extracted_text,
-            "extracted_links": extracted_links
+            "extracted_links": extracted_links,
+            "extracted_images": extracted_images
         }

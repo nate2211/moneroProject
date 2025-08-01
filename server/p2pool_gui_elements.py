@@ -1,24 +1,29 @@
+import base64
 import logging
 import os
 import re
+import subprocess
+import sys
 import webbrowser
 from typing import List
 import queue
 import threading
 import asyncio
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote_plus, parse_qs
 
 import requests
-from PyQt5.QtGui import QTextCursor, QIcon
+from PyQt5.QtGui import QTextCursor, QIcon, QPixmap
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
     QVBoxLayout, QHBoxLayout, QTextEdit, QListWidget, QCheckBox, QTreeWidgetItem, QTreeWidget, QTabWidget, QHeaderView, \
-    QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem
+    QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem, QSpinBox
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer, Qt
+from pygments.formatters.html import HtmlFormatter
+
 from p2pool_managers import PacketManager, AsyncNmapManager, AsyncGobusterManager, AsyncScrapingManager
 from p2pool_ai import GeminiChatBot
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, guess_lexer
-from pygments.formatters import HtmlFormatter
+
 import xml.etree.ElementTree as ET
 class AsyncWorker(QObject):
     finished = pyqtSignal()
@@ -39,10 +44,49 @@ class AsyncWorker(QObject):
             print(f"CRITICAL ERROR in application thread: {e}")
         finally:
             self.finished.emit()
+
+
+class ImageListItemWidget(QWidget):
+    def __init__(self, image_url, image_data, parent=None):
+        super().__init__(parent)
+        self.image_url = image_url
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # Image Label
+        self.image_label = QLabel()
+        self.image_label.setFixedSize(128, 128)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        pixmap = QPixmap()
+        pixmap.loadFromData(image_data)
+        self.image_label.setPixmap(pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(self.image_label)
+
+        # Info and Button Layout
+        info_layout = QVBoxLayout()
+        url_label = QLabel(f"<b>URL:</b> {self.image_url}")
+        url_label.setWordWrap(True)
+        copy_button = QPushButton("📋 Copy URL")
+        copy_button.clicked.connect(self._copy_url_to_clipboard)
+
+        info_layout.addWidget(url_label)
+        info_layout.addWidget(copy_button)
+        info_layout.addStretch()
+
+        layout.addLayout(info_layout)
+
+    def _copy_url_to_clipboard(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.image_url)
+        # Optionally, provide feedback to the user
+        print(f"Copied to clipboard: {self.image_url}")
+
+
 class ScrapingTab(QWidget):
     """
     A PyQt widget for a web scraping tool, integrating with AsyncScrapingManager.
-    Includes interactive features for extracted links.
+    Includes interactive features for extracted links and a Google search helper.
     """
     initialization_finished_signal = pyqtSignal()
     scraping_finished_signal = pyqtSignal(dict)
@@ -52,14 +96,11 @@ class ScrapingTab(QWidget):
         super().__init__(parent)
         self.logger = logger
         self.async_loop = async_worker_loop
-
-
         self.scraping_manager = AsyncScrapingManager(self.logger, self.async_loop)
 
         self._init_ui()
         self._setup_logging_and_signals()
         self._update_controls_enabled(False)
-
         self._on_initialize_manager()
 
     def _init_ui(self):
@@ -73,18 +114,53 @@ class ScrapingTab(QWidget):
         self.progress_label = QLabel("Progress: Idle")
         status_layout.addWidget(self.status_label)
         status_layout.addWidget(self.progress_label)
-        main_layout.addWidget(status_groupbox, 0, 0, 1, 2)
+        main_layout.addWidget(status_groupbox, 0, 0, 1, 1)
 
-        # URL Input
-        url_input_groupbox = QGroupBox("Target URL")
+        # URL Input & Options
+        url_input_groupbox = QGroupBox("Target URL & Options")
         url_input_layout = QHBoxLayout(url_input_groupbox)
         self.url_input = QLineEdit("https://www.google.com")
+
+        self.delay_label = QLabel("Load Delay (s):")
+        self.delay_input = QSpinBox()
+        self.delay_input.setMinimum(0)
+        self.delay_input.setMaximum(300)
+        self.delay_input.setValue(5)
+        self.delay_input.setToolTip(
+            "Seconds to wait on the page before scraping, to allow for logins or dynamic content loading.")
+
         self.scrape_button = QPushButton("🚀 Start Scrape")
         self.stop_button = QPushButton("⏹️ Stop Scrape")
+
         url_input_layout.addWidget(self.url_input)
+        url_input_layout.addWidget(self.delay_label)
+        url_input_layout.addWidget(self.delay_input)
         url_input_layout.addWidget(self.scrape_button)
         url_input_layout.addWidget(self.stop_button)
-        main_layout.addWidget(url_input_groupbox, 0, 2, 1, 2)
+        main_layout.addWidget(url_input_groupbox, 0, 1, 1, 2)
+
+        # Google Search Box
+        gsearch_groupbox = QGroupBox("Google Search")
+        gsearch_layout = QHBoxLayout(gsearch_groupbox)
+
+        self.gsearch_type_combo = QComboBox()
+        self.gsearch_type_combo.addItems(["Web Search", "Image Search"])
+
+        self.gsearch_query_input = QLineEdit()
+        self.gsearch_query_input.setPlaceholderText("Enter web search query...")
+
+        self.gsearch_page_input = QSpinBox()
+        self.gsearch_page_input.setMinimum(1)
+        self.gsearch_page_input.setMaximum(100)
+        self.gsearch_page_input.setPrefix("Page: ")
+
+        self.gsearch_button = QPushButton("🔍 Search & Scrape")
+
+        gsearch_layout.addWidget(self.gsearch_type_combo)
+        gsearch_layout.addWidget(self.gsearch_query_input)
+        gsearch_layout.addWidget(self.gsearch_page_input)
+        gsearch_layout.addWidget(self.gsearch_button)
+        main_layout.addWidget(gsearch_groupbox, 0, 3, 1, 1)
 
         # Output
         self.output_tabs = QTabWidget()
@@ -97,10 +173,13 @@ class ScrapingTab(QWidget):
         self.extracted_text_display = QTextEdit()
         self.extracted_text_display.setReadOnly(True)
         self.extracted_links_list = QListWidget()
+        self.extracted_images_list = QListWidget()
+
         self.output_tabs.addTab(self.rendered_view_display, "🌐 Rendered View (Simulated)")
         self.output_tabs.addTab(self.raw_html_display, "📝 Raw HTML")
         self.output_tabs.addTab(self.extracted_text_display, "📄 Extracted Text")
         self.output_tabs.addTab(self.extracted_links_list, "🔗 Extracted Links")
+        self.output_tabs.addTab(self.extracted_images_list, "🖼️ Extracted Images")
         main_layout.addWidget(self.output_tabs, 1, 0, 1, 4)
 
         # Logging Console
@@ -130,6 +209,7 @@ class ScrapingTab(QWidget):
 
         self.scrape_button.clicked.connect(self._on_start_scrape)
         self.stop_button.clicked.connect(self._on_stop_scrape)
+        self.gsearch_button.clicked.connect(self._on_start_google_search)
 
         self.extracted_links_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.extracted_links_list.customContextMenuRequested.connect(self._show_link_context_menu)
@@ -154,6 +234,10 @@ class ScrapingTab(QWidget):
         self.url_input.setEnabled(enabled)
         self.scrape_button.setEnabled(enabled)
         self.stop_button.setEnabled(False)
+        self.delay_input.setEnabled(enabled)
+        self.gsearch_query_input.setEnabled(enabled)
+        self.gsearch_page_input.setEnabled(enabled)
+        self.gsearch_button.setEnabled(enabled)
 
     def _on_initialize_manager(self):
         self.status_label.setText("Status: Initializing...")
@@ -178,6 +262,7 @@ class ScrapingTab(QWidget):
     @pyqtSlot()
     def _on_start_scrape(self):
         url = self.url_input.text().strip()
+        delay = self.delay_input.value()
         if not url:
             self.logger.log_message("[GUI] ❌ Please enter a URL.")
             return
@@ -186,15 +271,66 @@ class ScrapingTab(QWidget):
         self.raw_html_display.clear()
         self.extracted_text_display.clear()
         self.extracted_links_list.clear()
+        self.extracted_images_list.clear()
         self.scrape_button.setEnabled(False)
+        self.gsearch_button.setEnabled(False)
 
         asyncio.run_coroutine_threadsafe(
             self.scraping_manager.start_scrape(
                 url,
+                delay,
                 on_complete_callback=lambda data: self.scraping_finished_signal.emit(data)
             ),
             self.async_loop
         )
+
+    @pyqtSlot()
+    def _on_start_google_search(self):
+        """Constructs a Google search URL, parses one, or uses direct image URL and starts the scrape."""
+        raw_input = self.gsearch_query_input.text().strip()
+        if not raw_input:
+            self.logger.log_message("[GUI] ❌ Please enter a query, Google URL, or image URL.")
+            return
+
+        # --- Case 1: Direct image URL ---
+        if raw_input.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+            self.logger.log_message("[GUI] 📸 Detected direct image URL.")
+            self.url_input.setText(raw_input)
+            self._on_start_scrape()
+            return
+
+        # --- Case 2: Google Search URL ---
+        if raw_input.startswith("http://") or raw_input.startswith("https://"):
+            try:
+                parsed = urlparse(raw_input)
+                if "google." in parsed.netloc and "/search" in parsed.path:
+                    query_params = parse_qs(parsed.query)
+                    query = query_params.get("q", [""])[0]
+                    start = int(query_params.get("start", [0])[0])
+                    tbm = query_params.get("tbm", [""])[0]
+
+                    self.gsearch_query_input.setText(query)
+                    self.gsearch_page_input.setValue((start // 10) + 1)
+                    self.gsearch_type_combo.setCurrentText("Image Search" if tbm == "isch" else "Web Search")
+                    self.url_input.setText(raw_input)
+                    self._on_start_scrape()
+                    return
+            except Exception as e:
+                self.logger.log_message(f"[GUI] ❌ Failed to parse Google URL: {e}")
+                return
+
+        # --- Case 3: Raw Query ---
+        encoded_query = quote_plus(raw_input)
+        page_num = self.gsearch_page_input.value()
+        start_index = (page_num - 1) * 10
+        search_type = self.gsearch_type_combo.currentText()
+
+        url = f"https://www.google.com/search?q={encoded_query}&start={start_index}"
+        if search_type == "Image Search":
+            url += "&tbm=isch"
+
+        self.url_input.setText(url)
+        self._on_start_scrape()
 
     @pyqtSlot()
     def _handle_scraping_started(self):
@@ -211,6 +347,7 @@ class ScrapingTab(QWidget):
     def _handle_scraping_finished(self, scraped_data: dict):
         self.status_label.setText(f"Status: {self.scraping_manager.status.capitalize()}")
         self.scrape_button.setEnabled(True)
+        self.gsearch_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.log_timer.stop()
         self._flush_log()
@@ -241,7 +378,26 @@ class ScrapingTab(QWidget):
                 self.extracted_links_list.addItem(item)
         else:
             self.extracted_links_list.addItem("No links extracted.")
-        self.output_tabs.setCurrentIndex(3)
+
+        self.extracted_images_list.clear()
+        images = data.get("extracted_images", [])
+        if images:
+            for image_info in images:
+                if image_info.get('data'):
+                    self._add_image_to_list(image_info['src'], image_info['data'])
+        else:
+            self.extracted_images_list.addItem("No images extracted.")
+
+        self.output_tabs.setCurrentIndex(4)  # Switch to images tab
+
+    @pyqtSlot(str, bytes)
+    def _add_image_to_list(self, url, image_data):
+        """Adds a custom widget for the downloaded image to the list."""
+        item = QListWidgetItem(self.extracted_images_list)
+        widget = ImageListItemWidget(url, image_data)
+        item.setSizeHint(widget.sizeHint())
+        self.extracted_images_list.addItem(item)
+        self.extracted_images_list.setItemWidget(item, widget)
 
     @pyqtSlot()
     def _on_stop_scrape(self):
@@ -250,6 +406,7 @@ class ScrapingTab(QWidget):
         self.progress_label.setText("Progress: Stopping scrape...")
         self.stop_button.setEnabled(False)
         self.scrape_button.setEnabled(True)
+        self.gsearch_button.setEnabled(True)
 
     @pyqtSlot(QListWidgetItem)
     def _open_link_in_browser(self, item):
@@ -281,6 +438,14 @@ class ScrapingTab(QWidget):
             clipboard = QApplication.clipboard()
             clipboard.setText(url)
             self.logger.log_message(f"[GUI] ✅ Copied to clipboard: {url}")
+
+    def closeEvent(self, event):
+        """Clean up the main downloads folder on application close."""
+        self.logger.log_message("[GUI] Close event detected. Cleaning up downloads...")
+        # No longer needed as we are not saving files
+        event.accept()
+
+
 class GobusterTab(QWidget):
     initialization_finished_signal = pyqtSignal()
     # Removed scan_progress_signal
