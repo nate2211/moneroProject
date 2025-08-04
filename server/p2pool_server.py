@@ -88,7 +88,6 @@ async def application_main_loop(stop_event=None):
     flask_thread = threading.Thread(target=start_flask, daemon=True, name="FlaskServerThread")
     flask_thread.start()
     _non_qt_background_threads.append((flask_thread, None)) # Flask target doesn't have a direct stop() method
-
     p2pool_helper.router_manager = PythonRouterManager(router_logger)
     p2pool_helper.set_router_logger(router_logger)
     p2pool_helper.process_manager = ProcessManager(
