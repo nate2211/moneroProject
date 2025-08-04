@@ -11,6 +11,7 @@ from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import ARP, Ether, getmacbyip
+from scapy.layers.rip import RIPEntry, RIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet
@@ -64,32 +65,8 @@ class ICMPv6(Packet):
             cksum = in4_chksum(psd_hdr + p + pay)
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
-class RIPEntry(Packet):
-    """
-    A RIPv2 routing table entry.
-    """
-    name = "RIP Route Entry"
-    fields_desc = [
-        ShortField("af", 2),  # Address Family Identifier (2 for IP)
-        ShortField("route_tag", 0),
-        IPField("address", "0.0.0.0"),
-        IPField("subnet_mask", "0.0.0.0"),
-        IPField("next_hop", "0.0.0.0"),
-        IntField("metric", 1)
-    ]
 
 
-class RIP(Packet):
-    """
-    A RIPv2 packet.
-    """
-    name = "RIP"
-    fields_desc = [
-        ByteField("command", 1),
-        ByteField("version", 2),
-        ShortField("reserved", 0),
-        PacketListField("entries", [], RIPEntry, count_from=lambda pkt: len(pkt.entries)),
-    ]
 class StratumManager:
     """
     Monitors Stratum mining traffic (JSON-RPC over TCP).
@@ -189,11 +166,12 @@ class StratumManager:
         """Returns a snapshot of tracked miner sessions."""
         with self._lock:
             return dict(self.sessions)
-        
+
 class mDNSManager:
     """
     Manages Multicast DNS (mDNS) traffic for local service discovery.
-    Listens for announcements and stores services in a cache.
+    Listens for announcements, caches them, and forwards queries between interfaces.
+    Includes query suppression to prevent flooding.
     """
 
     # mDNS uses a specific multicast address and port
@@ -201,66 +179,120 @@ class mDNSManager:
     MDNS_IPV6_ADDR = "ff02::fb"
     MDNS_PORT = 5353
     MDNS_CACHE_TTL = 3600  # Default cache time in seconds
+    QUERY_COOLDOWN_SECONDS = 10  # Don't forward the same query from the same IP more than once every 10s
 
-    # [FIXED] The constructor now accepts dependencies needed for sending packets
     def __init__(self, router_logger, packet_writer, interfaces_config):
         self.logger = router_logger
         self.packet_writer = packet_writer
         self.interfaces_config = interfaces_config
+
+        # Service cache for responding to queries
         self._cache: Dict[Tuple[str, int], Tuple[Any, float]] = {}
         self._cache_lock = threading.Lock()
-        self.logger.log_message("[mDNS] Manager initialized. Ready for service discovery.")
 
+        # Query log for rate-limiting forwards
+        self._recent_queries: Dict[Tuple[str, int, str], float] = {}
+        self._query_log_lock = threading.Lock()
+        self._cleanup_thread = None
+        self._stop_event = threading.Event()
+
+        self.logger.log_message("[mDNS] Manager initialized. Query forwarding cooldown is active.")
+
+    def start(self):
+        """Starts the mDNS manager's background cleanup thread."""
+        self._stop_event.clear()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="mDNSCleanup")
+        self._cleanup_thread.start()
+        self.logger.log_message("[mDNS] Cleanup thread started.")
+
+    def stop(self):
+        """Stops the mDNS manager's background cleanup thread gracefully."""
+        self._stop_event.set()
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=2)
+        self.logger.log_message("[mDNS] Manager stopped.")
+
+    def _cleanup_loop(self):
+        """Periodically cleans expired services from the cache and old entries from the query log."""
+        while not self._stop_event.is_set():
+            now = time.time()
+            with self._cache_lock:
+                expired_services = [key for key, (_, expiry) in self._cache.items() if expiry <= now]
+                for key in expired_services:
+                    del self._cache[key]
+
+            with self._query_log_lock:
+                expired_queries = [
+                    key for key, timestamp in self._recent_queries.items()
+                    if (now - timestamp) > self.QUERY_COOLDOWN_SECONDS
+                ]
+                for key in expired_queries:
+                    del self._recent_queries[key]
+
+            self._stop_event.wait(30)
+
+    # [FIXED] Corrected the logical flow to remove duplicated query handling blocks.
     def handle_packet(self, packet: Packet) -> bool:
         """
         Processes an incoming packet to see if it's an mDNS announcement or query.
         Returns True if the packet was handled by this manager.
         """
-        # First, check if it's an mDNS packet
-        if not (packet.haslayer(UDP) and packet[UDP].dport == self.MDNS_PORT):
+        if not (packet.haslayer(UDP) and packet[UDP].dport == self.MDNS_PORT and packet.haslayer(DNS)):
             return False
 
-        if packet.haslayer(DNS):
-            dns_layer = packet[DNS]
+        dns_layer = packet[DNS]
 
-            # --- Case 1: Handle mDNS Queries from a local device ---
-            if dns_layer.qr == 0 and dns_layer.qd:
+        # Use if/elif to correctly handle mutually exclusive packet types (Query vs Answer)
+        if dns_layer.qr == 0 and dns_layer.qd:
+            # --- Handle Queries (qr=0) ---
+            try:
                 qname = dns_layer.qd.qname.decode()
                 qtype = dns_layer.qd.qtype
-                self.logger.log_message(f"[mDNS] ❓ Received query for '{qname}' ({qtype}) from {packet[IP].src}")
-
-                # Check cache for an answer
-                cached_answer = self.get_cached_answer(qname, qtype)
-                if cached_answer:
-                    self.logger.log_message(f"[mDNS] ✅ Answering query for '{qname}' from cache.")
-                    # [FIXED] Call the new method to send the response
-                    self._send_mdns_response(packet, qname, qtype, cached_answer)
-                else:
-                    self._forward_mdns_query(packet)
+                src_ip = packet[IPv6].src if packet.haslayer(IPv6) else packet[IP].src
+            except (IndexError, AttributeError):
+                self.logger.log_message("[mDNS] ⚠️ Received malformed mDNS query packet.")
                 return True
 
-            # --- Case 2: Handle mDNS Announcements (Answers) from a local device ---
-            if dns_layer.qr == 1 and dns_layer.an:
-                for answer in dns_layer.an:
-                    try:
-                        record_name = answer.rrname.decode()
-                        record_type = answer.type
-                        record_data = answer.rdata
+            self.logger.log_message(f"[mDNS] ❓ Received query for '{qname}' (Type: {qtype}) from {src_ip}")
 
-                        # Cache the discovered service
-                        self.cache_service(record_name, record_type, record_data, answer.ttl)
-                        self.logger.log_message(
-                            f"[mDNS] 📡 Discovered service '{record_name}' with IP '{record_data}' (TTL: {answer.ttl}s)"
-                        )
-                    except Exception as e:
-                        self.logger.log_message(f"[mDNS] ⚠️ Failed to parse DNS answer: {e}")
-                return True
+            # Perform rate-limiting check
+            now = time.time()
+            query_key = (qname, qtype, src_ip)
+            with self._query_log_lock:
+                if (now - self._recent_queries.get(query_key, 0)) < self.QUERY_COOLDOWN_SECONDS:
+                    self.logger.log_message(f"[mDNS] 🚫 Suppressing duplicate query for '{qname}' from {src_ip}.")
+                    return True
+                self._recent_queries[query_key] = now
+
+            # If not rate-limited, decide whether to answer from cache or forward
+            cached_answer = self.get_cached_answer(qname, qtype)
+            if cached_answer:
+                self.logger.log_message(f"[mDNS] ✅ Answering query for '{qname}' from cache.")
+                self._send_mdns_response(packet, qname, qtype, cached_answer)
+            else:
+                self._forward_mdns_query(packet)
+            return True
+
+        elif dns_layer.qr == 1 and dns_layer.an:
+            # --- Handle Announcements (qr=1) ---
+            for answer in dns_layer.an:
+                try:
+                    record_name = answer.rrname.decode()
+                    record_type = answer.type
+                    record_data = answer.rdata if hasattr(answer, 'rdata') else None
+
+                    self.cache_service(record_name, record_type, record_data, answer.ttl)
+                    self.logger.log_message(f"[mDNS] 📡 Discovered service: {answer.summary()}")
+                except Exception as e:
+                    self.logger.log_message(f"[mDNS] ⚠️ Failed to parse DNS answer record '{answer.summary()}': {e}")
+            return True
 
         return False
 
     def cache_service(self, name: str, record_type: int, data: Any, ttl: int):
         """Adds a service discovery record to the cache with an expiry time."""
-        expiry = time.time() + ttl
+        effective_ttl = max(ttl, 60)
+        expiry = time.time() + effective_ttl
         with self._cache_lock:
             self._cache[(name, record_type)] = (data, expiry)
 
@@ -272,6 +304,8 @@ class mDNSManager:
                 data, expiry = record
                 if time.time() < expiry:
                     return data
+                else:
+                    del self._cache[(name, record_type)]
         return None
 
     def get_services(self) -> List[Dict[str, Any]]:
@@ -286,11 +320,130 @@ class mDNSManager:
                     del self._cache[(name, rtype)]
         return active_services
 
-    # [NEW] Method to craft and send an mDNS response
-    def _send_mdns_response(self, original_packet: Packet, qname: str, qtype: int, answer_data: str):
+    # [FIXED] Updated to support PTR, TXT, and SRV records for service discovery.
+    def _send_mdns_response(self, original_packet: Packet, qname: str, qtype: int, answer_data: Any):
         """
         Builds and queues an mDNS response packet based on a cached answer.
+        Now supports A, AAAA, PTR, TXT, and SRV records.
         """
+        inbound_iface = original_packet.sniffed_on
+        iface_config = self.interfaces_config.get(inbound_iface)
+        if not iface_config:
+            self.logger.log_message(f"[mDNS] ❌ Cannot send response: Interface '{inbound_iface}' not configured.")
+            return
+
+        router_mac = iface_config.get("mac")
+        is_ipv6 = original_packet.haslayer(IPv6)
+        dns_rr = None
+
+        # Craft the DNS response record based on the query type (qtype)
+        if qtype == 1:    # A Record
+            dns_rr = DNSRR(rrname=qname, type="A", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
+        elif qtype == 12:   # PTR Record
+            dns_rr = DNSRR(rrname=qname, type="PTR", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
+        elif qtype == 16:   # TXT Record
+            # TXT rdata is often a list of strings
+            dns_rr = DNSRR(rrname=qname, type="TXT", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
+        elif qtype == 28:   # AAAA Record
+            dns_rr = DNSRR(rrname=qname, type="AAAA", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
+        elif qtype == 33:   # SRV Record
+            # SRV rdata is a complex type (priority, weight, port, target)
+            dns_rr = DNSRR(rrname=qname, type="SRV", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
+        else:
+            self.logger.log_message(f"[mDNS] ⚠️ Cannot craft response: Unsupported record type {qtype}")
+            return
+
+        # Build the full response packet
+        if is_ipv6:
+            src_ip = iface_config.get("ipv6_addr")
+            dst_ip = self.MDNS_IPV6_ADDR
+            eth_dst = "33:33:00:00:00:fb"
+        else:
+            src_ip = iface_config.get("ip_addr")
+            dst_ip = self.MDNS_IPV4_ADDR
+            eth_dst = "01:00:5e:00:00:fb"
+
+        if not src_ip or not router_mac:
+            self.logger.log_message(f"[mDNS] ❌ Cannot send response from {inbound_iface}: Missing IP or MAC.")
+            return
+
+        response_packet = Ether(src=router_mac, dst=eth_dst) / \
+                          (IPv6(src=src_ip, dst=dst_ip) if is_ipv6 else IP(src=src_ip, dst=dst_ip)) / \
+                          UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
+                          DNS(id=original_packet[DNS].id, qr=1, aa=1, qd=original_packet[DNS].qd, an=dns_rr)
+
+        self.packet_writer.queue_packet(response_packet, inbound_iface)
+        self.logger.log_message(f"[mDNS] ✅ Sent mDNS response for '{qname}' (Type: {qtype}) on {inbound_iface.split('_')[-1]}")
+
+    def _forward_mdns_query(self, original_packet: Packet):
+        """Forwards an mDNS query to all other interfaces."""
+        inbound_iface = original_packet.sniffed_on
+        try:
+            qname = original_packet[DNS].qd.qname.decode()
+        except (IndexError, AttributeError):
+            self.logger.log_message("[mDNS] ⚠️ Cannot forward: Malformed query packet.")
+            return
+
+        is_ipv6 = original_packet.haslayer(IPv6)
+        dst_mac = "33:33:00:00:00:fb" if is_ipv6 else "01:00:5e:00:00:fb"
+        dst_ip = self.MDNS_IPV6_ADDR if is_ipv6 else self.MDNS_IPV4_ADDR
+
+        for iface_name, config in self.interfaces_config.items():
+            if iface_name == inbound_iface:
+                continue
+
+            src_ip_out = config.get("ipv6_addr") if is_ipv6 else config.get("ip_addr")
+            src_mac_out = config.get("mac")
+
+            if not src_ip_out or not src_mac_out:
+                continue
+
+            l3 = IPv6(src=src_ip_out, dst=dst_ip) if is_ipv6 else IP(src=src_ip_out, dst=dst_ip)
+            forwarded_packet = Ether(src=src_mac_out, dst=dst_mac) / \
+                               l3 / \
+                               UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
+                               original_packet[DNS]
+
+            self.packet_writer.queue_packet(forwarded_packet, iface_name)
+            self.logger.log_message(f"[mDNS] 🔁 Forwarded mDNS query for '{qname}' to {iface_name.split('_')[-1]}")
+
+    def cache_service(self, name: str, record_type: int, data: Any, ttl: int):
+        """Adds a service discovery record to the cache with an expiry time."""
+        # Use a minimum TTL to avoid cache churn for very short-lived records
+        effective_ttl = max(ttl, 60)
+        expiry = time.time() + effective_ttl
+        with self._cache_lock:
+            self._cache[(name, record_type)] = (data, expiry)
+
+    def get_cached_answer(self, name: str, record_type: int) -> Optional[Any]:
+        """Retrieves an active record from the cache, if one exists."""
+        with self._cache_lock:
+            record = self._cache.get((name, record_type))
+            if record:
+                data, expiry = record
+                if time.time() < expiry:
+                    return data
+                else:  # Clean up expired entry on access
+                    del self._cache[(name, record_type)]
+        return None
+
+    def get_services(self) -> List[Dict[str, Any]]:
+        """Returns a list of all currently active services from the cache."""
+        active_services = []
+        with self._cache_lock:
+            now = time.time()
+            # Iterate over a copy of items to allow deletion
+            for (name, rtype), (data, expiry) in list(self._cache.items()):
+                if now < expiry:
+                    active_services.append({"name": name, "type": rtype, "data": data})
+                else:
+                    # Lazily remove expired items during retrieval
+                    del self._cache[(name, rtype)]
+        return active_services
+
+    def _send_mdns_response(self, original_packet: Packet, qname: str, qtype: int, answer_data: str):
+        """Builds and queues an mDNS response packet based on a cached answer."""
+        # ... (This method remains unchanged)
         inbound_iface = original_packet.sniffed_on
         iface_config = self.interfaces_config.get(inbound_iface)
 
@@ -302,18 +455,16 @@ class mDNSManager:
         router_mac = iface_config.get("mac")
         is_ipv6 = original_packet.haslayer(IPv6)
 
-        # Craft the DNS response record
-        if qtype == 1:  # A Record
+        if qtype == 1:
             dns_rr = DNSRR(rrname=qname, type="A", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        elif qtype == 28:  # AAAA Record
+        elif qtype == 28:
             dns_rr = DNSRR(rrname=qname, type="AAAA", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
         else:
             self.logger.log_message(f"[mDNS] ⚠️ Cannot craft response: Unsupported record type {qtype}")
             return
 
-        # Build the full response packet
         if is_ipv6:
-            src_ip = iface_config.get("ipv6_addr")  # Assumes ipv6_addr is configured
+            src_ip = iface_config.get("ipv6_addr")
             dst_ip = self.MDNS_IPV6_ADDR
             eth_dst = "33:33:00:00:00:fb"
             l3_packet = IPv6(src=src_ip, dst=dst_ip)
@@ -322,6 +473,10 @@ class mDNSManager:
             dst_ip = self.MDNS_IPV4_ADDR
             eth_dst = "01:00:5e:00:00:fb"
             l3_packet = IP(src=src_ip, dst=dst_ip)
+
+        if not src_ip or not router_mac:
+            self.logger.log_message(f"[mDNS] ❌ Cannot send response from {inbound_iface}: Missing IP or MAC.")
+            return
 
         response_packet = Ether(src=router_mac, dst=eth_dst) / \
                           l3_packet / \
@@ -334,17 +489,27 @@ class mDNSManager:
         self.logger.log_message(
             f"[mDNS] ✅ Sent mDNS response for '{qname}' ({qtype}) on {inbound_iface.split('_')[-1]}")
 
+    # [MODIFIED] Method now includes query suppression logic
     def _forward_mdns_query(self, original_packet: Packet):
         """
-        Forwards an mDNS query to all other interfaces except the one it came from.
-        This allows service discovery across interface boundaries.
+        Forwards an mDNS query to other interfaces, but only if it hasn't been
+        seen from the same source IP recently.
         """
         inbound_iface = original_packet.sniffed_on
-
-        # Validate the packet has required layers
-        if not original_packet.haslayer(DNS) or not original_packet.haslayer(UDP):
-            self.logger.log_message("[mDNS] ⚠️ Cannot forward: Packet missing DNS or UDP layer.")
+        if not original_packet.haslayer(DNS) or not original_packet[DNS].qd:
             return
+
+        # --- [NEW] Query Suppression Logic ---
+        try:
+            qname = original_packet[DNS].qd.qname.decode()
+            qtype = original_packet[DNS].qd.qtype
+            src_ip = original_packet[IPv6].src if original_packet.haslayer(IPv6) else original_packet[IP].src
+        except (IndexError, AttributeError):
+            self.logger.log_message("[mDNS] ⚠️ Cannot forward: Malformed query packet.")
+            return
+
+        now = time.time()
+        query_key = (qname, qtype, src_ip)
 
         is_ipv6 = original_packet.haslayer(IPv6)
         dst_mac = "33:33:00:00:00:fb" if is_ipv6 else "01:00:5e:00:00:fb"
@@ -352,27 +517,23 @@ class mDNSManager:
 
         for iface_name, config in self.interfaces_config.items():
             if iface_name == inbound_iface:
-                continue  # Skip original interface
-
-            src_ip = config.get("ipv6_addr") if is_ipv6 else config.get("ip_addr")
-            src_mac = config.get("mac")
-
-            if not src_ip or not src_mac:
-                self.logger.log_message(f"[mDNS] ⚠️ Skipping {iface_name}: Missing IP or MAC.")
                 continue
 
-            # Build appropriate IP layer
-            l3 = IPv6(src=src_ip, dst=dst_ip) if is_ipv6 else IP(src=src_ip, dst=dst_ip)
+            src_ip_out = config.get("ipv6_addr") if is_ipv6 else config.get("ip_addr")
+            src_mac_out = config.get("mac")
 
-            # Craft forwarded packet
-            forwarded_packet = Ether(src=src_mac, dst=dst_mac) / \
+            if not src_ip_out or not src_mac_out:
+                continue
+
+            l3 = IPv6(src=src_ip_out, dst=dst_ip) if is_ipv6 else IP(src=src_ip_out, dst=dst_ip)
+            forwarded_packet = Ether(src=src_mac_out, dst=dst_mac) / \
                                l3 / \
                                UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
                                original_packet[DNS]
 
             self.packet_writer.queue_packet(forwarded_packet, iface_name)
             self.logger.log_message(
-                f"[mDNS] 🔁 Forwarded mDNS query '{original_packet[DNS].qd.qname.decode()}' to {iface_name.split('_')[-1]}")
+                f"[mDNS] 🔁 Forwarded mDNS query for '{qname}' to {iface_name.split('_')[-1]}")
 
 HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
 
@@ -1008,61 +1169,72 @@ class RIPManager:
     def handle_packet(self, pkt: Packet, inbound_ifname: str):
         """Processes an incoming RIP packet with detailed logging."""
         self.router_logger.log_message(f"[RIP] Received packet on {inbound_ifname.split('_')[-1]}: {pkt.summary()}")
+        try:
+            rip = pkt[RIP]
+            if not rip:
+                self.router_logger.log_message("[RIP] Ignored packet with no RIP layer.")
+                return
 
-        rip = pkt.getlayer(RIP)
-        if not rip:
-            self.router_logger.log_message("[RIP] Ignored packet with no RIP layer.")
-            return
+            if not self._validate_rip_packet(pkt):
+                return  # Drop if authentication fails
 
-        if not self._validate_rip_packet(pkt):
-            return  # Drop if authentication fails
+            if rip.command == 1:  # RIP request
+                self.router_logger.log_message(f"[RIP] Ignoring RIP request from {pkt[IP].src}")
+                return
+            if rip.command != 2:  # Not a response
+                self.router_logger.log_message(
+                    f"[RIP] Ignored non-response/request RIP packet (command={rip.command}) from {pkt[IP].src}")
+                return
 
-        if rip.command == 1:  # RIP request
-            self.router_logger.log_message(f"[RIP] Ignoring RIP request from {pkt[IP].src}")
-            return
-        if rip.command != 2:  # Not a response
-            self.router_logger.log_message(
-                f"[RIP] Ignored non-response/request RIP packet (command={rip.command}) from {pkt[IP].src}")
-            return
+            src_router = pkt[IP].src
+            changed = False
+            with self._rt_lock:
+                for i, entry in enumerate(rip.entries):
+                    entry_net = f"{entry.address}/{entry.subnet_mask}"
+                    net = ipaddress.ip_network(entry_net, strict=False)
 
-        src_router = pkt[IP].src
-        changed = False
-        with self._rt_lock:
-            for i, entry in enumerate(rip.entries):
-                entry_net = f"{entry.address}/{entry.subnet_mask}"
-                net = ipaddress.ip_network(entry_net, strict=False)
+                    cost = min(entry.metric + 1, 16)
+                    current_route = self._routing_table.get(net)
 
-                cost = min(entry.metric + 1, 16)
-                current_route = self._routing_table.get(net)
+                    # Route Update Logic (prioritizes static routes)
+                    if current_route:
+                        # If existing route is static, do not override unless the RIP cost is *significantly* better
+                        # (and even then, in real routers, static routes are very sticky).
+                        # For simplicity, a static route is not updated by RIP unless it's gone or invalid.
+                        if current_route["type"] == "static":
+                            if cost < current_route["cost"] and cost < 16:  # RIP route is better than static
+                                self.router_logger.log_message(
+                                    f"[RIP] ⚠️ Static route {net} may be overridden by RIP from {src_router} (cost {cost} < {current_route['cost']}). This is unusual for static routes. Ignoring for now.")
+                                continue  # Static routes are generally not overridden by dynamic protocols.
+                            else:
+                                self.router_logger.log_message(f"[RIP] ℹ️ Skipping RIP update for static route {net}.")
+                                continue  # Don't update static routes via RIP
 
-                # Route Update Logic (prioritizes static routes)
-                if current_route:
-                    # If existing route is static, do not override unless the RIP cost is *significantly* better
-                    # (and even then, in real routers, static routes are very sticky).
-                    # For simplicity, a static route is not updated by RIP unless it's gone or invalid.
-                    if current_route["type"] == "static":
-                        if cost < current_route["cost"] and cost < 16:  # RIP route is better than static
+                        # Update if from same source (RIP neighbor) or if RIP provides a better path
+                        if current_route["advertised_by"] == src_router:
+                            # Update existing RIP route from this neighbor
+                            if current_route["cost"] != cost:
+                                self.router_logger.log_message(
+                                    f"[RIP] 🔄 Route update: {net} via {src_router} (cost changed {current_route['cost']}→{cost})")
+                            current_route["cost"] = cost
+                            current_route["last_update"] = time.time()
+                            current_route[
+                                "interface"] = inbound_ifname  # Update interface if RIP update came via different path
+                            changed = True
+                        elif cost < current_route["cost"]:  # RIP provides a better path from a different source
                             self.router_logger.log_message(
-                                f"[RIP] ⚠️ Static route {net} may be overridden by RIP from {src_router} (cost {cost} < {current_route['cost']}). This is unusual for static routes. Ignoring for now.")
-                            continue  # Static routes are generally not overridden by dynamic protocols.
-                        else:
-                            self.router_logger.log_message(f"[RIP] ℹ️ Skipping RIP update for static route {net}.")
-                            continue  # Don't update static routes via RIP
-
-                    # Update if from same source (RIP neighbor) or if RIP provides a better path
-                    if current_route["advertised_by"] == src_router:
-                        # Update existing RIP route from this neighbor
-                        if current_route["cost"] != cost:
-                            self.router_logger.log_message(
-                                f"[RIP] 🔄 Route update: {net} via {src_router} (cost changed {current_route['cost']}→{cost})")
-                        current_route["cost"] = cost
-                        current_route["last_update"] = time.time()
-                        current_route[
-                            "interface"] = inbound_ifname  # Update interface if RIP update came via different path
-                        changed = True
-                    elif cost < current_route["cost"]:  # RIP provides a better path from a different source
-                        self.router_logger.log_message(
-                            f"[RIP] ✨ Better route found: {net} via {src_router} (cost improved {current_route['cost']}→{cost})")
+                                f"[RIP] ✨ Better route found: {net} via {src_router} (cost improved {current_route['cost']}→{cost})")
+                            self._routing_table[net] = {
+                                "next_hop": src_router,
+                                "cost": cost,
+                                "interface": inbound_ifname,
+                                "advertised_by": src_router,
+                                "last_update": time.time(),
+                                "type": "rip"  # NEW: Route type
+                            }
+                            changed = True
+                        # If cost is higher or equal, and not from the same source, do nothing (keep current route).
+                    elif cost < 16:  # New route and not infinity
                         self._routing_table[net] = {
                             "next_hop": src_router,
                             "cost": cost,
@@ -1071,24 +1243,16 @@ class RIPManager:
                             "last_update": time.time(),
                             "type": "rip"  # NEW: Route type
                         }
+                        self.router_logger.log_message(
+                            f"[RIP] ✅ New RIP route discovered: {net} via {src_router} (cost={cost})")
                         changed = True
-                    # If cost is higher or equal, and not from the same source, do nothing (keep current route).
-                elif cost < 16:  # New route and not infinity
-                    self._routing_table[net] = {
-                        "next_hop": src_router,
-                        "cost": cost,
-                        "interface": inbound_ifname,
-                        "advertised_by": src_router,
-                        "last_update": time.time(),
-                        "type": "rip"  # NEW: Route type
-                    }
-                    self.router_logger.log_message(
-                        f"[RIP] ✅ New RIP route discovered: {net} via {src_router} (cost={cost})")
-                    changed = True
 
-        if changed:
-            self.router_logger.log_message(f"[RIP] Routing table updated by neighbor {src_router}.")
-
+            if changed:
+                self.router_logger.log_message(f"[RIP] Routing table updated by neighbor {src_router}.")
+        except Exception as e:
+            # This catch block handles the case where haslayer() was true but dissection fails.
+            self.router_logger.log_message(f"[RIP] Ignored packet: RIP or IP layer not found on full dissection. {e}")
+            return
     def _summarize_routes(self, routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Attempts to summarize routes to reduce the number of advertised entries.
@@ -1191,8 +1355,8 @@ class RIPManager:
                         metric_to_advertise = 16  # Poison reverse
 
                     entries.append(RIPEntry(
-                        address=str(net.network_address),
-                        subnet_mask=str(net.netmask),
+                        addr=str(net.network_address),  # Corrected from 'address'
+                        mask=str(net.netmask),  # Corrected from 'subnet_mask'
                         metric=metric_to_advertise
                     ))
 
@@ -1200,9 +1364,10 @@ class RIPManager:
                 continue
 
             rip_packet = Ether(src=cfg["mac"], dst="01:00:5e:00:00:09") / \
-                         IP(src=cfg["ip_addr"], dst=self.RIP_MCAST_ADDR) / \
-                         UDP(sport=self.RIP_PORT, dport=self.RIP_PORT) / \
-                         RIP(command=2, version=2, entries=entries)
+                         IP(src=cfg["ip_addr"], dst="224.0.0.9") / \
+                         UDP(sport=520, dport=520) / \
+                         RIP(cmd=2, version=2) / \
+                         entries
 
             # Add authentication data if configured (simple append to UDP payload)
             if self.authentication_key:
@@ -1726,6 +1891,8 @@ class DNSManager:
         self.DNS_CACHE_MAX_ENTRIES = 1000
         self._conditional_forwarders = {}
         self._dns_blacklist = set()
+        self.router_logger.log_message("[DNS] Manager initialized.  ")
+
 
     def add_conditional_forwarder(self, domain_suffix: str, dns_server_ip: str):
         """Adds a conditional DNS forwarder."""
@@ -2283,6 +2450,7 @@ class DHCPServer:
     Assigns IP addresses from a defined pool to requesting clients.
     Enhanced with lease persistence and DHCP relay agent capabilities for both IPv4 and IPv6.
     """
+
     def __init__(self, router_logger, packet_writer, router_in_interface_name: str, dhcp_pool_start: str,
                  dhcp_pool_end: str, interfaces_config: dict, dhcp_relay_target_ip: str = None,
                  dhcp6_prefix: str = None, dhcp6_relay_target_ip: str = None):
@@ -2295,6 +2463,8 @@ class DHCPServer:
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
         self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}
+        self.dynamic_ip_pool = list(self._generate_ip_pool(self.lease_pool_start, self.lease_pool_end))
+        self._static_leases: Dict[str, ipaddress.IPv4Address] = {}
         self._lease_lock = threading.Lock()
         self.LEASE_DURATION_SECONDS = 3600
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
@@ -2313,7 +2483,13 @@ class DHCPServer:
             f"[DHCP] Server initialized. DHCPv4 Relay target: {self.dhcp_relay_target_ip if self.dhcp_relay_target_ip else 'None'}. "
             f"DHCPv6 Prefix: {self.dhcp6_prefix if self.dhcp6_prefix else 'None'}. DHCPv6 Relay target: {self.dhcp6_relay_target_ip if self.dhcp6_relay_target_ip else 'None'}")
 
-
+    def _generate_ip_pool(self, start: ipaddress.IPv4Address, end: ipaddress.IPv4Address):
+        """Generate all usable IPs in the DHCP range."""
+        current = int(start)
+        end_int = int(end)
+        while current <= end_int:
+            yield ipaddress.IPv4Address(current)
+            current += 1
     def get_ip_to_mac_bindings(self) -> Dict[str, str]:
         """
         Returns a thread-safe copy of the current IP-to-MAC lease bindings.
@@ -2352,32 +2528,42 @@ class DHCPServer:
                     self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired and removed.")
             self._stop_event.wait(60)
 
+
     def _assign_ip(self, client_mac: str) -> ipaddress.IPv4Address | None:
-        """
-        Assigns an available IPv4 address from the pool by checking the internal lease table.
-        """
-        self.logger.log_message(f"[DHCPv4] Assigning IP for {client_mac}")
+        """Assigns an IP address, prioritizing static leases over the dynamic pool."""
+        norm_mac = client_mac.lower()
+        self.logger.log_message(f"[DHCP] Assigning IP for {norm_mac}")
+
         with self._lease_lock:
-            # 1. Check if the client already has an active lease to renew.
-            if client_mac in self._leases:
-                assigned_ip, expiry = self._leases[client_mac]
+            # 1. Check for a static lease assignment first.
+            if norm_mac in self._static_leases:
+                static_ip = self._static_leases[norm_mac]
+                for mac, (ip, expiry) in self._leases.items():
+                    if ip == static_ip and mac != norm_mac and time.time() < expiry:
+                        self.logger.log_message(f"[DHCP] ❌ Static IP conflict! {static_ip} is currently leased to {mac}.")
+                        return None
+                self._leases[norm_mac] = (static_ip, time.time() + self.LEASE_DURATION_SECONDS)
+                self.logger.log_message(f"[DHCP] 📌 Assigned static IP {static_ip} to {norm_mac}.")
+                return static_ip
+
+            # 2. Check for an existing dynamic lease to renew.
+            if norm_mac in self._leases:
+                assigned_ip, expiry = self._leases[norm_mac]
                 if time.time() < expiry:
-                    self._leases[client_mac] = (assigned_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCPv4] 🏠 Renewed lease for {assigned_ip} to {client_mac}")
+                    self._leases[norm_mac] = (assigned_ip, time.time() + self.LEASE_DURATION_SECONDS)
+                    self.logger.log_message(f"[DHCP] 🏠 Renewed dynamic lease for {assigned_ip} to {norm_mac}")
                     return assigned_ip
 
-            # 2. Find the next available IP address in the pool.
+            # 3. Find an available IP in the dynamic pool.
             leased_ips = {ip for ip, _ in self._leases.values()}
-            for i in range(int(self.lease_pool_end) - int(self.lease_pool_start) + 1):
-                potential_ip = self.lease_pool_start + i
-                if potential_ip not in leased_ips:
-                    # IP is not in our lease table, so we can assign it.
-                    self._leases[client_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCPv4] 💻 Assigned new IP {potential_ip} to {client_mac}.")
+            statically_reserved_ips = set(self._static_leases.values())
+            for potential_ip in self.dynamic_ip_pool:
+                if potential_ip not in leased_ips and potential_ip not in statically_reserved_ips:
+                    self._leases[norm_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
+                    self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {potential_ip} to {norm_mac}.")
                     return potential_ip
 
-        # 3. If no IP was found after checking the entire pool.
-        self.logger.log_message(f"[DHCPv4] ❌ No available IP addresses in pool for {client_mac}.")
+        self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
         return None
 
     def handle_packet(self, pkt: Packet, inbound_iface: str, find_route_function) -> bool:
@@ -2396,10 +2582,10 @@ class DHCPServer:
         if not router_in_ip or not router_in_mac:
             # IPv6 address is optional for DHCPv4 only environments
             if pkt.haslayer(DHCP6) and not router_in_ipv6:
-                self.logger.log_message(f"[DHCPv6] Error: IN interface '{self.in_iface}' missing IPv6 address.")
+                self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' missing IPv6 address.")
                 return False
             if pkt.haslayer(DHCP) and (not router_in_ip or not router_in_mac):
-                self.logger.log_message(f"[DHCPv4] Error: IN interface '{self.in_iface}' missing IP or MAC in configuration.")
+                self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' missing IP or MAC in configuration.")
                 return False
 
         # --- Check for DHCPv4 or DHCPv6 packets ---
@@ -2420,22 +2606,22 @@ class DHCPServer:
                 raw_mac = bootp_layer.chaddr[:6]
                 client_mac = ":".join(f"{b:02x}" for b in raw_mac)
             except (TypeError, IndexError):
-                self.logger.log_message("[DHCPv4] Received malformed DHCP packet with invalid chaddr. Ignoring.")
+                self.logger.log_message("[DHCP] Received malformed DHCP packet with invalid chaddr. Ignoring.")
                 return True
 
             dhcp_message_type = next(
                 (opt[1] for opt in dhcp_layer.options if isinstance(opt, tuple) and opt[0] == 'message-type'), None)
             if not dhcp_message_type:
                 self.logger.log_message(
-                    f"[DHCPv4] Received DHCP packet from {client_mac} but no message-type option. Ignoring.")
+                    f"[DHCP] Received DHCP packet from {client_mac} but no message-type option. Ignoring.")
                 return True
 
             self.logger.log_message(
-                f"[DHCPv4] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
+                f"[DHCP] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
 
             # DHCPv4 Relay Agent logic
             if self.dhcp_relay_target_ip:
-                self.logger.log_message(f"[DHCPv4] Relaying packet from {client_mac} to {self.dhcp_relay_target_ip}.")
+                self.logger.log_message(f"[DHCP] Relaying packet from {client_mac} to {self.dhcp_relay_target_ip}.")
                 # Forward the packet to the relay target
                 relay_packet = IP(src=router_in_ip, dst=self.dhcp_relay_target_ip) / \
                                UDP(sport=67, dport=67) / pkt[BOOTP] / pkt[DHCP]
@@ -2465,9 +2651,9 @@ class DHCPServer:
                     reply_packet = Ether(src=router_in_mac,
                                          dst="ff:ff:ff:ff:ff:ff") / offer_l3 if not is_loopback_request else offer_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                    self.logger.log_message(f"[DHCPv4] 📝 Sent DHCP Offer for {assigned_ip} to {client_mac}")
+                    self.logger.log_message(f"[DHCP] 📝 Sent DHCP Offer for {assigned_ip} to {client_mac}")
                 else:
-                    self.logger.log_message(f"[DHCPv4] 🚫 No IP available for {client_mac}, dropping Discover.")
+                    self.logger.log_message(f"[DHCP] 🚫 No IP available for {client_mac}, dropping Discover.")
                 return True
             elif dhcp_message_type == 3:  # DHCP Request
                 assigned_ip = self._assign_ip(client_mac)
@@ -2489,7 +2675,7 @@ class DHCPServer:
                     reply_packet = Ether(src=router_in_mac,
                                          dst=pkt[Ether].src) / ack_l3 if not is_loopback_request else ack_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                    self.logger.log_message(f"[DHCPv4] 🛰️ Sent DHCP ACK for {assigned_ip} to {client_mac}")
+                    self.logger.log_message(f"[DHCP] 🛰️ Sent DHCP ACK for {assigned_ip} to {client_mac}")
                 else:
                     nak_l3 = IP(src=router_in_ip, dst='255.255.255.255') / \
                              UDP(sport=67, dport=68) / \
@@ -2498,13 +2684,13 @@ class DHCPServer:
                     reply_packet = Ether(src=router_in_mac,
                                          dst="ff:ff:ff:ff:ff:ff") / nak_l3 if not is_loopback_request else nak_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                    self.logger.log_message(f"[DHCPv4] 🚫 Sent DHCP NAK to {client_mac} (no IP available or valid).")
+                    self.logger.log_message(f"[DHCP] 🚫 Sent DHCP NAK to {client_mac} (no IP available or valid).")
                 return True
 
         # --- DHCPv6 Handling ---
         elif is_dhcpv6:
             if not self.dhcp6_prefix:
-                self.logger.log_message("[DHCPv6] DHCPv6 is disabled. Ignoring packet.")
+                self.logger.log_message("[DHCP] DHCPv6 is disabled. Ignoring packet.")
                 return False
 
             dhcp6_layer = pkt[DHCP6]
@@ -2521,14 +2707,14 @@ class DHCPServer:
                     break
 
             if not client_duid:
-                self.logger.log_message("[DHCPv6] Received DHCPv6 packet without a client DUID. Ignoring.")
+                self.logger.log_message("[DHCP] Received DHCPv6 packet without a client DUID. Ignoring.")
                 return True
 
-            self.logger.log_message(f"[DHCPv6] 📨 Received DHCPv6 type {dhcp6_msg_type} from DUID: {client_duid.hex()}")
+            self.logger.log_message(f"[DHCP] 📨 Received DHCPv6 type {dhcp6_msg_type} from DUID: {client_duid.hex()}")
 
             # DHCPv6 Relay Agent logic
             if self.dhcp6_relay_target_ip:
-                self.logger.log_message(f"[DHCPv6] Relaying packet from DUID {client_duid.hex()} to {self.dhcp6_relay_target_ip}.")
+                self.logger.log_message(f"[DHCP] Relaying packet from DUID {client_duid.hex()} to {self.dhcp6_relay_target_ip}.")
                 # Construct and forward a DHCP6_RelayForward packet.
                 # This requires more complex parsing of the original packet.
                 relay_forward_packet = DHCP6_RelayForward(
@@ -2557,7 +2743,7 @@ class DHCPServer:
                                    DHCP6_Advertise(trid=dhcp6_layer.trid, options=dhcp6_options)
 
                 self.packet_writer.queue_packet(advertise_packet, self.in_iface)
-                self.logger.log_message(f"[DHCPv6] 📝 Sent DHCPv6 Advertise with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
+                self.logger.log_message(f"[DHCP] 📝 Sent DHCPv6 Advertise with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
                 return True
 
             elif dhcp6_msg_type == 3: # REQUEST
@@ -2573,7 +2759,7 @@ class DHCPServer:
                                DHCP6_Reply(trid=dhcp6_layer.trid, options=dhcp6_options)
 
                 self.packet_writer.queue_packet(reply_packet, self.in_iface)
-                self.logger.log_message(f"[DHCPv6] 🛰️ Sent DHCPv6 Reply with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
+                self.logger.log_message(f"[DHCP] 🛰️ Sent DHCPv6 Reply with prefix {self.dhcp6_prefix} to DUID {client_duid.hex()}")
                 return True
 
         return True

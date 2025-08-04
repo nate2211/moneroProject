@@ -1621,6 +1621,12 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
         self.dhcp_in_checkbox.setChecked(True)
 
+        self.router_ip_in_input = QLineEdit()
+        self.router_ip_in_input.setPlaceholderText("(optional)")
+
+        self.router_netmask_in_input = QLineEdit()
+        self.router_netmask_in_input.setText("255.255.255.0")  # Default netmask
+
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
 
@@ -1641,9 +1647,15 @@ class RouterTab(QWidget):
         control_layout = QHBoxLayout()
         control_layout.addWidget(self.start_router_button)
         control_layout.addWidget(self.stop_router_button)
+        control_layout.addWidget(QLabel("Manual LAN IP:"))
+        control_layout.addWidget(self.router_ip_in_input)
+        control_layout.addWidget(QLabel("Netmask:"))
+        control_layout.addWidget(self.router_netmask_in_input)
         control_layout.addWidget(self.dhcp_out_checkbox)
         control_layout.addWidget(self.dhcp_in_checkbox)
         control_layout.addStretch(1)
+
+
 
         # --- Pane Add/Remove Row ---
         pane_layout = QHBoxLayout()

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import ctypes
 import os
+import platform
 import queue
 import socket
 import string
@@ -43,14 +44,14 @@ from scapy.layers.kerberos import (Kerberos)
 from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
-    LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, MLDReport, MLDDone, RIP, \
-    RIPEntry, mDNSManager, StratumManager
+    LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, MLDReport, MLDDone, mDNSManager, \
+    StratumManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
 from p2pool_tools import ParallelPythonTool
 
-packet_queue = queue.Queue(maxsize=5)
+
 
 class PythonRouterManager:
 
@@ -138,6 +139,7 @@ class PythonRouterManager:
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.isakmp_manager = None
+
         self.stratum_manager = StratumManager(router_logger)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
@@ -518,7 +520,8 @@ class PythonRouterManager:
                     setattr(manager, 'sniffer', self.sniffer)
                     self.router_logger.log_message(f"[Sniffer] -> Injected sniffer into {manager.__class__.__name__}")
 
-    def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in):
+    def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
+                             router_netmask_in: str = "255.255.255.0"):
         """
         Automatically finds and configures IN, OUT, and Loopback interfaces.
         Sets their IP addresses dynamically (for IN/OUT) and determines default gateway.
@@ -659,18 +662,37 @@ class PythonRouterManager:
         self.router_gateway_out_ip = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
 
         # For IN interface: dynamically find an unused private subnet
-        unused_in_ip = self._find_unused_private_subnet(system_active_networks)
-        if unused_in_ip:
-            self.router_ip_in = unused_in_ip
-            self.router_netmask_in = "255.255.255.0"
-            self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}", strict=False)
-            self.router_logger.log_message(
-                f"[Router] Dynamically assigned IP for IN interface '{self.interface_in_friendly_name}': {self.router_ip_in}/{self.router_netmask_in}")
+        # --- [MODIFIED] Configuration for IN interface ---
+        if router_ip_in:
+            try:
+                # Validate the provided IP and assign it
+                ipaddress.ip_address(router_ip_in)  # Throws ValueError if invalid
+                self.router_ip_in = router_ip_in
+                self.router_netmask_in = router_netmask_in
+                self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}",
+                                                              strict=False)
+                self.router_logger.log_message(
+                    f"[Router] Using user-provided IP for IN interface '{self.interface_in_friendly_name}': {self.router_ip_in}/{self.router_netmask_in}")
+            except ValueError:
+                self.router_logger.log_message(
+                    f"[Router] CRITICAL ERROR: The provided IP for the IN interface '{router_ip_in}' is not valid.")
+                return False
         else:
+            # Fallback to the original dynamic assignment logic if no IP was provided
             self.router_logger.log_message(
-                "[Router] CRITICAL ERROR: Failed to assign IP to IN interface. Routing may not work.")
-            return False  # Cannot proceed without IN IP
-
+                "[Router] No IP provided for IN interface. Dynamically assigning one...")
+            unused_in_ip = self._find_unused_private_subnet(system_active_networks)
+            if unused_in_ip:
+                self.router_ip_in = unused_in_ip
+                self.router_netmask_in = "255.255.255.0"
+                self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}",
+                                                              strict=False)
+                self.router_logger.log_message(
+                    f"[Router] Dynamically assigned IP for IN interface '{self.interface_in_friendly_name}': {self.router_ip_in}/{self.router_netmask_in}")
+            else:
+                self.router_logger.log_message(
+                    "[Router] CRITICAL ERROR: Failed to assign any IP to IN interface.")
+                return False
         # Step 3: Assign IPs to interfaces using OS commands (netsh for Windows)
         self.router_logger.log_message(
             "[Router] Assigning IPs to interfaces via OS commands (Requires Admin). This may cause temporary network disruption.")
@@ -841,10 +863,10 @@ class PythonRouterManager:
                 gateway_mac = self.arp_manager.resolve(self.router_gateway_out_ip, self.interface_out_full_name)
                 if gateway_mac:
                     self.add_static_arp_entry(self.router_gateway_out_ip, gateway_mac)
-                    self.router_logger.log_message(
-                        f"[Router][ARP] 📌 Added static ARP entry for gateway {self.router_gateway_out_ip} → {gateway_mac}")
             except Exception as e:
                 self.router_logger.log_message(f"[Router][ARP] ⚠️ Failed to resolve gateway MAC: {e}")
+        if self.router_ip_in:
+            self.add_static_arp_entry(self.router_ip_in,self._interfaces_config[self.interface_in_full_name]['mac'])
 
         # NEW: Add Loopback interface to config if found
         if self.interface_loopback_full_name:
@@ -910,63 +932,93 @@ class PythonRouterManager:
             f"  External Gateway: {self.router_gateway_out_ip} via '{self.interface_out_friendly_name}'")
         self.router_logger.log_message(f"----------------------------------------------------------------")
         return True
+
     def _enable_nat_forwarding(self):
         """
         Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
         This makes the operation idempotent and resilient to crashes.
+        Falls back or warns if the OS does not support New-NetNat (e.g., Windows Home).
         """
+        if platform.system() != "Windows":
+            self.router_logger.log_message("[NAT Setup] ❌ NAT setup is only supported on Windows.")
+            return
+
         if not self.router_network_in:
             self.router_logger.log_message("[NAT Setup] ⚠️ Cannot enable NAT: IN network is not configured.")
             return
 
-        # --- Step 1: Unconditionally clean up any previous NAT rules ---
-        # This prevents errors caused by stale configurations from a previous run.
-        self._disable_nat_forwarding()
+        # --- Check Windows Edition ---
+        try:
+            edition_output = subprocess.check_output(
+                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
+                text=True
+            ).strip()
 
-        # --- Step 2: Create the new NAT rule ---
+            unsupported_skus = {"101", "100", "103", "104"}  # Known Home/Starter SKUs
+
+            if edition_output in unsupported_skus:
+                self.router_logger.log_message("[NAT Setup] 🏠 Windows Home or unsupported edition detected.")
+                return
+        except Exception as e:
+            self.router_logger.log_message(f"[NAT Setup] ⚠️ Could not determine Windows edition: {e}")
+
         lan_network_cidr = str(self.router_network_in)
         self.router_logger.log_message(f"[NAT Setup] 🚀 Enabling NAT for network {lan_network_cidr}...")
-
         ps_command = [
             "powershell.exe",
             "-Command",
             f'New-NetNat -Name "PythonRouterNAT" -InternalIPInterfaceAddressPrefix "{lan_network_cidr}"'
         ]
-
         try:
-            # Run the command. It requires administrator privileges.
             result = subprocess.run(ps_command, capture_output=True, text=True, check=True,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
             self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding enabled successfully.")
             if result.stdout:
                 self.router_logger.log_message(f"[NAT Setup] PowerShell output: {result.stdout.strip()}")
-
         except subprocess.CalledProcessError as e:
-            # After the cleanup step, an error here indicates a more serious problem.
-            self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
+            if "0x80041010" in e.stderr:
+                self.router_logger.log_message("[NAT Setup] ❌ New-NetNat is not supported on this Windows edition.")
+            else:
+                self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
             self.router_logger.log_message(
                 "[NAT Setup] ℹ️ Please ensure this script is run with Administrator privileges.")
         except FileNotFoundError:
             self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
         except Exception as e:
             self.router_logger.log_message(f"[NAT Setup] ❌ An unexpected error occurred while enabling NAT: {e}")
+
     def _disable_nat_forwarding(self):
         """
-        Removes the NAT forwarding rule created by the router.
+        Removes the NAT forwarding rule created by the router, but only if running
+        on a supported edition (Windows Pro or higher).
         """
         self.router_logger.log_message("[NAT Setup] 🧹 Disabling NAT forwarding...")
 
-        # The PowerShell command to remove the NAT rule by the name we gave it.
-        # -Confirm:$false prevents it from asking "Are you sure?"
+        if platform.system() != "Windows":
+            self.router_logger.log_message("[NAT Setup] ❌ NAT disabling is only supported on Windows.")
+            return
+
+        try:
+            # Check if the system is a supported SKU (i.e., not Home/Starter)
+            edition_output = subprocess.check_output(
+                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
+                text=True
+            ).strip()
+            unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
+            if edition_output in unsupported_skus:
+                self.router_logger.log_message("[NAT Setup] 🛑 Skipping NAT disable: unsupported Windows edition.")
+                return
+        except Exception as e:
+            self.router_logger.log_message(
+                f"[NAT Setup] ⚠️ Could not determine Windows edition. Skipping NAT disable. Reason: {e}")
+            return
         ps_command = [
             "powershell.exe",
             "-Command",
             'Remove-NetNat -Name "PythonRouterNAT" -Confirm:$false'
         ]
-
         try:
             subprocess.run(ps_command, capture_output=True, text=True, check=False,
-                           # check=False to ignore errors if rule doesn't exist
                            creationflags=subprocess.CREATE_NO_WINDOW)
             self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding rule removed (if it existed).")
         except Exception as e:
@@ -997,34 +1049,12 @@ class PythonRouterManager:
         return True
 
     def _start_single_sniffer(self, iface_name: str):
-        global packet_queue
-        """Starts a sniffer thread + processing worker pool for a given interface."""
-        RATE_LIMIT_PACKETS_PER = 5  # Can be any float value
-        TOKEN_BUCKET = {"tokens": RATE_LIMIT_PACKETS_PER, "last_refill": time.time()}
-        TOKEN_BUCKET_LOCK = threading.Lock()
-
-        def refill_tokens():
-            with TOKEN_BUCKET_LOCK:
-                now = time.time()
-                elapsed = now - TOKEN_BUCKET["last_refill"]
-                TOKEN_BUCKET["last_refill"] = now
-
-                # Accumulate tokens with float precision
-                TOKEN_BUCKET["tokens"] += elapsed * RATE_LIMIT_PACKETS_PER
-                # Optional: set a max burst limit (e.g., allow up to 5 tokens max)
-                TOKEN_BUCKET["tokens"] = min(TOKEN_BUCKET["tokens"], 5.0)
-
-        def consume_token() -> bool:
-            refill_tokens()
-            with TOKEN_BUCKET_LOCK:
-                if TOKEN_BUCKET["tokens"] >= 1.0:
-                    TOKEN_BUCKET["tokens"] -= 1.0
-                    return True
-                return False
+        """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
         friendly_name_for_filter = next(
             (item['friendly_name'] for item in self._discovered_tshark_interfaces if item['full_name'] == iface_name),
-            'DEFAULT')
+            'DEFAULT'
+        )
         filter_clauses = self.BPF_FILTER_BASE_DEFINITIONS.get(friendly_name_for_filter,
                                                               self.BPF_FILTER_BASE_DEFINITIONS.get("DEFAULT", []))
         filter_str = " or ".join(f"({clause})" for clause in filter_clauses) if filter_clauses else ""
@@ -1032,10 +1062,22 @@ class PythonRouterManager:
         def sniffer_loop(name=iface_name):
             self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[-1]} starting...")
 
+            def direct_process(pkt):
+                try:
+                    if not pkt.haslayer(Ether):
+                        return
+                    if len(pkt) < 14 or len(pkt) > 65535:
+                        return
+                    self._process_packet(pkt, iface_name)
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.router_logger.log_message(f"[Sniffer] ❗ Error in direct packet processing: {e}\n{tb}")
+
             try:
                 self.sniffer.sniff(
                     iface=name,
-                    prn=lambda pkt: safe_enqueue(pkt),
+                    prn=direct_process,
                     promisc=True,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
@@ -1047,79 +1089,43 @@ class PythonRouterManager:
             finally:
                 self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[-1]} has exited.")
 
-        def packet_worker():
-            while not self._stop_sniffing_event.is_set():
-                try:
-                    pkt = packet_queue.get(timeout=1)
-                    self._process_packet(pkt, iface_name)
-                except queue.Empty:
-                    continue  # Normal timeout behavior
-                except Exception as e:
-                    import traceback
-                    tb = traceback.format_exc()
-                    self.router_logger.log_message(f"[Worker] ❌ Error processing packet:\n{tb}")
-
-        def safe_enqueue(pkt):
-            """
-            Safely adds a packet to the queue. If the queue is full,
-            it processes all existing packets and sends them back to clear the queue.
-            """
-            global packet_queue
-            try:
-                if not pkt.haslayer(Ether):
-                    return
-                try:
-                    pkt_len = len(pkt)
-                except Exception:
-                    return
-                if pkt_len < 14 or pkt_len > 65535:
-                    return
-                if not consume_token():
-                    return
-                try:
-                    packet_queue.put(pkt, block=False)
-                except queue.Full:
-                    packet_queue.empty()
-            except Exception as e:
-                tb = traceback.format_exc()
-                self.router_logger.log_message(f"[Sniffer] ❗ Error in safe_enqueue(): {e}\n{tb}")
-
-
         sniffer_thread = threading.Thread(target=sniffer_loop, name=f"Sniffer-{iface_name.split('_')[-1]}", daemon=True)
 
         with self._sniff_threads_lock:
             self._sniff_threads[iface_name] = sniffer_thread
         sniffer_thread.start()
 
-
-        self._worker_threads[iface_name] = [] # Ensure this list is initialized for this interface
-        for i in range(4):
-            worker = threading.Thread(target=packet_worker, name=f"Worker-{iface_name}-{i}", daemon=True)
-            worker.start()
-            self._worker_threads[iface_name].append(worker)
-
-        self.router_logger.log_message(f"[Router] Sniffing + workers started on {iface_name.split('_')[-1]}.")
+        self.router_logger.log_message(f"[Router] Sniffing started on {iface_name.split('_')[-1]}.")
     def _start_dhcp_servers(self):
         if self.router_network_in:
-            dhcp_start_in_ip = str(self.router_network_in.network_address + 100)
-            dhcp_end_in_ip = str(self.router_network_in.network_address + 200)
-            dhcp_start_out_ip = str(self.router_network_out.network_address + 100)
-            dhcp_end_out_ip = str(self.router_network_out.network_address + 200)
+            def generate_full_pool(network, router_ip):
+                return [
+                    str(ip) for ip in network.hosts()
+                    if str(ip) != str(router_ip)
+                ]
+
+            # Get the router-assigned IPs (already set during interface setup)
+            in_iface_ip = self._interfaces_config.get(self.interface_in_full_name, {}).get("ip_addr")
+            out_iface_ip = self._interfaces_config.get(self.interface_out_full_name, {}).get("ip_addr")
+
+            # Use full dynamic ranges (excluding router's own IP)
+            dhcp_pool_in = generate_full_pool(self.router_network_in, in_iface_ip)
+            dhcp_pool_out = generate_full_pool(self.router_network_out, out_iface_ip)
 
             self.dhcp_server_in = DHCPServer(
                 self.router_logger,
                 self.packet_writer,
                 self.interface_in_full_name,
-                dhcp_start_in_ip,
-                dhcp_end_in_ip,
-                self._interfaces_config
+                dhcp_pool_in[0],
+                dhcp_pool_in[-1],
+                self._interfaces_config,
             )
             self.dhcp_server_out = DHCPServer(
                 self.router_logger,
                 self.packet_writer,
                 self.interface_out_full_name,
-                dhcp_start_out_ip,
-                dhcp_end_out_ip,
+                dhcp_pool_out[0],
+                dhcp_pool_out[-1],
                 self._interfaces_config
             )
             self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in, self.dhcp_server_out)
@@ -1165,7 +1171,6 @@ class PythonRouterManager:
 
             dst_ip = ip_layer.dst
             iface_short = inbound_iface.split('_')[-1]
-            iface_short = inbound_iface.split('_')[-1]
             if not ip_layer:
                 return
 
@@ -1197,10 +1202,7 @@ class PythonRouterManager:
                     self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP Echo Request on {iface_short}")
                     if self.icmp_manager.handle_packet(packet, inbound_iface):
                         return
-                if packet.haslayer(RIP) or packet.haslayer(RIPEntry):
-                    self.router_logger.log_message(f"[RIP] 📘 RIP packet for router detected on {iface_short}")
-                    self.rip_manager.handle_packet(packet, inbound_iface)
-                    return
+
             # --- Packet is NOT for the router, so it must be a transit packet. ---
 
             # Step 2: Perform Layer 3 and above processing for transit traffic.
@@ -1209,37 +1211,30 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
 
-            if self.mdns_manager.handle_packet(packet):
-                return
-
-            # Transport Layer inspection (for logging only)
-            if packet.haslayer(UDP):
-                udp = packet[UDP]
-                if packet.haslayer(Kerberos) or udp.sport == 88 or udp.dport == 88:
-                    if self.kerberos_manager.handle_kerberos_packet(packet, inbound_iface, self._interfaces_config):
-                        return
-
-            if packet.haslayer(TCP) and self.stratum_manager.handle_packet(packet, inbound_iface):
-                return True  # Handled as Stratum traffic
-            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=4)
-            if packet.haslayer(DNS) and packet[DNS].qr == 1:
-                self.dns_manager.handle_response(packet, self._interfaces_config, self.packet_writer)
-                return
-            # Handshake tracking for TCP sessions
             if packet.haslayer(TCP):
-                self.handshake_manager.handle_packet(packet, inbound_iface)
+                if self.handshake_manager.handle_packet(packet, inbound_iface):
+                    return
 
             if packet.haslayer(TLS):
-                if self.https_manager and self.https_manager.handle_packet(packet, inbound_iface):
+                if self.https_manager.handle_packet(packet, inbound_iface):
+                    return
+
+            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    return
+            if packet.haslayer(UDP) and packet[UDP] :
+                if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
+                                                     self.arp_manager.resolve,
+                                                     self.rip_manager.find_route, self.packet_writer,
+                                                     self.router_network_in):
                     return
 
 
 
-            # Firewall check
+            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=4)
 
-            # DHCP packets that are not for the router (e.g., DHCP Relay agent)
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP transit packet detected on {iface_short}")
+                self.router_logger.log_message(f"[DHCP] 📦 DHCP transit packet not for router detected on {iface_short}")
                 if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
                                                                              self.rip_manager.find_route):
                     return
@@ -1247,8 +1242,12 @@ class PythonRouterManager:
                                                                                self.rip_manager.find_route):
                     return
 
+            if packet.haslayer(Kerberos):
+                if self.kerberos_manager.handle_kerberos_packet(packet, inbound_iface, self._interfaces_config):
+                    return
 
-
+            if packet.haslayer(TCP) and self.stratum_manager.handle_packet(packet, inbound_iface):
+                return
 
 
             # Duplicate flow check (rate-limiting)
@@ -1544,12 +1543,12 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_in, netmask_in):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
                 self._initialize_interface_discovery()
-                if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in):
+                if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_in, netmask_in):
                     self.router_logger.log_message("[Router] ❌ Failed to auto-configure interfaces.")
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
@@ -1604,6 +1603,8 @@ class PythonRouterManager:
 
             self.router_logger.log_message("\n--- Python Router Starting Services ---")
             self._stop_sniffing_event.clear()
+
+
             self.syn_scanner = SYNScanner(
                 router_logger=self.router_logger,
                 packet_writer=self.packet_writer,
@@ -1615,6 +1616,7 @@ class PythonRouterManager:
                     ("1.1.1.1", [443]),
                 ],scan_interval=300)
             self._inject_dependencies()
+
             self.syn_scanner.start()
             self.rip_manager.start()
             self.packet_writer.start()
@@ -1648,6 +1650,7 @@ class PythonRouterManager:
                 self.dhcp_server_in.stop()
             if self.dhcp_server_out:
                 self.dhcp_server_out.stop()
+
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()
@@ -1656,11 +1659,6 @@ class PythonRouterManager:
                 self.nat_manager.stop()
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
-            for iface_workers_list in getattr(self, "_worker_threads", {}).values():
-                for worker in iface_workers_list:
-                    if worker.is_alive():
-                        worker.join(timeout=2)  # Give a short timeout
-            self._worker_threads.clear()
             self.router_logger.log_message("[Router] Worker threads stopped.")
             # 5. Join sniffer threads (these should have died or be dying from _stop_sniffing_event)
             self.router_logger.log_message("[Router] Waiting for sniffer threads to finish...")
@@ -1674,7 +1672,6 @@ class PythonRouterManager:
                         thread.join(timeout=2)
                 self._sniff_threads.clear() # Clear out any remaining references after joining
             self.router_logger.log_message("[Router] Sniffer threads stopped.")
-            self._worker_threads.clear()
             self._sniff_threads.clear()
             self.igmp_manager.stop()
             self.handshake_manager.stop()

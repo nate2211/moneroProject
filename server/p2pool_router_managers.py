@@ -2630,7 +2630,6 @@ class EthernetBridgeManager:
     """
     Manages Layer 2 bridging (switching) between a group of interfaces.
     This allows multiple physical ports to act as a single broadcast domain.
-    Enhanced with traffic rate-limiting to prevent network congestion.
     """
 
     def __init__(self, router_logger, packet_writer):
@@ -2646,15 +2645,6 @@ class EthernetBridgeManager:
         self._mac_table: Dict[str, Tuple[str, float]] = {}
         self._mac_table_lock = threading.Lock()
 
-        # --- New Traffic Management Fields ---
-        # _mac_traffic_count: { mac_address: count } for rate limiting
-        self._mac_traffic_count: Dict[str, int] = {}
-        self._traffic_lock = threading.Lock()
-        self.TRAFFIC_RATE_LIMIT = 40  # Max packets per MAC address per interval
-        self.TRAFFIC_CHECK_INTERVAL = 20  # Interval in seconds
-        # A queue for packets that exceed the rate limit
-        self._waiting_queue = deque()
-
         self._stop_event = threading.Event()
         self._cleanup_thread = None
         self.logger.log_message("[Bridge] Manager initialized.")
@@ -2666,7 +2656,6 @@ class EthernetBridgeManager:
             return False
 
         with self._bridge_lock:
-            # Check if any of the proposed members are already in another bridge
             for iface in member_interfaces:
                 for name, members in self._bridges.items():
                     if name != bridge_name and iface in members:
@@ -2685,7 +2674,6 @@ class EthernetBridgeManager:
             if bridge_name in self._bridges:
                 del self._bridges[bridge_name]
                 self.logger.log_message(f"[Bridge] 🗑️ Removed bridge '{bridge_name}'.")
-                # Optionally, clear MAC table entries associated with this bridge's interfaces
                 return True
             else:
                 self.logger.log_message(f"[Bridge] ⚠️ Bridge '{bridge_name}' not found.")
@@ -2710,9 +2698,7 @@ class EthernetBridgeManager:
     def learn_mac(self, mac_address: str, iface_name: str):
         """Adds or updates a MAC address in the forwarding table."""
         with self._mac_table_lock:
-            # Do not learn broadcast or multicast MACs as source addresses
-            if mac_address.lower() == "ff:ff:ff:ff:ff:ff" or mac_address.startswith(
-                    "01:00:5e") or mac_address.startswith("33:33"):
+            if mac_address.lower() == "ff:ff:ff:ff:ff:ff" or mac_address.startswith(("01:00:5e", "33:33")):
                 return
 
             if self._mac_table.get(mac_address, (None, 0))[0] != iface_name:
@@ -2720,82 +2706,63 @@ class EthernetBridgeManager:
             self._mac_table[mac_address] = (iface_name, time.time() + self.MAC_TABLE_TIMEOUT)
 
     def handle_frame(self, frame: Packet, inbound_iface: str):
+        """
+        Processes a Layer 2 frame by learning its source MAC and then
+        either forwarding it to a known port or flooding it to all other ports.
+        """
         if not frame.haslayer(Ether):
-            self.logger.log_message(
-                f"[Bridge] ⚠️ Non-Ethernet frame received on {inbound_iface.split('_')[-1]}. Dropping.")
             return
 
         src_mac = frame[Ether].src
         dst_mac = frame[Ether].dst
-        ether_type = frame[Ether].type
 
-        # --- New Traffic Management Logic ---
-        with self._traffic_lock:
-            self._mac_traffic_count[src_mac] = self._mac_traffic_count.get(src_mac, 0) + 1
-            if self._mac_traffic_count[src_mac] > self.TRAFFIC_RATE_LIMIT:
-                # Place packet in waiting queue instead of processing it
-                self._waiting_queue.append((frame, inbound_iface))
-                self.logger.log_message(
-                    f"[Bridge] 🚦 Rate limit exceeded for {src_mac}. Packet moved to waiting queue.")
-                return
-
-        log_this_frame = False
-        if ether_type in [0x0800, 0x0806, 0x86DD]:
-            log_this_frame = True
-        elif dst_mac.lower() == "ff:ff:ff:ff:ff:ff" or dst_mac.startswith("01:00:5e") or dst_mac.startswith("33:33"):
-            reason = "Broadcast" if dst_mac.lower() == "ff:ff:ff:ff:ff:ff" else "Multicast"
-            if ether_type not in [0x0800, 0x0806, 0x86DD]:
-                self.logger.log_message(
-                    f"[Bridge] 📡 L2 Flooding ({reason} Type {hex(ether_type)}) from {inbound_iface.split('_')[-1]}")
-
+        # Learn the source MAC address and associate it with the inbound interface.
         self.learn_mac(src_mac, inbound_iface)
 
         bridge_name = self.get_bridge_for_interface(inbound_iface)
         if not bridge_name:
-            self.logger.log_message(
-                f"[Bridge] ⚠️ {inbound_iface.split('_')[-1]} is not in any bridge. Cannot handle frame.")
+            # This should not happen if called from the main router dispatcher correctly
             return
 
+        # Look up the destination MAC in our learned table.
         with self._mac_table_lock:
-            target_iface = self._mac_table.get(dst_mac, (None, 0))[0]
+            target_info = self._mac_table.get(dst_mac)
 
+        target_iface = target_info[0] if target_info else None
+
+        # Decide whether to forward to a specific port or flood to all ports.
         is_broadcast = dst_mac.lower() == "ff:ff:ff:ff:ff:ff"
-        is_multicast = dst_mac.startswith("01:00:5e") or dst_mac.startswith("33:33")
+        is_multicast = dst_mac.startswith(("01:00:5e", "33:33"))
 
-        if log_this_frame:
-            if target_iface and not is_broadcast and not is_multicast:
-                if target_iface == inbound_iface:
-                    self.logger.log_message(f"[Bridge] ↩️ Dropping L2 Frame {src_mac}->{dst_mac} (same port).")
-                    return
-                else:
-                    self.logger.log_message(
-                        f"[Bridge] ➡️ Forwarding L2 Frame {src_mac} -> {dst_mac} on {target_iface.split('_')[-1]}")
-            else:
-                reason = "Broadcast" if is_broadcast else "Multicast" if is_multicast else "Unknown Unicast"
-                self.logger.log_message(
-                    f"[Bridge] ❓ Flooding L2 Frame {src_mac} -> {dst_mac} ({reason}) from {inbound_iface.split('_')[-1]}")
-
-                flood_targets = []
-                interfaces = self._bridges.get(bridge_name, set())
-                for iface in interfaces:
-                    if iface != inbound_iface:
-                        self.packet_writer.queue_packet(frame, iface)
-                        flood_targets.append(iface.split('_')[-1])
-
-                if flood_targets:
-                    self.logger.log_message(
-                        f"[Bridge] 🌊 Flooded to: {', '.join(flood_targets)}")
-                else:
-                    self.logger.log_message("[Bridge] 🚫 No active interfaces to flood to.")
+        # Case 1: Destination is known and is not a broadcast/multicast (Unicast Forwarding)
+        if target_iface and not is_broadcast and not is_multicast:
+            # If the target port is the same as the source port, drop the frame to prevent loops.
+            if target_iface == inbound_iface:
+                self.logger.log_message(f"[Bridge] ↩️ Dropping L2 Frame {src_mac}->{dst_mac} (same source/dest port).")
                 return
 
-            if target_iface and target_iface != inbound_iface:
-                self.packet_writer.queue_packet(frame, target_iface)
-                self.logger.log_message(f"[Bridge] 📬 Forwarded unicast frame to {target_iface.split('_')[-1]}")
-            else:
-                self.logger.log_message(
-                    f"[Bridge] ⚠️ Target interface {target_iface.split('_')[-1]} is down. Dropping frame.")
+            # Forward the frame to the specific target interface.
+            self.logger.log_message(
+                f"[Bridge] ➡️ Forwarding L2 Frame {src_mac} -> {dst_mac} to port {target_iface.split('_')[-1]}")
+            self.packet_writer.queue_packet(frame, target_iface)
 
+        # Case 2: Destination is unknown, a broadcast, or a multicast (Flooding)
+        else:
+            reason = "Broadcast" if is_broadcast else "Multicast" if is_multicast else "Unknown Unicast"
+            self.logger.log_message(
+                f"[Bridge] 🌊 Flooding L2 Frame {src_mac} -> {dst_mac} ({reason}) from port {inbound_iface.split('_')[-1]}")
+
+            flood_targets = []
+            interfaces_in_bridge = self._bridges.get(bridge_name, set())
+
+            for iface in interfaces_in_bridge:
+                # Don't send the frame back out the port it came in on.
+                if iface != inbound_iface:
+                    self.packet_writer.queue_packet(frame.copy(), iface)
+                    flood_targets.append(iface.split('_')[-1])
+
+            if not flood_targets:
+                self.logger.log_message("[Bridge] 🚫 No other active interfaces in bridge to flood to.")
 
     def _cleanup_mac_table_loop(self):
         """Periodically removes stale entries from the MAC address table."""
@@ -2808,34 +2775,21 @@ class EthernetBridgeManager:
                     self.logger.log_message(f"[Bridge] 🗑️ MAC table entry for {mac} expired.")
             self._stop_event.wait(60)
 
-    def _cleanup_traffic_loop(self):
-        """Periodically resets the traffic counters."""
-        while not self._stop_event.is_set():
-            time.sleep(self.TRAFFIC_CHECK_INTERVAL)
-            with self._traffic_lock:
-                # Clear the counters after each interval
-                self._mac_traffic_count.clear()
-            self.logger.log_message("[Bridge] ⏱️ Traffic counters have been reset.")
-
     def start(self):
-        """Starts the MAC table and traffic cleanup threads."""
+        """Starts the MAC table cleanup thread."""
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._cleanup_mac_table_loop, daemon=True,
                                                 name="BridgeMacCleanup")
         self._cleanup_thread.start()
-        self._traffic_cleanup_thread = threading.Thread(target=self._cleanup_traffic_loop, daemon=True,
-                                                        name="BridgeTrafficCleanup")
-        self._traffic_cleanup_thread.start()
-        self.logger.log_message("[Bridge] Cleanup threads started.")
+        self.logger.log_message("[Bridge] Cleanup thread started.")
 
     def stop(self):
-        """Stops the cleanup threads."""
+        """Stops the cleanup thread."""
         if self._cleanup_thread and self._cleanup_thread.is_alive():
-            self.logger.log_message("[Bridge] Stopping cleanup threads...")
+            self.logger.log_message("[Bridge] Stopping cleanup thread...")
             self._stop_event.set()
             self._cleanup_thread.join(timeout=2)
-            self._traffic_cleanup_thread.join(timeout=2)
-            self.logger.log_message("[Bridge] Cleanup threads stopped.")
+            self.logger.log_message("[Bridge] Cleanup thread stopped.")
 
 class EthernetL2Manager:
     """
@@ -2897,7 +2851,6 @@ class EthernetL2Manager:
                 final_message=f"[L2] ‼️ ERROR dissecting problematic non-IP packet on {iface_name}: {e}. Raw packet summary: {packet.summary()}. Count: {{}}.",
                 count_message=None)
             return True # Handled (by dropping due to error)
-
 
 class SYNScanner:
     """
@@ -3057,7 +3010,7 @@ class SYNScanner:
             tcp_layer = TCP(dport=target_port, flags="S")
             pkt = Ether(src=src_mac, dst=dst_mac) / ip_layer / tcp_layer
 
-            response = self.sniffer.sr1(pkt, timeout=timeout, verbose=0, iface=iface)  # MODIFIED: specify interface for reliability
+            response = self.sniffer.sr1(pkt, timeout=timeout, verbose=0)  # MODIFIED: specify interface for reliability
 
             if response is None:
                 return 'FILTERED (no response)', None, None

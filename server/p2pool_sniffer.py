@@ -9,6 +9,7 @@ import sys
 import psutil
 from scapy.arch import get_if_hwaddr
 from scapy.fields import IntField
+from scapy.layers.dns import DNS
 from scapy.layers.rip import RIP
 
 # Import all functionalities from the Scapy library to parse packets.
@@ -191,6 +192,8 @@ class SnifferSoftware:
         bind_layers(Ether, ARP, type=0x0806)
         bind_layers(UDP, ISKEMP, dport=9999)
         bind_layers(UDP, ISKEMP, sport=9999)
+        bind_layers(UDP, DNS, dport=53)
+        bind_layers(UDP, DNS, sport=53)
         load_layer("tls")
         load_layer("kerberos")
         load_layer("rip")
@@ -317,7 +320,7 @@ class SnifferSoftware:
                 raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
                 try:
                     packet = Ether(raw_packet)
-
+                    packet.sniffed_on = iface
                     if mac_filter_only and not packet.haslayer(Ether):
                         continue
                     if packet.haslayer(ARP):
@@ -391,16 +394,26 @@ class SnifferSoftware:
                         continue
 
                     if packet.haslayer(RIP):
-                        ip_layer = packet.getlayer(IP)
-                        if ip_layer and ip_layer.dst not in self.local_ips:
-                            self.notification_manager.send_notification({
-                                "event": "RIP Blocked",
-                                "message": f"Dropped RIP packet from {ip_layer.src} to {ip_layer.dst} (not for router)",
-                                "iface": iface,
-                                "timestamp": time.time(),
-                                "emojis": ["🚫", "🧨", "🛑"]
-                            }, cooldown_seconds=20, cooldown_key="rip_blocked")
-                            continue
+                        try:
+                            original_ip = packet.getlayer(IP)
+                            original_udp = packet.getlayer(UDP)
+                            if original_ip and original_udp:
+                                if original_ip.dst == self.rip_manager.RIP_MCAST_ADDR or original_ip.dst in self.local_ips:
+                                    self.logger.log_message(
+                                        f"[RIP] 📘 RIP packet for router detected on {iface}. Granular rebuild...")
+                                    self.rip_manager.handle_packet(packet, iface)
+                                else:
+                                    # This is a RIP packet not destined for us.
+                                    if self.notification_manager:
+                                        self.notification_manager.send_notification({
+                                            "event": "RIP Blocked",
+                                            "message": f"Dropped RIP packet from {original_ip.src} to {original_ip.dst} (not for this router)",
+                                            "iface": iface, "timestamp": time.time(), "emojis": ["🚫", "🗺️", "🛑"]
+                                        }, cooldown_seconds=20, cooldown_key="rip_blocked")
+                        except Exception as e:
+                            self.logger.log_message(f"[Sniffer] ⚠️ Exception during granular RIP rebuild: {e}")
+                        # After handling or dropping, move to the next packet.
+                        continue
 
                     processed_packet = packet
                     if session:
@@ -544,13 +557,11 @@ class SnifferSoftware:
                 error_msg = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode('utf-8', errors='ignore')
                 if "device attached" in error_msg.lower() or "not functioning" in error_msg.lower():
                     self.logger.log_message(
-                        f"[Sniffer] ⛔ sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31). Skipping interface.",
-                        "ERROR"
+                        f"[Sniffer] ⛔ sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31). Skipping interface."
                     )
                 else:
                     self.logger.log_message(
-                        f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}",
-                        "ERROR"
+                        f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}"
                     )
                 return None
 
