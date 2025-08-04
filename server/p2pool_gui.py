@@ -2,7 +2,9 @@ import ctypes
 import queue
 import threading
 import asyncio
-from PyQt5.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit
+from typing import Dict
+
+from PyQt5.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QWidget
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
 from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
     PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab
@@ -118,13 +120,14 @@ class PacketLogger(QObject):
 
     def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
 
-
 class RouterLogger(QObject):
-    """A dedicated logger for PythonRouterManager operations."""
     message_signal = pyqtSignal(str)
 
-    def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
+    def __init__(self):
+        super().__init__()
 
+    def log_message(self, msg):
+        self.message_signal.emit(str(msg).rstrip())
 class GeminiLogger(QObject):
     """A dedicated logger for Gemini chat messages."""
     message_signal = pyqtSignal(str, str)  # Now emits content and message_type
@@ -251,7 +254,7 @@ class P2PoolGUI(QMainWindow):
         self.p2pool_tab = P2PoolTab()
         self.wireshark_tab = WiresharkTab()
         self.packet_sender_tab = PacketSenderTab()
-        self.router_tab = RouterTab()
+        self.router_tab = RouterTab(self.router_logger)
         self.gemini_chat_tab = GeminiChatTab(self.gemini_logger)
         self.nmap_tab = NmapTab(self.nmap_logger, self.async_worker.loop)
         self.gobuster_tab = GobusterTab(self.gobuster_logger, self.async_worker.loop)
@@ -270,7 +273,6 @@ class P2PoolGUI(QMainWindow):
         self.gui_logger.message_signal.connect(self.p2pool_tab.log_message) # General console messages to P2Pool tab (or a dedicated general console tab)
         self.wireshark_logger.message_signal.connect(self.wireshark_tab.log_message)
         self.packet_logger.message_signal.connect(self.packet_sender_tab.log_message)
-        self.router_logger.message_signal.connect(self.router_tab.log_message)
         self.gemini_logger.message_signal.connect(self.gemini_chat_tab.log_message)
         self.nmap_logger.message_signal.connect(self.nmap_tab.log_message)
         self.gobuster_logger.message_signal.connect(self.gobuster_tab.log_message) # Connect Gobuster logger to its tab's log

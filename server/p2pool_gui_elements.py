@@ -1,11 +1,8 @@
-import base64
 import logging
 import os
 import re
-import subprocess
-import sys
 import webbrowser
-from typing import List
+from typing import List, Dict
 import queue
 import threading
 import asyncio
@@ -1418,37 +1415,30 @@ class GeminiChatTab(QWidget):
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'",
                                                                                                                    "&#x27;")
 
-    @pyqtSlot(str, str)  # Changed signature to accept content and message_type
+    @pyqtSlot(str, str)
     def log_message(self, content: str, message_type: str = "info"):
-        """
-        Appends a message to the chat output via the GeminiLogger, with appropriate styling.
-        The 'content' argument should be the raw text or pre-formatted HTML for the message body.
-        'message_type' can be "user", "gemini", "error", or "info".
-        """
         prefix = ""
         color = ""
 
         if message_type == "user":
             prefix = "<b>You:</b> "
-            color = "#87CEEB"  # Light blue
+            color = "#87CEEB"
         elif message_type == "gemini":
             prefix = "<b>Gemini:</b> "
-            color = "#90EE90"  # Light green
+            color = "#90EE90"
         elif message_type == "error":
             prefix = "<b>ERROR:</b> "
-            color = "#FF6347"  # Red
+            color = "#FF6347"
 
-        # Combine prefix and content.
-        # The 'content' is expected to be already HTML formatted (e.g., from _handle_gemini_response)
-        # or plain text that needs to be part of a larger HTML structure.
         final_html = (
-            f"<div style='color:{color}; margin-bottom: 5px;'>{prefix}{content}</div>"
-            f"<div style='height:10px;'></div>"  # Add vertical space after each message
+            f"<div style='color:{color}; margin-bottom: 12px;'>"
+            f"{prefix}{content}</div><br>"  # Add <br> outside to force newline
         )
 
+        self.chat_output.moveCursor(QTextCursor.End)  # Always move to end before inserting
         self.chat_output.insertHtml(final_html)
-        # Scroll to the bottom after adding message
-        self.chat_output.verticalScrollBar().setValue(self.chat_output.verticalScrollBar().maximum())
+        self.chat_output.insertHtml("<br>")  # Optional: extra newline
+        self.chat_output.moveCursor(QTextCursor.End)
 
 
 class PacketSenderWorker(QObject):
@@ -1597,52 +1587,170 @@ class WiresharkTab(QWidget):
     def log_message(self, message: str):
         """Appends a message to the Wireshark console log."""
         self.wireshark_log.appendPlainText(message)
+
+
 class RouterTab(QWidget):
     """
-    A QWidget that encapsulates all UI elements and logic for the Router tab.
-    Allows enabling DHCP for IN and OUT interfaces.
+    A QWidget that encapsulates all UI elements and logic for the Router tab,
+    including categorized console panes and log filtering based on message prefixes.
     """
-    def __init__(self, parent=None):
+
+    def __init__(self, logger, parent=None):
         super().__init__(parent)
+        self.router_logger = logger
+        self._console_panes = {}  # name → QPlainTextEdit
+
+        self.presets = {
+            "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/TLS/HTTPS/DNS/mDNS",
+                     "Handshake", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
+            "Minimal": ["General"],
+        }
+
         self._create_widgets()
         self._configure_layout()
+        self._connect_signals()
+        self.router_logger.message_signal.connect(self.log_message)
 
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
-        self.start_router_button.setObjectName("start_router_button")
-        self.start_router_button.setEnabled(True)
-
         self.stop_router_button = QPushButton("Stop Router")
-        self.stop_router_button.setObjectName("stop_router_button")
-        self.stop_router_button.setEnabled(False)
 
-        # ✅ DHCP checkboxes for both interfaces
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
-        self.dhcp_out_checkbox.setChecked(False)  # Optional: default OFF
+        self.dhcp_out_checkbox.setChecked(True)
 
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
-        self.dhcp_in_checkbox.setChecked(False)  # Optional: default OFF
+        self.dhcp_in_checkbox.setChecked(True)
 
-        self.router_log = QPlainTextEdit()
-        self.router_log.setReadOnly(True)
+        self.add_pane_input = QLineEdit()
+        self.add_pane_input.setPlaceholderText("Add Pane")
+
+        self.add_pane_button = QPushButton("➕")
+        self.remove_pane_button = QPushButton("➖")
+
+        self.console_tabs = QTabWidget()
+
+        self.preset_dropdown = QComboBox()
+        self.preset_dropdown.addItems(self.presets.keys())
+
+        self._load_presets("Full")
 
     def _configure_layout(self):
         layout = QVBoxLayout(self)
-        control_layout = QHBoxLayout()
 
+        # --- Top Control Row ---
+        control_layout = QHBoxLayout()
         control_layout.addWidget(self.start_router_button)
         control_layout.addWidget(self.stop_router_button)
         control_layout.addWidget(self.dhcp_out_checkbox)
         control_layout.addWidget(self.dhcp_in_checkbox)
         control_layout.addStretch(1)
 
+        # --- Pane Add/Remove Row ---
+        pane_layout = QHBoxLayout()
+        pane_layout.addWidget(QLabel("Pane:"))
+        pane_layout.addWidget(self.add_pane_input)
+        pane_layout.addWidget(self.add_pane_button)
+        pane_layout.addWidget(self.remove_pane_button)
+        pane_layout.addStretch(1)
+
+        # --- Preset Dropdown Row ---
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Presets:"))
+        preset_layout.addWidget(self.preset_dropdown)
+        preset_layout.addStretch(1)
+
+        # --- Final Layout ---
         layout.addLayout(control_layout)
-        layout.addWidget(self.router_log)
+        layout.addLayout(pane_layout)
+        layout.addLayout(preset_layout)
+        layout.addWidget(self.console_tabs)
+
+    def _connect_signals(self):
+        self.start_router_button.clicked.connect(self._on_start_router)
+        self.add_pane_button.clicked.connect(self._on_add_pane)
+        self.remove_pane_button.clicked.connect(self._on_remove_pane)
+        self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
+
+    def _load_presets(self, preset_name: str):
+        panes_to_add = self.presets.get(preset_name, [])
+
+        # Remove all non-General panes
+        for pane in list(self._console_panes):
+            if pane != "General":
+                self._remove_console_pane(pane)
+
+        # Add new panes
+        for pane in panes_to_add:
+            self._add_console_pane(pane)
+
+    def _on_preset_selected(self, preset_name: str):
+        self._load_presets(preset_name)
+
+    def _add_console_pane(self, name: str):
+        if name not in self._console_panes:
+            console = QPlainTextEdit()
+            console.setReadOnly(True)
+            self.console_tabs.addTab(console, name)
+            self._console_panes[name] = console
+
+    def _remove_console_pane(self, name: str):
+        if name in self._console_panes and name != "General":
+            index = self.console_tabs.indexOf(self._console_panes[name])
+            self.console_tabs.removeTab(index)
+            del self._console_panes[name]
+
+    def _on_add_pane(self):
+        name = self.add_pane_input.text().strip()
+        if name:
+            self._add_console_pane(name)
+            self._log("General", f"[UI] Added pane: {name}")
+            self.add_pane_input.clear()
+
+    def _on_remove_pane(self):
+        name = self.add_pane_input.text().strip()
+        if name:
+            self._remove_console_pane(name)
+            self._log("General", f"[UI] Removed pane: {name}")
+            self.add_pane_input.clear()
+
+    def _on_start_router(self):
+        self.start_router_button.setEnabled(False)
+        self.stop_router_button.setEnabled(True)
+        self._log("General", "Router started!")
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """Appends a message to the router console log."""
-        self.router_log.appendPlainText(message)
+        """
+        Routes log messages to a pane based on the prefix. If no matching pane, logs to 'General'.
+        """
+        prefixes = re.findall(r'\[(.*?)\]', message)
+
+
+        target_pane = None
+        longest_prefix_len = 1000
+
+        # Find the best possible match by checking all prefixes against all keys
+        for prefix in reversed(prefixes):
+            for pane_key in self._console_panes:
+                cleaned_pane_key = re.sub(r'[^a-zA-Z0-9\s]', '', pane_key)
+                # Check if the prefix is a substring of the key
+                if prefix.lower() in cleaned_pane_key.lower():
+                    # If this prefix is longer than our previous best match, it's the new best one.
+                    if len(prefix) < longest_prefix_len:
+                        longest_prefix_len = len(prefix)
+                        target_pane = pane_key
+
+        self._log(target_pane or "General", message)
+
+    def _log(self, category: str, message: str):
+        if category in self._console_panes:
+            self._console_panes[category].appendPlainText(message)
+        else:
+            if "General" not in self._console_panes:
+                self._add_console_pane("General")
+            self._console_panes["General"].appendPlainText(message)
+
+
 
 class PacketSenderTab(QWidget):
     """
