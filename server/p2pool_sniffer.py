@@ -146,6 +146,7 @@ class SnifferSoftware:
         self.supported_ethertypes = {0x0800, 0x86DD, 0x0806, 0x8100}  # IPv4, IPv6, ARP, VLAN-tagged
         self.unsupported_ethertypes = {0x8006}
         self.local_ips = self._get_local_ips()
+        self.banned_packets = []
         self._load_pcap_library()
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
@@ -280,6 +281,8 @@ class SnifferSoftware:
             sys.stderr.write(f"[Sniffer] Error: `stop_filter` must be callable. Got type {type(stop_filter)}.\n")
             return
 
+
+
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode('utf-8'), 65535, 1 if promisc else 0, timeout, errbuf)
         if not handle:
@@ -290,8 +293,7 @@ class SnifferSoftware:
             bpf = bpf_program()
             if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), filter.encode(), 1, 0) == -1:
                 self.logger.log_message(
-                    f"[Sniffer] Filter error: {ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode(errors='ignore')}",
-                    "ERROR")
+                    f"[Sniffer] Filter error: {ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode(errors='ignore')}")
                 self.libpcap.pcap_close(handle)
                 return
             self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf))
@@ -320,6 +322,15 @@ class SnifferSoftware:
                 raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
                 try:
                     packet = Ether(raw_packet)
+                    if packet in self.banned_packets:
+                        self.notification_manager.send_notification({
+                            "event": "Banned Packets",
+                            "message": f"Banned packets",
+                            "iface": iface,
+                            "timestamp": time.time(),
+                            "emojis": ["🛑", "🧩", "🐍"]
+                        }, cooldown_seconds=5, cooldown_key="banned_packets")
+                        continue
                     packet.sniffed_on = iface
                     if mac_filter_only and not packet.haslayer(Ether):
                         continue
@@ -393,27 +404,29 @@ class SnifferSoftware:
                         }, cooldown_seconds=10, cooldown_key="ipv6_blocked")
                         continue
 
-                    if packet.haslayer(RIP):
+                    if packet.haslayer(RIP) and packet.haslayer(IP) and packet.haslayer(UDP):
                         try:
                             original_ip = packet.getlayer(IP)
                             original_udp = packet.getlayer(UDP)
-                            if original_ip and original_udp:
-                                if original_ip.dst == self.rip_manager.RIP_MCAST_ADDR or original_ip.dst in self.local_ips:
-                                    self.logger.log_message(
-                                        f"[RIP] 📘 RIP packet for router detected on {iface}. Granular rebuild...")
-                                    self.rip_manager.handle_packet(packet, iface)
-                                else:
-                                    # This is a RIP packet not destined for us.
-                                    if self.notification_manager:
-                                        self.notification_manager.send_notification({
-                                            "event": "RIP Blocked",
-                                            "message": f"Dropped RIP packet from {original_ip.src} to {original_ip.dst} (not for this router)",
-                                            "iface": iface, "timestamp": time.time(), "emojis": ["🚫", "🗺️", "🛑"]
-                                        }, cooldown_seconds=20, cooldown_key="rip_blocked")
+
+                            if original_ip.dst == self.rip_manager.RIP_MCAST_ADDR or original_ip.dst in self.local_ips:
+                                self.rip_manager.handle_packet(packet, iface)
+                            else:
+                                if self.notification_manager:
+                                    self.notification_manager.send_notification({
+                                        "event": "RIP Blocked",
+                                        "message": f"Dropped RIP packet from {original_ip.src} to {original_ip.dst} (not for this router)",
+                                        "iface": iface, "timestamp": time.time(), "emojis": ["🚫", "🗺️", "🛑"]
+                                    }, cooldown_seconds=20, cooldown_key="rip_blocked")
                         except Exception as e:
-                            self.logger.log_message(f"[Sniffer] ⚠️ Exception during granular RIP rebuild: {e}")
-                        # After handling or dropping, move to the next packet.
-                        continue
+                            original_ip = packet.getlayer(IP)
+                            self.rip_manager.rip_from_suspicious_source(original_ip.src, packet)
+                            if self.notification_manager:
+                                self.notification_manager.send_notification({
+                                    "event": "RIP Unsolicited",
+                                    "message": f"[Sniffer] ⚠️ Unsolicited RIP handling: {e}",
+                                    "iface": iface, "timestamp": time.time(), "emojis": ["🚫", "🗺️", "🛑"]
+                                }, cooldown_seconds=20, cooldown_key="rip_unsolicited")
 
                     processed_packet = packet
                     if session:

@@ -1602,7 +1602,7 @@ class RouterTab(QWidget):
 
         self.presets = {
             "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/TLS/HTTPS/DNS/mDNS",
-                     "Handshake", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
+                     "Handshake/SSL", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
 
@@ -1744,10 +1744,8 @@ class RouterTab(QWidget):
         # Find the best possible match by checking all prefixes against all keys
         for prefix in reversed(prefixes):
             for pane_key in self._console_panes:
-                cleaned_pane_key = re.sub(r'[^a-zA-Z0-9\s]', '', pane_key)
-                # Check if the prefix is a substring of the key
+                cleaned_pane_key = re.sub(r'[^a-zA-Z0-9]', '', pane_key)
                 if prefix.lower() in cleaned_pane_key.lower():
-                    # If this prefix is longer than our previous best match, it's the new best one.
                     if len(prefix) < longest_prefix_len:
                         longest_prefix_len = len(prefix)
                         target_pane = pane_key
