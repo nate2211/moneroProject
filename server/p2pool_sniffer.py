@@ -3,8 +3,9 @@ import ipaddress
 import socket
 import struct
 import time
-from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
+from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint, cast
 import sys
+from typing import List, Tuple, Union
 
 import psutil
 from scapy.arch import get_if_hwaddr
@@ -613,3 +614,88 @@ class SnifferSoftware:
         finally:
             if handle:
                 self.libpcap.pcap_close(handle)
+
+    def srp(self, packets: Union[Packet, List[Packet]], iface: str, timeout: int = 5, verbose: int = 0) -> Tuple[
+        List, List]:
+        """
+        Sends one or more Layer 2 packets and waits for replies.
+        Returns a tuple of (answered, unanswered).
+        """
+        if not packets:
+            return [], []
+
+        if not isinstance(packets, list):
+            packets = [packets]
+
+        unanswered_packets = list(packets)
+        answered_packets = []
+
+        try:
+            our_mac = get_if_hwaddr(iface)
+        except Exception:
+            self.logger.log_message(f"[Sniffer] ❌ Could not get MAC address for interface '{iface}'.")
+            return [], unanswered_packets
+
+        bpf_filter_str = ""
+        if any(pkt.haslayer(ARP) for pkt in packets):
+            bpf_filter_str = f"arp and ether host {our_mac}"
+
+        errbuf = ctypes.create_string_buffer(256)
+        raw_handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, int(timeout * 1000), errbuf)
+
+        if not raw_handle:
+            self.logger.log_message(f"[Sniffer] ❌ Error opening device: {errbuf.value.decode()}")
+            return [], unanswered_packets
+
+        # Since your prototype expects POINTER(c_char), cast it:
+        handle = ctypes.cast(raw_handle, POINTER(c_char))
+
+        try:
+            # --- FIX: Use our own sendp function to send the packet. ---
+            for pkt in packets:
+                self.sendp(pkt, iface=iface, verbose=verbose)
+
+            if bpf_filter_str:
+                bpf = bpf_program()
+                if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), bpf_filter_str.encode(), 1, 0) == -1:
+                    err = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode(errors="ignore")
+                    self.logger.log_message(f"[Sniffer] ❌ Filter compile error: {err}")
+                    return [], unanswered_packets
+
+                self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf))
+                self.libpcap.pcap_freecode(ctypes.byref(bpf))
+
+            pkthdr_ptr = ctypes.POINTER(pcap_pkthdr)()
+            packet_data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+            start_time = time.time()
+
+            while time.time() - start_time < timeout and unanswered_packets:
+                res = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
+                if res == 1:
+                    packet_len = pkthdr_ptr.contents.len
+                    raw = ctypes.string_at(packet_data_ptr, packet_len)
+
+                    try:
+                        received_packet = Ether(raw)
+                    except Exception:
+                        continue
+
+                    for sent_pkt in list(unanswered_packets):
+                        if received_packet.haslayer(ARP) and sent_pkt.haslayer(ARP):
+                            if (received_packet[ARP].op == 2 and
+                                    received_packet[ARP].psrc == sent_pkt[ARP].pdst):
+                                answered_packets.append((sent_pkt, received_packet))
+                                unanswered_packets.remove(sent_pkt)
+                                if verbose >= 1:
+                                    self.logger.log_message(
+                                        f"[Sniffer] ✅ Received ARP reply: {received_packet[ARP].psrc} is at {received_packet[ARP].hwsrc}"
+                                    )
+                                break
+
+            if verbose >= 1 and unanswered_packets:
+                self.logger.log_message(f"[Sniffer] 🕒 Timeout: {len(unanswered_packets)} packet(s) unanswered.")
+
+        finally:
+            self.libpcap.pcap_close(handle)
+
+        return answered_packets, unanswered_packets
