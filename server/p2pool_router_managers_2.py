@@ -1,11 +1,14 @@
 import json
 import struct
+import subprocess
 from collections import defaultdict
 from functools import reduce
 from typing import Optional, List, Any
 import ipaddress
 import threading
 import time
+
+import psutil
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
@@ -1831,7 +1834,6 @@ class RIPManager:
         except ValueError:
             return None
 
-
 class NATManager:
     """
     Manages Network Address Translation (NAT) with both:
@@ -1884,7 +1886,7 @@ class NATManager:
         self._ban_threshold = 30  # Number of unmapped port hits to trigger ban
         self._ban_duration = 120  # Ban duration in seconds
 
-        self._max_temp_leases_per_ip = 15  # NEW: Flat limit on active temporary leases per IP
+        self._max_temp_leases_per_ip = 5  # NEW: Flat limit on active temporary leases per IP
         self._temp_nat_leases: Dict[str, Dict[int, Dict[str, float | str | int]]] = defaultdict(
             dict)  # ip -> {port -> lease_info}
         self._temp_nat_lease_duration = 60  # seconds
@@ -2257,6 +2259,7 @@ class NATManager:
                 f"[NAT] 🧐 Query for internal IP from external {external_ip}. Requires deeper NAT state knowledge.")
             return None
         return None
+
 class DNSManager:
     """
     Manages DNS query proxying. Intercepts local DNS requests and forwards
@@ -2506,7 +2509,7 @@ class DNSManager:
         qname = dns_layer.qd.qname.decode() if dns_layer.qd else "unknown"
 
         key = (ip_layer.dst, udp_layer.dport, dns_layer.id)
-
+        modified_packet = packet.copy()
         with self._lock:
             original_request = self._pending_requests.pop(key, None)
 
@@ -2517,7 +2520,7 @@ class DNSManager:
             response_iface_name = original_request["inbound_iface"]
             response_iface_config = router_interfaces.get(response_iface_name)
 
-            modified_packet = packet.copy()
+
 
 
             if IP in modified_packet:
@@ -2537,9 +2540,8 @@ class DNSManager:
             elif IPv6 in modified_packet:
                 del modified_packet[UDP].chksum
 
-            return True
-
-        return False
+        self.packet_writer.queue_packet(modified_packet)
+        return True
 
 class ARPManager:
     """
@@ -2547,7 +2549,7 @@ class ARPManager:
     Enhanced with Gratuitous ARP and a placeholder for ARP Snooping/Inspection.
     """
 
-    def __init__(self, router_logger,cache_timeout_seconds=300):
+    def __init__(self, router_logger,lag_manager, cache_timeout_seconds=300):
         """
         Initializes the ARP Manager.
         Args:
@@ -2568,6 +2570,7 @@ class ARPManager:
         self._temp_arp_leases: dict[str, dict[str, float]] = {}
         # ARP Snooping/Inspection (Placeholder)
         self._trusted_ports = set()  # Example: {'Ethernet_IN_Full_Name'}
+        self.lag_manager = lag_manager
         self._static_arp_entries = {}  # {IP: MAC} for trusted static entries
 
     def set_dhcp_server_reference(self, dhcp_server_in, dhcp_server_out):
@@ -2661,60 +2664,63 @@ class ARPManager:
         Resolves an IP address to a MAC address using static entries, cache, a temporary lease,
         or a custom ARP request. Caches the result if successful.
         """
-        ip_address = ip_address.strip()
-        now = time.time()
+        if self.sniffer is not None and self.lag_manager.is_lag_interface("MyARPLANAggregation"):
+            ip_address = ip_address.strip()
+            now = time.time()
 
-        if ipaddress.ip_address(ip_address).is_loopback:
-            self.router_logger.log_message(f"[ARP] Local delivery: Loopback IP {ip_address}. No ARP needed.")
-            return None
+            if ipaddress.ip_address(ip_address).is_loopback:
+                self.router_logger.log_message(f"[ARP] Local delivery: Loopback IP {ip_address}. No ARP needed.")
+                return None
 
-        # --- Static ARP entries ---
-        if ip_address in self._static_arp_entries:
-            mac = self._static_arp_entries[ip_address]
+            # --- Static ARP entries ---
+            if ip_address in self._static_arp_entries:
+                mac = self._static_arp_entries[ip_address]
+                with self._arp_cache_lock:
+                    cached_entry = self._arp_cache.get(ip_address)
+                    if not cached_entry or cached_entry[0].lower() != mac.lower():
+                        self._arp_cache[ip_address] = (mac, now)
+                        self.router_logger.log_message(f"[ARP] 🧷 Cached static ARP entry: {ip_address} → {mac}")
+                return mac
+
+            # --- Dynamic ARP cache ---
             with self._arp_cache_lock:
                 cached_entry = self._arp_cache.get(ip_address)
-                if not cached_entry or cached_entry[0].lower() != mac.lower():
-                    self._arp_cache[ip_address] = (mac, now)
-                    self.router_logger.log_message(f"[ARP] 🧷 Cached static ARP entry: {ip_address} → {mac}")
-            return mac
+                if cached_entry:
+                    mac, timestamp = cached_entry
+                    if now - timestamp < self.CACHE_TIMEOUT:
+                        self.router_logger.log_message(f"[ARP] ⚡ Cache hit for {ip_address} → {mac}")
+                        return mac
+                    self.router_logger.log_message(f"[ARP] 🕓 Stale cache entry for {ip_address}. Re-resolving...")
+                else:
+                    self.router_logger.log_message(f"[ARP] 🛰️ Cache miss for {ip_address}. Resolving...")
 
-        # --- Dynamic ARP cache ---
-        with self._arp_cache_lock:
-            cached_entry = self._arp_cache.get(ip_address)
-            if cached_entry:
-                mac, timestamp = cached_entry
-                if now - timestamp < self.CACHE_TIMEOUT:
-                    self.router_logger.log_message(f"[ARP] ⚡ Cache hit for {ip_address} → {mac}")
-                    return mac
-                self.router_logger.log_message(f"[ARP] 🕓 Stale cache entry for {ip_address}. Re-resolving...")
+            # --- NEW: Check for an active temporary lease ---
+
+            lease_info = self._temp_arp_leases.get(ip_address)
+            if lease_info and now < lease_info["lease_end"]:
+                our_mac = get_if_hwaddr(iface)
+                if our_mac:
+                    self.router_logger.log_message(
+                        f"[ARP] 🧪 Active temporary ARP lease for {ip_address}, using router's MAC: {our_mac}."
+                    )
+                    return our_mac
+                else:
+                    self.router_logger.log_message(
+                        f"[ARP] ❌ Failed to get router MAC for temporary lease on {iface}."
+                    )
+
+            # --- Custom ARP request as a final fallback ---
+            resolved_mac = self.send_custom_arp_request(ip_address)
+
+            if resolved_mac:
+                with self._arp_cache_lock:
+                    self._arp_cache[ip_address] = (resolved_mac, now)
+                self.router_logger.log_message(f"[ARP] ✅ Resolved {ip_address} → {resolved_mac}")
+                return resolved_mac
             else:
-                self.router_logger.log_message(f"[ARP] 🛰️ Cache miss for {ip_address}. Resolving...")
-
-        # --- NEW: Check for an active temporary lease ---
-        lease_info = self._temp_arp_leases.get(ip_address)
-        if lease_info and now < lease_info["lease_end"]:
-            our_mac = get_if_hwaddr(iface)
-            if our_mac:
-                self.router_logger.log_message(
-                    f"[ARP] 🧪 Active temporary ARP lease for {ip_address}, using router's MAC: {our_mac}."
-                )
-                return our_mac
-            else:
-                self.router_logger.log_message(
-                    f"[ARP] ❌ Failed to get router MAC for temporary lease on {iface}."
-                )
-
-        # --- Custom ARP request as a final fallback ---
-        resolved_mac = getmacbyip(ip_address)
-
-        if resolved_mac:
-            with self._arp_cache_lock:
-                self._arp_cache[ip_address] = (resolved_mac, now)
-            self.router_logger.log_message(f"[ARP] ✅ Resolved {ip_address} → {resolved_mac}")
-            return resolved_mac
-        else:
-            self.router_logger.log_message(f"[ARP] ❌ Resolve failed {ip_address}")
-            return None
+                self.router_logger.log_message(f"[ARP] ❌ Resolve failed {ip_address}")
+                return None
+        return None
 
     def send_gratuitous_arp(self, ip_address: str, mac_address: str, iface: str):
         """
@@ -2732,11 +2738,10 @@ class ARPManager:
         except Exception as e:
             self.router_logger.log_message(f"[ARP] ❌ Failed to send Gratuitous ARP on {iface.split('_')[-1]}: {e}")
 
-
-    def send_custom_arp_request(self, target_ip: str, iface: str, timeout: int = 2) -> str | None:
+    def send_custom_arp_request(self, target_ip: str, iface: str = None, timeout: int = 2) -> str | None:
         """
         Sends a custom ARP request to the target IP and waits for a reply.
-        This bypasses the cache and returns the resolved MAC address, or None if unreachable.
+        Only sends ARP if the target is a valid unicast IPv4 address.
 
         Args:
             target_ip (str): The IP address to resolve.
@@ -2744,21 +2749,42 @@ class ARPManager:
             timeout (int): How long to wait for a reply (default 2 seconds).
 
         Returns:
-            str | None: The resolved MAC address, or None if no reply.
+            str | None: The resolved MAC address, or None if no reply or invalid target.
         """
         try:
-            self.router_logger.log_message(
-                f"[ARP] 📡 Sending direct ARP request for {target_ip} on {iface.split('_')[-1]}")
-            arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip)
-            answered, _ = self.sniffer.srp(arp_request, iface=iface, timeout=timeout, verbose=False)
+            ip = ipaddress.ip_address(target_ip)
+            if not isinstance(ip, ipaddress.IPv4Address):
+                self.router_logger.log_message(f"[ARP] ⚠️ Skipping non-IPv4 address: {target_ip}")
+                return None
 
-            if answered:
-                resolved_mac = answered[0][1].hwsrc
+            if (
+                    ip.is_multicast or ip.is_loopback or ip.is_unspecified or ip.is_reserved
+                    or ip.is_link_local or ip == ipaddress.IPv4Address("255.255.255.255")
+            ):
+                self.router_logger.log_message(f"[ARP] ⚠️ Skipping non-unicast IP: {target_ip}")
+                return None
+
+
+            arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip)
+            if iface is None:
+                iface = self.lag_manager.get_member_interface("MyARPLANAggregation", arp_request)
+            self.router_logger.log_message(
+                f"[ARP] 📡 Sending direct ARP request for {target_ip} on {iface}"
+            )
+            packet = self.sniffer.sr2(arp_request, iface=iface, timeout=timeout, verbose=False)
+
+            if packet:
+                resolved_mac = packet.hwsrc
                 self.router_logger.log_message(f"[ARP] 🎯 Directly resolved {target_ip} → {resolved_mac}")
                 return resolved_mac
             else:
-                self.router_logger.log_message(f"[ARP] ⛔ No response to ARP for {target_ip} on {iface.split('_')[-1]}")
-                return None
+                self.router_logger.log_message(f"[ARP] ⛔ No response to ARP for {target_ip} on {iface.split('_')[-1]} getting mac address with function.")
+                resolved_mac = getmacbyip(target_ip)
+                return resolved_mac
+
+        except ValueError:
+            self.router_logger.log_message(f"[ARP] ⚠️ Invalid IP address format: {target_ip}")
+            return None
         except Exception as e:
             self.router_logger.log_message(f"[ARP] ❌ Error sending custom ARP for {target_ip}: {e}")
             return None
@@ -2923,6 +2949,18 @@ class ARPManager:
         )
         return True
 
+    def fallback_mac_from_os_cache(self, ip: str) -> str | None:
+        try:
+            output = subprocess.check_output(["arp", "-a"], text=True)
+            for line in output.splitlines():
+                if ip in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[1]  # MAC address
+            self.router_logger.log_message(f"[ARP] ✅ MAC for {ip} found in OS ARP cache: {parts[1]}")
+        except Exception as e:
+            self.router_logger.log_message(f"[ARP] ⚠️ ARP fallback cache check failed: {e}")
+        return None
     def get_cache_view(self) -> dict:
         """Returns a copy of the current ARP cache for inspection."""
         with self._arp_cache_lock:
@@ -2933,6 +2971,7 @@ class ARPManager:
         with self._arp_cache_lock:
             self._arp_cache.clear()
         self.router_logger.log_message("[ARP] 🧹 ARP cache cleared.")
+
 
 class DHCPServer:
     """
@@ -3371,15 +3410,16 @@ class LinkAggregationManager:
                 self.logger.log_message(f"[LAG] ⚠️ LAG '{lag_name}' not found.")
                 return False
 
-    def is_lag_interface(self, iface_name: str) -> bool:
+    def is_lag_interface(self, lag_name) -> bool:
         """Checks if a given interface name is a logical LAG interface."""
         with self._lag_lock:
-            return iface_name in self._lags
+            return lag_name in self._lags
 
     def get_member_interface(self, lag_name: str, packet: Packet) -> str | None:
         """
         Selects a physical member interface from a LAG for a given packet.
-        Uses a hash-based algorithm (src IP, dst IP, src port, dst port) for flow consistency.
+        Uses a hash-based algorithm (src IP, dst IP, src port, dst port) for flow consistency
+        for IP traffic. For non-IP traffic, it uses the destination MAC address.
         """
         with self._lag_lock:
             member_interfaces = self._lags.get(lag_name)
@@ -3387,9 +3427,7 @@ class LinkAggregationManager:
                 self.logger.log_message(f"[LAG] ❌ LAG '{lag_name}' not found or has no active members.")
                 return None
 
-            # Filter out any non-functional interfaces if a monitoring mechanism were in place
-            active_members = [iface for iface in member_interfaces if True]  # Placeholder for actual health check
-
+            active_members = [iface for iface in member_interfaces if True]  # Placeholder
             if not active_members:
                 self.logger.log_message(f"[LAG] 🚫 LAG '{lag_name}' has no active physical members. Cannot send packet.")
                 return None
@@ -3397,20 +3435,30 @@ class LinkAggregationManager:
             if len(active_members) == 1:
                 return active_members[0]
 
-            # Hash based on source IP, destination IP, and optionally ports for TCP/UDP
-            ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
-            hash_components = [ip_layer.src, ip_layer.dst]
-            if packet.haslayer(TCP):
-                hash_components.extend([packet[TCP].sport, packet[TCP].dport])
-            elif packet.haslayer(UDP):
-                hash_components.extend([packet[UDP].sport, packet[UDP].dport])
+            hash_components = []
+            if packet.haslayer(IP) or packet.haslayer(IPv6):
+                # Case 1: IP packet - use the IP and transport layer information
+                ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+                hash_components.extend([ip_layer.src, ip_layer.dst])
+
+                if packet.haslayer(TCP):
+                    hash_components.extend([packet[TCP].sport, packet[TCP].dport])
+                elif packet.haslayer(UDP):
+                    hash_components.extend([packet[UDP].sport, packet[UDP].dport])
+
+                # Use a generic log message for IP flows
+                flow_info = f"{ip_layer.src} -> {ip_layer.dst}"
+            else:
+                # Case 2: Non-IP packet (e.g., ARP, LLDP) - use the destination MAC address
+                hash_components.append(packet.dst)
+                flow_info = f"non-IP traffic to MAC {packet.dst}"
 
             hash_val = hash(tuple(hash_components))
             selected_index = hash_val % len(active_members)
             selected_member = active_members[selected_index]
 
             self.logger.log_message(
-                f"[LAG] Selected member {selected_member.split('_')[-1]} for LAG '{lag_name}' flow {ip_layer.src} -> {ip_layer.dst}.")
+                f"[LAG] Selected member {selected_member.split('_')[-1]} for LAG '{lag_name}' flow ({flow_info}).")
             return selected_member
 
     def get_lag_members(self) -> Dict[str, List[str]]:

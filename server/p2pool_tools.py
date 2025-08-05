@@ -4,8 +4,12 @@ import sys
 import ctypes
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Any, Dict
+
+import numpy as np
+import psutil
 from PyQt5.QtCore import QObject
 
 
@@ -20,7 +24,11 @@ class CSharpLogger(QObject):
 
     def log_message(self, msg: str):
         if self._logger:
-            formatted_message = f"{self._prefix} {msg}"
+            formatted_message = ""
+            if self._prefix == "":
+                formatted_message = f"{msg}"
+            else:
+                formatted_message = f"{self._prefix} {msg}"
             self._logger.log_message(formatted_message)
 
 
@@ -56,6 +64,8 @@ class ParallelPythonTool:
         self._callback_wrappers: Dict[str, Any] = {}
         self._parallel_queues: Dict[str, list[tuple]] = {}  # name → list of (wrapper, type, result_obj)\
         self.csharp_logger = CSharpLogger(self.logger)
+        self._process = psutil.Process(os.getpid())
+        self._cpu_usage_history = deque(maxlen=10)
         self._load_dll()
 
         atexit.register(self.stop)
@@ -64,6 +74,21 @@ class ParallelPythonTool:
     def __del__(self):
         self.stop()
 
+    def get_resource_usage(self) -> dict:
+        """
+        Returns a dictionary with current CPU and memory usage of the process.
+        Normalizes CPU usage to a 0–100% scale based on total logical cores.
+        """
+        cpu_percent_raw = self._process.cpu_percent(interval=1)
+        memory_info = self._process.memory_info()
+        logical_cores = psutil.cpu_count(logical=True)  # e.g., 32
+        max_possible = 100 * logical_cores
+        cpu_percent_normalized = min((cpu_percent_raw / max_possible) * 100, 100.0)
+
+        return {
+            "cpu_percent": cpu_percent_normalized,
+            "memory_usage_mb": memory_info.rss / (1024 * 1024)
+        }
     def inject_into(self, target_obj: object, primary_attr: str = 'logger',
                     fallback_attr: str = 'router_logger') -> bool:
         if hasattr(target_obj, primary_attr):
@@ -158,7 +183,6 @@ class ParallelPythonTool:
 
         if return_type not in self._RETURN_TYPE_MAP:
             raise ValueError(f"Invalid return_type: {return_type}")
-
         descriptors = []
         typ = self._RETURN_TYPE_MAP[return_type]
 
@@ -189,7 +213,6 @@ class ParallelPythonTool:
     def run_parallel(self, func: Callable, *args: Any, return_type: str = 'void', queue_name: str = None, count_to_call = 10) -> Any:
         if not self._load_dll():
             return
-
         # Handle special "all" case for batching
         if return_type == 'all':
             wrapped_func = lambda: func(*args)
@@ -204,6 +227,7 @@ class ParallelPythonTool:
                 f"[C#] [Python] 📝 Queued '{queue_key}' parallel call ({len(self._parallel_queues[queue_key])}/{count_to_call})")
 
             if len(self._parallel_queues[queue_key]) >= count_to_call:
+                self.csharp_logger.set_prefix("[C#]")
                 self._flush_parallel_queue(queue_key)
 
             return None
@@ -240,9 +264,9 @@ class ParallelPythonTool:
             raise ValueError(f"Invalid return_type '{return_type}'")
 
     def _flush_parallel_queue(self, queue_key: str) -> None:
+        self.csharp_logger.set_prefix("[C#]")
         if queue_key not in self._parallel_queues or not self._parallel_queues[queue_key]:
             return
-
         queue = self._parallel_queues[queue_key]
         count = len(queue)
         descriptors = []
@@ -267,6 +291,25 @@ class ParallelPythonTool:
         self._dll.invoke_all_parallel(ctypes.cast(descriptor_array, ctypes.c_void_p), count)
         self.logger.log_message(f"[C#] [Python] 🚀 Flushed {count} callbacks for '{queue_key}'")
         self._parallel_queues[queue_key] = []
+
+    def run_normal(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """
+        Runs a Python function normally, setting the CSharpLogger prefix to "" during execution
+        and resetting it afterwards.
+
+        Args:
+            func (Callable): The function to execute.
+            *args: Positional arguments to pass to the function.
+            **kwargs: Keyword arguments to pass to the function.
+        """
+        try:
+            self.csharp_logger.set_prefix("")
+            result = func(*args, **kwargs)
+            return result
+        except Exception as e:
+            self.logger.log_message(f"Error running function '{func.__name__}' normally: {e}")
+            raise  # Re-raise the exception after logging
+
 
     def stop(self) -> None:
         if self._dll:

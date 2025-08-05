@@ -5,7 +5,7 @@ import struct
 import time
 from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint, cast
 import sys
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
 
 import psutil
 from scapy.arch import get_if_hwaddr
@@ -615,87 +615,145 @@ class SnifferSoftware:
             if handle:
                 self.libpcap.pcap_close(handle)
 
-    def srp(self, packets: Union[Packet, List[Packet]], iface: str, timeout: int = 5, verbose: int = 0) -> Tuple[
-        List, List]:
+    def sr2(self, packet: Packet, iface: str, timeout: int = 2, verbose: int = 0) -> Optional[Packet]:
         """
-        Sends one or more Layer 2 packets and waits for replies.
-        Returns a tuple of (answered, unanswered).
+        Sends a Layer 2 packet and waits for a single reply.
+        Assumes the packet is already a complete Layer 2 frame (Ether()).
+
+        Args:
+            packet (Packet): The Layer 2 packet (Ether frame) to send.
+            iface (str): The network interface to send the packet on.
+            timeout (int): The number of seconds to wait for a reply.
+            verbose (int): Verbosity level (0=quiet, 1=normal, 2=detailed).
+
+        Returns:
+            Optional[Packet]: The first reply packet received, or None on timeout/error.
         """
-        if not packets:
-            return [], []
+        # 1. Validate the input packet is a Layer 2 frame and has a valid destination MAC
+        if not isinstance(packet, Ether):
+            self.logger.log_message("[Sniffer] Error: sr2 requires a Layer 2 packet (Ether frame).")
+            return None
+        if not packet.dst:
+            self.logger.log_message(
+                "[Sniffer] Error: The provided Layer 2 packet is missing a destination MAC address.")
+            return None
 
-        if not isinstance(packets, list):
-            packets = [packets]
+        # 2. Get the interface name and MAC addresses for the BPF filter
+        iface_out = iface
+        src_mac = packet.src
+        dst_mac = packet.dst
 
-        unanswered_packets = list(packets)
-        answered_packets = []
+        if not iface_out:
+            self.logger.log_message("[Sniffer] Error: Interface not specified for sr2.")
+            return None
 
-        try:
-            our_mac = get_if_hwaddr(iface)
-        except Exception:
-            self.logger.log_message(f"[Sniffer] ❌ Could not get MAC address for interface '{iface}'.")
-            return [], unanswered_packets
-
-        bpf_filter_str = ""
-        if any(pkt.haslayer(ARP) for pkt in packets):
-            bpf_filter_str = f"arp and ether host {our_mac}"
-
+        # 3. Open the libpcap handle for sniffing on the specified interface.
+        # snaplen=65535 (capture full packets), promiscuous=1 (capture all packets on the network), timeout_ms=int(timeout * 1000)
         errbuf = ctypes.create_string_buffer(256)
-        raw_handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, int(timeout * 1000), errbuf)
+        handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
 
-        if not raw_handle:
-            self.logger.log_message(f"[Sniffer] ❌ Error opening device: {errbuf.value.decode()}")
-            return [], unanswered_packets
-
-        # Since your prototype expects POINTER(c_char), cast it:
-        handle = ctypes.cast(raw_handle, POINTER(c_char))
+        if not handle:
+            self.logger.log_message(
+                f"[Sniffer] Error opening device {iface_out}: {errbuf.value.decode('utf-8', errors='ignore')}"
+            )
+            return None
 
         try:
-            # --- FIX: Use our own sendp function to send the packet. ---
-            for pkt in packets:
-                self.sendp(pkt, iface=iface, verbose=verbose)
+            # 4. Compile a BPF filter to capture reply packets.
+            # A valid reply will have the original destination MAC as its source, and vice-versa.
+            # We also filter by protocol if the original packet is an ARP request.
+            bpf_filter_str = f"ether src {dst_mac} and ether dst {src_mac}"
+            if ARP in packet:
+                bpf_filter_str += " and arp"
 
-            if bpf_filter_str:
-                bpf = bpf_program()
-                if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), bpf_filter_str.encode(), 1, 0) == -1:
-                    err = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode(errors="ignore")
-                    self.logger.log_message(f"[Sniffer] ❌ Filter compile error: {err}")
-                    return [], unanswered_packets
+            bpf = bpf_program()
+            if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), bpf_filter_str.encode("utf-8"), 1, 0) != 0:
+                error_msg = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode('utf-8', errors='ignore')
+                self.logger.log_message(f"[Sniffer] Error compiling BPF filter: {error_msg}")
+                return None
 
-                self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf))
-                self.libpcap.pcap_freecode(ctypes.byref(bpf))
+            # 5. Apply the filter to the pcap handle
+            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) != 0:
+                error_msg = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode('utf-8', errors='ignore')
+                self.logger.log_message(f"[Sniffer] Error setting BPF filter: {error_msg}")
+                return None
+            self.libpcap.pcap_freecode(ctypes.byref(bpf))
 
+            # 6. Send the Layer 2 packet
+            packet_bytes = bytes(packet)
+            result = self.libpcap.pcap_sendpacket(
+                handle,
+                (ctypes.c_ubyte * len(packet_bytes))(*packet_bytes),
+                len(packet_bytes)
+            )
+
+            if result != 0:
+                error_msg = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode('utf-8', errors='ignore')
+                # Improved error handling for common device-related issues
+                if "device attached" in error_msg.lower() or "not functioning" in error_msg.lower():
+                    self.logger.log_message(
+                        f"[Sniffer] ⛔ sr2 send failed on {iface_out}: Device not functioning (likely Win32 error 31). Skipping interface."
+                    )
+                else:
+                    self.logger.log_message(f"[Sniffer] ❌ sr2 send failed on {iface_out}: {error_msg}")
+                return None
+
+            if verbose >= 1:
+                self.logger.log_message(f"[+] Sent packet on {iface_out}: {packet.summary()}")
+                if verbose >= 2:
+                    packet.show()
+
+            # 7. Sniff for a reply packet until timeout
             pkthdr_ptr = ctypes.POINTER(pcap_pkthdr)()
-            packet_data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+            packet_data_ptr = ctypes.POINTER(ctypes.c_char)()
+
             start_time = time.time()
-
-            while time.time() - start_time < timeout and unanswered_packets:
-                res = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
-                if res == 1:
-                    packet_len = pkthdr_ptr.contents.len
-                    raw = ctypes.string_at(packet_data_ptr, packet_len)
-
-                    try:
-                        received_packet = Ether(raw)
-                    except Exception:
+            while time.time() - start_time < timeout:
+                ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
+                if ret == 1:
+                    # We received a packet that passed the filter.
+                    if not pkthdr_ptr or not pkthdr_ptr.contents:
+                        self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
                         continue
+                    packet_len = pkthdr_ptr.contents.len
+                    if packet_len <= 0:
+                        self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
+                        continue
+                    raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
+                    reply_packet = Ether(raw_packet)
 
-                    for sent_pkt in list(unanswered_packets):
-                        if received_packet.haslayer(ARP) and sent_pkt.haslayer(ARP):
-                            if (received_packet[ARP].op == 2 and
-                                    received_packet[ARP].psrc == sent_pkt[ARP].pdst):
-                                answered_packets.append((sent_pkt, received_packet))
-                                unanswered_packets.remove(sent_pkt)
-                                if verbose >= 1:
-                                    self.logger.log_message(
-                                        f"[Sniffer] ✅ Received ARP reply: {received_packet[ARP].psrc} is at {received_packet[ARP].hwsrc}"
-                                    )
-                                break
+                    # Additional check to verify the reply is a valid ARP response to our request
+                    if ARP in packet and ARP in reply_packet:
+                        # Check if the ARP reply is for the original ARP request
+                        if reply_packet[ARP].op == 2 and reply_packet[ARP].psrc == packet[ARP].pdst:
+                            if verbose >= 1:
+                                self.logger.log_message(
+                                    f"[Sniffer] ✅ Received ARP reply on {iface_out}: {reply_packet.summary()}")
+                            return reply_packet
+                        else:
+                            # If the ARP reply doesn't match, we ignore it and continue sniffing
+                            continue
+                    else:
+                        # For non-ARP packets, we assume any packet that matches the BPF filter is a valid reply
+                        if verbose >= 1:
+                            self.logger.log_message(
+                                f"[Sniffer] ✅ Received reply on {iface_out}: {reply_packet.summary()}")
+                        return reply_packet
 
-            if verbose >= 1 and unanswered_packets:
-                self.logger.log_message(f"[Sniffer] 🕒 Timeout: {len(unanswered_packets)} packet(s) unanswered.")
+                elif ret == -1:
+                    error_msg = ctypes.string_at(self.libpcap.pcap_geterr(handle)).decode('utf-8', errors='ignore')
+                    self.logger.log_message(f"[Sniffer] Error reading packet: {error_msg}")
+                    break
+                # ret == 0 means timeout, which is handled by the while loop's condition
+
+            # 8. Handle timeout case
+            if verbose >= 1:
+                self.logger.log_message("[Sniffer] Timeout: No reply received.")
+            return None
 
         finally:
-            self.libpcap.pcap_close(handle)
+            # 9. Clean up resources
+            if handle:
+                self.libpcap.pcap_close(handle)
 
-        return answered_packets, unanswered_packets
+
