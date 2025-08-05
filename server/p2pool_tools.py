@@ -59,7 +59,7 @@ class ParallelPythonTool:
         self._load_dll()
 
         atexit.register(self.stop)
-        self.logger.log_message(" [C#] [Python] ParallelPythonTool initialized for native interop.")
+        self.logger.log_message("[C#] [Python] ParallelPythonTool initialized for native interop.")
 
     def __del__(self):
         self.stop()
@@ -82,7 +82,7 @@ class ParallelPythonTool:
         dll_path = base_path / relative_path
         if dll_path.exists():
             return dll_path
-        self.logger.log_message(f" [C#] [Python] Error: DLL not found at: {dll_path}")
+        self.logger.log_message(f"[C#] [Python] Error: DLL not found at: {dll_path}")
         return None
 
     def _load_dll(self) -> bool:
@@ -91,7 +91,7 @@ class ParallelPythonTool:
         if not self._dll_path:
             return False
         try:
-            self.logger.log_message(f" [C#] [Python] 🚀 Loading C# DLL from: {self._dll_path}")
+            self.logger.log_message(f"[C#] [Python] 🚀 Loading C# DLL from: {self._dll_path}")
             self._dll = ctypes.cdll.LoadLibrary(str(self._dll_path))
 
             self._dll.invoke_python_callback.argtypes = [ctypes.c_void_p]
@@ -103,10 +103,10 @@ class ParallelPythonTool:
             self._dll.invoke_all_parallel.argtypes = [ctypes.c_void_p, ctypes.c_int]
             self._dll.invoke_all_parallel.restype = None
 
-            self.logger.log_message(" [C#] [Python] ✅ C# DLL loaded successfully.")
+            self.logger.log_message("[C#] [Python] ✅ C# DLL loaded successfully.")
             return True
         except Exception as e:
-            self.logger.log_message(f" [C#] [Python] ❌ Failed to load DLL: {e}")
+            self.logger.log_message(f"[C#] [Python] ❌ Failed to load DLL: {e}")
             return False
 
     def _create_callback_wrapper(self, func: Callable, return_type: str) -> tuple:
@@ -143,7 +143,7 @@ class ParallelPythonTool:
         wrapper, _ = self._create_callback_wrapper(func, return_type)
         self._registered_callbacks[name] = func
         self._callback_wrappers[name] = wrapper
-        self.logger.log_message(f" [C#] [Python] ✅ Registered callback: '{name}'")
+        self.logger.log_message(f"[C#] [Python] ✅ Registered callback: '{name}'")
 
     def run_all_parallel(self, funcs: list[tuple[Callable, tuple]], return_type: str = 'void') -> None:
         """
@@ -184,7 +184,7 @@ class ParallelPythonTool:
         descriptor_array = DescriptorArrayType(*descriptors)
 
         self._dll.invoke_all_parallel(ctypes.cast(descriptor_array, ctypes.c_void_p), count)
-        self.logger.log_message(f" [C#] [Python] 🚀 Ran {count} callbacks in batch via run_all_parallel()")
+        self.logger.log_message(f"[C#] [Python] 🚀 Ran {count} callbacks in batch via run_all_parallel()")
 
     def run_parallel(self, func: Callable, *args: Any, return_type: str = 'void', queue_name: str = None, count_to_call = 10) -> Any:
         if not self._load_dll():
@@ -201,7 +201,7 @@ class ParallelPythonTool:
 
             self._parallel_queues[queue_key].append((wrapper, self._RETURN_TYPE_MAP['void'], result))
             self.logger.log_message(
-                f" [C#] [Python] 📝 Queued '{queue_key}' parallel call ({len(self._parallel_queues[queue_key])}/{count_to_call})")
+                f"[C#] [Python] 📝 Queued '{queue_key}' parallel call ({len(self._parallel_queues[queue_key])}/{count_to_call})")
 
             if len(self._parallel_queues[queue_key]) >= count_to_call:
                 self._flush_parallel_queue(queue_key)
@@ -214,7 +214,7 @@ class ParallelPythonTool:
         func_ptr = ctypes.cast(wrapper, ctypes.c_void_p)
 
         self.logger.log_message(
-            f" [C#] [Python] ⚡ Running immediate callback (return_type='{return_type}') for '{func.__name__}'")
+            f"[C#] [Python] ⚡ Running immediate callback (return_type='{return_type}') for '{func.__name__}'")
 
         if return_type == 'void':
             self._dll.invoke_python_callback(func_ptr)
@@ -265,7 +265,7 @@ class ParallelPythonTool:
         descriptor_array = DescriptorArrayType(*descriptors)
 
         self._dll.invoke_all_parallel(ctypes.cast(descriptor_array, ctypes.c_void_p), count)
-        self.logger.log_message(f" [C#] [Python] 🚀 Flushed {count} callbacks for '{queue_key}'")
+        self.logger.log_message(f"[C#] [Python] 🚀 Flushed {count} callbacks for '{queue_key}'")
         self._parallel_queues[queue_key] = []
 
     def stop(self) -> None:
@@ -280,9 +280,9 @@ class ParallelPythonTool:
                     success = FreeLibrary(hmodule)
                     if not success:
                         raise ctypes.WinError()
-                self.logger.log_message(" [C#] [Python] ✅ C# DLL unloaded.")
+                self.logger.log_message("[C#] [Python] ✅ C# DLL unloaded.")
             except Exception as e:
-                self.logger.log_message(f" [C#] [Python] ⚠️ Failed to unload DLL: {e}")
+                self.logger.log_message(f"[C#] [Python] ⚠️ Failed to unload DLL: {e}")
             finally:
                 self._dll = None
 

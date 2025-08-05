@@ -120,7 +120,7 @@ class PythonRouterManager:
         self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer)
         self.dns_manager = DNSManager(router_logger, self.packet_writer)
         self.mdns_manager = mDNSManager(router_logger, self.packet_writer, self._interfaces_config)
-        self.rip_manager = RIPManager(router_logger)
+        self.rip_manager = RIPManager(router_logger, self.function_call_tracker)
         self.nat_manager = None  # Initialized after public IP is known
         self.notification_manager = None
         self.packet_catcher = PacketCatcherManager(router_logger, self._interfaces_config)
@@ -144,6 +144,7 @@ class PythonRouterManager:
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
         self.parallel_python.inject_into(self.packet_catcher)
+        self.parallel_python.inject_into(self.https_manager)
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -250,86 +251,6 @@ class PythonRouterManager:
         except Exception as e:
             self.router_logger.log_message(f"[Firewall] ❌ Unexpected error adding rules: {e}")
 
-    def _setup_dynamic_firewall_manager_rules(self):
-        """
-        Adds firewall rules based on the dynamically configured LAN network.
-        """
-        if not self.router_network_in:
-            self.router_logger.log_message("[Firewall] Skipping dynamic rule setup: LAN network not configured.")
-            return
-
-        lan_network_cidr = str(self.router_network_in)
-        self.router_logger.log_message(f"[Firewall] Adding dynamic rules for LAN: {lan_network_cidr}")
-
-        # Rule 1: Allow all traffic within the LAN
-        self.firewall_manager.add_rule(
-            action='permit', protocol='any', src_ip=lan_network_cidr, dst_ip=lan_network_cidr,
-            src_port='any', dst_port='any'
-        )
-        # Rule 2: Allow outbound HTTP/HTTPS from LAN
-        self.firewall_manager.add_rule(
-            action='permit', protocol='tcp', src_ip=lan_network_cidr, dst_ip='any',
-            src_port='any', dst_port=80
-        )
-        self.firewall_manager.add_rule(
-            action='permit', protocol='tcp', src_ip=lan_network_cidr, dst_ip='any',
-            src_port='any', dst_port=443
-        )
-        # Rule 3: Allow outbound DNS from LAN
-        self.firewall_manager.add_rule(
-            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='any',
-            src_port='any', dst_port=53
-        )
-        # Rule 4: Allow outbound ICMP (ping) from LAN
-        self.firewall_manager.add_rule(
-            action='permit', protocol='icmp', src_ip=lan_network_cidr, dst_ip='any',
-            src_port='any', dst_port='any'
-        )
-        # Rule 5: Allow inbound traffic for established connections to the LAN
-        self.firewall_manager.add_rule(
-            action='permit', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr,
-            src_port='any', dst_port='1024-65535'
-        )
-        self.firewall_manager.add_rule(
-            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=22,
-        )
-        self.firewall_manager.add_rule(
-            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=3389,
-        )
-        self.firewall_manager.add_rule(
-            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=445,
-        )
-        self.firewall_manager.add_rule(action='permit', protocol='udp', src_ip='0.0.0.0', dst_ip='255.255.255.255', src_port=68,
-         dst_port=67)
-        self.firewall_manager.add_rule(action='permit', protocol='udp', src_ip='any', dst_ip='255.255.255.255', src_port=67,
-         dst_port=68)
-
-        self.firewall_manager.add_rule(
-            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='224.0.0.9',
-            src_port='any', dst_port=520
-        )
-
-
-        self.firewall_manager.add_rule(
-            action='permit', protocol='udp', src_ip='any', dst_ip=lan_network_cidr,
-            src_port=520, dst_port='any'
-        )
-
-        self.firewall_manager.add_rule(
-            action='permit', protocol='udp', src_ip='any', dst_ip='any',
-            src_port='any', dst_port=53
-        )
-
-
-        self.firewall_manager.add_rule(
-            action='permit', protocol='tcp', src_ip='any', dst_ip='any',
-            src_port='any', dst_port=53
-        )
-
-        self.firewall_manager.add_rule(
-            action='permit', protocol='igmp', src_ip='any', dst_ip='any',
-            src_port='any', dst_port='any'  # Ports are 'any' as IGMP doesn't use them
-        )
     def _remove_firewall_rules(self):
         """Removes any firewall rules added by this router."""
         try:
@@ -850,12 +771,25 @@ class PythonRouterManager:
         # Trust the IN interface
         self.add_trusted_arp_port(self.interface_in_full_name)
         self.add_trusted_arp_port(self.interface_out_full_name)
+
         # Optionally trust Ethernet 2 (if used in bridging)
         if ethernet_2_info:
+            self.add_static_arp_entry(
+                self._interfaces_config[self.interface_ethernet_2_full_name]["ip_addr"],
+                self._interfaces_config[self.interface_ethernet_2_full_name]["mac"]
+            )
             self.add_trusted_arp_port(self.interface_ethernet_2_full_name)
         if self.interface_lac_full_name:
+            self.add_static_arp_entry(
+                self._interfaces_config[self.interface_lac_full_name]["ip_addr"],
+                self._interfaces_config[self.interface_lac_full_name]["mac"]
+            )
             self.add_trusted_arp_port(self.interface_lac_full_name)
         if self.interface_lac_2_full_name:
+            self.add_static_arp_entry(
+                self._interfaces_config[self.interface_lac_2_full_name]["ip_addr"],
+                self._interfaces_config[self.interface_lac_2_full_name]["mac"]
+            )
             self.add_trusted_arp_port(self.interface_lac_2_full_name)
         # Example: Add static ARP entry for gateway (if known)
         if self.router_gateway_out_ip:
@@ -889,6 +823,7 @@ class PythonRouterManager:
                 "broadcast": str(loopback_network.broadcast_address)
             }
             if self.interface_loopback_full_name:
+                self.add_static_arp_entry(loopback_ip, loopback_mac)
                 self.add_trusted_arp_port(self.interface_loopback_full_name)
             self.rip_manager.interface_loopback_full_name = self.interface_loopback_full_name
             self.router_logger.log_message(
@@ -907,18 +842,7 @@ class PythonRouterManager:
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
-        conf.route.add(net=str(self.router_network_in), gw=self.router_gateway_out_ip,
-                       dev=self.interface_out_friendly_name)
-        conf.route.add(
-            host="192.168.0.10",
-            gw="192.168.0.1",
-            dev=self.interface_out_friendly_name  # <-- Use the dynamically found name
-        )
-        # Do the same for IPv6 if needed
-        conf.route6.add(
-            dst="2001:db8:cafe:f000::/64",
-            dev=self.interface_out_friendly_name  # <-- Use the dynamically found name
-        )
+
         self.router_macs = {cfg.get('mac') for cfg in self._interfaces_config.values() if 'mac' in cfg}
 
         self.router_logger.log_message(f"\n--- Python Router Configuration Summary (Dynamically Assigned) ---")
@@ -931,121 +855,6 @@ class PythonRouterManager:
         self.router_logger.log_message(
             f"  External Gateway: {self.router_gateway_out_ip} via '{self.interface_out_friendly_name}'")
         self.router_logger.log_message(f"----------------------------------------------------------------")
-        return True
-
-    def _enable_nat_forwarding(self):
-        """
-        Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
-        This makes the operation idempotent and resilient to crashes.
-        Falls back or warns if the OS does not support New-NetNat (e.g., Windows Home).
-        """
-        if platform.system() != "Windows":
-            self.router_logger.log_message("[NAT Setup] ❌ NAT setup is only supported on Windows.")
-            return
-
-        if not self.router_network_in:
-            self.router_logger.log_message("[NAT Setup] ⚠️ Cannot enable NAT: IN network is not configured.")
-            return
-
-        # --- Check Windows Edition ---
-        try:
-            edition_output = subprocess.check_output(
-                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
-                text=True
-            ).strip()
-
-            unsupported_skus = {"101", "100", "103", "104"}  # Known Home/Starter SKUs
-
-            if edition_output in unsupported_skus:
-                self.router_logger.log_message("[NAT Setup] 🏠 Windows Home or unsupported edition detected.")
-                return
-        except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ⚠️ Could not determine Windows edition: {e}")
-
-        lan_network_cidr = str(self.router_network_in)
-        self.router_logger.log_message(f"[NAT Setup] 🚀 Enabling NAT for network {lan_network_cidr}...")
-        ps_command = [
-            "powershell.exe",
-            "-Command",
-            f'New-NetNat -Name "PythonRouterNAT" -InternalIPInterfaceAddressPrefix "{lan_network_cidr}"'
-        ]
-        try:
-            result = subprocess.run(ps_command, capture_output=True, text=True, check=True,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding enabled successfully.")
-            if result.stdout:
-                self.router_logger.log_message(f"[NAT Setup] PowerShell output: {result.stdout.strip()}")
-        except subprocess.CalledProcessError as e:
-            if "0x80041010" in e.stderr:
-                self.router_logger.log_message("[NAT Setup] ❌ New-NetNat is not supported on this Windows edition.")
-            else:
-                self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
-            self.router_logger.log_message(
-                "[NAT Setup] ℹ️ Please ensure this script is run with Administrator privileges.")
-        except FileNotFoundError:
-            self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
-        except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ❌ An unexpected error occurred while enabling NAT: {e}")
-
-    def _disable_nat_forwarding(self):
-        """
-        Removes the NAT forwarding rule created by the router, but only if running
-        on a supported edition (Windows Pro or higher).
-        """
-        self.router_logger.log_message("[NAT Setup] 🧹 Disabling NAT forwarding...")
-
-        if platform.system() != "Windows":
-            self.router_logger.log_message("[NAT Setup] ❌ NAT disabling is only supported on Windows.")
-            return
-
-        try:
-            # Check if the system is a supported SKU (i.e., not Home/Starter)
-            edition_output = subprocess.check_output(
-                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
-                text=True
-            ).strip()
-            unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
-            if edition_output in unsupported_skus:
-                self.router_logger.log_message("[NAT Setup] 🛑 Skipping NAT disable: unsupported Windows edition.")
-                return
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[NAT Setup] ⚠️ Could not determine Windows edition. Skipping NAT disable. Reason: {e}")
-            return
-        ps_command = [
-            "powershell.exe",
-            "-Command",
-            'Remove-NetNat -Name "PythonRouterNAT" -Confirm:$false'
-        ]
-        try:
-            subprocess.run(ps_command, capture_output=True, text=True, check=False,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding rule removed (if it existed).")
-        except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
-
-    def add_static_routes_for_all_interfaces(self):
-        self.rip_manager.interfaces_config = self._interfaces_config
-        for ifname, cfg in self._interfaces_config.items():
-            ip_addr = cfg.get("ip_addr")
-            net_obj = cfg.get("network")
-            if not ip_addr or not net_obj:
-                continue
-            self.rip_manager.add_static_route(str(net_obj), "0.0.0.0", ifname, cost=1)
-    def set_default_gateway(self, gateway_ip: str, outbound_iface_name: str) -> bool:
-        """
-        Sets the default gateway IP and the interface through which to reach it.
-        outbound_iface_name here is the full Scapy interface name.
-        """
-        if outbound_iface_name not in self._interfaces_config:
-            self.router_logger.log_message(
-                f"[Router] ERROR: Outbound interface '{outbound_iface_name}' not configured for default gateway.")
-            return False
-
-        self.default_gateway_ip = gateway_ip
-        self._interfaces_config[outbound_iface_name]['is_default_gateway_iface'] = True
-        self.router_logger.log_message(
-            f"[Router] Set default gateway: {gateway_ip} via {outbound_iface_name.split('_')[-1]}")
         return True
 
     def _start_single_sniffer(self, iface_name: str):
@@ -1216,8 +1025,7 @@ class PythonRouterManager:
                     return
 
             if packet.haslayer(TLS):
-                if self.https_manager.handle_packet(packet, inbound_iface):
-                    return
+                self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=5)
 
             if packet.haslayer(UDP) and packet[UDP].dport == 5353:
                 if self.mdns_manager.handle_packet(packet):
@@ -1231,7 +1039,7 @@ class PythonRouterManager:
 
 
 
-            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=4)
+            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=10)
 
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP transit packet not for router detected on {iface_short}")
@@ -1571,32 +1379,16 @@ class PythonRouterManager:
             self.packet_signer.notification_manager = self.notification_manager
             self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
 
-            self.rip_manager.initialize_routes(self._interfaces_config, self.router_gateway_out_ip,
-                                               self.interface_out_full_name)
-            self.add_static_routes_for_all_interfaces()
+            self.rip_manager.initialize_routes(
+                interfaces_config=self._interfaces_config,
+                default_gateway_ip=self.router_gateway_out_ip,
+                default_gateway_iface=self.interface_out_full_name,
+                router_gateway_out_ip=self.router_gateway_out_ip,
+                interface_out_full_name=self.interface_out_full_name,
+                interface_in_full_name=self.interface_in_full_name
+            )
 
-            google_dns_route_network = ipaddress.ip_network("8.8.8.8/32")
 
-            current_route_details = self.rip_manager.find_route("8.8.8.8")
-            if not current_route_details or current_route_details.get("type") != "static":
-                self.router_logger.log_message("[Router] Adding/Updating static route for 8.8.8.8/32.")
-
-                self.rip_manager.add_static_route(
-                    network_str=str(google_dns_route_network),
-                    next_hop=self.router_gateway_out_ip,
-                    interface=self.interface_out_full_name,
-                    cost=1
-                )
-                loopback_network = ipaddress.IPv6Network("::1/128")
-
-                self.rip_manager.add_static_route(
-                    network_str=str(loopback_network),
-                    next_hop="::1",
-                    interface=self.interface_in_full_name,  # fallback to your IN interface
-                    cost=2
-                )
-            else:
-                self.router_logger.log_message("[Router] Static route for 8.8.8.8/32 already exists.")
 
             self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager,
                                                       self.rip_manager)
@@ -1684,7 +1476,206 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
+    def _enable_nat_forwarding(self):
+        """
+        Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
+        This makes the operation idempotent and resilient to crashes.
+        Falls back or warns if the OS does not support New-NetNat (e.g., Windows Home).
+        """
+        if platform.system() != "Windows":
+            self.router_logger.log_message("[NAT Setup] ❌ NAT setup is only supported on Windows.")
+            return
 
+        if not self.router_network_in:
+            self.router_logger.log_message("[NAT Setup] ⚠️ Cannot enable NAT: IN network is not configured.")
+            return
+
+        # --- Check Windows Edition ---
+        try:
+            edition_output = subprocess.check_output(
+                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
+                text=True
+            ).strip()
+
+            unsupported_skus = {"100", "103", "104"}  # Excludes 101 (Win11 Home), which works
+
+            if edition_output in unsupported_skus:
+                self.router_logger.log_message("[NAT Setup] 🏠 Windows Home or unsupported edition detected.")
+                return
+        except Exception as e:
+            self.router_logger.log_message(f"[NAT Setup] ⚠️ Could not determine Windows edition: {e}")
+
+        lan_network_cidr = str(self.router_network_in)
+        self.router_logger.log_message(f"[NAT Setup] 🚀 Enabling NAT for network {lan_network_cidr}...")
+
+        try:
+            # Remove any existing NAT instance with the same name
+            cleanup_cmd = [
+                "powershell.exe",
+                "-Command",
+                "if (Get-NetNat -Name 'PythonRouterNAT' -ErrorAction SilentlyContinue) {"
+                " Remove-NetNat -Name 'PythonRouterNAT' -Confirm:$false }"
+            ]
+            subprocess.run(cleanup_cmd, capture_output=True, text=True, check=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+
+            # Now create the new NAT rule
+            ps_command = [
+                "powershell.exe",
+                "-Command",
+                f'New-NetNat -Name "PythonRouterNAT" -InternalIPInterfaceAddressPrefix "{lan_network_cidr}"'
+            ]
+            result = subprocess.run(ps_command, capture_output=True, text=True, check=True,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+
+            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding enabled successfully.")
+            if result.stdout:
+                self.router_logger.log_message(f"[NAT Setup] PowerShell output: {result.stdout.strip()}")
+
+        except subprocess.CalledProcessError as e:
+            if "0x80041010" in e.stderr:
+                self.router_logger.log_message("[NAT Setup] ❌ New-NetNat is not supported on this Windows edition.")
+            else:
+                self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
+            self.router_logger.log_message(
+                "[NAT Setup] ℹ️ Please ensure this script is run with Administrator privileges.")
+        except FileNotFoundError:
+            self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
+        except Exception as e:
+            self.router_logger.log_message(f"[NAT Setup] ❌ An unexpected error occurred while enabling NAT: {e}")
+
+    def _disable_nat_forwarding(self):
+        """
+        Removes the NAT forwarding rule created by the router, but only if running
+        on a supported edition (Windows Pro or higher).
+        """
+        self.router_logger.log_message("[NAT Setup] 🧹 Disabling NAT forwarding...")
+
+        if platform.system() != "Windows":
+            self.router_logger.log_message("[NAT Setup] ❌ NAT disabling is only supported on Windows.")
+            return
+
+        try:
+            # Check if the system is a supported SKU (i.e., not Home/Starter)
+            edition_output = subprocess.check_output(
+                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
+                text=True
+            ).strip()
+            unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
+            if edition_output in unsupported_skus:
+                self.router_logger.log_message("[NAT Setup] 🛑 Skipping NAT disable: unsupported Windows edition.")
+                return
+        except Exception as e:
+            self.router_logger.log_message(
+                f"[NAT Setup] ⚠️ Could not determine Windows edition. Skipping NAT disable. Reason: {e}")
+            return
+        ps_command = [
+            "powershell.exe",
+            "-Command",
+            'Remove-NetNat -Name "PythonRouterNAT" -Confirm:$false'
+        ]
+        try:
+            subprocess.run(ps_command, capture_output=True, text=True, check=False,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding rule removed (if it existed).")
+        except Exception as e:
+            self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
+
+    def _setup_dynamic_firewall_manager_rules(self):
+        """
+        Adds firewall rules based on the dynamically configured LAN network.
+        """
+        if not self.router_network_in:
+            self.router_logger.log_message("[Firewall] Skipping dynamic rule setup: LAN network not configured.")
+            return
+
+        lan_network_cidr = str(self.router_network_in)
+        self.router_logger.log_message(f"[Firewall] Adding dynamic rules for LAN: {lan_network_cidr}")
+
+        # Rule 1: Allow all traffic within the LAN
+        self.firewall_manager.add_rule(
+            action='permit', protocol='any', src_ip=lan_network_cidr, dst_ip=lan_network_cidr,
+            src_port='any', dst_port='any'
+        )
+        # Rule 2: Allow outbound HTTP/HTTPS from LAN
+        self.firewall_manager.add_rule(
+            action='permit', protocol='tcp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port=80
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='tcp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port=443
+        )
+        # Rule 3: Allow outbound DNS from LAN
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port=53
+        )
+        # Rule 4: Allow outbound ICMP (ping) from LAN
+        self.firewall_manager.add_rule(
+            action='permit', protocol='icmp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port='any'
+        )
+        # Rule 5: Allow inbound traffic for established connections to the LAN
+        self.firewall_manager.add_rule(
+            action='permit', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port='any', dst_port='1024-65535'
+        )
+        self.firewall_manager.add_rule(
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=22,
+        )
+        self.firewall_manager.add_rule(
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=3389,
+        )
+        self.firewall_manager.add_rule(
+            action='deny', protocol='tcp', src_ip='any', dst_ip=lan_network_cidr, dst_port=445,
+        )
+        self.firewall_manager.add_rule(action='permit', protocol='udp', src_ip='0.0.0.0', dst_ip='255.255.255.255',
+                                       src_port=68,
+                                       dst_port=67)
+        self.firewall_manager.add_rule(action='permit', protocol='udp', src_ip='any', dst_ip='255.255.255.255',
+                                       src_port=67,
+                                       dst_port=68)
+
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='224.0.0.9',
+            src_port='any', dst_port=520
+        )
+
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port=520, dst_port='any'
+        )
+
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip='any',
+            src_port='any', dst_port=53
+        )
+
+        self.firewall_manager.add_rule(
+            action='permit', protocol='tcp', src_ip='any', dst_ip='any',
+            src_port='any', dst_port=53
+        )
+
+        self.firewall_manager.add_rule(
+            action='permit', protocol='igmp', src_ip='any', dst_ip='any',
+            src_port='any', dst_port='any'  # Ports are 'any' as IGMP doesn't use them
+        )
+    def set_default_gateway(self, gateway_ip: str, outbound_iface_name: str) -> bool:
+        """
+        Sets the default gateway IP and the interface through which to reach it.
+        outbound_iface_name here is the full Scapy interface name.
+        """
+        if outbound_iface_name not in self._interfaces_config:
+            self.router_logger.log_message(
+                f"[Router] ERROR: Outbound interface '{outbound_iface_name}' not configured for default gateway.")
+            return False
+
+        self.default_gateway_ip = gateway_ip
+        self._interfaces_config[outbound_iface_name]['is_default_gateway_iface'] = True
+        self.router_logger.log_message(
+            f"[Router] Set default gateway: {gateway_ip} via {outbound_iface_name.split('_')[-1]}")
+        return True
     def cleanup_all_network_changes(self):
         """
         Cleans up all network changes made by the router, reverting IPs and DNS
@@ -1781,24 +1772,7 @@ class PythonRouterManager:
         return self.ethernet_manager.remove_bridge(bridge_name)
 
     # --- New Methods for Static Route Management ---
-    def add_static_route(self, network_str: str, next_hop: str, interface_full_name: str, cost: int = 1) -> bool:
-        """
-        Adds a static route to the router's routing table.
-        Args:
-            network_str (str): CIDR notation for the destination network (e.g., "192.168.1.0/24").
-            next_hop (str): The IP address of the next hop router, or "0.0.0.0" for direct delivery.
-            interface_full_name (str): The full Scapy name of the outbound interface for this route.
-            cost (int): The metric/cost of this route (1-15 valid, 16 = infinity).
-        Returns True if added/updated, False otherwise.
-        """
-        return self.rip_manager.add_static_route(network_str, next_hop, interface_full_name, cost)
 
-    def remove_static_route(self, network_str: str) -> bool:
-        """
-        Removes a static route from the router's routing table.
-        Returns True if removed, False otherwise.
-        """
-        return self.rip_manager.remove_static_route(network_str)
 
     def get_routing_table(self) -> list[dict]:
         """

@@ -1109,7 +1109,7 @@ class TransportManager:
             if "R" in flags: flag_details.append("RST")
 
             self.logger.log_message(
-                f"[Transport] 🧵 TCP Packet on {iface_short}: {src_ip}:{tcp.sport} → {dst_ip}:{tcp.dport} | "
+                f"[Transport][🧵 TCP] Packet on {iface_short}: {src_ip}:{tcp.sport} → {dst_ip}:{tcp.dport} | "
                 f"Flags: {','.join(flag_details)} | Payload: {payload_len}"
             )
             if packet.haslayer(TLS):
@@ -1117,13 +1117,13 @@ class TransportManager:
             # Example hook: Detect SYN scan
             if "SYN" in flag_details and payload_len == 0:
                 self.logger.log_message(
-                    f"[Transport][⚠️ SCAN] SYN scan suspected from {src_ip} → {dst_ip}:{tcp.dport}"
+                    f"[Transport][🧵 TCP][⚠️ SCAN] SYN scan suspected from {src_ip} → {dst_ip}:{tcp.dport}"
                 )
 
             # Check for dynamic port 56709
             if tcp.sport == 56709 or tcp.dport == 56709:
                 self.logger.log_message(
-                    f"[Transport][❔ Dynamic Port] TCP Port 56709 detected from {src_ip}:{tcp.sport} to {dst_ip}:{tcp.dport}."
+                    f"[Transport][🧵 TCP][❔ Dynamic Port] TCP Port 56709 detected from {src_ip}:{tcp.sport} to {dst_ip}:{tcp.dport}."
                 )
 
             return True
@@ -1134,7 +1134,7 @@ class TransportManager:
             payload_len = len(udp.payload)
 
             self.logger.log_message(
-                f"[Transport] 🚀 UDP Packet on {iface_short}: {src_ip}:{udp.sport} → {dst_ip}:{udp.dport} | "
+                f"[Transport][🚀 UDP] Packet on {iface_short}: {src_ip}:{udp.sport} → {dst_ip}:{udp.dport} | "
                 f"Payload: {payload_len}"
             )
 
@@ -1161,159 +1161,139 @@ class TransportManager:
                 self._handle_ws_discovery_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
             elif udp.dport == 51163 or udp.sport == 51163:
                 self.logger.log_message(
-                    f"[Transport][❔ Ephemeral Port] UDP Port 51163 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}. "
+                    f"[Transport][🚀 UDP][❔ Ephemeral Port] UDP Port 51163 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}. "
                     "This is an ephemeral port, often used by client applications."
                 )
             elif udp.dport == 54742 or udp.sport == 54742:
                 self.logger.log_message(
-                    f"[Transport][❔ Ephemeral Port] UDP Port 54742 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}."
+                    f"[Transport][🚀 UDP][❔ Ephemeral Port] UDP Port 54742 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}."
                 )
             else:
                 self.logger.log_message(
-                    f"[Transport][❔ Undecoded] Unknown UDP protocol on ports {udp.sport} → {udp.dport}. "
+                    f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {udp.sport} → {udp.dport}. "
                     f"Payload size: {payload_len}"
                 )
 
             return True
 
         return False
+
     def _handle_tls_handshake(self, packet: Packet):
         """
         Dissects and logs various TLS handshake messages to provide a more
         complete view of the handshake process.
         """
-        # Iterate through packet layers to log handshake message types
         current_layer = packet
         while current_layer:
             layer_name = current_layer.__class__.__name__
 
-            # Check if the layer is a handshake record and has a message type
             if hasattr(current_layer, "msg_type") and "TLSHandshake" in layer_name:
                 try:
-                    # msg_type is often a list in handshake records
                     for handshake_msg in current_layer.msg:
                         msg_type_name = handshake_msg.msg_type.name
                         self.logger.log_message(
-                            f"[Transport][🔐 TLS] Handshake Message: {msg_type_name}")
+                            f"[Transport][🧵 TCP][🔐 TLS] Handshake Message: {msg_type_name}")
                 except Exception as e:
-                    self.logger.log_message(f"[Transport][⚠️ TLS] Failed to read msg_type on {layer_name}: {e}")
+                    self.logger.log_message(f"[Transport][🧵 TCP][⚠️ TLS] Failed to read msg_type on {layer_name}: {e}")
 
             current_layer = current_layer.payload
 
-        # Specific checks for key handshake messages to trigger dissection
         if packet.haslayer(TLSServerHello):
-            self.logger.log_message("[Transport][🤝 TLS] Server Hello message detected.")
-
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Hello message detected.")
         if packet.haslayer(TLSCertificate):
-            self.logger.log_message("[Transport][🤝 TLS] Certificate message detected.")
-
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Certificate message detected.")
         if packet.haslayer(TLSServerKeyExchange):
-            self.logger.log_message("[Transport][🤝 TLS] Server Key Exchange message detected.")
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Key Exchange message detected.")
             self._dissect_server_key_exchange(packet)
-
         if packet.haslayer(TLSServerHelloDone):
-            self.logger.log_message("[Transport][🤝 TLS] Server Hello Done message detected.")
-
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Hello Done message detected.")
         if packet.haslayer(TLSClientKeyExchange):
-            self.logger.log_message("[Transport][🤝 TLS] Client Key Exchange message detected.")
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Client Key Exchange message detected.")
             self._dissect_client_key_exchange(packet)
-
         if packet.haslayer(TLSChangeCipherSpec):
-            self.logger.log_message("[Transport][🤝 TLS] Change Cipher Spec message detected.")
+            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Change Cipher Spec message detected.")
 
     def _dissect_server_key_exchange(self, packet: Packet):
         """Dissects the parameters within a TLSServerKeyExchange message."""
         ske = packet[TLSServerKeyExchange]
 
-        # Handle Elliptic Curve Diffie-Hellman (ECDHE) parameters
         if packet.haslayer(ServerECDHNamedCurveParams):
             params = packet[ServerECDHNamedCurveParams]
             self.logger.log_message(
-                f"  [+] Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)"
+                f"[Transport][🧵 TCP]   [+] Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)"
             )
             self.logger.log_message(
-                f"  [+] Curve: {params.named_curve.name} (ID: {params.named_curve})"
+                f"[Transport][🧵 TCP]   [+] Curve: {params.named_curve.name} (ID: {params.named_curve})"
             )
             self.logger.log_message(
-                f"  [+] Server Public Point (Yc): 0x{params.point.hex()}"
+                f"[Transport][🧵 TCP]   [+] Server Public Point (Yc): 0x{params.point.hex()}"
             )
-
-        # Handle classic Diffie-Hellman (DHE) parameters
         elif packet.haslayer(ServerDHParams):
             params = packet[ServerDHParams]
             self.logger.log_message(
-                f"  [+] Key Exchange: DHE (Diffie-Hellman Ephemeral)"
+                f"[Transport][🧵 TCP]   [+] Key Exchange: DHE (Diffie-Hellman Ephemeral)"
             )
             self.logger.log_message(
-                f"  [+] DH Prime (p) length: {len(params.dh_p)} bytes"
+                f"[Transport][🧵 TCP]   [+] DH Prime (p) length: {len(params.dh_p)} bytes"
             )
             self.logger.log_message(
-                f"  [+] DH Generator (g) length: {len(params.dh_g)} bytes"
+                f"[Transport][🧵 TCP]   [+] DH Generator (g) length: {len(params.dh_g)} bytes"
             )
             self.logger.log_message(
-                f"  [+] Server Public Value (Ys) length: {len(params.dh_Ys)} bytes"
+                f"[Transport][🧵 TCP]   [+] Server Public Value (Ys) length: {len(params.dh_Ys)} bytes"
             )
-
-        # Log the signature data, which authenticates the parameters
         if ske.sig_len > 0:
             self.logger.log_message(
-                f"  [+] Signature Algorithm: {ske.sig_hash_alg.name}"
+                f"[Transport][🧵 TCP]   [+] Signature Algorithm: {ske.sig_hash_alg.name}"
             )
             self.logger.log_message(
-                f"  [+] Signature Length: {ske.sig_len} bytes"
+                f"[Transport][🧵 TCP]   [+] Signature Length: {ske.sig_len} bytes"
             )
         else:
-            self.logger.log_message("  [+] No signature present in this message.")
+            self.logger.log_message("[Transport][🧵 TCP]   [+] No signature present in this message.")
 
     def _dissect_client_key_exchange(self, packet: Packet):
         """Dissects the data within a TLSClientKeyExchange message."""
         try:
-            # Handle Elliptic Curve Diffie-Hellman (ECDHE) public value
             if packet.haslayer(ClientECDiffieHellmanPublic):
                 params = packet[ClientECDiffieHellmanPublic]
                 self.logger.log_message(
-                    f"  [+] Client Public Point (Yc) Length: {len(params.ecdh_Yc)} bytes"
+                    f"[Transport][🧵 TCP]   [+] Client Public Point (Yc) Length: {len(params.ecdh_Yc)} bytes"
                 )
-
-            # Handle classic Diffie-Hellman (DHE) public value
             elif packet.haslayer(ClientDiffieHellmanPublic):
                 params = packet[ClientDiffieHellmanPublic]
                 self.logger.log_message(
-                    f"  [+] Client Public Value (Yc) Length: {len(params.dh_Yc)} bytes"
+                    f"[Transport][🧵 TCP]   [+] Client Public Value (Yc) Length: {len(params.dh_Yc)} bytes"
                 )
-
-            # Handle RSA key exchange where the Pre-Master Secret is encrypted
             elif packet.haslayer(EncryptedPreMasterSecret):
                 self.logger.log_message(
-                    f"  [+] Encrypted Pre-Master Secret found (RSA Key Exchange)."
+                    f"[Transport][🧵 TCP]   [+] Encrypted Pre-Master Secret found (RSA Key Exchange)."
                 )
         except Exception as e:
-            self.logger.log_message(f"Error dissecting TLS Client Key Exchange: {e}")
+            self.logger.log_message(f"[Transport][🧵 TCP] Error dissecting TLS Client Key Exchange: {e}")
 
     def _bytes_to_str(self, data: bytes) -> str:
-        """
-        Safely decodes bytes to a string, ignoring any decoding errors.
-        """
+        """Safely decodes bytes to a string, ignoring any decoding errors."""
         return data.decode('utf-8', errors='ignore')
 
     def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for DNS packets."""
         dns = packet[DNS]
         query_name = "N/A"
-        if dns.qr == 0 and dns.qd:  # It's a query
+        if dns.qr == 0 and dns.qd:
             query_name = self._bytes_to_str(dns.qd.qname)
             self.logger.log_message(
-                f"[Transport][🔍 DNS] Query from {src_ip}:{sport} for domain '{query_name}'"
+                f"[Transport][🚀 UDP][🔍 DNS] Query from {src_ip}:{sport} for domain '{query_name}'"
             )
-        elif dns.qr == 1 and dns.an:  # It's a response
+        elif dns.qr == 1 and dns.an:
             query_name = self._bytes_to_str(dns.qd.qname) if dns.qd else "N/A"
             answers = dns.ancount
             self.logger.log_message(
-                f"[Transport][🔍 DNS] Response to {dst_ip}:{dport} for '{query_name}' with {answers} answers."
+                f"[Transport][🚀 UDP][🔍 DNS] Response to {dst_ip}:{dport} for '{query_name}' with {answers} answers."
             )
         else:
             self.logger.log_message(
-                f"[Transport][🔍 DNS] Malformed or unrecognized DNS packet from {src_ip}:{sport}"
+                f"[Transport][🚀 UDP][🔍 DNS] Malformed or unrecognized DNS packet from {src_ip}:{sport}"
             )
 
     def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport):
@@ -1326,14 +1306,13 @@ class TransportManager:
                     if isinstance(opt, tuple) and opt[0] == 'message-type':
                         dhcp_message_type = opt[1]
                         break
-
             self.logger.log_message(
-                f"[Transport][⚙️ DHCP] {dhcp_message_type} packet from {src_ip}:{sport} to {dst_ip}:{dport} "
+                f"[Transport][🚀 UDP][⚙️ DHCP] {dhcp_message_type} packet from {src_ip}:{sport} to {dst_ip}:{dport} "
                 f"Client MAC: {bootp.chaddr.hex()}"
             )
         else:
             self.logger.log_message(
-                f"[Transport][⚙️ DHCP] DHCP-related UDP packet from {src_ip}:{sport}, no BOOTP layer found."
+                f"[Transport][🚀 UDP][⚙️ DHCP] DHCP-related UDP packet from {src_ip}:{sport}, no BOOTP layer found."
             )
 
     def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport):
@@ -1346,63 +1325,48 @@ class TransportManager:
 
             if len(raw_data) >= 1:
                 first_byte = raw_data[0]
-                is_long_header = (first_byte & 0x80) == 0x80  # MSB is 1 for long header
+                is_long_header = (first_byte & 0x80) == 0x80
 
                 if is_long_header and len(raw_data) >= 6:
-                    # Long Header Parsing
                     packet_type = (first_byte & 0x30) >> 4
                     version_bytes = raw_data[1:5]
                     version_hex = version_bytes.hex()
-
                     dcid_len = raw_data[5]
-                    # Check if packet is long enough for SCID len and SCID
                     if len(raw_data) > 6 + dcid_len:
                         scid_len = raw_data[6 + dcid_len]
-
                     try:
                         dcid = raw_data[6:6 + dcid_len].hex()
                         scid = raw_data[7 + dcid_len:7 + dcid_len + scid_len].hex()
-
                         packet_type_str = {
                             0: "Initial", 1: "0-RTT", 2: "Handshake", 3: "Retry"
                         }.get(packet_type, "Unknown")
-
                         self.logger.log_message(
-                            f"[Transport][🌐 QUIC] Long Header ({packet_type_str}) from {src_ip}:{sport} | "
+                            f"[Transport][🚀 UDP][🌐 QUIC] Long Header ({packet_type_str}) from {src_ip}:{sport} | "
                             f"Version: 0x{version_hex} | DCID: {dcid} | SCID: {scid}"
                         )
                     except IndexError:
                         self.logger.log_message(
-                            f"[Transport][🌐 QUIC] Malformed Long Header from {src_ip}:{sport}"
+                            f"[Transport][🚀 UDP][🌐 QUIC] Malformed Long Header from {src_ip}:{sport}"
                         )
-
                 elif not is_long_header:
-                    # Short Header Parsing
-                    dcid_len = 8  # A common guess, but not explicitly defined in the header
+                    dcid_len = 8
                     dcid = raw_data[1:1 + dcid_len].hex() if len(raw_data) > 1 + dcid_len else "?"
                     spin_bit = (first_byte & 0x20) >> 5
                     key_phase_bit = (first_byte & 0x04) >> 2
-
-                    # --- UPDATED: More descriptive key phase logging ---
                     key_phase_str = "Updated Keys" if key_phase_bit else "Initial Keys"
                     self.logger.log_message(
-                        f"[Transport][🌐 QUIC] Short Header from {src_ip}:{sport} | "
+                        f"[Transport][🚀 UDP][🌐 QUIC] Short Header from {src_ip}:{sport} | "
                         f"DCID: {dcid} | Spin Bit: {spin_bit} | Key Phase: {key_phase_str}"
                     )
-                # Determine payload start and inspect frames
                 if is_long_header:
-                    # Approximation: header length is 1 (type) + 4 (version) + 1 (dcid_len) + dcid_len + 1 (scid_len) + scid_len
                     header_len = 7 + dcid_len + scid_len
                 else:
-                    # Approximation: header is 1 (type) + dcid_len
                     header_len = 1 + dcid_len
-
                 if len(raw_data) > header_len:
-                    # --- UPDATED: Pass dst_ip to frame inspector ---
                     self._inspect_quic_frames(raw_data[header_len:], src_ip, dst_ip, dport)
         else:
             self.logger.log_message(
-                f"[Transport][🌐 QUIC] UDP on port 443 detected, but no Raw payload."
+                f"[Transport][🚀 UDP][🌐 QUIC] UDP on port 443 detected, but no Raw payload."
             )
 
     def _inspect_quic_frames(self, data: bytes, src_ip: str, dst_ip: str, dport: int):
@@ -1410,37 +1374,22 @@ class TransportManager:
         Parses and logs details of QUIC frames within a packet payload. This version
         prevents spam by only logging new STREAM frames and using a time-based
         cache to expire old stream entries.
-
-        Args:
-            data (bytes): The raw QUIC payload (without the header).
-            src_ip (str): The source IP of the packet.
-            dst_ip (str): The destination IP of the packet.
-            dport (int): The destination port of the packet.
         """
         i = 0
         while i < len(data):
             try:
                 first_byte = data[i]
-
-                # --- UPDATED: Reworked STREAM frame handling with time-based cache ---
                 if 0x08 <= first_byte <= 0x0f:
                     has_len_bit = (first_byte & 0x02)
                     has_off_bit = (first_byte & 0x04)
-
                     offset = 1
                     stream_id, bytes_read = self._parse_quic_varint(data[i + offset:])
-                    if bytes_read == 0: break  # Parsing failed
-
+                    if bytes_read == 0: break
                     stream_key = (src_ip, dst_ip, stream_id)
                     current_time = time.time()
-
-                    # Only log if we haven't seen this stream before.
                     if stream_key not in self.logged_quic_streams:
-                        log_msg = f"[Transport][🌐 QUIC Frame] STREAM | New Stream ID: {stream_id}"
+                        log_msg = f"[Transport][🌐 QUIC][Frame] STREAM | New Stream ID: {stream_id}"
                         self.logger.log_message(log_msg)
-
-                        # Periodically prune the cache of expired streams.
-                        # This check runs at most once every 60 seconds to be efficient.
                         if current_time - self.last_quic_cleanup_time > 60:
                             expired_keys = [
                                 key for key, timestamp in self.logged_quic_streams.items()
@@ -1452,13 +1401,8 @@ class TransportManager:
                                 )
                                 for key in expired_keys:
                                     self.logged_quic_streams.pop(key, None)
-
                             self.last_quic_cleanup_time = current_time
-
-                    # Add the new stream or update the timestamp of an existing one.
                     self.logged_quic_streams[stream_key] = current_time
-
-                    # Correctly advance index 'i' past this frame
                     offset += bytes_read
                     data_len = 0
                     if has_off_bit:
@@ -1467,43 +1411,40 @@ class TransportManager:
                     if has_len_bit:
                         data_len, bytes_read = self._parse_quic_varint(data[i + offset:])
                         offset += bytes_read
-                    else:  # If no length field, stream data is the rest of the packet
+                    else:
                         data_len = len(data) - (i + offset)
-
                     i += offset + data_len
-                    continue  # Continue to next frame
-
-                # --- Handling for other frame types remains the same ---
+                    continue
                 frame_type = first_byte
-                if frame_type == 0x24:  # RESET_STREAM_AT (custom)
-                    self.logger.log_message(f"[Transport][🔄 QUIC Frame] RESET_STREAM_AT")
+                if frame_type == 0x24:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] RESET_STREAM_AT")
                     i = len(data)
-                elif frame_type == 0x14:  # STREAMS_BLOCKED
-                    self.logger.log_message(f"[Transport][🚫 QUIC Frame] STREAMS_BLOCKED")
+                elif frame_type == 0x14:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] STREAMS_BLOCKED")
                     i = len(data)
-                elif frame_type == 0xa4:  # ACK_FREQUENCY (custom)
-                    self.logger.log_message(f"[Transport][📶 QUIC Frame] ACK_FREQUENCY")
+                elif frame_type == 0xa4:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK_FREQUENCY")
                     i = len(data)
-                elif frame_type == 0x02 or frame_type == 0x03:  # ACK
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] ACK")
+                elif frame_type == 0x02 or frame_type == 0x03:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK")
                     i = len(data)
-                elif frame_type == 0x06:  # CRYPTO
+                elif frame_type == 0x06:
                     offset, length = struct.unpack("!II", data[i + 1:i + 9])
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] CRYPTO | Offset: {offset} | Length: {length}")
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] CRYPTO | Offset: {offset} | Length: {length}")
                     i += 9 + length
-                elif frame_type == 0x00:  # PADDING
+                elif frame_type == 0x00:
                     i += 1
-                elif frame_type == 0x01:  # PING
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] PING")
+                elif frame_type == 0x01:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] PING")
                     i += 1
-                elif frame_type == 0x1C or frame_type == 0x1D:  # CONNECTION_CLOSE
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] CONNECTION_CLOSE")
+                elif frame_type == 0x1C or frame_type == 0x1D:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] CONNECTION_CLOSE")
                     i = len(data)
                 else:
-                    self.logger.log_message(f"[Transport][🌐 QUIC Frame] Unknown frame type: 0x{first_byte:02x}")
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] Unknown frame type: 0x{first_byte:02x}")
                     break
             except (struct.error, IndexError):
-                self.logger.log_message("[Transport][🌐 QUIC Frame] Malformed frame or end of packet reached.")
+                self.logger.log_message("[Transport][🌐 QUIC][Frame] Malformed frame or end of packet reached.")
                 break
 
     def _parse_quic_varint(self, data: bytes) -> tuple[int, int]:
@@ -1516,51 +1457,47 @@ class TransportManager:
         """
         if not data:
             return 0, 0
-
         first_byte = data[0]
         length_bits = first_byte >> 6
-
         try:
-            if length_bits == 0b00:  # 1-byte
+            if length_bits == 0b00:
                 return first_byte & 0x3F, 1
-            elif length_bits == 0b01:  # 2-byte
+            elif length_bits == 0b01:
                 if len(data) < 2: return 0, 0
                 val = struct.unpack("!H", data[:2])[0]
                 return val & 0x3FFF, 2
-            elif length_bits == 0b10:  # 4-byte
+            elif length_bits == 0b10:
                 if len(data) < 4: return 0, 0
                 val = struct.unpack("!I", data[:4])[0]
                 return val & 0x3FFFFFFF, 4
-            elif length_bits == 0b11:  # 8-byte
+            elif length_bits == 0b11:
                 if len(data) < 8: return 0, 0
                 val = struct.unpack("!Q", data[:8])[0]
                 return val & 0x3FFFFFFFFFFFFFFF, 8
         except (struct.error, IndexError):
             return 0, 0
         return 0, 0
+
     def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for NTP packets."""
         raw_data = bytes(packet[Raw].load)
-        if len(raw_data) >= 48:  # A standard NTP packet is 48 bytes
+        if len(raw_data) >= 48:
             try:
                 first_byte = raw_data[0]
-                li = (first_byte >> 6) & 0x03  # Leap Indicator (2 bits)
-                vn = (first_byte >> 3) & 0x07  # Version Number (3 bits)
-                mode = first_byte & 0x07  # Mode (3 bits)
-                stratum = raw_data[1]  # Stratum (1 byte)
-
+                li = (first_byte >> 6) & 0x03
+                vn = (first_byte >> 3) & 0x07
+                mode = first_byte & 0x07
+                stratum = raw_data[1]
                 mode_str = {1: "Symmetric Active", 2: "Symmetric Passive", 3: "Client",
                             4: "Server", 5: "Broadcast"}.get(mode, "Unknown")
-
                 self.logger.log_message(
-                    f"[Transport][🕰️ NTP] NTP packet from {src_ip}:{sport} | "
+                    f"[Transport][🚀 UDP][🕰️ NTP] NTP packet from {src_ip}:{sport} | "
                     f"Mode: {mode_str} | Version: {vn} | Stratum: {stratum}"
                 )
             except IndexError:
                 self.logger.log_message(
-                    f"[Transport][🕰️ NTP] Malformed NTP packet from {src_ip}:{sport}"
+                    f"[Transport][🚀 UDP][🕰️ NTP] Malformed NTP packet from {src_ip}:{sport}"
                 )
-
 
     def _handle_tftp_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for TFTP packets."""
@@ -1570,25 +1507,24 @@ class TransportManager:
                 opcode = struct.unpack("!H", raw_data[0:2])[0]
                 opcode_str = {1: "RRQ (Read Request)", 2: "WRQ (Write Request)",
                               3: "DATA", 4: "ACK", 5: "ERROR"}.get(opcode, "Unknown")
-
                 if opcode == 3 or opcode == 4:
                     if len(raw_data) >= 4:
                         block_number = struct.unpack("!H", raw_data[2:4])[0]
                         self.logger.log_message(
-                            f"[Transport][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport} | "
+                            f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport} | "
                             f"Block #: {block_number}"
                         )
                     else:
                         self.logger.log_message(
-                            f"[Transport][📄 TFTP] Malformed {opcode_str} packet from {src_ip}:{sport}"
+                            f"[Transport][🚀 UDP][📄 TFTP] Malformed {opcode_str} packet from {src_ip}:{sport}"
                         )
                 else:
                     self.logger.log_message(
-                        f"[Transport][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport}"
+                        f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport}"
                     )
             except (struct.error, IndexError):
                 self.logger.log_message(
-                    f"[Transport][📄 TFTP] Malformed TFTP packet from {src_ip}:{sport}"
+                    f"[Transport][🚀 UDP][📄 TFTP] Malformed TFTP packet from {src_ip}:{sport}"
                 )
 
     def _handle_sip_packet(self, packet, src_ip, dst_ip, sport, dport):
@@ -1596,22 +1532,21 @@ class TransportManager:
         if packet.haslayer(Raw):
             raw_data = bytes(packet[Raw].load)
             try:
-                # SIP is a text-based protocol, check for key strings in the payload
                 if raw_data.startswith(b"INVITE") or raw_data.startswith(b"REGISTER") or raw_data.startswith(b"BYE"):
                     first_line = raw_data.split(b"\r\n")[0].decode('utf-8', errors='ignore')
                     self.logger.log_message(
-                        f"[Transport][📞 SIP] Request from {src_ip}:{sport} to {dst_ip}:{dport} | "
+                        f"[Transport][🚀 UDP][📞 SIP] Request from {src_ip}:{sport} to {dst_ip}:{dport} | "
                         f"Method: {first_line.split(' ')[0]}"
                     )
                 elif raw_data.startswith(b"SIP/2.0"):
                     status_line = raw_data.split(b"\r\n")[0].decode('utf-8', errors='ignore')
                     self.logger.log_message(
-                        f"[Transport][📞 SIP] Response from {src_ip}:{sport} to {dst_ip}:{dport} | "
+                        f"[Transport][🚀 UDP][📞 SIP] Response from {src_ip}:{sport} to {dst_ip}:{dport} | "
                         f"Status: {status_line.split(' ', 1)[1]}"
                     )
             except (UnicodeDecodeError, IndexError):
                 self.logger.log_message(
-                    f"[Transport][📞 SIP] Malformed or undecodable SIP packet from {src_ip}:{sport}"
+                    f"[Transport][🚀 UDP][📞 SIP] Malformed or undecodable SIP packet from {src_ip}:{sport}"
                 )
 
     def _handle_rtp_packet(self, packet, src_ip, dst_ip, sport, dport):
@@ -1619,72 +1554,57 @@ class TransportManager:
         Handles and logs details for RTP packets with full header parsing.
         This enhanced version decodes the SSRC, sequence number, and marker bit.
         """
-        if packet.haslayer(Raw) and len(packet[Raw].load) >= 12:  # Min RTP header is 12 bytes
+        if packet.haslayer(Raw) and len(packet[Raw].load) >= 12:
             raw_data = bytes(packet[Raw].load)
-
-            # A more comprehensive map of common RTP payload types
             RTP_PAYLOAD_TYPES = {
                 0: "PCMU", 3: "GSM", 4: "G723", 8: "PCMA", 9: "G722",
                 10: "L16/2ch", 11: "L16/1ch", 15: "G728", 18: "G729",
                 26: "JPEG", 31: "H261", 32: "MPV", 33: "MP2T", 34: "H263",
-                # Dynamic types are common for modern codecs
                 96: "H264", 97: "H264", 98: "H265/HEVC", 100: "VP8", 101: "VP9", 103: "Opus"
             }
-
             try:
-                # Unpack the first 12 bytes of the RTP header using struct
-                # Format: ! (Network Order) B(1 byte) B(1) H(2) I(4) I(4)
                 byte1, byte2, seq_num, timestamp, ssrc = struct.unpack('!BBHII', raw_data[:12])
-
-                # Extract fields using bitwise operations
                 version = (byte1 >> 6) & 0x03
-                marker = (byte2 >> 7) & 0x01  # Marker bit
+                marker = (byte2 >> 7) & 0x01
                 payload_type = byte2 & 0x7F
-
-                # Process only standard RTP version 2 packets
                 if version == 2:
                     payload_type_str = RTP_PAYLOAD_TYPES.get(payload_type, f"Dynamic({payload_type})")
-
-                    # Build a more detailed log message including the SSRC and Sequence Number
                     log_details = (
                         f"Ver: {version}, PT: {payload_type_str}, "
                         f"Seq: {seq_num}, SSRC: 0x{ssrc:08x}"
                     )
-
-                    # The Marker bit is important; it often signals the end of a frame or talk spurt
                     if marker:
                         log_details += " [Marker]"
-
                     self.logger.log_message(
-                        f"[Transport][🔊 RTP] Media Stream from {src_ip}:{sport} to {dst_ip}:{dport} | {log_details}"
+                        f"[Transport][🚀 UDP][🔊 RTP] Media Stream from {src_ip}:{sport} to {dst_ip}:{dport} | {log_details}"
                     )
                 else:
                     self.logger.log_message(
-                        f"[Transport][🔊 RTP] Non-RTP packet on VoIP port, or unknown version {version}"
+                        f"[Transport][🚀 UDP][🔊 RTP] Non-RTP packet on VoIP port, or unknown version {version}"
                     )
             except (struct.error, IndexError):
                 self.logger.log_message(
-                    f"[Transport][🔊 RTP] Malformed RTP packet from {src_ip}:{sport}"
+                    f"[Transport][🚀 UDP][🔊 RTP] Malformed RTP packet from {src_ip}:{sport}"
                 )
 
     def _handle_zerotier_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for ZeroTier-like packets on UDP port 9993."""
         self.logger.log_message(
-            f"[Transport][🛰️ ZeroTier] UDP port 9993 traffic detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
+            f"[Transport][🚀 UDP][🛰️ ZeroTier] UDP port 9993 traffic detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
             "Likely ZeroTier, Cisco ACS, or other application."
         )
 
     def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for SSDP/UPnP packets on UDP port 1900."""
         self.logger.log_message(
-            f"[Transport][🔌 SSDP] SSDP/UPnP packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
+            f"[Transport][🚀 UDP][🔌 SSDP] SSDP/UPnP packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
             "Likely for device discovery."
         )
 
     def _handle_ws_discovery_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
         self.logger.log_message(
-            f"[Transport][🔍 WS-Discovery] WS-Discovery packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
+            f"[Transport][🚀 UDP][🔍 WS-Discovery] WS-Discovery packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
             "Likely for dynamic device discovery."
         )
 
@@ -2538,7 +2458,7 @@ class ForwardingManager:
         # CHANGED: from a set to a dictionary to store (count, timestamp)
         self._flow_counts: Dict[Tuple, Tuple[int, float]] = {}
         self.ban_duration = 60  # seconds
-        self.max_consecutive_rate = 5  # e.g., more than 10 packets/sec = ban
+        self.max_consecutive_rate = 20  # e.g., more than 10 packets/sec = ban
         self._banned_flows: Dict[Tuple, float] = {}  # flow → ban_expiry_time
         self._lock = threading.Lock()
 
