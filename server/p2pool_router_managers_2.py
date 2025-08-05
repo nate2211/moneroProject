@@ -2658,10 +2658,11 @@ class ARPManager:
 
     def resolve(self, ip_address: str, iface: str) -> str | None:
         """
-        Resolves an IP address to a MAC address using static entries, cache, or ARP requests via getmacbyip.
-        Caches the result if successful.
+        Resolves an IP address to a MAC address using static entries, cache, a temporary lease,
+        or a custom ARP request. Caches the result if successful.
         """
-        ip_address = ip_address.strip()  # Normalize input
+        ip_address = ip_address.strip()
+        now = time.time()
 
         if ipaddress.ip_address(ip_address).is_loopback:
             self.router_logger.log_message(f"[ARP] Local delivery: Loopback IP {ip_address}. No ARP needed.")
@@ -2670,11 +2671,10 @@ class ARPManager:
         # --- Static ARP entries ---
         if ip_address in self._static_arp_entries:
             mac = self._static_arp_entries[ip_address]
-
             with self._arp_cache_lock:
                 cached_entry = self._arp_cache.get(ip_address)
                 if not cached_entry or cached_entry[0].lower() != mac.lower():
-                    self._arp_cache[ip_address] = (mac, time.time())
+                    self._arp_cache[ip_address] = (mac, now)
                     self.router_logger.log_message(f"[ARP] 🧷 Cached static ARP entry: {ip_address} → {mac}")
             return mac
 
@@ -2683,28 +2683,38 @@ class ARPManager:
             cached_entry = self._arp_cache.get(ip_address)
             if cached_entry:
                 mac, timestamp = cached_entry
-                if time.time() - timestamp < self.CACHE_TIMEOUT:
+                if now - timestamp < self.CACHE_TIMEOUT:
                     self.router_logger.log_message(f"[ARP] ⚡ Cache hit for {ip_address} → {mac}")
                     return mac
-                else:
-                    self.router_logger.log_message(f"[ARP] 🕓 Stale cache entry for {ip_address}. Re-resolving...")
+                self.router_logger.log_message(f"[ARP] 🕓 Stale cache entry for {ip_address}. Re-resolving...")
             else:
                 self.router_logger.log_message(f"[ARP] 🛰️ Cache miss for {ip_address}. Resolving...")
 
-        # --- Use Scapy's getmacbyip as fallback ---
-        try:
-            resolved_mac = getmacbyip(ip_address)
-            if resolved_mac:
-                with self._arp_cache_lock:
-                    self._arp_cache[ip_address] = (resolved_mac, time.time())
-                self.router_logger.log_message(f"[ARP] ✅ Resolved {ip_address} → {resolved_mac}")
-                return resolved_mac
+        # --- NEW: Check for an active temporary lease ---
+        lease_info = self._temp_arp_leases.get(ip_address)
+        if lease_info and now < lease_info["lease_end"]:
+            our_mac = get_if_hwaddr(iface)
+            if our_mac:
+                self.router_logger.log_message(
+                    f"[ARP] 🧪 Active temporary ARP lease for {ip_address}, using router's MAC: {our_mac}."
+                )
+                return our_mac
             else:
-                self.router_logger.log_message(f"[ARP] ❌ Resolve failed {ip_address}")
-        except Exception as e:
-            self.router_logger.log_message(f"[ARP] ❗ Exception during getmacbyip: {e}")
+                self.router_logger.log_message(
+                    f"[ARP] ❌ Failed to get router MAC for temporary lease on {iface}."
+                )
 
-        return None
+        # --- Custom ARP request as a final fallback ---
+        resolved_mac = getmacbyip(ip_address)
+
+        if resolved_mac:
+            with self._arp_cache_lock:
+                self._arp_cache[ip_address] = (resolved_mac, now)
+            self.router_logger.log_message(f"[ARP] ✅ Resolved {ip_address} → {resolved_mac}")
+            return resolved_mac
+        else:
+            self.router_logger.log_message(f"[ARP] ❌ Resolve failed {ip_address}")
+            return None
 
     def send_gratuitous_arp(self, ip_address: str, mac_address: str, iface: str):
         """
@@ -2757,9 +2767,7 @@ class ARPManager:
         """
         Learns and caches ARP is-at responses (i.e., ARP replies).
         Only updates the cache if the new MAC is different or missing.
-
-        Args:
-            pkt (Packet): The ARP packet received (must have ARP layer).
+        Supports learning from active temporary ARP leases.
         """
         if not pkt.haslayer(ARP) or pkt[ARP].op != 2:
             return  # Not an ARP reply (is-at)
@@ -2767,6 +2775,23 @@ class ARPManager:
         ip = pkt[ARP].psrc
         mac = pkt[ARP].hwsrc
         iface = pkt.sniffed_on if hasattr(pkt, "sniffed_on") else "Unknown"
+        now = time.time()
+
+        # --- Check for static ARP override ---
+        static_mac = self._static_arp_entries.get(ip)
+        if static_mac and static_mac.lower() != mac.lower():
+            self.router_logger.log_message(
+                f"[ARP] 🚫 Ignoring ARP response for {ip}: MAC {mac} conflicts with static entry {static_mac}."
+            )
+            return
+
+        # --- Check if a temporary lease exists and is active ---
+        lease_info = self._temp_arp_leases.get(ip)
+        if lease_info and now > lease_info["lease_end"]:
+            self.router_logger.log_message(
+                f"[ARP][LEASE] ⏳ Lease for {ip} expired. Not accepting ARP response from {mac}."
+            )
+            return
 
         with self._arp_cache_lock:
             existing_entry = self._arp_cache.get(ip)
@@ -2781,7 +2806,12 @@ class ARPManager:
                     f"[ARP] 🧠 Learned new ARP: {ip} → {mac} on {iface.split('_')[-1]}"
                 )
 
-            self._arp_cache[ip] = (mac, time.time())
+            self._arp_cache[ip] = (mac, now)
+
+            if lease_info:
+                self.router_logger.log_message(
+                    f"[ARP][LEASE] ✅ ARP response accepted for {ip} under active temporary lease."
+                )
 
     def reply_to_arp_request(self, request_pkt: Packet, iface: str):
         """

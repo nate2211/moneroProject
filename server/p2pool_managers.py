@@ -890,7 +890,7 @@ class PythonRouterManager:
                     promisc=True,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
-                    mac_filter_only=True,
+                    mac_filter_only=False,
                     session=TCPSession,
                 )
             except Exception as e:
