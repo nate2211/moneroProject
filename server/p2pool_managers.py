@@ -113,15 +113,16 @@ class PythonRouterManager:
         # Instantiate all specialized managers
 
 
-        self.arp_manager = ARPManager(router_logger)
-        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)  # New: Outbound Load Balancer
+        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
+        self.lag_manager = LinkAggregationManager(router_logger)
+        self.arp_manager = ARPManager(router_logger, self.lag_manager)
         self.packet_signer = PacketSigningManager(router_logger)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
         self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer)
         self.dns_manager = DNSManager(router_logger, self.packet_writer)
         self.mdns_manager = mDNSManager(router_logger, self.packet_writer, self._interfaces_config)
         self.rip_manager = RIPManager(router_logger, self.function_call_tracker)
-        self.nat_manager = None  # Initialized after public IP is known
+        self.nat_manager = None
         self.notification_manager = None
         self.packet_catcher = PacketCatcherManager(router_logger, self._interfaces_config)
         self.handshake_manager = None
@@ -129,8 +130,7 @@ class PythonRouterManager:
         self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self.sendback_manager, self._interfaces_config)
         self.dhcp_server_in = None
         self.dhcp_server_out = None
-        self.lag_manager = LinkAggregationManager(router_logger)  # New: Link Aggregation Manager
-        self.firewall_manager = FirewallManager(router_logger)  # New: Firewall Manager
+        self.firewall_manager = FirewallManager(router_logger)
         self.syn_scanner = None
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
         self.forwarding_manager = ForwardingManager(self.function_call_tracker, router_logger=self.router_logger,)
@@ -832,9 +832,11 @@ class PythonRouterManager:
         self.create_l2_bridge("MyLANBridge", bridge_members)
         self.add_outbound_load_balancing_interface(self.interface_out_full_name)
         link_group = [self.interface_out_full_name]
+        arp_link_group = [self.interface_out_full_name]
         if self.interface_lac_full_name:
             self.add_outbound_load_balancing_interface(self.interface_lac_full_name)
             link_group.append(self.interface_lac_full_name)
+            arp_link_group.append(self.interface_lac_full_name)
         if self.interface_lac_2_full_name:
             self.add_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             link_group.append(self.interface_lac_2_full_name)
@@ -842,7 +844,7 @@ class PythonRouterManager:
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
-
+        self.create_link_aggregation_group("MyARPLANAggregation", arp_link_group)
         self.router_macs = {cfg.get('mac') for cfg in self._interfaces_config.values() if 'mac' in cfg}
 
         self.router_logger.log_message(f"\n--- Python Router Configuration Summary (Dynamically Assigned) ---")
@@ -1007,7 +1009,7 @@ class PythonRouterManager:
                                                                                    self.rip_manager.find_route):
                         return
 
-                if packet.haslayer(scapy.layers.inet.ICMP) and (packet[ICMP].type == 8):  # Echo Request
+                if packet.haslayer(ICMP) and (packet[ICMP].type == 8):  # Echo Request
                     self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP Echo Request on {iface_short}")
                     if self.icmp_manager.handle_packet(packet, inbound_iface):
                         return
@@ -1025,21 +1027,24 @@ class PythonRouterManager:
                     return
 
             if packet.haslayer(TLS):
-                self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=5)
+                    self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface,
+                                                      return_type="void", queue_name="https")
+
 
             if packet.haslayer(UDP) and packet[UDP].dport == 5353:
                 if self.mdns_manager.handle_packet(packet):
                     return
-            if packet.haslayer(UDP) and packet[UDP] :
+            if packet.haslayer(UDP) and packet[UDP]:
                 if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
-                                                     self.arp_manager.resolve,
-                                                     self.rip_manager.find_route, self.packet_writer,
-                                                     self.router_network_in):
+                                                 self.arp_manager.resolve,
+                                                 self.rip_manager.find_route, self.packet_writer,
+                                                 self.router_network_in):
                     return
 
 
+            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface,
+                                                  return_type="void", queue_name="transport")
 
-            self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface, return_type="all", count_to_call=10)
 
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP transit packet not for router detected on {iface_short}")
@@ -1056,7 +1061,6 @@ class PythonRouterManager:
 
             if packet.haslayer(TCP) and self.stratum_manager.handle_packet(packet, inbound_iface):
                 return
-
 
             # Duplicate flow check (rate-limiting)
             proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
@@ -1077,36 +1081,52 @@ class PythonRouterManager:
                 RouterRandomMessages(
                     name="Router",
                     message=f"Forwarding: {packet.summary()} | In:{iface_short}",
-                    emoticons=["🚚", "🚛", "🛻", "🚒", "🚐", "🚙", "🚎", "🚕"]
+                    emoticons=["🚚", "🚛", "🛻", "�", "🚐", "🚙", "🚎", "🚕"]
                 )
             )
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
-                                              return_type="void")
-
+                                                  return_type="void", queue_name="forward_packets")
         except Exception as e:
             self.router_logger.log_message(
                 f"[Router] ❗ ERROR while processing on {inbound_iface.split('_')[-1]}: {e}. Packet: {packet.summary()}")
+
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
-  # Prevent loop
         iface_short = inbound_iface.split('_')[-1]
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         dst_ip = ip_layer.dst
 
-        ip_layer = None
-        if packet.haslayer(IP):
-            ip_layer = packet[IP]
-        elif packet.haslayer(IPv6):
-            ip_layer = packet[IPv6]
-
         if not ip_layer:
             self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
             return
-        if isinstance(ip_layer, IPv6) and ipaddress.ip_address(dst_ip).is_multicast:
-            self.router_logger.log_message(f"[Router] 🚧 Flooding IPv6 multicast packet for {dst_ip} via bridge.")
-            # Use the EthernetBridgeManager to handle L2 flooding
-            self.ethernet_manager.handle_frame(packet, inbound_iface)
-            return # IMPORTANT: Stop further processing to prevent routing attempt
+
+        # --- Multicast Handling (IPv4 and IPv6) ---
+        if ipaddress.ip_address(dst_ip).is_multicast:
+            self.router_logger.log_message(f"[Router] 🚧 Multicast packet detected for {dst_ip}.")
+            target_mac = None
+
+            if isinstance(ip_layer, IP):
+                # IPv4 Multicast MAC: 01:00:5e: + last 23 bits of multicast IP
+                ip_bytes = ipaddress.ip_address(dst_ip).packed
+                target_mac = "01:00:5e:%02x:%02x:%02x" % (
+                    ip_bytes[1] & 0x7F,  # Mask to get last 7 bits
+                    ip_bytes[2],
+                    ip_bytes[3]
+                )
+            elif isinstance(ip_layer, IPv6):
+                # IPv6 Multicast MAC: 33:33: + last 32 bits of multicast IP
+                ip_bytes = ipaddress.ip_address(dst_ip).packed
+                target_mac = "33:33:%02x:%02x:%02x:%02x" % (
+                    ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]
+                )
+
+            if target_mac:
+                packet[Ether].dst = target_mac
+                self.router_logger.log_message(f"[Router] 📢 Forwarding multicast packet to MAC: {target_mac}")
+                self.ethernet_manager.handle_frame(packet, inbound_iface)
+            else:
+                self.router_logger.log_message(f"[Router] ❌ Could not determine multicast MAC for {dst_ip}. Dropping.")
+            return
 
         src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
@@ -1131,7 +1151,6 @@ class PythonRouterManager:
         initial_outbound_iface = route["interface"]
         next_hop_ip = route["next_hop"] if route["next_hop"] != "0.0.0.0" else dst_ip
 
-
         if ipaddress.ip_address(dst_ip).is_global:
             selected_iface = None
             if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
@@ -1151,17 +1170,21 @@ class PythonRouterManager:
                 next_hop_mac = self.arp_manager.send_custom_arp_request(dst_ip, iface=selected_iface)
 
                 if not next_hop_mac:
-                    self.router_logger.log_message(f"[ARP] 🚫 MAC for {dst_ip} not found. Dropping.")
-                    if self.arp_manager.notification_manager:
-                        event_data = {
-                            "event": "MAC Resolution Failure",
-                            "message": f"Unable to resolve MAC address for {dst_ip} on {selected_iface.split('_')[-1]}",
-                            "iface": selected_iface,
-                            "timestamp": time.time(),
-                            "emojis": ["🚫", "🧲", "📡"]
-                        }
-                        self.notification_manager.send_notification(event_data)
-                    return
+                    self.router_logger.log_message(f"[ARP] 🧲 Attempting fallback ping to populate OS ARP for {dst_ip}")
+                    self.trigger_arp_via_ping(dst_ip)
+                    next_hop_mac = self.arp_manager.fallback_mac_from_os_cache(dst_ip)
+                    if not next_hop_mac:
+                        self.router_logger.log_message(f"[ARP] 🚫 MAC for {dst_ip} not found. Dropping.")
+                        if self.arp_manager.notification_manager:
+                            event_data = {
+                                "event": "MAC Resolution Failure",
+                                "message": f"Unable to resolve MAC address for {dst_ip} on {selected_iface.split('_')[-1]}",
+                                "iface": selected_iface,
+                                "timestamp": time.time(),
+                                "emojis": ["🚫", "🧲", "📡"]
+                            }
+                            self.notification_manager.send_notification(event_data)
+                        return
 
             # Optional: Gratuitous ARP for our translated source IP
             # Perform dynamic NAT: translate src IP and src port
@@ -1177,14 +1200,12 @@ class PythonRouterManager:
             packet[Ether].src = self.get_interface_mac(selected_iface)
             packet[Ether].dst = next_hop_mac
 
-
             packet[IP].src = self.nat_manager.public_ip
             del packet[IP].chksum
             if packet.haslayer(TCP):
                 del packet[TCP].chksum
             elif packet.haslayer(UDP):
                 del packet[UDP].chksum
-
 
             # Log and send
             self.router_logger.log_message(
@@ -1196,21 +1217,6 @@ class PythonRouterManager:
             )
             self.packet_writer.queue_packet(packet, selected_iface)
             return
-
-
-        # Step 3: [Multicast] Handle multicast traffic as a special case.
-        if ipaddress.ip_address(dst_ip).is_multicast:
-            if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
-                initial_outbound_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
-            self.router_logger.log_message(f"[IGMP] Received multicast packet for {dst_ip} on {iface_short}.")
-            self.igmp_manager.handle_packet(packet, initial_outbound_iface )
-            if self.igmp_manager.should_forward_multicast(dst_ip, initial_outbound_iface ):
-                self.router_logger.log_message(f"[IGMP] ✅ Forwarding {dst_ip} via L2 bridge.")
-                self.ethernet_manager.handle_frame(packet, initial_outbound_iface )
-            else:
-                self.router_logger.log_message(f"[IGMP] 🚫 Dropping {dst_ip} - no active listeners.")
-
-            return  # Multicast traffic is handled, do not proceed to unicast forwarding.
 
         is_from_internal_bridge = self.ethernet_manager.is_bridge_member(inbound_iface)
         is_to_external_wan = initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces()
@@ -1226,8 +1232,6 @@ class PythonRouterManager:
                 ipaddress.ip_address(dst_ip) in inbound_network and
                 dst_ip != inbound_config.get("ip_addr")
         )
-
-
 
         if inbound_iface == initial_outbound_iface:
             if not is_intra_lan:
@@ -1262,8 +1266,6 @@ class PythonRouterManager:
                 self.router_logger.log_message(
                     f"[Router] 🏠 Intra-LAN forwarding: {packet.summary()} | In:{iface_short} -> Out:{iface_short}"
                 )
-
-
 
         # --- [7] Prepare L2 Details ---
         outbound_config = self._interfaces_config.get(initial_outbound_iface)
@@ -1345,7 +1347,8 @@ class PythonRouterManager:
         deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
         sampling_rate = self.packet_catcher_heuristic_rates.get(proto, self.packet_catcher_heuristic_rates['DEFAULT'])
         if deterministic_value < sampling_rate:
-            self.parallel_python.run_parallel(self.packet_catcher.process_packet, packet, return_type="all", count_to_call=10)
+            self.parallel_python.run_parallel(self.packet_catcher.process_packet, packet, return_type="all",
+                                              count_to_call=10)
         self.router_logger.log_message(
             f"[Router] 📤 Packet queued to {initial_outbound_iface.split('_')[-1]}"
         )
@@ -1360,6 +1363,7 @@ class PythonRouterManager:
                     self.router_logger.log_message("[Router] ❌ Failed to auto-configure interfaces.")
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
+            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
 
 
             self._enable_nat_forwarding()
@@ -1377,7 +1381,6 @@ class PythonRouterManager:
             self.packet_catcher.notification_manager = self.notification_manager
             self.arp_manager.notification_manager = self.notification_manager
             self.packet_signer.notification_manager = self.notification_manager
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
 
             self.rip_manager.initialize_routes(
                 interfaces_config=self._interfaces_config,
@@ -1476,6 +1479,14 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
+
+    def trigger_arp_via_ping(self, ip: str, timeout: float = 1.0):
+        try:
+            subprocess.run(["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass  # Suppress all errors
+
     def _enable_nat_forwarding(self):
         """
         Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
@@ -1534,7 +1545,7 @@ class PythonRouterManager:
 
         except subprocess.CalledProcessError as e:
             if "0x80041010" in e.stderr:
-                self.router_logger.log_message("[NAT Setup] ❌ New-NetNat is not supported on this Windows edition.")
+                self._fallback_enable_ics()
             else:
                 self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
             self.router_logger.log_message(
@@ -1563,7 +1574,7 @@ class PythonRouterManager:
             ).strip()
             unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
             if edition_output in unsupported_skus:
-                self.router_logger.log_message("[NAT Setup] 🛑 Skipping NAT disable: unsupported Windows edition.")
+                self._fallback_disable_ics()
                 return
         except Exception as e:
             self.router_logger.log_message(
@@ -1580,6 +1591,96 @@ class PythonRouterManager:
             self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding rule removed (if it existed).")
         except Exception as e:
             self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
+
+    def _fallback_enable_ics(self, public_iface: str = "Wi-Fi", private_iface: str = "Ethernet"):
+        """
+        Enables Internet Connection Sharing (ICS) from public_iface to private_iface.
+
+        Args:
+            public_iface (str): Interface with internet access (e.g., "Wi-Fi").
+            private_iface (str): LAN interface to share connection with (e.g., "Ethernet").
+        """
+        self.router_logger.log_message(f"[ICS Fallback] 🔄 Attempting ICS: {public_iface} ➝ {private_iface}")
+
+        try:
+            # Enable the private interface
+            self._execute_netsh(["set", "interface", private_iface, "enable"])
+
+
+            # Run PowerShell ICS script using COM interface
+            ics_script = f"""
+            $netSharingManager = New-Object -ComObject HNetCfg.HNetShare
+            $connections = $netSharingManager.EnumEveryConnection()
+            foreach ($conn in $connections) {{
+                $props = $netSharingManager.NetConnectionProps($conn)
+                if ($props.Name -eq '{public_iface}') {{
+                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
+                    if (-not $config.SharingEnabled) {{
+                        $config.EnableSharing(0)  # Public (0)
+                    }}
+                }} elseif ($props.Name -eq '{private_iface}') {{
+                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
+                    if (-not $config.SharingEnabled) {{
+                        $config.EnableSharing(1)  # Private (1)
+                    }}
+                }}
+            }}
+            """
+            result = subprocess.run(
+                ["powershell.exe", "-Command", ics_script],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            if result.returncode == 0:
+                self.router_logger.log_message("[ICS Fallback] ✅ ICS enabled successfully.")
+                if result.stdout.strip():
+                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDOUT:\n{result.stdout.strip()}")
+            else:
+                self.router_logger.log_message("[ICS Fallback] ❌ PowerShell failed to enable ICS.")
+                if result.stderr.strip():
+                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDERR:\n{result.stderr.strip()}")
+        except Exception as e:
+            self.router_logger.log_message(f"[ICS Fallback] ❌ Exception during ICS enable: {e}")
+
+    def _fallback_disable_ics(self, public_iface: str = "Wi-Fi", private_iface: str = "Ethernet"):
+        """
+        Disables Internet Connection Sharing (ICS) from both public and private interfaces.
+        """
+        self.router_logger.log_message(f"[ICS Fallback] 🧹 Disabling ICS on: {public_iface}, {private_iface}")
+
+        try:
+            ics_script = f"""
+            $netSharingManager = New-Object -ComObject HNetCfg.HNetShare
+            $connections = $netSharingManager.EnumEveryConnection()
+            foreach ($conn in $connections) {{
+                $props = $netSharingManager.NetConnectionProps($conn)
+                if ($props.Name -eq '{public_iface}' -or $props.Name -eq '{private_iface}') {{
+                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
+                    if ($config.SharingEnabled) {{
+                        $config.DisableSharing()
+                    }}
+                }}
+            }}
+            """
+            result = subprocess.run(
+                ["powershell.exe", "-Command", ics_script],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            if result.returncode == 0:
+                self.router_logger.log_message("[ICS Fallback] ✅ ICS disabled successfully.")
+                if result.stdout.strip():
+                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDOUT:\n{result.stdout.strip()}")
+            else:
+                self.router_logger.log_message("[ICS Fallback] ❌ PowerShell failed to disable ICS.")
+                if result.stderr.strip():
+                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDERR:\n{result.stderr.strip()}")
+        except Exception as e:
+            self.router_logger.log_message(f"[ICS Fallback] ❌ Exception during ICS disable: {e}")
 
     def _setup_dynamic_firewall_manager_rules(self):
         """
