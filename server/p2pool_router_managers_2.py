@@ -174,6 +174,7 @@ class StratumManager:
         """Returns a snapshot of tracked miner sessions."""
         with self._lock:
             return dict(self.sessions)
+
 class mDNSManager:
     """
     Manages Multicast DNS (mDNS) traffic for local service discovery.
@@ -186,7 +187,7 @@ class mDNSManager:
     MDNS_IPV6_ADDR = "ff02::fb"
     MDNS_PORT = 5353
     MDNS_CACHE_TTL = 3600  # Default cache time in seconds
-    QUERY_COOLDOWN_SECONDS = 10  # Don't forward the same query from the same IP more than once every 10s
+    QUERY_COOLDOWN_SECONDS = .2  # Don't forward the same query from the same IP more than once every 10s
 
     def __init__(self, router_logger, packet_writer, interfaces_config):
         self.logger = router_logger
@@ -456,7 +457,7 @@ class HandshakeManager:
         self.timeout_half_open = timeout_half_open
         self.timeout_established = timeout_established
         self._stop_event = threading.Event()
-        self._tls_streams = {}
+        self._tls_streams = defaultdict(list)
         self.arp_manager = arp_manager
         self.nat_manager = nat_manager
         self.rip_manager = rip_manager
@@ -602,6 +603,10 @@ class HandshakeManager:
                                                      original_dst_ip, original_dst_port)
                     self.logger.log_message(
                         f"[Handshake] ✅ Inferred ESTABLISHED session from ACK ACK: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
+                    self.nat_manager.add_stateful_mapping(
+                        src_ip=stored_original_src_ip, src_port=stored_original_src_port,
+                        dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
+                    )
                 return False
 
             elif flags == 0x10: # ACK
@@ -609,6 +614,10 @@ class HandshakeManager:
                     self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
                         f"[Handshake] ✅ Connection ESTABLISHED: {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                    )
+                    self.nat_manager.add_stateful_mapping(
+                        src_ip=stored_original_src_ip, src_port=stored_original_src_port,
+                        dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
                     )
                 elif session_state == "ESTABLISHED":
                     self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
@@ -841,11 +850,12 @@ class HandshakeManager:
 
             self.packet_writer.queue_packet(forward_pkt)
             self.logger.log_message(
-                f"[TLS] 🔁 Queued TLS Application Data for forwarding to {session_info['dst']}"
+                f"[TLS] 🔁 Queued TLS Application Data for forwarding to {session_info['dst_ip']}"
             )
 
         except Exception as e:
             self.logger.log_message(f"[TLS] ❌ Exception while building forwarding packet: {e}")
+
 class IGMPManager:
     """
     Manages IP multicast group memberships using IGMPv2.
@@ -1892,6 +1902,10 @@ class NATManager:
         self._cleanup_thread = None
         self.router_internal_ip_for_self_mapping: str = "0.0.0.0"
 
+        self._stateful_nat_outbound = {}  # Maps canonical_key -> (translated_port, last_seen_timestamp)
+        self._stateful_nat_inbound = {}  # Maps translated_port -> canonical_key
+        self.STATEFUL_NAT_TIMEOUT_SECONDS = 300  # A longer timeout for established connections
+
         # Initialize with predefined static mappings
         self.add_static_mapping(external_port=65406, internal_ip="192.168.1.50", internal_port=88)
         self.add_static_mapping(external_port=80, internal_ip="192.168.1.100", internal_port=80)
@@ -1902,6 +1916,21 @@ class NATManager:
         self.add_static_mapping(external_port=520, internal_ip="192.168.1.50", internal_port=520)
 
         self.router_logger.log_message("[NAT] 🚀 Manager initialized with port scan detection and temporary leases.")
+
+
+    def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
+        """Creates a stateful NAT mapping for an established connection."""
+        canonical_key = _get_canonical_session_key(src_ip, src_port, dst_ip, dst_port)
+        with self._lock:
+            # Check if a dynamic mapping already exists for this flow
+            existing_mapping = self._nat_table.get((src_ip, src_port))
+            if existing_mapping:
+                translated_port, _ = existing_mapping
+                self._stateful_nat_outbound[canonical_key] = (translated_port, time.time())
+                self._stateful_nat_inbound[translated_port] = canonical_key
+                self.logger.log_message(
+                    f"[NAT][STATEFUL] ✅ Created stateful mapping for {src_ip}:{src_port} -> {self.public_ip}:{translated_port}"
+                )
 
     def set_router_internal_ip(self, ip: str):
         self.router_internal_ip_for_self_mapping = ip
@@ -1960,6 +1989,16 @@ class NATManager:
                     # Clean up the outer dictionary if it's empty
                     if not self._temp_nat_leases[src_ip]:
                         del self._temp_nat_leases[src_ip]
+                now = time.time()
+                stale_stateful_keys = [
+                    k for k, (_, ts) in self._stateful_nat_outbound.items()
+                    if now - ts > self.STATEFUL_NAT_TIMEOUT_SECONDS
+                ]
+                for key in stale_stateful_keys:
+                    translated_port, _ = self._stateful_nat_outbound.pop(key, (None, None))
+                    if translated_port in self._stateful_nat_inbound:
+                        del self._stateful_nat_inbound[translated_port]
+                    self.router_logger.log_message(f"[NAT][STATEFUL] 🗑️ Timed out stateful mapping for {key}.")
 
             self._stop_event.wait(self.NAT_TIMEOUT_SECONDS / 2)
 
@@ -2017,51 +2056,81 @@ class NATManager:
                 f"[NAT][ALG] ❓ DNS traffic observed ({direction}). (No DNS payload rewriting by NAT.)")
 
     def translate_outbound(self, packet: Packet):
-        """Translates outbound packets using dynamic NAT."""
+        """
+        Translates outbound packets using dynamic NAT.
+
+        If a connection is being established and a stateful mapping exists, it will
+        reuse that mapping. Otherwise, it creates or renews a dynamic mapping.
+        """
         if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
             self.router_logger.log_message(
                 f"[NAT] ⏭️ Skipping outbound translation for non-IP packet: {packet.summary()}")
             return
         ip = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+
+        # Check for ICMP, DHCP, IGMP, which do not need port translation
         if not (packet.haslayer(TCP) or packet.haslayer(UDP)):
             if packet.haslayer(ICMP):
                 self.router_logger.log_message(
                     f"[NAT] 핑 Passing outbound ICMP for {ip.src} to {ip.dst} without port NAT.")
-                return
-            if packet.haslayer(DHCP):
+            elif packet.haslayer(DHCP):
                 self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for DHCP packet from {ip.src}.")
-                return
-            if packet.haslayer(IGMP):
+            elif packet.haslayer(IGMP):
                 self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for IGMP packet from {ip.src}.")
-                return
-            self.router_logger.log_message(
-                f"[NAT] 🧐 Skipping outbound translation for unhandled non-TCP/UDP/ICMP packet: {packet.summary()}")
+            else:
+                self.router_logger.log_message(
+                    f"[NAT] 🧐 Skipping outbound translation for unhandled non-TCP/UDP/ICMP packet: {packet.summary()}")
             return
 
         t = packet[TCP] if packet.haslayer(TCP) else packet[UDP]
         internal_key = (ip.src, t.sport)
 
         with self._lock:
-            if internal_key not in self._nat_table:
+            # Check for an existing stateful mapping first, as it's more persistent
+            canonical_key = _get_canonical_session_key(ip.src, t.sport, ip.dst, t.dport)
+            stateful_mapping = self._stateful_nat_outbound.get(canonical_key)
+
+            if stateful_mapping:
+                # Reuse the existing translated port from the stateful table
+                new_port, _ = stateful_mapping
+                self.router_logger.log_message(
+                    f"[NAT] ➡️ Reusing stateful mapping: "
+                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
+                )
+                # Update timestamp to keep the session alive
+                self._stateful_nat_outbound[canonical_key] = (new_port, time.time())
+            elif internal_key not in self._nat_table:
+                # No existing mapping, create a new dynamic one
                 new_port = self._get_next_port()
                 if new_port == -1:
+                    self.router_logger.log_message("[NAT] ❌ Outbound port allocation failed.")
                     return
 
                 self._nat_table[internal_key] = (new_port, time.time())
                 self._nat_reverse_table[new_port] = internal_key
                 self.router_logger.log_message(
                     f"[NAT] ➡️ Created dynamic mapping: "
-                    f"{ip.src}:{t.sport} → {self.public_ip}:{new_port}"
+                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
                 )
             else:
+                # An old dynamic mapping exists, renew its timestamp
                 new_port, _ = self._nat_table[internal_key]
                 self._nat_table[internal_key] = (new_port, time.time())
                 self.router_logger.log_message(
                     f"[NAT] 🔄 Reusing dynamic mapping: "
-                    f"{ip.src}:{t.sport} → {self.public_ip}:{new_port}"
+                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
                 )
+
+        # Apply the translation to the packet layers
         ip.src = self.public_ip
         t.sport = new_port
+
+        # Recalculate checksums
+        del ip.chksum
+        if packet.haslayer(TCP):
+            del packet[TCP].chksum
+        elif packet.haslayer(UDP):
+            del packet[UDP].chksum
 
     def translate_inbound(self, packet: Packet) -> bool:
         """Translates inbound packets using static, dynamic, or temporary NAT mappings."""
@@ -2154,6 +2223,16 @@ class NATManager:
                 )
                 return None
 
+            if external_port in self._stateful_nat_inbound:
+                canonical_key = self._stateful_nat_inbound[external_port]
+                # Verify the return traffic's source IP matches the original flow's destination
+                original_src_ip = canonical_key[0][0]
+                original_dst_ip = canonical_key[1][0]
+                if src_ip == original_dst_ip:
+                    # Refresh the stateful timestamp
+                    self._stateful_nat_outbound[canonical_key] = (external_port, time.time())
+                    # Return the original source IP and port
+                    return canonical_key[0][0], canonical_key[0][1]
             # Step 2: Check for a permanent static mapping
             static_mapping = self._static_mappings.get(external_port)
             if static_mapping:

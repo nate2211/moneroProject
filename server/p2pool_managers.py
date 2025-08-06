@@ -23,7 +23,6 @@ import json
 import time
 import psutil
 import requests
-import scapy
 from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -73,6 +72,7 @@ class PythonRouterManager:
         "10.0.10.0/24", "10.0.11.0/24", "10.0.12.0/24",
         "172.16.10.0/24", "172.16.11.0/24", "172.16.12.0/24"
     ]
+
 
     BPF_FILTER_BASE_DEFINITIONS = {
         "Ethernet": [],
@@ -337,19 +337,35 @@ class PythonRouterManager:
             f"[Router] Successfully assigned IP {ip_address} to '{iface_friendly_name}'.")
         return True
 
-    def _get_system_networks(self) -> list[ipaddress.IPv4Network]:
-        """Gets all currently active IPv4 networks on the system using psutil."""
+    def _get_system_networks(self, router_ip_in: str = None, router_netmask_in: str = "255.255.255.0") -> list[
+        ipaddress.IPv4Network]:
+        """Gets all currently active IPv4 networks on the system using psutil,
+           and adds a user-provided network for conflict checking."""
         active_networks = []
         try:
             for iface_name, addrs in psutil.net_if_addrs().items():
                 for addr in addrs:
-                    if addr.family == socket.AF_INET and addr.address and addr.netmask:  # Use socket.AF_INET
+                    if addr.family == socket.AF_INET and addr.address and addr.netmask:
                         try:
                             network_obj = ipaddress.ip_network(f"{addr.address}/{addr.netmask}", strict=False)
                             active_networks.append(network_obj)
                         except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
                             self.router_logger.log_message(
                                 f"[Router] Warning: Could not parse network {addr.address}/{addr.netmask}: {e}")
+
+            # --- NEW: Check for the provided IN interface IP and add it to the list
+            if router_ip_in:
+                try:
+                    router_in_network = ipaddress.ip_network(f"{router_ip_in}/{router_netmask_in}", strict=False)
+                    active_networks.append(router_in_network)
+                    self.router_logger.log_message(
+                        f"[Router] ✅ User-provided IN network {router_in_network} added to conflict list."
+                    )
+                except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
+                    self.router_logger.log_message(
+                        f"[Router] Warning: Could not parse user-provided IN network {router_ip_in}/{router_netmask_in}: {e}"
+                    )
+
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error getting system networks via psutil: {e}")
         return active_networks
@@ -386,40 +402,6 @@ class PythonRouterManager:
         self.router_logger.log_message("[Router] ERROR: No unused private subnet found from predefined list.")
         return None
 
-    def _get_default_gateway_for_interface(self, iface_friendly_name: str) -> str | None:
-        """
-        Attempts to get the default gateway IP for a specific interface using PowerShell.
-        (Windows specific: uses Get-NetRoute and Get-NetAdapter)
-        """
-        self.router_logger.log_message(f"[Router] Discovering default gateway for '{iface_friendly_name}'...")
-        try:
-            ps_command = f"""
-            $iface = Get-NetAdapter -Name "{iface_friendly_name}" -ErrorAction SilentlyContinue
-            if ($iface) {{
-                (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Where-Object {{ $_.InterfaceIndex -eq $iface.IfIndex }}).NextHop | Select-Object -First 1
-            }}
-            """
-
-            result = subprocess.run(
-                ["powershell.exe", "-Command", ps_command],
-                capture_output=True, text=True, check=False,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                gateway_ip = result.stdout.strip()
-                self.router_logger.log_message(
-                    f"[Router] Discovered gateway for '{iface_friendly_name}': {gateway_ip}")
-                return gateway_ip
-            else:
-                self.router_logger.log_message(
-                    f"[Router] Could not discover gateway for '{iface_friendly_name}'. STDOUT: {result.stdout.strip()}, STDERR: {result.stderr.strip()}")
-                return None
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[Router] Error discovering gateway for '{iface_friendly_name}': {e}")
-            return None
-
     def _inject_dependencies(self):
         """
         Injects shared dependencies (like the sniffer/sender) into all manager classes
@@ -442,14 +424,16 @@ class PythonRouterManager:
                     self.router_logger.log_message(f"[Sniffer] -> Injected sniffer into {manager.__class__.__name__}")
 
     def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
-                             router_netmask_in: str = "255.255.255.0"):
+                                   router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
+                                   router_netmask_out: str = "255.255.255.0"):
         """
         Automatically finds and configures IN, OUT, and Loopback interfaces.
-        Sets their IP addresses dynamically (for IN/OUT) and determines default gateway.
+        Sets their IP addresses dynamically (for IN/OUT) and determines the default gateway.
+        Adds a new parameter `use_os_gateway` to control the default gateway.
         """
         in_iface_info = None
         out_iface_info = None
-        loopback_iface_info = None  # NEW: For loopback interface
+        loopback_iface_info = None
         ethernet_2_info = None
         lac_2_info = None
         lac_2_info_2 = None
@@ -467,7 +451,6 @@ class PythonRouterManager:
                 lac_2_info_2 = iface
                 self.router_logger.log_message(
                     f"[Router] Found exact match for LAC 2: {iface['friendly_name']}")
-
 
         if lac_2_info:
             self.router_logger.log_message(
@@ -522,15 +505,15 @@ class PythonRouterManager:
             return False
 
         # Assign full and friendly names to instance attributes
-        if(lac_2_info_2):
+        if (lac_2_info_2):
             self.interface_lac_2_full_name = lac_2_info_2["full_name"]
             self.interface_lac_2_friendly_name = lac_2_info_2["friendly_name"]
-        if(lac_2_info):
+        if (lac_2_info):
             self.interface_lac_full_name = lac_2_info['full_name']
             self.interface_lac_friendly_name = lac_2_info['friendly_name']
-        if(ethernet_2_info):
-            self.interface_ethernet_2_full_name =  ethernet_2_info['full_name']
-            self.interface_ethernet_2_friendly_name =  ethernet_2_info['friendly_name']
+        if (ethernet_2_info):
+            self.interface_ethernet_2_full_name = ethernet_2_info['full_name']
+            self.interface_ethernet_2_friendly_name = ethernet_2_info['friendly_name']
         self.interface_in_full_name = in_iface_info['full_name']
         self.interface_in_friendly_name = in_iface_info['friendly_name']
         self.interface_out_full_name = out_iface_info['full_name']
@@ -538,101 +521,220 @@ class PythonRouterManager:
         if loopback_iface_info:  # Assign if found
             self.interface_loopback_full_name = loopback_iface_info['full_name']
 
-        # Step 2: Determine IP configurations for IN and OUT interfaces
-        system_active_networks = self._get_system_networks()
+        # Step 2: Determine IP configurations for OUT and IN interfaces
+        # Call _get_system_networks initially with router_ip_in to include it in conflict checks
+        system_active_networks = self._get_system_networks(router_ip_in, router_netmask_in)
 
-        # For OUT interface: use its current IP config as router_ip_out
+        # --- Start of Logic for OUT (WAN) Interface ---
         current_out_ip = None
         current_out_netmask = None
+        current_out_gateway = None
 
-        for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
-            if addr.family == socket.AF_INET:
-                current_out_ip = addr.address
-                current_out_netmask = addr.netmask
-                break
-
-        self._configure_firewall_rules()  # Configure firewall rules based on discovered OUT interface
-
-        if current_out_ip and current_out_netmask:
-            self.router_ip_out = current_out_ip
-            self.router_netmask_out = current_out_netmask
-            self.router_network_out = ipaddress.ip_network(f"{self.router_ip_out}/{self.router_netmask_out}",
-                                                           strict=False)
+        if use_dhcp_out:
             self.router_logger.log_message(
-                f"[Router] Using current IP for OUT interface '{self.interface_out_friendly_name}': {self.router_ip_out}/{self.router_netmask_out}")
-        else:
-            self.router_logger.log_message(
-                f"[Router] WARNING: Could not determine current IP for OUT interface '{self.interface_out_friendly_name}'. Attempting DHCP/dynamic configuration fallback.")
-            # Fallback logic if current IP is not found - assign a new private IP or rely on DHCP
-            # This is a bit unusual for a production WAN interface but ensures the router has an IP.
-            # In a real scenario, you'd likely use DHCP client here or fail.
-            unused_out_ip = self._find_unused_private_subnet(system_active_networks)
-            if unused_out_ip:
-                self.router_ip_out = unused_out_ip
-                self.router_netmask_out = "255.255.255.0"
-                self.router_network_out = ipaddress.ip_network(f"{self.router_ip_out}/{self.router_netmask_out}",
-                                                               strict=False)
+                f"[Router] 🌍 Setting OUT interface '{self.interface_out_friendly_name}' to DHCP to get internet access.")
+            if not self._execute_netsh(["set", "address", f'name={self.interface_out_friendly_name}', "source=dhcp"]):
                 self.router_logger.log_message(
-                    f"[Router] Dynamically assigned fallback IP for OUT interface '{self.interface_out_friendly_name}': {self.router_ip_out}/{self.router_netmask_out}")
+                    f"[Router] ⚠️ Failed to set OUT interface to DHCP. It might already be configured. Proceeding to retrieve current IP...")
+
+            time.sleep(5)  # Give OS time to acquire DHCP lease
+
+            # Retrieve the newly assigned IP address and netmask using psutil
+            for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
+                if addr.family == socket.AF_INET:
+                    current_out_ip = addr.address
+                    current_out_netmask = addr.netmask
+                    break
+
+            if current_out_ip and current_out_netmask:
+                current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
+                self.router_logger.log_message(
+                    f"[Router] ✅ OUT interface successfully obtained IP via DHCP: {current_out_ip}/{current_out_netmask}, Gateway: {current_out_gateway}")
             else:
                 self.router_logger.log_message(
-                    "[Router] CRITICAL ERROR: Failed to assign any IP to OUT interface. Routing may not work.")
-                return False  # Cannot proceed without OUT IP
-
-        # Discover default gateway for the OUT interface (using friendly name)
-        self.router_gateway_out_ip = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
-
-        # For IN interface: dynamically find an unused private subnet
-        # --- [MODIFIED] Configuration for IN interface ---
-        if router_ip_in:
-            try:
-                # Validate the provided IP and assign it
-                ipaddress.ip_address(router_ip_in)  # Throws ValueError if invalid
-                self.router_ip_in = router_ip_in
-                self.router_netmask_in = router_netmask_in
-                self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}",
-                                                              strict=False)
+                    f"[Router] ❌ FAILED to get IP via DHCP for OUT interface. Falling back to a private IP or user-provided static IP.")
+                # Fallback if DHCP fails: try user-provided static IP for OUT, or find unused private subnet
+                if router_ip_out:  # Check if user provided a static IP for OUT
+                    current_out_ip = router_ip_out
+                    current_out_netmask = router_netmask_out
+                    current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
+                    self.router_logger.log_message(
+                        f"[Router] Using user-provided static IP for OUT interface: {current_out_ip}/{current_out_netmask}")
+                else:  # No user-provided static IP for OUT, find unused private subnet
+                    unused_out_ip = self._find_unused_private_subnet(system_active_networks)
+                    if unused_out_ip:
+                        current_out_ip = unused_out_ip
+                        current_out_netmask = "255.255.255.0"
+                        current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
+                        self.router_logger.log_message(
+                            f"[Router] Dynamically assigned fallback private IP for OUT interface '{self.interface_out_friendly_name}': {current_out_ip}/{current_out_netmask}")
+                    else:
+                        self.router_logger.log_message(
+                            "[Router] CRITICAL ERROR: Failed to assign any IP to OUT interface. Routing may not work.")
+                        return False
+        else:  # use_dhcp_out is False, so configure statically
+            if router_ip_out:  # User explicitly provided static IP for OUT
+                current_out_ip = router_ip_out
+                current_out_netmask = router_netmask_out
+                current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
                 self.router_logger.log_message(
-                    f"[Router] Using user-provided IP for IN interface '{self.interface_in_friendly_name}': {self.router_ip_in}/{self.router_netmask_in}")
-            except ValueError:
-                self.router_logger.log_message(
-                    f"[Router] CRITICAL ERROR: The provided IP for the IN interface '{router_ip_in}' is not valid.")
-                return False
-        else:
-            # Fallback to the original dynamic assignment logic if no IP was provided
+                    f"[Router] Using user-provided static IP for OUT interface: {current_out_ip}/{current_out_netmask}")
+            else:  # No user-provided static IP for OUT, try to get current OS static config
+                for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
+                    if addr.family == socket.AF_INET:
+                        current_out_ip = addr.address
+                        current_out_netmask = addr.netmask
+                        current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
+                        break
+                if current_out_ip and current_out_netmask:
+                    self.router_logger.log_message(
+                        f"[Router] Using current static IP for OUT interface '{self.interface_out_friendly_name}': {current_out_ip}/{current_out_netmask}, Gateway: {current_out_gateway}")
+                else:
+                    self.router_logger.log_message(
+                        "[Router] CRITICAL ERROR: Could not determine static IP for OUT interface. Please configure it manually or use DHCP.")
+                    return False
+
+        self.router_gateway_out_ip = current_out_gateway
+
+        # Assign determined OUT interface details to router attributes
+        self.router_ip_out = current_out_ip
+        self.router_netmask_out = current_out_netmask
+        self.router_network_out = ipaddress.ip_network(f"{self.router_ip_out}/{self.router_netmask_out}", strict=False)
+        # The router_gateway_out_ip is already set based on the new logic.
+        # --- End of Logic for OUT (WAN) Interface ---
+
+        # --- Start of Logic for IN (LAN) Interface ---
+        # Re-get system active networks after OUT interface IP is determined,
+        # ensuring router_network_out is included for IN interface conflict checks.
+        # This is crucial to prevent IN and OUT interfaces from being on the same subnet.
+        system_active_networks_updated = self._get_system_networks(router_ip_in, router_netmask_in)
+        existing_networks_for_in = system_active_networks_updated + [self.router_network_out]
+
+        current_in_ip, current_in_netmask = None, None
+
+        if use_dhcp_in:
             self.router_logger.log_message(
-                "[Router] No IP provided for IN interface. Dynamically assigning one...")
-            unused_in_ip = self._find_unused_private_subnet(system_active_networks)
-            if unused_in_ip:
-                self.router_ip_in = unused_in_ip
-                self.router_netmask_in = "255.255.255.0"
-                self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}",
-                                                              strict=False)
+                f"[Router] 🏠 Setting IN interface '{self.interface_in_friendly_name}' to DHCP.")
+            if not self._execute_netsh(["set", "address", f'name={self.interface_in_friendly_name}', "source=dhcp"]):
                 self.router_logger.log_message(
-                    f"[Router] Dynamically assigned IP for IN interface '{self.interface_in_friendly_name}': {self.router_ip_in}/{self.router_netmask_in}")
+                    f"[Router] ⚠️ Failed to set IN interface to DHCP. Proceeding to retrieve current IP...")
+            time.sleep(5)
+            for addr in psutil.net_if_addrs().get(self.interface_in_friendly_name, []):
+                if addr.family == socket.AF_INET:
+                    current_in_ip = addr.address
+                    current_in_netmask = addr.netmask
+                    break
+            if current_in_ip and current_in_netmask:
+                self.router_logger.log_message(
+                    f"[Router] ✅ IN interface successfully obtained IP via DHCP: {current_in_ip}/{current_in_netmask}")
             else:
                 self.router_logger.log_message(
-                    "[Router] CRITICAL ERROR: Failed to assign any IP to IN interface.")
-                return False
+                    f"[Router] ❌ FAILED to get IP via DHCP for IN interface. Falling back to a private IP.")
+                unused_in_ip = self._find_unused_private_subnet(existing_networks_for_in)
+                if unused_in_ip:
+                    current_in_ip = unused_in_ip
+                    current_in_netmask = "255.255.255.0"
+                    self.router_logger.log_message(
+                        f"[Router] Dynamically assigned fallback private IP for IN interface '{self.interface_in_friendly_name}': {current_in_ip}/{current_in_netmask}")
+                else:
+                    self.router_logger.log_message("[Router] CRITICAL ERROR: Failed to assign any IP to IN interface.")
+                    return False
+        else:  # use_dhcp_in is False
+            if router_ip_in:
+                current_in_ip = router_ip_in
+                current_in_netmask = router_netmask_in
+                self.router_logger.log_message(
+                    f"[Router] Using user-provided static IP for IN interface: {current_in_ip}/{current_in_netmask}")
+            else:
+                self.router_logger.log_message(
+                    "[Router] No static IP provided for IN interface. Dynamically assigning a private one...")
+                unused_in_ip = self._find_unused_private_subnet(existing_networks_for_in)
+                if unused_in_ip:
+                    current_in_ip = unused_in_ip
+                    current_in_netmask = "255.255.255.0"
+                    self.router_logger.log_message(
+                        f"[Router] Dynamically assigned private IP for IN interface '{self.interface_in_friendly_name}': {current_in_ip}/{current_in_netmask}")
+                else:
+                    self.router_logger.log_message("[Router] CRITICAL ERROR: Failed to assign any IP to IN interface.")
+                    return False
+
+        # Assign determined IN interface details to router attributes
+        self.router_ip_in = current_in_ip
+        self.router_netmask_in = current_in_netmask
+        self.router_network_in = ipaddress.ip_network(f"{self.router_ip_in}/{self.router_netmask_in}", strict=False)
+        # --- End of Logic for IN (LAN) Interface ---
+
         # Step 3: Assign IPs to interfaces using OS commands (netsh for Windows)
         self.router_logger.log_message(
             "[Router] Assigning IPs to interfaces via OS commands (Requires Admin). This may cause temporary network disruption.")
 
-        # Assign IN interface IP (using its friendly name for netsh)
-
-        if(not use_dhcp_in):
-            if not self._assign_ip_to_interface(self.interface_in_friendly_name, self.router_ip_in, self.router_netmask_in):
+        if not use_dhcp_in:
+            if not self._assign_ip_to_interface(self.interface_in_friendly_name, self.router_ip_in,
+                                                self.router_netmask_in):
                 self.router_logger.log_message(
                     f"[Router] CRITICAL ERROR: Failed to assign IP to IN interface. Routing may not work.")
                 return False
 
-        # Assign OUT interface IP with its (discovered/fallback) gateway (using its friendly name for netsh)
-        if(not use_dhcp_out):
+        # The key change is here: only assign a static gateway if we are NOT using the OS gateway
+        if not use_dhcp_out:
             if not self._assign_ip_to_interface(self.interface_out_friendly_name, self.router_ip_out,
                                                 self.router_netmask_out,
                                                 self.router_gateway_out_ip):
                 self.router_logger.log_message(
                     f"[Router] CRITICAL ERROR: Failed to assign IP to OUT interface. Routing may not work.")
+                return False
+
+        # Assign IPs to the additional interfaces (Ethernet 2, LAC 1, LAC 2)
+        # We will give them static IPs from the same subnet as the IN interface.
+        # Note: These IPs must be unique and not conflict with other devices.
+        if ethernet_2_info:
+            # Check for a pre-configured IP or assign one
+            eth2_ip = None
+            for addr in psutil.net_if_addrs().get(ethernet_2_info["friendly_name"], []):
+                if addr.family == socket.AF_INET:
+                    eth2_ip = addr.address
+                    break
+
+            # If no static IP found, assign a new one from the IN subnet
+            if not eth2_ip:
+                eth2_ip = str(self.router_network_in.network_address + 2)
+
+            self.router_logger.log_message(f"[Router] Attempting to assign IP {eth2_ip} to Ethernet 2.")
+            if not self._assign_ip_to_interface(ethernet_2_info['friendly_name'], eth2_ip, self.router_netmask_in):
+                self.router_logger.log_message(
+                    f"[Router] CRITICAL ERROR: Failed to assign IP to Ethernet 2. Bridging may not work.")
+                return False
+
+        if lac_2_info:
+            lac_1_ip = None
+            for addr in psutil.net_if_addrs().get(lac_2_info["friendly_name"], []):
+                if addr.family == socket.AF_INET:
+                    lac_1_ip = addr.address
+                    break
+
+            if not lac_1_ip:
+                lac_1_ip = str(self.router_network_in.network_address + 3)
+
+            self.router_logger.log_message(f"[Router] Attempting to assign IP {lac_1_ip} to LAC 1.")
+            if not self._assign_ip_to_interface(lac_2_info['friendly_name'], lac_1_ip, self.router_netmask_in):
+                self.router_logger.log_message(
+                    f"[Router] CRITICAL ERROR: Failed to assign IP to LAC 1. Bridging/LAG may not work.")
+                return False
+
+        if lac_2_info_2:
+            lac_2_ip = None
+            for addr in psutil.net_if_addrs().get(lac_2_info_2["friendly_name"], []):
+                if addr.family == socket.AF_INET:
+                    lac_2_ip = addr.address
+                    break
+
+            if not lac_2_ip:
+                lac_2_ip = str(self.router_network_in.network_address + 4)
+
+            self.router_logger.log_message(f"[Router] Attempting to assign IP {lac_2_ip} to LAC 2.")
+            if not self._assign_ip_to_interface(lac_2_info_2['friendly_name'], lac_2_ip, self.router_netmask_in):
+                self.router_logger.log_message(
+                    f"[Router] CRITICAL ERROR: Failed to assign IP to LAC 2. Bridging/LAG may not work.")
                 return False
 
         # Step 4: Update internal _interfaces_config with assigned IPs and MACs
@@ -652,9 +754,7 @@ class PythonRouterManager:
         }
         self.default_gateway_ip = self.router_gateway_out_ip
 
-
         bridge_members = [self.interface_in_full_name]
-
 
         if ethernet_2_info:
             try:
@@ -692,7 +792,6 @@ class PythonRouterManager:
                 lac_mac = get_if_hwaddr(self.interface_lac_full_name)
                 lac_ip = None
                 lac_netmask = None
-                # Find the IP configuration for the LAC interface
                 for addr in psutil.net_if_addrs().get(self.interface_lac_friendly_name, []):
                     if addr.family == socket.AF_INET:
                         lac_ip = addr.address
@@ -710,7 +809,6 @@ class PythonRouterManager:
                     self.router_logger.log_message(
                         f"[Router] Added LAC interface to config: {self.interface_lac_full_name}, IP: {lac_ip}, MAC: {lac_mac}")
                 else:
-                    # If no IP is found, add it with a placeholder IP
                     self._interfaces_config[self.interface_lac_full_name] = {
                         "ip_addr": "0.0.0.0",
                         "network": None,
@@ -725,23 +823,19 @@ class PythonRouterManager:
                     f"[Router] ⚠️ Failed to configure LAC interface {self.interface_lac_full_name}: {e}")
         if lac_2_info_2:
             try:
-                # Use the full name for getting hardware address
                 lac_2_mac = get_if_hwaddr(self.interface_lac_2_full_name)
                 lac_2_ip = None
                 lac_2_netmask = None
 
-                # Find the IP configuration for the second LAC interface using its friendly name
                 for addr in psutil.net_if_addrs().get(self.interface_lac_2_friendly_name, []):
                     if addr.family == socket.AF_INET:
                         lac_2_ip = addr.address
                         lac_2_netmask = addr.netmask
-                        break  # Stop after finding the first IPv4 address
+                        break
 
-                # If an IP and netmask were successfully found, calculate network info
                 if lac_2_ip and lac_2_netmask:
                     lac_2_network = ipaddress.ip_network(f"{lac_2_ip}/{lac_2_netmask}", strict=False)
 
-                    # Add the interface configuration to your main dictionary
                     self._interfaces_config[self.interface_lac_2_full_name] = {
                         "ip_addr": lac_2_ip,
                         "network": lac_2_network,
@@ -751,7 +845,6 @@ class PythonRouterManager:
                     self.router_logger.log_message(
                         f"[Router] Added LAC 2 interface to config: {self.interface_lac_2_full_name}, IP: {lac_2_ip}, MAC: {lac_2_mac}")
                 else:
-                    # If no IP is found, add it with a placeholder IP
                     self._interfaces_config[self.interface_lac_2_full_name] = {
                         "ip_addr": "0.0.0.0",
                         "network": None,
@@ -778,7 +871,7 @@ class PythonRouterManager:
                 self._interfaces_config[self.interface_ethernet_2_full_name]["mac"]
             )
             self.add_trusted_arp_port(self.interface_ethernet_2_full_name)
-        if self.interface_lac_full_name:
+        if lac_2_info:
             self.add_static_arp_entry(
                 self._interfaces_config[self.interface_lac_full_name]["ip_addr"],
                 self._interfaces_config[self.interface_lac_full_name]["mac"]
@@ -799,21 +892,17 @@ class PythonRouterManager:
             except Exception as e:
                 self.router_logger.log_message(f"[Router][ARP] ⚠️ Failed to resolve gateway MAC: {e}")
         if self.router_ip_in:
-            self.add_static_arp_entry(self.router_ip_in,self._interfaces_config[self.interface_in_full_name]['mac'])
+            self.add_static_arp_entry(self.router_ip_in, self._interfaces_config[self.interface_in_full_name]['mac'])
 
         # NEW: Add Loopback interface to config if found
         if self.interface_loopback_full_name:
-            # Loopback usually has 127.0.0.1/8. MAC is typically '00:00:00:00:00:00' or similar virtual.
             loopback_ip = "127.0.0.1"
             loopback_netmask = "255.0.0.0"
             loopback_network = ipaddress.ip_network(f"{loopback_ip}/{loopback_netmask}", strict=False)
-
-            # Attempt to get actual loopback MAC, but fall back to dummy if not available
-            # Some platforms or virtual envs might not give a real MAC for loopback.
             try:
                 loopback_mac = get_if_hwaddr(self.interface_loopback_full_name)
             except Exception:
-                loopback_mac = "00:00:00:00:00:00"  # Dummy MAC for loopback
+                loopback_mac = "00:00:00:00:00:00"
 
             self._interfaces_config[self.interface_loopback_full_name] = {
                 'ip_addr': loopback_ip,
@@ -837,13 +926,13 @@ class PythonRouterManager:
         if self.interface_lac_2_full_name:
             self.add_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             link_group.append(self.interface_lac_2_full_name)
-        # Get our own MAC addresses (re-get after IP assignment for certainty)
+
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
         self.router_macs = {cfg.get('mac') for cfg in self._interfaces_config.values() if 'mac' in cfg}
 
-        self.router_logger.log_message(f"\n--- Python Router Configuration Summary (Dynamically Assigned) ---")
+        self.router_logger.log_message(f"\n--- Python Router Configuration Summary ---")
         self.router_logger.log_message(
             f"  IN Interface: '{self.interface_in_friendly_name}' (Full: {self.interface_in_full_name}, MAC: {self.mac_in}, IP: {self.router_ip_in}/{self.router_netmask_in})")
         self.router_logger.log_message(
@@ -854,7 +943,6 @@ class PythonRouterManager:
             f"  External Gateway: {self.router_gateway_out_ip} via '{self.interface_out_friendly_name}'")
         self.router_logger.log_message(f"----------------------------------------------------------------")
         return True
-
     def _start_single_sniffer(self, iface_name: str):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
@@ -888,7 +976,7 @@ class PythonRouterManager:
                     promisc=True,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
-                    mac_filter_only=False,
+                    mac_filter_only=True,
                     session=TCPSession,
                 )
             except Exception as e:
@@ -1116,19 +1204,12 @@ class PythonRouterManager:
                 target_mac = "33:33:%02x:%02x:%02x:%02x" % (
                     ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]
                 )
-            interested_interfaces = self.igmp_manager.get_group_memberships()
-            if not interested_interfaces:
-                self.igmp_manager.handle_packet(packet, inbound_iface)
-                self.router_logger.log_message(f"[Router] 💧 No active listeners for group {dst_ip}.IGMP Handling packet.")
-                return
-
-            # Instead of flooding to all interfaces, flood only to interested ones
-            for iface_name in interested_interfaces:
-                if iface_name != inbound_iface:
-                    self.ethernet_manager.handle_frame(packet, iface_name)
-            return
-        else:
-            self.router_logger.log_message(f"[Router] ❌ Could not determine multicast MAC for {dst_ip}. Dropping.")
+            if target_mac:
+                packet[Ether].dst = target_mac
+                self.router_logger.log_message(f"[Router] 📢 Forwarding multicast packet to MAC: {target_mac}")
+                self.ethernet_manager.handle_frame(packet, inbound_iface)
+            else:
+                self.router_logger.log_message(f"[Router] ❌ Could not determine multicast MAC for {dst_ip}. Dropping.")
             return
 
         src_ip = ip_layer.src
@@ -1357,18 +1438,18 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_in, netmask_in, use_static):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
                 self._initialize_interface_discovery()
-                if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_in, netmask_in):
+                if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
                     self.router_logger.log_message("[Router] ❌ Failed to auto-configure interfaces.")
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
 
             if use_static:
-                self._configure_interface_settings(use_dhcp_out, use_dhcp_in, router_ip_in, netmask_in)
+                self._configure_interface_settings(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
 
 
             self._enable_nat_forwarding()
@@ -1495,11 +1576,20 @@ class PythonRouterManager:
             pass  # Suppress all errors
 
     def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, router_ip_in: str = None,
-                                      netmask_in: str = "255.255.255.0") -> bool:
+                                      router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
+                                      router_netmask_out: str = "255.255.255.0") -> bool:
         """
         Configures all interfaces defined in self._interfaces_config using PowerShell.
         Automatically determines gateway and DNS settings. Skips configuration for interfaces
         based on DHCP flags or if missing essential data.
+
+        Args:
+            use_dhcp_out (bool): True to configure OUT interface via DHCP, False for static.
+            use_dhcp_in (bool): True to configure IN interface via DHCP, False for static.
+            router_ip_in (str, optional): Static IP for the IN interface. Used if use_dhcp_in is False.
+            router_netmask_in (str, optional): Netmask for the IN interface.
+            router_ip_out (str, optional): Static IP for the OUT interface. Used if use_dhcp_out is False.
+            router_netmask_out (str, optional): Netmask for the OUT interface.
 
         Returns:
             bool: True if all configurations succeeded, False otherwise.
@@ -1508,132 +1598,168 @@ class PythonRouterManager:
 
         for iface_full_name, config in self._interfaces_config.items():
             iface_friendly_name = self._get_friendly_name_from_full(iface_full_name)
-            if iface_friendly_name != "Ethernet" :
-                ip_address = config.get('ip_addr')
-                network = config.get('network')
-
-                is_out = config.get('is_default_gateway_iface', False)
-                is_in = not is_out
-
-                # Determine if this specific interface should be configured via DHCP
-                should_use_dhcp_for_this_iface = False
-                if is_out and use_dhcp_out:
-                    should_use_dhcp_for_this_iface = True
-                elif is_in and use_dhcp_in:
-                    should_use_dhcp_for_this_iface = True
-
-                if should_use_dhcp_for_this_iface:
-                    self.router_logger.log_message(f"[Router] ⏭️ Setting '{iface_friendly_name}' to DHCP.")
-                    ps_command = f"""
-                      $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
-                      if (-not $iface) {{
-                          Write-Output \"SKIP\"
-                          exit 0
-                      }}
-                      Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Enabled -ErrorAction Stop
-                      Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-                      """
-                    result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    if result.returncode == 0:
-                        self.router_logger.log_message(f"[Router] ✅ Successfully set '{iface_friendly_name}' to DHCP.")
-                    else:
-                        self.router_logger.log_message(f"[Router] ❌ Failed to set '{iface_friendly_name}' to DHCP.")
-                        self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
-                        all_success = False
-                    continue  # Move to the next interface
-
-                # For static configuration
-                if not ip_address or not network:
-                    self.router_logger.log_message(
-                        f"[Router] ⚠️ Skipping '{iface_friendly_name}' — missing IP or network for static config.")
-                    all_success = False  # Mark as failure if static config is intended but data is missing
-                    continue
-
-                netmask = str(network.netmask)
-                prefix_len = network.prefixlen  # Use prefixlen directly from ipaddress object
-
-                gateway = self.default_gateway_ip if is_out else ""
-                dns_server = "8.8.8.8" if is_out else ip_address  # Router itself is DNS for IN, public for OUT
-
+            # Skip loopback and other specific internal interfaces if they are not meant for dynamic config
+            if iface_friendly_name == "Ethernet" or iface_friendly_name == "Adapter for loopback traffic capture" or \
+                    iface_friendly_name.lower() == "lo" or \
+                    "local area connection*" in iface_friendly_name.lower():  # Catch LAC interfaces
                 self.router_logger.log_message(
-                    f"[Router] 🛠️ Configuring '{iface_friendly_name}' → IP: {ip_address}/{prefix_len}, "
-                    f"Gateway: {gateway or 'None'}, DNS: {dns_server}"
-                )
+                    f"[Router] ⏭️ Skipping configuration for internal/virtual interface: '{iface_friendly_name}'.")
+                continue
 
-                try:
-                    ps_command = f"""
-                      $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
-                      if (-not $iface) {{
-                          Write-Output \"SKIP\"
-                          exit 0
-                      }}
-    
-                      # Ensure DHCP is disabled before static configuration
-                      Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
-                      Start-Sleep -Milliseconds 500
-    
-                      # --- FIX: Wait for DHCP state to be 'Disabled' ---
-                      $tries = 0
-                      do {{
-                          $state = (Get-NetIPInterface -InterfaceIndex $iface.IfIndex).Dhcp
-                          if ($state -eq "Enabled") {{
-                              # Optionally re-attempt disabling if it's still enabled
-                              Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
-                          }}
-                          Start-Sleep -Milliseconds 200
-                          $tries++
-                      }} while ($state -ne "Disabled" -and $tries -lt 10) # Max 10 tries = 2 seconds
-    
-                      if ($state -ne "Disabled") {{
-                          Write-Error "Failed to disable DHCP on interface '{iface_friendly_name}' after multiple attempts. Current state: $state"
-                          exit 1 # Exit PowerShell script with error
-                      }}
-                      # --- END FIX ---
-    
-                      # Remove all existing IPv4 addresses
-                      Get-NetIPAddress -InterfaceIndex $iface.IfIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-                      Start-Sleep -Milliseconds 500
-    
-                      # Assign static IP
-                      New-NetIPAddress -InterfaceIndex $iface.IfIndex -IPAddress \"{ip_address}\" -PrefixLength {prefix_len} -ErrorAction Stop
-    
-                      # Handle default gateway
-                      if (\"{gateway}\") {{
-                          # Remove existing default route for this interface if it exists
-                          Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                          Start-Sleep -Milliseconds 500
-                          # Add the new default route
-                          New-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix 0.0.0.0/0 -NextHop \"{gateway}\" -ErrorAction Stop
-                      }} else {{
-                          # Ensure no default route exists if none is specified
-                          Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                      }}
-    
-                      # Set DNS server
-                      if (\"{dns_server}\") {{
-                          Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ServerAddresses \"{dns_server}\" -ErrorAction Stop
-                      }} else {{
-                          # Clear DNS if no server is specified
-                          Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-                      }}
-                      """
+            ip_address_config = config.get('ip_addr')
+            network_config = config.get('network')
 
-                    result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
+            is_out_iface = (iface_full_name == self.interface_out_full_name)
+            is_in_iface = (iface_full_name == self.interface_in_full_name)
 
-                    if result.returncode == 0:
-                        self.router_logger.log_message(f"[Router] ✅ Successfully configured '{iface_friendly_name}'.")
-                    else:
-                        self.router_logger.log_message(f"[Router] ❌ Failed to configure '{iface_friendly_name}'.")
-                        self.router_logger.log_message(
-                            f"[Router] PowerShell STDOUT: {result.stdout.strip()}")  # Log stdout too
-                        self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
-                        all_success = False
+            # Determine if this specific interface should be configured via DHCP
+            should_use_dhcp_for_this_iface = False
+            if is_out_iface and use_dhcp_out:
+                should_use_dhcp_for_this_iface = True
+            elif is_in_iface and use_dhcp_in:
+                should_use_dhcp_for_this_iface = True
 
-                except Exception as e:
-                    self.router_logger.log_message(f"[Router] ❌ Exception configuring '{iface_friendly_name}': {e}")
+            if should_use_dhcp_for_this_iface:
+                self.router_logger.log_message(f"[Router] ⏭️ Setting '{iface_friendly_name}' to DHCP.")
+                ps_command = f"""
+                  $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
+                  if (-not $iface) {{
+                      Write-Output \"SKIP\"
+                      exit 0
+                  }}
+                  Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Enabled -ErrorAction Stop
+                  Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+                  """
+                result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode == 0:
+                    self.router_logger.log_message(f"[Router] ✅ Successfully set '{iface_friendly_name}' to DHCP.")
+                else:
+                    self.router_logger.log_message(f"[Router] ❌ Failed to set '{iface_friendly_name}' to DHCP.")
+                    self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
                     all_success = False
+                continue  # Move to the next interface
+
+            # --- For static configuration ---
+            # Determine the correct IP and netmask based on whether it's IN or OUT
+            ip_to_assign = None
+            netmask_to_assign = None
+            gateway_to_assign = ""
+            dns_server_to_assign = ""
+
+            if is_out_iface:
+                ip_to_assign = router_ip_out if router_ip_out else ip_address_config
+                netmask_to_assign = router_netmask_out if router_netmask_out else str(network_config.netmask)
+                gateway_to_assign = self.router_gateway_out_ip  # Use the discovered/configured gateway for OUT
+                dns_server_to_assign = "8.8.8.8"  # Public DNS for WAN interface
+            elif is_in_iface:
+                ip_to_assign = router_ip_in if router_ip_in else ip_address_config
+                netmask_to_assign = router_netmask_in if router_netmask_in else str(network_config.netmask)
+                # IN interface typically doesn't have a gateway configured on itself, it *is* the gateway
+                gateway_to_assign = ""
+                dns_server_to_assign = ip_to_assign  # Router itself is DNS for IN
+            else:  # For other interfaces not explicitly IN/OUT (e.g., Ethernet 2, LAC)
+                ip_to_assign = ip_address_config
+                netmask_to_assign = str(network_config.netmask) if network_config else "255.255.255.0"
+                gateway_to_assign = ""  # No gateway for these
+                dns_server_to_assign = ""  # No DNS for these
+
+            if not ip_to_assign or not netmask_to_assign:
+                self.router_logger.log_message(
+                    f"[Router] ⚠️ Skipping '{iface_friendly_name}' — missing IP or network for static config.")
+                all_success = False
+                continue
+
+            try:
+                # Convert netmask string to prefix length
+                prefix_len = ipaddress.IPv4Network(f"0.0.0.0/{netmask_to_assign}", strict=False).prefixlen
+            except ValueError:
+                self.router_logger.log_message(
+                    f"[Router] ❌ Invalid netmask '{netmask_to_assign}' for '{iface_friendly_name}'. Skipping static config.")
+                all_success = False
+                continue
+
+            self.router_logger.log_message(
+                f"[Router] 🛠️ Configuring '{iface_friendly_name}' → IP: {ip_to_assign}/{prefix_len}, "
+                f"Gateway: {gateway_to_assign or 'None'}, DNS: {dns_server_to_assign or 'None'}"
+            )
+
+            try:
+                # The core change is here: check if gateway_to_assign is not empty before attempting to add a route
+                ps_command = f"""
+                  $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
+                  if (-not $iface) {{
+                      Write-Output \"SKIP\"
+                      exit 0
+                  }}
+
+                  # Ensure DHCP is disabled before static configuration
+                  Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
+                  Start-Sleep -Milliseconds 500
+
+                  # --- FIX: Wait for DHCP state to be 'Disabled' ---
+                  $tries = 0
+                  do {{
+                      $state = (Get-NetIPInterface -InterfaceIndex $iface.IfIndex).Dhcp
+                      if ($state -eq "Enabled") {{
+                          # Optionally re-attempt disabling if it's still enabled
+                          Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
+                      }}
+                      Start-Sleep -Milliseconds 200
+                      $tries++
+                  }} while ($state -ne "Disabled" -and $tries -lt 10) # Max 10 tries = 2 seconds
+
+                  if ($state -ne "Disabled") {{
+                      Write-Error "Failed to disable DHCP on interface '{iface_friendly_name}' after multiple attempts. Current state: $state"
+                      exit 1 # Exit PowerShell script with error
+                  }}
+                  # --- END FIX ---
+
+                  # Remove all existing IPv4 addresses
+                  Get-NetIPAddress -InterfaceIndex $iface.IfIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                  Start-Sleep -Milliseconds 500
+
+                  # Assign static IP
+                  New-NetIPAddress -InterfaceIndex $iface.IfIndex -IPAddress \"{ip_to_assign}\" -PrefixLength {prefix_len} -ErrorAction Stop
+
+                  # Handle default gateway
+                  # --- FIX: New conditional block to handle cases where there is no gateway ---
+                  if (\"{gateway_to_assign}\") {{
+                      # Remove existing default route for this interface if it exists
+                      Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                      Start-Sleep -Milliseconds 500
+                      # Add the new default route
+                      New-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix 0.0.0.0/0 -NextHop \"{gateway_to_assign}\" -ErrorAction Stop
+                  }} else {{
+                      # Ensure no default route exists if none is specified
+                      Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                  }}
+                  # --- END FIX ---
+
+                  # Set DNS server
+                  if (\"{dns_server_to_assign}\") {{
+                      Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ServerAddresses \"{dns_server_to_assign}\" -ErrorAction Stop
+                  }} else {{
+                      # Clear DNS if no server is specified
+                      Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+                  }}
+                  """
+
+                result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+
+                if result.returncode == 0:
+                    self.router_logger.log_message(f"[Router] ✅ Successfully configured '{iface_friendly_name}'.")
+                else:
+                    self.router_logger.log_message(f"[Router] ❌ Failed to configure '{iface_friendly_name}'.")
+                    self.router_logger.log_message(
+                        f"[Router] PowerShell STDOUT: {result.stdout.strip()}")  # Log stdout too
+                    self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
+                    all_success = False
+
+            except Exception as e:
+                self.router_logger.log_message(f"[Router] ❌ Exception configuring '{iface_friendly_name}': {e}")
+                all_success = False
 
         return all_success
 
@@ -1653,7 +1779,7 @@ class PythonRouterManager:
             iface_friendly_name = self._get_real_adapter_name(partial_name) or partial_name
 
             # Skip the "Ethernet" interface as requested
-            if iface_friendly_name == "Ethernet" or iface_friendly_name == "Adapter for loopback traffic capture" or iface_friendly_name == "Local Area Connection* 12" or iface_friendly_name == "Local Area Connection* 1":
+            if iface_friendly_name == "Ethernet" or iface_friendly_name == "Adapter for loopback traffic capture" or iface_friendly_name == "Local Area Connection* 12" or iface_friendly_name == "Local Area Connection* 1"or iface_friendly_name == "Local Area Connection* 2":
                 self.router_logger.log_message(
                     f"[Router] ⏭️ Skipping deconfiguration for '{iface_friendly_name}' as requested.")
                 continue
@@ -1707,6 +1833,7 @@ class PythonRouterManager:
             if partial_name.lower().replace("*", "") in name.lower():
                 return name.strip()
         return None
+
     def _get_friendly_name_from_full(self, full_name: str) -> str:
 
         for iface in self._discovered_tshark_interfaces:
@@ -1771,7 +1898,7 @@ class PythonRouterManager:
 
         except subprocess.CalledProcessError as e:
             if "0x80041010" in e.stderr:
-                self._fallback_enable_ics()
+                return
             else:
                 self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
             self.router_logger.log_message(
@@ -1800,7 +1927,6 @@ class PythonRouterManager:
             ).strip()
             unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
             if edition_output in unsupported_skus:
-                self._fallback_disable_ics()
                 return
         except Exception as e:
             self.router_logger.log_message(
@@ -1818,95 +1944,86 @@ class PythonRouterManager:
         except Exception as e:
             self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
 
-    def _fallback_enable_ics(self, public_iface: str = "Wi-Fi", private_iface: str = "Ethernet"):
+    def _get_default_gateway_for_interface(self, iface_friendly_name: str) -> str | None:
         """
-        Enables Internet Connection Sharing (ICS) from public_iface to private_iface.
+        Parses 'ipconfig /all' to extract the last listed default gateway for a specific interface.
+        This includes inactive/DHCP/statically configured gateways.
 
         Args:
-            public_iface (str): Interface with internet access (e.g., "Wi-Fi").
-            private_iface (str): LAN interface to share connection with (e.g., "Ethernet").
-        """
-        self.router_logger.log_message(f"[ICS Fallback] 🔄 Attempting ICS: {public_iface} ➝ {private_iface}")
+            iface_friendly_name (str): Name of the adapter (e.g., "Wi-Fi", "Ethernet")
 
+        Returns:
+            str | None: The last configured default gateway IP for the given interface, or None if not found.
+        """
+        self.router_logger.log_message(f"[Router] Parsing ipconfig for default gateway of '{iface_friendly_name}'...")
         try:
-            # Enable the private interface
-            self._execute_netsh(["set", "interface", private_iface, "enable"])
+            result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, check=True)
+            output = result.stdout
 
+            current_adapter = None
+            adapter_block = []
+            found_gateway = None
 
-            # Run PowerShell ICS script using COM interface
-            ics_script = f"""
-            $netSharingManager = New-Object -ComObject HNetCfg.HNetShare
-            $connections = $netSharingManager.EnumEveryConnection()
-            foreach ($conn in $connections) {{
-                $props = $netSharingManager.NetConnectionProps($conn)
-                if ($props.Name -eq '{public_iface}') {{
-                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
-                    if (-not $config.SharingEnabled) {{
-                        $config.EnableSharing(0)  # Public (0)
-                    }}
-                }} elseif ($props.Name -eq '{private_iface}') {{
-                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
-                    if (-not $config.SharingEnabled) {{
-                        $config.EnableSharing(1)  # Private (1)
-                    }}
-                }}
-            }}
-            """
-            result = subprocess.run(
-                ["powershell.exe", "-Command", ics_script],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            lines = output.splitlines()
+            for line in lines:
+                line = line.rstrip()
 
-            if result.returncode == 0:
-                self.router_logger.log_message("[ICS Fallback] ✅ ICS enabled successfully.")
-                if result.stdout.strip():
-                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDOUT:\n{result.stdout.strip()}")
-            else:
-                self.router_logger.log_message("[ICS Fallback] ❌ PowerShell failed to enable ICS.")
-                if result.stderr.strip():
-                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDERR:\n{result.stderr.strip()}")
-        except Exception as e:
-            self.router_logger.log_message(f"[ICS Fallback] ❌ Exception during ICS enable: {e}")
+                if re.match(r"^[A-Z].*adapter .*:$", line):
+                    # If we're leaving the target adapter's section, process its block
+                    if current_adapter == iface_friendly_name and adapter_block:
+                        gateways = []
+                        capture = False
+                        for l in adapter_block:
+                            if 'Default Gateway' in l:
+                                parts = l.split(':', 1)
+                                if len(parts) > 1 and parts[1].strip():
+                                    gateways.append(parts[1].strip())
+                                capture = True
+                            elif capture:
+                                if l.strip() == '':
+                                    break
+                                elif re.match(r"^\s+\d+\.\d+\.\d+\.\d+", l):
+                                    gateways.append(l.strip())
+                                else:
+                                    break
+                        if gateways:
+                            found_gateway = gateways[-1]  # Use the last one found
+                            self.router_logger.log_message(
+                                f"[Router] Found default gateway for '{iface_friendly_name}': {found_gateway}")
+                            return found_gateway
+                    # Start a new block
+                    current_adapter = line.strip(':').split('adapter')[-1].strip()
+                    adapter_block = []
+                elif current_adapter:
+                    adapter_block.append(line)
+            if current_adapter == iface_friendly_name and adapter_block:
+                gateways = []
+                capture = False
+                for l in adapter_block:
+                    if 'Default Gateway' in l:
+                        parts = l.split(':', 1)
+                        if len(parts) > 1 and parts[1].strip():
+                            gateways.append(parts[1].strip())
+                        capture = True
+                    elif capture:
+                        if l.strip() == '':
+                            break
+                        elif re.match(r"^\s+\d+\.\d+\.\d+\.\d+", l):
+                            gateways.append(l.strip())
+                        else:
+                            break
+                if gateways:
+                    found_gateway = gateways[-1]
+                    self.router_logger.log_message(
+                        f"[Router] Found default gateway for '{iface_friendly_name}': {found_gateway}")
+                    return found_gateway
+            self.router_logger.log_message(
+                f"[Router] No gateway found for '{iface_friendly_name}' in ipconfig output.")
+            return None
+        except subprocess.CalledProcessError as e:
+            self.router_logger.log_message(f"[Router] ❌ Failed to run ipconfig: {e}")
+            return None
 
-    def _fallback_disable_ics(self, public_iface: str = "Wi-Fi", private_iface: str = "Ethernet"):
-        """
-        Disables Internet Connection Sharing (ICS) from both public and private interfaces.
-        """
-        self.router_logger.log_message(f"[ICS Fallback] 🧹 Disabling ICS on: {public_iface}, {private_iface}")
-
-        try:
-            ics_script = f"""
-            $netSharingManager = New-Object -ComObject HNetCfg.HNetShare
-            $connections = $netSharingManager.EnumEveryConnection()
-            foreach ($conn in $connections) {{
-                $props = $netSharingManager.NetConnectionProps($conn)
-                if ($props.Name -eq '{public_iface}' -or $props.Name -eq '{private_iface}') {{
-                    $config = $netSharingManager.INetSharingConfigurationForINetConnection($conn)
-                    if ($config.SharingEnabled) {{
-                        $config.DisableSharing()
-                    }}
-                }}
-            }}
-            """
-            result = subprocess.run(
-                ["powershell.exe", "-Command", ics_script],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-
-            if result.returncode == 0:
-                self.router_logger.log_message("[ICS Fallback] ✅ ICS disabled successfully.")
-                if result.stdout.strip():
-                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDOUT:\n{result.stdout.strip()}")
-            else:
-                self.router_logger.log_message("[ICS Fallback] ❌ PowerShell failed to disable ICS.")
-                if result.stderr.strip():
-                    self.router_logger.log_message(f"[ICS Fallback] PowerShell STDERR:\n{result.stderr.strip()}")
-        except Exception as e:
-            self.router_logger.log_message(f"[ICS Fallback] ❌ Exception during ICS disable: {e}")
 
     def _setup_dynamic_firewall_manager_rules(self):
         """
