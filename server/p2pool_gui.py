@@ -382,13 +382,13 @@ class P2PoolGUI(QMainWindow):
             use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
             use_static = self.router_tab.use_static_checkbox.isChecked()
-            lan_ip = self.router_tab.router_ip_in_input.text().strip()
-            netmask_in = self.router_tab.router_netmask_in_input.text().strip()
+            lan_ip = self.router_tab.router_ip_out_input.text().strip()
+            netmask_out = self.router_tab.router_netmask_out_input.text().strip()
             try:
                 if lan_ip:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_in, use_static)
+                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static)
                 else:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, None, netmask_in, use_static)
+                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, None, netmask_out, use_static)
             except Exception as e:
                 self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
             self.router_tab.start_router_button.setEnabled(False)

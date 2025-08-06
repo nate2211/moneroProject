@@ -56,7 +56,7 @@ class ParallelPythonTool:
         'string': 4,
     }
 
-    def __init__(self, logger, dll_relative_path: str = 'tools/ParallelPython.dll'):
+    def __init__(self, logger, dll_relative_path: str = 'tools\\ParallelPython.dll'):
         self.logger = logger
         self._dll_path = self._resolve_dll_path(dll_relative_path)
         self._dll = None
@@ -99,16 +99,27 @@ class ParallelPythonTool:
             return True
         return False
 
-    def _resolve_dll_path(self, relative_path: str) -> Path | None:
-        if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
-            base_path = Path(sys._MEIPASS)
+    def _resolve_dll_path(self, relative_path: str) -> str:
+        """
+        Resolves the correct absolute path to the DLL file.
+        Handles PyInstaller (_MEIPASS) and development environments.
+        """
+
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # If running in a PyInstaller bundle
+            base_path = sys._MEIPASS
         else:
-            base_path = Path(__file__).resolve().parent
-        dll_path = base_path / relative_path
-        if dll_path.exists():
-            return dll_path
-        self.logger.log_message(f"[C#] [Python] Error: DLL not found at: {dll_path}")
-        return None
+            # Dev mode: base path is the script's directory, not current working dir
+            base_path = os.path.dirname(os.path.abspath(__file__))
+
+        resolved_path = os.path.abspath(os.path.join(base_path, relative_path))
+
+        if not os.path.exists(resolved_path):
+            self.logger.log_message(f"[DLL Loader] ❌ DLL not found at: {resolved_path}")
+        else:
+            self.logger.log_message(f"[DLL Loader] ✅ DLL found at: {resolved_path}")
+
+        return resolved_path
 
     def _load_dll(self) -> bool:
         if self._dll:

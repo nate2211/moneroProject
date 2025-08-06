@@ -213,15 +213,21 @@ class ISAKMPManager:
         Checks for signs of malformed ISAKMP packets and sends a notification.
         This includes checking for unexpected bytes after dissection.
         """
-        # Ensure we have the necessary layers to proceed
         if not packet.haslayer(IP) or not packet.haslayer(UDP):
             return
 
         ip_layer = packet.getlayer(IP)
 
         if packet.haslayer(IKEv2):
-            # Check for "extra bytes after dissection"
-            if packet.haslayer(Raw, after=IKEv2):
+            has_raw_after_ikev2 = False
+            p = packet.getlayer(IKEv2)
+            while p and p.name != 'Raw' and hasattr(p, 'payload'):
+                p = p.payload
+            if p and p.name == 'Raw':
+                has_raw_after_ikev2 = True
+
+            if has_raw_after_ikev2:
+                # --- END MODIFIED CODE BLOCK ---
                 event_data = {
                     "event": "Malformed ISAKMP Packet Detected",
                     "message": f"Malformed ISAKMP packet from {ip_layer.src} to {ip_layer.dst}. Extra unparsed bytes found after dissection. This could be a scan or exploit attempt.",
@@ -229,7 +235,8 @@ class ISAKMPManager:
                     "timestamp": time.time(),
                     "emojis": ["🚨", "🗃️", "💥"]
                 }
-                self.notification_manager.send_notification(event_data, cooldown_seconds=10, cooldown_key="isakmpmalformed")
+                self.notification_manager.send_notification(event_data, cooldown_seconds=10,
+                                                            cooldown_key="isakmpmalformed")
 
             # Iterate through payloads to check for malformed parts
             p = packet.getlayer(IKEv2)
@@ -242,8 +249,10 @@ class ISAKMPManager:
                         "timestamp": time.time(),
                         "emojis": ["⚠️", "🕵️", "❌"]
                     }
-                    self.notification_manager.send_notification(event_data, cooldown_seconds=10, cooldown_key="isakmppayload")
+                    self.notification_manager.send_notification(event_data, cooldown_seconds=10,
+                                                                cooldown_key="isakmppayload")
                     break
+                p = p.payload
                 p = p.payload
 
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
