@@ -152,6 +152,13 @@ class SnifferSoftware:
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
 
+    def is_interface_connected(self, iface: str) -> bool:
+        for nic, addrs in psutil.net_if_addrs().items():
+            if iface in nic:
+                stats = psutil.net_if_stats().get(nic)
+                if stats and stats.isup:
+                    return True
+        return False
     def _default_logger(self):
         """Provides a basic logger if none is provided."""
 
@@ -281,8 +288,6 @@ class SnifferSoftware:
         if stop_filter and not callable(stop_filter):
             sys.stderr.write(f"[Sniffer] Error: `stop_filter` must be callable. Got type {type(stop_filter)}.\n")
             return
-
-
 
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode('utf-8'), 65535, 1 if promisc else 0, timeout, errbuf)

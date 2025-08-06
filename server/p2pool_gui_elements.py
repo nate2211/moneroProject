@@ -1601,8 +1601,8 @@ class RouterTab(QWidget):
         self._console_panes = {}  # name → QPlainTextEdit
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/TLS/HTTPS/DNS/mDNS",
-                     "Handshake/SSL", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
+            "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/HTTPS/DNS/mDNS",
+                     "Handshake/SSL/TLS", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
 
@@ -1621,11 +1621,14 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
         self.dhcp_in_checkbox.setChecked(True)
 
+        self.use_static_checkbox = QCheckBox("Use Static for all interfaces")
+        self.use_static_checkbox.setChecked(False)
+
         self.router_ip_in_input = QLineEdit()
         self.router_ip_in_input.setPlaceholderText("(optional)")
 
         self.router_netmask_in_input = QLineEdit()
-        self.router_netmask_in_input.setText("255.255.255.0")  # Default netmask
+        self.router_netmask_in_input.setText("255.255.255.0")
 
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
@@ -1643,45 +1646,42 @@ class RouterTab(QWidget):
     def _configure_layout(self):
         layout = QVBoxLayout(self)
 
-        # --- Top Control Row ---
-        control_layout = QHBoxLayout()
-        control_layout.addWidget(self.start_router_button)
-        control_layout.addWidget(self.stop_router_button)
-        control_layout.addWidget(QLabel("Manual LAN IP:"))
-        control_layout.addWidget(self.router_ip_in_input)
-        control_layout.addWidget(QLabel("Netmask:"))
-        control_layout.addWidget(self.router_netmask_in_input)
-        control_layout.addWidget(self.dhcp_out_checkbox)
-        control_layout.addWidget(self.dhcp_in_checkbox)
-        control_layout.addStretch(1)
+        # --- Top Row (Buttons, IP, Netmask, Checkboxes) ---
+        top_row_layout = QHBoxLayout()
+        top_row_layout.addWidget(self.start_router_button)
+        top_row_layout.addWidget(self.stop_router_button)
+        top_row_layout.addWidget(QLabel("Manual LAN IP:"))
+        top_row_layout.addWidget(self.router_ip_in_input)
+        top_row_layout.addWidget(QLabel("Netmask:"))
+        top_row_layout.addWidget(self.router_netmask_in_input)
+        top_row_layout.addWidget(self.dhcp_out_checkbox)
+        top_row_layout.addWidget(self.dhcp_in_checkbox)
+        top_row_layout.addWidget(self.use_static_checkbox)
+        top_row_layout.addStretch(1)
 
+        # --- Combined Pane Add/Remove + Preset Dropdown Row ---
+        pane_and_preset_layout = QHBoxLayout()
+        pane_and_preset_layout.addWidget(QLabel("Pane:"))
+        pane_and_preset_layout.addWidget(self.add_pane_input)
+        pane_and_preset_layout.addWidget(self.add_pane_button)
+        pane_and_preset_layout.addWidget(self.remove_pane_button)
+        pane_and_preset_layout.addStretch(1)
+        pane_and_preset_layout.addWidget(QLabel("Presets:"))
+        pane_and_preset_layout.addWidget(self.preset_dropdown)
 
-
-        # --- Pane Add/Remove Row ---
-        pane_layout = QHBoxLayout()
-        pane_layout.addWidget(QLabel("Pane:"))
-        pane_layout.addWidget(self.add_pane_input)
-        pane_layout.addWidget(self.add_pane_button)
-        pane_layout.addWidget(self.remove_pane_button)
-        pane_layout.addStretch(1)
-
-        # --- Preset Dropdown Row ---
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(QLabel("Presets:"))
-        preset_layout.addWidget(self.preset_dropdown)
-        preset_layout.addStretch(1)
-
-        # --- Final Layout ---
-        layout.addLayout(control_layout)
-        layout.addLayout(pane_layout)
-        layout.addLayout(preset_layout)
+        # --- Final Assembly ---
+        layout.addLayout(top_row_layout)
+        layout.addLayout(pane_and_preset_layout)
         layout.addWidget(self.console_tabs)
-
     def _connect_signals(self):
         self.start_router_button.clicked.connect(self._on_start_router)
         self.add_pane_button.clicked.connect(self._on_add_pane)
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
+        self.use_static_checkbox.stateChanged.connect(self._on_use_static_changed)
+
+    def _on_use_static_changed(self, state):
+        self.use_static = bool(state)
 
     def _load_presets(self, preset_name: str):
         panes_to_add = self.presets.get(preset_name, [])
