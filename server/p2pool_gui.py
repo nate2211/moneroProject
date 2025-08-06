@@ -381,13 +381,14 @@ class P2PoolGUI(QMainWindow):
         if self.helper.router_manager:
             use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
+            use_static = self.router_tab.use_static_checkbox.isChecked()
             lan_ip = self.router_tab.router_ip_in_input.text().strip()
             netmask_in = self.router_tab.router_netmask_in_input.text().strip()
             try:
                 if lan_ip:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_in)
+                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_in, use_static)
                 else:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, None, netmask_in)
+                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, None, netmask_in, use_static)
             except Exception as e:
                 self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
             self.router_tab.start_router_button.setEnabled(False)
@@ -398,7 +399,10 @@ class P2PoolGUI(QMainWindow):
     def stop_router(self):
         self.router_logger.log_message("[GUI] Requesting to stop Router...")
         if self.helper.router_manager:
-            self.helper.router_manager.stop_routing()
+            use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
+            use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
+            use_static = self.router_tab.use_static_checkbox.isChecked()
+            self.helper.router_manager.stop_routing(use_dhcp_out, use_dhcp_in, use_static)
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
         else:

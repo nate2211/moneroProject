@@ -2430,7 +2430,7 @@ class PacketWriter:
         self.packet_queue.put(None)  # Sentinel to unblock queue
         self.worker_thread.join(timeout=2)
 
-    def queue_packet(self, packet, interface: str):
+    def queue_packet(self, packet, interface: str = None):
         """
         Adds a packet to the queue for asynchronous sending.
         Args:
@@ -2440,7 +2440,11 @@ class PacketWriter:
         if self._stop_event.is_set():
             self.logger.log_message("[PacketWriter] ⚠️ Warning: Cannot queue packet — writer is stopping.")
             return
-        outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
+        outbound_interface = None
+        if not interface:
+            outbound_interface = self.outbound_load_balancer.get_next_interface(packet)
+        else:
+            outbound_interface = interface
         self.packet_queue.put((packet, outbound_interface))
 
 class ForwardingManager:
