@@ -1023,8 +1023,9 @@ class PythonRouterManager:
                     return
 
             if packet.haslayer(TLS):
-                    self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface,
-                                                      return_type="void", queue_name="https")
+                    if self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface,
+                                                      return_type="bool", queue_name="https"):
+                        return
 
 
             if packet.haslayer(UDP) and packet[UDP].dport == 5353:
