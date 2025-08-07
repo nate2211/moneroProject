@@ -39,9 +39,6 @@ from scapy.layers.kerberos import (
     EncryptedData, PADATA
 )
 
-
-
-
 class FunctionCallTracker:
     """
     A class that tracks the invocation count for multiple functions or events.

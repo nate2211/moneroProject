@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import json
+import os
 import socket
 import struct
 import subprocess
@@ -10,6 +13,9 @@ import threading
 import time
 
 import psutil
+from Crypto.Cipher import AES
+from passlib.handlers.windows import nthash
+from pyDes import des, ECB
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
@@ -22,10 +28,19 @@ from scapy.layers.rip import RIPEntry, RIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet, Raw
-from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, IP6Field
+from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, IP6Field, BitField, LongField, \
+    StrFixedLenField, StrLenField, ByteEnumField, FieldLenField
 from scapy.layers.inet import IP, UDP
+from enum import Enum, auto
+from scapy.layers.l2 import Ether
+from scapy.layers.eap import EAPOL, EAP, EAP_PEAP
+from OpenSSL import SSL
+import ssl, socket
+from io import BytesIO
 from typing import Tuple, Dict, Literal
-
+from hmac import new as hmac_new
+from hashlib import sha1
+import struct
 
 
 class MLDQuery(Packet):
@@ -73,7 +88,6 @@ class ICMPv6(Packet):
             cksum = in4_chksum(psd_hdr + p + pay)
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
-
 
 class StratumManager:
     """
