@@ -116,8 +116,7 @@ class ParallelPythonTool:
 
         if not os.path.exists(resolved_path):
             self.logger.log_message(f"[DLL Loader] ❌ DLL not found at: {resolved_path}")
-        else:
-            self.logger.log_message(f"[DLL Loader] ✅ DLL found at: {resolved_path}")
+
 
         return resolved_path
 

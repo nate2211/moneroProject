@@ -7,6 +7,7 @@ import random
 import socket
 import string
 import struct
+import subprocess
 import traceback
 from collections import defaultdict, deque
 from collections.abc import Set
@@ -183,7 +184,6 @@ class FunctionCallTracker:
 def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
     emoji = random.choice(emoticons) if emoticons else ''
     return f"[{name}] {emoji} {message}"
-
 
 class ISAKMPManager:
     """
