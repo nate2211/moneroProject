@@ -1533,7 +1533,6 @@ class PythonRouterManager:
                 self.dhcp_server_in.stop()
             if self.dhcp_server_out:
                 self.dhcp_server_out.stop()
-
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()

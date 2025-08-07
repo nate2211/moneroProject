@@ -80101,3 +80101,145 @@ NOTICE  2025-07-29 02:27:31.9799 SideChain PPLNS window  = 2160 blocks
 NOTICE  2025-07-29 02:27:31.9799 SideChain uncle penalty = 20%
 NOTICE  2025-07-29 02:27:31.9799 SideChain generating consensus ID
 NOTICE  2025-07-29 02:27:31.9799 SideChain consensus ID = 3982c91a************************************************35187ec4
+NOTICE  2025-08-06 00:13:13.0150 Log started
+NOTICE  2025-08-06 00:13:13.0156 P2Pool v4.9 (built with clang/20.1.8_p2pool (https://github.com/llvm/llvm-project.git 87f0227cb60147a26a1eeb4fb06e3b505e9c7261) on 2025-07-20)
+NOTICE  2025-08-06 00:13:13.0158 SideChain network type  = mainnet
+NOTICE  2025-08-06 00:13:13.0159 SideChain using default config
+NOTICE  2025-08-06 00:13:13.0159 SideChain pool name     = mini
+NOTICE  2025-08-06 00:13:13.0159 SideChain block time    = 10 seconds
+NOTICE  2025-08-06 00:13:13.0159 SideChain min diff      = 100000
+NOTICE  2025-08-06 00:13:13.0159 SideChain PPLNS window  = 2160 blocks
+NOTICE  2025-08-06 00:13:13.0159 SideChain uncle penalty = 20%
+NOTICE  2025-08-06 00:13:13.0159 SideChain generating consensus ID
+NOTICE  2025-08-06 00:13:13.0159 SideChain consensus ID = 3982c91a************************************************35187ec4
+NOTICE  2025-08-06 00:13:13.0172 RandomX_Hasher allocated 2592 MiB
+NOTICE  2025-08-06 00:13:13.0178 ConsoleCommands uv_guess_handle returned 7
+NOTICE  2025-08-06 00:13:13.0179 ConsoleCommands processing stdin as UV_NAMED_PIPE
+NOTICE  2025-08-06 00:13:13.0188 ConsoleCommands event loop started
+WARNING 2025-08-06 00:13:14.0289 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:16.0530 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:18.0807 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:20.1065 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:22.1267 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:24.1532 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:26.1776 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:28.2020 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:30.2286 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:32.2507 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:34.2748 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:36.3003 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:38.3280 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:40.3543 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:42.3763 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:44.4001 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:46.4291 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:48.4529 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:50.4776 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:52.5052 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:54.5324 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:56.5607 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:13:58.5866 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:00.5983 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:02.6256 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:04.6520 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:06.6730 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:08.6918 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:10.7160 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:12.7312 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:14.7580 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:16.7720 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:18.8004 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:20.8261 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:22.8506 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:24.8733 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:26.9003 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:28.9233 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:30.9533 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:32.9738 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:34.9957 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:37.0204 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:39.0433 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:41.0731 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:43.0974 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:45.1228 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:47.1507 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:49.1732 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:51.2018 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:53.2218 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:55.2345 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:57.2615 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:14:59.2896 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:15:01.3154 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:15:03.3407 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 00:15:05.3676 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+NOTICE  2025-08-06 01:42:05.1748 Log started
+NOTICE  2025-08-06 01:42:05.1754 P2Pool v4.9 (built with clang/20.1.8_p2pool (https://github.com/llvm/llvm-project.git 87f0227cb60147a26a1eeb4fb06e3b505e9c7261) on 2025-07-20)
+NOTICE  2025-08-06 01:42:05.1756 SideChain network type  = mainnet
+NOTICE  2025-08-06 01:42:05.1757 SideChain using default config
+NOTICE  2025-08-06 01:42:05.1757 SideChain pool name     = mini
+NOTICE  2025-08-06 01:42:05.1757 SideChain block time    = 10 seconds
+NOTICE  2025-08-06 01:42:05.1757 SideChain min diff      = 100000
+NOTICE  2025-08-06 01:42:05.1757 SideChain PPLNS window  = 2160 blocks
+NOTICE  2025-08-06 01:42:05.1757 SideChain uncle penalty = 20%
+NOTICE  2025-08-06 01:42:05.1757 SideChain generating consensus ID
+NOTICE  2025-08-06 01:42:05.1757 SideChain consensus ID = 3982c91a************************************************35187ec4
+NOTICE  2025-08-06 01:42:05.1766 RandomX_Hasher allocated 2592 MiB
+NOTICE  2025-08-06 01:42:05.1767 ConsoleCommands uv_guess_handle returned 7
+NOTICE  2025-08-06 01:42:05.1767 ConsoleCommands processing stdin as UV_NAMED_PIPE
+NOTICE  2025-08-06 01:42:05.1768 ConsoleCommands event loop started
+WARNING 2025-08-06 01:42:06.1806 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:08.2037 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:10.2270 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:12.2483 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:14.2695 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:16.2933 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:18.3210 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:20.3429 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:22.3601 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:24.3869 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:26.3961 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:28.4146 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:30.4372 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:32.4616 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:34.4847 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:36.5097 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:38.5357 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:40.5602 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:42.5827 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:44.6007 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:46.6257 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:48.6498 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:50.6708 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:52.6942 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:54.7193 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:56.7453 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:42:58.7688 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:00.7883 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:02.8118 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:04.8278 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:06.8529 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:08.8759 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:10.8965 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:12.9230 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:14.9470 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:16.9726 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:18.9926 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:21.0171 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:23.0428 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:25.0634 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:27.0850 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:29.1086 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:31.1361 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:33.1597 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:35.1836 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:37.2094 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:39.2353 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:41.2589 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:43.2850 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:45.3101 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:47.3316 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:49.3591 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:51.3837 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:53.4117 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:55.4392 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
+WARNING 2025-08-06 01:43:57.4654 P2Pool get_info RPC request to host 127.0.0.1:RPC 18081:ZMQ 18083 failed: Error (empty response), trying again in 1 second
