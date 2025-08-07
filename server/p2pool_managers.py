@@ -141,6 +141,7 @@ class PythonRouterManager:
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.isakmp_manager = None
         self.stratum_manager = StratumManager(router_logger)
+
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
         self.parallel_python.inject_into(self.packet_catcher)
@@ -437,8 +438,7 @@ class PythonRouterManager:
         ethernet_2_info = None
         lac_2_info = None
         lac_2_info_2 = None
-        self.router_logger.log_message(
-            "[Router] Attempting to auto-configure IN, OUT, and Loopback interfaces...")
+        self.router_logger.log_message("[Router] Attempting to auto-configure IN, OUT, and Loopback interfaces...")
 
         for iface in self._discovered_tshark_interfaces:
             name = iface['friendly_name'].lower()
@@ -1447,7 +1447,6 @@ class PythonRouterManager:
                     self.router_logger.log_message("[Router] ❌ Failed to auto-configure interfaces.")
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
-
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
 
