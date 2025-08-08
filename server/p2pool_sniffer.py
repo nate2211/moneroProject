@@ -11,6 +11,8 @@ import psutil
 from scapy.arch import get_if_hwaddr
 from scapy.fields import IntField
 from scapy.layers.dns import DNS
+from scapy.layers.eap import EAPOL, EAP
+from scapy.layers.ipsec import ESP
 from scapy.layers.rip import RIP
 
 # Import all functionalities from the Scapy library to parse packets.
@@ -203,6 +205,7 @@ class SnifferSoftware:
         bind_layers(UDP, ISKEMP, sport=9999)
         bind_layers(UDP, DNS, dport=53)
         bind_layers(UDP, DNS, sport=53)
+        bind_layers(IP, ESP, proto=50)
         load_layer("tls")
         load_layer("kerberos")
         load_layer("rip")

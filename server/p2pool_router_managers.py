@@ -2337,8 +2337,18 @@ class PacketWriter:
         elif IPv6 in packet:
             dst_ip = packet[IPv6].dst
 
+
         # [FIXED] If destination is one of our own IPs, do not attempt to send it out.
-        if dst_ip in router_ips:
+        allow_local_dest = bool(getattr(packet, "_pw_allow_local_dest", False))
+
+        router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
+        dst_ip = None
+        if IP in packet:
+            dst_ip = packet[IP].dst
+        elif IPv6 in packet:
+            dst_ip = packet[IPv6].dst
+
+        if dst_ip in router_ips and not allow_local_dest:
             self.logger.log_message(
                 f"[PacketWriter] 🚫 Dropped packet: Destination IP ({dst_ip}) is one of our own. Summary: {packet.summary()}")
             return
@@ -2386,10 +2396,15 @@ class PacketWriter:
                         f"[PacketWriter] 🚫 Dropped invalid destination {dst_ip_obj}. Summary: {packet.summary()}"
                     )
                     return
-                if not hasattr(packet[Ether], "dst") or not packet[Ether].dst or packet[
-                    Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+                allow_broadcast = bool(getattr(packet, "_pw_allow_broadcast", False))
+
+                if not hasattr(packet[Ether], "dst") or not packet[Ether].dst:
                     self.logger.log_message(
-                        f"[PacketWriter] ☔ Dropped packet: Ethernet layer has an invalid destination MAC address or it's a broadcast address. Summary: {packet.summary()}")
+                        f"[PacketWriter] ☔ Dropped: missing destination MAC. Summary: {packet.summary()}")
+                    return
+                if packet[Ether].dst.lower() == "ff:ff:ff:ff:ff:ff" and not allow_broadcast:
+                    self.logger.log_message(
+                        f"[PacketWriter] ☔ Dropped broadcast (no override). Summary: {packet.summary()}")
                     return
                 self.packet_signer.sign_packet(packet)
                 self.sniffer.sendp(packet, iface=interface, verbose=0)
@@ -2416,6 +2431,80 @@ class PacketWriter:
         except Exception as e:
             self.logger.log_message(f"[PacketWriter] ❌ Failed to send packet on '{interface}': {e}")
 
+    def forward_l2(self,pkt,*,inbound_iface: str = None,egress_iface: str = None,next_hop_ip: str = None,preserve_vlan: bool = True,allow_local_dest: bool = False,allow_broadcast: bool = False):
+        """
+        Rebuilds the Ethernet header and forwards the packet out a specific interface.
+
+        - Re-writes L2 (src=egress NIC MAC, dst=next-hop MAC via ARP)
+        - Preserves Dot1Q tag if present (optional)
+        - Allows sending to our own IPs (for VPN client/host cases) when allow_local_dest=True
+        - Allows broadcast MAC (for EAPOL, DHCP, etc.) when allow_broadcast=True
+        """
+
+        # 0) Decide egress
+        if not egress_iface:
+            egress_iface = self.outbound_load_balancer.get_next_interface(pkt)
+        if not egress_iface:
+            self.logger.log_message("[PacketWriter] forward_l2: No egress iface")
+            return
+
+        if inbound_iface and egress_iface == inbound_iface:
+            # avoid hairpinning unless that’s desired
+            self.logger.log_message(f"[PacketWriter] forward_l2: Skip hairpin on {egress_iface}")
+            return
+
+        # 1) Figure L3 destination + next hop
+        dst_ip = None
+        if IP in pkt:
+            dst_ip = pkt[IP].dst
+        elif IPv6 in pkt:
+            dst_ip = pkt[IPv6].dst
+
+        # Fall back: if no next_hop provided, use L3 dst if present
+        nh_ip = next_hop_ip or dst_ip
+
+        # 2) Resolve egress MACs
+        try:
+            src_mac = get_if_hwaddr(egress_iface)
+        except Exception as e:
+            self.logger.log_message(f"[PacketWriter] forward_l2: get_if_hwaddr({egress_iface}) failed: {e}")
+            return
+
+        # Decide destination MAC:
+        # - If broadcast is allowed, keep broadcast as-is
+        # - Else resolve via ARP if we have an IP next hop
+        # - Else fall back to original Ethernet dst (best effort for non-IP)
+        if allow_broadcast and pkt.haslayer(Ether) and pkt[Ether].dst and pkt[Ether].dst.lower() == "ff:ff:ff:ff:ff:ff":
+            dst_mac = "ff:ff:ff:ff:ff:ff"
+        elif nh_ip:
+            dst_mac = getmacbyip(nh_ip)
+            if not dst_mac:
+                self.logger.log_message(f"[PacketWriter] forward_l2: ARP failed for next-hop {nh_ip} on {egress_iface}")
+                return
+        else:
+            if pkt.haslayer(Ether) and pkt[Ether].dst:
+                dst_mac = pkt[Ether].dst
+            else:
+                self.logger.log_message("[PacketWriter] forward_l2: No next-hop and no Ether dst to use")
+                return
+
+        # 3) Build new L2 frame (strip any existing Ether from payload)
+        payload = pkt.payload if pkt.haslayer(Ether) else pkt
+        if preserve_vlan and pkt.haslayer(Dot1Q):
+            vlan = pkt[Dot1Q].vlan
+            out_frame = Ether(src=src_mac, dst=dst_mac) / Dot1Q(vlan=vlan) / payload
+        else:
+            out_frame = Ether(src=src_mac, dst=dst_mac) / payload
+
+        # 4) Mark forwarding metadata so _send_raw_packet can bypass “own-IP”/broadcast drops & RX loop
+        setattr(out_frame, "_pw_tx", True)
+        if allow_local_dest:
+            setattr(out_frame, "_pw_allow_local_dest", True)
+        if allow_broadcast:
+            setattr(out_frame, "_pw_allow_broadcast", True)
+
+        # 5) Queue it to the egress NIC
+        self.queue_packet(out_frame, interface=egress_iface)
     def start(self):
         """Starts the packet-sending worker thread."""
         if self.worker_thread and self.worker_thread.is_alive():
