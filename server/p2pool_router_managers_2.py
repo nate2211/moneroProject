@@ -3653,7 +3653,7 @@ class FirewallManager:
         if rule['action'] not in ['permit', 'deny']:
             self.logger.log_message(f"[Firewall] 🔥 Invalid action '{action}'. Must be 'permit' or 'deny'.")
             return False
-        if rule['protocol'] not in ['tcp', 'udp', 'icmp', 'igmp', 'any']:
+        if rule['protocol'] not in ['tcp', 'udp', 'icmp', 'igmp', 'eap', 'any']:
             self.logger.log_message(
                 f"[Firewall] 🔥 Invalid protocol '{protocol}'. Must be 'tcp', 'udp', 'icmp', or 'any'.")
             return False

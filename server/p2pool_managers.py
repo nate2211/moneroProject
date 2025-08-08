@@ -31,8 +31,10 @@ from scapy.arch import get_if_hwaddr
 from scapy.layers.dhcp import DHCP
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNSQR, DNS
+from scapy.layers.eap import EAPOL, EAP
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
+from scapy.layers.ipsec import ESP
 from scapy.layers.l2 import Ether, ARP
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet
@@ -1069,7 +1071,19 @@ class PythonRouterManager:
             if not ip_layer:
                 return
 
+            if IP in packet:
+                if packet.haslayer(ESP):
+                    self.router_logger.log_message(f"[ESP] Forwarding ESP packet from {packet[IP].src} to {packet[IP].dst}")
+                    self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
+                                                  egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
+                    return True
+                if UDP in packet and (packet[UDP].sport == 4500 or packet[UDP].dport == 4500):
+                    self.router_logger.log_message(f"[VPN] 🔄 Handling NAT-T (UDP 4500) from {packet[IP].src}")
+                    self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
+                                                  egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
+                    return
             if self.isakmp_manager.handle_packet(packet, inbound_iface):
+                self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface, egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
                 return
 
             is_for_router = dst_ip in self._get_all_local_ips()
@@ -2103,6 +2117,35 @@ class PythonRouterManager:
             action='permit', protocol='igmp', src_ip='any', dst_ip='any',
             src_port='any', dst_port='any'  # Ports are 'any' as IGMP doesn't use them
         )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port='any', dst_port=500
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port=500
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port='any', dst_port=4500
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port=4500
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='esp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port='any', dst_port='any'
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='esp', src_ip=lan_network_cidr, dst_ip='any',
+            src_port='any', dst_port='any'
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip=lan_network_cidr,
+            src_port='any', dst_port=4500
+        )
+
     def set_default_gateway(self, gateway_ip: str, outbound_iface_name: str) -> bool:
         """
         Sets the default gateway IP and the interface through which to reach it.
