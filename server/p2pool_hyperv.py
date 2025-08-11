@@ -47,7 +47,7 @@ class HyperVManager:
 
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
-        self._torn_down = False
+
 
         atexit.register(self.teardown)
 
@@ -131,9 +131,7 @@ class HyperVManager:
             pass
 
     def teardown(self) -> None:
-        if self._torn_down:
-            return
-        self._torn_down = True
+
 
         proc = self._proc
         if not proc:

@@ -1,3 +1,5 @@
+# giltools/__init__.py
+
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import importlib, sys, types
@@ -22,6 +24,10 @@ try:
             NotImplementedError("wait_handle_no_gil is only available on Windows.")
         ),
     )
+    unhinge_process = _ext.unhinge_process
+    start_cpu_boost = _ext.start_cpu_boost
+    stop_cpu_boost = _ext.stop_cpu_boost
+    is_cpu_boost_running = _ext.is_cpu_boost_running
 
     # make attribute access/dir delegate to the extension for better UX/autocomplete
     def __getattr__(name: str):
@@ -47,12 +53,12 @@ except Exception as e:
     yield_no_gil = _missing        # type: ignore[assignment]
     burn_no_gil = _missing         # type: ignore[assignment]
     wait_handle_no_gil = _missing  # type: ignore[assignment]
+    unhinge_process = _missing     # type: ignore[assignment]
+    start_cpu_boost = _missing     # type: ignore[assignment]
+    stop_cpu_boost = _missing      # type: ignore[assignment]
+    is_cpu_boost_running = _missing # type: ignore[assignment]
 
-# typing hints for linters/IDEs
-if TYPE_CHECKING:
-    from .giltools import yield_no_gil, burn_no_gil, wait_handle_no_gil  # noqa: F401
-    giltools: types.ModuleType
-    gilltools: types.ModuleType
+
 
 __all__ = [
     "giltools",
@@ -60,4 +66,8 @@ __all__ = [
     "yield_no_gil",
     "burn_no_gil",
     "wait_handle_no_gil",
+    "unhinge_process",
+    "start_cpu_boost",
+    "stop_cpu_boost",
+    "is_cpu_boost_running",
 ]
