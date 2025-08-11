@@ -51,8 +51,8 @@ from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackM
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
 from p2pool_tools import ParallelPythonTool
-
-
+from p2pool_hyperv import HyperVManager
+from tools import giltools
 
 class PythonRouterManager:
 
@@ -83,6 +83,7 @@ class PythonRouterManager:
         "Ethernet 2": [],
     }
     def __init__(self, router_logger):
+
 
 
 
@@ -143,7 +144,7 @@ class PythonRouterManager:
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.isakmp_manager = None
         self.stratum_manager = StratumManager(router_logger)
-
+        self.hyperv_manager = HyperVManager(self.router_logger)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
         self.parallel_python.inject_into(self.packet_catcher)
@@ -1452,7 +1453,7 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -1526,17 +1527,22 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_in, self.mac_in, self.interface_in_full_name)
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
-            sniffer_tasks = []
-
+            if use_hyperv:
+                self.hyperv_manager.start()
+            sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
-                sniffer_tasks.append((self._start_single_sniffer, (iface_name,)))
+                sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
-            self.parallel_python.run_all_parallel(sniffer_tasks, return_type="void")
+            self.parallel_python.run_all_parallel(sniffing_tasks,return_type="void")
+            giltools.start_cpu_boost(threads=32, target_util=.60, cores=list(range(8)), pin_per_thread=True)
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static):
+
+
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv):
         """Stops all manager threads and cleans up network interfaces."""
         try:
+            giltools.stop_cpu_boost()
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
             if use_static:
                 self._deconfigure_interface_settings()
@@ -1558,15 +1564,10 @@ class PythonRouterManager:
             # 5. Join sniffer threads (these should have died or be dying from _stop_sniffing_event)
             self.router_logger.log_message("[Router] Waiting for sniffer threads to finish...")
             # Access _sniff_threads with lock, as monitor might be trying to remove/add.
-            with self._sniff_threads_lock:
-                # Take a snapshot of current threads to avoid RuntimeError from dict changes during iteration
-                # while a thread is joining.
-                active_sniffers_snapshot = list(self._sniff_threads.values())
-                for thread in active_sniffers_snapshot:
-                    if thread.is_alive():
-                        thread.join(timeout=2)
-                self._sniff_threads.clear() # Clear out any remaining references after joining
+
             self.router_logger.log_message("[Router] Sniffer threads stopped.")
+            if use_hyperv:
+                self.hyperv_manager.teardown()
             self._sniff_threads.clear()
             self.igmp_manager.stop()
             self.handshake_manager.stop()
