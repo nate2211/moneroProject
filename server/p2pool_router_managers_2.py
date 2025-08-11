@@ -1901,10 +1901,10 @@ class NATManager:
         # --- NAT Security & Temporary Leases ---
         self._port_probe_counts: Dict[str, int] = defaultdict(int)
         self._ban_list: Dict[str, float] = {}  # ip -> ban_expiry_timestamp
-        self._ban_threshold = 30  # Number of unmapped port hits to trigger ban
+        self._ban_threshold = 3  # Number of unmapped port hits to trigger ban
         self._ban_duration = 120  # Ban duration in seconds
 
-        self._max_temp_leases_per_ip = 5  # NEW: Flat limit on active temporary leases per IP
+        self._max_temp_leases_per_ip = 2  # NEW: Flat limit on active temporary leases per IP
         self._temp_nat_leases: Dict[str, Dict[int, Dict[str, float | str | int]]] = defaultdict(
             dict)  # ip -> {port -> lease_info}
         self._temp_nat_lease_duration = 60  # seconds
@@ -3653,7 +3653,7 @@ class FirewallManager:
         if rule['action'] not in ['permit', 'deny']:
             self.logger.log_message(f"[Firewall] 🔥 Invalid action '{action}'. Must be 'permit' or 'deny'.")
             return False
-        if rule['protocol'] not in ['tcp', 'udp', 'icmp', 'igmp', 'eap', 'any']:
+        if rule['protocol'] not in ['tcp', 'udp', 'icmp', 'igmp', 'esp', 'any']:
             self.logger.log_message(
                 f"[Firewall] 🔥 Invalid protocol '{protocol}'. Must be 'tcp', 'udp', 'icmp', or 'any'.")
             return False
