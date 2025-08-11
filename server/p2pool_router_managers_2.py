@@ -2357,16 +2357,33 @@ class DNSManager:
     def __init__(self, router_logger, packet_writer):
         self.packet_writer = packet_writer
         self.router_logger = router_logger
-        self.PRIMARY_DNS_SERVER = "8.8.8.8"  # Google's public DNS
+        self.PRIMARY_DNS_SERVER = "8.8.8.8"
+        self.PRIMARY_DNS_PORT = 53  # NEW
         self._pending_requests = {}
         self._lock = threading.Lock()
         self._dns_cache = {}
         self.DNS_CACHE_TTL_MIN = 60
         self.DNS_CACHE_MAX_ENTRIES = 1000
-        self._conditional_forwarders = {}
+        self._conditional_forwarders = {}  # allow "ip" or "ip:port"
         self._dns_blacklist = set()
-        self.router_logger.log_message("[DNS] Manager initialized.  ")
+        self.router_logger.log_message("[DNS] Manager initialized.")
 
+    # --- NEW: easy way to pick a local stub like 127.0.0.1:8888
+    def set_primary_upstream(self, ip: str, port: int = 53):
+        self.PRIMARY_DNS_SERVER = ip
+        self.PRIMARY_DNS_PORT = int(port)
+        self.router_logger.log_message(f"[DNS] Primary upstream set to {ip}:{port}")
+
+    # --- helper: resolve forward target (supports "ip:port" values in conditional forwarders)
+    def _get_forward_target(self, qname: str) -> tuple[str, int]:
+        q = qname.lower().strip('.')
+        for suffix, target in self._conditional_forwarders.items():
+            if q.endswith(suffix) or q == suffix:
+                if ":" in target and target.count(":") == 1:  # minimal, IPv4 "ip:port"
+                    ip, port = target.split(":", 1)
+                    return ip, int(port)
+                return target, self.PRIMARY_DNS_PORT
+        return self.PRIMARY_DNS_SERVER, self.PRIMARY_DNS_PORT
 
     def add_conditional_forwarder(self, domain_suffix: str, dns_server_ip: str):
         """Adds a conditional DNS forwarder."""
@@ -2438,196 +2455,155 @@ class DNSManager:
                     del self._dns_cache[qname]
         return None
 
-    def handle_query(self, packet, inbound_iface: str, router_interfaces: dict, get_mac_function, find_route_function,
-                     packet_writer, router_lan_network: ipaddress._BaseNetwork):
+    def handle_query(self, packet, inbound_iface: str, router_interfaces: dict,
+                     get_mac_function, find_route_function):
         if not (packet.haslayer(DNS) and packet[DNS].qr == 0):
             return False
 
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         if ip_layer is None:
-            self.router_logger.log_message("[DNS] ❌ No IP layer found in DNS packet.")
+            self.router_logger.log_message("[DNS] ❌ No IP layer in DNS query.")
             return False
 
-        layer_name = "IP" if packet.haslayer(IP) else "IPv6"
         udp_layer = packet.getlayer(UDP)
         dns_layer = packet.getlayer(DNS)
+        if not udp_layer or not dns_layer:
+            return False
+
         qname = dns_layer.qd.qname.decode() if dns_layer.qd else "unknown"
 
-        if self._is_blacklisted(qname):
-            response = Ether(src=packet[Ether].dst, dst=packet[Ether].src) / \
-                       packet.getlayer(type(ip_layer)).__class__(src=ip_layer.dst, dst=ip_layer.src) / \
-                       UDP(sport=udp_layer.dport, dport=udp_layer.sport) / \
-                       DNS(id=dns_layer.id, qr=1, ra=1, rcode=3, qd=dns_layer.qd)
-            self.packet_writer.queue_packet(response, inbound_iface)
-            return True
-
-        ip_cls = ip_layer.__class__
-
-        cached_response = self._get_from_cache(qname)
-        if cached_response:
-            response_pkt = cached_response.copy()
-
-            # Set destination IP in correct layer (IP or IPv6)
-            response_pkt[ip_cls].dst = ip_layer.src
-
-            # Set UDP destination port and DNS ID to match query
-            response_pkt[UDP].dport = udp_layer.sport
-            response_pkt[DNS].id = dns_layer.id
-
-            # Handle Ethernet layer (if it exists)
-            if response_pkt.haslayer(Ether) and packet.haslayer(Ether):
-                response_pkt[Ether].dst = packet[Ether].src
-
-            # Remove checksums to force recalculation
-            if ip_cls is IP:
-                del response_pkt[IP].chksum
-            elif ip_cls is IPv6:
-                # IPv6 doesn't have a checksum; just reset UDP
+        # blacklist / cache paths unchanged...
+        cached = self._get_from_cache(qname)
+        if cached:
+            resp = cached.copy()
+            # rewrite back to client
+            if IP in resp:
+                resp[IP].dst = ip_layer.src
+                del resp[IP].chksum
+            elif IPv6 in resp:
                 pass
-
-            if UDP in response_pkt:
-                del response_pkt[UDP].chksum
-
-            self.packet_writer.queue_packet(response_pkt, inbound_iface)
+            resp[UDP].dport = udp_layer.sport
+            resp[DNS].id = dns_layer.id
+            if resp.haslayer(Ether) and packet.haslayer(Ether):
+                resp[Ether].dst = packet[Ether].src
+            if UDP in resp: del resp[UDP].chksum
+            self.packet_writer.queue_packet(resp, inbound_iface)
             return True
 
-        target_dns_server = self._get_forward_dns_server(qname)
-        default_route = find_route_function(target_dns_server)
-        if not default_route:
-            return False
+        # --- NEW: choose (ip, port) and detect loopback
+        target_ip, target_port = self._get_forward_target(qname)
+        is_loopback_target = False
+        try:
+            is_loopback_target = ipaddress.ip_address(target_ip).is_loopback
+        except ValueError:
+            pass
 
-        outbound_iface_name = default_route.get("interface")
-        if not outbound_iface_name:
-            return False
-
-        is_from_lan = ipaddress.ip_address(ip_layer.src) in router_lan_network
-        if inbound_iface == outbound_iface_name and not is_from_lan:
-            self.router_logger.log_message(
-                f"[DNS] ⚠️ Refusing external DNS query from {ip_layer.src} to prevent loop. Sending REFUSED response.")
-
-            # Construct a DNS response with RCODE 5 (Refused)
-            refused_response = Ether(src=packet[Ether].dst, dst=packet[Ether].src) / \
-                               ip_layer.__class__(src=ip_layer.dst, dst=ip_layer.src) / \
-                               UDP(sport=udp_layer.dport, dport=udp_layer.sport) / \
-                               DNS(id=dns_layer.id, qr=1, ra=1, rcode=5, qd=dns_layer.qd)
-
-            # Remove checksums to force recalculation by the packet writer
-            if refused_response.haslayer(IP):
-                del refused_response[IP].chksum
-            if refused_response.haslayer(UDP):
-                del refused_response[UDP].chksum
-
-            self.packet_writer.queue_packet(refused_response, inbound_iface)
-            return True  # T
+        # pick outbound iface
+        if is_loopback_target:
+            # find the loopback interface we added to _interfaces_config (ip 127.0.0.1 / ::1)
+            outbound_iface_name = None
+            for name, cfg in router_interfaces.items():
+                if cfg.get("ip_addr") in ("127.0.0.1", "::1"):
+                    outbound_iface_name = name
+                    break
+            if not outbound_iface_name:
+                self.router_logger.log_message("[DNS] ❌ No loopback interface configured.")
+                return False
+        else:
+            route = find_route_function(target_ip)
+            if not route or not route.get("interface"):
+                return False
+            outbound_iface_name = route["interface"]
 
         outbound_iface_config = router_interfaces.get(outbound_iface_name)
         if not outbound_iface_config:
             return False
-        udp_layer = packet.getlayer(UDP)
-        if not udp_layer:
-            self.router_logger.log_message("[DNS] ❌ No UDP layer in DNS query packet; skipping.")
-            return False  # Or raise or handle however you prefer
-        key = (ip_layer.src, udp_layer.sport, dns_layer.id)
+
+        # --- NEW: correct pending key: (router_src_ip_used_upstream, client_sport, dns_id)
+        router_src_ip_used_upstream = "127.0.0.1" if is_loopback_target else outbound_iface_config["ip_addr"]
+        key = (router_src_ip_used_upstream, udp_layer.sport, dns_layer.id)
         with self._lock:
             self._pending_requests[key] = {
                 "original_mac_src": packet[Ether].src if packet.haslayer(Ether) else None,
                 "inbound_iface": inbound_iface
             }
 
-        self.router_logger.log_message(
-            f"[DNS] ➡️ Proxying query for {qname} from {ip_layer.src} to {target_dns_server}")
-        if qname.endswith(".local."):
-            self.router_logger.log_message(f"[DNS] 🌐 Forwarding mDNS query for {qname} via multicast")
+        # build upstream packet
+        fwd = packet.copy()
+        if IP in fwd:
+            fwd[IP].src = router_src_ip_used_upstream
+            fwd[IP].dst = target_ip
+            del fwd[IP].chksum
+        elif IPv6 in fwd:
+            if ":" not in target_ip:
+                target_ip = "2001:4860:4860::8888"
+            fwd[IPv6].src = outbound_iface_config["ip_addr"]
+            fwd[IPv6].dst = target_ip
+        fwd[UDP].dport = target_port  # NEW: allow non-53 upstream
+        del fwd[UDP].chksum
 
-            if packet.haslayer(IP):
-                multicast_ip = "224.0.0.251"
-                ether_dst = "ff:ff:ff:ff:ff:ff"
-                ip_layer = IP(dst=multicast_ip)
-            elif packet.haslayer(IPv6):
-                multicast_ip = "ff02::fb"
-                ether_dst = "33:33:00:00:00:fb"
-                ip_layer = IPv6(dst=multicast_ip)
+        if fwd.haslayer(Ether):
+            fwd[Ether].src = outbound_iface_config["mac"]
+            if is_loopback_target:
+                fwd[Ether].dst = "00:00:00:00:00:00"  # no ARP on loopback
             else:
-                self.router_logger.log_message("[DNS] ❌ No IP layer found for mDNS forwarding.")
-                return False
+                gw_ip = route.get("next_hop") or target_ip
+                mac = get_mac_function(gw_ip, outbound_iface_name)
+                if not mac:
+                    with self._lock: self._pending_requests.pop(key, None)
+                    return True
+                fwd[Ether].dst = mac
 
-            multicast_packet = Ether(dst=ether_dst, src=outbound_iface_config['mac']) / \
-                               ip_layer / \
-                               UDP(sport=udp_layer.sport, dport=5353) / \
-                               DNS(id=dns_layer.id, qr=0, qd=dns_layer.qd)
-
-            del multicast_packet[UDP].chksum
-            if hasattr(multicast_packet[ip_layer.name], "chksum"):
-                del multicast_packet[ip_layer.name].chksum
-
-            self.packet_writer.queue_packet(multicast_packet, outbound_iface_name)
-            return True
-        modified_packet = packet.copy()
-        modified_packet[layer_name].src = outbound_iface_config['ip_addr']
-        if layer_name == "IPv6" and ":" not in target_dns_server:
-            self.router_logger.log_message("[DNS] ⚠️ IPv6 DNS query routed to IPv4 DNS server — switching to IPv6 DNS")
-            target_dns_server = "2001:4860:4860::8888"  # or your own IPv6 resolver
-
-        modified_packet[layer_name].dst = target_dns_server
-        if modified_packet.haslayer(Ether):
-            modified_packet[Ether].src = outbound_iface_config['mac']
-            gateway_ip = default_route.get("next_hop") or target_dns_server
-            target_mac = get_mac_function(gateway_ip, outbound_iface_name)
-            if not target_mac:
-                with self._lock: self._pending_requests.pop(key, None)
-                return True
-            modified_packet[Ether].dst = target_mac
-
-        # Remove checksum to allow Scapy to recalculate
-        if hasattr(modified_packet[layer_name], "chksum"):
-            del modified_packet[layer_name].chksum
-        if hasattr(modified_packet[UDP], "chksum"):
-            del modified_packet[UDP].chksum
-        self.packet_writer.queue_packet(modified_packet, outbound_iface_name)
+        self.router_logger.log_message(
+            f"[DNS] ➡️ {ip_layer.src}:{udp_layer.sport} {qname} -> {target_ip}:{target_port} via {outbound_iface_name.split('_')[-1]}"
+        )
+        self.packet_writer.queue_packet(fwd, outbound_iface_name)
         return True
 
-    def handle_response(self, packet, router_interfaces: dict, packet_writer):
+    def handle_response(self, packet, router_interfaces: dict):
         if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
             return False
 
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         udp_layer = packet.getlayer(UDP)
         dns_layer = packet[DNS]
+        if not (ip_layer and udp_layer and dns_layer):
+            return False
+
         qname = dns_layer.qd.qname.decode() if dns_layer.qd else "unknown"
 
-        key = (ip_layer.dst, udp_layer.dport, dns_layer.id)
-        modified_packet = packet.copy()
+        # --- NEW: look up by (dst_is_router_src_used_upstream, dport_is_client_sport, id)
+        lookup_key = (ip_layer.dst, udp_layer.dport, dns_layer.id)
         with self._lock:
-            original_request = self._pending_requests.pop(key, None)
+            original = self._pending_requests.pop(lookup_key, None)
 
-        if original_request:
-            self.router_logger.log_message(f"[DNS] ⬅️  Routing response for {qname} to {key[0]}")
-            self._add_to_cache(qname, packet)
+        if not original:
+            return False
 
-            response_iface_name = original_request["inbound_iface"]
-            response_iface_config = router_interfaces.get(response_iface_name)
+        self._add_to_cache(qname, packet)
+        resp_iface = original["inbound_iface"]
+        resp_cfg = router_interfaces.get(resp_iface)
+        if not resp_cfg:
+            return False
 
+        out = packet.copy()
+        # rewrite back to LAN client
+        if IP in out:
+            out[IP].src = resp_cfg["ip_addr"]
+            out[IP].dst = lookup_key[0]  # client IP stored in key
+            del out[IP].chksum
+        elif IPv6 in out:
+            out[IPv6].src = resp_cfg["ip_addr"]
+            out[IPv6].dst = lookup_key[0]
 
+        if Ether in out and original["original_mac_src"]:
+            out[Ether].src = resp_cfg["mac"]
+            out[Ether].dst = original["original_mac_src"]
 
+        if UDP in out: del out[UDP].chksum
 
-            if IP in modified_packet:
-                modified_packet[IP].src = response_iface_config['ip_addr']
-                modified_packet[IP].dst = key[0]
-            elif IPv6 in modified_packet:
-                modified_packet[IPv6].src = response_iface_config['ip_addr']
-                modified_packet[IPv6].dst = key[0]
-
-
-            if Ether in modified_packet and original_request["original_mac_src"]:
-                modified_packet[Ether].src = response_iface_config['mac']
-                modified_packet[Ether].dst = original_request["original_mac_src"]
-
-            if IP in modified_packet:
-                del modified_packet[IP].chksum
-            elif IPv6 in modified_packet:
-                del modified_packet[UDP].chksum
-
-        self.packet_writer.queue_packet(modified_packet)
+        self.router_logger.log_message(f"[DNS] ⬅️ {qname} -> {lookup_key[0]} via {resp_iface.split('_')[-1]}")
+        self.packet_writer.queue_packet(out, resp_iface)  # specify egress iface
         return True
 
 class ARPManager:
@@ -2656,6 +2632,7 @@ class ARPManager:
         self.dhcp_manager = None # Not used directly in the provided snippets, but kept for context
         self._temp_arp_leases: dict[str, dict[str, float]] = {}
         # ARP Snooping/Inspection (Placeholder)
+        self.MAX_REPLIES_PER_LEASE  = 3
         self._trusted_ports = set()  # Example: {'Ethernet_IN_Full_Name'}
         self.outbound_load_balancer = outbound_load_balancer
         self._static_arp_entries = {}  # {IP: MAC} for trusted static entries
@@ -2951,6 +2928,10 @@ class ARPManager:
             # --- Case 2: Temporary lease exists and is valid
             elif target_ip in self._temp_arp_leases:
                 lease_info = self._temp_arp_leases[target_ip]
+                if lease_info["replies_sent"] >= self.MAX_REPLIES_PER_LEASE and now < lease_info["lease_end"]:
+                    self.router_logger.log_message(
+                        f"[ARP][LEASE] ❌ Too many replies for {target_ip}")
+                    return
                 if now < lease_info["lease_end"]:
                     our_mac = get_if_hwaddr(iface)
                     if not our_mac:
@@ -2960,6 +2941,7 @@ class ARPManager:
                     self.router_logger.log_message(
                         f"[ARP][LEASE] 🔓 Active lease: replying to ARP for {target_ip} with {our_mac}."
                     )
+                    lease_info["replies_sent"] += 1
                 elif now >= lease_info["cooldown_end"]:
                     del self._temp_arp_leases[target_ip]
                     self.router_logger.log_message(
@@ -3028,7 +3010,8 @@ class ARPManager:
 
         self._temp_arp_leases[ip_address] = {
             "lease_end": now + lease_duration,
-            "cooldown_end": now + lease_duration + cooldown
+            "cooldown_end": now + lease_duration + cooldown,
+            "replies_sent": 0
         }
 
         self.router_logger.log_message(

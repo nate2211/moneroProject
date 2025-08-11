@@ -1095,8 +1095,7 @@ class PythonRouterManager:
                     self.router_logger.log_message(f"[DNS] 🗺️ Intercepting DNS query on {iface_short}")
                     if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
                                                      self.arp_manager.resolve,
-                                                     self.rip_manager.find_route, self.packet_writer,
-                                                     self.router_network_in):
+                                                     self.rip_manager.find_route):
                         return
 
                 if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
@@ -1130,17 +1129,17 @@ class PythonRouterManager:
                                                       return_type="bool", queue_name="https"):
                         return
 
-
-            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
-                if self.mdns_manager.handle_packet(packet):
+            if packet.haslayer(DNS) and packet[DNS].qr == 1:
+                if self.dns_manager.handle_response(packet, self._interfaces_config):
                     return
             if packet.haslayer(UDP) and packet[UDP]:
                 if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
                                                  self.arp_manager.resolve,
-                                                 self.rip_manager.find_route, self.packet_writer,
-                                                 self.router_network_in):
+                                                 self.rip_manager.find_route):
                     return
-
+            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    return
 
             self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="transport")
@@ -1463,7 +1462,7 @@ class PythonRouterManager:
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
-                self._configure_interface_settings(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
+                self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
 
 
             self._enable_nat_forwarding()
@@ -1480,6 +1479,7 @@ class PythonRouterManager:
             self.isakmp_manager = ISAKMPManager(self.router_logger, self.packet_writer, self.notification_manager, self._interfaces_config)
             self.packet_catcher.notification_manager = self.notification_manager
             self.arp_manager.notification_manager = self.notification_manager
+
             self.packet_signer.notification_manager = self.notification_manager
 
             self.rip_manager.initialize_routes(
@@ -1534,7 +1534,10 @@ class PythonRouterManager:
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
             self.parallel_python.run_all_parallel(sniffing_tasks,return_type="void")
-            giltools.start_cpu_boost(threads=32, target_util=.60, cores=list(range(8)), pin_per_thread=True)
+            pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]  # example: your P-cores (adjust for your CPU)
+            giltools.unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
+
+
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
@@ -1542,7 +1545,6 @@ class PythonRouterManager:
     def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv):
         """Stops all manager threads and cleans up network interfaces."""
         try:
-            giltools.stop_cpu_boost()
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
             if use_static:
                 self._deconfigure_interface_settings()
@@ -1588,7 +1590,7 @@ class PythonRouterManager:
         except Exception:
             pass  # Suppress all errors
 
-    def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, router_ip_in: str = None,
+    def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, use_hyperv: bool, router_ip_in: str = None,
                                       router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
                                       router_netmask_out: str = "255.255.255.0") -> bool:
         """
@@ -1664,7 +1666,7 @@ class PythonRouterManager:
                 ip_to_assign = router_ip_out if router_ip_out else ip_address_config
                 netmask_to_assign = router_netmask_out if router_netmask_out else str(network_config.netmask)
                 gateway_to_assign = self.router_gateway_out_ip  # Use the discovered/configured gateway for OUT
-                dns_server_to_assign = "8.8.8.8"  # Public DNS for WAN interface
+                dns_server_to_assign = self.router_ip_in
             elif is_in_iface:
                 ip_to_assign = router_ip_in if router_ip_in else ip_address_config
                 netmask_to_assign = router_netmask_in if router_netmask_in else str(network_config.netmask)
@@ -1959,84 +1961,90 @@ class PythonRouterManager:
 
     def _get_default_gateway_for_interface(self, iface_friendly_name: str) -> str | None:
         """
-        Parses 'ipconfig /all' to extract the last listed default gateway for a specific interface.
-        This includes inactive/DHCP/statically configured gateways.
-
-        Args:
-            iface_friendly_name (str): Name of the adapter (e.g., "Wi-Fi", "Ethernet")
-
-        Returns:
-            str | None: The last configured default gateway IP for the given interface, or None if not found.
+        Parses 'ipconfig /all' and returns the FIRST listed default gateway for the given interface.
+        Prefers IPv4 if both IPv4 and IPv6 are shown.
         """
         self.router_logger.log_message(f"[Router] Parsing ipconfig for default gateway of '{iface_friendly_name}'...")
         try:
             result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, check=True)
             output = result.stdout
 
+            def extract_first_gateway(adapter_block: list[str]) -> str | None:
+                gw_lines_started = False
+                candidates: list[str] = []
+
+                for l in adapter_block:
+                    # Start capture at the "Default Gateway" line
+                    if "Default Gateway" in l:
+                        parts = l.split(":", 1)
+                        gw_lines_started = True
+                        if len(parts) > 1:
+                            val = parts[1].strip()
+                            if val:
+                                candidates.append(val)
+                        continue
+
+                    # After the label line, capture subsequent indented lines until blank / next label
+                    if gw_lines_started:
+                        s = l.strip()
+                        if not s:
+                            break
+                        if ":" in l:  # next labeled field encountered
+                            break
+                        candidates.append(s)
+
+                if not candidates:
+                    return None
+
+                # Prefer the first IPv4, else take the very first candidate
+                ipv4_re = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+                for c in candidates:
+                    if ipv4_re.search(c):
+                        return ipv4_re.search(c).group(0)
+                return candidates[0]  # likely IPv6
+
             current_adapter = None
-            adapter_block = []
-            found_gateway = None
+            adapter_block: list[str] = []
 
             lines = output.splitlines()
             for line in lines:
                 line = line.rstrip()
 
+                # New adapter header?
                 if re.match(r"^[A-Z].*adapter .*:$", line):
-                    # If we're leaving the target adapter's section, process its block
+                    # Process the block we just finished if it was the target
                     if current_adapter == iface_friendly_name and adapter_block:
-                        gateways = []
-                        capture = False
-                        for l in adapter_block:
-                            if 'Default Gateway' in l:
-                                parts = l.split(':', 1)
-                                if len(parts) > 1 and parts[1].strip():
-                                    gateways.append(parts[1].strip())
-                                capture = True
-                            elif capture:
-                                if l.strip() == '':
-                                    break
-                                elif re.match(r"^\s+\d+\.\d+\.\d+\.\d+", l):
-                                    gateways.append(l.strip())
-                                else:
-                                    break
-                        if gateways:
-                            found_gateway = gateways[-1]  # Use the last one found
+                        gw = extract_first_gateway(adapter_block)
+                        if gw:
                             self.router_logger.log_message(
-                                f"[Router] Found default gateway for '{iface_friendly_name}': {found_gateway}")
-                            return found_gateway
-                    # Start a new block
-                    current_adapter = line.strip(':').split('adapter')[-1].strip()
+                                f"[Router] Found default gateway for '{iface_friendly_name}': {gw}"
+                            )
+                            return gw
+
+                    # Start new block
+                    current_adapter = line.strip(":").split("adapter", 1)[-1].strip()
                     adapter_block = []
-                elif current_adapter:
-                    adapter_block.append(line)
+                else:
+                    if current_adapter:
+                        adapter_block.append(line)
+
+            # Process the last collected block
             if current_adapter == iface_friendly_name and adapter_block:
-                gateways = []
-                capture = False
-                for l in adapter_block:
-                    if 'Default Gateway' in l:
-                        parts = l.split(':', 1)
-                        if len(parts) > 1 and parts[1].strip():
-                            gateways.append(parts[1].strip())
-                        capture = True
-                    elif capture:
-                        if l.strip() == '':
-                            break
-                        elif re.match(r"^\s+\d+\.\d+\.\d+\.\d+", l):
-                            gateways.append(l.strip())
-                        else:
-                            break
-                if gateways:
-                    found_gateway = gateways[-1]
+                gw = extract_first_gateway(adapter_block)
+                if gw:
                     self.router_logger.log_message(
-                        f"[Router] Found default gateway for '{iface_friendly_name}': {found_gateway}")
-                    return found_gateway
+                        f"[Router] Found default gateway for '{iface_friendly_name}': {gw}"
+                    )
+                    return gw
+
             self.router_logger.log_message(
-                f"[Router] No gateway found for '{iface_friendly_name}' in ipconfig output.")
+                f"[Router] No gateway found for '{iface_friendly_name}' in ipconfig output."
+            )
             return None
+
         except subprocess.CalledProcessError as e:
             self.router_logger.log_message(f"[Router] ❌ Failed to run ipconfig: {e}")
             return None
-
 
     def _setup_dynamic_firewall_manager_rules(self):
         """

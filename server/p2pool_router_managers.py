@@ -23,7 +23,7 @@ from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dns import  DNS
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply
-from scapy.layers.l2 import ARP, Ether
+from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished, TLSCertificate, \
     TLSClientKeyExchange, TLSServerKeyExchange, TLSServerHelloDone, TLSCertificateRequest, TLSNewSessionTicket, \
     TLSEncryptedExtensions
