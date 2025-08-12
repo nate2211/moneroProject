@@ -7,7 +7,11 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Optional
-
+import win32file
+import win32pipe
+import pywintypes
+import time
+import struct
 from PyQt5.QtCore import QObject, pyqtSignal, Qt, QCoreApplication
 
 
@@ -132,7 +136,10 @@ class HyperVManager:
 
     def teardown(self) -> None:
 
-
+        try:
+            self.close_pipe(graceful=True)
+        except Exception:
+            pass
         proc = self._proc
         if not proc:
             self._logger.log_message("Teardown called with no running process.")
@@ -172,5 +179,137 @@ class HyperVManager:
         self._reader_thread = None
         self._logger.log_message("Successfully tore down the virtual machine and cleaned up.")
 
+    def close_pipe(self, graceful: bool = True) -> None:
+        """
+        Gracefully disconnect from \\\\.\\pipe\\vmrouter_packets and drop the handle.
+        If 'graceful' is True, send a 0-length frame first so the C++ reader
+        exits its loop without error.
+        """
+        import struct
+        if not hasattr(self, "_pipe_lock"):
+            return
+        with self._pipe_lock:
+            h = getattr(self, "_pipe_handle", None)
+            if not h:
+                return
+            if graceful:
+                try:
+                    # Our wire format is <uint32 LE len> + data; len=0 asks server to stop reading.
+                    h.write(struct.pack('<I', 0))
+                    h.flush()
+                except Exception:
+                    pass
+            try:
+                h.close()
+            except Exception:
+                pass
+            self._pipe_handle = None
+    def send_packet(self, packet, connect_timeout: float = 3.0) -> bool:
+        """
+        Send a raw Ethernet frame into the C++ named pipe (\\.\pipe\vmrouter_packets)
+        using only the Python standard library (no pywin32).
 
+        Accepts many 'packet' forms and normalizes to bytes:
+          - bytes/bytearray/memoryview
+          - str hex: "01 23 ab cd", "0123ABCD", with ':', '-', '0x' allowed
+          - list/tuple of ints (0..255)
+          - objects with .original, .build(), .to_bytes(), or __bytes__()
+
+        Wire format: <uint32 little-endian length> + <frame bytes>
+        """
+        PIPE_NAME = r'\\.\pipe\vmrouter_packets'
+
+        # --- normalize input to raw bytes ---
+        def _to_bytes(obj):
+            if obj is None:
+                return None
+
+            if isinstance(obj, (bytes, bytearray, memoryview)):
+                return bytes(obj)
+
+            if isinstance(obj, str):
+                s = obj.strip().lower()
+                for ch in (" ", ":", "-", "\n", "\r", "\t"):
+                    s = s.replace(ch, "")
+                if s.startswith("0x"):
+                    s = s[2:]
+                try:
+                    return bytes.fromhex(s)
+                except ValueError:
+                    return None
+
+            if isinstance(obj, (list, tuple)):
+                try:
+                    return bytes(obj)
+                except Exception:
+                    return None
+
+            if hasattr(obj, "original"):
+                try:
+                    return bytes(obj.original)
+                except Exception:
+                    pass
+
+            for meth in ("build", "to_bytes"):
+                if hasattr(obj, meth):
+                    try:
+                        b = getattr(obj, meth)()
+                        if not isinstance(b, (bytes, bytearray, memoryview)):
+                            b = bytes(b)
+                        return bytes(b)
+                    except Exception:
+                        pass
+
+            try:
+                return bytes(obj)
+            except Exception:
+                return None
+
+        frame = _to_bytes(packet)
+        if not frame:
+            self._logger.log_message("[PYPIPE] Could not normalize packet to bytes")
+            return False
+
+        import struct, time
+        payload = struct.pack('<I', len(frame)) + frame
+
+        # Cache a handle/file object across calls
+        if not hasattr(self, "_pipe_handle"):
+            self._pipe_handle = None
+        if not hasattr(self, "_pipe_lock"):
+            import threading
+            self._pipe_lock = threading.Lock()
+
+        with self._pipe_lock:
+            deadline = time.time() + max(0.0, connect_timeout)
+
+            # Connect if needed (simple retry loop)
+            while self._pipe_handle is None:
+                try:
+                    # Opening a named pipe with built-in open() works once the server is ready
+                    self._pipe_handle = open(PIPE_NAME, "wb", buffering=0)
+                except Exception as e:
+                    if time.time() >= deadline:
+                        self._logger.log_message(f"[PYPIPE] Could not connect to pipe: {e}")
+                        return False
+                    time.sleep(0.1)
+                    continue
+
+            # Write the payload
+            try:
+                self._pipe_handle.write(payload)
+                self._pipe_handle.flush()
+                return True
+            except Exception as e:
+                # Likely broken pipe; drop handle so we reconnect next time
+                try:
+                    if self._pipe_handle:
+                        self._pipe_handle.close()
+                except Exception:
+                    pass
+                finally:
+                    self._pipe_handle = None
+
+                self._logger.log_message(f"[PYPIPE] Write failed (handle reset): {e}")
+                return False
 

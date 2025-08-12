@@ -145,6 +145,7 @@ class PythonRouterManager:
         self.isakmp_manager = None
         self.stratum_manager = StratumManager(router_logger)
         self.hyperv_manager = HyperVManager(self.router_logger)
+        self.hyperv_enabled = False
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
         self.parallel_python.inject_into(self.packet_catcher)
@@ -1074,10 +1075,15 @@ class PythonRouterManager:
 
             if IP in packet:
                 if packet.haslayer(ESP):
-                    self.router_logger.log_message(f"[ESP] Forwarding ESP packet from {packet[IP].src} to {packet[IP].dst}")
-                    self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
-                                                  egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
-                    return True
+                    if self.hyperv_enabled:
+                        self.router_logger.log_message(f"[ESP] Sending ESP packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
+                        self.hyperv_manager.send_packet(packet)
+                        return True
+                    else:
+                        self.router_logger.log_message(f"[ESP] Forwarding ESP packet from {packet[IP].src} to {packet[IP].dst}")
+                        self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
+                                                      egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
+                        return True
                 if UDP in packet and (packet[UDP].sport == 4500 or packet[UDP].dport == 4500):
                     self.router_logger.log_message(f"[VPN] 🔄 Handling NAT-T (UDP 4500) from {packet[IP].src}")
                     self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
@@ -1183,6 +1189,7 @@ class PythonRouterManager:
                     emoticons=["🚚", "🚛", "🛻", "�", "🚐", "🚙", "🚎", "🚕"]
                 )
             )
+
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
         except Exception as e:
@@ -1529,14 +1536,20 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
             if use_hyperv:
                 self.hyperv_manager.start()
+                self.hyperv_enabled = True
+            else:
+                self.hyperv_enabled = False
+
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
-            self.parallel_python.run_all_parallel(sniffing_tasks,return_type="void")
-            pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]  # example: your P-cores (adjust for your CPU)
+            self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
+            pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]  # example: your P-cores (adjust for your CPU)
             giltools.unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
+            giltools.start_cpu_boost(threads=pcores, target_util=0.70, pin_per_thread=True, unhinge=True)
+            giltools.burn_no_gil(1.0, threads=pcores)
 
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
@@ -1570,6 +1583,7 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] Sniffer threads stopped.")
             if use_hyperv:
                 self.hyperv_manager.teardown()
+                self.hyperv_enabled = False
             self._sniff_threads.clear()
             self.igmp_manager.stop()
             self.handshake_manager.stop()
