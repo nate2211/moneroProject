@@ -1548,8 +1548,8 @@ class PythonRouterManager:
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]  # example: your P-cores (adjust for your CPU)
             giltools.unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            giltools.start_cpu_boost(threads=pcores, target_util=0.70, pin_per_thread=True, unhinge=True)
-            giltools.burn_no_gil(1.0, threads=pcores)
+            giltools.start_cpu_boost(threads=len(pcores), target_util=0.70, cores=pcores, pin_per_thread=True, unhinge=False)
+            giltools.burn_no_gil(1.0, threads=len(pcores))
 
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
