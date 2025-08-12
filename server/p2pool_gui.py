@@ -2,10 +2,9 @@ import ctypes
 import queue
 import threading
 import asyncio
-from typing import Dict
 
-from PyQt5.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QWidget
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
+from PyQt5.QtWidgets import QMainWindow, QTabWidget
+from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
     PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab
 
