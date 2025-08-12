@@ -20,8 +20,11 @@ from p2pool_managers import PacketManager, AsyncNmapManager, AsyncGobusterManage
 from p2pool_ai import GeminiChatBot
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, guess_lexer
-
+from tools.pythontools import yield_no_gil
 import xml.etree.ElementTree as ET
+
+
+
 class AsyncWorker(QObject):
     finished = pyqtSignal()
     started = pyqtSignal()
@@ -1742,8 +1745,8 @@ class RouterTab(QWidget):
     @pyqtSlot(str)
     def log_message(self, message: str):
         prefixes = [self._norm(p) for p in re.findall(r'\[(.*?)\]', message)]
-
         # Fast path: route noisy prefixes directly to their pane (C++)
+
         for sprefix in reversed(prefixes):
             pane = self._hot_prefix_to_pane.get(sprefix)
             if pane:

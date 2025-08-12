@@ -3,12 +3,10 @@ import base64
 import ctypes
 import os
 import platform
-import queue
 import socket
 import string
 import traceback
 import uuid
-import warnings
 from pathlib import Path
 from typing import Optional, List, Any
 import geoip2.database
@@ -26,16 +24,15 @@ import requests
 from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from scapy.all import send, sr1, conf
+from scapy.all import send, sr1
 from scapy.arch import get_if_hwaddr
 from scapy.layers.dhcp import DHCP
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNSQR, DNS
-from scapy.layers.eap import EAPOL, EAP
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
-from scapy.layers.ipsec import ESP
-from scapy.layers.l2 import Ether, ARP
+from scapy.layers.ipsec import ESP, AH
+from scapy.layers.l2 import Ether, GRE
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet
 from scapy.layers.inet import IP, UDP
@@ -45,15 +42,14 @@ from scapy.layers.kerberos import (Kerberos)
 from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
-    LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, MLDReport, MLDDone, mDNSManager, \
+    LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
 from p2pool_tools import ParallelPythonTool
 from p2pool_hyperv import HyperVManager
-from tools import giltools
-
+from tools.pythontools import start_cpu_boost, yield_no_gil, burn_no_gil, unhinge_process
 class PythonRouterManager:
 
     """
@@ -1084,6 +1080,16 @@ class PythonRouterManager:
                         self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
                                                       egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
                         return True
+                if packet.haslayer(AH):
+                    if self.hyperv_enabled:
+                        self.router_logger.log_message(f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
+                        self.hyperv_manager.send_packet(packet)
+                        return True
+                if packet.haslayer(GRE):
+                    if self.hyperv_enabled:
+                        self.router_logger.log_message(f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
+                        self.hyperv_manager.send_packet(packet)
+                        return True
                 if UDP in packet and (packet[UDP].sport == 4500 or packet[UDP].dport == 4500):
                     self.router_logger.log_message(f"[VPN] 🔄 Handling NAT-T (UDP 4500) from {packet[IP].src}")
                     self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
@@ -1138,15 +1144,14 @@ class PythonRouterManager:
             if packet.haslayer(DNS) and packet[DNS].qr == 1:
                 if self.dns_manager.handle_response(packet, self._interfaces_config):
                     return
+            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    return
             if packet.haslayer(UDP) and packet[UDP]:
                 if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
                                                  self.arp_manager.resolve,
                                                  self.rip_manager.find_route):
                     return
-            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
-                if self.mdns_manager.handle_packet(packet):
-                    return
-
             self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="transport")
 
@@ -1546,10 +1551,9 @@ class PythonRouterManager:
 
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]  # example: your P-cores (adjust for your CPU)
-            giltools.unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
+            unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            giltools.start_cpu_boost(threads=len(pcores), target_util=0.70, cores=pcores, pin_per_thread=True, unhinge=False)
-            giltools.burn_no_gil(1.0, threads=len(pcores))
+            start_cpu_boost(threads=len(pcores), target_util=0.90, cores=pcores, pin_per_thread=True, unhinge=False)
 
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
