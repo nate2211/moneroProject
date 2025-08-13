@@ -1194,7 +1194,7 @@ class PythonRouterManager:
                     emoticons=["🚚", "🚛", "🛻", "�", "🚐", "🚙", "🚎", "🚕"]
                 )
             )
-
+            yield_no_gil(0.5)
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
         except Exception as e:
