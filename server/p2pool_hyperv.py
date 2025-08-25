@@ -1,19 +1,31 @@
 # HyperVManager.py
+import ctypes
+import gc
 import os
+import queue
 import sys
 import atexit
 import signal
 import subprocess
 import threading
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Optional
+
+import win32con
+import win32event
 import win32file
 import win32pipe
 import pywintypes
 import time
 import struct
 from PyQt5.QtCore import QObject, pyqtSignal, Qt, QCoreApplication
-
+from scapy.config import conf
+from scapy.layers.inet import IP
+from scapy.layers.inet6 import IPv6
+from scapy.layers.l2 import Ether
+from win32 import win32api
+from tools.pythontools import yield_no_gil
 
 class CppLogger(QObject):
     def __init__(self, logger):
@@ -205,18 +217,6 @@ class HyperVManager:
                 pass
             self._pipe_handle = None
     def send_packet(self, packet, connect_timeout: float = 3.0) -> bool:
-        """
-        Send a raw Ethernet frame into the C++ named pipe (\\.\pipe\vmrouter_packets)
-        using only the Python standard library (no pywin32).
-
-        Accepts many 'packet' forms and normalizes to bytes:
-          - bytes/bytearray/memoryview
-          - str hex: "01 23 ab cd", "0123ABCD", with ':', '-', '0x' allowed
-          - list/tuple of ints (0..255)
-          - objects with .original, .build(), .to_bytes(), or __bytes__()
-
-        Wire format: <uint32 little-endian length> + <frame bytes>
-        """
         PIPE_NAME = r'\\.\pipe\vmrouter_packets'
 
         # --- normalize input to raw bytes ---
@@ -313,3 +313,335 @@ class HyperVManager:
                 self._logger.log_message(f"[PYPIPE] Write failed (handle reset): {e}")
                 return False
 
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_OpenThread = _kernel32.OpenThread
+_OpenThread.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+_OpenThread.restype = ctypes.c_void_p
+
+_CancelSyncIo = _kernel32.CancelSynchronousIo
+_CancelSyncIo.argtypes = [ctypes.c_void_p]
+_CancelSyncIo.restype = ctypes.c_int
+
+_CloseHandle = _kernel32.CloseHandle
+_CloseHandle.argtypes = [ctypes.c_void_p]
+_CloseHandle.restype = ctypes.c_int
+
+_CancelIoEx = _kernel32.CancelIoEx
+_CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]  # (HANDLE, LPOVERLAPPED)
+_CancelIoEx.restype = wintypes.BOOL
+
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 0x00000102
+
+THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+THREAD_ALL_ACCESS = 0x1FFFFF
+
+
+class WinDivertManager:
+    """
+    Pipe reader for WinDivert frames that processes packets immediately (no queue).
+    - Overlapped, cancelable reads
+    - Backpressure: we only read when we're ready to process; C++ blocks naturally
+    - Reader thread is the sole owner/closer of handles (no double-close)
+    """
+    VIRTUAL_IFACE_NAME = "WinDivertBridge"
+    DEFAULT_PIPE_NAME = r'\\.\pipe\windivert_to_python'
+
+    def __init__(self, router_manager, pipe_name=DEFAULT_PIPE_NAME,
+                 idle_timeout=2.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
+
+        # --- FIX 1: Handle long IPv6 extension header chains ---
+        # Increase Scapy's default limit for dissecting chained packet layers.
+        # This prevents the "Maximum amount of items reached" error.
+        conf.max_list_count = 512
+
+        self.router_manager = router_manager
+        self.logger = router_manager.router_logger
+        self.pipe_name = pipe_name
+
+        # handles/state (owned/closed by reader thread)
+        self._pipe_handle = None
+        self._ovl_event = None
+        self._ovl = None
+
+        self._stop_event = threading.Event()
+        self._reader_thread = None
+        self._reader_tid = None
+
+        # tuning
+        self._idle_timeout = float(idle_timeout)
+        self._max_frames = int(max_frames_per_batch)
+        self._max_bytes = int(max_bytes_per_batch)
+
+        # avoid races on shared handles
+        self._hdl_lock = threading.Lock()
+
+        # stats
+        self.frames_read = 0
+        self.frames_processed = 0
+        self.frames_badlen = 0
+
+    # ---------------- public control ----------------
+
+    def start(self):
+        if self._reader_thread and self._reader_thread.is_alive():
+            return
+        self.logger.log_message("[WinDivert] Starting manager (immediate processing, no queue)...")
+        self._stop_event.clear()
+
+        self._reader_thread = threading.Thread(
+            target=self._pipe_reader_loop, name="WinDivertReader", daemon=True
+        )
+        self._reader_thread.start()
+
+    def stop(self):
+        """Signal stop and attempt a graceful shutdown to prevent race conditions."""
+        if not self._reader_thread or not self._reader_thread.is_alive():
+            self.logger.log_message("[WinDivert] Manager already stopped.")
+            return
+        self.logger.log_message("[WinDivert] Stopping manager...")
+
+        # --- STAGE 1: Graceful Shutdown ---
+        # 1. Signal the thread that it's time to stop.
+        self._stop_event.set()
+
+        # 2. Gently wake the thread if it's in a long wait. This helps it
+        #    see the stop_event sooner.
+        try:
+            with self._hdl_lock:
+                ev = self._ovl_event
+            if ev:
+                win32event.SetEvent(ev)
+        except Exception:
+            pass
+        self._unblock_pipe_wait()
+
+
+        self._reader_thread.join(timeout=5.0)
+
+        self.logger.log_message("[WinDivert] Manager stopped successfully.")
+        # Hint to GC to clean up now that the thread is confirmed dead.
+        gc.collect()
+
+    # ---------------- internal helpers ----------------
+
+    def _unblock_pipe_wait(self):
+        try:
+            h = win32file.CreateFile(
+                self.pipe_name, win32file.GENERIC_READ, 0, None,
+                win32file.OPEN_EXISTING, 0, None
+            )
+            win32file.CloseHandle(h)
+        except pywintypes.error:
+            pass
+
+    # ---------------- reader thread ----------------
+
+    def _pipe_reader_loop(self):
+        try:
+            self._reader_tid = win32api.GetCurrentThreadId()
+        except Exception:
+            self._reader_tid = None
+
+        while not self._stop_event.is_set():
+            ph = ev = ovl = None
+            try:
+                # wait up to 1s for a pipe instance
+                try:
+                    win32pipe.WaitNamedPipe(self.pipe_name, 1000)
+                except pywintypes.error as e:
+                    if e.winerror == 2:  # not created yet
+                        self._stop_event.wait(0.25)
+                        continue
+                    raise
+
+                if self._stop_event.is_set():
+                    break
+
+                self.logger.log_message(f"[WinDivert] 🔎 Connecting to pipe: {self.pipe_name}")
+                ph = win32file.CreateFile(
+                    self.pipe_name,
+                    win32file.GENERIC_READ,
+                    0, None,
+                    win32file.OPEN_EXISTING,
+                    win32con.FILE_FLAG_OVERLAPPED,  # overlapped -> cancelable & backpressure
+                    None
+                )
+                self.logger.log_message("[WinDivert] ✅ Pipe connected (OVERLAPPED, immediate processing).")
+
+                # message mode (avoid NOWAIT with overlapped)
+                try:
+                    PIPE_READMODE_MESSAGE = 0x00000002
+                    win32pipe.SetNamedPipeHandleState(ph, PIPE_READMODE_MESSAGE, None, None)
+                except pywintypes.error:
+                    pass
+
+                # per-connection event + OVERLAPPED
+                ev = win32event.CreateEvent(None, True, False, None)
+                ovl = pywintypes.OVERLAPPED()
+                ovl.hEvent = ev
+
+                # publish to shared (for stop() cancellation)
+                with self._hdl_lock:
+                    self._pipe_handle = ph
+                    self._ovl_event = ev
+                    self._ovl = ovl
+
+                # main read/process loop
+                while not self._stop_event.is_set():
+                    keep = self._read_and_process_frames_overlapped(
+                        ph, ev, ovl,
+                        idle_timeout=self._idle_timeout,
+                        max_frames=self._max_frames,
+                        max_bytes=self._max_bytes
+                    )
+                    if not keep:
+                        break
+
+            except pywintypes.error as e:
+                if not self._stop_event.is_set():
+                    self.logger.log_message(f"[WinDivert] Connection/read error ({e.winerror}). Retrying...")
+                self._stop_event.wait(0.05)
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    self.logger.log_message(f"[WinDivert] ❗ Reader error: {e}. Retrying...")
+                self._stop_event.wait(0.05)
+            finally:
+                # sole close point
+                with self._hdl_lock:
+                    self._pipe_handle = None
+                    self._ovl_event = None
+                    self._ovl = None
+
+                if ph:
+                    try:
+                        win32file.CloseHandle(ph)
+                    except Exception:
+                        pass
+                    ph = None
+                    if not self._stop_event.is_set():
+                        self.logger.log_message("[WinDivert] Pipe disconnected.")
+                if ev:
+                    try:
+                        win32api.CloseHandle(ev)
+                    except Exception:
+                        pass
+                    ev = None
+                ovl = None
+
+    # ---------------- core: read & process immediately ----------------
+
+    def _read_and_process_frames_overlapped(self, ph, ev, ovl,
+                                            idle_timeout=2.0, max_frames=1024, max_bytes=(1 << 20)):
+        """
+        Overlapped, cancelable batch read.
+        Processes each frame immediately in this thread (no queue).
+        Returns False on server close/error to trigger reconnect/exit.
+        """
+        buf = bytearray()
+        frames_this_batch = 0
+        bytes_read_total = 0
+        deadline = time.monotonic() + idle_timeout
+        MAX_FRAMES_PER_PASS = 256
+
+        def _reset_event():
+            if ev:
+                win32event.ResetEvent(ev)
+
+        while (not self._stop_event.is_set()
+               and frames_this_batch < max_frames
+               and bytes_read_total < max_bytes
+               and time.monotonic() < deadline):
+
+            try:
+                _reset_event()
+                try:
+                    hr, data = win32file.ReadFile(ph, 65536, ovl)
+                except pywintypes.error as e:
+                    if e.winerror != win32con.ERROR_IO_PENDING:
+                        return False
+                    ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    rc = win32event.WaitForSingleObject(ev, ms)
+                    if rc == WAIT_TIMEOUT:
+                        continue
+                    try:
+                        hr, data = win32file.GetOverlappedResult(ph, ovl, True)
+                    except pywintypes.error as ge:
+                        if ge.winerror in (win32con.ERROR_OPERATION_ABORTED, 995):
+                            return False
+                        return False
+
+                if not data:
+                    return False
+
+                buf.extend(data)
+                bytes_read_total += len(data)
+                deadline = time.monotonic() + idle_timeout
+
+                parsed_this_pass = 0
+                while parsed_this_pass < MAX_FRAMES_PER_PASS:
+                    if self._stop_event.is_set():
+                        return False
+                    if len(buf) < 4:
+                        break
+
+                    pkt_len = int.from_bytes(buf[0:4], "little", signed=False)
+                    if not (14 <= pkt_len <= 65535):
+                        del buf[:4]
+                        self.frames_badlen += 1
+                        continue
+
+                    if len(buf) < 4 + pkt_len:
+                        break
+
+                    mv = memoryview(buf)
+                    pkt = bytes(mv[4:4 + pkt_len])
+                    del mv
+                    del buf[:4 + pkt_len]
+
+                    self.frames_read += 1
+                    try:
+                        if pkt:
+                            yield_no_gil(0.01)
+                            ver = pkt[0] >> 4
+                            if ver == 4:
+                                # --- FIX 2: Prevent Scapy from parsing truncated ("runt") packets ---
+                                # A valid IPv4 header is at least 20 bytes.
+                                if len(pkt) < 20:
+                                    self.logger.log_message(
+                                        f"[WinDivert] ❗ Skipping runt IPv4 packet of {len(pkt)} bytes.")
+                                    continue
+
+                                self.router_manager.process_packet(IP(pkt), self.VIRTUAL_IFACE_NAME)
+                                self.logger.log_message(f"[WinDivert] Processing IPv4 Packet")
+
+                            elif ver == 6:
+                                # --- FIX 2: Prevent Scapy from parsing truncated ("runt") packets ---
+                                # A valid IPv6 header is 40 bytes.
+                                if len(pkt) < 40:
+                                    self.logger.log_message(
+                                        f"[WinDivert] ❗ Skipping runt IPv6 packet of {len(pkt)} bytes.")
+                                    continue
+
+                                self.router_manager.process_packet(IPv6(pkt), self.VIRTUAL_IFACE_NAME)
+                                self.logger.log_message(f"[WinDivert] Processing IPv6 Packet")
+
+                        self.frames_processed += 1
+                    except Exception as e:
+                        self.logger.log_message(
+                            f"[WinDivert] ❗ process_packet error: '{e}' on packet data: {pkt.hex()}"
+                        )
+
+                    frames_this_batch += 1
+                    parsed_this_pass += 1
+
+            except MemoryError:
+                buf.clear()
+            except pywintypes.error:
+                return False
+            except Exception:
+                return False
+
+        return True

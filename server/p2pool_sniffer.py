@@ -458,7 +458,7 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, 100, errbuf)
         if not handle:
-            self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}", "ERROR"); return
+            self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}"); return
         try:
             packet_bytes = bytes(packet)
             self.libpcap.pcap_sendpacket(handle, (ctypes.c_ubyte * len(packet_bytes))(*packet_bytes), len(packet_bytes))
