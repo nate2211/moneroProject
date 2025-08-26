@@ -2,10 +2,9 @@ import ctypes
 import queue
 import threading
 import asyncio
-from typing import Dict
 
-from PyQt5.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QPushButton, QPlainTextEdit, QWidget
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
+from PyQt5.QtWidgets import QMainWindow, QTabWidget
+from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
     PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab
 
@@ -384,11 +383,9 @@ class P2PoolGUI(QMainWindow):
             use_static = self.router_tab.use_static_checkbox.isChecked()
             lan_ip = self.router_tab.router_ip_out_input.text().strip()
             netmask_out = self.router_tab.router_netmask_out_input.text().strip()
+            use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
             try:
-                if lan_ip:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static)
-                else:
-                    self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, None, netmask_out, use_static)
+                self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static, use_hyperv)
             except Exception as e:
                 self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
             self.router_tab.start_router_button.setEnabled(False)
@@ -402,7 +399,8 @@ class P2PoolGUI(QMainWindow):
             use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
             use_static = self.router_tab.use_static_checkbox.isChecked()
-            self.helper.router_manager.stop_routing(use_dhcp_out, use_dhcp_in, use_static)
+            use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
+            self.helper.router_manager.stop_routing(use_dhcp_out, use_dhcp_in, use_static, use_hyperv)
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
         else:

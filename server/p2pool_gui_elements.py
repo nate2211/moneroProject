@@ -20,8 +20,11 @@ from p2pool_managers import PacketManager, AsyncNmapManager, AsyncGobusterManage
 from p2pool_ai import GeminiChatBot
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, guess_lexer
-
+from tools.pythontools import yield_no_gil
 import xml.etree.ElementTree as ET
+
+
+
 class AsyncWorker(QObject):
     finished = pyqtSignal()
     started = pyqtSignal()
@@ -1601,11 +1604,13 @@ class RouterTab(QWidget):
         self._console_panes = {}  # name → QPlainTextEdit
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/HTTPS/DNS/mDNS",
+            "Full": ["General", "Router", "DHCP", "Transport", "Python", "C++", "Signing", "TCP/HTTPS/DNS/mDNS",
                      "Handshake/SSL/TLS", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
-
+        self._hot_prefix_to_pane = {
+            self._norm("C++"): "C++",
+        }
         self._create_widgets()
         self._configure_layout()
         self._connect_signals()
@@ -1620,6 +1625,9 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox.setChecked(False)
         self.use_static_checkbox = QCheckBox("Use Static for all interfaces")
         self.use_static_checkbox.setChecked(False)
+        self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
+        self.use_hyperv_checkbox.setChecked(True)
+
 
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("(optional)")
@@ -1647,6 +1655,7 @@ class RouterTab(QWidget):
         top_row_layout.addWidget(self.dhcp_out_checkbox)
         top_row_layout.addWidget(self.dhcp_in_checkbox)
         top_row_layout.addWidget(self.use_static_checkbox)
+        top_row_layout.addWidget(self.use_hyperv_checkbox)
         top_row_layout.addStretch(1)
 
         # --- Combined Pane Add/Remove + Preset Dropdown Row ---
@@ -1720,28 +1729,42 @@ class RouterTab(QWidget):
         self.stop_router_button.setEnabled(True)
         self._log("General", "Router started!")
 
+    def _norm(self,s: str) -> str:
+        # keep numbers/symbols; just strip whitespace + casefold
+        return ''.join(s.split()).casefold()
+
+    def _rebuild_pane_index(self):
+        # map normalized part -> list of (pane_key, depth)
+        idx = {}
+        for pane_key in self._console_panes:
+            for depth, part in enumerate(pane_key.split('/')):
+                n = self._norm(part)
+                idx.setdefault(n, []).append((pane_key, depth))
+        self._pane_index = idx
+
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """
-        Routes log messages to a pane based on the prefix. If no matching pane, logs to 'General'.
-        """
-        prefixes = re.findall(r'\[(.*?)\]', message)
+        prefixes = [self._norm(p) for p in re.findall(r'\[(.*?)\]', message)]
+        # Fast path: route noisy prefixes directly to their pane (C++)
 
+        for sprefix in reversed(prefixes):
+            pane = self._hot_prefix_to_pane.get(sprefix)
+            if pane:
+                self._log(pane, message)
+                return
 
-        target_pane = None
-        longest_prefix_len = 1000
+        # Slow path: do the indexed lookup
+        if not hasattr(self, "_pane_index"):
+            self._rebuild_pane_index()
 
-        # Find the best possible match by checking all prefixes against all keys
-        for prefix in reversed(prefixes):
-            for pane_key in self._console_panes:
-                cleaned_pane_key = re.sub(r'[^a-zA-Z0-9]', '', pane_key)
-                if prefix.lower() in cleaned_pane_key.lower():
-                    if len(prefix) < longest_prefix_len:
-                        longest_prefix_len = len(prefix)
-                        target_pane = pane_key
+        for sprefix in reversed(prefixes):
+            hits = self._pane_index.get(sprefix)
+            if hits:
+                target_pane = max(hits, key=lambda x: x[1])[0]  # most specific segment
+                self._log(target_pane, message)
+                return
 
-        self._log(target_pane or "General", message)
-
+        self._log("General", message)
     def _log(self, category: str, message: str):
         if category in self._console_panes:
             self._console_panes[category].appendPlainText(message)

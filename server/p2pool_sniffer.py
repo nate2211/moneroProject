@@ -12,7 +12,7 @@ from scapy.arch import get_if_hwaddr
 from scapy.fields import IntField
 from scapy.layers.dns import DNS
 from scapy.layers.eap import EAPOL, EAP
-from scapy.layers.ipsec import ESP
+from scapy.layers.ipsec import ESP, AH
 from scapy.layers.rip import RIP
 
 # Import all functionalities from the Scapy library to parse packets.
@@ -22,7 +22,7 @@ try:
     from scapy.layers.inet import in4_chksum, TCP, UDP, IP, ICMP
     from scapy.layers.inet6 import ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RA, \
         ICMPv6ND_RS, IPv6
-    from scapy.layers.l2 import Ether, ARP, getmacbyip
+    from scapy.layers.l2 import Ether, ARP, getmacbyip, GRE
     from scapy.packet import bind_layers, Raw
 except ImportError:
     # Print error for Scapy and exit
@@ -206,6 +206,10 @@ class SnifferSoftware:
         bind_layers(UDP, DNS, dport=53)
         bind_layers(UDP, DNS, sport=53)
         bind_layers(IP, ESP, proto=50)
+        bind_layers(IP, AH, proto=51)
+        bind_layers(IPv6, AH, nh=51)
+        bind_layers(IP, GRE, proto=47)
+        bind_layers(IPv6, GRE, nh=47)
         load_layer("tls")
         load_layer("kerberos")
         load_layer("rip")
@@ -454,7 +458,7 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, 100, errbuf)
         if not handle:
-            self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}", "ERROR"); return
+            self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}"); return
         try:
             packet_bytes = bytes(packet)
             self.libpcap.pcap_sendpacket(handle, (ctypes.c_ubyte * len(packet_bytes))(*packet_bytes), len(packet_bytes))

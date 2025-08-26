@@ -1,12 +1,16 @@
+import asyncio
 import atexit
+import gc
 import os
+import platform
 import sys
 import ctypes
 import threading
 import time
 from collections import deque
+from ctypes import wintypes
 from pathlib import Path
-from typing import Callable, Any, Dict
+from typing import Callable, Any, Dict, List, Set, Tuple, Optional
 
 import numpy as np
 import psutil
@@ -30,7 +34,6 @@ class CSharpLogger(QObject):
             else:
                 formatted_message = f"{self._prefix} {msg}"
             self._logger.log_message(formatted_message)
-
 
 
 class ParallelPythonTool:
@@ -62,10 +65,11 @@ class ParallelPythonTool:
         self._dll = None
         self._registered_callbacks: Dict[str, Callable] = {}
         self._callback_wrappers: Dict[str, Any] = {}
-        self._parallel_queues: Dict[str, list[tuple]] = {}  # name → list of (wrapper, type, result_obj)\
+        self._parallel_queues: Dict[str, list[tuple]] = {}  # name → list of (wrapper, type, result_obj)
         self.csharp_logger = CSharpLogger(self.logger)
         self._process = psutil.Process(os.getpid())
         self._cpu_usage_history = deque(maxlen=10)
+        self._ram_buffer = None  # Attribute to hold allocated memory
         self._load_dll()
 
         atexit.register(self.stop)
@@ -81,14 +85,70 @@ class ParallelPythonTool:
         """
         cpu_percent_raw = self._process.cpu_percent(interval=1)
         memory_info = self._process.memory_info()
-        logical_cores = psutil.cpu_count(logical=True)  # e.g., 32
-        max_possible = 100 * logical_cores
-        cpu_percent_normalized = min((cpu_percent_raw / max_possible) * 100, 100.0)
+        logical_cores = psutil.cpu_count(logical=True)
+        max_possible = 100 * logical_cores if logical_cores else 100
+        cpu_percent_normalized = min((cpu_percent_raw / max_possible) * 100, 100.0) if max_possible > 0 else 0.0
 
         return {
             "cpu_percent": cpu_percent_normalized,
             "memory_usage_mb": memory_info.rss / (1024 * 1024)
         }
+
+    # --------------------------- NEW RAM USAGE METHODS ---------------------------
+    def increase_ram_usage(self, megabytes: int):
+        """
+        Allocates a large bytearray to increase the process's resident memory usage.
+        psutil is used here to report the memory usage before and after.
+        """
+        if self._ram_buffer:
+            self.logger.log_message(f"[RAM] ⚠️ Releasing existing RAM buffer before allocating a new one.")
+            self.release_ram_usage()
+
+        self.logger.log_message(f"[RAM] 📈 Attempting to allocate {megabytes} MB of RAM...")
+        try:
+            num_bytes = megabytes * 1024 * 1024
+
+            # Get memory usage before allocation
+            mem_before = self._process.memory_info().rss / (1024 * 1024)
+
+            # Allocate the memory by creating a large bytearray
+            self._ram_buffer = bytearray(num_bytes)
+
+            # Get memory usage after allocation
+            mem_after = self._process.memory_info().rss / (1024 * 1024)
+
+            self.logger.log_message(
+                f"[RAM] ✅ Successfully allocated buffer. Memory usage increased from {mem_before:.2f} MB to {mem_after:.2f} MB.")
+
+        except MemoryError:
+            self.logger.log_message(
+                f"[RAM] ❌ MemoryError: Failed to allocate {megabytes} MB. The system may be out of memory.")
+            self._ram_buffer = None
+        except Exception as e:
+            self.logger.log_message(f"[RAM] ❌ An unexpected error occurred during RAM allocation: {e}")
+            self._ram_buffer = None
+
+    def release_ram_usage(self):
+        """
+        Releases the memory allocated by `increase_ram_usage`.
+        """
+        if not self._ram_buffer:
+            self.logger.log_message("[RAM] ℹ️ No RAM buffer to release.")
+            return
+
+        self.logger.log_message("[RAM] 📉 Releasing allocated RAM buffer...")
+        mem_before = self._process.memory_info().rss / (1024 * 1024)
+
+        # Setting the buffer to None allows the garbage collector to reclaim it
+        self._ram_buffer = None
+        gc.collect()  # Encourage garbage collection to run sooner
+
+        mem_after = self._process.memory_info().rss / (1024 * 1024)
+        self.logger.log_message(
+            f"[RAM] ✅ RAM buffer released. Memory usage changed from {mem_before:.2f} MB to {mem_after:.2f} MB.")
+
+    # -------------------------------------------------------------------------
+
     def inject_into(self, target_obj: object, primary_attr: str = 'logger',
                     fallback_attr: str = 'router_logger') -> bool:
         if hasattr(target_obj, primary_attr):
@@ -100,30 +160,20 @@ class ParallelPythonTool:
         return False
 
     def _resolve_dll_path(self, relative_path: str) -> str:
-        """
-        Resolves the correct absolute path to the DLL file.
-        Handles PyInstaller (_MEIPASS) and development environments.
-        """
-
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            # If running in a PyInstaller bundle
             base_path = sys._MEIPASS
         else:
-            # Dev mode: base path is the script's directory, not current working dir
             base_path = os.path.dirname(os.path.abspath(__file__))
 
         resolved_path = os.path.abspath(os.path.join(base_path, relative_path))
-
         if not os.path.exists(resolved_path):
             self.logger.log_message(f"[DLL Loader] ❌ DLL not found at: {resolved_path}")
-
-
         return resolved_path
 
     def _load_dll(self) -> bool:
         if self._dll:
             return True
-        if not self._dll_path:
+        if not self._dll_path or not os.path.exists(self._dll_path):
             return False
         try:
             self.logger.log_message(f"[C#] [Python] 🚀 Loading C# DLL from: {self._dll_path}")
@@ -181,13 +231,6 @@ class ParallelPythonTool:
         self.logger.log_message(f"[C#] [Python] ✅ Registered callback: '{name}'")
 
     def run_all_parallel(self, funcs: list[tuple[Callable, tuple]], return_type: str = 'void') -> None:
-        """
-        Accepts a list of (function, args) tuples and invokes them all at once using the C# parallel batch interface.
-
-        Args:
-            funcs (list): List of tuples where each is (callable_function, args_tuple)
-            return_type (str): Return type for all functions: 'void', 'int', 'bool', 'double', or 'string'
-        """
         if not self._load_dll():
             return
 
@@ -204,9 +247,9 @@ class ParallelPythonTool:
             result_ptr = None
             buffer_size = 0
 
-            if typ in [1, 2, 3]:  # int, bool, double
+            if typ in [1, 2, 3]:
                 result_ptr = ctypes.cast(ctypes.pointer(result), ctypes.c_void_p)
-            elif typ == 4:  # string
+            elif typ == 4:
                 result_ptr = ctypes.cast(result, ctypes.c_void_p)
                 buffer_size = len(result)
 
@@ -220,13 +263,13 @@ class ParallelPythonTool:
         self._dll.invoke_all_parallel(ctypes.cast(descriptor_array, ctypes.c_void_p), count)
         self.logger.log_message(f"[C#] [Python] 🚀 Ran {count} callbacks in batch via run_all_parallel()")
 
-    def run_parallel(self, func: Callable, *args: Any, return_type: str = 'void', queue_name: str = None, count_to_call = 10) -> Any:
+    def run_parallel(self, func: Callable, *args: Any, return_type: str = 'void', queue_name: str = None,
+                     count_to_call=10) -> Any:
         if not self._load_dll():
             return
-        # Handle special "all" case for batching
         if return_type == 'all':
             wrapped_func = lambda: func(*args)
-            wrapper, result = self._create_callback_wrapper(wrapped_func, 'void')  # Treat as void
+            wrapper, result = self._create_callback_wrapper(wrapped_func, 'void')
             queue_key = queue_name or func.__name__
 
             if queue_key not in self._parallel_queues:
@@ -239,14 +282,11 @@ class ParallelPythonTool:
             if len(self._parallel_queues[queue_key]) >= count_to_call:
                 self.csharp_logger.set_prefix("[C#]")
                 self._flush_parallel_queue(queue_key)
-
             return None
 
-        # Otherwise: execute immediately via corresponding invoke_* call
         wrapped_func = lambda: func(*args)
         wrapper, result = self._create_callback_wrapper(wrapped_func, return_type)
         func_ptr = ctypes.cast(wrapper, ctypes.c_void_p)
-
         self.logger.log_message(
             f"[C#] [Python] ⚡ Running immediate callback (return_type='{return_type}') for '{func.__name__}'")
 
@@ -286,9 +326,9 @@ class ParallelPythonTool:
             result_ptr = None
             buffer_size = 0
 
-            if typ in [1, 2, 3]:  # int, bool, double
+            if typ in [1, 2, 3]:
                 result_ptr = ctypes.cast(ctypes.pointer(result), ctypes.c_void_p)
-            elif typ == 4:  # string
+            elif typ == 4:
                 result_ptr = ctypes.cast(result, ctypes.c_void_p)
                 buffer_size = len(result)
 
@@ -303,25 +343,18 @@ class ParallelPythonTool:
         self._parallel_queues[queue_key] = []
 
     def run_normal(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
-        """
-        Runs a Python function normally, setting the CSharpLogger prefix to "" during execution
-        and resetting it afterwards.
-
-        Args:
-            func (Callable): The function to execute.
-            *args: Positional arguments to pass to the function.
-            **kwargs: Keyword arguments to pass to the function.
-        """
         try:
             self.csharp_logger.set_prefix("")
             result = func(*args, **kwargs)
             return result
         except Exception as e:
             self.logger.log_message(f"Error running function '{func.__name__}' normally: {e}")
-            raise  # Re-raise the exception after logging
-
+            raise
 
     def stop(self) -> None:
+        # Release any allocated RAM before unloading the DLL
+        self.release_ram_usage()
+
         if self._dll:
             try:
                 if os.name == 'nt':
@@ -338,5 +371,6 @@ class ParallelPythonTool:
                 self.logger.log_message(f"[C#] [Python] ⚠️ Failed to unload DLL: {e}")
             finally:
                 self._dll = None
+
 
 
