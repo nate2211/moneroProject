@@ -1214,6 +1214,7 @@ class PythonRouterManager:
 
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
+
         iface_short = inbound_iface.split('_')[-1]
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         dst_ip = ip_layer.dst
@@ -1225,6 +1226,10 @@ class PythonRouterManager:
         # --- Multicast Handling (IPv4 and IPv6) ---
         if ipaddress.ip_address(dst_ip).is_multicast:
             self.router_logger.log_message(f"[Router] 🚧 Multicast packet detected for {dst_ip}.")
+            if not packet.haslayer(Ether):
+                self.router_logger.log_message(
+                    f"[Router] ❌ Dropping multicast packet for {dst_ip} that has no Ether layer.")
+                return
             target_mac = None
 
             if isinstance(ip_layer, IP):

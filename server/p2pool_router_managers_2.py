@@ -2,23 +2,24 @@ import json
 import subprocess
 from collections import defaultdict
 from functools import reduce
+from typing import Optional, List, Any, Dict, Tuple, Literal
 import ipaddress
 import threading
 import time
-from typing import Dict, Any, Tuple, Optional, List, Literal
-from scapy.layers.l2 import ARP
+
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
-from scapy.fields import ShortField, IP6Field, ByteField
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP6OptDNSServers, DHCP6_Advertise, DHCP6_Reply
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
+from scapy.layers.l2 import ARP, getmacbyip
 from scapy.layers.rip import RIPEntry, RIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet, Raw
+from scapy.fields import ByteField, ShortField,IP6Field
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import Ether
 import struct
@@ -2824,7 +2825,7 @@ class ARPManager:
                 return resolved_mac
             else:
                 self.router_logger.log_message(f"[ARP] ⛔ No response to ARP for {target_ip} on {iface.split('_')[-1]} getting mac address with function.")
-                resolved_mac = self.fallback_mac_from_os_cache(target_ip)
+                resolved_mac = getmacbyip(target_ip)
                 return resolved_mac
 
         except ValueError:
@@ -3042,9 +3043,13 @@ class DHCPServer:
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
         self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}
+        # --- CHANGED: Use a set for efficient O(1) IP allocation and deallocation ---
         self.dynamic_ip_pool = list(self._generate_ip_pool(self.lease_pool_start, self.lease_pool_end))
+        self.available_ips = set(self.dynamic_ip_pool)
         self._static_leases: Dict[str, ipaddress.IPv4Address] = {}
         self._lease_lock = threading.Lock()
+        # --- CHANGED: Reduced lease time to 10 minutes for faster recycling in busy networks ---
+        self.LEASE_DURATION_SECONDS = 600
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
 
         # --- DHCPv6 Configuration ---
@@ -3065,6 +3070,7 @@ class DHCPServer:
         while current <= end_int:
             yield ipaddress.IPv4Address(current)
             current += 1
+
     def get_ip_to_mac_bindings(self) -> Dict[str, str]:
         """
         Returns a thread-safe copy of the current IP-to-MAC lease bindings.
@@ -3092,12 +3098,17 @@ class DHCPServer:
         self.logger.log_message("[DHCP] Server stopped.")
 
     def _cleanup_leases_loop(self):
+        """Periodically removes expired DHCP leases and returns IPs to the available pool."""
         while not self._stop_event.is_set():
             now = time.time()
             with self._lease_lock:
                 expired_macs = [mac for mac, (ip, expiry) in self._leases.items() if expiry <= now]
                 for mac in expired_macs:
                     ip, _ = self._leases.pop(mac)
+                    # --- ADDED: Return the expired IP address to the available pool ---
+                    if ip not in set(self._static_leases.values()):
+                        self.available_ips.add(ip)
+                    self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired and returned to pool.")
             self._stop_event.wait(60)
 
     def _assign_ip(self, client_mac: str) -> ipaddress.IPv4Address | None:
@@ -3109,6 +3120,8 @@ class DHCPServer:
             # 1. Check for a static lease assignment first.
             if norm_mac in self._static_leases:
                 static_ip = self._static_leases[norm_mac]
+                # If this static IP is in the available pool, remove it
+                self.available_ips.discard(static_ip)
                 self._leases[norm_mac] = (static_ip, time.time() + self.LEASE_DURATION_SECONDS)
                 self.logger.log_message(f"[DHCP] 📌 Assigned static IP {static_ip} to {norm_mac}.")
                 return static_ip
@@ -3121,12 +3134,20 @@ class DHCPServer:
                     self.logger.log_message(f"[DHCP] 🏠 Renewed dynamic lease for {assigned_ip} to {norm_mac}")
                     return assigned_ip
 
-                    self._leases[norm_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {potential_ip} to {norm_mac}.")
-                    return potential_ip
-        self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
-        return None
+            # 3. --- REWRITTEN: Find an available IP from the efficient set ---
+            try:
+                # Pop an arbitrary (but very fast) IP from the set of available ones
+                potential_ip = self.available_ips.pop()
+                self._leases[norm_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
+                self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {potential_ip} to {norm_mac}.")
+                return potential_ip
+            except KeyError:
+                # This happens if the available_ips set is empty
+                self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
+                return None
 
+    # The handle_packet function and the rest of the class remains the same.
+    # ... (rest of your original class code from `handle_packet` onwards) ...
     def handle_packet(self, pkt: Packet, inbound_iface: str, find_route_function) -> bool:
         """
         Handles incoming DHCP packets (DISCOVER, REQUEST, SOLICIT, etc.).
