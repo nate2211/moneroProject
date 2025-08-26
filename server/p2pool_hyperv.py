@@ -24,7 +24,7 @@ from scapy.config import conf
 from scapy.layers.inet import IP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import Ether
-from win32 import win32api
+import win32api
 from tools.pythontools import yield_no_gil
 
 class CppLogger(QObject):

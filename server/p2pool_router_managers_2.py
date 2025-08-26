@@ -5,9 +5,11 @@ from functools import reduce
 import ipaddress
 import threading
 import time
-
+from typing import Dict, Any, Tuple, Optional, List, Literal
+from scapy.layers.l2 import ARP
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
+from scapy.fields import ShortField, IP6Field, ByteField
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP6OptDNSServers, DHCP6_Advertise, DHCP6_Reply
 from scapy.layers.dns import DNS, DNSRR
