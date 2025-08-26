@@ -1,0 +1,23 @@
+[2025-07-27 16:30:08.693] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute '_handle_scraping_started'
+[2025-07-27 16:33:39.490] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message'
+[2025-07-27 16:34:07.235] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message_to_gui'
+[2025-07-27 16:41:03.361] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
+[2025-07-27 16:41:45.008] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
+[2025-07-27 16:44:19.971] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
+[2025-07-27 16:45:34.056] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message'
+[2025-07-27 16:45:51.734] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message_to_gui'
+[2025-07-27 16:49:09.007] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
+[2025-07-27 16:51:36.483] [FATAL] Unhandled top-level exception: No module named 'scraping_manager'
+[2025-08-01 20:38:21.624] [FATAL] Unhandled top-level exception: name 'selfcp_in_checkbox' is not defined
+[2025-08-01 20:39:30.266] [FATAL] Unhandled top-level exception: name 'RouterLogger' is not defined
+[2025-08-02 16:39:34.216] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
+[2025-08-02 16:39:58.038] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
+[2025-08-02 16:40:38.630] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
+[2025-08-02 16:41:02.496] [FATAL] Unhandled top-level exception: index 0 has type 'list' but 'str' is expected
+[2025-08-02 16:41:49.063] [FATAL] Unhandled top-level exception: index 0 has type 'list' but 'str' is expected
+[2025-08-02 17:53:40.515] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'preset'
+[2025-08-02 17:54:25.763] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute '_load_preset'
+[2025-08-05 20:08:12.384] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute '_on_use_static_changed'
+[2025-08-10 17:33:49.676] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
+[2025-08-10 17:34:20.758] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
+[2025-08-10 17:34:24.946] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
