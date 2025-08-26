@@ -26,13 +26,14 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.all import send, sr1
 from scapy.arch import get_if_hwaddr
+from scapy.config import conf
 from scapy.layers.dhcp import DHCP
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.ipsec import ESP, AH
-from scapy.layers.l2 import Ether, GRE
+from scapy.layers.l2 import Ether, GRE, ARP
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet
 from scapy.layers.inet import IP, UDP
@@ -48,8 +49,9 @@ from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackM
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
 from p2pool_tools import ParallelPythonTool
-from p2pool_hyperv import HyperVManager
-from tools.pythontools import start_cpu_boost, yield_no_gil, burn_no_gil, unhinge_process
+from p2pool_hyperv import HyperVManager, WinDivertManager
+from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
+
 class PythonRouterManager:
 
     """
@@ -142,6 +144,7 @@ class PythonRouterManager:
         self.stratum_manager = StratumManager(router_logger)
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
+        self.windivert_manager = WinDivertManager(self)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
         self.parallel_python.inject_into(self.packet_catcher)
@@ -740,12 +743,14 @@ class PythonRouterManager:
         # Step 4: Update internal _interfaces_config with assigned IPs and MACs
         # Store configurations by full Scapy name
         self._interfaces_config[self.interface_in_full_name] = {
+            "friendly_name": self.interface_in_friendly_name,
             'ip_addr': self.router_ip_in,
             'network': self.router_network_in,
             'mac': get_if_hwaddr(self.interface_in_full_name),
             'broadcast': str(self.router_network_in.broadcast_address)
         }
         self._interfaces_config[self.interface_out_full_name] = {
+            "friendly_name": self.interface_out_friendly_name,
             'ip_addr': self.router_ip_out,
             'network': self.router_network_out,
             'mac': get_if_hwaddr(self.interface_out_full_name),
@@ -769,6 +774,7 @@ class PythonRouterManager:
                 if eth2_ip and eth2_netmask:
                     eth2_network = ipaddress.ip_network(f"{eth2_ip}/{eth2_netmask}", strict=False)
                     self._interfaces_config[ethernet_2_info["full_name"]] = {
+                        "friendly_name": self.interface_ethernet_2_friendly_name,
                         "ip_addr": eth2_ip,
                         "network": eth2_network,
                         "mac": eth2_mac,
@@ -776,6 +782,7 @@ class PythonRouterManager:
                     }
                 else:
                     self._interfaces_config[ethernet_2_info["full_name"]] = {
+                        "friendly_name": self.interface_ethernet_2_friendly_name,
                         "ip_addr": "0.0.0.0",
                         "network": None,
                         "mac": eth2_mac,
@@ -801,6 +808,7 @@ class PythonRouterManager:
                 if lac_ip and lac_netmask:
                     lac_network = ipaddress.ip_network(f"{lac_ip}/{lac_netmask}", strict=False)
                     self._interfaces_config[self.interface_lac_full_name] = {
+                        "friendly_name": self.interface_lac_friendly_name,
                         "ip_addr": lac_ip,
                         "network": lac_network,
                         "mac": lac_mac,
@@ -810,6 +818,7 @@ class PythonRouterManager:
                         f"[Router] Added LAC interface to config: {self.interface_lac_full_name}, IP: {lac_ip}, MAC: {lac_mac}")
                 else:
                     self._interfaces_config[self.interface_lac_full_name] = {
+                        "friendly_name": self.interface_lac_friendly_name,
                         "ip_addr": "0.0.0.0",
                         "network": None,
                         "mac": lac_mac,
@@ -837,6 +846,7 @@ class PythonRouterManager:
                     lac_2_network = ipaddress.ip_network(f"{lac_2_ip}/{lac_2_netmask}", strict=False)
 
                     self._interfaces_config[self.interface_lac_2_full_name] = {
+                        "friendly_name": self.interface_lac_2_friendly_name,
                         "ip_addr": lac_2_ip,
                         "network": lac_2_network,
                         "mac": lac_2_mac,
@@ -846,6 +856,7 @@ class PythonRouterManager:
                         f"[Router] Added LAC 2 interface to config: {self.interface_lac_2_full_name}, IP: {lac_2_ip}, MAC: {lac_2_mac}")
                 else:
                     self._interfaces_config[self.interface_lac_2_full_name] = {
+                        "friendly_name": self.interface_lac_2_friendly_name,
                         "ip_addr": "0.0.0.0",
                         "network": None,
                         "mac": lac_2_mac,
@@ -905,6 +916,7 @@ class PythonRouterManager:
                 loopback_mac = "00:00:00:00:00:00"
 
             self._interfaces_config[self.interface_loopback_full_name] = {
+                'friendly_name': "Loopback",
                 'ip_addr': loopback_ip,
                 'network': loopback_network,
                 'mac': loopback_mac,
@@ -931,7 +943,6 @@ class PythonRouterManager:
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
         self.router_macs = {cfg.get('mac') for cfg in self._interfaces_config.values() if 'mac' in cfg}
-
         self.router_logger.log_message(f"\n--- Python Router Configuration Summary ---")
         self.router_logger.log_message(
             f"  IN Interface: '{self.interface_in_friendly_name}' (Full: {self.interface_in_full_name}, MAC: {self.mac_in}, IP: {self.router_ip_in}/{self.router_netmask_in})")
@@ -943,6 +954,7 @@ class PythonRouterManager:
             f"  External Gateway: {self.router_gateway_out_ip} via '{self.interface_out_friendly_name}'")
         self.router_logger.log_message(f"----------------------------------------------------------------")
         return True
+
     def _start_single_sniffer(self, iface_name: str):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
@@ -963,7 +975,7 @@ class PythonRouterManager:
                         return
                     if len(pkt) < 14 or len(pkt) > 65535:
                         return
-                    self._process_packet(pkt, iface_name)
+                    self.process_packet(pkt, iface_name)
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
@@ -1031,27 +1043,29 @@ class PythonRouterManager:
         if self.dhcp_server_out:
             self.dhcp_server_out.start()
 
-    def _process_packet(self, packet, inbound_iface: str):
+    def process_packet(self, packet, inbound_iface: str):
         """
         Main packet processing pipeline with a clear separation for router-destined
         vs. transit traffic.
         """
         try:
+
             if packet.haslayer(Ether):
                 src_mac = packet[Ether].src
-                # Create a list of all router MACs dynamically to ensure it's always up to date
-                if src_mac.lower() in self.router_macs:
+                if src_mac and src_mac.lower() in self.router_macs:
                     self.function_call_tracker.track(
                         identifier='DroppedMacLog',
                         threshold=20,
                         final_message=f"[Router] 👻 Dropping packet from our own MAC ({src_mac}). Count: {{}}.",
                         count_message=None,
                     )
-                    return  # Do not process this packet
-            try:
-                eth_type = packet[Ether].type
-            except Exception as e:
-                self.router_logger.log_message(f"[Bridge] ⚠️ Failed to extract EtherType: {e}")
+                    return
+
+            # 2) Get “ether type” for downstream routing decisions
+            eth_type = self._eth_type_or_none(packet)
+            if eth_type is None:
+                # Rate-limit this if it’s noisy
+                self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
             # Step 1: [Layer 2] Handle non-IP packets first (e.g., ARP, L2 frames).
             # The L2 manager returns True if the packet is handled and should not be processed further.
@@ -1096,9 +1110,9 @@ class PythonRouterManager:
                                                   egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
                     return
             if self.isakmp_manager.handle_packet(packet, inbound_iface):
-                self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface, egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
                 return
-
+            if self.stratum_manager.handle_packet(packet, inbound_iface):
+                return
             is_for_router = dst_ip in self._get_all_local_ips()
 
             if is_for_router:
@@ -1168,9 +1182,6 @@ class PythonRouterManager:
             if packet.haslayer(Kerberos):
                 if self.kerberos_manager.handle_kerberos_packet(packet, inbound_iface, self._interfaces_config):
                     return
-
-            if packet.haslayer(TCP) and self.stratum_manager.handle_packet(packet, inbound_iface):
-                return
 
             # Duplicate flow check (rate-limiting)
             proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
@@ -1476,7 +1487,7 @@ class PythonRouterManager:
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
 
-
+            self.packet_writer.update_interfaces(self._interfaces_config)
             self._enable_nat_forwarding()
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
 
@@ -1539,22 +1550,26 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_in, self.mac_in, self.interface_in_full_name)
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
-            if use_hyperv:
-                self.hyperv_manager.start()
-                self.hyperv_enabled = True
-            else:
-                self.hyperv_enabled = False
+
+
+
 
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
-            pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]  # example: your P-cores (adjust for your CPU)
+            self.parallel_python.increase_ram_usage(700)
+            pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            start_cpu_boost(threads=len(pcores), target_util=0.90, cores=pcores, pin_per_thread=True, unhinge=False)
-
+            start_cpu_boost(threads=len(pcores), target_util=0.25, cores=pcores, pin_per_thread=True, unhinge=True)
+            if use_hyperv:
+                self.hyperv_manager.start()
+                self.windivert_manager.start()
+                self.hyperv_enabled = True
+            else:
+                self.hyperv_enabled = False
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
@@ -1563,6 +1578,7 @@ class PythonRouterManager:
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
+            self.parallel_python.release_ram_usage()
             if use_static:
                 self._deconfigure_interface_settings()
             self._stop_sniffing_event.set()
@@ -1585,21 +1601,39 @@ class PythonRouterManager:
             # Access _sniff_threads with lock, as monitor might be trying to remove/add.
 
             self.router_logger.log_message("[Router] Sniffer threads stopped.")
-            if use_hyperv:
-                self.hyperv_manager.teardown()
-                self.hyperv_enabled = False
+            stop_cpu_boost()
             self._sniff_threads.clear()
             self.igmp_manager.stop()
             self.handshake_manager.stop()
             self.remove_l2_bridge("MyLANBridge")
             self.remove_link_aggregation_group("MyLANAggregation")
-            self.remove_outbound_load_balancing_interface(self.interface_ethernet_2_full_name)
-            self.remove_outbound_load_balancing_interface(self.interface_out_full_name)
+            if self.interface_out_full_name:
+                self.remove_outbound_load_balancing_interface(self.interface_out_full_name)
+            if self.interface_lac_full_name:
+                self.remove_outbound_load_balancing_interface(self.interface_lac_full_name)
+            if self.interface_lac_2_full_name:
+                self.remove_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             self.syn_scanner.stop()
             self.cleanup_all_network_changes()
+            if use_hyperv:
+                self.windivert_manager.stop()
+                self.hyperv_manager.teardown()
+                self.hyperv_enabled = False
+
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
+
+    def _eth_type_or_none(self, pkt):
+        if pkt.haslayer(Ether):
+            return pkt[Ether].type
+        if pkt.haslayer(IP):
+            return 0x0800  # IPv4
+        if pkt.haslayer(IPv6):
+            return 0x86DD  # IPv6
+        if pkt.haslayer(ARP):
+            return 0x0806  # (won’t appear from WinDivert, but safe)
+        return None
 
     def trigger_arp_via_ping(self, ip: str, timeout: float = 1.0):
         try:

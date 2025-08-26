@@ -1,21 +1,11 @@
-import hashlib
-import hmac
 import json
-import os
-import socket
-import struct
 import subprocess
 from collections import defaultdict
 from functools import reduce
-from typing import Optional, List, Any
 import ipaddress
 import threading
 import time
 
-import psutil
-from Crypto.Cipher import AES
-from passlib.handlers.windows import nthash
-from pyDes import des, ECB
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
@@ -23,23 +13,12 @@ from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
-from scapy.layers.l2 import ARP, Ether, getmacbyip
 from scapy.layers.rip import RIPEntry, RIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet, Raw
-from scapy.fields import ByteField, ShortField, IntField, IPField, PacketListField, IP6Field, BitField, LongField, \
-    StrFixedLenField, StrLenField, ByteEnumField, FieldLenField
 from scapy.layers.inet import IP, UDP
-from enum import Enum, auto
 from scapy.layers.l2 import Ether
-from scapy.layers.eap import EAPOL, EAP, EAP_PEAP
-from OpenSSL import SSL
-import ssl, socket
-from io import BytesIO
-from typing import Tuple, Dict, Literal
-from hmac import new as hmac_new
-from hashlib import sha1
 import struct
 
 
@@ -3064,15 +3043,11 @@ class DHCPServer:
         self.dynamic_ip_pool = list(self._generate_ip_pool(self.lease_pool_start, self.lease_pool_end))
         self._static_leases: Dict[str, ipaddress.IPv4Address] = {}
         self._lease_lock = threading.Lock()
-        self.LEASE_DURATION_SECONDS = 3600
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
 
         # --- DHCPv6 Configuration ---
         self.dhcp6_prefix = ipaddress.IPv6Network(dhcp6_prefix) if dhcp6_prefix else None
         self.dhcp6_relay_target_ip = dhcp6_relay_target_ip
-        # Note: For simplicity, this implementation uses stateless DHCPv6.
-        # It does not maintain a lease table for IPv6 addresses.
-        # It only replies with configuration options.
 
         self._stop_event = threading.Event()
         self._cleanup_thread = None
@@ -3099,7 +3074,6 @@ class DHCPServer:
             bindings = {str(ip): mac for mac, (ip, expiry) in self._leases.items() if time.time() < expiry}
         return bindings
 
-
     def start(self):
         """Starts the DHCP server's cleanup thread."""
         self._stop_event.clear()
@@ -3116,16 +3090,13 @@ class DHCPServer:
         self.logger.log_message("[DHCP] Server stopped.")
 
     def _cleanup_leases_loop(self):
-        """Periodically removes expired DHCP leases (IPv4 only)."""
         while not self._stop_event.is_set():
             now = time.time()
             with self._lease_lock:
                 expired_macs = [mac for mac, (ip, expiry) in self._leases.items() if expiry <= now]
                 for mac in expired_macs:
                     ip, _ = self._leases.pop(mac)
-                    self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired and removed.")
             self._stop_event.wait(60)
-
 
     def _assign_ip(self, client_mac: str) -> ipaddress.IPv4Address | None:
         """Assigns an IP address, prioritizing static leases over the dynamic pool."""
@@ -3136,10 +3107,6 @@ class DHCPServer:
             # 1. Check for a static lease assignment first.
             if norm_mac in self._static_leases:
                 static_ip = self._static_leases[norm_mac]
-                for mac, (ip, expiry) in self._leases.items():
-                    if ip == static_ip and mac != norm_mac and time.time() < expiry:
-                        self.logger.log_message(f"[DHCP] ❌ Static IP conflict! {static_ip} is currently leased to {mac}.")
-                        return None
                 self._leases[norm_mac] = (static_ip, time.time() + self.LEASE_DURATION_SECONDS)
                 self.logger.log_message(f"[DHCP] 📌 Assigned static IP {static_ip} to {norm_mac}.")
                 return static_ip
@@ -3152,15 +3119,9 @@ class DHCPServer:
                     self.logger.log_message(f"[DHCP] 🏠 Renewed dynamic lease for {assigned_ip} to {norm_mac}")
                     return assigned_ip
 
-            # 3. Find an available IP in the dynamic pool.
-            leased_ips = {ip for ip, _ in self._leases.values()}
-            statically_reserved_ips = set(self._static_leases.values())
-            for potential_ip in self.dynamic_ip_pool:
-                if potential_ip not in leased_ips and potential_ip not in statically_reserved_ips:
                     self._leases[norm_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
                     self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {potential_ip} to {norm_mac}.")
                     return potential_ip
-
         self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
         return None
 

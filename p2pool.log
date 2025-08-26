@@ -1,23 +1,36 @@
-[2025-07-27 16:30:08.693] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute '_handle_scraping_started'
-[2025-07-27 16:33:39.490] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message'
-[2025-07-27 16:34:07.235] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message_to_gui'
-[2025-07-27 16:41:03.361] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
-[2025-07-27 16:41:45.008] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
-[2025-07-27 16:44:19.971] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
-[2025-07-27 16:45:34.056] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message'
-[2025-07-27 16:45:51.734] [FATAL] Unhandled top-level exception: 'ScrapingTab' object has no attribute 'log_message_to_gui'
-[2025-07-27 16:49:09.007] [FATAL] Unhandled top-level exception: 'PyQt5.QtCore.pyqtSignal' object has no attribute 'connect'
-[2025-07-27 16:51:36.483] [FATAL] Unhandled top-level exception: No module named 'scraping_manager'
-[2025-08-01 20:38:21.624] [FATAL] Unhandled top-level exception: name 'selfcp_in_checkbox' is not defined
-[2025-08-01 20:39:30.266] [FATAL] Unhandled top-level exception: name 'RouterLogger' is not defined
-[2025-08-02 16:39:34.216] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
-[2025-08-02 16:39:58.038] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
-[2025-08-02 16:40:38.630] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'presets'
-[2025-08-02 16:41:02.496] [FATAL] Unhandled top-level exception: index 0 has type 'list' but 'str' is expected
-[2025-08-02 16:41:49.063] [FATAL] Unhandled top-level exception: index 0 has type 'list' but 'str' is expected
-[2025-08-02 17:53:40.515] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'preset'
-[2025-08-02 17:54:25.763] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute '_load_preset'
-[2025-08-05 20:08:12.384] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute '_on_use_static_changed'
-[2025-08-10 17:33:49.676] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
-[2025-08-10 17:34:20.758] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
-[2025-08-10 17:34:24.946] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'cpu_affinity_input_input'
+[2025-07-22 14:11:22.079] [FATAL] Unhandled top-level exception: 'P2PoolHelper' object has no attribute 'packet_manager'
+[2025-07-22 14:17:45.197] [FATAL] Unhandled top-level exception: 'P2PoolHelper' object has no attribute 'packetk_manager'
+[2025-07-22 14:19:24.399] [FATAL] Unhandled top-level exception: 'P2PoolHelper' object has no attribute 'packetk_manager'
+[2025-07-22 16:53:16.206] [FATAL] Unhandled top-level exception: P2PoolGUI.__init__() missing 1 required positional argument: 'p2pool_helper'
+[2025-07-22 16:53:28.160] [FATAL] Unhandled top-level exception: P2PoolGUI.__init__() missing 1 required positional argument: 'p2pool_helper'
+[2025-07-22 16:54:55.255] [FATAL] Unhandled top-level exception: P2PoolGUI.__init__() missing 1 required positional argument: 'p2pool_helper'
+[2025-07-23 13:32:44.260] [FATAL] Unhandled top-level exception: 'P2PoolGUI' object has no attribute 'send_ping_packet'
+[2025-07-23 13:32:48.867] [FATAL] Unhandled top-level exception: 'P2PoolGUI' object has no attribute 'send_ping_packet'
+[2025-07-23 13:34:24.189] [FATAL] Unhandled top-level exception: decorated slot has no signature compatible with clicked(bool)
+[2025-07-23 13:36:47.363] [FATAL] Unhandled top-level exception: 'P2PoolGUI' object has no attribute 'send_ping_packet'
+[2025-07-23 13:48:26.210] [FATAL] Unhandled top-level exception: P2PoolGUI.__init__() takes 6 positional arguments but 7 were given
+[2025-07-23 13:49:04.323] [FATAL] Unhandled top-level exception: name 'PacketSenderTab' is not defined
+[2025-07-23 14:15:50.247] [FATAL] Unhandled top-level exception: name 'is_admin' is not defined
+[2025-07-25 08:57:22.498] [FATAL] Unhandled top-level exception: 'QTextEdit' object has no attribute 'appendHtml'
+[2025-07-25 09:32:35.370] [FATAL] Unhandled top-level exception: module 'google.genai' has no attribute 'configure'
+[2025-07-25 09:53:36.614] [FATAL] Unhandled top-level exception: 'QTextEdit' object has no attribute 'log_message'
+[2025-07-25 09:53:57.044] [FATAL] Unhandled top-level exception: decorated slot has no signature compatible with GeminiLogger.message_signal[str]
+[2025-07-25 09:55:10.731] [FATAL] Unhandled top-level exception: GeminiChatTab.log_message() got an unexpected keyword argument 'message_type'
+[2025-07-25 09:57:44.297] [FATAL] Unhandled top-level exception: decorated slot has no signature compatible with GeminiLogger.message_signal[str]
+[2025-07-25 12:42:43.614] [FATAL] Unhandled top-level exception: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+[2025-07-25 14:23:37.760] [FATAL] Unhandled top-level exception: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+[2025-07-25 14:23:57.049] [FATAL] Unhandled top-level exception: Missing key inputs argument! To use the Google AI API, provide (`api_key`) arguments. To use the Google Cloud API, provide (`vertexai`, `project` & `location`) arguments.
+[2025-07-25 14:31:31.678] [FATAL] Unhandled top-level exception: 'GeminiChatBot' object has no attribute 'grounding_tool'
+[2025-07-25 14:31:49.849] [FATAL] Unhandled top-level exception: 'GeminiChatBot' object has no attribute 'grounding_tool'
+[2025-07-25 14:45:52.864] [FATAL] Unhandled top-level exception: 1 validation error for GenerateContentConfig
+stop_sequences.0
+  Input should be a valid string [type=string_type, input_value=Tool(
+  google_search=GoogleSearch()
+), input_type=Tool]
+    For further information visit https://errors.pydantic.dev/2.11/v/string_type
+[2025-07-27 23:47:40.637] [FATAL] Unhandled top-level exception: 'NmapLogger' object is not callable
+[2025-07-27 23:48:25.672] [FATAL] Unhandled top-level exception: 'NmapLogger' object is not callable
+[2025-07-27 23:48:34.067] [FATAL] Unhandled top-level exception: 'NmapLogger' object is not callable
+[2025-07-27 23:48:56.629] [FATAL] Unhandled top-level exception: 'NmapLogger' object is not callable
+[2025-08-06 09:55:29.592] [FATAL] Unhandled top-level exception: 'RouterTab' object has no attribute 'router_ip_out_input'
+[2025-08-08 15:28:51.109] [FATAL] Unhandled top-level exception: 'NoneType' object has no attribute 'call_soon_threadsafe'
