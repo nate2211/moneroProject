@@ -44,7 +44,7 @@ from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
-    StratumManager
+    StratumManager, StratumConnectionManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
@@ -142,6 +142,11 @@ class PythonRouterManager:
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.isakmp_manager = None
         self.stratum_manager = StratumManager(router_logger)
+        self.stratum_connection_manager = StratumConnectionManager(
+            self.router_logger,
+            self.stratum_manager,
+            self.process_packet  # Callback for reinjection
+        )
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.windivert_manager = WinDivertManager(self)
@@ -1218,10 +1223,6 @@ class PythonRouterManager:
         iface_short = inbound_iface.split('_')[-1]
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         dst_ip = ip_layer.dst
-        if not packet.haslayer(Ether):
-            self.router_logger.log_message(
-                f"[Router] ❌ Dropping packet for {dst_ip} that has no Ether layer.")
-            return
         if not ip_layer:
             self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
             return
@@ -1229,10 +1230,7 @@ class PythonRouterManager:
         # --- Multicast Handling (IPv4 and IPv6) ---
         if ipaddress.ip_address(dst_ip).is_multicast:
             self.router_logger.log_message(f"[Router] 🚧 Multicast packet detected for {dst_ip}.")
-            if not packet.haslayer(Ether):
-                self.router_logger.log_message(
-                    f"[Router] ❌ Dropping multicast packet for {dst_ip} that has no Ether layer.")
-                return
+
             target_mac = None
 
             if isinstance(ip_layer, IP):
@@ -1326,8 +1324,18 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(translated_ip, translated_mac, selected_iface)
 
             # Rewrite MACs
-            packet[Ether].src = self.get_interface_mac(selected_iface)
-            packet[Ether].dst = next_hop_mac
+            if packet.haslayer(Ether):
+                # Standard case: The packet has an L2 frame, so we just modify it.
+                packet[Ether].src = self.get_interface_mac(selected_iface)
+                packet[Ether].dst = next_hop_mac
+            else:
+                # HARDENING: Packet is missing the Ether layer. We'll build one.
+                self.router_logger.log_message(
+                    f"[Router] 🛠️ Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer."
+                )
+                src_mac = self.get_interface_mac(selected_iface)
+                # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
+                packet = Ether(src=src_mac, dst=next_hop_mac) / packet
 
             packet[IP].src = self.nat_manager.public_ip
             del packet[IP].chksum
@@ -1415,6 +1423,17 @@ class PythonRouterManager:
         # --- [8] MAC Resolution ---
         if is_loopback:
             target_mac = "00:00:00:00:00:00"
+            if packet.haslayer(Ether):
+                # This is a standard packet, just update the MAC addresses
+                packet[Ether].src = outbound_config["mac"]
+                packet[Ether].dst = target_mac
+            else:
+                # HARDENING: The packet is missing an Ether layer. We will build one.
+                self.router_logger.log_message(
+                    f"[Router] 🛠️ Hardening packet for {dst_ip}: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}."
+                )
+                # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
+                packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
 
             self.router_logger.log_message(
                 f"[Router] 🌀 Loopback forwarding for {dst_ip}. No ARP needed."
@@ -1456,15 +1475,18 @@ class PythonRouterManager:
         # --- [10] Adjust or Apply Ether Layer ---
         if is_loopback:
             if packet.haslayer(Ether):
-                packet = packet.payload  # strip Ethernet layer
+                packet = packet.payload  # Strip Ethernet layer for loopback processing
         elif packet.haslayer(Ether):
+            # Standard case: The packet has a frame, so we just update the MACs.
             packet[Ether].src = outbound_config["mac"]
             packet[Ether].dst = target_mac
         else:
+            # HARDENING: Packet is missing the Ether layer. We will build one.
             self.router_logger.log_message(
-                f"[Router] ⚠️ Packet missing Ether layer for {initial_outbound_iface.split('_')[-1]}. Cannot send."
+                f"[Router] 🛠️ Hardening packet: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}."
             )
-            return
+            # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
+            packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
 
         # --- [11] Fix Checksums ---
         del ip_layer.chksum
@@ -1483,7 +1505,7 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -1558,10 +1580,9 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_in, self.mac_in, self.interface_in_full_name)
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
-
-
-
-
+            if use_startum_comm:
+                self.stratum_connection_manager.configure("170.253.164.244", 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
+                self.stratum_connection_manager.start()
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
@@ -1582,11 +1603,13 @@ class PythonRouterManager:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv):
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm):
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
             self.parallel_python.release_ram_usage()
+            if use_stratum_comm:
+                self.stratum_connection_manager.stop()
             if use_static:
                 self._deconfigure_interface_settings()
             self._stop_sniffing_event.set()

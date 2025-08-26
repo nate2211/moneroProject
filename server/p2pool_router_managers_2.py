@@ -1,4 +1,5 @@
 import json
+import queue
 import subprocess
 from collections import defaultdict
 from functools import reduce
@@ -23,6 +24,11 @@ from scapy.fields import ByteField, ShortField,IP6Field
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import Ether
 import struct
+import socket
+import threading
+import json
+from scapy.packet import Packet, Raw
+from scapy.layers.inet import IP, TCP
 
 
 class MLDQuery(Packet):
@@ -71,105 +77,640 @@ class ICMPv6(Packet):
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
 
+
+class StratumConnectionManager:
+    """
+    Acts as a Stratum proxy and a direct pool connector for Monero simultaneously.
+    It listens for local miners to relay their data, while also maintaining its own
+    direct connection to the pool for independent data gathering.
+
+    This version:
+      - Fixes socket lifecycle bugs and thread joins.
+      - Drops any packet that isn't valid Monero Stratum JSON-RPC (allowlisted).
+      - Avoids passing non-IP placeholders into Scapy.
+      - Ensures direct pool socket is tracked for submit/keepalive.
+      - Adds robust line framing and JSON handling.
+    """
+
+    # ---- Strict allowlist for Monero Stratum JSON-RPC methods ----
+    # Monero pools (xmrig/xmrig-proxy flavor) typically use: login, submit, job, keepalived, getjob
+    MONERO_ALLOWED_METHODS = {"login", "submit", "job", "keepalived", "getjob"}
+
+    def __init__(self, router_logger, stratum_manager, packet_processor_callback):
+        self.logger = router_logger
+        self.stratum_manager = stratum_manager
+        self.packet_processor = packet_processor_callback
+
+        # --- Proxy Configuration ---
+        self.proxy_host = "127.0.0.1"
+        self.proxy_port = 3333
+
+        # --- Pool Connection Details ---
+        self.pool_ip: Optional[str] = None
+        self.pool_port: Optional[int] = None
+        self.wallet_address: Optional[str] = None
+        self.worker_name = "default"
+        self.user_agent = "XMRig/6.18.0"
+
+        # --- State and Threading ---
+        self._threads: List[threading.Thread] = []
+        self._active_sockets: List[socket.socket] = []
+        self._stop_event = threading.Event()
+        self.direct_session_id: Optional[str] = None  # Session ID for the direct connection
+        self._last_activity_time = 0.0
+        self.KEEPALIVE_INTERVAL = 30
+        self._lock = threading.Lock()
+
+        # Track connected pool socket for direct submit()
+        self._pool_socket: Optional[socket.socket] = None  # FIX: ensure we keep reference
+
+        self.logger.log_message("[StratumConn] ⛏️ Dual-Mode Manager initialized with Priority Processing.")
+
+    def configure(self, pool_ip: str, pool_port: int, wallet: str, worker: str = "default", listen_port: int = 3333):
+        """Configures the manager for both proxy and direct operations."""
+        self.pool_ip = pool_ip
+        self.pool_port = pool_port
+        self.wallet_address = wallet
+        self.worker_name = worker
+        self.proxy_port = listen_port
+        self.logger.log_message(
+            f"[StratumConn] 🎯 Configured for pool {pool_ip}:{pool_port}. Proxy listening on {self.proxy_host}:{listen_port}"
+        )
+
+    def start(self):
+        """Starts both the direct connector and proxy listener threads."""
+        if not all([self.pool_ip, self.wallet_address, self.pool_port]):
+            self.logger.log_message("[StratumConn] ❌ Cannot start: Configuration is incomplete.")
+            return
+        if self._threads:
+            self.logger.log_message("[StratumConn] Manager is already running.")
+            return
+
+        self._stop_event.clear()
+
+        direct_thread = threading.Thread(
+            target=self._direct_connection_loop, daemon=True, name="StratumDirectConnector"
+        )
+        self._threads.append(direct_thread)
+        direct_thread.start()
+
+        proxy_thread = threading.Thread(
+            target=self._listen_for_miners, daemon=True, name="StratumProxyListener"
+        )
+        self._threads.append(proxy_thread)
+        proxy_thread.start()
+
+    def stop(self):
+        """Stops all threads and closes all active sockets."""
+        if not self._threads:
+            return
+
+        self.logger.log_message("[StratumConn] Stopping all operations...")
+        self._stop_event.set()
+
+        # Close sockets
+        with self._lock:
+            for sock in list(self._active_sockets):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._active_sockets.clear()
+
+        # Join threads
+        for thread in self._threads:
+            try:
+                thread.join(timeout=2)
+            except RuntimeError:
+                pass
+        self._threads.clear()
+        self.logger.log_message("[StratumConn] All operations stopped.")
+
+    def _add_socket(self, sock: socket.socket):
+        with self._lock:
+            self._active_sockets.append(sock)
+
+    def _remove_socket(self, sock: socket.socket):
+        with self._lock:
+            if sock in self._active_sockets:
+                self._active_sockets.remove(sock)
+
+    # ==================================================================
+    # Direct Connection Mode Logic
+    # ==================================================================
+    def _direct_connection_loop(self):
+        reconnect_delay = 5.0
+
+        while not self._stop_event.is_set():
+            pool_socket: Optional[socket.socket] = None
+            try:
+                assert self.pool_ip is not None and self.pool_port is not None
+                self.logger.log_message(f"[StratumConn] 🔌 (Direct) Connecting to {self.pool_ip}:{self.pool_port}...")
+                pool_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                pool_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                pool_socket.settimeout(10.0)
+                pool_socket.connect((self.pool_ip, self.pool_port))
+                pool_socket.settimeout(1.0)  # non-blocking-ish read loop
+                self._add_socket(pool_socket)
+                self._pool_socket = pool_socket  # FIX: remember direct socket for submit/keepalive
+                self.logger.log_message(f"[StratumConn] ✅ (Direct) Connected.")
+
+                reconnect_delay = 5.0
+                self._last_activity_time = time.time()
+                self._send_authorize_request(pool_socket)
+                receive_buffer = b""
+
+                while not self._stop_event.is_set():
+                    if time.time() - self._last_activity_time > self.KEEPALIVE_INTERVAL:
+                        self._send_keepalive(pool_socket)
+
+                    try:
+                        data = pool_socket.recv(8192)
+                        if not data:
+                            self.logger.log_message("[StratumConn] 💔 (Direct) Connection closed by peer.")
+                            break
+                        self._last_activity_time = time.time()
+                        receive_buffer += data
+                        receive_buffer = self._process_received_data(receive_buffer, pool_socket)
+                    except socket.timeout:
+                        continue
+                    except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                        self.logger.log_message(f"[StratumConn] 💔 (Direct) Connection error: {e}")
+                        break
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] ❌ (Direct) Connection failed: {e}")
+            finally:
+                if pool_socket:
+                    try:
+                        pool_socket.close()
+                    except OSError:
+                        pass
+                    self._remove_socket(pool_socket)
+                self._pool_socket = None  # FIX: clear dangling reference
+
+            if not self._stop_event.is_set():
+                self._stop_event.wait(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, 60.0)
+
+    # ==================================================================
+    # Proxy Mode Logic
+    # ==================================================================
+    def _listen_for_miners(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.proxy_host, self.proxy_port))
+        server_socket.listen(64)
+        server_socket.settimeout(1.0)
+        self.logger.log_message(f"[StratumConn] 👂 (Proxy) Listening for miners on {self.proxy_host}:{self.proxy_port}")
+        self._add_socket(server_socket)
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    miner_conn, miner_addr = server_socket.accept()
+                    miner_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    miner_conn.settimeout(1.0)
+                    self.logger.log_message(f"[StratumConn] 🤝 (Proxy) Accepted connection from miner at {miner_addr}")
+
+                    handler_thread = threading.Thread(
+                        target=self._handle_miner_session, args=(miner_conn,), daemon=True
+                    )
+                    handler_thread.start()
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    if not self._stop_event.is_set():
+                        self.logger.log_message(f"[StratumConn] (Proxy) Listener error: {e}")
+        finally:
+            try:
+                server_socket.close()
+            except OSError:
+                pass
+            self._remove_socket(server_socket)
+
+    def _handle_miner_session(self, miner_socket: socket.socket):
+        pool_socket: Optional[socket.socket] = None
+        self._add_socket(miner_socket)
+        send_queue: "queue.PriorityQueue[Tuple[int, bytes]]" = queue.PriorityQueue()
+        try:
+            assert self.pool_ip is not None and self.pool_port is not None
+            self.logger.log_message(f"[StratumConn] 🔌 (Proxy) Connecting to pool {self.pool_ip}:{self.pool_port}...")
+            pool_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            pool_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            pool_socket.settimeout(10.0)
+            pool_socket.connect((self.pool_ip, self.pool_port))
+            pool_socket.settimeout(1.0)
+            self._add_socket(pool_socket)
+            self.logger.log_message("[StratumConn] ✅ (Proxy) Pool connection successful.")
+
+            sender_thread = threading.Thread(
+                target=self._sender_worker, args=(send_queue, pool_socket), daemon=True
+            )
+            sender_thread.start()
+
+            # Relay directions
+            miner_to_pool_thread = threading.Thread(
+                target=self._relay_data,
+                args=(miner_socket, send_queue, "Miner -> Pool", pool_socket),
+                daemon=True,
+            )
+            pool_to_miner_thread = threading.Thread(
+                target=self._relay_data,
+                args=(pool_socket, miner_socket, "Pool -> Miner"),
+                daemon=True,
+            )
+
+            miner_to_pool_thread.start()
+            pool_to_miner_thread.start()
+            miner_to_pool_thread.join()
+            pool_to_miner_thread.join()
+
+        except Exception as e:
+            self.logger.log_message(f"[StratumConn] ❌ (Proxy) Session failed: {e}")
+        finally:
+            self.logger.log_message("[StratumConn] 💔 (Proxy) Session ended.")
+            # Unblock sender worker
+            try:
+                send_queue.put((99, b""))  # sentinel
+            except Exception:
+                pass
+            for s in (miner_socket, pool_socket):
+                if s:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                    self._remove_socket(s)
+
+    def _sender_worker(self, send_queue: "queue.PriorityQueue[Tuple[int, bytes]]", dest_socket: socket.socket):
+        """Worker thread that sends data from a priority queue."""
+        while not self._stop_event.is_set():
+            try:
+                priority, data = send_queue.get()
+                if data == b"":
+                    break  # sentinel
+                if not data:
+                    continue
+                dest_socket.sendall(data)
+            except (ConnectionAbortedError, ConnectionResetError, OSError):
+                break
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] Sender worker error: {e}")
+                break
+
+    def _relay_data(self, src_socket, dest, direction: str):
+        """
+        Relays data from a source socket.
+        - Miner -> Pool: dest is a PriorityQueue
+        - Pool -> Miner: dest is a socket
+        """
+        miner_to_pool = direction == "Miner -> Pool"
+
+        while not self._stop_event.is_set():
+            try:
+                data = src_socket.recv(8192)
+                if not data:
+                    self.logger.log_message(f"[StratumConn] Relay {direction}: Connection closed.")
+                    break
+
+                if miner_to_pool:
+                    # Break data into JSON messages, enqueue with priority
+                    messages = data.strip().split(b'\n')
+                    for msg_bytes in messages:
+                        if not msg_bytes:
+                            continue
+                        priority = 3
+                        try:
+                            decoded = json.loads(msg_bytes)
+                            if decoded.get("method") in ("job", "mining.notify"):
+                                priority = 1
+                            elif decoded.get("method") in ("submit", "mining.submit"):
+                                priority = 2
+                        except Exception:
+                            pass
+                        dest.put((priority, msg_bytes + b'\n'))
+                else:
+                    # Pool -> Miner: send raw bytes to miner socket
+                    dest.sendall(data)
+
+                # optional analysis hook
+                self._analyze_relayed_data(data, src_socket, dest, direction)
+
+            except (socket.timeout, ConnectionAbortedError, ConnectionResetError, OSError):
+                break
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] Relay error in {direction}: {e}")
+                break
+
+    # ==================================================================
+    # Shared Logic
+    # ==================================================================
+    def _split_lines(self, data: bytes) -> List[bytes]:
+        """
+        Supports \n or \r\n framed JSON-RPC. Keeps partials for the caller to manage.
+        Here we only process complete lines passed in (caller responsible for buffering if needed).
+        """
+        # The callers in this class only call this on already whole chunks or immediate lines;
+        # direct mode uses its own buffer to preserve partial trailing data.
+        # Normalize CRLF to LF, then split.
+        data = data.replace(b"\r\n", b"\n")
+        return [seg for seg in data.split(b"\n") if seg]
+
+    def _parse_monero_json(self, line: bytes) -> Optional[List[Dict[str, Any]]]:
+        """
+        Returns a list of JSON objects if the line is valid Monero Stratum JSON-RPC, else None.
+        Accepts single object or array batch.
+        """
+        line = line.strip()
+        if not line or (line[:1] not in (b"{", b"[")):
+            return None
+        try:
+            decoded = json.loads(line.decode("utf-8", "strict"))
+        except Exception:
+            return None
+
+        objs = decoded if isinstance(decoded, list) else [decoded]
+        if not all(isinstance(o, dict) for o in objs):
+            return None
+
+        # Allowlist filter
+        ok = True
+        for o in objs:
+            if "method" in o:
+                method = o.get("method")
+                if method not in self.MONERO_ALLOWED_METHODS:
+                    ok = False
+                    break
+            else:
+                # Responses must be JSON-RPC-esque with result or error
+                if ("result" not in o) and ("error" not in o):
+                    ok = False
+                    break
+        return objs if ok else None
+
+    def _priority_for_messages(self, msgs: List[Dict[str, Any]]) -> int:
+        """
+        Lower number = higher priority.
+        submit (shares) -> 1, job -> 2, everything else -> 3
+        """
+        prio = 3
+        for m in msgs:
+            method = m.get("method")
+            if method == "submit":
+                return 1
+            if method == "job":
+                prio = min(prio, 2)
+        return prio
+
+    def _send_json_rpc_request(self, sock: socket.socket, message: dict):
+        try:
+            if not message:
+                return
+            request = json.dumps(message) + "\n"
+            sock.sendall(request.encode("utf-8"))
+            method = message.get("method", "response")
+            self.logger.log_message(f"[StratumConn] ➡️ Sent {method} request.")
+            self._last_activity_time = time.time()
+        except Exception as e:
+            self.logger.log_message(f"[StratumConn] ❌ Failed to send request: {e}")
+
+    def _send_authorize_request(self, sock: socket.socket):
+        params = {"login": self.wallet_address, "pass": self.worker_name, "agent": self.user_agent, "rigid": ""}
+        auth_msg = {"jsonrpc": "2.0", "id": 1, "method": "login", "params": params}
+        self._send_json_rpc_request(sock, auth_msg)
+
+    def _send_keepalive(self, sock: socket.socket):
+        if self.direct_session_id:
+            keepalive_msg = {"jsonrpc": "2.0", "method": "keepalived", "params": {"id": self.direct_session_id}}
+            self._send_json_rpc_request(sock, keepalive_msg)
+
+    def submit_share(self, job_id: str, nonce: str, result_hash: str):
+        if not self.direct_session_id:
+            self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: Direct connection not logged in.")
+            return
+        params = {"id": self.direct_session_id, "job_id": job_id, "nonce": nonce, "result": result_hash}
+        submit_msg = {"jsonrpc": "2.0", "id": 4, "method": "submit", "params": params}
+        if self._pool_socket and self._pool_socket.fileno() != -1:
+            self._send_json_rpc_request(self._pool_socket, submit_msg)
+        else:
+            self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: No active pool socket.")
+
+    def _process_received_data(self, buffer: bytes, source_socket: socket.socket) -> bytes:
+        """
+        Direct connection receive path: maintain a buffer, extract LF-framed lines,
+        strictly filter them to Monero JSON-RPC, then forward to StratumManager.
+        """
+        # Normalize CRLF to LF for framing
+        buffer = buffer.replace(b"\r\n", b"\n")
+        if b"\n" not in buffer:
+            return buffer
+
+        lines = buffer.split(b"\n")
+        incomplete = lines.pop()  # trailing partial (may be b'')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            msgs = self._parse_monero_json(line)
+            if not msgs:
+                # Non-Monero or invalid JSON; drop
+                continue
+
+            try:
+                # Login success -> get session id from result.id (common xmrig-style)
+                for obj in msgs:
+                    if isinstance(obj.get("result"), dict) and "id" in obj["result"]:
+                        self.direct_session_id = obj["result"]["id"]
+                        self.logger.log_message(
+                            f"[StratumConn] 🔑 (Direct) Login successful. Session ID: {self.direct_session_id}"
+                        )
+
+                # Safe reconstruction for manager visibility
+                local_ip, local_port = source_socket.getsockname()
+                if self.pool_ip is not None and self.pool_port is not None:
+                    reconstructed_packet = (
+                        IP(src=self.pool_ip, dst=local_ip)
+                        / TCP(sport=self.pool_port, dport=local_port, flags="PA")
+                        / Raw(load=line)
+                    )
+                    self.stratum_manager.handle_packet(reconstructed_packet, "stratum_direct")
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] ❌ Error processing direct data: {e}")
+
+        return incomplete
+
+    def _analyze_relayed_data(
+        self,
+        line: bytes,
+        src_sock: socket.socket,
+        dest_q_or_sock,
+        direction: str,
+        pool_socket_for_meta: Optional[socket.socket],
+    ):
+        """
+        Optional analysis hook to mirror filtered Monero JSON-RPC into StratumManager with reasonable 5-tuples.
+        """
+        try:
+            # Compute endpoints
+            if direction == "Miner -> Pool":
+                src_ip, src_port = src_sock.getpeername()  # miner addr
+                assert self.pool_ip is not None and self.pool_port is not None
+                dst_ip, dst_port = self.pool_ip, self.pool_port
+            else:  # "Pool -> Miner"
+                # Source is pool
+                if self.pool_ip is None or self.pool_port is None:
+                    return
+                src_ip, src_port = self.pool_ip, self.pool_port
+                # Destination is the miner socket, if provided (dest_q_or_sock is socket in this direction)
+                if isinstance(dest_q_or_sock, socket.socket):
+                    dst_ip, dst_port = dest_q_or_sock.getpeername()
+                else:
+                    # As a fallback, use proxy host/port (less accurate but valid IP/port)
+                    dst_ip, dst_port = self.proxy_host, self.proxy_port
+
+            reconstructed_packet = IP(src=src_ip, dst=dst_ip) / TCP(sport=src_port, dport=dst_port, flags="PA") / Raw(
+                load=line
+            )
+            self.stratum_manager.handle_packet(reconstructed_packet, "stratum_proxy")
+        except Exception as e:
+            self.logger.log_message(f"[StratumProxy] ❌ Error during data analysis: {e}")
+
+
 class StratumManager:
     """
-    Monitors Stratum mining traffic (JSON-RPC over TCP).
-    Extracts and tracks miner sessions, job info, and share submissions.
+    Monitors and processes universal Stratum traffic. This manager is protocol-agnostic
+    but expects the connection manager to pre-filter to Monero JSON-RPC already.
     """
 
     def __init__(self, router_logger):
         self.logger = router_logger
-        self.sessions: Dict[str, Dict[str, Any]] = {}  # key = src_ip:src_port
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.session_buffers: Dict[str, bytes] = {}
         self._lock = threading.Lock()
-        self.logger.log_message("[Stratum] Initialized.")
+        self.logger.log_message("[Stratum] Universal Manager initialized.")
 
-    def handle_packet(self, packet, iface: str) -> bool:
-        """Handle a TCP packet and try to extract Stratum messages."""
-        if not packet.haslayer(TCP):
-            return False
-
-        tcp = packet[TCP]
-        ip = packet.payload
-
-        # Stratum usually runs on TCP port 3333 or 4444
-        if tcp.sport not in (3333, 4444) and tcp.dport not in (3333, 4444):
-            return False
-
+    def handle_packet(self, packet: Packet, iface: str) -> bool:
         try:
-            if hasattr(tcp, "payload") and bytes(tcp.payload):
-                raw_data = bytes(tcp.payload)
-                session_id = f"{ip.src}:{tcp.sport}" if tcp.sport in (3333, 4444) else f"{ip.dst}:{tcp.dport}"
-                self._process_stratum_payload(session_id, raw_data, iface)
-                return True
+            # Minimal guards; connection manager already filtered and reconstructed valid 5-tuples
+            if not (hasattr(packet, "haslayer") and packet.haslayer(TCP) and packet.haslayer(Raw) and packet.haslayer(IP)):
+                return False
+
+            tcp = packet[TCP]
+            ip = packet[IP]
+            raw = packet[Raw]
+
+            # Keep this permissive; all strict filtering happens in StratumConnectionManager
+            session_id = (
+                f"{ip.src}:{tcp.sport}-{ip.dst}:{tcp.dport}"
+                if int(tcp.sport) > int(tcp.dport)
+                else f"{ip.dst}:{tcp.dport}-{ip.src}:{tcp.sport}"
+            )
+            self._process_stratum_payload(session_id, bytes(raw.load))
+            return True
         except Exception as e:
-            self.logger.log_message(f"[Stratum] ⚠️ Error processing Stratum packet: {e}")
+            self.logger.log_message(f"[Stratum] ⚠️ Error processing packet: {e}")
             return False
 
-    def _process_stratum_payload(self, session_id: str, raw_data: bytes, iface: str):
-        """Parses and logs JSON-RPC messages from the raw TCP payload."""
+    def _looks_like_json(self, msg: bytes) -> bool:
+        """
+        Fast pre-filter to drop non-JSON junk.
+        Requires it to start with { or [,
+        and only contain valid UTF-8 printable characters.
+        """
+        if not msg:
+            return False
+        if msg[0] not in (ord('{'), ord('[')):
+            return False
         try:
-            text = raw_data.decode("utf-8", errors="ignore")
-            messages = text.split("\n")
+            msg.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return False
+        return True
 
-            for msg in messages:
-                msg = msg.strip()
-                if not msg:
-                    continue
+    def _process_stratum_payload(self, session_id: str, raw_data: bytes):
+        """
+        Buffers and parses incoming data to handle newline-delimited JSON-RPC messages
+        that may be fragmented across multiple TCP packets or batched into a single line.
+        """
+        self.session_buffers.setdefault(session_id, b"")
+        self.session_buffers[session_id] += raw_data
+        buffer = self.session_buffers[session_id]
 
-                data = json.loads(msg)
-                method = data.get("method")
-                params = data.get("params", [])
+        # Normalize CRLF -> LF to make framing predictable
+        buffer = buffer.replace(b"\r\n", b"\n")
 
-                if method == "mining.subscribe":
-                    self._track_subscribe(session_id, params)
-                elif method == "mining.authorize":
-                    self._track_authorize(session_id, params)
-                elif method == "mining.set_difficulty":
-                    self._track_difficulty(session_id, params)
-                elif method == "mining.notify":
-                    self._track_job_notify(session_id, params)
-                elif method == "mining.submit":
-                    self._track_submit(session_id, params)
-                else:
-                    self.logger.log_message(f"[Stratum] 📦 {session_id} sent method: {method}")
-        except json.JSONDecodeError:
-            self.logger.log_message("[Stratum] ❌ Failed to decode JSON from payload.")
-        except Exception as e:
-            self.logger.log_message(f"[Stratum] ❌ Unexpected error: {e}")
+        while b"\n" in buffer:
+            message_data, buffer = buffer.split(b"\n", 1)
+            msg_stripped = message_data.strip()
+            if not msg_stripped:
+                continue
 
-    def _track_subscribe(self, session_id: str, params):
-        self.logger.log_message(f"[Stratum] 🤝 {session_id} sent subscribe: {params}")
+            # Expect valid JSON here (already filtered upstream) but be defensive
+            if not self._looks_like_json(msg_stripped):
+                # Silently skip junk packets
+                continue
+
+            try:
+                data = json.loads(msg_stripped.decode("utf-8", "strict"))
+                messages = data if isinstance(data, list) else [data]
+                for message in messages:
+                    if isinstance(message, dict):
+                        self._process_single_message(session_id, message)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.logger.log_message(f"[Stratum] ℹ️ Failed to decode malformed JSON for session {session_id}.")
+            except Exception as e:
+                self.logger.log_message(f"[Stratum] ❌ Unexpected error during payload processing: {e}")
+
+        self.session_buffers[session_id] = buffer
+
+    def _process_single_message(self, session_id: str, data: Dict[str, Any]):
+        method = data.get("method")
+        params = data.get("params") or {}
+        result = data.get("result") or {}
+
+        if result:
+            if isinstance(result, dict) and "job" in result:
+                self._handle_job(session_id, result["job"])
+            if isinstance(result, dict) and "status" in result:
+                self.logger.log_message(f"[Stratum] 📣 {session_id} status: {result['status']}")
+        elif method == "job":
+            self._handle_job(session_id, params)
+        elif method == "submit":
+            self._track_submit(session_id, params)
+
+    def _handle_job(self, session_id: str, job_data: dict):
+        """
+        Processes and stores a new mining job from the pool, logging key details.
+        """
+        job_id = job_data.get("job_id")
+        blob = job_data.get("blob")
+        target = job_data.get("target")
+
+        if not all([job_id, blob, target]):
+            self.logger.log_message(f"[Stratum] ⚠️ Received incomplete job for {session_id}: {job_data}")
+            return
+
+        self.logger.log_message(f"[Stratum] 🚧 {session_id} received new job ID: {job_id}")
+        self.logger.log_message(f"    - Target: {target}")
+        self.logger.log_message(f"    - Blob: {blob[:40]}...")  # Log a snippet of the blob for identification
+
         with self._lock:
-            self.sessions.setdefault(session_id, {})['subscribed'] = time.time()
+            self.sessions.setdefault(session_id, {})["current_job"] = job_data
+            self.sessions[session_id]["last_job_time"] = time.time()
 
-    def _track_authorize(self, session_id: str, params):
-        username = params[0] if params else "unknown"
-        self.logger.log_message(f"[Stratum] 🧑‍💻 {session_id} authorized as {username}")
+    def _track_submit(self, session_id: str, params: dict):
+        job_id = params.get("job_id", "?")
+        self.logger.log_message(f"[Stratum] ⛏️ {session_id} submitted share for job: {job_id}")
         with self._lock:
-            self.sessions.setdefault(session_id, {})['username'] = username
+            sess = self.sessions.setdefault(session_id, {})
+            sess["last_submit_time"] = time.time()
+            sess["shares"] = sess.get("shares", 0) + 1
 
-    def _track_difficulty(self, session_id: str, params):
-        difficulty = params[0] if params else "?"
-        self.logger.log_message(f"[Stratum] 🧱 {session_id} set difficulty: {difficulty}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['difficulty'] = difficulty
-
-    def _track_job_notify(self, session_id: str, params):
-        job_id = params[0] if params else "?"
-        self.logger.log_message(f"[Stratum] 🚧 {session_id} received job ID: {job_id}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['last_job'] = job_id
-
-    def _track_submit(self, session_id: str, params):
-        worker = params[0] if params else "unknown"
-        self.logger.log_message(f"[Stratum] ⛏️ {session_id} submitted share from worker: {worker}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['last_submit'] = time.time()
-
-    def get_active_sessions(self) -> Dict[str, Any]:
-        """Returns a snapshot of tracked miner sessions."""
-        with self._lock:
-            return dict(self.sessions)
 
 class mDNSManager:
     """

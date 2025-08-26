@@ -1619,6 +1619,8 @@ class RouterTab(QWidget):
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
         self.stop_router_button = QPushButton("Stop Router")
+        self.startum_comm_checkbox= QCheckBox("Use Stratum Comm")
+        self.startum_comm_checkbox.setChecked(False)
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
         self.dhcp_out_checkbox.setChecked(True)
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
@@ -1648,6 +1650,7 @@ class RouterTab(QWidget):
         top_row_layout = QHBoxLayout()
         top_row_layout.addWidget(self.start_router_button)
         top_row_layout.addWidget(self.stop_router_button)
+        top_row_layout.addWidget(self.startum_comm_checkbox)
         top_row_layout.addWidget(QLabel("Manual LAN IP:"))
         top_row_layout.addWidget(self.router_ip_out_input)
         top_row_layout.addWidget(QLabel("Netmask:"))
