@@ -20,8 +20,11 @@ from p2pool_managers import PacketManager, AsyncNmapManager, AsyncGobusterManage
 from p2pool_ai import GeminiChatBot
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, guess_lexer
-
+from tools.pythontools import yield_no_gil
 import xml.etree.ElementTree as ET
+
+
+
 class AsyncWorker(QObject):
     finished = pyqtSignal()
     started = pyqtSignal()
@@ -1601,11 +1604,13 @@ class RouterTab(QWidget):
         self._console_panes = {}  # name → QPlainTextEdit
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "Python", "Signing", "TCP/TLS/HTTPS/DNS/mDNS",
-                     "Handshake/SSL", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
+            "Full": ["General", "Router", "DHCP", "Transport", "Python", "C++", "Signing", "TCP/HTTPS/DNS/mDNS",
+                     "Handshake/SSL/TLS", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
-
+        self._hot_prefix_to_pane = {
+            self._norm("C++"): "C++",
+        }
         self._create_widgets()
         self._configure_layout()
         self._connect_signals()
@@ -1614,67 +1619,58 @@ class RouterTab(QWidget):
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
         self.stop_router_button = QPushButton("Stop Router")
-
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
         self.dhcp_out_checkbox.setChecked(True)
-
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
-        self.dhcp_in_checkbox.setChecked(True)
+        self.dhcp_in_checkbox.setChecked(False)
+        self.use_static_checkbox = QCheckBox("Use Static for all interfaces")
+        self.use_static_checkbox.setChecked(False)
+        self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
+        self.use_hyperv_checkbox.setChecked(True)
 
-        self.router_ip_in_input = QLineEdit()
-        self.router_ip_in_input.setPlaceholderText("(optional)")
 
-        self.router_netmask_in_input = QLineEdit()
-        self.router_netmask_in_input.setText("255.255.255.0")  # Default netmask
-
+        self.router_ip_out_input = QLineEdit()
+        self.router_ip_out_input.setPlaceholderText("(optional)")
+        self.router_netmask_out_input = QLineEdit()
+        self.router_netmask_out_input.setText("255.255.255.0")
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
-
         self.add_pane_button = QPushButton("➕")
         self.remove_pane_button = QPushButton("➖")
-
         self.console_tabs = QTabWidget()
-
         self.preset_dropdown = QComboBox()
         self.preset_dropdown.addItems(self.presets.keys())
-
         self._load_presets("Full")
 
     def _configure_layout(self):
         layout = QVBoxLayout(self)
+        # --- Top Row (Buttons, IP, Netmask, Checkboxes) ---
+        top_row_layout = QHBoxLayout()
+        top_row_layout.addWidget(self.start_router_button)
+        top_row_layout.addWidget(self.stop_router_button)
+        top_row_layout.addWidget(QLabel("Manual LAN IP:"))
+        top_row_layout.addWidget(self.router_ip_out_input)
+        top_row_layout.addWidget(QLabel("Netmask:"))
+        top_row_layout.addWidget(self.router_netmask_out_input)
+        top_row_layout.addWidget(self.dhcp_out_checkbox)
+        top_row_layout.addWidget(self.dhcp_in_checkbox)
+        top_row_layout.addWidget(self.use_static_checkbox)
+        top_row_layout.addWidget(self.use_hyperv_checkbox)
+        top_row_layout.addStretch(1)
 
-        # --- Top Control Row ---
-        control_layout = QHBoxLayout()
-        control_layout.addWidget(self.start_router_button)
-        control_layout.addWidget(self.stop_router_button)
-        control_layout.addWidget(QLabel("Manual LAN IP:"))
-        control_layout.addWidget(self.router_ip_in_input)
-        control_layout.addWidget(QLabel("Netmask:"))
-        control_layout.addWidget(self.router_netmask_in_input)
-        control_layout.addWidget(self.dhcp_out_checkbox)
-        control_layout.addWidget(self.dhcp_in_checkbox)
-        control_layout.addStretch(1)
+        # --- Combined Pane Add/Remove + Preset Dropdown Row ---
+        pane_and_preset_layout = QHBoxLayout()
+        pane_and_preset_layout.addWidget(QLabel("Pane:"))
+        pane_and_preset_layout.addWidget(self.add_pane_input)
+        pane_and_preset_layout.addWidget(self.add_pane_button)
+        pane_and_preset_layout.addWidget(self.remove_pane_button)
+        pane_and_preset_layout.addStretch(1)
+        pane_and_preset_layout.addWidget(QLabel("Presets:"))
+        pane_and_preset_layout.addWidget(self.preset_dropdown)
 
-
-
-        # --- Pane Add/Remove Row ---
-        pane_layout = QHBoxLayout()
-        pane_layout.addWidget(QLabel("Pane:"))
-        pane_layout.addWidget(self.add_pane_input)
-        pane_layout.addWidget(self.add_pane_button)
-        pane_layout.addWidget(self.remove_pane_button)
-        pane_layout.addStretch(1)
-
-        # --- Preset Dropdown Row ---
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(QLabel("Presets:"))
-        preset_layout.addWidget(self.preset_dropdown)
-        preset_layout.addStretch(1)
-
-        # --- Final Layout ---
-        layout.addLayout(control_layout)
-        layout.addLayout(pane_layout)
-        layout.addLayout(preset_layout)
+        # --- Final Assembly ---
+        layout.addLayout(top_row_layout)
+        layout.addLayout(pane_and_preset_layout)
         layout.addWidget(self.console_tabs)
 
     def _connect_signals(self):
@@ -1682,6 +1678,9 @@ class RouterTab(QWidget):
         self.add_pane_button.clicked.connect(self._on_add_pane)
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
+        self.use_static_checkbox.stateChanged.connect(self._on_use_static_changed)
+    def _on_use_static_changed(self, state):
+        self.use_static = bool(state)
 
     def _load_presets(self, preset_name: str):
         panes_to_add = self.presets.get(preset_name, [])
@@ -1730,28 +1729,42 @@ class RouterTab(QWidget):
         self.stop_router_button.setEnabled(True)
         self._log("General", "Router started!")
 
+    def _norm(self,s: str) -> str:
+        # keep numbers/symbols; just strip whitespace + casefold
+        return ''.join(s.split()).casefold()
+
+    def _rebuild_pane_index(self):
+        # map normalized part -> list of (pane_key, depth)
+        idx = {}
+        for pane_key in self._console_panes:
+            for depth, part in enumerate(pane_key.split('/')):
+                n = self._norm(part)
+                idx.setdefault(n, []).append((pane_key, depth))
+        self._pane_index = idx
+
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """
-        Routes log messages to a pane based on the prefix. If no matching pane, logs to 'General'.
-        """
-        prefixes = re.findall(r'\[(.*?)\]', message)
+        prefixes = [self._norm(p) for p in re.findall(r'\[(.*?)\]', message)]
+        # Fast path: route noisy prefixes directly to their pane (C++)
 
+        for sprefix in reversed(prefixes):
+            pane = self._hot_prefix_to_pane.get(sprefix)
+            if pane:
+                self._log(pane, message)
+                return
 
-        target_pane = None
-        longest_prefix_len = 1000
+        # Slow path: do the indexed lookup
+        if not hasattr(self, "_pane_index"):
+            self._rebuild_pane_index()
 
-        # Find the best possible match by checking all prefixes against all keys
-        for prefix in reversed(prefixes):
-            for pane_key in self._console_panes:
-                cleaned_pane_key = re.sub(r'[^a-zA-Z0-9]', '', pane_key)
-                if prefix.lower() in cleaned_pane_key.lower():
-                    if len(prefix) < longest_prefix_len:
-                        longest_prefix_len = len(prefix)
-                        target_pane = pane_key
+        for sprefix in reversed(prefixes):
+            hits = self._pane_index.get(sprefix)
+            if hits:
+                target_pane = max(hits, key=lambda x: x[1])[0]  # most specific segment
+                self._log(target_pane, message)
+                return
 
-        self._log(target_pane or "General", message)
-
+        self._log("General", message)
     def _log(self, category: str, message: str):
         if category in self._console_panes:
             self._console_panes[category].appendPlainText(message)
