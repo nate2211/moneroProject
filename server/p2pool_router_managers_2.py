@@ -2824,7 +2824,7 @@ class ARPManager:
                 return resolved_mac
             else:
                 self.router_logger.log_message(f"[ARP] ⛔ No response to ARP for {target_ip} on {iface.split('_')[-1]} getting mac address with function.")
-                resolved_mac = getmacbyip(target_ip)
+                resolved_mac = self.fallback_mac_from_os_cache(target_ip)
                 return resolved_mac
 
         except ValueError:
