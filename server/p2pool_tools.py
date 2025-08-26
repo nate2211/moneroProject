@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import binascii
 import gc
 import os
 import platform
@@ -373,4 +374,230 @@ class ParallelPythonTool:
                 self._dll = None
 
 
+class RandomXFlags:
+    """Mirrors the randomx_flags enum from randomx.h for clarity."""
+    DEFAULT = 0x0
+    LARGE_PAGES = 0x1
+    HARD_AES = 0x2
+    FULL_MEM = 0x4
+    JIT = 0x8
+    SECURE = 0x10
+    ARGON2_SSSE3 = 0x20
+    ARGON2_AVX2 = 0x40
+
+
+def _resolve_path(relpath: str) -> Path:
+    """Finds the library file, works in dev and PyInstaller."""
+    # This function determines the base path to correctly locate the DLL,
+    # whether the script is running from source or as a bundled executable.
+    base = getattr(sys, "_MEIPASS", None)
+    base = Path(base) if base else Path(__file__).resolve().parent
+    return (base / relpath).resolve()
+
+
+class RandomXLoader:
+    """
+    A robust Python wrapper for the RandomX C++ library.
+    This class handles loading the DLL, managing memory, and providing
+    easy-to-use hashing functions.
+    """
+
+    def __init__(self, dll_rel_path: str = "randomx.dll", flags: Optional[int] = None, logger=None):
+        """
+        Initializes the loader.
+        Note: The DLL is not loaded until ensure_started() is called.
+
+        Args:
+            dll_rel_path: Relative path to the randomx.dll file.
+            flags: Optional override for RandomX initialization flags. If None,
+                   the best flags for the CPU will be detected automatically.
+            logger: An optional logger object with a `log_message` method.
+        """
+        self._dll_path = _resolve_path(dll_rel_path)
+        self._init_flags = flags
+        self._logger = logger
+        self._dll: Optional[ctypes.CDLL] = None
+        self._cache = None
+        self._dataset = None
+        self._vm = None
+        self._lock = threading.Lock()
+        self._started = False
+
+    def _log(self, msg: str):
+        """Logs a message using the provided logger or prints to console."""
+        if self._logger:
+            self._logger.log_message(msg)
+        else:
+            print(msg)
+
+    def _load_and_verify_dll(self):
+        """
+        Loads the DLL and sets up the function prototypes.
+        This internal method verifies that all required functions are present
+        in the DLL, preventing crashes from a misconfigured build.
+        """
+        if self._dll:
+            return
+        if not self._dll_path.exists():
+            raise FileNotFoundError(f"RandomX library not found at: {self._dll_path}")
+
+        try:
+            # Use CDLL on all platforms as RandomX uses the standard cdecl calling convention.
+            self._dll = ctypes.CDLL(str(self._dll_path))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {self._dll_path}: {e}")
+
+        # Define all function prototypes and verify their existence.
+        funcs_to_define = {
+            "randomx_get_flags": ([], ctypes.c_int),
+            "randomx_alloc_cache": ([ctypes.c_int], ctypes.c_void_p),
+            "randomx_init_cache": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t], None),
+            "randomx_release_cache": ([ctypes.c_void_p], None),
+            "randomx_create_vm": ([ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_void_p),
+            "randomx_destroy_vm": ([ctypes.c_void_p], None),
+            "randomx_calculate_hash": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p], None),
+            "randomx_calculate_hash_first": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t], None),
+            "randomx_calculate_hash_next": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p], None),
+            "randomx_calculate_hash_last": ([ctypes.c_void_p, ctypes.c_void_p], None),
+        }
+
+        for name, (argtypes, restype) in funcs_to_define.items():
+            if not hasattr(self._dll, name):
+                raise AttributeError(f"Function '{name}' not found in DLL. Check C++ build exports.")
+            func = getattr(self._dll, name)
+            func.argtypes = argtypes
+            func.restype = restype
+
+    def ensure_started(self, seed: bytes, use_dataset: bool = False):
+        """
+        Initializes the RandomX cache and VM. Idempotent and thread-safe.
+        This must be called before any hashing operations.
+
+        Args:
+            seed: The seed (usually a block hash) to initialize the cache with.
+            use_dataset: If True, allocates and initializes the full dataset for
+                         faster hashing (requires >2GB RAM).
+        """
+        with self._lock:
+            if self._started:
+                return
+
+            try:
+                self._load_and_verify_dll()
+                d = self._dll
+
+                flags = self._init_flags if self._init_flags is not None else d.randomx_get_flags()
+                if use_dataset:
+                    flags |= RandomXFlags.FULL_MEM
+
+                self._cache = d.randomx_alloc_cache(flags)
+                if not self._cache:
+                    raise RuntimeError("randomx_alloc_cache failed (returned NULL)")
+
+                seed_buf = (ctypes.c_ubyte * len(seed)).from_buffer_copy(seed)
+                d.randomx_init_cache(self._cache, ctypes.cast(seed_buf, ctypes.c_void_p), len(seed))
+
+                if use_dataset and hasattr(d, "randomx_alloc_dataset"):
+                    d.randomx_alloc_dataset.argtypes = [ctypes.c_int]
+                    d.randomx_alloc_dataset.restype = ctypes.c_void_p
+                    d.randomx_dataset_item_count.restype = ctypes.c_uint64
+                    d.randomx_init_dataset.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+                                                       ctypes.c_uint64]
+
+                    self._dataset = d.randomx_alloc_dataset(flags)
+                    if self._dataset:
+                        count = d.randomx_dataset_item_count()
+                        d.randomx_init_dataset(self._dataset, self._cache, 0, count)
+                    else:
+                        self._log("[RandomX] ⚠️ Dataset allocation failed, continuing in light mode.")
+
+                self._vm = d.randomx_create_vm(flags, self._cache, self._dataset)
+                if not self._vm:
+                    raise RuntimeError("randomx_create_vm failed (returned NULL)")
+
+                self._started = True
+                mode = "Full Dataset" if self._dataset else "Light Cache"
+                self._log(f"[RandomX] ✅ VM ready ({mode} Mode, Flags: {hex(flags)})")
+
+            except (FileNotFoundError, RuntimeError, AttributeError) as e:
+                error_message = f"[RandomX] ❌ Initialization failed: {e}"
+                self._log(error_message)
+                raise RuntimeError(error_message) from e
+
+    def calculate_hash(self, blob: bytes) -> bytes:
+        """Calculates a single hash. Less efficient for multiple hashes."""
+        if not self._started:
+            raise RuntimeError("RandomX not started. Call ensure_started() first.")
+
+        out = (ctypes.c_ubyte * 32)()
+        with self._lock:
+            in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+            self._dll.randomx_calculate_hash(self._vm, ctypes.cast(in_buf, ctypes.c_void_p), len(blob),
+                                             ctypes.cast(out, ctypes.c_void_p))
+        return bytes(out)
+
+    def calculate_hash_hex(self, blob_hex: str) -> str:
+        """
+        Calculates a single hash from a hex string and returns a hex string.
+        This is a convenience wrapper for the calculate_hash method.
+        """
+        if not self._started:
+            raise RuntimeError("RandomX not started. Call ensure_started(seed, ...) first.")
+
+        # Convert hex string input to bytes
+        data = binascii.unhexlify(blob_hex)
+
+        # Call the primary hash function
+        hash_bytes = self.calculate_hash(data)
+
+        # Convert the resulting bytes back to a hex string
+        return hash_bytes.hex()
+
+    def calculate_hash_first(self, blob: bytes):
+        """Starts a batch hash sequence."""
+        if not self._started:
+            raise RuntimeError("RandomX not started. Call ensure_started() first.")
+        with self._lock:
+            in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+            self._dll.randomx_calculate_hash_first(self._vm, ctypes.cast(in_buf, ctypes.c_void_p), len(blob))
+
+    def calculate_hash_next(self, next_blob: bytes) -> bytes:
+        """
+        Calculates hash of the PREVIOUS blob and prepares for the next one.
+        Returns the hash of the blob from the prior `first` or `next` call.
+        """
+        if not self._started:
+            raise RuntimeError("RandomX not started. Call ensure_started() first.")
+
+        out = (ctypes.c_ubyte * 32)()
+        with self._lock:
+            in_buf = (ctypes.c_ubyte * len(next_blob)).from_buffer_copy(next_blob)
+            self._dll.randomx_calculate_hash_next(self._vm, ctypes.cast(in_buf, ctypes.c_void_p), len(next_blob),
+                                                  ctypes.cast(out, ctypes.c_void_p))
+        return bytes(out)
+
+    def calculate_hash_last(self) -> bytes:
+        """Calculates and returns the hash of the final blob in a sequence."""
+        if not self._started:
+            raise RuntimeError("RandomX not started. Call ensure_started() first.")
+
+        out = (ctypes.c_ubyte * 32)()
+        with self._lock:
+            self._dll.randomx_calculate_hash_last(self._vm, ctypes.cast(out, ctypes.c_void_p))
+        return bytes(out)
+
+    def destroy(self):
+        """Releases all RandomX resources."""
+        with self._lock:
+            if not self._started:
+                return
+            if self._vm: self._dll.randomx_destroy_vm(self._vm)
+            if self._dataset and hasattr(self._dll, "randomx_release_dataset"):
+                self._dll.randomx_release_dataset.argtypes = [ctypes.c_void_p]
+                self._dll.randomx_release_dataset(self._dataset)
+            if self._cache: self._dll.randomx_release_cache(self._cache)
+
+            self._vm = self._dataset = self._cache = None
+            self._started = False
+            self._log("[RandomX] 🛑 VM and resources destroyed.")
 

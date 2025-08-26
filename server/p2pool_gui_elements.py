@@ -1592,6 +1592,8 @@ class WiresharkTab(QWidget):
         self.wireshark_log.appendPlainText(message)
 
 
+
+
 class RouterTab(QWidget):
     """
     A QWidget that encapsulates all UI elements and logic for the Router tab,
@@ -1619,8 +1621,13 @@ class RouterTab(QWidget):
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
         self.stop_router_button = QPushButton("Stop Router")
-        self.startum_comm_checkbox= QCheckBox("Use Stratum Comm")
+        self.startum_comm_checkbox = QCheckBox("Use Stratum Comm")
         self.startum_comm_checkbox.setChecked(False)
+
+        # New p2pool_server_ip field
+        self.p2pool_server_ip_input = QLineEdit()
+        self.p2pool_server_ip_input.setPlaceholderText("")
+
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
         self.dhcp_out_checkbox.setChecked(True)
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
@@ -1629,7 +1636,6 @@ class RouterTab(QWidget):
         self.use_static_checkbox.setChecked(False)
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(True)
-
 
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("(optional)")
@@ -1651,6 +1657,11 @@ class RouterTab(QWidget):
         top_row_layout.addWidget(self.start_router_button)
         top_row_layout.addWidget(self.stop_router_button)
         top_row_layout.addWidget(self.startum_comm_checkbox)
+
+        # Added P2Pool IP field and its label
+        top_row_layout.addWidget(QLabel("P2Pool IP:"))
+        top_row_layout.addWidget(self.p2pool_server_ip_input)
+
         top_row_layout.addWidget(QLabel("Manual LAN IP:"))
         top_row_layout.addWidget(self.router_ip_out_input)
         top_row_layout.addWidget(QLabel("Netmask:"))
@@ -1682,6 +1693,7 @@ class RouterTab(QWidget):
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
         self.use_static_checkbox.stateChanged.connect(self._on_use_static_changed)
+
     def _on_use_static_changed(self, state):
         self.use_static = bool(state)
 
@@ -1732,7 +1744,7 @@ class RouterTab(QWidget):
         self.stop_router_button.setEnabled(True)
         self._log("General", "Router started!")
 
-    def _norm(self,s: str) -> str:
+    def _norm(self, s: str) -> str:
         # keep numbers/symbols; just strip whitespace + casefold
         return ''.join(s.split()).casefold()
 
@@ -1768,6 +1780,7 @@ class RouterTab(QWidget):
                 return
 
         self._log("General", message)
+
     def _log(self, category: str, message: str):
         if category in self._console_panes:
             self._console_panes[category].appendPlainText(message)
