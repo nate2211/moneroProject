@@ -1116,8 +1116,7 @@ class PythonRouterManager:
                     return
             if self.isakmp_manager.handle_packet(packet, inbound_iface):
                 return
-            if self.stratum_manager.handle_packet(packet, inbound_iface):
-                return
+
             is_for_router = dst_ip in self._get_all_local_ips()
 
             if is_for_router:
@@ -1221,12 +1220,11 @@ class PythonRouterManager:
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
 
         iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6) or packet.getlayer(Ether)
         dst_ip = ip_layer.dst
         if not ip_layer:
             self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
             return
-
         # --- Multicast Handling (IPv4 and IPv6) ---
         if ipaddress.ip_address(dst_ip).is_multicast:
             self.router_logger.log_message(f"[Router] 🚧 Multicast packet detected for {dst_ip}.")
