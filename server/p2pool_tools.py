@@ -395,12 +395,12 @@ def _resolve_path(relpath: str) -> Path:
 
 class RandomXLoader:
     """
-    Robust Python wrapper for the RandomX C/C++ library that matches the
-    interface expected by the share worker:
-      - calculate_hash(...) -> int (little-endian)
-      - calculate_hash_first/next/last(...) pipelined API (emulated)
+    Robust Python wrapper for RandomX C/C++ library with helpers included.
     """
-    # ---- C API names we rely on ----
+
+    NONCE_BYTE_OFFSET = 39  # bytes; used by both daemon+stratum paths
+
+    # ---- DLL symbols we rely on ----
     _FN_RANDOMX_GET_FLAGS = "randomx_get_flags"
     _FN_RANDOMX_ALLOC_CACHE = "randomx_alloc_cache"
     _FN_RANDOMX_INIT_CACHE = "randomx_init_cache"
@@ -416,19 +416,19 @@ class RandomXLoader:
 
         self._dll: Optional[ctypes.CDLL] = None
         self._cache = None
-        self._dataset = None  # not used here; wire it up if you add full dataset support
+        self._dataset = None
         self._vm = None
 
         self._lock = threading.Lock()
         self._started = False
 
-        # ---- pipeline emulation state (thread-safe behind _lock) ----
+        # Pipeline state
         self._pipe_prev_digest: Optional[int] = None
         self._pipe_has_prev: bool = False
 
-    # --------------- logging ---------------
+    # ---------------- Logging ----------------
     def _log(self, msg: str):
-        if self._logger:
+        if self._logger and hasattr(self._logger, "log_message"):
             try:
                 self._logger.log_message(msg)
                 return
@@ -436,7 +436,7 @@ class RandomXLoader:
                 pass
         print(msg)
 
-    # --------------- DLL load/verify ---------------
+    # ---------------- DLL Bind ----------------
     def _load_and_verify_dll(self):
         if self._dll:
             return
@@ -448,10 +448,9 @@ class RandomXLoader:
         except Exception as e:
             raise RuntimeError(f"Failed to load {self._dll_path}: {e}")
 
-        # Bind and type the subset of functions we use.
         def _bind(name, argtypes, restype):
             if not hasattr(self._dll, name):
-                raise AttributeError(f"Function '{name}' not found in DLL exports.")
+                raise AttributeError(f"Function '{name}' not in DLL exports.")
             fn = getattr(self._dll, name)
             fn.argtypes = argtypes
             fn.restype = restype
@@ -468,57 +467,108 @@ class RandomXLoader:
         self._rx_calculate_hash = _bind(self._FN_RANDOMX_CALCULATE_HASH,
                                         [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p], None)
 
-    # --------------- lifecycle ---------------
+    # ---------------- Lifecycle ----------------
     @property
     def started(self) -> bool:
         return self._started
 
+    def is_ready(self) -> bool:
+        # Helper you can also use from StratumManager
+        return bool(self._started and self._vm)
+
     def ensure_started(self, seed: bytes, use_dataset: bool = False):
-        """
-        Initialize or re-seed the VM. Safe to call when already started.
-        """
         if not isinstance(seed, (bytes, bytearray, memoryview)):
             raise TypeError("seed must be bytes-like")
 
         with self._lock:
             self._load_and_verify_dll()
-
-            # If already running, just re-init the cache with the new seed.
             if self._started and self._cache:
                 seed_buf = (ctypes.c_ubyte * len(seed)).from_buffer_copy(seed)
                 self._rx_init_cache(self._cache, ctypes.cast(seed_buf, ctypes.c_void_p), len(seed))
                 self._reset_pipeline_locked()
-                self._log("[RandomX] ✅ VM cache re-initialized with new seed.")
+                self._log("[RandomX] ✅ Cache re-initialized with new seed.")
                 return
 
             flags = self._init_flags if self._init_flags is not None else int(self._rx_get_flags())
             if use_dataset:
-                flags |= RandomXFlags.FULL_MEM  # optional, depending on your build/setup
+                flags |= RandomXFlags.FULL_MEM
 
-            # Allocate and initialize cache
             self._cache = self._rx_alloc_cache(flags)
             if not self._cache:
-                raise RuntimeError("randomx_alloc_cache failed (returned NULL)")
+                raise RuntimeError("randomx_alloc_cache failed")
 
             seed_buf = (ctypes.c_ubyte * len(seed)).from_buffer_copy(seed)
             self._rx_init_cache(self._cache, ctypes.cast(seed_buf, ctypes.c_void_p), len(seed))
 
-            # Create VM (dataset not wired; you can create/attach if desired)
             self._vm = self._rx_create_vm(flags, self._cache, self._dataset)
             if not self._vm:
-                # Clean up cache if VM creation failed
                 self._rx_release_cache(self._cache)
                 self._cache = None
-                raise RuntimeError("randomx_create_vm failed (returned NULL)")
+                raise RuntimeError("randomx_create_vm failed")
 
             self._started = True
             self._reset_pipeline_locked()
-            mode = "Full Dataset" if self._dataset else "Light Cache"
-            self._log(f"[RandomX] ✅ VM ready ({mode} Mode, Flags: {hex(flags)})")
+            self._log(f"[RandomX] ✅ VM ready (Flags: {hex(flags)})")
+
+    def calculate_hash(self, blob: bytes) -> int:
+        if not self._started or not self._vm:
+            raise RuntimeError("RandomX not started.")
+        if not isinstance(blob, (bytes, bytearray, memoryview)):
+            raise TypeError("blob must be bytes-like")
+        out = (ctypes.c_ubyte * 32)()
+        with self._lock:
+            if not self._started or not self._vm:
+                raise RuntimeError("RandomX not started.")
+            in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+            self._rx_calculate_hash(self._vm,
+                                    ctypes.cast(in_buf, ctypes.c_void_p),
+                                    len(blob),
+                                    ctypes.cast(out, ctypes.c_void_p))
+        return int.from_bytes(bytes(out), "little")
+
+    def calculate_hash_first(self, blob: bytes) -> None:
+        if not self._started or not self._vm:
+            raise RuntimeError("RandomX not started.")
+        with self._lock:
+            self._pipe_prev_digest = self._calc_locked(blob)
+            self._pipe_has_prev = True
+
+    def calculate_hash_next(self, blob: bytes) -> int:
+        if not self._started or not self._vm:
+            raise RuntimeError("RandomX not started.")
+        with self._lock:
+            if not self._pipe_has_prev:
+                raise RuntimeError("Pipeline not started.")
+            prev = self._pipe_prev_digest
+            self._pipe_prev_digest = self._calc_locked(blob)
+            return int(prev)
+
+    def calculate_hash_last(self) -> int:
+        if not self._started or not self._vm:
+            raise RuntimeError("RandomX not started.")
+        with self._lock:
+            if not self._pipe_has_prev:
+                raise RuntimeError("Pipeline not started.")
+            last = self._pipe_prev_digest
+            self._reset_pipeline_locked()
+            return int(last)
+
+        # ---------------- Internal helpers ----------------
+
+    def _calc_locked(self, blob: bytes) -> int:
+        if not self._started or not self._vm:
+            raise RuntimeError("RandomX not started.")
+        out = (ctypes.c_ubyte * 32)()
+        in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+        self._rx_calculate_hash(self._vm,
+                                ctypes.cast(in_buf, ctypes.c_void_p),
+                                len(blob),
+                                ctypes.cast(out, ctypes.c_void_p))
+        return int.from_bytes(bytes(out), "little")
 
     def destroy(self):
         with self._lock:
-            if not self._started:
+            if not self._started and not self._vm and not self._cache:
                 return
             try:
                 if self._vm:
@@ -528,80 +578,12 @@ class RandomXLoader:
                 if self._cache:
                     self._rx_release_cache(self._cache)
                     self._cache = None
-                # (If you add dataset support, release it here as well)
                 self._started = False
                 self._reset_pipeline_locked()
-                self._log("[RandomX] 🛑 VM and resources destroyed.")
+                self._log("[RandomX] 🛑 VM destroyed.")
 
-    # --------------- hashing: scalar ---------------
-    def calculate_hash(self, blob: bytes) -> int:
-        """
-        Compute digest for 'blob' and return as a little-endian integer (32 bytes).
-        Matches the comparison semantics used in _share_worker (dig <= target).
-        """
-        if not self._started:
-            raise RuntimeError("RandomX not started. Call ensure_started() first.")
-        if not isinstance(blob, (bytes, bytearray, memoryview)):
-            raise TypeError("blob must be bytes-like")
-
-        out = (ctypes.c_ubyte * 32)()
-        with self._lock:
-            in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
-            self._rx_calculate_hash(self._vm,
-                                    ctypes.cast(in_buf, ctypes.c_void_p),
-                                    len(blob),
-                                    ctypes.cast(out, ctypes.c_void_p))
-        # Return as little-endian integer for direct target comparison
-        return int.from_bytes(bytes(out), "little")
-
-    # --------------- hashing: pipelined (emulated) ---------------
-    def calculate_hash_first(self, blob: bytes) -> None:
-        """
-        Start a pipeline batch. We emulate pipelining by computing immediately
-        and buffering the digest; 'next' returns the previous digest.
-        """
-        if not isinstance(blob, (bytes, bytearray, memoryview)):
-            raise TypeError("blob must be bytes-like")
-        if not self._started:
-            raise RuntimeError("RandomX not started. Call ensure_started() first.")
-        with self._lock:
-            self._pipe_prev_digest = self._calc_locked(blob)
-            self._pipe_has_prev = True
-
-    def calculate_hash_next(self, blob: bytes) -> int:
-        """
-        Return the digest of the *previous* blob in the current pipeline batch,
-        and compute/store the digest for 'blob' as the new previous.
-        """
-        if not isinstance(blob, (bytes, bytearray, memoryview)):
-            raise TypeError("blob must be bytes-like")
-        if not self._started:
-            raise RuntimeError("RandomX not started. Call ensure_started() first.")
-        with self._lock:
-            if not self._pipe_has_prev:
-                raise RuntimeError("Pipeline not started. Call calculate_hash_first() first.")
-            # emit previous, compute new
-            prev = self._pipe_prev_digest
-            self._pipe_prev_digest = self._calc_locked(blob)
-            return int(prev)
-
-    def calculate_hash_last(self) -> int:
-        """
-        Finish the pipeline batch and return the digest for the last blob submitted.
-        """
-        if not self._started:
-            raise RuntimeError("RandomX not started. Call ensure_started() first.")
-        with self._lock:
-            if not self._pipe_has_prev:
-                raise RuntimeError("Pipeline not started. Call calculate_hash_first() first.")
-            last = self._pipe_prev_digest
-            # reset pipeline state
-            self._reset_pipeline_locked()
-            return int(last)
-
-    # --------------- helpers (internal) ---------------
+    # ---------------- Internal helpers ----------------
     def _calc_locked(self, blob: bytes) -> int:
-        """Assumes _lock is held; returns little-endian int digest."""
         out = (ctypes.c_ubyte * 32)()
         in_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
         self._rx_calculate_hash(self._vm,
@@ -613,3 +595,34 @@ class RandomXLoader:
     def _reset_pipeline_locked(self):
         self._pipe_prev_digest = None
         self._pipe_has_prev = False
+
+    # ---------------- Utility functions (static) ----------------
+    @staticmethod
+    def norm_hex(h: Optional[str]) -> Optional[str]:
+        if not h or not isinstance(h, str):
+            return None
+        h = h.strip().lower()
+        if h.startswith("0x"):
+            h = h[2:]
+        return "".join(c for c in h if c in "0123456789abcdef") or None
+
+    @staticmethod
+    def target_from_difficulty_int(difficulty: int) -> int:
+        D = max(1, int(difficulty))
+        return (1 << 256) // D
+
+    @staticmethod
+    def target_hex_from_difficulty(difficulty: int) -> str:
+        T = RandomXLoader.target_from_difficulty_int(difficulty)
+        return T.to_bytes(32, "little").hex()
+
+    @staticmethod
+    def bytes_target_int(target_hex: str) -> int:
+        if not target_hex:
+            raise ValueError("Target hex cannot be empty")
+        n = len(target_hex)
+        if n == 64:
+            return int.from_bytes(bytes.fromhex(target_hex), "little")
+        if n == 8:
+            return int.from_bytes(bytes.fromhex(target_hex).ljust(32, b"\x00"), "little")
+        raise ValueError(f"Invalid target hex length: expected 64 or 8, got {n}")

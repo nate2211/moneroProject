@@ -39,6 +39,9 @@ from scapy.layers.kerberos import (
     EncryptedData, PADATA
 )
 
+from server.p2pool_router_managers_2 import TLSRecordManager, TLSRecord
+
+
 class FunctionCallTracker:
     """
     A class that tracks the invocation count for multiple functions or events.
@@ -182,6 +185,8 @@ def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
     emoji = random.choice(emoticons) if emoticons else ''
     return f"[{name}] {emoji} {message}"
 
+def _canon_key(ip1: str, pt1: int, ip2: str, pt2: int):
+    return tuple(sorted([(ip1, pt1), (ip2, pt2)]))
 
 class ISAKMPManager:
     """
@@ -1026,16 +1031,13 @@ class TransportManager:
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
     This version supports a wide variety of protocols including DNS, DHCP, NTP, TFTP,
     VoIP (SIP/RTP), QUIC, ZeroTier/SSDP, and dynamic ports.
+
+    TLS dissection is performed passively by TLSRecordManager using TCP Raw bytes.
     """
 
     def __init__(self, router_logger, packet_signer):
         """
         Initializes the TransportManager with a logger and a packet signer.
-
-        Args:
-            router_logger: An object for logging messages.
-            packet_signer: An object for signing packets (not used in this example,
-                           but part of the original class context).
         """
         self.logger = router_logger
         self.packet_signer = packet_signer
@@ -1045,19 +1047,184 @@ class TransportManager:
         self.QUIC_STREAM_TIMEOUT = 300
         self.last_quic_cleanup_time = time.time()
 
+        # TLS record manager + callbacks
+        self.tls_manager = TLSRecordManager(self.logger)
+        self._wire_tls_callbacks()
+
+        # Minimal initiator tracker to set c2s/s2c directions reliably
+        # key -> (client_ip, client_port)
+        self._initiators: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Tuple[str,int]] = {}
+
+        # Alert/Description maps for prettier logs (optional)
+        self.TLS_ALERT_LEVEL = {1: "warning", 2: "fatal"}
+        self.TLS_ALERT_DESCRIPTION = {
+            0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
+            22: "record_overflow", 40: "handshake_failure", 42: "bad_certificate",
+            43: "unsupported_certificate", 46: "certificate_unknown", 47: "illegal_parameter",
+            48: "unknown_ca", 49: "access_denied", 50: "decode_error",
+            51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
+            80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
+        }
+    def _on_tls_policy_decision(self, key, rec, decision):
+        """
+        Called on EVERY TLS record after the policy engine evaluates it.
+        key: canonical 4-tuple ((src_ip,src_port),(dst_ip,dst_port))
+        rec: TLSRecord (content_type/version/length/src/dst/ports/direction)
+        decision: TLSPolicyDecision(action, reason, tags)
+        """
+        flow = f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} [{rec.direction}]"
+        if decision.action == "allow":
+            self.logger.log_message(
+                f"[Transport][🔐 TLS][policy] ✅ allow | {flow}"
+            )
+            return
+
+        tag_str = ",".join(decision.tags) if decision.tags else "-"
+        if decision.action == "alert":
+            self.logger.log_message(
+                f"[Transport][🔐 TLS][policy] ⚠️ alert | {flow} | reason={decision.reason} | tags={tag_str}"
+            )
+            return
+
+        # block / quarantine -> log + enforce hook
+        self.logger.log_message(
+            f"[Transport][🔐 TLS][policy] ⛔ {decision.action} | {flow} | reason={decision.reason} | tags={tag_str}"
+        )
+        try:
+            self._enforce_tls_decision(key, rec, decision)
+        except Exception as e:
+            self.logger.log_message(f"[Transport][🔐 TLS][policy] enforcement error: {e}")
+
+    def _on_tls_event(self, evt: dict):
+        """
+        High-level event feed from TLSRecordManager (client_hello/server_hello/alert/block/quarantine/policy_alert).
+        Use this to emit metrics or forward to your UI.
+        """
+        kind = evt.get("kind")
+        data = evt.get("data", {})
+        flow = evt.get("flow")
+        # Keep it concise; expand if you want richer telemetry
+        if kind in ("client_hello", "server_hello"):
+            brief = []
+            if "sni" in data and data["sni"]:
+                brief.append(f"SNI={data['sni']}")
+            if "ja3" in data and data["ja3"]:
+                brief.append("ja3")
+            if "ja3s" in data and data["ja3s"]:
+                brief.append("ja3s")
+            self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {' '.join(brief) or '-'}")
+        elif kind in ("alert", "policy_alert", "block", "quarantine"):
+            self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {data}")
+        else:
+            # Uncomment if you want every event
+            # self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {data}")
+            pass
+
+    def _enforce_tls_decision(self, key, rec, decision):
+        """
+        Central place to ACT on a block/quarantine decision.
+        Replace the placeholders with your real enforcement (firewall, ACL, RST, etc.)
+        """
+        # Example: mark in your signer/tagger, raise a notification, or update a banlist.
+        # self.packet_signer.tag_flow(key, decision.tags)
+        # self.notification_manager.warn(...)
+
+        # If you want to immediately terminate TCP:
+        #   - you can queue forged TCP RSTs to both directions (requires your packet writer)
+        #   - or set a table your firewall consults to drop subsequent segments
+
+        action = decision.action
+        reason = decision.reason
+
+        # Example pseudo-enforcement toggles:
+        DROP_FUTURE_APPDATA = True
+        SEND_TCP_RST        = False
+
+        if DROP_FUTURE_APPDATA:
+            # TLSRecordManager already suppresses on_application_data callbacks
+            # once a session is marked blocked/quarantined. Nothing else needed here.
+            pass
+
+        if SEND_TCP_RST:
+            try:
+                sip, sport = rec.src, rec.src_port
+                dip, dport = rec.dst, rec.dst_port
+                # enqueue two RSTs (c2s and s2c) via your packet writer here...
+                # self.packet_writer.send_tcp_rst(sip, sport, dip, dport)
+                # self.packet_writer.send_tcp_rst(dip, dport, sip, sport)
+                self.logger.log_message(
+                    f"[Transport][🔐 TLS][policy] injected TCP RSTs for {sip}:{sport} <-> {dip}:{dport}"
+                )
+            except Exception as e:
+                self.logger.log_message(f"[Transport][🔐 TLS][policy] RST injection failed: {e}")
+    # --------------------- TLS callback wiring ------------------------
+    def _wire_tls_callbacks(self):
+        def fmt_flow(rec: TLSRecord):
+            return f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} [{rec.direction}]"
+
+        # Every TLS record parsed
+        self.tls_manager.on_record = lambda rec: self.logger.log_message(
+            f"[Transport][🔐 TLS] Record ct={rec.content_type} v={rec.version[0]}.{rec.version[1]} "
+            f"len={rec.length} on {fmt_flow(rec)}"
+        )
+
+        # Handshake messages summary (ClientHello/ServerHello best-effort)
+        def on_hs(rec: TLSRecord, info: Dict):
+            for m in info.get("messages", []):
+                t = m.get("type") or f"type={m.get('type_id')}"
+                if m.get("hello") == "client":
+                    v = m.get("version")
+                    sni = m.get("sni") or "N/A"
+                    suites = m.get("cipher_suites_count")
+                    self.logger.log_message(
+                        f"[Transport][🔐 TLS] ClientHello v={v} SNI={sni} suites≈{suites} on {fmt_flow(rec)}"
+                    )
+                elif m.get("hello") == "server":
+                    v = m.get("version")
+                    cs = m.get("cipher_suite")
+                    self.logger.log_message(
+                        f"[Transport][🔐 TLS] ServerHello v={v} cipher={cs} on {fmt_flow(rec)}"
+                    )
+                else:
+                    self.logger.log_message(f"[Transport][🔐 TLS] Handshake {t} on {fmt_flow(rec)}")
+
+        self.tls_manager.on_handshake = on_hs
+
+        # Application Data (encrypted)
+        self.tls_manager.on_application_data = lambda rec: self.logger.log_message(
+            f"[Transport][🔐 TLS] Application Data {rec.length}B on {fmt_flow(rec)}"
+        )
+
+        # Alerts
+        def on_alert(rec: TLSRecord, alert: Dict):
+            lvl = self.TLS_ALERT_LEVEL.get(alert.get("level"), str(alert.get("level")))
+            desc = self.TLS_ALERT_DESCRIPTION.get(alert.get("description"), str(alert.get("description")))
+            self.logger.log_message(
+                f"[Transport][🔐 TLS] Alert on {fmt_flow(rec)}: level={lvl} desc={desc}"
+            )
+
+        self.tls_manager.on_alert = on_alert
+
+        # ChangeCipherSpec
+        self.tls_manager.on_change_cipher_spec = lambda rec: self.logger.log_message(
+            f"[Transport][🔐 TLS] ChangeCipherSpec on {fmt_flow(rec)}"
+        )
+
+        # Legacy SSL-ish
+        self.tls_manager.on_legacy_ssl = lambda rec: self.logger.log_message(
+            f"[Transport][🔐 TLS] Legacy/SSLv2-like record len={rec.length} on {fmt_flow(rec)}"
+        )
+
+        # 🔧 NEW: policy decisions + event feed
+        self.tls_manager.on_decision = self._on_tls_policy_decision
+        self.tls_manager.on_event = self._on_tls_event
+
+    # --------------------- Main packet handler ------------------------
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
         Processes and logs Transport Layer packet details, with enhanced UDP protocol
-        dissection for DNS, DHCP, NTP, TFTP, and VoIP.
-
-        Args:
-            packet (Packet): The Scapy packet to process.
-            inbound_iface (str): The full Scapy name of the interface the packet
-                                 was sniffed on.
-
-        Returns:
-            bool: True if the packet contained a recognized transport layer and was
-                  processed. False otherwise.
+        dissection for DNS, DHCP, NTP, TFTP, VoIP, QUIC, ZeroTier/SSDP, and dynamic ports.
+        Also feeds TCP payloads into TLSRecordManager for passive TLS parsing.
         """
         iface_short = inbound_iface.split('_')[-1]
         ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6] if packet.haslayer(IPv6) else None
@@ -1067,6 +1234,7 @@ class TransportManager:
 
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
+        processed = False
 
         # --- TCP ---
         if packet.haslayer(TCP):
@@ -1083,8 +1251,34 @@ class TransportManager:
                 f"[Transport][🧵 TCP] Packet on {iface_short}: {src_ip}:{tcp.sport} → {dst_ip}:{tcp.dport} | "
                 f"Flags: {','.join(flag_details)} | Payload: {payload_len}"
             )
-            if packet.haslayer(TLS):
-                self._handle_tls_handshake(packet)
+
+            # Track initiator when we see initial SYN (no ACK)
+            if "S" in flags and "A" not in flags:
+                key = _canon_key(src_ip, tcp.sport, dst_ip, tcp.dport)
+                self._initiators[key] = (src_ip, tcp.sport)
+
+            # Feed TLS bytes (if present) to TLSRecordManager
+            if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
+                raw_bytes = bytes(packet[Raw].load)
+                key = _canon_key(src_ip, tcp.sport, dst_ip, tcp.dport)
+                client_tuple = self._initiators.get(key)
+
+                # Decide direction: c2s if (src_ip,src_port) == client_tuple
+                if client_tuple:
+                    is_c2s = (src_ip, tcp.sport) == client_tuple
+                else:
+                    # Fallback heuristic if we never saw the SYN
+                    is_c2s = (tcp.sport <= tcp.dport)
+
+                self.tls_manager.feed_tcp_segment(
+                    canonical_key=key,
+                    is_c2s=is_c2s,
+                    payload=raw_bytes,
+                    src_ip=src_ip, src_port=tcp.sport,
+                    dst_ip=dst_ip, dst_port=tcp.dport,
+                    ts=time.time()
+                )
+
             # Example hook: Detect SYN scan
             if "SYN" in flag_details and payload_len == 0:
                 self.logger.log_message(
@@ -1097,7 +1291,7 @@ class TransportManager:
                     f"[Transport][🧵 TCP][❔ Dynamic Port] TCP Port 56709 detected from {src_ip}:{tcp.sport} to {dst_ip}:{tcp.dport}."
                 )
 
-            return True
+            processed = True
 
         # --- UDP ---
         elif packet.haslayer(UDP):
@@ -1145,104 +1339,11 @@ class TransportManager:
                     f"Payload size: {payload_len}"
                 )
 
-            return True
+            processed = True
 
-        return False
+        return processed
 
-    def _handle_tls_handshake(self, packet: Packet):
-        """
-        Dissects and logs various TLS handshake messages to provide a more
-        complete view of the handshake process.
-        """
-        current_layer = packet
-        while current_layer:
-            layer_name = current_layer.__class__.__name__
-
-            if hasattr(current_layer, "msg_type") and "TLSHandshake" in layer_name:
-                try:
-                    for handshake_msg in current_layer.msg:
-                        msg_type_name = handshake_msg.msg_type.name
-                        self.logger.log_message(
-                            f"[Transport][🧵 TCP][🔐 TLS] Handshake Message: {msg_type_name}")
-                except Exception as e:
-                    self.logger.log_message(f"[Transport][🧵 TCP][⚠️ TLS] Failed to read msg_type on {layer_name}: {e}")
-
-            current_layer = current_layer.payload
-
-        if packet.haslayer(TLSServerHello):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Hello message detected.")
-        if packet.haslayer(TLSCertificate):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Certificate message detected.")
-        if packet.haslayer(TLSServerKeyExchange):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Key Exchange message detected.")
-            self._dissect_server_key_exchange(packet)
-        if packet.haslayer(TLSServerHelloDone):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Server Hello Done message detected.")
-        if packet.haslayer(TLSClientKeyExchange):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Client Key Exchange message detected.")
-            self._dissect_client_key_exchange(packet)
-        if packet.haslayer(TLSChangeCipherSpec):
-            self.logger.log_message("[Transport][🧵 TCP][🤝 TLS] Change Cipher Spec message detected.")
-
-    def _dissect_server_key_exchange(self, packet: Packet):
-        """Dissects the parameters within a TLSServerKeyExchange message."""
-        ske = packet[TLSServerKeyExchange]
-
-        if packet.haslayer(ServerECDHNamedCurveParams):
-            params = packet[ServerECDHNamedCurveParams]
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Curve: {params.named_curve.name} (ID: {params.named_curve})"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Server Public Point (Yc): 0x{params.point.hex()}"
-            )
-        elif packet.haslayer(ServerDHParams):
-            params = packet[ServerDHParams]
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Key Exchange: DHE (Diffie-Hellman Ephemeral)"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] DH Prime (p) length: {len(params.dh_p)} bytes"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] DH Generator (g) length: {len(params.dh_g)} bytes"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Server Public Value (Ys) length: {len(params.dh_Ys)} bytes"
-            )
-        if ske.sig_len > 0:
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Signature Algorithm: {ske.sig_hash_alg.name}"
-            )
-            self.logger.log_message(
-                f"[Transport][🧵 TCP]   [+] Signature Length: {ske.sig_len} bytes"
-            )
-        else:
-            self.logger.log_message("[Transport][🧵 TCP]   [+] No signature present in this message.")
-
-    def _dissect_client_key_exchange(self, packet: Packet):
-        """Dissects the data within a TLSClientKeyExchange message."""
-        try:
-            if packet.haslayer(ClientECDiffieHellmanPublic):
-                params = packet[ClientECDiffieHellmanPublic]
-                self.logger.log_message(
-                    f"[Transport][🧵 TCP]   [+] Client Public Point (Yc) Length: {len(params.ecdh_Yc)} bytes"
-                )
-            elif packet.haslayer(ClientDiffieHellmanPublic):
-                params = packet[ClientDiffieHellmanPublic]
-                self.logger.log_message(
-                    f"[Transport][🧵 TCP]   [+] Client Public Value (Yc) Length: {len(params.dh_Yc)} bytes"
-                )
-            elif packet.haslayer(EncryptedPreMasterSecret):
-                self.logger.log_message(
-                    f"[Transport][🧵 TCP]   [+] Encrypted Pre-Master Secret found (RSA Key Exchange)."
-                )
-        except Exception as e:
-            self.logger.log_message(f"[Transport][🧵 TCP] Error dissecting TLS Client Key Exchange: {e}")
-
+    # ---------------------- UDP protocol handlers ---------------------
     def _bytes_to_str(self, data: bytes) -> str:
         """Safely decodes bytes to a string, ignoring any decoding errors."""
         return data.decode('utf-8', errors='ignore')
@@ -1421,10 +1522,7 @@ class TransportManager:
     def _parse_quic_varint(self, data: bytes) -> tuple[int, int]:
         """
         Parses a QUIC variable-length integer from the beginning of a byte string.
-
-        Returns:
-            A tuple containing (the integer value, number of bytes consumed).
-            Returns (0, 0) if data is invalid or insufficient.
+        Returns (value, bytes_consumed), or (0,0) on failure.
         """
         if not data:
             return 0, 0
@@ -1581,63 +1679,24 @@ class TransportManager:
 
 class HTTPSManager:
     """
-    Manages passive monitoring of HTTPS/TLS and TCP traffic.
-    This enhanced version provides detailed logging for TLS 1.2 and 1.3 handshakes,
-    and now includes a comprehensive analysis of TCP connection establishment,
-    termination, and key options.
+    Passive HTTPS/TLS + TCP monitor that **does not** rely on Scapy's TLS layers.
+    Instead, it feeds TCP payload bytes into TLSRecordManager, which performs
+    stream-aware reassembly and best-effort TLS record/handshake parsing (e.g., SNI).
     """
+
+    # Pretty names for TLS content types
+    _CT_NAMES = {20: "ChangeCipherSpec", 21: "Alert", 22: "Handshake", 23: "ApplicationData"}
+
+    # Common TLS server ports (used as a light prefilter; parsing still works on any port)
+    _TLS_LIKE_PORTS = {443, 8443, 9443, 10443, 444, 8444}
 
     def __init__(self, router_logger):
         self.router_logger = router_logger
-        self.cipher_map = self.build_cipher_suite_map()
+        self.cipher_map = self._build_cipher_suite_map()
         self.router_logger.log_message("[HTTPS] 🔒 Initialized for passive TLS/TCP monitoring.")
-        self.router_logger.log_message(f"[HTTPS] 🗺️  Built map with {len(self.cipher_map)} cipher suites.")
+        self.router_logger.log_message(f"[HTTPS] 🗺️  Cipher map has {len(self.cipher_map)} entries.")
 
-        self.TLS_VERSIONS = {
-            0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
-            0x0303: "TLS 1.2", 0x0304: "TLS 1.3"
-        }
-
-        # Updated to include TLS 1.2 handshake messages
-        self.TLS_HANDSHAKE_TYPES = {
-            0: "hello_request_RESERVED", 1: "client_hello", 2: "server_hello",
-            3: "hello_verify_request_RESERVED", 4: "new_session_ticket",
-            5: "end_of_early_data", 6: "hello_retry_request_RESERVED",
-            8: "encrypted_extensions", 11: "certificate",
-            12: "server_key_exchange", 13: "certificate_request",
-            14: "server_hello_done", 15: "certificate_verify",
-            16: "client_key_exchange", 20: "finished",
-            21: "certificate_url_RESERVED", 22: "certificate_status_RESERVED",
-            23: "supplemental_data_RESERVED", 24: "key_update",
-            254: "message_hash"
-        }
-
-        self.TLS_EXTENSIONS = {
-            0: "server_name", 1: "max_fragment_length", 2: "client_certificate_url",
-            3: "trusted_ca_keys", 4: "truncated_hmac", 5: "status_request",
-            6: "user_mapping", 7: "client_authz", 8: "server_authz", 9: "cert_type",
-            10: "supported_groups", 11: "ec_point_formats", 12: "srp",
-            13: "signature_algorithms", 14: "use_srtp", 15: "heartbeat",
-            16: "application_layer_protocol_negotiation", 17: "status_request_v2",
-            18: "signed_certificate_timestamp", 19: "client_certificate_type",
-            20: "server_certificate_type", 21: "padding", 22: "encrypt_then_mac",
-            23: "extended_master_secret", 24: "token_binding", 25: "cached_info",
-            26: "tls_lts", 27: "compress_certificate", 28: "record_size_limit",
-            29: "pwd_protect", 30: "pwd_clear", 31: "password_salt",
-            32: "ticket_pinning", 33: "tls_cert_with_extern_psk", 34: "delegated_credential",
-            35: "session_ticket", 36: "TLMSP", 37: "TLMSP_proxying",
-            38: "TLMSP_delegate", 39: "supported_ekt_ciphers", 40: "Reserved",
-            41: "pre_shared_key", 42: "early_data", 43: "supported_versions",
-            44: "cookie", 45: "psk_key_exchange_modes", 46: "Reserved",
-            47: "certificate_authorities", 48: "oid_filters", 49: "post_handshake_auth",
-            50: "signature_algorithms_cert", 51: "key_share", 52: "transparency_info",
-            53: "connection_id (deprecated)", 54: "connection_id", 55: "external_id_hash",
-            56: "external_session_id", 57: "quic_transport_parameters", 58: "ticket_request",
-            59: "dnssec_chain", 60: "sequence_number_encryption_algorithms", 61: "rrc",
-            62: "tls_flags", 2570: "Reserved", 65037: "encrypted_client_hello",
-            65281: "renegotiation_info"
-        }
-
+        # For nicer alert logs
         self.TLS_ALERT_LEVEL = {1: "warning", 2: "fatal"}
         self.TLS_ALERT_DESCRIPTION = {
             0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
@@ -1648,41 +1707,268 @@ class HTTPSManager:
             80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
         }
 
-        self.ALPN_PROTOCOLS = {
-            b'http/0.9': 'HTTP/0.9', b'http/1.0': 'HTTP/1.0', b'http/1.1': 'HTTP/1.1',
-            b'spdy/1': 'SPDY/1', b'spdy/2': 'SPDY/2', b'spdy/3': 'SPDY/3',
-            b'stun.turn': 'Traversal Using Relays around NAT (TURN)',
-            b'stun.nat-discovery': 'NAT discovery using STUN', b'h2': 'HTTP/2 over TLS',
-            b'h2c': 'HTTP/2 over TCP', b'webrtc': 'WebRTC Media and Data',
-            b'c-webrtc': 'Confidential WebRTC Media and Data', b'ftp': 'FTP',
-            b'imap': 'IMAP', b'pop3': 'POP3', b'managesieve': 'ManageSieve',
-            b'coap': 'CoAP (over TLS)', b'co': 'CoAP (over DTLS)',
-            b'xmpp-client': 'XMPP jabber:client', b'xmpp-server': 'XMPP jabber:server',
-            b'acme-tls/1': 'acme-tls/1', b'mqtt': 'MQTT', b'dot': 'DNS-over-TLS',
-            b'ntske/1': 'Network Time Security Key Establishment', b'sunrpc': 'SunRPC',
-            b'h3': 'HTTP/3', b'smb': 'SMB2', b'irc': 'IRC', b'nntp': 'NNTP (reading)',
-            b'nnsp': 'NNTP (transit)', b'doq': 'DoQ', b'sip/2': 'SIP',
-            b'tds/8.0': 'TDS/8.0', b'dicom': 'DICOM', b'postgresql': 'PostgreSQL',
-            b'radius/1.0': 'RADIUS/1.0', b'radius/1.1': 'RADIUS/1.1'
-        }
+        # TCP state tracking (simple)
+        self.tcp_state_map: Dict[Tuple[str, int, str, int], str] = {}
+        self.TCP_FLAGS = {'S': 'SYN', 'A': 'ACK', 'F': 'FIN', 'R': 'RST', 'P': 'PSH', 'U': 'URG'}
 
-        self.tcp_state_map = {}  # Tracks TCP states by connection tuple
-        self.TCP_FLAGS = {
-            'S': 'SYN', 'A': 'ACK', 'F': 'FIN', 'R': 'RST', 'P': 'PSH', 'U': 'URG'
-        }
+        # Track TCP initiators so we can label TLS direction (c2s vs s2c)
+        # key = canonical 4-tuple (two endpoint pairs in sorted order) -> (client_ip, client_port)
+        self._initiators: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
 
-    def build_cipher_suite_map(self) -> dict:
+        # TLS record parser/manager
+        self.tls_manager = TLSRecordManager(self.router_logger)
+        self._wire_tls_callbacks()
+
+    # ------------ Public ------------
+
+    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
-        Dynamically builds a map of TLS cipher suite IDs to their string names
-        for compatibility with various Scapy versions.
+        Handle one packet: log TCP, parse TCP options/state, and feed any TCP payload
+        bytes into TLSRecordManager (direction-aware) for passive TLS parsing.
         """
-        # Primarily focus on modern, secure cipher suites
+        processed = False
+
+        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
+            return processed
+
+        ip = packet.getlayer(IP) or packet.getlayer(IPv6)
+
+        # ---------- TCP ----------
+        if packet.haslayer(TCP):
+            tcp = packet[TCP]
+            self.router_logger.log_message(self._generate_tcp_summary(packet, inbound_iface))
+            self._handle_tcp_options(packet)
+            self._handle_tcp_state(packet)
+
+            # Record the initiator on a bare SYN (no ACK)
+            flags_txt = tcp.sprintf("%TCP.flags%")
+            if "S" in flags_txt and "A" not in flags_txt:
+                key = self._canon_key(ip.src, tcp.sport, ip.dst, tcp.dport)
+                self._initiators[key] = (ip.src, tcp.sport)
+
+            # Feed possible TLS bytes (Raw) into TLSRecordManager
+            if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
+                raw = bytes(packet[Raw].load)
+                if self._looks_tlsish(raw, tcp.sport, tcp.dport):
+                    key = self._canon_key(ip.src, tcp.sport, ip.dst, tcp.dport)
+                    client_tuple = self._initiators.get(key)
+                    is_c2s = (client_tuple is not None and (ip.src, tcp.sport) == client_tuple)
+                    # Fallback heuristic if initiator unknown
+                    if client_tuple is None:
+                        is_c2s = (tcp.sport <= tcp.dport)
+
+                    self.tls_manager.feed_tcp_segment(
+                        canonical_key=key,
+                        is_c2s=is_c2s,
+                        payload=raw,
+                        src_ip=ip.src, src_port=tcp.sport,
+                        dst_ip=ip.dst, dst_port=tcp.dport,
+                        ts=time.time()
+                    )
+            processed = True
+
+        return processed
+
+    # ------------ TLS wiring & callbacks ------------
+
+    def _wire_tls_callbacks(self):
+        def fmt_flow(rec):
+            return f"{rec.src}:{rec.src_port} → {rec.dst}:{rec.dst_port} [{rec.direction}]"
+
+        # Generic TLS record callback
+        def on_record(rec):
+            ct_name = self._CT_NAMES.get(rec.content_type, f"ct={rec.content_type}")
+            self.router_logger.log_message(
+                f"[HTTPS][TLS] 📦 {ct_name} v={rec.version[0]}.{rec.version[1]} len={rec.length} on {fmt_flow(rec)}"
+            )
+
+        # Handshake messages (best-effort summaries from TLSRecordManager)
+        def on_handshake(rec, info):
+            for m in info.get("messages", []):
+                if m.get("hello") == "client":
+                    v = m.get("version") or "?"
+                    sni = m.get("sni") or "N/A"
+                    suites = m.get("cipher_suites_count")
+                    self.router_logger.log_message(
+                        f"[HTTPS][TLS] 🤝 ClientHello v={v} SNI={sni} suites≈{suites} on {fmt_flow(rec)}"
+                    )
+                elif m.get("hello") == "server":
+                    v = m.get("version") or "?"
+                    cs_id_hex = (m.get("cipher_suite") or "").lower()  # "0xNNNN"
+                    cs_name = None
+                    try:
+                        if cs_id_hex.startswith("0x"):
+                            cs_val = int(cs_id_hex, 16)
+                            cs_name = self.cipher_map.get(cs_val)
+                    except Exception:
+                        pass
+                    cs_display = f"{cs_name} ({cs_id_hex})" if cs_name else (cs_id_hex or "?")
+                    self.router_logger.log_message(
+                        f"[HTTPS][TLS] 🤝 ServerHello v={v} cipher={cs_display} on {fmt_flow(rec)}"
+                    )
+                else:
+                    t = m.get("type") or f"type={m.get('type_id')}"
+                    self.router_logger.log_message(
+                        f"[HTTPS][TLS] 🤝 Handshake: {t} on {fmt_flow(rec)}"
+                    )
+
+        def on_app(rec):
+            self.router_logger.log_message(
+                f"[HTTPS][TLS] 🔒 Application Data {rec.length}B on {fmt_flow(rec)}"
+            )
+
+        def on_alert(rec, alert):
+            lvl = self.TLS_ALERT_LEVEL.get(alert.get("level"), str(alert.get("level")))
+            desc = self.TLS_ALERT_DESCRIPTION.get(alert.get("description"), str(alert.get("description")))
+            self.router_logger.log_message(
+                f"[HTTPS][TLS] ⚠️ Alert on {fmt_flow(rec)}: level={lvl}, desc={desc}"
+            )
+
+        def on_ccs(rec):
+            self.router_logger.log_message(
+                f"[HTTPS][TLS] 🔁 ChangeCipherSpec on {fmt_flow(rec)}"
+            )
+
+        def on_legacy(rec):
+            self.router_logger.log_message(
+                f"[HTTPS][TLS] 🧓 Legacy/SSLv2-like record len={rec.length} on {fmt_flow(rec)}"
+            )
+
+        self.tls_manager.on_record = on_record
+        self.tls_manager.on_handshake = on_handshake
+        self.tls_manager.on_application_data = on_app
+        self.tls_manager.on_alert = on_alert
+        self.tls_manager.on_change_cipher_spec = on_ccs
+        self.tls_manager.on_legacy_ssl = on_legacy
+
+    # ------------ TCP helpers/logging ------------
+
+    def _generate_tcp_summary(self, packet: Packet, inbound_iface: str) -> str:
+        iface_short = inbound_iface.split('_')[-1]
+        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        tcp = packet.getlayer(TCP)
+
+        if not ip_layer or not tcp:
+            return f"[TCP] 🔄 TCP packet on {iface_short} (no IP/TCP layer?)"
+
+        src_ip, dst_ip = ip_layer.src, ip_layer.dst
+        flags_str = ",".join([self.TCP_FLAGS.get(f, f) for f in str(tcp.flags)])
+        return (f"[TCP] 🔄 {src_ip}:{tcp.sport} -> {dst_ip}:{tcp.dport} on {iface_short} | "
+                f"Flags: {flags_str} | Seq: {tcp.seq} | Ack: {tcp.ack}")
+
+    def _handle_tcp_options(self, packet: Packet):
+        tcp = packet.getlayer(TCP)
+        if hasattr(tcp, 'options') and tcp.options:
+            self.router_logger.log_message(f"[TCP]   - Options ({len(tcp.options)} total):")
+            for opt in tcp.options:
+                name = opt[0]
+                if name == 'WScale':
+                    self.router_logger.log_message(f"[TCP]     - Window Scale: {opt[1]} 📈")
+                elif name == 'Timestamp':
+                    ts_val, ts_ecr = opt[1]
+                    self.router_logger.log_message(f"[TCP]     - Timestamps: TSval={ts_val}, TSecr={ts_ecr} ⏰")
+                elif name == 'SAckOK':
+                    self.router_logger.log_message(f"[TCP]     - SACK Permitted ✅")
+                elif name == 'MSS':
+                    self.router_logger.log_message(f"[TCP]     - MSS: {opt[1]} 📝")
+                elif name == 'NOP':
+                    continue
+                else:
+                    self.router_logger.log_message(f"[TCP]     - Option: {name} ❓")
+
+    def _handle_tcp_state(self, packet: Packet):
+        ip = packet.getlayer(IP) or packet.getlayer(IPv6)
+        tcp = packet.getlayer(TCP)
+        if not ip or not tcp:
+            return
+
+        src_ip, src_port = ip.src, tcp.sport
+        dst_ip, dst_port = ip.dst, tcp.dport
+
+        # Direction-agnostic key
+        conn_key = (src_ip, src_port, dst_ip, dst_port) if src_port < dst_port else (dst_ip, dst_port, src_ip, src_port)
+        cur = self.tcp_state_map.get(conn_key, "CLOSED")
+        flags = tcp.flags
+
+        if flags == 0x02:  # SYN
+            if cur == "CLOSED":
+                self.router_logger.log_message(
+                    f"[TCP] Handshake Initiated: {src_ip}:{src_port} sent SYN. ➡️ State: SYN-SENT."
+                )
+                self.tcp_state_map[conn_key] = "SYN-SENT"
+        elif flags == 0x12:  # SYN-ACK
+            if cur == "SYN-SENT":
+                self.router_logger.log_message(
+                    f"[TCP] Handshake Progress: {src_ip}:{src_port} replied with SYN-ACK. 🔄 State: SYN-RECEIVED."
+                )
+                self.tcp_state_map[conn_key] = "SYN-RECEIVED"
+        elif flags == 0x10 and cur == "SYN-RECEIVED":  # ACK
+            self.router_logger.log_message(
+                f"[TCP] Handshake Completed: {src_ip}:{src_port} sent ACK. ✅ ESTABLISHED."
+            )
+            self.tcp_state_map[conn_key] = "ESTABLISHED"
+        elif 'F' in str(flags):
+            if cur == "ESTABLISHED":
+                self.router_logger.log_message(
+                    f"[TCP] Termination Started: {src_ip}:{src_port} sent FIN. ✂️ FIN-WAIT-1."
+                )
+                self.tcp_state_map[conn_key] = "FIN-WAIT-1"
+        elif 'R' in str(flags):
+            self.router_logger.log_message(
+                f"[TCP] Connection Aborted: {src_ip}:{src_port} sent RST. ⚠️ Reset."
+            )
+            self.tcp_state_map.pop(conn_key, None)
+
+        def on_decision(key, rec, decision):
+            flow = f"{rec.src}:{rec.src_port} → {rec.dst}:{rec.dst_port} [{rec.direction}]"
+            if decision.action == "allow":
+                return
+            self.router_logger.log_message(
+                f"[HTTPS][Policy] {decision.action.upper()} on {flow} "
+                f"reason={decision.reason} tags={decision.tags}"
+            )
+
+        def on_event(evt):
+            flow = evt.get("flow")
+            kind = evt.get("kind")
+            data = evt.get("data", {})
+            self.router_logger.log_message(
+                f"[HTTPS][Event] kind={kind} flow={flow} data={data}"
+            )
+
+        self.tls_manager.on_decision = on_decision
+        self.tls_manager.on_event = on_event
+    # ------------ Utils ------------
+
+    @staticmethod
+    def _canon_key(ip1: str, pt1: int, ip2: str, pt2: int) -> Tuple[Tuple[str, int], Tuple[str, int]]:
+        """Order-independent session key: ((a,pa),(b,pb)) sorted by tuple."""
+        a, b = (ip1, pt1), (ip2, pt2)
+        return (a, b) if a <= b else (b, a)
+
+    def _looks_tlsish(self, buf: bytes, sport: int, dport: int) -> bool:
+        """
+        Cheap prefilter to avoid feeding obviously non-TLS payloads.
+        Still safe to return True liberally—TLSRecordManager will resync/drop non-TLS.
+        """
+        if len(buf) >= 5 and buf[1] == 3 and buf[0] in (20, 21, 22, 23):
+            return True  # TLS1.x record header
+        if len(buf) >= 2 and (buf[0] & 0x80):  # SSLv2 length MSB set
+            return True
+        if sport in self._TLS_LIKE_PORTS or dport in self._TLS_LIKE_PORTS:
+            return True
+        return False
+
+    def _build_cipher_suite_map(self) -> dict:
+        """
+        Build a minimal cipher map; extend from scapy's tls_ciphersuites if present.
+        """
         cipher_map = {
-            # TLS 1.3 Cipher Suites
+            # TLS 1.3
             0x1301: "TLS_AES_128_GCM_SHA256",
             0x1302: "TLS_AES_256_GCM_SHA384",
             0x1303: "TLS_CHACHA20_POLY1305_SHA256",
-            # TLS 1.2 ECDHE Cipher Suites
+            # Common TLS 1.2 ECDHE
             0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
             0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
             0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
@@ -1690,267 +1976,12 @@ class HTTPSManager:
             0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
             0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         }
-        # Add more cipher suites from Scapy's dictionaries if needed
         if 'tls_ciphersuites' in globals():
-            cipher_map.update(globals()['tls_ciphersuites'])
+            try:
+                cipher_map.update(globals()['tls_ciphersuites'])
+            except Exception:
+                pass
         return cipher_map
-
-    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
-        """
-        Processes an incoming packet, first handling the TCP layer and then
-        iterating through any TLS records to detect and process all handshake messages.
-        """
-        processed = False
-        if packet.haslayer(TCP):
-            self.router_logger.log_message(self._generate_tcp_summary(packet, inbound_iface))
-            self._handle_tcp_options(packet, inbound_iface)
-            self._handle_tcp_state(packet, inbound_iface)
-            processed = True
-
-        # Now check for TLS records on top of TCP
-        if packet.haslayer(TLS):
-            tls_layer = packet.getlayer(TLS)
-            # A single TCP packet can contain multiple TLS records
-            while tls_layer:
-                if isinstance(tls_layer, TLS):
-                    # Handle different record types
-                    if tls_layer.type == 22 and tls_layer.payload:  # Handshake
-                        # A single handshake record can contain multiple messages
-                        handshake_payload = tls_layer.payload
-                        while handshake_payload and isinstance(handshake_payload, Packet) and hasattr(handshake_payload,'msg_type'):
-                            processed = self._handle_tls_handshake_payload(handshake_payload,
-                                                                           inbound_iface) or processed
-                            handshake_payload = handshake_payload.payload
-                    elif tls_layer.type == 21:  # Alert
-                        processed = self._handle_tls_alert(tls_layer.payload, inbound_iface) or processed
-                    elif tls_layer.type == 23:  # Application Data
-                        processed = self._handle_tls_app_data(inbound_iface) or processed
-
-                # Move to the next potential TLS record in the same TCP packet
-                tls_layer = tls_layer.payload if hasattr(tls_layer, 'payload') and isinstance(tls_layer.payload,
-                                                                                              TLS) else None
-
-        return processed
-
-    def _generate_tcp_summary(self, packet: Packet, inbound_iface: str) -> str:
-        """
-        Generates a summary string for a detected TCP packet.
-        """
-        iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        transport_layer = packet.getlayer(TCP)
-
-        if not ip_layer or not transport_layer:
-            return f"[TCP] 🔄 TCP packet detected on {iface_short}. Cannot determine source/dest."
-
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
-        src_port = transport_layer.sport
-        dst_port = transport_layer.dport
-
-        flags_str = ",".join([self.TCP_FLAGS.get(f, f) for f in str(transport_layer.flags)])
-
-        return (f"[TCP] 🔄 TCP packet on {iface_short}: "
-                f"{src_ip}:{src_port} -> {dst_ip}:{dst_port} | "
-                f"Flags: {flags_str} | "
-                f"Seq: {transport_layer.seq} | Ack: {transport_layer.ack}")
-
-    def _handle_tcp_state(self, packet: Packet, inbound_iface: str):
-        """
-        Monitors and logs TCP connection state changes based on flags.
-        This provides a high-level view of the three-way handshake and termination.
-        """
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        tcp_layer = packet.getlayer(TCP)
-
-        src_ip, src_port = ip_layer.src, tcp_layer.sport
-        dst_ip, dst_port = ip_layer.dst, tcp_layer.dport
-
-        # Use a consistent tuple for tracking the conversation, regardless of direction
-        if src_port < dst_port:
-            conn_key = (src_ip, src_port, dst_ip, dst_port)
-        else:
-            conn_key = (dst_ip, dst_port, src_ip, src_port)
-
-        current_state = self.tcp_state_map.get(conn_key, "CLOSED")
-        flags = tcp_layer.flags
-
-        # Connection Establishment (Three-way handshake)
-        if flags == 2:  # SYN
-            if current_state == "CLOSED":
-                self.router_logger.log_message(
-                    f"[TCP] Handshake Initiated: Client {src_ip}:{src_port} sent SYN. ➡️ State: SYN-SENT.")
-                self.tcp_state_map[conn_key] = "SYN-SENT"
-        elif flags == 18:  # SYN-ACK
-            if current_state == "SYN-SENT":
-                self.router_logger.log_message(
-                    f"[TCP] Handshake Progress: Server {src_ip}:{src_port} replied with SYN-ACK. 🔄 State: SYN-RECEIVED.")
-                self.tcp_state_map[conn_key] = "SYN-RECEIVED"
-        elif flags == 16 and current_state == "SYN-RECEIVED":  # ACK of SYN-ACK
-            self.router_logger.log_message(
-                f"[TCP] Handshake Completed: Client {src_ip}:{src_port} sent ACK. ✅ Connection ESTABLISHED.")
-            self.tcp_state_map[conn_key] = "ESTABLISHED"
-
-        # Connection Termination
-        elif 'F' in str(flags):
-            if current_state == "ESTABLISHED":
-                self.router_logger.log_message(
-                    f"[TCP] Termination Started: {src_ip}:{src_port} sent FIN. ✂️ State: FIN-WAIT-1.")
-                self.tcp_state_map[conn_key] = "FIN-WAIT-1"
-        elif 'R' in str(flags):
-            self.router_logger.log_message(
-                f"[TCP] Connection Aborted: {src_ip}:{src_port} sent RST. ⚠️ Connection reset.")
-            self.tcp_state_map.pop(conn_key, None)
-
-    def _handle_tcp_options(self, packet: Packet, inbound_iface: str):
-        """
-        Parses and logs details about TCP options, such as Window Scale, Timestamps, and SACK.
-        """
-        tcp_layer = packet.getlayer(TCP)
-        if hasattr(tcp_layer, 'options') and tcp_layer.options:
-            self.router_logger.log_message(f"[TCP]   - Options ({len(tcp_layer.options)} total):")
-            for opt in tcp_layer.options:
-                opt_name = opt[0]
-                if opt_name == 'WScale':
-                    scale_val = opt[1]
-                    self.router_logger.log_message(f"[TCP]     - Found Option: Window Scale (WScale={scale_val}) 📈")
-                elif opt_name == 'Timestamp':
-                    ts_val, ts_ecr = opt[1]
-                    self.router_logger.log_message(
-                        f"[TCP]     - Found Option: Timestamps (TSval={ts_val}, TSecr={ts_ecr}) ⏰")
-                elif opt_name == 'SAckOK':
-                    self.router_logger.log_message(
-                        f"[TCP]     - Found Option: Selective Acknowledgment (SACK) Permitted ✅")
-                elif opt_name == 'MSS':
-                    mss_val = opt[1]
-                    self.router_logger.log_message(f"[TCP]     - Found Option: Maximum Segment Size (MSS={mss_val}) 📝")
-                elif opt_name == 'NOP':
-                    continue  # No-op, just padding
-                else:
-                    self.router_logger.log_message(f"[TCP]     - Found Unknown Option: {opt_name} ❓")
-
-    def _handle_tls_handshake_payload(self, payload: Packet, iface_short: str) -> bool:
-        """
-        Processes a single TLS handshake message from within a TLS record.
-        """
-        processed = False
-        handshake_type_val = payload.msg_type
-        handshake_type_str = self.TLS_HANDSHAKE_TYPES.get(handshake_type_val, f"Unknown ({handshake_type_val})")
-
-        self.router_logger.log_message(
-            f"[HTTPS] 🤝 TLS Handshake Message: {handshake_type_str} detected on {iface_short}.")
-
-        if isinstance(payload, TLSClientHello):
-            self._handle_client_hello(payload, iface_short)
-            processed = True
-        elif isinstance(payload, TLSServerHello):
-            self._handle_server_hello(payload, iface_short)
-            processed = True
-        elif isinstance(payload, TLSCertificate):
-            self._handle_certificate(payload, iface_short)
-            processed = True
-        elif isinstance(payload, TLSServerKeyExchange):
-            self.router_logger.log_message("[HTTPS]   - 🔑 Server Key Exchange received (parameters for DH/ECDH).")
-            processed = True
-        elif isinstance(payload, TLSCertificateRequest):
-            self.router_logger.log_message("[HTTPS]   - 🤝 Server requested a client certificate (Mutual TLS).")
-            processed = True
-        elif isinstance(payload, TLSServerHelloDone):
-            self.router_logger.log_message("[HTTPS]   - 👉 Server Hello Done. Server is awaiting client's response.")
-            processed = True
-        elif isinstance(payload, TLSClientKeyExchange):
-            self.router_logger.log_message("[HTTPS]   - 🔑 Client Key Exchange received (contains premaster secret).")
-            processed = True
-        elif isinstance(payload, TLSFinished):
-            self.router_logger.log_message("[HTTPS]   - 🎉 Handshake Finished message. Connection keys established.")
-            processed = True
-        # TLS 1.3 specific messages
-        elif isinstance(payload, TLSEncryptedExtensions):
-            self.router_logger.log_message("[HTTPS]   - 📝 Encrypted extensions received. Server's final parameters.")
-            self._handle_extensions_from_payload(payload)
-            processed = True
-        elif isinstance(payload, TLSNewSessionTicket):
-            self.router_logger.log_message("[HTTPS]   - 🎟️ New session ticket issued, enabling session resumption.")
-            processed = True
-
-        return processed
-
-    def _handle_client_hello(self, client_hello: TLSClientHello, iface_short: str):
-        """Processes and logs details from a TLS ClientHello message."""
-        version_str = self.TLS_VERSIONS.get(client_hello.version, f"Unknown (0x{client_hello.version:04x})")
-        self.router_logger.log_message(f"[HTTPS]   - Version Offered: {version_str}")
-        if hasattr(client_hello, 'ciphers'):
-            self.router_logger.log_message(f"[HTTPS]   - Ciphers Offered: {len(client_hello.ciphers)}")
-
-        self._handle_extensions_from_payload(client_hello)
-
-    def _handle_server_hello(self, server_hello: TLSServerHello, iface_short: str):
-        """Processes and logs details from a TLS ServerHello message."""
-        version_str = self.TLS_VERSIONS.get(server_hello.version, f"Unknown (0x{server_hello.version:04x})")
-        self.router_logger.log_message(f"[HTTPS]   - Version Negotiated: {version_str}")
-        cipher_suite = server_hello.cipher
-        cipher_name = self.cipher_map.get(cipher_suite, f"Unknown (ID: 0x{cipher_suite:04x})")
-        self.router_logger.log_message(f"[HTTPS]   - Cipher Suite Chosen: {cipher_name}")
-
-        self._handle_extensions_from_payload(server_hello)
-
-    def _handle_extensions_from_payload(self, payload: Packet):
-        """Parses and logs details from TLS extensions in a handshake message."""
-        if hasattr(payload, 'ext') and payload.ext:
-            self.router_logger.log_message(f"[HTTPS]   - Extensions ({len(payload.ext)} total):")
-            for ext in payload.ext:
-                ext_type = getattr(ext, 'type', None)
-                ext_name = self.TLS_EXTENSIONS.get(ext_type, f"Unknown (ID: {ext_type})")
-                self.router_logger.log_message(f"[HTTPS]     - Found Extension: {ext_name}")
-
-                # Identify specific extensions by their numeric type ID
-                if ext_type == 0 and hasattr(ext, 'servernames'):  # server_name (SNI)
-                    sni_name = ext.servernames[0].servername.decode('utf-8', 'ignore')
-                    self.router_logger.log_message(f"[HTTPS]       - SNI: {sni_name} 🌐")
-                elif ext_type == 16 and hasattr(ext, 'protocols'):  # application_layer_protocol_negotiation (ALPN)
-                    alpn_list = [self.ALPN_PROTOCOLS.get(p, p.decode('utf-8', 'ignore')) for p in ext.protocols]
-                    self.router_logger.log_message(f"[HTTPS]       - ALPN Protocols: {', '.join(alpn_list)} 💬")
-                elif ext_type == 43 and hasattr(ext, 'versions'):  # supported_versions
-                    version_list = [self.TLS_VERSIONS.get(v, f"Unknown (0x{v:04x})") for v in ext.versions]
-                    self.router_logger.log_message(f"[HTTPS]       - Supported Versions: {', '.join(version_list)} 📜")
-
-    def _handle_certificate(self, cert_payload: TLSCertificate, iface_short: str):
-        """Processes and logs details from a TLS Certificate message."""
-        num_certs = len(cert_payload.certs)
-        self.router_logger.log_message(
-            f"[HTTPS] 📜 Certificate message detected on {iface_short} with {num_certs} certificate(s).")
-        if num_certs > 0:
-            # Scapy wraps the ASN.1 cert in an X509Cert object
-            server_cert = cert_payload.certs[0].cert
-            # The subject commonName is often a good identifier
-            if hasattr(server_cert, 'tbsCertificate') and hasattr(server_cert.tbsCertificate, 'subject'):
-                subject_rdn = server_cert.tbsCertificate.subject.rdnSequence
-                for rdn in subject_rdn:
-                    # Look for the commonName attribute
-                    if rdn[0].type.val == '2.5.4.3':
-                        cn = rdn[0].value.val.decode('utf-8', 'ignore')
-                        self.router_logger.log_message(f"[HTTPS]   - Certificate CN: {cn} 👨‍💻")
-                        break
-            # Log validity period
-            if hasattr(server_cert, 'tbsCertificate') and hasattr(server_cert.tbsCertificate, 'validity'):
-                valid_from = server_cert.tbsCertificate.validity.notBefore.val
-                valid_to = server_cert.tbsCertificate.validity.notAfter.val
-                self.router_logger.log_message(f"[HTTPS]   - Validity: {valid_from} to {valid_to} 📅")
-
-    def _handle_tls_alert(self, alert_payload: Packet, iface_short: str) -> bool:
-        """Processes and logs details from a TLS Alert message."""
-        if isinstance(alert_payload, TLSAlert):
-            level = self.TLS_ALERT_LEVEL.get(alert_payload.level, "Unknown")
-            description = self.TLS_ALERT_DESCRIPTION.get(alert_payload.descr, "Unknown")
-            self.router_logger.log_message(
-                f"[HTTPS] ⚠️  Alert on {iface_short}: Level={level}, Desc='{description}'")
-            return True
-        return False
-
-    def _handle_tls_app_data(self, iface_short: str) -> bool:
-        """Logs the presence of encrypted application data."""
-        self.router_logger.log_message(f"[HTTPS] 📦 Encrypted Application Data on {iface_short}.")
-        return True
 
 class KerberosManager:
     """
@@ -2232,6 +2263,152 @@ class PacketWriter:
     thread using a queue.
     """
 
+    # --- MAC normalization helpers ---
+    _HEX = "0123456789abcdef"
+
+    @staticmethod
+    def _normalize_mac(mac) -> Optional[str]:
+        """
+        Accepts many forms:
+          - 'aa:bb:cc:dd:ee:ff'
+          - 'aa-bb-cc-dd-ee-ff'
+          - 'aabbccddeeff'
+        Rejects placeholders like 'dynamic', 'unknown', '', None.
+        Returns lowercased colon-form or None if invalid.
+        """
+        if mac is None:
+            return None
+        if isinstance(mac, bytes):
+            try:
+                mac = mac.decode("ascii", "ignore")
+            except Exception:
+                return None
+        mac = str(mac).strip().lower()
+        if mac in ("", "dynamic", "unknown", "ff:ff:ff:ff:ff:ff (broadcast)"):
+            return None
+        mac = mac.replace("-", ":")
+        # bare 12 hex digits -> colonize
+        raw = mac.replace(":", "")
+        if len(raw) == 12 and all(c in PacketWriter._HEX for c in raw):
+            mac = ":".join(raw[i:i+2] for i in range(0, 12, 2))
+        # validate aa:bb:cc:dd:ee:ff
+        parts = mac.split(":")
+        if len(parts) != 6 or any(len(p) != 2 or any(ch not in PacketWriter._HEX for ch in p) for p in parts):
+            return None
+        return mac
+
+    @staticmethod
+    def _is_broadcast(mac: str) -> bool:
+        return mac and mac.lower().replace("-", ":") == "ff:ff:ff:ff:ff:ff"
+
+    def _same_subnet(self, ip: str, iface_ip: str, netmask: str | int) -> bool:
+        try:
+            if isinstance(netmask, int):
+                cidr = f"{iface_ip}/{netmask}"
+            else:
+                # netmask like "255.255.255.0"
+                cidr = f"{iface_ip}/{netmask}"
+            return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+        except Exception:
+            return False
+
+    def _ipv4_mcast_mac(self, ip: str) -> str:
+        # RFC 1112: 01:00:5e:0x:xx:xx (low 23 bits of IPv4 mcast)
+        n = int(ipaddress.IPv4Address(ip))
+        low23 = n & 0x7FFFFF
+        return "01:00:5e:%02x:%02x:%02x" % ((low23 >> 16) & 0x7f, (low23 >> 8) & 0xff, low23 & 0xff)
+
+    def _ipv6_mcast_mac(self, ip6: str) -> str:
+        # RFC 2464: 33:33:xx:xx:xx:xx (low 32 bits of IPv6 dest)
+        n = int(ipaddress.IPv6Address(ip6))
+        return "33:33:%02x:%02x:%02x:%02x" % ((n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
+
+    def _infer_next_hop(self, final_iface: str, pkt) -> tuple[Optional[str], Optional[str]]:
+        """
+        Decide the L3 next-hop IP and address-family for ARP/ND resolution.
+        Returns (next_hop_ip, af) where af is 'ipv4'| 'ipv6' | None.
+        """
+        cfg = self._interfaces_config.get(final_iface, {})
+        if IP in pkt:
+            dst = pkt[IP].dst
+            if dst == "255.255.255.255":
+                return (dst, "ipv4")
+            ip_if = cfg.get("ip_addr")
+            netmask = cfg.get("netmask") or cfg.get("cidr")
+            if ip_if and netmask and self._same_subnet(dst, ip_if, netmask):
+                return (dst, "ipv4")
+            gw = cfg.get("gateway_ip")
+            return (gw if gw else None, "ipv4")
+        elif IPv6 in pkt:
+            dst6 = pkt[IPv6].dst
+            # For IPv6, if on-link (assume /64 unless provided)
+            ip_if6 = cfg.get("ip6_addr")
+            prefix = cfg.get("prefixlen6") or 64
+            try:
+                if ip_if6 and ipaddress.IPv6Address(dst6).exploded.split(":")[:4] == ipaddress.IPv6Address(
+                        ip_if6).exploded.split(":")[:4]:
+                    return (dst6, "ipv6")
+            except Exception:
+                pass
+            gw6 = cfg.get("gateway_ip6")
+            return (gw6 if gw6 else None, "ipv6")
+        return (None, None)
+
+    def _heal_dst_mac_before_queue(self, packet, final_iface: str) -> bool:
+        """
+        If Ether.dst is invalid (e.g., 'dynamic'), attempt to repair it based on L3.
+        Returns True if dst MAC is now valid, False otherwise.
+        """
+        if not packet.haslayer(Ether):
+            return False
+
+        eth = packet[Ether]
+        dst_fixed = self._normalize_mac(eth.dst)
+        if dst_fixed:
+            eth.dst = dst_fixed
+            return True
+
+        # Broadcast allowed?
+        if bool(getattr(packet, "_pw_allow_broadcast", False)):
+            eth.dst = "ff:ff:ff:ff:ff:ff"
+            return True
+
+        # L3-derived mappings
+        try:
+            if IP in packet:
+                dip = packet[IP].dst
+                # IPv4 broadcast/multicast
+                if dip == "255.255.255.255":
+                    eth.dst = "ff:ff:ff:ff:ff:ff"
+                    return True
+                if ipaddress.IPv4Address(dip).is_multicast:
+                    eth.dst = self._ipv4_mcast_mac(dip)
+                    return True
+            elif IPv6 in packet:
+                dip6 = packet[IPv6].dst
+                if ipaddress.IPv6Address(dip6).is_multicast:
+                    eth.dst = self._ipv6_mcast_mac(dip6)
+                    return True
+        except Exception:
+            pass
+
+        # Try next-hop resolution (ARP/ND)
+        nh_ip, af = self._infer_next_hop(final_iface, packet)
+        if nh_ip:
+            try:
+                if af == "ipv4":
+                    mac = self._normalize_mac(getmacbyip(nh_ip))
+                else:
+                    # For ND resolution, scapy has functions; as a simple fallback, leave for OS/neigh cache.
+                    mac = None
+                if mac:
+                    eth.dst = mac
+                    return True
+            except Exception:
+                pass
+
+        # Could not heal
+        return False
     def __init__(self, logger, interfaces_config, packet_signer, outbound_load_balancer):
         """
         Initializes the PacketWriter.
@@ -2287,7 +2464,8 @@ class PacketWriter:
         while not self._stop_event.is_set():
             try:
                 item = self.packet_queue.get(timeout=1)
-                if item is None: continue
+                if item is None:
+                    continue
                 packet, interface = item
                 packet._pw_allow_local_dest = True
                 self._send_raw_packet(packet, interface)
@@ -2308,7 +2486,36 @@ class PacketWriter:
                 f"[PacketWriter] 🚫 Dropped packet: Missing Ethernet layer. Summary: {packet.summary()}")
             return
 
-        router_ips = [cfg["ip_addr"] for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
+        # Final guard: fix/validate Ether src/dst before send
+        try:
+            eth = packet[Ether]
+            norm_src = self._normalize_mac(eth.src)
+            norm_dst = self._normalize_mac(eth.dst)
+
+            if not norm_src:
+                # Try to use interface MAC if src is bogus
+                try:
+                    eth.src = get_if_hwaddr(interface)
+                    norm_src = self._normalize_mac(eth.src)
+                except Exception:
+                    pass
+            if not norm_src:
+                raise ValueError(f"Invalid Ether src '{eth.src}'")
+
+            if not norm_dst:
+                # If caller allowed broadcast, salvage as broadcast
+                if bool(getattr(packet, "_pw_allow_broadcast", False)):
+                    eth.dst = "ff:ff:ff:ff:ff:ff"
+                else:
+                    raise ValueError(f"Invalid Ether dst '{eth.dst}'")
+            else:
+                eth.dst = norm_dst
+                eth.src = norm_src
+        except Exception as ve:
+            self.logger.log_message(f"[PacketWriter] ❌ Packet validation failed: {ve}")
+            return
+
+        router_ips = [cfg.get("ip_addr") for cfg in self._interfaces_config.values() if "ip_addr" in cfg]
         dst_ip = packet[IP].dst if IP in packet else packet[IPv6].dst if IPv6 in packet else None
 
         allow_local_dest = bool(getattr(packet, "_pw_allow_local_dest", False))
@@ -2319,7 +2526,6 @@ class PacketWriter:
 
         try:
             self.packet_signer.sign_packet(packet)
-            # This call now receives the correct system name
             self.sniffer.sendp(packet, iface=interface, verbose=0)
         except Exception as e:
             self.logger.log_message(f"[PacketWriter] ❌ Failed to send packet on '{interface}': {e}")
@@ -2345,18 +2551,32 @@ class PacketWriter:
             self.logger.log_message(f"[PacketWriter] forward_l2: get_if_hwaddr({egress_iface}) failed: {e}")
             return
 
-        dst_mac = "ff:ff:ff:ff:ff:ff" if allow_broadcast and pkt.haslayer(
-            Ether) and pkt.dst.lower() == "ff:ff:ff:ff:ff:ff" else getmacbyip(
-            nh_ip) if nh_ip else pkt.dst if pkt.haslayer(Ether) and pkt.dst else None
-        if not dst_mac and nh_ip:
-            self.logger.log_message(f"[PacketWriter] forward_l2: ARP failed for next-hop {nh_ip} on {egress_iface}")
-            return
+        # Resolve destination MAC robustly
+        dst_mac: Optional[str] = None
+        try:
+            if allow_broadcast and pkt.haslayer(Ether) and self._is_broadcast(getattr(pkt, "dst", "")):
+                dst_mac = "ff:ff:ff:ff:ff:ff"
+            elif nh_ip:
+                dst_mac = self._normalize_mac(getmacbyip(nh_ip))
+            elif pkt.haslayer(Ether) and getattr(pkt, "dst", None):
+                dst_mac = self._normalize_mac(pkt.dst)  # may be 'dynamic' → becomes None
+        except Exception:
+            dst_mac = None
+
         if not dst_mac:
-            self.logger.log_message("[PacketWriter] forward_l2: No next-hop and no Ether dst to use")
-            return
+            if allow_broadcast:
+                dst_mac = "ff:ff:ff:ff:ff:ff"
+            else:
+                # Don't attempt to send with 'dynamic'/unknown MAC
+                msg_dst = getattr(pkt, "dst", None)
+                self.logger.log_message(
+                    f"[PacketWriter] forward_l2: No valid dst MAC "
+                    f"(nh={nh_ip}, pkt.dst={msg_dst!r}). ARP unresolved; dropping."
+                )
+                return
 
         payload = pkt.payload if pkt.haslayer(Ether) else pkt
-        out_frame = Ether(src=src_mac, dst=dst_mac) / (
+        out_frame = Ether(src=self._normalize_mac(src_mac) or src_mac, dst=dst_mac) / (
             Dot1Q(vlan=pkt[Dot1Q].vlan) / payload if preserve_vlan and pkt.haslayer(Dot1Q) else payload)
 
         is_ike_packet = UDP in pkt and (pkt[UDP].sport in [500, 4500] or pkt[UDP].dport in [500, 4500])
@@ -2367,8 +2587,10 @@ class PacketWriter:
         final_allow_broadcast = allow_broadcast or is_ike_packet
 
         setattr(out_frame, "_pw_tx", True)
-        if final_allow_local: setattr(out_frame, "_pw_allow_local_dest", True)
-        if final_allow_broadcast: setattr(out_frame, "_pw_allow_broadcast", True)
+        if final_allow_local:
+            setattr(out_frame, "_pw_allow_local_dest", True)
+        if final_allow_broadcast:
+            setattr(out_frame, "_pw_allow_broadcast", True)
 
         self.queue_packet(out_frame, interface=egress_iface)
 
@@ -2392,6 +2614,7 @@ class PacketWriter:
         """
         Adds a packet to the queue for sending.
         Translates friendly interface name to system name before queuing.
+        Attempts to repair invalid Ether.dst values (e.g., 'dynamic') automatically.
         """
         if self._stop_event.is_set():
             self.logger.log_message("[PacketWriter] ⚠️ Warning: Cannot queue packet — writer is stopping.")
@@ -2402,13 +2625,20 @@ class PacketWriter:
             self.logger.log_message("[PacketWriter] ⚠️ Dropped packet: No outbound interface determined.")
             return
 
-        # --- FIX: Translate the friendly name to the required system name using the map ---
+        # Translate friendly -> system name
         final_iface = self.iface_map.get(target_iface_name, target_iface_name)
-        if final_iface == target_iface_name:
-            if not target_iface_name.startswith("\\Device\\NPF_"):
+        if final_iface == target_iface_name and not target_iface_name.startswith("\\Device\\NPF_"):
+            self.logger.log_message(
+                f"[PacketWriter] ⚠️ No system name mapped for '{target_iface_name}'. Sending may fail.")
+
+        # Heal dst MAC if invalid
+        if packet.haslayer(Ether):
+            if not self._heal_dst_mac_before_queue(packet, final_iface):
                 self.logger.log_message(
-                    f"[PacketWriter] ⚠️ Warning: No system name found for '{target_iface_name}'. Sending may fail.")
-        # ---------------------------------------------------------------------------------
+                    f"[PacketWriter] 🚫 Dropped packet before queue: invalid Ether.dst '{packet[Ether].dst}'")
+                # Helpful once: where did this come from?
+                self.logger.log_message("".join(traceback.format_stack(limit=4)))
+                return
 
         self.packet_queue.put((packet, final_iface))
 

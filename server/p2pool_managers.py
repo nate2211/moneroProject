@@ -44,7 +44,7 @@ from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
-    StratumManager, StratumConnectionManager
+    StratumManager, StratumConnectionManager, MoneroDaemonManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager
@@ -147,6 +147,7 @@ class PythonRouterManager:
             self.stratum_manager,
             self.process_packet  # Callback for reinjection
         )
+        self.daemon_manager = None
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.windivert_manager = WinDivertManager(self)
@@ -1031,6 +1032,7 @@ class PythonRouterManager:
                 dhcp_pool_in[0],
                 dhcp_pool_in[-1],
                 self._interfaces_config,
+                enforce_same_subnet=False
             )
             self.dhcp_server_out = DHCPServer(
                 self.router_logger,
@@ -1038,7 +1040,8 @@ class PythonRouterManager:
                 self.interface_out_full_name,
                 dhcp_pool_out[0],
                 dhcp_pool_out[-1],
-                self._interfaces_config
+                self._interfaces_config,
+                enforce_same_subnet=False
             )
             self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in, self.dhcp_server_out)
         else:
@@ -1104,6 +1107,7 @@ class PythonRouterManager:
                         self.router_logger.log_message(f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
                         self.hyperv_manager.send_packet(packet)
                         return True
+
                 if packet.haslayer(GRE):
                     if self.hyperv_enabled:
                         self.router_logger.log_message(f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
@@ -1145,7 +1149,6 @@ class PythonRouterManager:
             # --- Packet is NOT for the router, so it must be a transit packet. ---
 
             # Step 2: Perform Layer 3 and above processing for transit traffic.
-
             if not self.firewall_manager.process_packet(packet):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
@@ -1175,13 +1178,13 @@ class PythonRouterManager:
 
 
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP transit packet not for router detected on {iface_short}")
                 if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
                                                                              self.rip_manager.find_route):
                     return
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
                     return
+
 
             if packet.haslayer(Kerberos):
                 if self.kerberos_manager.handle_kerberos_packet(packet, inbound_iface, self._interfaces_config):
@@ -1246,6 +1249,19 @@ class PythonRouterManager:
                     ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]
                 )
             if target_mac:
+                if packet.haslayer(Ether):
+                    packet[Ether].dst = target_mac
+                else:
+                    route = self.rip_manager.find_route(dst_ip)
+                    next_hop_mac = self.arp_manager.resolve(dst_ip, iface=route["interface"])
+                    # HARDENING: Packet is missing the Ether layer. We'll build one.
+                    self.router_logger.log_message(
+                        f"[Router] 🛠️ Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer."
+                    )
+
+                    src_mac = self.get_interface_mac(route["interface"])
+                    # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
+                    packet = Ether(src=src_mac, dst=next_hop_mac) / packet
                 packet[Ether].dst = target_mac
                 self.router_logger.log_message(f"[Router] 📢 Forwarding multicast packet to MAC: {target_mac}")
                 self.ethernet_manager.handle_frame(packet, inbound_iface)
@@ -1579,8 +1595,20 @@ class PythonRouterManager:
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
             if use_startum_comm:
-                self.stratum_connection_manager.configure(p2pool_sever_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
-                self.stratum_connection_manager.start()
+                if p2pool_sever_ip == "":
+                    self.stratum_connection_manager.configure(p2pool_sever_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
+                    self.daemon_manager = MoneroDaemonManager(
+                        daemon_url="http://127.0.0.1:18081",
+                        zmq_address="tcp://127.0.0.1:18083",
+                        stratum_conn_manager=self.stratum_connection_manager,
+                        logger=self.router_logger
+                        )
+                    self.daemon_manager.start()
+                else:
+                    self.stratum_connection_manager.configure(p2pool_sever_ip, 3333,
+                                                          "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
+                                                          "PythonProxy")
+                    self.stratum_connection_manager.start()
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
@@ -1607,6 +1635,8 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
             self.parallel_python.release_ram_usage()
             if use_stratum_comm:
+                if self.daemon_manager:
+                    self.daemon_manager.stop()
                 self.stratum_connection_manager.stop()
             if use_static:
                 self._deconfigure_interface_settings()
