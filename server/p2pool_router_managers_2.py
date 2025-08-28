@@ -86,8 +86,6 @@ class ICMPv6(Packet):
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
 
-
-# --- Enums for State Management ---
 class ConnectionState(Enum):
     """Represents the explicit state of the direct pool connection."""
     DISCONNECTED = auto()
@@ -1143,17 +1141,62 @@ class StratumManager:
         Emits SHARE and BLOCK candidates via attached submitter.
         """
         from time import perf_counter
+        import time
+        import random
 
         logger = self.logger
         submitter = self._submitters.get(session_id)
 
+        # Tuning
         BATCH = 4
-        PREEMPT_EVERY = 0x3FFF
+        PREEMPT_EVERY = 0x3FFF  # check occasionally; won't starve hashing
         LOG_INTERVAL = 2.0
         max_backoff = 0.5
 
+        # Odd stride per-session so threads don't collide
         stride_seed = abs(hash(session_id)) or 1
-        stride = ((stride_seed & 0xFFFF) | 1)  # odd
+        stride = ((stride_seed & 0xFFFF) | 1)
+
+        # --- helpers -------------------------------------------------------------
+        def _u256_le(x) -> int:
+            """Normalize a 32-byte digest (bytes or int) to a Python int as little-endian 256."""
+            if isinstance(x, int):
+                return x
+            if isinstance(x, (bytes, bytearray)):
+                if len(x) != 32:
+                    # Some backends return bytearray of 32. Enforce exact size.
+                    raise ValueError(f"digest length != 32 (got {len(x)})")
+                return int.from_bytes(x, "little")
+            raise TypeError(f"Unsupported digest type: {type(x)}")
+
+        def _target_u256_from_hex_le(hex_str: str | None) -> int | None:
+            if not hex_str:
+                return None
+            b = bytes.fromhex(hex_str)
+            # P2Pool/Monero targets are provided as LE. 32 bytes is full 256-bit target.
+            if len(b) == 32:
+                return int.from_bytes(b, "little")
+            elif len(b) == 8:
+                # 64-bit target: compare against low 64 bits of hash (LE).
+                # We lift to 256 space by zero-extending—equivalent to checking h_low64 <= T64.
+                return int.from_bytes(b, "little")
+            else:
+                # Be permissive: interpret as LE integer anyway.
+                return int.from_bytes(b, "little")
+
+        def _meets_target(d_u256: int, T: int, T_len_bytes: int) -> bool:
+            """Compare respecting width: if target was 8 bytes, compare low 64 bits only."""
+            if T_len_bytes == 8:
+                return (d_u256 & ((1 << 64) - 1)) <= T
+            # 32 bytes or other: full 256-bit compare
+            return d_u256 <= T
+
+        def _target_len_bytes(hex_str: str | None) -> int:
+            if not hex_str:
+                return 0
+            return len(hex_str) // 2
+
+        # ------------------------------------------------------------------------
 
         while True:
             job = job_q.get()
@@ -1178,16 +1221,29 @@ class StratumManager:
             rx = self.rx
 
             try:
-                share_t = RandomXLoader.bytes_target_int(share_hex)
-                block_t = RandomXLoader.bytes_target_int(block_hex) if block_hex else (
-                    RandomXLoader.target_from_difficulty_int(diff_val) if diff_val else None
-                )
+                # Targets as LE integers + remember original width for correct compare
+                share_T = _target_u256_from_hex_le(share_hex)
+                share_T_len = _target_len_bytes(share_hex)
+
+                if block_hex:
+                    block_T = _target_u256_from_hex_le(block_hex)
+                    block_T_len = _target_len_bytes(block_hex)
+                else:
+                    block_T = None
+                    block_T_len = 0
+                    if diff_val:
+                        # Use your existing difficulty->target converter (LE, 256-bit int)
+                        block_T = RandomXLoader.target_from_difficulty_int(int(diff_val))
+                        block_T_len = 32
+
                 buf, off = self._prepare_blob_template(blob_hex)
             except Exception as e:
                 logger.log_message(f"[Stratum] ❌ Job setup failed for {job_id}: {e}")
                 continue
 
-            has_pipe = all(hasattr(rx, m) for m in ("calculate_hash_first", "calculate_hash_next", "calculate_hash_last"))
+            # Backend capabilities
+            has_pipe = all(
+                hasattr(rx, m) for m in ("calculate_hash_first", "calculate_hash_next", "calculate_hash_last"))
             calc_hash = getattr(rx, "calculate_hash", None)
             if not callable(calc_hash):
                 logger.log_message("[Stratum] ❌ Hashing backend (rx) is not ready.")
@@ -1197,67 +1253,105 @@ class StratumManager:
             tries, ema_rate, last_log, error_streak = 0, None, perf_counter(), 0
             submitted_nonces: set[str] = set()
 
+            # Diagnostics: track best observed hashes to sanity-check targets
+            min_h64 = (1 << 64) - 1
+            min_h256 = (1 << 256) - 1
+
             logger.log_message(f"[Stratum] ▶️ Working job {job_id} (stride={stride}, batch={BATCH if has_pipe else 1})")
 
             while True:
-                # quick preemption check
-                if (tries & PREEMPT_EVERY) == 0:
+                # preemption: check occasionally for a newer job
+                if (tries & PREEMPT_EVERY) == 0 and tries != 0:
                     try:
                         newj = job_q.get_nowait()
                         job_q.put(newj)
-                        logger.log_message(f"[Stratum] 🔄 New job arrived, switching from {job_id}.")
-                        break
+                        if (newj.get("id") or newj.get("job_id")) != job_id:
+                            logger.log_message(f"[Stratum] 🔄 New job arrived, switching from {job_id}.")
+                            break
                     except queue.Empty:
                         pass
 
                 try:
                     if has_pipe and BATCH >= 2:
-                        nonces, digests = [], []
+                        nonces, digests_u256 = [], []
+
+                        # first
                         self._write_nonce_le_inplace(buf, off, nonce)
                         nonces.append(nonce)
                         rx.calculate_hash_first(bytes(buf))
+
                         cur = nonce
                         for _ in range(1, BATCH):
                             cur = (cur + stride) & 0xFFFFFFFF
                             self._write_nonce_le_inplace(buf, off, cur)
                             d_prev = rx.calculate_hash_next(bytes(buf))
-                            digests.append(d_prev)
+                            d_prev_u256 = _u256_le(d_prev)
+                            digests_u256.append(d_prev_u256)
                             nonces.append(cur)
-                        d_last = rx.calculate_hash_last()
-                        digests.append(d_last)
 
-                        for n_val, dig in zip(nonces, digests):
-                            if dig <= share_t:
+                        d_last = rx.calculate_hash_last()
+                        digests_u256.append(_u256_le(d_last))
+
+                        # Optional occasional pipeline self-check (cheap & rare)
+                        if (tries & 0xFFFF) == 0:
+                            tn = nonces[-1]
+                            self._write_nonce_le_inplace(buf, off, tn)
+                            d_single = _u256_le(calc_hash(bytes(buf)))
+                            if d_single != digests_u256[-1]:
+                                logger.log_message("[Stratum] ❌ Pipeline mismatch vs single-hash path")
+                                # fallback to single path if you prefer:
+                                # has_pipe = False
+
+                        # decisions
+                        for n_val, d_u256 in zip(nonces, digests_u256):
+                            # diagnostics
+                            h64 = d_u256 & ((1 << 64) - 1)
+                            if h64 < min_h64: min_h64 = h64
+                            if d_u256 < min_h256: min_h256 = d_u256
+
+                            if _meets_target(d_u256, share_T, share_T_len):
                                 n_hex = n_val.to_bytes(4, "little").hex()
                                 if n_hex not in submitted_nonces:
                                     submitted_nonces.add(n_hex)
-                                    logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
                                     if submitter:
                                         try:
-                                            result_hex = dig.to_bytes(32, "little").hex()
+                                            result_hex = d_u256.to_bytes(32, "little").hex()
                                             submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
                                         except Exception as e:
                                             logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
-                                    if block_t and dig <= block_t:
+                                    logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
+
+                                    if block_T and _meets_target(d_u256, block_T, block_T_len):
                                         logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
+
                         tries += BATCH
                         nonce = (nonces[-1] + stride) & 0xFFFFFFFF
+
                     else:
+                        # Single-shot path (no pipeline)
                         self._write_nonce_le_inplace(buf, off, nonce)
-                        dig = calc_hash(bytes(buf))
-                        if dig <= share_t:
+                        d_single = _u256_le(calc_hash(bytes(buf)))
+
+                        # diagnostics
+                        h64 = d_single & ((1 << 64) - 1)
+                        if h64 < min_h64: min_h64 = h64
+                        if d_single < min_h256: min_h256 = d_single
+
+                        if _meets_target(d_single, share_T, share_T_len):
                             n_hex = nonce.to_bytes(4, "little").hex()
                             if n_hex not in submitted_nonces:
                                 submitted_nonces.add(n_hex)
-                                logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
                                 if submitter:
                                     try:
-                                        result_hex = dig.to_bytes(32, "little").hex()
+                                        result_hex = d_single.to_bytes(32, "little").hex()
                                         submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
                                     except Exception as e:
                                         logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
-                                if block_t and dig <= block_t:
+                                logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
+
+                                if block_T and _meets_target(d_single, block_T, block_T_len):
                                     logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
+
                         tries += 1
                         nonce = (nonce + stride) & 0xFFFFFFFF
 
@@ -1265,7 +1359,19 @@ class StratumManager:
                     if (now - last_log) >= LOG_INTERVAL:
                         rate = tries / (now - last_log) if now > last_log else 0.0
                         ema_rate = (0.2 * rate + 0.8 * (ema_rate or rate))
-                        logger.log_message(f"[Stratum] ⏱️ {session_id} job {job_id}: {ema_rate:.0f} H/s")
+                        # Show min-hash vs target to catch width/endianness mistakes immediately
+                        msg = f"[Stratum] ⏱️ {session_id} job {job_id}: {ema_rate:.0f} H/s"
+                        try:
+                            sh_bytes = bytes.fromhex(share_hex)
+                            if len(sh_bytes) == 8:
+                                T64 = int.from_bytes(sh_bytes, "little")
+                                msg += f" | min_h64=0x{min_h64:016x} vs T64=0x{T64:016x}"
+                            elif len(sh_bytes) == 32:
+                                T256 = int.from_bytes(sh_bytes, "little")
+                                msg += f" | min_h256=0x{min_h256:064x} vs T256=0x{T256:064x}"
+                        except Exception:
+                            pass
+                        logger.log_message(msg)
                         tries, last_log = 0, now
                     error_streak = 0
 
