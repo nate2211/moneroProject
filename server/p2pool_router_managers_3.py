@@ -1,16 +1,20 @@
+import collections
 import inspect
 import json
+import math
 import queue
+import random
 import threading
 import time
 import re
 import traceback
 from collections import deque, defaultdict, Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, Tuple, Mapping, Iterator
 
 # NumPy for analysis (only used during analysis; raw values stay as Python lists)
 import numpy as np
+import tiktoken
 
 
 # ---------- Knowledge model ----------
@@ -264,8 +268,208 @@ class CodeOutputManager:
         # Hard caps to avoid unbounded memory
         self._per_feature_cap = 8192  # recent N numeric values remembered per feature
 
+        self._chat_mode = True
+        self._chat_history: Deque[Dict[str, Any]] = deque(maxlen=200)  # rolling memory
+        self._chat_ttl_s = 600.0  # chat turns stick around for 10 minutes
+        self._max_context_snippets = 6  # retrieval budget
+        self._chat_persona = "crisp, technical, friendly"  # style hint
+
+        # Seed a small starter so Markov text won’t be empty at first
+        self._chat_seed_corpus = [
+            "acknowledged","noted","let us inspect the observed attributes","computing statistics","deriving insight","analyzing traffic snapshot",
+            "parsing headers","validating checksums","normalizing fields","estimating baselines","detecting anomalies","flagging outliers","correlating sessions","mapping flows",
+            "tracking latencies","sampling payloads","applying heuristics","scoring risk","summarizing evidence","cross-referencing indicators","triaging alerts","escalating incident",
+            "probing endpoints","queuing retries","caching results","rotating logs",
+            "rotating keys","syncing state","reconciling counters","replaying capture",
+            "learning patterns","auto-tuning thresholds","estimating entropy","hashing fingerprints","classifying protocols",
+            "labeling streams","reassembling fragments",
+            "decoding asn.1","decoding gss-api",
+            "decoding kerberos","validating tickets","tracking nonces","checking replay","measuring jitter","accounting bandwidth","dropping malformed","quarantining sources",
+            "whitelisting peers", "blacklisting hosts","closing sockets","opening circuit","backing off","resuming flow",
+            "writing pcap","emitting metrics","updating dashboard","acknowledging event","compiling signature","testing hypothesis",
+            "verifying fix","rolling update","committing change","synchronizing clocks","aligning windows","applying policy","enforcing rules",
+        ]
+        self.chatgen = ChatGenManager(
+            format_kv=lambda attrs, limit=8: self._format_kv(attrs, limit=8),
+            history_getter=lambda: self._chat_history,
+            persona=self._chat_persona,
+            seed_corpus=self._chat_seed_corpus,
+            max_chars=1000,
+        )
+
+        self.packet_learner = PacketLearnerManager(
+            default_ttls={"kerberos": 180.0, "dns": 60.0},
+            ttl_boost_factor=1.5,
+            ttl_boost_threshold=20,
+            logger=lambda s: print(s),
+        )
+
+        self.method_generator = SnapshotMethodGenerator()
+        self.stats_manager = StatisticsManager()
+        self.snapshot_builder = SnapshotBuilder(self._log)
         self.log_message("[CodeOutput] Manager initialized (drop-in, protocol-agnostic, NumPy stats ready).")
 
+    def ask(self, prompt: str) -> str:
+        """
+        Chat-style interface:
+          - stores the user message,
+          - does tiny intent detection,
+          - retrieves relevant transient knowledge,
+          - answers in a friendly technical tone,
+          - may call stats/snapshot paths when asked.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return "Say something and I’ll analyze it."
+
+        # Ingest the message so it participates in learning
+        self.submit_message(prompt, role="user")
+        intent = self._infer_intent(prompt)
+
+        try:
+            if intent == "purge":
+                # try to detect a topic to purge; fallback 'misc'
+                toks = self._tokenize(prompt)
+                candidates = [t for t in toks if t in self._knowledge_by_topic]
+                topic = candidates[0] if candidates else "misc"
+                n = self.purge_topic(topic)
+                reply = f"Purged topic '{topic}' (removed {n} items)."
+            elif intent == "inspect":
+                snap = self.export_knowledge()
+                if not snap:
+                    reply = "I don’t have non-expired knowledge yet."
+                else:
+                    # Summarize compactly
+                    parts = []
+                    for t, arr in snap.items():
+                        parts.append(f"[{t}] {len(arr)} item(s)")
+                    reply = "Knowledge summary: " + ", ".join(parts)
+            elif intent == "stats":
+                # quick stats over all topics; reuse your manager
+                stats = self._compute_statistics_with_numpy(
+                    topics=[], percentiles=[5, 25, 50, 75, 95], topk_categorical=8, min_count_for_stats=2
+                )
+                if not stats:
+                    reply = "No numeric feature has enough samples to compute stats yet."
+                else:
+                    # pick a few headline numbers
+                    lines = ["Statistics (headlines):"]
+                    shown = 0
+                    for topic, blocks in stats.items():
+                        num = blocks.get("numeric") or {}
+                        for feat, fs in num.items():
+                            lines.append(
+                                f"• [{topic}.{feat}] count={fs.get('count')} mean={fs.get('mean'):.3g} std={fs.get('std'):.3g}")
+                            shown += 1
+                            if shown >= 8:
+                                break
+                        if shown >= 8:
+                            break
+                    reply = "\n".join(lines)
+            elif intent == "emit":
+                cfg = self._default_emit_builder()
+                code = self.generate_class_from_config(cfg)
+                # Store assistant reply
+                self.submit_message("[snapshot emitted]", role="assistant")
+                reply = f"Emitted snapshot class '{cfg.get('class_name')}' ({len(code)} bytes)."
+            else:
+                # 'gen' fallback: retrieval + tiny generation
+                retrieved = self._retrieve_snippets(prompt)
+                reply = self._chat_generate(prompt, retrieved)
+        except Exception as ex:
+            self._stats.errors += 1
+            reply = f"Internal error while answering: {ex}"
+
+        # Store and return assistant message
+        self.submit_message(reply, role="assistant")
+        return reply
+    # ---------- Chatbot core ----------
+
+    def _chat_now(self) -> float:
+        return time.time()
+
+    def _expire_chat_history(self) -> None:
+        now = self._chat_now()
+        while self._chat_history and now - self._chat_history[0]["ts"] > self._chat_ttl_s:
+            self._chat_history.popleft()
+
+    def _infer_intent(self, text: str) -> str:
+        """
+        Trivial, fast intent labeling:
+          - 'gen' => needs generative explanation
+          - 'stats' => wants numbers/stats
+          - 'emit' => wants a snapshot
+          - 'purge' => wants to forget
+          - 'inspect' => wants current knowledge
+        """
+        t = text.lower()
+        if any(k in t for k in ("emit class", "generate class", "snapshot", "emit code")):
+            return "emit"
+        if any(k in t for k in ("stats", "statistics", "percentile", "z-score", "mean", "median")):
+            return "stats"
+        if any(k in t for k in ("forget", "purge", "clear", "erase")):
+            return "purge"
+        if any(k in t for k in ("what do you know", "show knowledge", "dump", "inspect", "list topics")):
+            return "inspect"
+        return "gen"
+
+    def _retrieve_snippets(self, query: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Very small retrieval: pick most frequent concepts overlapping the query
+        and pull freshest packets across topics. Returns [(topic, attrs), ...]
+        """
+        self._expire_chat_history()
+        q_tokens = set(self._tokenize(query))
+        if not q_tokens:
+            q_tokens = set(["default"])
+
+        # Score topics by overlap with learned concept counts
+        scores: List[Tuple[float, str]] = []
+        for topic, cc in self._concept_counts.items():
+            overlap = sum(cc.get(tok, 0) for tok in q_tokens)
+            if overlap > 0:
+                scores.append((float(overlap), topic))
+        scores.sort(reverse=True)
+        top_topics = [t for _, t in scores[:5]] or list(self._knowledge_by_topic.keys())[:3]
+
+        # Take freshest packets from top topics
+        now = time.time()
+        results: List[Tuple[str, Dict[str, Any]]] = []
+        for topic in top_topics:
+            dq = self._knowledge_by_topic.get(topic) or deque()
+            for pkt in reversed(dq):
+                if pkt.is_expired(now):
+                    continue
+                attrs = (pkt.payload or {}).get("attributes", {})
+                if attrs:
+                    results.append((topic, attrs))
+                    if len(results) >= self._max_context_snippets:
+                        return results
+        return results
+
+    def _format_kv(self, d: Dict[str, Any], limit: int = 10) -> str:
+        items = []
+        for i, (k, v) in enumerate(d.items()):
+            if i >= limit:
+                items.append("…")
+                break
+            items.append(f"{k}={v!r}")
+        return ", ".join(items)
+
+    def _chat_generate(self, prompt: str, retrieved: List[Tuple[str, Dict[str, Any]]]) -> str:
+        return self.chatgen.generate(prompt, retrieved)
+
+    def submit_message(self, text: str, role: str = "user", tags: Optional[List[str]] = None) -> None:
+        """
+        Push a chat message into the bus and transient store.
+        - role: "user" | "system" | "assistant"
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self._chat_history.append({"role": role, "text": text, "ts": time.time()})
+        attrs = {"role": role, "text": text}
+        self.submit_event(topic="misc", attributes=attrs, tags=(tags or ["chat"]), ttl=self._chat_ttl_s)
     # --------------------------- logging helpers ---------------------------
 
     def set_verbose(self, level: int = 1) -> None:
@@ -412,7 +616,7 @@ class CodeOutputManager:
 
                 h = hashlib.sha256(code.encode("utf-8")).hexdigest()
                 self._log(f"[CodeOutput] 🔁 Auto-emitter produced hash={h[:10]}… len={len(code)} bytes.", 1)
-                self._log(f"[CodeOutput] 🔁 {code}", 2)
+                self._log(f"[CodeOutput] 🔁 {self.ask("Output some code")}")
                 if h != self._last_emitted_hash:
                     self._emit_sink(code, cfg)
                     self._fire_hooks("post_emit", code=code, cfg=cfg)
@@ -585,76 +789,35 @@ class CodeOutputManager:
 
     def generate_class_from_config(self, config: Dict[str, Any]) -> str:
         """
-        Build Python code for a class from config + merged transient knowledge.
+        Builds Python code for a class by delegating to the SnapshotBuilder.
         """
-        class_name = config.get("class_name", "GeneratedClass")
-        base_attrs: Dict[str, Any] = dict(config.get("attributes", {}))
-        base_methods: Dict[str, Any] = dict(config.get("methods", {}))
-        topics: List[str] = config.get("topics") or []
-        attr_policy = (config.get("attr_policy") or "merge").lower()
-        method_policy = (config.get("method_policy") or "merge").lower()
-        include_insights = bool(config.get("include_insights", False))
-
-        # Aggregation controls
-        attr_aggregate = (config.get("attr_aggregate") or "last").lower()  # "list" or "last"
-        listify_singletons = bool(config.get("listify_singletons", False))
-        max_list_values = int(config.get("max_list_values", 12))
-        prefer_order = (config.get("prefer_order") or "observed").lower()  # "observed" or "sorted"
-
-        # Gather knowledge
-        k_attrs, k_methods = (
-            self._gather_knowledge_aggregate(topics, max_list_values, prefer_order)
+        # Determine which knowledge gathering function to use based on config
+        attr_aggregate = (config.get("attr_aggregate") or "last").lower()
+        gatherer = (
+            self._gather_knowledge_aggregate
             if attr_aggregate == "list"
-            else self._gather_knowledge(topics)
+            else self._gather_knowledge
         )
 
-        # Merge attrs
-        if attr_policy == "override":
-            merged_attrs = (k_attrs or {}) or base_attrs
-        else:
-            merged_attrs = {**base_attrs, **(k_attrs or {})}
-
-        # Optionally listify singletons
-        if attr_aggregate == "list" and listify_singletons:
-            for k, v in list(merged_attrs.items()):
-                if not isinstance(v, list):
-                    merged_attrs[k] = [v]
-
-        # Merge methods
-        if method_policy == "override":
-            merged_methods = (k_methods or {}) or base_methods
-        else:
-            merged_methods = {**base_methods, **(k_methods or {})}
-
-        # Insights
-        if include_insights:
-            insights = self._insights_for_topics(topics)
-            if insights:
-                merged_attrs["_insights"] = insights
-
-        # ---------- NumPy statistics ----------
-        if config.get("include_statistics", False):
-            stats = self._compute_statistics_with_numpy(
-                topics=topics,
-                percentiles=list(config.get("percentiles", [5, 25, 50, 75, 95])),
-                topk_categorical=int(config.get("topk_categorical", 10)),
-                min_count_for_stats=int(config.get("min_count_for_stats", 2)),
-            )
-            if stats:
-                merged_attrs["_statistics"] = stats
-
-        # Inject helper methods into the snapshot
-        merged_methods.update(self._default_snapshot_methods(stats))
-
-        # Loud info
-        self._log(
-            f"[CodeOutput] 🧩 Generating class '{class_name}' topics={topics or 'ALL'} "
-            f"attrs={len(merged_attrs)} methods={len(merged_methods)} "
-            f"aggregate={attr_aggregate}", 1
+        # Create lambdas to pass the necessary stats/method computer functions
+        # This ensures they are called with the right parameters inside the builder.
+        stats_computer = lambda: self._compute_statistics_with_numpy(
+            topics=config.get("topics") or [],
+            percentiles=list(config.get("percentiles", [5, 25, 50, 75, 95])),
+            topk_categorical=int(config.get("topk_categorical", 10)),
+            min_count_for_stats=int(config.get("min_count_for_stats", 2)),
         )
 
-        doc = "A generated class."
-        return MiniTemplateEngine.render_class(class_name, merged_attrs, merged_methods, doc=doc)
+        method_generator = lambda stats: self._default_snapshot_methods(stats)
+
+        # Call the builder with the config and data-providing functions
+        return self.snapshot_builder.build(
+            config=config,
+            knowledge_gatherer=gatherer,
+            insights_fetcher=self._insights_for_topics,
+            stats_computer=stats_computer,
+            method_generator=method_generator,
+        )
 
     # --------------------------- internal loops ---------------------------
 
@@ -725,6 +888,9 @@ class CodeOutputManager:
                 self._log(f"[CodeOutput] 📥 Ingesting type={type(raw).__name__} iface={iface}", 2)
 
                 packets: List[KnowledgePacket] = []
+                if isinstance(raw, KnowledgePacket):
+                    packets = [self._finalize_packet(raw)]
+                    self._log(f"[CodeOutput] 🔎 Normalized via direct KnowledgePacket path → 1 pkt(s).", 2)
 
                 # TLSRecord (duck-typed)
                 try:
@@ -1276,29 +1442,7 @@ class CodeOutputManager:
     # --------------------------- adaptive learning ---------------------------
 
     def _learn_from_packet(self, pkt: KnowledgePacket) -> None:
-        """
-        Tokenize attribute keys & string values to capture frequent concepts per topic.
-        """
-        attrs = (pkt.payload or {}).get("attributes", {})
-        tokens: List[str] = []
-        for k, v in attrs.items():
-            tokens.extend(self._tokenize(str(k)))
-            if isinstance(v, str) and v:
-                tokens.extend(self._tokenize(v))
-        if not tokens:
-            return
-
-        cc = self._concept_counts[pkt.topic]
-        for t in tokens:
-            cc[t] = int(cc.get(t, 0)) + 1
-
-        dominant = max(cc.values()) if cc else 0
-        if dominant >= self._ttl_boost_threshold and pkt.ttl < self.DEFAULT_TTLS.get(pkt.topic,
-                                                                                     120.0) * self._ttl_boost_factor:
-            old = pkt.ttl
-            pkt.ttl = min(self.DEFAULT_TTLS.get(pkt.topic, 120.0) * self._ttl_boost_factor,
-                          old * self._ttl_boost_factor)
-            self._log(f"[CodeOutput] ⏫ TTL boosted for topic='{pkt.topic}' ({old:.1f} -> {pkt.ttl:.1f}).", 2)
+       self.packet_learner.learn_from_packet(pkt)
 
     def _tokenize(self, s: str) -> List[str]:
         return [t for t in self.TOKEN_SPLIT_RE.split(s.lower()) if t and not t.isdigit()]
@@ -1331,67 +1475,14 @@ class CodeOutputManager:
             topk_categorical: int,
             min_count_for_stats: int,
     ) -> Dict[str, Any]:
-        """
-        Build a dictionary with numeric & categorical statistics per topic.
-
-        Numeric per feature:
-            mean, std, min, max, median, count, percentiles{p:value}
-
-        Categorical per feature:
-            unique_count, top_k: [(value, count), ...]
-        """
-        stats: Dict[str, Any] = {}
-        with self._k_lock:
-            topic_list = list(topics) if topics else list(
-                set(self._num_vectors.keys()) | set(self._cat_counters.keys()))
-            for topic in topic_list:
-                tnum = self._num_vectors.get(topic, {})
-                tcat = self._cat_counters.get(topic, {})
-
-                topic_stats: Dict[str, Any] = {}
-
-                # Numeric features
-                num_stats: Dict[str, Any] = {}
-                for feat, values in tnum.items():
-                    if len(values) < min_count_for_stats:
-                        continue
-                    vec = np.asarray(values, dtype=float)
-                    valid = vec[~np.isnan(vec)]
-                    if valid.size < min_count_for_stats:
-                        continue
-                    entry = {
-                        "count": int(valid.size),
-                        "mean": float(np.mean(valid)),
-                        "std": float(np.std(valid)),
-                        "min": float(np.min(valid)),
-                        "max": float(np.max(valid)),
-                        "median": float(np.median(valid)),
-                        "percentiles": {int(p): float(np.percentile(valid, p)) for p in percentiles},
-                    }
-                    num_stats[feat] = entry
-                if num_stats:
-                    topic_stats["numeric"] = num_stats
-
-                # Categorical features
-                cat_stats: Dict[str, Any] = {}
-                for feat, counter in tcat.items():
-                    if not counter:
-                        continue
-                    total = sum(counter.values())
-                    top = counter.most_common(topk_categorical)
-                    entry = {
-                        "unique_count": int(len(counter)),
-                        "total_count": int(total),
-                        "top_k": [(val, int(cnt)) for val, cnt in top],
-                    }
-                    cat_stats[feat] = entry
-                if cat_stats:
-                    topic_stats["categorical"] = cat_stats
-
-                if topic_stats:
-                    stats[topic] = topic_stats
-
-        return stats
+        return self.stats_manager.compute(
+        num_vectors=self._num_vectors,
+        cat_counters=self._cat_counters,
+        topics=topics,
+        percentiles=list(percentiles),
+        topk_categorical=int(topk_categorical),
+        min_count_for_stats=int(min_count_for_stats),
+    )
 
     # --------------------------- utilities ---------------------------
 
@@ -1500,74 +1591,7 @@ class CodeOutputManager:
     # --------------------------- snapshot helper methods ---------------------------
 
     def _default_snapshot_methods(self, stats) -> Dict[str, Any]:
-        """
-        Generates methods with dynamic, multi-line Python code bodies.
-
-        This creates more powerful, self-contained methods that can perform
-        logic like filtering or selecting specific metrics, rather than just
-        proxying a call to another helper.
-        """
-        methods = {}
-        for topic, kinds in stats.items():
-            for kind, features in kinds.items():
-                for feature in features.keys():
-                    # Sanitize names for valid Python method syntax
-                    safe_topic = re.sub(r'[^a-zA-Z0-9_]', '', topic)
-                    safe_feature = re.sub(r'[^a-zA-Z0-9_]', '', feature)
-
-                    # --- Generate Dynamic Code for NUMERIC Features ---
-                    if kind == 'numeric':
-                        m_name = f"get_{safe_topic}_{safe_feature}_stats"
-
-                        # This is a string containing the actual Python code for the method body.
-                        body = f"""
-        metric = kwargs.get('metric')
-        stats = self.stat(topic='{topic}', feature='{feature}', kind='numeric') or {{}}
-        if not metric:
-            return stats
-        # Return a specific metric like 'mean', 'std', 'median', etc.
-        return stats.get(metric)
-        """
-                        docstring = f"""
-        Provides numeric statistics for the '{feature}' feature in topic '{topic}'.
-
-        Args:
-            metric (str, optional): If provided, returns only the value for this
-                specific metric (e.g., 'mean', 'std', 'median').
-                Defaults to returning the entire statistics dictionary.
-
-        Returns:
-            dict or float: The full stats dictionary or a single numeric value.
-        """
-                        methods[m_name] = {"body": body.strip(), "doc": docstring.strip()}
-
-                    # --- Generate Dynamic Code for CATEGORICAL Features ---
-                    elif kind == 'categorical':
-                        m_name = f"get_{safe_topic}_{safe_feature}_top_values"
-
-                        # This generated code can either return the full list of top
-                        # values or the specific count for a requested value.
-                        body = f"""
-        value = kwargs.get('value')
-        top_list = self.top_values(topic='{topic}', feature='{feature}') or []
-        if not value:
-            return top_list
-        # If a specific value is requested, find its count in the list.
-        return dict(top_list).get(value, 0)
-        """
-                        docstring = f"""
-        Provides top categorical values for the '{feature}' feature in topic '{topic}'.
-
-        Args:
-            value (str, optional): If provided, returns the count for this specific
-                value instead of the whole list. Defaults to 0 if not found.
-
-        Returns:
-            list or int: A list of (value, count) tuples, or a single integer count.
-        """
-                        methods[m_name] = {"body": body.strip(), "doc": docstring.strip()}
-
-        return methods
+        return self.method_generator.generate(stats)
 
 
 def wire_tls_to_code_output(tls_mgr: Any, co_mgr: CodeOutputManager) -> Callable[[], None]:
@@ -1663,3 +1687,1212 @@ def wire_tls_to_code_output(tls_mgr: Any, co_mgr: CodeOutputManager) -> Callable
     return detach
 
 
+class SnapshotMethodGenerator:
+    """
+    Synthesizes small analysis methods from snapshot statistics.
+
+    Robustness improvements over the original:
+      - Defensive parsing of stats (supports str/int/float, rejects NaN/inf).
+      - Treats tiny std as zero via epsilon (configurable).
+      - Sanitizes names deterministically (lowercase, collapses underscores, letter-prefixed).
+      - Optional topic prefixing to avoid collisions across topics.
+      - Runtime guards in generated methods (type coercion, NaN checks).
+      - Clear, concise docstrings; consistent return format.
+    """
+
+    def __init__(
+        self,
+        *,
+        include_topic_in_name: bool = True,
+        std_epsilon: float = 1e-12,
+        z1: float = 1.0,
+        z2: float = 2.0,
+        z3: float = 3.0,
+        float_precision: int = 4,
+    ) -> None:
+        self.include_topic_in_name = include_topic_in_name
+        self.std_epsilon = float(std_epsilon)
+        self.z1, self.z2, self.z3 = float(z1), float(z2), float(z3)
+        self.float_precision = int(float_precision)
+
+        if not (0 < self.z1 < self.z2 < self.z3):
+            raise ValueError("Expected 0 < z1 < z2 < z3.")
+
+    # --------------------------- Public API ---------------------------
+
+    def generate(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generates synthesized method definitions.
+
+        Input schema (example):
+        {
+          "latency": {
+            "numeric": {
+              "p95": {"mean": 112.3, "std": 30.1},
+              "p50": {"mean": "81.0", "std": "9.7"}
+            }
+          },
+          "throughput": {
+            "numeric": {
+              "rps": {"mean": 950.0, "std": 210.0}
+            }
+          }
+        }
+
+        Returns:
+            Dict[str, Any]: { method_name: {"args": "...", "body": "...", "doc": "..."} }
+        """
+        methods: Dict[str, Any] = {}
+        if not isinstance(stats, dict) or not stats:
+            return methods
+
+        for topic, kinds in stats.items():
+            if not isinstance(kinds, dict):
+                continue
+
+            numeric_block = kinds.get("numeric")
+            if not isinstance(numeric_block, dict):
+                continue
+
+            for feature, feature_stats in numeric_block.items():
+                if not isinstance(feature_stats, dict):
+                    continue
+
+                m_name, m_def = self._synthesize_scorer_method(topic, feature, feature_stats)
+                if m_name and m_def:
+                    # Avoid accidental collisions by uniquifying names
+                    unique_name = m_name
+                    suffix = 2
+                    while unique_name in methods:
+                        unique_name = f"{m_name}_{suffix}"
+                        suffix += 1
+                    methods[unique_name] = m_def
+
+        return methods
+
+    # --------------------------- Core Code Synthesis Engine ---------------------------
+
+    def _synthesize_scorer_method(
+        self, topic: str, feature: str, feature_stats: Dict[str, Any]
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        mean = self._as_finite_float(feature_stats.get("mean"))
+        std = self._as_finite_float(feature_stats.get("std"))
+
+        if mean is None or std is None:
+            return None, None
+
+        safe_feature = self._sanitize_name(feature)
+        safe_topic = self._sanitize_name(topic)
+
+        base_name = f"analyze_{safe_feature}_value"
+        if self.include_topic_in_name and safe_topic:
+            base_name = f"{safe_topic}__{base_name}"
+
+        method_name = base_name
+
+        # --- Begin Code Synthesis ---
+        p = self.float_precision
+        eps = self.std_epsilon
+
+        code_lines = []
+        code_lines.append("# This method was synthesized to analyze normality using a Z-score.")
+        code_lines.append(f"MEAN = {mean:.{p}f}")
+        code_lines.append(f"STD = {std:.{p}f}")
+        code_lines.append(f"STD_EPS = {eps:.{p}g}")
+        code_lines.append("")
+        code_lines.append("# --- Runtime guards & coercion ---")
+        code_lines.append("try:")
+        code_lines.append("    v = float(value)")
+        code_lines.append("except (TypeError, ValueError):")
+        code_lines.append('    return "Invalid: value is not numeric/coercible."')
+        code_lines.append("if math.isnan(v) or math.isinf(v):")
+        code_lines.append('    return "Invalid: value is NaN/Inf."')
+        code_lines.append("")
+        code_lines.append("# --- Handle constant / near-constant data ---")
+        code_lines.append("if abs(STD) <= STD_EPS:")
+        code_lines.append("    if abs(v - MEAN) <= STD_EPS:")
+        code_lines.append('        return "(Z-Score: 0.00) This value is typical; data was effectively constant."')
+        code_lines.append('    return "Anomalous for a constant feature: value deviates from the only observed level."')
+        code_lines.append("")
+        code_lines.append("# --- Standard Z-score path ---")
+        code_lines.append("z = (v - MEAN) / STD")
+        code_lines.append("az = abs(z)")
+        code_lines.append("")
+        code_lines.append("# Threshold interpretation")
+        code_lines.append(f"if az >= {self.z3:.{p}f}:")
+        code_lines.append('    bucket = "a highly unusual outlier."')
+        code_lines.append(f"elif az >= {self.z2:.{p}f}:")
+        code_lines.append('    bucket = "uncommon and a potential outlier."')
+        code_lines.append(f"elif az >= {self.z1:.{p}f}:")
+        code_lines.append('    bucket = "common, but moderately away from average."')
+        code_lines.append("else:")
+        code_lines.append('    bucket = "very typical and close to the average."')
+        code_lines.append("")
+        code_lines.append(f'return f"(Z-Score: {{z:.2f}}) This value is {{bucket}}"')
+        # --- End Code Synthesis ---
+
+        final_body = "\n".join(f"    {line}" for line in code_lines)
+
+        docstring = f"""
+Analyzes a new numeric value for the '{feature}' feature using Z-score buckets.
+
+Guards:
+  - Coerces input to float; rejects NaN/Inf.
+  - Treats tiny STD (≤ {eps}) as constant data.
+
+Args:
+    value (int|float|str): The value to analyze.
+
+Returns:
+    str: A human-readable assessment, including the Z-score when applicable.
+""".strip()
+
+        method_definition = {
+            "args": "self, value",
+            "body": final_body,
+            "doc": docstring,
+        }
+        return method_name, method_definition
+
+    # --------------------------- Utilities ---------------------------
+
+    def _as_finite_float(self, x: Any) -> Optional[float]:
+        """Return a finite float or None."""
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+
+    def _sanitize_name(self, name: str) -> str:
+        """
+        Make a safe, deterministic identifier:
+          - lowercase
+          - non [a-z0-9_] -> '_'
+          - collapse multiple '_' and strip edges
+          - ensure starts with a letter; if not, prefix 'f_'
+        """
+        if not isinstance(name, str):
+            name = str(name)
+        s = name.lower()
+        s = re.sub(r"[^a-z0-9_]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        if not s or not s[0].isalpha():
+            s = f"f_{s}" if s else "f"
+        return s
+
+
+class StatisticsManager:
+    """
+    A stateless manager to compute numeric and categorical statistics from
+    feature data stores using NumPy.
+
+    This class is designed to be a drop-in replacement for the original
+    _compute_statistics_with_numpy function. It takes raw data vectors
+    and counters and returns a structured dictionary of computed stats.
+    """
+
+    def compute(
+            self,
+            num_vectors: Dict[str, Dict[str, List[float]]],
+            cat_counters: Dict[str, Dict[str, Counter]],
+            topics: Iterable[str],
+            percentiles: List[int],
+            topk_categorical: int,
+            min_count_for_stats: int,
+    ) -> Dict[str, Any]:
+        """
+        Builds a dictionary with statistics for the specified topics.
+
+        This is the main public method that orchestrates the computation.
+
+        Args:
+            num_vectors: Numeric features, as {topic: {feature: [values]}}.
+            cat_counters: Categorical features, as {topic: {feature: Counter()}}.
+            topics: A list of topics to process. If empty, all available
+                    topics from the data will be used.
+            percentiles: A list of integers for percentile calculations (e.g., [25, 50, 75]).
+            topk_categorical: The number of top items to return for categorical features.
+            min_count_for_stats: The minimum number of data points required to
+                                 compute statistics for a feature.
+
+        Returns:
+            A dictionary containing the computed statistics.
+        """
+        stats: Dict[str, Any] = {}
+
+        # If no specific topics are provided, use all topics present in the data.
+        topic_list = list(topics) if topics else list(set(num_vectors.keys()) | set(cat_counters.keys()))
+
+        for topic in topic_list:
+            topic_stats: Dict[str, Any] = {}
+
+            # Compute stats for numeric features for the current topic
+            numeric_stats = self._compute_numeric_stats_for_topic(
+                num_vectors.get(topic, {}), percentiles, min_count_for_stats
+            )
+            if numeric_stats:
+                topic_stats["numeric"] = numeric_stats
+
+            # Compute stats for categorical features for the current topic
+            categorical_stats = self._compute_categorical_stats_for_topic(
+                cat_counters.get(topic, {}), topk_categorical
+            )
+            if categorical_stats:
+                topic_stats["categorical"] = categorical_stats
+
+            # Add the topic's stats to the main dictionary if any were generated
+            if topic_stats:
+                stats[topic] = topic_stats
+
+        return stats
+
+    # --------------------------- Private Helper Methods ---------------------------
+
+    def _compute_numeric_stats_for_topic(
+            self,
+            topic_num_vectors: Dict[str, List[float]],
+            percentiles: List[int],
+            min_count: int,
+    ) -> Dict[str, Any]:
+        """Helper to process all numeric features for a single topic."""
+        stats: Dict[str, Any] = {}
+        for feature, values in topic_num_vectors.items():
+            if len(values) >= min_count:
+                feature_stats = self._calculate_numeric_feature(values, percentiles, min_count)
+                if feature_stats:
+                    stats[feature] = feature_stats
+        return stats
+
+    def _calculate_numeric_feature(
+            self, values: List[float], percentiles: List[int], min_count: int
+    ) -> Optional[Dict[str, Any]]:
+        """Helper to calculate all statistics for a single numeric feature vector."""
+        try:
+            vec = np.asarray(values, dtype=float)
+            valid_vec = vec[~np.isnan(vec)]  # Filter out any NaN values
+
+            if valid_vec.size < min_count:
+                return None
+
+            return {
+                "count": int(valid_vec.size),
+                "mean": float(np.mean(valid_vec)),
+                "std": float(np.std(valid_vec)),
+                "min": float(np.min(valid_vec)),
+                "max": float(np.max(valid_vec)),
+                "median": float(np.median(valid_vec)),
+                "percentiles": {
+                    int(p): float(np.percentile(valid_vec, p)) for p in percentiles
+                },
+            }
+        except Exception:
+            # In case of any unexpected numpy errors, fail gracefully for this feature
+            return None
+
+    def _compute_categorical_stats_for_topic(
+            self, topic_cat_counters: Dict[str, Counter], top_k: int
+    ) -> Dict[str, Any]:
+        """Helper to process all categorical features for a single topic."""
+        stats: Dict[str, Any] = {}
+        for feature, counter in topic_cat_counters.items():
+            if counter:
+                stats[feature] = self._calculate_categorical_feature(counter, top_k)
+        return stats
+
+    def _calculate_categorical_feature(
+            self, counter: Counter, top_k: int
+    ) -> Dict[str, Any]:
+        """Helper to calculate all statistics for a single categorical counter."""
+        total_count = sum(counter.values())
+        top_values = counter.most_common(top_k)
+
+        return {
+            "unique_count": int(len(counter)),
+            "total_count": int(total_count),
+            "top_k": [(str(val), int(cnt)) for val, cnt in top_values],
+        }
+
+
+class SnapshotBuilder:
+    """
+    An advanced manager that builds a Python class by learning from observed
+    code examples to procedurally generate new, descriptive docstrings.
+
+    This class uses a NumPy-powered Markov Chain model to function like a
+    mini "code chatbot," creating unique summaries for each generated snapshot.
+    """
+
+    def __init__(self, logger: Callable[[str, int], None]):
+        self._log = logger
+        self._markov_model: Dict[str, Dict[str, int]] = {}
+        self._starters: List[str] = []
+
+    def build(
+        self,
+        config: Dict[str, Any],
+        knowledge_gatherer: Callable[..., Tuple[Dict, Dict]],
+        insights_fetcher: Callable[..., Dict],
+        stats_computer: Callable[..., Dict],
+        method_generator: Callable[..., Dict],
+    ) -> str:
+        """
+        The main public method to generate the class code string.
+        """
+        # 1. Parse config and gather all knowledge
+        class_name, base_attrs, base_methods, topics, policies = self._parse_config(config)
+        merged_attrs, merged_methods = self._gather_and_merge_knowledge(
+            knowledge_gatherer, base_attrs, base_methods, topics, policies
+        )
+
+        # 2. Learn from existing code to power the generator
+        # We extract text from method bodies to learn from
+        code_examples = [
+            m.get("body") for m in knowledge_gatherer(topics=topics)[1].values()
+            if isinstance(m.get("body"), str)
+        ]
+        self._train_generative_model(code_examples)
+
+        # 3. Add insights, stats, and standard methods
+        if policies.get("include_insights"):
+            insights = insights_fetcher(topics=topics)
+            if insights:
+                merged_attrs["_insights"] = insights
+
+        stats = {}
+        if policies.get("include_statistics"):
+            stats = stats_computer()
+            if stats:
+                merged_attrs["_statistics"] = stats
+
+        merged_methods.update(method_generator(stats=stats))
+
+        # 4. Use the generative model to write a unique class docstring
+        generative_docstring = self._generate_text(max_length=20)
+
+        # 5. Log and render the final class string with the new docstring
+        self._log_summary(class_name, topics, merged_attrs, merged_methods, policies)
+        return self._render_class(class_name, merged_attrs, merged_methods, generative_docstring)
+
+    # --------------------------- Generative Model Methods ---------------------------
+
+    def _train_generative_model(self, texts: List[str]):
+        """Builds a word-level Markov Chain model from example code/text."""
+        self._markov_model = {}
+        self._starters = []
+        if not texts:
+            return
+
+        for text in texts:
+            words = text.strip().lower().split()
+            if not words:
+                continue
+
+            self._starters.append(words[0])
+
+            for i in range(len(words) - 1):
+                current_word = words[i]
+                next_word = words[i+1]
+
+                if current_word not in self._markov_model:
+                    self._markov_model[current_word] = {}
+
+                transitions = self._markov_model[current_word]
+                transitions[next_word] = transitions.get(next_word, 0) + 1
+
+    def _generate_text(self, max_length: int = 15, seed_word: Optional[str] = None) -> str:
+        """Generates a new text string using the trained probabilistic model."""
+        if not self._markov_model:
+            return "A generated class snapshot."
+
+        # Choose a starting word
+        if seed_word and seed_word in self._markov_model:
+            current_word = seed_word
+        elif self._starters:
+            current_word = random.choice(self._starters)
+        else:
+            return "A generated class snapshot."
+
+        sentence = [current_word.capitalize()]
+
+        for _ in range(max_length - 1):
+            if current_word not in self._markov_model:
+                break
+
+            # Use NumPy to probabilistically choose the next word
+            next_word_options = self._markov_model[current_word]
+            words = list(next_word_options.keys())
+            counts = np.array(list(next_word_options.values()), dtype=np.float32)
+            probabilities = counts / counts.sum()
+
+            # The core of the generative logic
+            next_word = np.random.choice(words, p=probabilities)
+
+            sentence.append(next_word)
+            current_word = next_word
+
+        return " ".join(sentence) + "."
+
+    # --------------------------- Private Helper Methods (Unchanged) ---------------------------
+
+    def _parse_config(self, config: Dict[str, Any]) -> Tuple:
+        class_name = config.get("class_name", "GeneratedClass")
+        base_attrs = dict(config.get("attributes", {}))
+        base_methods = dict(config.get("methods", {}))
+        topics = config.get("topics") or []
+        policies = {
+            "attr_policy": (config.get("attr_policy") or "merge").lower(),
+            "method_policy": (config.get("method_policy") or "merge").lower(),
+            "attr_aggregate": (config.get("attr_aggregate") or "last").lower(),
+            "listify_singletons": bool(config.get("listify_singletons", False)),
+            "include_insights": bool(config.get("include_insights", False)),
+            "include_statistics": bool(config.get("include_statistics", False)),
+        }
+        return class_name, base_attrs, base_methods, topics, policies
+
+    def _gather_and_merge_knowledge(self, gatherer: Callable, base_attrs: Dict, base_methods: Dict, topics: List, policies: Dict) -> Tuple[Dict, Dict]:
+        k_attrs, k_methods = gatherer(topics=topics)
+        merged_attrs = {**base_attrs, **(k_attrs or {})}
+        if policies["attr_policy"] == "override":
+            merged_attrs = (k_attrs or {}) or base_attrs
+        if policies["attr_aggregate"] == "list" and policies["listify_singletons"]:
+            for k, v in list(merged_attrs.items()):
+                if not isinstance(v, list):
+                    merged_attrs[k] = [v]
+        merged_methods = {**base_methods, **(k_methods or {})}
+        if policies["method_policy"] == "override":
+            merged_methods = (k_methods or {}) or base_methods
+        return merged_attrs, merged_methods
+
+    def _log_summary(self, name: str, topics: List, attrs: Dict, methods: Dict, policies: Dict):
+        self._log(
+            f"[CodeOutput] 🧠 Generating class '{name}' with a unique docstring, "
+            f"attrs={len(attrs)}, methods={len(methods)}", 1
+        )
+
+    @staticmethod
+    def _render_class(class_name: str, attributes: Dict, methods: Dict, doc: str) -> str:
+        lines = [f"class {class_name}:", f'    """{doc}"""', "", "    def __init__(self):"]
+        if not attributes:
+            lines.append("        pass")
+        else:
+            for name, val in sorted(attributes.items()):
+                lines.append(f"        self.{name} = {repr(val)}")
+        lines.append("")
+
+        for mname, mdef in sorted(methods.items()):
+            lines.append(f"    def {mname}(self, *args, **kwargs):")
+            body = mdef.get("body") if isinstance(mdef, dict) else mdef
+            if isinstance(body, str) and body.strip():
+                for ln in body.splitlines():
+                    lines.append(f"        {ln}")
+            else:
+                lines.append(f"        return {repr(body)}")
+            lines.append("")
+        return "\n".join(lines)
+
+
+class ChatGenManager:
+    """
+    Higher-order Markov generator with contextual backoff and multi-config,
+    one-line renderings for each retrieved record. Each line uses a different
+    style and a rotated subset of attributes to avoid repetition.
+    """
+
+    def __init__(
+        self,
+        format_kv: Callable[[Dict[str, Any]], str] | None,
+        history_getter: Callable[[], Iterable[Dict[str, Any]]],
+        persona: str = "Assistant",
+        seed_corpus: Iterable[str] = (),
+        max_chars: int = 250,
+        max_history: int = 8,
+        sample_len: int = 24,
+        state_size: int = 2,  # 2-word context by default
+        config_styles: tuple[str, ...] = ("kv", "yaml", "ini", "shell", "json"),
+        preview_pairs: int = 8,        # how many k/v pairs per line
+        per_line_char_max: int = 160,  # soft cap per rendered line
+    ):
+        self._format_kv = format_kv
+        self._get_history = history_getter
+        self._persona = persona
+        self._seed_corpus = list(seed_corpus)
+        self._max_chars = max_chars
+        self._max_history = max_history
+        self._sample_len = sample_len
+        self._state_size = max(1, state_size)
+        self._np_rng = np.random.default_rng()
+        self._config_styles = config_styles or ("kv",)
+        self._preview_pairs = max(1, preview_pairs)
+        self._per_line_char_max = max(40, per_line_char_max)
+
+    # ---------- Public ----------
+    def generate(self, prompt: str, retrieved: List[Tuple[str, Dict[str, Any]]]) -> str:
+        corpus = self._build_corpus()
+        model, starters = self._train_markov(corpus)
+        tail = self._sample(model, starters)
+        text = self._stitch(retrieved, tail)
+        return self._truncate(text, self._max_chars)
+
+    # ---------- Helpers: corpus / model ----------
+    def _build_corpus(self) -> List[str]:
+        history = list(self._get_history())[-self._max_history:]
+        lines = [h.get("text", "") for h in history if h.get("text")]
+        lines.extend(self._seed_corpus)
+        return lines
+
+    def _train_markov(
+        self, corpus: List[str]
+    ) -> Tuple[Dict[Tuple[str, ...], Dict[str, int]], List[Tuple[str, ...]]]:
+        model = collections.defaultdict(lambda: collections.defaultdict(int))
+        starters: List[Tuple[str, ...]] = []
+        for text in corpus:
+            words = text.strip().lower().split()
+            if len(words) <= self._state_size:
+                continue
+            starters.append(tuple(words[: self._state_size]))
+            for i in range(len(words) - self._state_size):
+                state = tuple(words[i : i + self._state_size])
+                nxt = words[i + self._state_size]
+                model[state][nxt] += 1
+        return model, starters
+
+    def _sample(
+        self,
+        model: Dict[Tuple[str, ...], Dict[str, int]],
+        starters: List[Tuple[str, ...]],
+    ) -> str:
+        if not model:
+            return random.choice(self._seed_corpus) if self._seed_corpus else "Acknowledged. I'm awaiting more data to analyze."
+
+        current_state = random.choice(starters)
+        words = list(current_state)
+
+        for _ in range(self._sample_len - self._state_size):
+            next_opts = model.get(current_state)
+            if not next_opts and self._state_size > 1:
+                shorter = current_state[-(self._state_size - 1):]
+                next_opts = model.get(tuple(shorter))
+            if next_opts:
+                options = list(next_opts.keys())
+                counts = np.array(list(next_opts.values()), dtype=np.float32)
+                probs = counts / counts.sum()
+                nxt = str(self._np_rng.choice(options, p=probs))
+                words.append(nxt)
+                current_state = tuple(words[-self._state_size:])
+            else:
+                current_state = random.choice(starters)
+
+        sentence = " ".join(words).capitalize()
+        if sentence and sentence[-1].isalnum():
+            sentence += "."
+        return sentence
+
+    # ---------- Helpers: multi-config stitching ----------
+    def _stitch(self, retrieved: List[Tuple[str, Dict[str, Any]]], tail: str) -> str:
+        lines = [f"({self._persona})"]
+        if retrieved:
+            lines.append("Here’s what I’m seeing right now:")
+            for i, (_topic, attrs) in enumerate(retrieved):
+                style = self._config_styles[i % len(self._config_styles)]
+                line = self._format_attrs_one_line(attrs, style, self._preview_pairs, line_index=i)
+                lines.append(self._limit_line(line, self._per_line_char_max))
+        else:
+            lines.append("I don’t have fresh packets yet; I’ll reason from the prompt.")
+        lines.append(tail)
+        return "\n".join(lines)
+
+    def _format_attrs_one_line(
+        self,
+        attrs: Mapping[str, Any],
+        style: str,
+        limit: int,
+        line_index: int = 0,
+    ) -> str:
+        flat = self._flatten(attrs)
+        pairs = self._select_pairs(flat, limit, line_index)
+
+        if style == "kv":
+            return ", ".join(f"{k}='{v}'" for k, v in pairs)
+        elif style == "yaml":  # flow-style YAML on one line
+            return "{ " + ", ".join(f"{k}: {self._yaml_scalar(v)}" for k, v in pairs) + " }"
+        elif style == "ini":   # INI-ish inline
+            return "; ".join(f"{k}={v}" for k, v in pairs)
+        elif style == "shell": # shell env-style
+            return " ".join(f"{k.upper()}={self._shell_quote(v)}" for k, v in pairs)
+        elif style == "json":
+            obj = {k: v for k, v in pairs}
+            return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        elif style == "ext" and self._format_kv:
+            # user-provided formatter if you want to plug your own
+            return self._format_kv(dict(pairs))
+        else:
+            # fallback
+            return ", ".join(f"{k}={v}" for k, v in pairs)
+
+    # ---------- Helpers: attribute selection & formatting ----------
+    def _flatten(self, obj: Any, prefix: str = "") -> List[Tuple[str, str]]:
+        """
+        Flattens nested mappings/lists into dot/bracket paths: a.b[0].c
+        Converts values to compact strings.
+        """
+        out: List[Tuple[str, str]] = []
+        if isinstance(obj, Mapping):
+            for k, v in obj.items():
+                key = f"{prefix}.{k}" if prefix else str(k)
+                out.extend(self._flatten(v, key))
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                key = f"{prefix}[{i}]"
+                out.extend(self._flatten(v, key))
+        else:
+            # leaf
+            sval = self._to_scalar(obj)
+            if prefix:
+                out.append((prefix, sval))
+        return out
+
+    def _to_scalar(self, v: Any) -> str:
+        if v is None:
+            return "null"
+        if isinstance(v, (int, float, bool)):
+            return str(v).lower() if isinstance(v, bool) else str(v)
+        s = str(v)
+        # tiny compaction (e.g., long MAC/IP strings still visible but shorter)
+        if len(s) > 64:
+            s = s[:61] + "…"
+        return s
+
+    def _select_pairs(self, flat: List[Tuple[str, str]], limit: int, line_index: int) -> List[Tuple[str, str]]:
+        """
+        Deterministic rotation so each line gets a different slice of attributes:
+        sort by key, then rotate by line_index, then take 'limit' pairs.
+        """
+        if not flat:
+            return []
+        flat_sorted = sorted(flat, key=lambda kv: kv[0])
+        offset = line_index % len(flat_sorted)
+        rotated = flat_sorted[offset:] + flat_sorted[:offset]
+        return rotated[:limit]
+
+    def _yaml_scalar(self, v: str) -> str:
+        # quote only when necessary
+        if not v or any(ch in v for ch in " \t,:{}[]#&*!|>'\"%@`"):
+            return '"' + v.replace('"', '\\"') + '"'
+        return v
+
+    def _shell_quote(self, v: str) -> str:
+        if v and v.isalnum():
+            return v
+        return "'" + v.replace("'", "'\\''") + "'"
+
+    def _limit_line(self, s: str, maxlen: int) -> str:
+        if len(s) <= maxlen:
+            return s
+        cut = s.rfind(" ", 0, maxlen - 1)
+        if cut == -1 or cut < maxlen // 2:
+            cut = maxlen - 1
+        return s[:cut].rstrip() + "…"
+
+    # ---------- Helpers: final truncation ----------
+    def _truncate(self, s: str, maxlen: int) -> str:
+        if len(s) <= maxlen:
+            return s
+        cut = s.rfind(" ", 0, maxlen - 1)
+        if cut == -1 or cut < maxlen // 2:
+            cut = maxlen - 1
+        return s[:cut].rstrip() + "…"
+
+
+class PacketLearnerManager:
+    """
+    Learns concept frequencies & structure from packet attributes and adjusts TTL.
+
+    Additions over basic version:
+      • Heuristic extraction of IP/MAC/ports/proto/VLAN/TTL/length.
+      • Counters for categorical fields (ips, macs, ports, protos).
+      • Online numeric stats for ttl/length.
+      • Size histogram (power-of-two buckets).
+      • Per-topic EWMA rate + spike detection (z-score).
+      • Hot/cold TTL adjustment (boost on spikes/hot tokens, decay when cold).
+      • Accepts KnowledgePacket OR raw Scapy Packet (duck-typed) OR plain dict.
+      • Snapshot/restore of learned state.
+    """
+
+    class OnlineStats:
+        """Welford online variance + min/max."""
+        __slots__ = ("n", "mean", "M2", "min", "max")
+
+        def __init__(self) -> None:
+            self.n = 0;
+            self.mean = 0.0;
+            self.M2 = 0.0;
+            self.min = float("inf");
+            self.max = float("-inf")
+
+        def add(self, x: float) -> None:
+            self.n += 1
+            delta = x - self.mean
+            self.mean += delta / self.n
+            self.M2 += delta * (x - self.mean)
+            if x < self.min: self.min = x
+            if x > self.max: self.max = x
+
+        def std(self) -> float:
+            return math.sqrt(self.M2 / (self.n - 1)) if self.n > 1 else 0.0
+
+    class EWMA:
+        """Exponentially weighted moving average of event rate (events/sec)."""
+        __slots__ = ("alpha", "value", "last_t")
+
+        def __init__(self, alpha: float = 0.3) -> None:
+            self.alpha = float(alpha);
+            self.value = 0.0;
+            self.last_t = None
+
+        def tick(self, now: float) -> float:
+            if self.last_t is None:
+                self.last_t = now;
+                return self.value
+            dt = max(1e-3, now - self.last_t)
+            inst_rate = 1.0 / dt
+            self.value = self.alpha * inst_rate + (1 - self.alpha) * self.value
+            self.last_t = now
+            return self.value
+    # ---------------- Configuration ----------------
+    DEFAULT_BASE_TTL = 120.0
+    DEFAULT_TTL_BOOST_FACTOR = 1.5
+    DEFAULT_TTL_BOOST_THRESHOLD = 20      # dominant token count
+    DEFAULT_MAX_VOCAB_PER_TOPIC = 5000
+    DEFAULT_DECAY_ON_OVERFLOW = 0.5
+    DEFAULT_RATE_SPIKE_Z = 3.0            # z-score threshold for spikes
+    DEFAULT_COLD_SECONDS = 180.0          # if no events > this, treat cold
+    DEFAULT_MIN_TTL = 10.0
+    DEFAULT_MAX_TTL_MULT = 3.0            # cap TTL at default * MAX_TTL_MULT
+    DEFAULT_BINS = tuple(2**k for k in range(5, 17))  # 32..65536
+    EWMA_ALPHA = 0.25
+
+    _STOPWORDS = {
+        "the","a","an","of","and","or","to","in","on","for","with","by","at","as",
+        "is","are","was","were","be","been","being","this","that","these","those",
+        "it","its","from","into","over","under","about","via","per","not","no",
+    }
+    _TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")  # 2–32 chars, starts alpha
+    _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    _MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+
+    def _now(self) -> float:
+        return time.time()
+    def __init__(
+        self,
+        *,
+        default_ttls: Optional[Mapping[str, float]] = None,
+        ttl_boost_factor: float = DEFAULT_TTL_BOOST_FACTOR,
+        ttl_boost_threshold: int = DEFAULT_TTL_BOOST_THRESHOLD,
+        max_vocab_per_topic: int = DEFAULT_MAX_VOCAB_PER_TOPIC,
+        decay_on_overflow: float = DEFAULT_DECAY_ON_OVERFLOW,
+        rate_spike_z: float = DEFAULT_RATE_SPIKE_Z,
+        cold_seconds: float = DEFAULT_COLD_SECONDS,
+        min_ttl: float = DEFAULT_MIN_TTL,
+        max_ttl_mult: float = DEFAULT_MAX_TTL_MULT,
+        logger: Optional[Callable[[str], None]] = None,
+        log_level: int = 2,
+    ) -> None:
+        self.default_ttls: Dict[str, float] = dict(default_ttls or {})
+        self.ttl_boost_factor = float(ttl_boost_factor)
+        self.ttl_boost_threshold = int(ttl_boost_threshold)
+        self.max_vocab_per_topic = int(max_vocab_per_topic)
+        self.decay_on_overflow = float(decay_on_overflow)
+        self.rate_spike_z = float(rate_spike_z)
+        self.cold_seconds = float(cold_seconds)
+        self.min_ttl = float(min_ttl)
+        self.max_ttl_mult = float(max_ttl_mult)
+
+        self._concept_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
+        self._cat_counts: Dict[str, Dict[str, Counter]] = defaultdict(lambda: {
+            "ip": Counter(), "mac": Counter(), "proto": Counter(), "port": Counter(), "vlan": Counter()
+        })
+        self._num_stats: Dict[str, Dict[str, PacketLearnerManager.OnlineStats]] = defaultdict(lambda: {
+            "ttl": self.OnlineStats(), "length": self.OnlineStats()
+        })
+        self._size_hist: Dict[str, List[int]] = defaultdict(lambda: [0]*len(self.DEFAULT_BINS))
+        self._rate: Dict[str, PacketLearnerManager.EWMA] = defaultdict(lambda: self.EWMA(self.EWMA_ALPHA))
+        self._rate_mean_std: Dict[str, Tuple[PacketLearnerManager.OnlineStats, PacketLearnerManager.OnlineStats]] = defaultdict(lambda: (self.OnlineStats(), self.OnlineStats()))
+        self._last_seen: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._logger = logger or (lambda s: None)
+        self._log_level = log_level
+
+    # --------------- Public API ----------------
+    def learn_from_packet(self, pkt: Any) -> Any:
+        """
+        Accepts KnowledgePacket, Scapy Packet, or dict-like payload.
+        Learns features and (if KnowledgePacket) may adjust pkt.ttl.
+        Returns the same object for chaining.
+        """
+        topic, attrs, initial_ttl, is_kp = self._coerce_input(pkt)
+        if not attrs:
+            return pkt
+
+        now = self._now()
+        tokens = self._collect_tokens(attrs)
+        signals = self._extract_signals(attrs)
+
+        if not tokens and not any(signals.values()):
+            return pkt
+
+        with self._lock:
+            # 1) token vocab
+            cc = self._concept_counts[topic]
+            self._update_counts(cc, tokens)
+            self._maybe_compact_vocab(cc)
+            dominant = max(cc.values()) if cc else 0
+
+            # 2) categorical tallies
+            self._update_categoricals(topic, signals)
+
+            # 3) numeric stats & histograms
+            self._update_numeric(topic, signals)
+            self._update_histogram(topic, signals)
+
+            # 4) rate tracking & spike detection
+            rate = self._rate[topic].tick(now)
+            mean_s, std_s = self._rate_mean_std[topic]
+            mean_s.add(rate)
+            std_s.add(rate)  # reuse container to track dispersion similarly
+            z = 0.0
+            if mean_s.n > 10 and std_s.std() > 1e-6:
+                z = (rate - mean_s.mean) / std_s.std()
+
+            # 5) TTL logic (KnowledgePacket only)
+            if is_kp:
+                default_ttl = float(self.default_ttls.get(topic, self.DEFAULT_BASE_TTL))
+                old_ttl = float(initial_ttl if initial_ttl is not None else default_ttl)
+
+                new_ttl = self._ttl_adjust(
+                    current_ttl=old_ttl,
+                    dominant=dominant,
+                    default_ttl=default_ttl,
+                    last_seen=self._last_seen.get(topic),
+                    now=now,
+                    spike_z=z,
+                )
+                if new_ttl != old_ttl:
+                    try:
+                        pkt.ttl = new_ttl
+                    except Exception:
+                        pass  # be defensive if caller object is immutable
+                    self._log(
+                        f"[PacketLearner] TTL {'boosted' if new_ttl>old_ttl else 'adjusted'} "
+                        f"topic='{topic}' ({old_ttl:.1f} -> {new_ttl:.1f}); "
+                        f"dominant={dominant}, rate={rate:.2f}/s z={z:.2f}", 2
+                    )
+
+            # 6) housekeeping
+            self._last_seen[topic] = now
+
+        return pkt
+
+    # --------------- Input coercion ----------------
+    def _coerce_input(self, pkt: Any) -> Tuple[str, Dict[str, Any], Optional[float], bool]:
+        """
+        Returns: (topic, attrs, ttl, is_knowledge_packet)
+        Accepts:
+          - KnowledgePacket: use pkt.topic, pkt.payload['attributes']
+          - Scapy Packet: builds attributes from typical fields (best-effort)
+          - dict: treat as {'attributes': {...}} or raw attrs mapping
+        """
+        # KnowledgePacket-like?
+        topic = "default"
+        ttl = None
+        is_kp = False
+        if hasattr(pkt, "topic") and hasattr(pkt, "payload"):
+            is_kp = True
+            topic = getattr(pkt, "topic", "default") or "default"
+            ttl = getattr(pkt, "ttl", None)
+            attrs = self._extract_attributes(getattr(pkt, "payload", None))
+            return topic, attrs, ttl, True
+
+        # Scapy Packet (duck-typed): use .fields / layers if present
+        try:
+            from scapy.packet import Packet as ScapyPacket  # type: ignore
+            from scapy.layers.inet import IP, TCP, UDP  # type: ignore
+            from scapy.layers.l2 import Ether, Dot1Q  # type: ignore
+            is_scapy = isinstance(pkt, ScapyPacket)
+        except Exception:
+            is_scapy = False
+
+        if is_scapy:
+            attrs: Dict[str, Any] = {}
+            try:
+                if pkt.haslayer("Ether"):
+                    eth = pkt.getlayer("Ether")
+                    attrs["eth_src"] = getattr(eth, "src", None)
+                    attrs["eth_dst"] = getattr(eth, "dst", None)
+                if pkt.haslayer("Dot1Q"):
+                    q = pkt.getlayer("Dot1Q")
+                    attrs["vlan"] = getattr(q, "vlan", None)
+                    attrs["vlan_prio"] = getattr(q, "prio", None)
+                if pkt.haslayer("IP"):
+                    ip = pkt.getlayer("IP")
+                    attrs["saddr"] = getattr(ip, "src", None)
+                    attrs["daddr"] = getattr(ip, "dst", None)
+                    attrs["ttl"] = getattr(ip, "ttl", None)
+                    attrs["length"] = getattr(ip, "len", None)
+                if pkt.haslayer("TCP"):
+                    tcp = pkt.getlayer("TCP")
+                    attrs["proto"] = "tcp"
+                    attrs["sport"] = getattr(tcp, "sport", None)
+                    attrs["dport"] = getattr(tcp, "dport", None)
+                elif pkt.haslayer("UDP"):
+                    udp = pkt.getlayer("UDP")
+                    attrs["proto"] = "udp"
+                    attrs["sport"] = getattr(udp, "sport", None)
+                    attrs["dport"] = getattr(udp, "dport", None)
+            except Exception:
+                pass
+            return "default", {k: v for k, v in attrs.items() if v is not None}, None, False
+
+        # dict-like
+        if isinstance(pkt, Mapping):
+            attrs = self._extract_attributes(pkt)
+            return "default", attrs, None, False
+
+        # fallback
+        return "default", {}, None, False
+
+    # --------------- Helpers: attributes & tokens ----------------
+    def _extract_attributes(self, payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            return {}
+        attrs = payload.get("attributes") if isinstance(payload, Mapping) else None
+        return attrs if isinstance(attrs, Mapping) else {}
+
+    def _collect_tokens(self, attrs: Mapping[str, Any]) -> List[str]:
+        tokens: List[str] = []
+        # keys
+        for k in attrs.keys():
+            tokens.extend(self._tokenize(str(k)))
+        # values (strings anywhere within nested structures)
+        for s in self._iter_string_values(attrs):
+            tokens.extend(self._tokenize(s))
+        return tokens
+
+    def _iter_string_values(self, obj: Any, _depth: int = 0, _max_depth: int = 3) -> Iterator[str]:
+        if _depth > _max_depth:
+            return
+        if isinstance(obj, str):
+            yield obj
+        elif isinstance(obj, Mapping):
+            for v in obj.values():
+                yield from self._iter_string_values(v, _depth + 1, _max_depth)
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                yield from self._iter_string_values(v, _depth + 1, _max_depth)
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = text.lower()
+        toks = [t for t in self._TOKEN_RE.findall(text) if t not in self._STOPWORDS]
+        return toks
+
+    # --------------- Helpers: signals extraction ----------------
+    def _extract_signals(self, attrs: Mapping[str, Any]) -> Dict[str, Any]:
+        """
+        Pull common fields out of typical network attrs. Best-effort heuristics.
+        """
+        as_str = lambda k: str(attrs.get(k)) if attrs.get(k) is not None else ""
+        sig: Dict[str, Any] = {
+            "ips": [],
+            "macs": [],
+            "proto": None,
+            "ports": [],
+            "vlan": None,
+            "ttl": None,
+            "length": None,
+        }
+
+        # IPs
+        for k in ("saddr","src","source","ip_src","daddr","dst","dest","ip_dst"):
+            v = attrs.get(k)
+            if isinstance(v, str):
+                for ip in self._IP_RE.findall(v): sig["ips"].append(ip)
+
+        # MACs
+        for k in ("eth_src","ether_src","mac_src","eth_dst","ether_dst","mac_dst"):
+            v = as_str(k)
+            if v:
+                for m in self._MAC_RE.findall(v): sig["macs"].append(m.lower())
+
+        # Proto
+        proto = attrs.get("proto") or attrs.get("l4_proto") or attrs.get("protocol")
+        if isinstance(proto, str): sig["proto"] = proto.lower()
+        elif isinstance(proto, int): sig["proto"] = str(proto)
+
+        # Ports
+        for k in ("sport","src_port","source_port","dport","dst_port","dest_port"):
+            v = attrs.get(k)
+            if isinstance(v, (int, str)) and str(v).isdigit():
+                val = int(v)
+                if 0 < val < 65536: sig["ports"].append(val)
+
+        # VLAN
+        vlan = attrs.get("vlan")
+        if isinstance(vlan, int): sig["vlan"] = vlan
+
+        # TTL & length
+        ttl = attrs.get("ttl")
+        if isinstance(ttl, int): sig["ttl"] = ttl
+        length = attrs.get("length") or attrs.get("len") or attrs.get("payload_len")
+        if isinstance(length, int): sig["length"] = length
+
+        return sig
+
+    # --------------- Helpers: counts & vocab mgmt ----------------
+    def _update_counts(self, cc: Dict[str, int], tokens: Iterable[str]) -> None:
+        for t in tokens:
+            cc[t] = cc.get(t, 0) + 1
+
+    def _maybe_compact_vocab(self, cc: Dict[str, int]) -> None:
+        if len(cc) <= self.max_vocab_per_topic:
+            return
+        # Decay counts
+        if 0.0 < self.decay_on_overflow < 1.0:
+            for k in list(cc.keys()):
+                cc[k] = max(1, int(cc[k] * self.decay_on_overflow))
+        # Drop the tail if still too big
+        if len(cc) > self.max_vocab_per_topic:
+            items = sorted(cc.items(), key=lambda kv: kv[1], reverse=True)[: self.max_vocab_per_topic]
+            cc.clear()
+            cc.update(items)
+
+    def _update_categoricals(self, topic: str, sig: Dict[str, Any]) -> None:
+        cats = self._cat_counts[topic]
+        for ip in sig.get("ips", []): cats["ip"][ip] += 1
+        for mac in sig.get("macs", []): cats["mac"][mac] += 1
+        if sig.get("proto"): cats["proto"][sig["proto"]] += 1
+        for p in sig.get("ports", []): cats["port"][str(p)] += 1
+        if sig.get("vlan") is not None: cats["vlan"][str(sig["vlan"])] += 1
+
+    def _update_numeric(self, topic: str, sig: Dict[str, Any]) -> None:
+        stats = self._num_stats[topic]
+        if sig.get("ttl") is not None: stats["ttl"].add(float(sig["ttl"]))
+        if sig.get("length") is not None: stats["length"].add(float(sig["length"]))
+
+    def _update_histogram(self, topic: str, sig: Dict[str, Any]) -> None:
+        length = sig.get("length")
+        if length is None: return
+        bins = self.DEFAULT_BINS
+        hist = self._size_hist[topic]
+        # place into first bucket >= length
+        for i, b in enumerate(bins):
+            if length <= b:
+                hist[i] += 1
+                return
+        # overflow: ignore or extend (keep simple)
+        hist[-1] += 1
+
+    # --------------- Helpers: TTL logic ----------------
+    def _ttl_adjust(
+        self,
+        *,
+        current_ttl: float,
+        dominant: int,
+        default_ttl: float,
+        last_seen: Optional[float],
+        now: float,
+        spike_z: float,
+    ) -> float:
+        limit = default_ttl * self.max_ttl_mult
+        ttl = max(self.min_ttl, current_ttl)
+
+        # Boost for hot tokens
+        if dominant >= self.ttl_boost_threshold and ttl < default_ttl * self.ttl_boost_factor:
+            ttl = min(limit, ttl * self.ttl_boost_factor)
+
+        # Boost for spikes
+        if spike_z >= self.rate_spike_z:
+            ttl = min(limit, ttl * self.ttl_boost_factor)
+
+        # Decay when cold (no events recently)
+        if last_seen is not None and (now - last_seen) > self.cold_seconds:
+            ttl = max(self.min_ttl, ttl / self.ttl_boost_factor)
+
+        return ttl
+
+    # --------------- Logging ----------------
+    def _log(self, msg: str, level: int = 2) -> None:
+        if self._log_level >= level:
+            self._logger(msg)
+
+    # --------------- Inspection APIs ----------------
+    def snapshot_counts(self, topic: Optional[str] = None, top_k: int = 20) -> List[Tuple[str, int]]:
+        with self._lock:
+            if topic is not None:
+                cc = self._concept_counts.get(topic, {})
+                return sorted(cc.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+            merged: Dict[str, int] = defaultdict(int)
+            for cc in self._concept_counts.values():
+                for k, v in cc.items():
+                    merged[k] += v
+            return sorted(merged.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+
+    def snapshot_categoricals(self, topic: str, top_k: int = 10) -> Dict[str, List[Tuple[str, int]]]:
+        with self._lock:
+            cats = self._cat_counts.get(topic, {})
+            return {k: cats.get(k, Counter()).most_common(top_k) for k in ("ip","mac","proto","port","vlan")}
+
+    def snapshot_numeric(self, topic: str) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            ns = self._num_stats.get(topic, {})
+            out = {}
+            for k, st in ns.items():
+                out[k] = {"n": st.n, "mean": st.mean, "std": st.std(), "min": st.min, "max": st.max}
+            return out
+
+    def snapshot_histogram(self, topic: str) -> List[Tuple[int, int]]:
+        """Return (upper_bound, count) pairs for size histogram."""
+        with self._lock:
+            hist = list(self._size_hist.get(topic, []))
+        return list(zip(self.DEFAULT_BINS, hist))
+
+    def save_state(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "concept_counts": {t: dict(cc) for t, cc in self._concept_counts.items()},
+                "cat_counts": {t: {k: dict(v) for k, v in cats.items()} for t, cats in self._cat_counts.items()},
+                "num_stats": {t: {k: {"n": st.n, "mean": st.mean, "M2": st.M2, "min": st.min, "max": st.max}
+                                  for k, st in stats.items()} for t, stats in self._num_stats.items()},
+                "size_hist": {t: list(h) for t, h in self._size_hist.items()},
+                "rate": {t: {"value": ew.value, "last_t": ew.last_t} for t, ew in self._rate.items()},
+                "last_seen": dict(self._last_seen),
+            }
+
+    def load_state(self, state: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._concept_counts.clear()
+            for t, cc in state.get("concept_counts", {}).items():
+                self._concept_counts[t] = dict(cc)
+
+            self._cat_counts.clear()
+            for t, cats in state.get("cat_counts", {}).items():
+                self._cat_counts[t] = {k: Counter(v) for k, v in cats.items()}
+
+            self._num_stats.clear()
+            for t, stats in state.get("num_stats", {}).items():
+                self._num_stats[t] = {}
+                for k, d in stats.items():
+                    st = self.OnlineStats()
+                    st.n, st.mean, st.M2 = int(d.get("n", 0)), float(d.get("mean", 0.0)), float(d.get("M2", 0.0))
+                    st.min, st.max = float(d.get("min", float("inf"))), float(d.get("max", float("-inf")))
+                    self._num_stats[t][k] = st
+
+            self._size_hist = defaultdict(lambda: [0]*len(self.DEFAULT_BINS),
+                                          {t: list(h) for t, h in state.get("size_hist", {}).items()})
+            self._rate.clear()
+            for t, d in state.get("rate", {}).items():
+                ew = self.EWMA(self.EWMA_ALPHA); ew.value = float(d.get("value", 0.0)); ew.last_t = d.get("last_t", None)
+                self._rate[t] = ew
+
+            self._last_seen = dict(state.get("last_seen", {}))

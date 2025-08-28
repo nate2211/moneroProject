@@ -9,11 +9,18 @@ from typing import List, Tuple, Union, Optional
 
 import psutil
 from scapy.arch import get_if_hwaddr
+from scapy.contrib.geneve import GENEVE
 from scapy.fields import IntField
+from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNS
 from scapy.layers.eap import EAPOL, EAP
 from scapy.layers.ipsec import ESP, AH
+from scapy.layers.l2tp import L2TP
+from scapy.layers.mobileip import MobileIP
+from scapy.layers.ppp import PPP
 from scapy.layers.rip import RIP
+from scapy.layers.rtp import RTP
+from scapy.main import load_contrib
 
 # Import all functionalities from the Scapy library to parse packets.
 try:
@@ -24,6 +31,8 @@ try:
         ICMPv6ND_RS, IPv6
     from scapy.layers.l2 import Ether, ARP, getmacbyip, GRE
     from scapy.packet import bind_layers, Raw
+
+
 except ImportError:
     # Print error for Scapy and exit
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
@@ -209,6 +218,21 @@ class SnifferSoftware:
         bind_layers(IP, AH, proto=51)
         bind_layers(IPv6, AH, nh=51)
         bind_layers(IP, GRE, proto=47)
+        #new -
+        bind_layers(UDP, DHCP6, sport=547)
+        bind_layers(UDP, DHCP6, dport=546)
+        bind_layers(UDP, RTP, dport=5004)
+        bind_layers(UDP, RTP, sport=5004)
+        bind_layers(UDP, GENEVE, dport=6081)
+        bind_layers(UDP, GENEVE, sport=6081)
+        bind_layers(UDP, L2TP, dport=1701)
+        bind_layers(UDP, L2TP, sport=1701)
+        bind_layers(UDP, MobileIP, dport=434)
+        bind_layers(UDP, MobileIP, sport=434)
+        bind_layers(EAPOL, EAP, type=0)
+        bind_layers(PPP, EAP, proto=0xC227)
+        #-
+        bind_layers(Ether, EAPOL, type=0x888E)
         load_layer("vxlan")
         load_layer("dhcp")
         load_layer("dhcp6")

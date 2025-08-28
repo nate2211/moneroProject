@@ -26,7 +26,6 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.all import send, sr1
 from scapy.arch import get_if_hwaddr
-from scapy.config import conf
 from scapy.layers.dhcp import DHCP
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNSQR, DNS
@@ -1156,6 +1155,8 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
 
+
+
             if packet.haslayer(TCP):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
@@ -1204,12 +1205,15 @@ class PythonRouterManager:
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dhcp")
                     return
-
-
-            if packet.haslayer(Kerberos):
+            if (
+                    packet.haslayer("Kerberos")
+                    or (UDP in packet and (int(packet[UDP].sport) in (88, 464) or int(packet[UDP].dport) in (88, 464)))
+                    or (TCP in packet and (int(packet[TCP].sport) in (88, 464) or int(packet[TCP].dport) in (88, 464)))
+            ):
                 if self.kerberos_manager.handle_kerberos_packet(packet, inbound_iface, self._interfaces_config):
+                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+                                                           phase="handled", component="kerberos")
                     return
-
             # Duplicate flow check (rate-limiting)
             proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
             sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(UDP) else 0
@@ -1235,9 +1239,10 @@ class PythonRouterManager:
             yield_no_gil(0.5)
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[Router] ❗ ERROR while processing on {inbound_iface.split('_')[-1]}: {e}. Packet: {packet.summary()}")
+        except Exception:
+            self.logger.log_message(
+                f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
+            )
 
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
@@ -1394,6 +1399,8 @@ class PythonRouterManager:
         if is_from_internal_bridge and is_to_external_wan:
             self.nat_manager.translate_outbound(packet)
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+
+
 
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)

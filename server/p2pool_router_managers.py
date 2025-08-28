@@ -11,7 +11,7 @@ import subprocess
 import traceback
 from collections import defaultdict, deque
 from collections.abc import Set
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Callable
 import ipaddress
 import threading
 import json
@@ -19,11 +19,13 @@ import time
 import numpy as np
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.ikev2 import IKEv2
+from scapy.fields import StrLenField
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dns import  DNS
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply
 from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
+from scapy.layers.mobileip import MobileIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished, TLSCertificate, \
     TLSClientKeyExchange, TLSServerKeyExchange, TLSServerHelloDone, TLSCertificateRequest, TLSNewSessionTicket, \
     TLSEncryptedExtensions
@@ -1983,11 +1985,305 @@ class HTTPSManager:
                 pass
         return cipher_map
 
+class _MsgTypeShim:
+    def __init__(self, val: int): self.val = val
+
+class _RootShim:
+    def __init__(self, msgtype_val: int): self.msgType = _MsgTypeShim(msgtype_val)
+
 class KerberosManager:
     """
     Manages Kerberos protocol traffic within the router.
     Can be used for passive analysis, logging, or active intervention/proxying.
     """
+
+    class KerberosOpaque(Packet):
+        name = "KerberosOpaque"
+        fields_desc = [StrLenField("blob", b"", length_from=lambda pkt: len(pkt.blob))]
+
+        # Kerberos APPLICATION tag number -> msgType value (same number for these)
+        _APPNUM_TO_MSGTYPE = {
+            10: 10, 11: 11, 12: 12, 13: 13, 14: 14, 15: 15,  # AS/TGS/AP
+            20: 20, 21: 21, 22: 22,  # KRB-SAFE/PRIV/CRED
+            30: 30,  # KRB-ERROR
+        }
+        _MSGTYPE_NAME = {
+            10: "AS-REQ", 11: "AS-REP", 12: "TGS-REQ", 13: "TGS-REP",
+            14: "AP-REQ", 15: "AP-REP", 20: "KRB-SAFE", 21: "KRB-PRIV",
+            22: "KRB-CRED", 30: "KRB-ERROR"
+        }
+
+        @staticmethod
+        def _ber_read_len(buf: bytes, i: int):
+            if i >= len(buf): return None, None
+            first = buf[i];
+            i += 1
+            if first < 0x80: return first, i
+            n = first & 0x7F
+            if n == 0 or i + n > len(buf): return None, None
+            return int.from_bytes(buf[i:i + n], "big"), i + n
+
+        @classmethod
+        def _peel_octet_string(cls, buf: bytes):
+            if not buf or buf[0] != 0x04: return None
+            ln, j = cls._ber_read_len(buf, 1)
+            if ln is None or j is None or j + ln > len(buf): return None
+            return buf[j:j + ln]
+
+        @classmethod
+        def _extract_gssapi_inner(cls, buf: bytes):
+            # Kerberos V5 OID: 1.2.840.113554.1.2.2
+            KRB5_OID = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02"
+            idx = buf.find(KRB5_OID)
+            if idx < 0: return None
+            oct_idx = buf.find(b"\x04", idx + len(KRB5_OID))
+            if oct_idx < 0: return None
+            return cls._peel_octet_string(buf[oct_idx:])
+
+        @classmethod
+        def _extract_spnego_inner(cls, buf: bytes):
+            """
+            Find SPNEGO (1.3.6.1.5.5.2) and peel the first OCTET STRING likely to be
+            mechToken/responseToken containing AP-REQ/REP.
+            """
+            SPNEGO_OID = b"\x06\x06\x2b\x06\x01\x05\x05\x02"  # DER OID for 1.3.6.1.5.5.2
+            idx = buf.find(SPNEGO_OID)
+            if idx < 0:
+                return None
+            # Search a window after the OID for a plausible OCTET STRING and peel it
+            win = buf[idx + len(SPNEGO_OID): idx + len(SPNEGO_OID) + 2048]
+            pos = 0
+            while True:
+                j = win.find(b"\x04", pos)  # OCTET STRING tag
+                if j < 0:
+                    return None
+                ln, k = cls._ber_read_len(win, j + 1)
+                if ln is None:
+                    return None
+                if k + ln <= len(win):
+                    return win[k:k + ln]  # inner bytes (often AP-REQ/REP)
+                pos = j + 1
+
+        @classmethod
+        def _scan_for_kerb_app(cls, buf: bytes):
+            """
+            Scan the blob for the first byte that looks like an APPLICATION|CONSTRUCTED tag
+            used by Kerberos (10,11,12,13,14,15,20,21,22,30). Return the slice starting there.
+            """
+            VALID = {10, 11, 12, 13, 14, 15, 20, 21, 22, 30}
+            for i in range(len(buf)):
+                b0 = buf[i]
+                if (b0 & 0xE0) == 0x60:  # APPLICATION + constructed
+                    appnum = b0 & 0x1F
+                    if appnum in VALID:
+                        return buf[i:]
+            return None
+
+        @classmethod
+        def _candidates(cls, blob: bytes):
+            """
+            Build increasingly aggressive candidates:
+            - raw
+            - single OCTET STRING peel
+            - GSS-API (Kerberos OID) inner token
+            - SPNEGO (NegToken) inner token
+            - second peel of any found inner
+            - deep scan for a Kerberos APPLICATION tag anywhere
+            """
+            cands = []
+            if blob:
+                cands.append(blob)
+
+                peeled = cls._peel_octet_string(blob)
+                if peeled:
+                    cands.append(peeled)
+
+                # existing Kerberos V5 OID extraction (GSS-API InitialContextToken)
+                inner_gss = cls._extract_gssapi_inner(blob)
+                if inner_gss:
+                    cands.append(inner_gss)
+                    inner2 = cls._peel_octet_string(inner_gss)
+                    if inner2:
+                        cands.append(inner2)
+
+                # NEW: SPNEGO unwrap
+                inner_spnego = cls._extract_spnego_inner(blob)
+                if inner_spnego:
+                    cands.append(inner_spnego)
+                    inner2b = cls._peel_octet_string(inner_spnego)
+                    if inner2b:
+                        cands.append(inner2b)
+
+                # NEW: deep scan anywhere in the blob
+                scanned = cls._scan_for_kerb_app(blob)
+                if scanned:
+                    cands.append(scanned)
+
+            return cands
+
+        @staticmethod
+        def _is_app_tag(b: int) -> bool:
+            # Application + Constructed
+            return (b & 0xE0) == 0x60
+
+        def _classify_appnum(self) -> int | None:
+            for cand in self._candidates(self.blob or b""):
+                if cand and self._is_app_tag(cand[0]):
+                    return cand[0] & 0x1F  # application tag number
+            return None
+
+        def _classify_msgtype(self) -> int | None:
+            appnum = self._classify_appnum()
+            if appnum is None:
+                return None
+            # If we know the mapping, use it; else return the raw app tag as msgType
+            return self._APPNUM_TO_MSGTYPE.get(appnum, appnum)
+
+        @property
+        def root(self):
+            mt = self._classify_msgtype()
+            return _RootShim(mt if mt is not None else -1)
+
+        def msgtype_name(self) -> str:
+            mt = self._classify_msgtype()
+            if mt in self._MSGTYPE_NAME:
+                return self._MSGTYPE_NAME[mt]
+            appnum = self._classify_appnum()
+            return f"APP-{appnum}" if appnum is not None else "UNKNOWN"
+
+    # ===== OPAQUE ASN.1 HELPERS =====
+
+    def _ber_len(self, buf: bytes, i: int):
+        if i >= len(buf): return None, None
+        first = buf[i];
+        i += 1
+        if first < 0x80: return first, i
+        n = first & 0x7F
+        if n == 0 or i + n > len(buf): return None, None
+        return int.from_bytes(buf[i:i + n], "big"), i + n
+
+    def _find_first_universal_string(self, buf: bytes):
+        # Try UTF8String (0x0C), GeneralString (0x1B), IA5String (0x16)
+        i = 0
+        while i < len(buf):
+            tag = buf[i]
+            ln, j = self._ber_len(buf, i + 1)
+            if ln is None or j is None: break
+            if tag in (0x0C, 0x1B, 0x16) and j + ln <= len(buf):
+                raw = buf[j:j + ln]
+                try:
+                    return raw.decode("utf-8" if tag == 0x0C else "latin-1", "ignore")
+                except Exception:
+                    pass
+            i = j + ln
+        return None
+
+    def _find_ctx_slice(self, buf: bytes, ctx_tag_num: int):
+        """
+        Find a context-specific [N] (constructed) tag and return its value slice.
+        Tag byte = 0xA0 | (ctx_tag_num & 0x1F).
+        """
+        want = bytes([0xA0 | (ctx_tag_num & 0x1F)])
+        i = 0
+        while True:
+            idx = buf.find(want, i)
+            if idx < 0: return None
+            ln, j = self._ber_len(buf, idx + 1)
+            if ln is None or j is None: return None
+            if j + ln <= len(buf):
+                return buf[j:j + ln]
+            i = idx + 1
+
+    def _scan_app_slice(self, buf: bytes, appnum: int):
+        """Return the slice of an APPLICATION|CONSTRUCTED tag (e.g., Ticket app=1 => 0x61)."""
+        want = bytes([(0x60 | (appnum & 0x1F))])
+        i = 0
+        while True:
+            idx = buf.find(want, i)
+            if idx < 0: return None
+            ln, j = self._ber_len(buf, idx + 1)
+            if ln is None or j is None: return None
+            if j + ln <= len(buf):
+                return buf[j:j + ln]
+            i = idx + 1
+
+    # ---- specific opaque extractors ----
+
+    def _opaque_guess_realm_from_kdc_req(self, blob: bytes):
+        # KDC-REQ-BODY is [4]; inside, realm is [2]
+        body = self._find_ctx_slice(blob, 4)
+        if not body: return None
+        realm_ctx = self._find_ctx_slice(body, 2)
+        return self._find_first_universal_string(realm_ctx or b"")
+
+    def _opaque_guess_sname_from_kdc_req(self, blob: bytes):
+        # KDC-REQ-BODY [4] -> sname [3] -> PrincipalName -> name-string [1] -> first string
+        body = self._find_ctx_slice(blob, 4)
+        if not body: return None
+        sname_ctx = self._find_ctx_slice(body, 3)
+        if not sname_ctx: return None
+        names_ctx = self._find_ctx_slice(sname_ctx, 1)  # name-string [1]
+        return self._find_first_universal_string(names_ctx or b"")
+
+    def _opaque_guess_cname_from_kdc_rep(self, blob: bytes):
+        # KDC-REP: crealm [3], cname [4]
+        cname_ctx = self._find_ctx_slice(blob, 4)
+        if not cname_ctx: return None
+        names_ctx = self._find_ctx_slice(cname_ctx, 1)  # PrincipalName.name-string [1]
+        return self._find_first_universal_string(names_ctx or b"")
+
+    def _opaque_guess_crealm_from_kdc_rep(self, blob: bytes):
+        # KDC-REP: crealm [3]
+        realm_ctx = self._find_ctx_slice(blob, 3)
+        return self._find_first_universal_string(realm_ctx or b"")
+
+    def _opaque_guess_ticket_realm_from_ap_req(self, blob: bytes):
+        # AP-REQ: ticket [3] -> Ticket (APPLICATION 1) -> realm [1]
+        ticket_ctx = self._find_ctx_slice(blob, 3)
+        if not ticket_ctx:
+            # Sometimes we can just scan for Ticket APPLICATION(1) = 0x61
+            ticket_ctx = self._scan_app_slice(blob, 1)
+        if not ticket_ctx: return None
+        realm_ctx = self._find_ctx_slice(ticket_ctx, 1)  # realm [1]
+        return self._find_first_universal_string(realm_ctx or b"")
+
+    def _opaque_guess_ticket_sname_from_ap_req(self, blob: bytes):
+        # AP-REQ: ticket [3] -> Ticket (app=1) -> sname [2] -> name-string [1]
+        ticket_ctx = self._find_ctx_slice(blob, 3) or self._scan_app_slice(blob, 1)
+        if not ticket_ctx: return None
+        sname_ctx = self._find_ctx_slice(ticket_ctx, 2)  # sname [2]
+        if not sname_ctx: return None
+        names_ctx = self._find_ctx_slice(sname_ctx, 1)  # name-string [1]
+        return self._find_first_universal_string(names_ctx or b"")
+
+    def _opaque_guess_error_code(self, blob: bytes):
+        # KRB-ERROR: error-code [6] => 0xA6 -> INTEGER (0x02)
+        ctx = self._find_ctx_slice(blob, 6)
+        if not ctx: return None
+        i = 0
+        while i < len(ctx):
+            if i < len(ctx) and ctx[i] == 0x02:  # INTEGER
+                ln, j = self._ber_len(ctx, i + 1)
+                if ln is not None and j is not None and j + ln <= len(ctx):
+                    try:
+                        return int.from_bytes(ctx[j:j + ln], "big", signed=True)
+                    except Exception:
+                        pass
+            ln, j = self._ber_len(ctx, i + 1)
+            if ln is None or j is None: break
+            i = j + ln
+        return None
+
+    def _opaque_5tuple(self, original_packet):
+        try:
+            from scapy.layers.inet import IP, TCP, UDP
+            ip = original_packet.getlayer(IP)
+            l4 = original_packet.getlayer(TCP) or original_packet.getlayer(UDP)
+            if ip and l4:
+                return f"{ip.src}:{int(l4.sport)} > {ip.dst}:{int(l4.dport)}"
+        except Exception:
+            pass
+        return "n/a"
 
     def __init__(self, router_logger, packet_writer):
         self.router_logger = router_logger
@@ -1996,23 +2292,66 @@ class KerberosManager:
         self._keytab_entries = {} # Stores principal keys (e.g., from a 'keytab' file or configuration)
         self._stop_event = threading.Event()
         self._cleanup_thread: Optional[threading.Thread] = None
-
-        self.router_logger.log_message("[KerberosManager] Initialized.")
+        self._dynamic_handlers: dict[int, Callable[[Packet, Packet, str], None]] = {}
+        self.error_counts = {}  # Key: src_ip, Value: [count, timestamp]
+        self.ERROR_THRESHOLD = 10  # Alert if 10 errors...
+        self.ERROR_TIMEFRAME = 60  # ...within 60 seconds.
+        self.message_type_counts = {}
+        self.router_logger.log_message("[Kerberos] Initialized.")
 
     def start(self):
         """Starts background threads for session management, if any."""
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._session_cleanup_loop, daemon=True)
         self._cleanup_thread.start()
-        self.router_logger.log_message("[KerberosManager] Started session cleanup thread.")
+        self.router_logger.log_message("[Kerberos] Started session cleanup thread.")
 
     def stop(self):
         """Stops all background threads."""
         self._stop_event.set()
         if self._cleanup_thread and self._cleanup_thread.is_alive():
             self._cleanup_thread.join(timeout=2)
-        self.router_logger.log_message("[KerberosManager] Stopped.")
+        self.router_logger.log_message("[Kerberos] Stopped.")
 
+    def register_msgtype_handler(self, msgtype: int, handler: Callable[[Packet, Packet, str], None]):
+        """Register/override a handler for a Kerberos msgType (works for decoded and opaque)."""
+        self._dynamic_handlers[msgtype] = handler
+        self.router_logger.log_message(f"[Kerberos] Registered handler for msgType {msgtype}")
+
+    def unregister_msgtype_handler(self, msgtype: int):
+        self._dynamic_handlers.pop(msgtype, None)
+        self.router_logger.log_message(f"[Kerberos] Unregistered handler for msgType {msgtype}")
+
+    def _handle_unknown(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        iface_short = inbound_iface.split('_')[-1]
+        mt = getattr(getattr(kerb_layer, "root", None), "msgType", None)
+        mt_val = getattr(mt, "val", None)
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob_len = len(getattr(kerb_layer, "blob", b""))
+            self.router_logger.log_message(
+                f"[Kerberos] 🤷 Unknown/unsupported msgType {mt_val} on {iface_short} (opaque, {blob_len} bytes)."
+            )
+        else:
+            self.router_logger.log_message(
+                f"[Kerberos] 🤷 Unknown/unsupported msgType {mt_val} on {iface_short} (decoded Kerberos)."
+            )
+
+    def _resolve_handler(self, msgtype_val: int):
+        """Resolves a handler for any Kerberos message type."""
+        builtin = {
+            10: self._handle_as_req,
+            11: self._handle_as_rep,
+            12: self._handle_tgs_req,
+            13: self._handle_tgs_rep,
+            14: self._handle_ap_req,  # <-- ADDED
+            15: self._handle_ap_rep,  # <-- ADDED
+            20: self._handle_krb_safe,
+            21: self._handle_krb_priv,
+            22: self._handle_krb_cred,
+            30: self._handle_error,
+        }
+        # Dynamic overrides take precedence; then built-ins; else unknown
+        return self._dynamic_handlers.get(msgtype_val) or builtin.get(msgtype_val) or self._handle_unknown
     def add_keytab_entry(self, principal_name: str, key_type: int, key_value_hex: str):
         """
         Adds a key for a specific principal to be used for decryption/encryption.
@@ -2024,11 +2363,11 @@ class KerberosManager:
         try:
             key_bytes = bytes.fromhex(key_value_hex)
             self._keytab_entries[principal_name.lower()] = Key(key_type, key=key_bytes)
-            self.router_logger.log_message(f"[KerberosManager] Added key for principal: {principal_name}")
+            self.router_logger.log_message(f"[Kerberos] Added key for principal: {principal_name}")
         except ValueError as e:
-            self.router_logger.log_message(f"[KerberosManager] ❌ Error adding key for {principal_name}: Invalid hex string. {e}")
+            self.router_logger.log_message(f"[Kerberos] ❌ Error adding key for {principal_name}: Invalid hex string. {e}")
         except Exception as e:
-            self.router_logger.log_message(f"[KerberosManager] ❌ Unexpected error adding key for {principal_name}: {e}")
+            self.router_logger.log_message(f"[Kerberos] ❌ Unexpected error adding key for {principal_name}: {e}")
 
 
     def _session_cleanup_loop(self):
@@ -2047,94 +2386,213 @@ class KerberosManager:
 
     def handle_kerberos_packet(self, packet: Packet, inbound_iface: str, interfaces_config: Dict[str, Any]) -> bool:
         """
-        Attempts to extract and handle a Kerberos packet.
+        Hardened: always yields a Kerberos-like layer and dispatches it
+        to the correct, type-aware handler.
         """
         iface_short = inbound_iface.split('_')[-1]
 
         try:
-            # Try to extract or reparse Kerberos layer manually from UDP payload
-            if Kerberos not in packet:
-                if packet.haslayer(UDP) and packet.haslayer(Raw):
-                    raw_data = bytes(packet[Raw].load)
-                    first_tag = raw_data[0]
-
-                    # Valid Kerberos tags (context-specific constructed)
-                    valid_kerberos_tags = [96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
-                                           106, 107, 108, 109, 110, 111, 126]  # as per RFC 4120
-
-                    if first_tag in valid_kerberos_tags:
-                        try:
-                            kerb_layer = Kerberos(raw_data)
-                            packet[UDP].remove_payload()
-                            packet = packet / kerb_layer
-                        except Exception as decode_error:
-                            return True
-                    else:
-                        return True
-
-            kerb_layer = packet[Kerberos]
-            self.router_logger.log_message(f"[KerberosManager] 🔑 Kerberos packet detected on {iface_short}.")
-
-            # Identify message type
-            msg_type = kerb_layer.root.msgType.val
-
-            if msg_type == KRB_AS_REQ.msgType.val:
-                self._handle_as_req(kerb_layer, packet, inbound_iface)
-            elif msg_type == KRB_AS_REP.msgType.val:
-                self._handle_as_rep(kerb_layer, packet, inbound_iface)
-            elif msg_type == KRB_TGS_REQ.msgType.val:
-                self._handle_tgs_req(kerb_layer, packet, inbound_iface)
-            elif msg_type == KRB_TGS_REP.msgType.val:
-                self._handle_tgs_rep(kerb_layer, packet, inbound_iface)
-            elif msg_type == KRB_ERROR.msgType.val:
-                self._handle_error(kerb_layer, packet, inbound_iface)
+            # 1) Gate: Ensure it's a potential Kerberos packet (unchanged)
+            if UDP in packet:
+                l4 = packet[UDP]
+            elif TCP in packet:
+                l4 = packet[TCP]
             else:
-                self.router_logger.log_message(f"[KerberosManager] Unhandled Kerberos message type: {msg_type}")
+                return False
+
+            if 88 not in (l4.sport, l4.dport) and 464 not in (l4.sport, l4.dport) and Kerberos not in packet:
+                return False
+
+            # 2) Ensure Kerberos-like layer (unchanged)
+            if Kerberos in packet:
+                kerb_layer = packet[Kerberos]
+                self.router_logger.log_message(f"[Kerberos] 🔑 Decoded Kerberos packet on {iface_short}.")
+            else:
+                raw_payload = bytes(getattr(packet.getlayer(Raw) or Raw(), "load", b""))
+                if not raw_payload: return False
+                try:
+                    # Still try to decode first, it's better if it works
+                    kerb_layer = Kerberos(raw_payload)
+                    self.router_logger.log_message(f"[Kerberos] 🔑 Decoded raw payload on {iface_short}.")
+                except Exception:
+                    kerb_layer = self.KerberosOpaque(blob=raw_payload)
+                    # The classification log will be handled below
+
+            # 3) UNIFIED DISPATCH LOGIC
+            root = getattr(kerb_layer, "root", None)
+            if not root or not hasattr(root, "msgType"):
+                self.router_logger.log_message(f"[Kerberos] ⚠️ Could not determine msgType.")
+                return True  # Handled, but can't dispatch
+
+            msgtype_val = getattr(root.msgType, "val", -1)
+
+            # --- ADD THIS BLOCK FOR PROFILING ---
+            self.message_type_counts[msgtype_val] = self.message_type_counts.get(msgtype_val, 0) + 1
+            # ------------------------------------
+
+            is_opaque = isinstance(kerb_layer, self.KerberosOpaque) or hasattr(kerb_layer, "blob")
+
+            if is_opaque:
+                mt_val = getattr(getattr(getattr(kerb_layer, "root", None), "msgType", None), "val", -1)
+                mt_name = kerb_layer.msgtype_name() if hasattr(kerb_layer, "msgtype_name") else "UNKNOWN"
+                self.router_logger.log_message(
+                    f"[Kerberos] 📦 Opaque on {iface_short} classified as {mt_name} ({mt_val})"
+                )
+                self._handle_opaque(mt_val, kerb_layer, packet, inbound_iface)
+                return True  # ← DO NOT FALL THROUGH
+
+            # Resolve and call the appropriate handler
+            handler = self._resolve_handler(msgtype_val)
+            handler(kerb_layer, packet, inbound_iface)
 
             return True
 
         except Exception as e:
-            self.router_logger.log_message(f"[KerberosManager] ❌ Error processing Kerberos packet: {e}")
+            self.router_logger.log_message(f"[Kerberos] ❌ Error processing Kerberos packet: {repr(e)}")
             return False
 
+        except Exception as e:
+            self.router_logger.log_message(f"[Kerberos] ❌ Error: {e}\n{traceback.format_exc()}")
+            return False
+
+        except Exception as e:
+            self.router_logger.log_message(f"[Kerberos] ❌ Error: {e}\n{traceback.format_exc()}")
+            return False
+
+        except Exception as e:
+            # Make sure the router gets a useful error string
+            self.router_logger.log_message(f"[Kerberos] ❌ Error processing Kerberos packet: {repr(e)}")
+            return False
+    def _handle_opaque(self, mt_val: int, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        iface_short = inbound_iface.split('_')[-1]
+        blob_len = len(getattr(kerb_layer, "blob", b""))
+        self.router_logger.log_message(
+            f"[Kerberos] (opaque) msgType {mt_val} on {iface_short}; {blob_len} bytes; skipping structured parse."
+        )
     def _handle_as_req(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
         """Handles an AS-REQ packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            cname = self._opaque_guess_sname_from_kdc_req(
+                blob)  # cname/sname share structure; we prefer sname() for strings
+            realm = self._opaque_guess_realm_from_kdc_req(blob)
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(
+                f"[Kerberos] (opaque) AS-REQ {five} "
+                f"{'(cname=' + cname + ') ' if cname else ''}{'(realm=' + realm + ') ' if realm else ''}"
+                f"len={len(blob)}"
+            )
+            return
+
         as_req = kerb_layer.root
-        cname = as_req.reqBody.cname.nameString[0] if as_req.reqBody.cname and as_req.reqBody.cname.nameString else "UNKNOWN"
+        cname = as_req.reqBody.cname.nameString[0] if as_req.reqBody.cname else "UNKNOWN"
         crealm = as_req.reqBody.realm if as_req.reqBody.realm else "UNKNOWN"
-        etype_str = ", ".join([str(e.val) for e in as_req.reqBody.etype]) if as_req.reqBody.etype else "None"
+        nonce = as_req.reqBody.nonce.val  # Extract the nonce
 
-        self.router_logger.log_message(f"[KerberosManager] AS-REQ from {cname}@{crealm} (ETypes: {etype_str})")
+        # Store session info in the dictionary we defined in __init__
+        self.kerberos_sessions[nonce] = {
+            "client": f"{cname}@{crealm}",
+            "timestamp": time.time(),
+            "type": "AS-REQ"
+        }
+        self.router_logger.log_message(f"[Kerberos] AS-REQ from {cname}@{crealm} (Nonce: {nonce})")
 
-        # Example: Try to decrypt pre-authentication data if present (e.g., PA-ENC-TIMESTAMP)
-        for pa_data_item in as_req.padata:
-            if pa_data_item.padataType.val == PADATA:
-                enc_data = pa_data_item.padataValue
-                self.router_logger.log_message(f"[KerberosManager] Attempting to decrypt PA-ENC-TIMESTAMP...")
-                # To decrypt, you'd need the client's long-term key, which is usually not available on the router.
-                # This is why client AS-REQs are hard to decrypt without the password/keytab.
-                # If you *had* the key (e.g., from a known test client), you could do:
-                # client_key = self._keytab_entries.get(f"{cname}@{crealm}".lower())
-                # if client_key and isinstance(enc_data, EncryptedData):
-                #     try:
-                #         decrypted_timestamp = enc_data.decrypt(client_key, cls=PA_ENC_TIMESTAMP)
-                #         self.router_logger.log_message(f"[KerberosManager] Decrypted PA-ENC-TIMESTAMP: {decrypted_timestamp.patimestamp.ctime}")
-                #     except Exception as e:
-                #         self.router_logger.log_message(f"[KerberosManager] Failed to decrypt PA-ENC-TIMESTAMP: {e}")
-                break # Only try to decrypt the first one
+    def _handle_ap_req(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles an AP-REQ (msgType 14) packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            realm = self._opaque_guess_ticket_realm_from_ap_req(blob)
+            sname = self._opaque_guess_ticket_sname_from_ap_req(blob)
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(
+                f"[Kerberos] (opaque) AP-REQ {five} "
+                f"{'(ticket_realm=' + realm + ') ' if realm else ''}"
+                f"{'(sname=' + sname + ') ' if sname else ''}"
+                f"len={len(blob)}"
+            )
+            return
+        # Logic for fully parsed AP-REQ packets
+        ap_req = kerb_layer.root
+        # You could potentially inspect ap_req.authenticator if you have the right session key
+        self.router_logger.log_message("[Kerberos] Parsed AP-REQ message.")
 
-        # Store session info if tracking needed (e.g., for replay detection)
-        # self.kerberos_sessions[nonce] = {"client": f"{cname}@{crealm}", "timestamp": time.time(), ...}
+    def _handle_ap_rep(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles an AP-REP (msgType 15) packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(f"[Kerberos] (opaque) AP-REP {five} len={len(blob)}")
+            return
+
+        as_rep = kerb_layer.root
+        nonce = as_rep.encPart.nonce.val  # Extract the nonce from the encrypted part
+
+        # Check if this is a reply to a known request
+        if nonce in self.kerberos_sessions:
+            session_info = self.kerberos_sessions[nonce]
+            client = session_info.get("client", "UNKNOWN")
+            request_time = session_info.get("timestamp", 0)
+            response_time = time.time() - request_time
+
+            self.router_logger.log_message(
+                f"[Kerberos] ✅ Correlated AS-REP for {client} (Nonce: {nonce}, Response time: {response_time:.2f}s)"
+            )
+            # Clean up the completed session
+            del self.kerberos_sessions[nonce]
+        else:
+            self.router_logger.log_message(
+                f"[Kerberos] ⚠️ Uncorrelated AS-REP received (Nonce: {nonce})"
+            )
+
+
+    def _handle_krb_safe(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a KRB-SAFE (msgType 20) packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(f"[Kerberos] (opaque) KRB-SAFE {five} len={len(blob)}")
+            return
+        # Add logic here for fully parsed KRB-SAFE packets if needed
+        self.router_logger.log_message("[Kerberos] Parsed KRB-SAFE message.")
+
+    def _handle_krb_priv(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a KRB-PRIV (msgType 21) packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(f"[Kerberos] (opaque) KRB-PRIV {five} len={len(blob)}")
+            return
+        self.router_logger.log_message("[Kerberos] Parsed KRB-PRIV message.")
+
+    def _handle_krb_cred(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
+        """Handles a KRB-CRED (msgType 22) packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(f"[Kerberos] (opaque) KRB-CRED {five} len={len(blob)}")
+            return
+        self.router_logger.log_message("[Kerberos] Parsed KRB-CRED message.")
 
     def _handle_as_rep(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
         """Handles an AS-REP packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            crealm = self._opaque_guess_crealm_from_kdc_rep(blob)
+            cname = self._opaque_guess_cname_from_kdc_rep(blob)
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(
+                f"[Kerberos] (opaque) AS-REP {five} "
+                f"{'(cname=' + cname + ') ' if cname else ''}{'(crealm=' + crealm + ') ' if crealm else ''}"
+                f"len={len(blob)}"
+            )
+            return
         as_rep = kerb_layer.root
         crealm = as_rep.crealm if as_rep.crealm else "UNKNOWN"
         cname = as_rep.cname.nameString[0] if as_rep.cname and as_rep.cname.nameString else "UNKNOWN"
         sname = as_rep.ticket.sname.nameString[0] if as_rep.ticket.sname and as_rep.ticket.sname.nameString else "UNKNOWN"
         srealm = as_rep.ticket.realm if as_rep.ticket.realm else "UNKNOWN"
 
-        self.router_logger.log_message(f"[KerberosManager] AS-REP for {cname}@{crealm} from {sname}@{srealm}")
+        self.router_logger.log_message(f"[Kerberos] AS-REP for {cname}@{crealm} from {sname}@{srealm}")
 
         # The AS-REP `encPart` contains the EncASRepPart, encrypted with the client's long-term key.
         # This is hard to decrypt passively without the client's password.
@@ -2157,55 +2615,77 @@ class KerberosManager:
             pass # Placeholder for actual decryption logic
 
     def _handle_tgs_req(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
-        """Handles a TGS-REQ packet."""
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            sname = self._opaque_guess_sname_from_kdc_req(blob)
+            realm = self._opaque_guess_realm_from_kdc_req(blob)
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(
+                f"[Kerberos] (opaque) TGS-REQ {five} "
+                f"{'(sname=' + sname + ') ' if sname else ''}{'(realm=' + realm + ') ' if realm else ''}"
+                f"len={len(blob)}"
+            )
         tgs_req = kerb_layer.root
-        sname = tgs_req.reqBody.sname.nameString[0] if tgs_req.reqBody.sname and tgs_req.reqBody.sname.nameString else "UNKNOWN"
+        sname = (tgs_req.reqBody.sname.nameString[0]
+                 if tgs_req.reqBody.sname and tgs_req.reqBody.sname.nameString else "UNKNOWN")
         realm = tgs_req.reqBody.realm if tgs_req.reqBody.realm else "UNKNOWN"
-        self.router_logger.log_message(f"[KerberosManager] TGS-REQ requesting service ticket for {sname}@{realm}")
-
-        # The TGS-REQ contains an Authenticator encrypted with the TGT session key.
-        # To decrypt this, you'd need the session key from the previously seen AS-REP's EncASRepPart.
-        # This requires robust session tracking.
+        self.router_logger.log_message(f"[Kerberos] TGS-REQ requesting service ticket for {sname}@{realm}")
 
     def _handle_tgs_rep(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
-        """Handles a TGS-REP packet."""
+        """Handles a TGS-REP packet, whether parsed or opaque."""
+        # This is the crucial check
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(f"[Kerberos] (opaque) TGS-REP {five} len={len(blob)}")
+            return
+        # This code only runs if the packet was fully parsed
         tgs_rep = kerb_layer.root
         crealm = tgs_rep.crealm if tgs_rep.crealm else "UNKNOWN"
         cname = tgs_rep.cname.nameString[0] if tgs_rep.cname and tgs_rep.cname.nameString else "UNKNOWN"
-        sname = tgs_rep.ticket.sname.nameString[0] if tgs_rep.ticket.sname and tgs_rep.ticket.sname.nameString else "UNKNOWN"
-        srealm = tgs_rep.ticket.realm if tgs_rep.ticket.realm else "UNKNOWN"
 
-        self.router_logger.log_message(f"[KerberosManager] TGS-REP for {cname}@{crealm} from {sname}@{srealm}")
-
-        # Similar to AS-REP, the `encPart` is encrypted with the TGT session key (for the EncTGSRepPart).
-        # The `ticket.encPart` is encrypted with the service principal's long-term key.
-        # If your router acts as that service or has access to the service's keytab, it could decrypt this.
-        encrypted_service_ticket_part = tgs_rep.ticket.encPart
-        if isinstance(encrypted_service_ticket_part, EncryptedData):
-            # Example: Decrypt the service ticket if the service principal's key is known
-            # SERVICE_PRINCIPAL = f"{sname}@{srealm}".lower()
-            # service_key = self._keytab_entries.get(SERVICE_PRINCIPAL)
-            # if service_key:
-            #     try:
-            #         decrypted_service_ticket = encrypted_service_ticket_part.decrypt(service_key, cls=EncTicketPart)
-            #         self.router_logger.log_message(f"[KerberosManager] Decrypted Service Ticket for {decrypted_service_ticket.cname.nameString[0]}@{decrypted_service_ticket.crealm}")
-            #     except Exception as e:
-            #         self.router_logger.log_message(f"[KerberosManager] Failed to decrypt Service Ticket: {e}")
-            pass # Placeholder
+        self.router_logger.log_message(f"[Kerberos] TGS-REP for {cname}@{crealm}")
 
     def _handle_error(self, kerb_layer: Packet, original_packet: Packet, inbound_iface: str):
-        """Handles a KRB-ERROR packet."""
-        error_msg = kerb_layer.root
-        error_code = error_msg.errorCode.val
-        e_text = error_msg.eText if error_msg.eText else ""
-        sname = error_msg.sname.nameString[0] if error_msg.sname and error_msg.sname.nameString else "UNKNOWN"
-        srealm = error_msg.realm if error_msg.realm else "UNKNOWN"
+        """Handles a KRB-ERROR packet and tracks error rates."""
+        # This logic applies even if the packet is opaque, since we have the IP header.
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            blob = getattr(kerb_layer, "blob", b"")
+            code = self._opaque_guess_error_code(blob)
+            five = self._opaque_5tuple(original_packet)
+            self.router_logger.log_message(
+                f"[Kerberos] (opaque) KRB-ERROR {five} "
+                f"{'(code=' + str(code) + ') ' if code is not None else ''}"
+                f"len={len(blob)}"
+            )
+            return
+        if IP in original_packet:
+            src_ip = original_packet[IP].src
+            current_time = time.time()
 
-        self.router_logger.log_message(f"[KerberosManager] ⚠️ KRB-ERROR (Code: {error_code}) from {sname}@{srealm}: {e_text}")
+            # Get or initialize the count for this IP
+            count, first_seen = self.error_counts.get(src_ip, [0, 0])
 
-        # You can map error codes to meanings for better logging/alerting
-        # e.g., if error_code == 6 (KDC_ERR_C_PRINCIPAL_UNKNOWN) log a specific alert.
-        # Check RFC 4120 for a full list of error codes.
+            # If outside the time window, reset the count
+            if current_time - first_seen > self.ERROR_TIMEFRAME:
+                count = 0
+                first_seen = current_time
+
+            count += 1
+            self.error_counts[src_ip] = [count, first_seen]
+
+            # Check if the threshold has been breached
+            if count >= self.ERROR_THRESHOLD:
+                self.router_logger.log_message(
+                    f"[Kerberos] 🚨 SECURITY ALERT: High rate of KRB-ERRORs ({count}) from {src_ip}!"
+                )
+                # You could add logic here to temporarily block the IP
+                # Reset count after alerting to avoid log spam
+                self.error_counts[src_ip] = [0, current_time]
+
+        if isinstance(kerb_layer, self.KerberosOpaque):
+            self.router_logger.log_message("[Kerberos] (opaque) KRB-ERROR: Cannot inspect error details.")
+            return
 
     # Additional methods could be added here for active Kerberos proxying,
     # or for initiating Kerberos requests from the router itself.
@@ -2637,7 +3117,6 @@ class PacketWriter:
                 self.logger.log_message(
                     f"[PacketWriter] 🚫 Dropped packet before queue: invalid Ether.dst '{packet[Ether].dst}'")
                 # Helpful once: where did this come from?
-                self.logger.log_message("".join(traceback.format_stack(limit=4)))
                 return
 
         self.packet_queue.put((packet, final_iface))

@@ -1606,7 +1606,7 @@ class RouterTab(QWidget):
         self._console_panes = {}  # name → QPlainTextEdit
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Stratum/StratumConn", "DNS/mDNS/HTTPS",
+            "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Kerberos", "Stratum/StratumConn", "DNS/mDNS/HTTPS",
                      "Handshake/SSL/TCP", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
@@ -1641,6 +1641,8 @@ class RouterTab(QWidget):
         self.router_ip_out_input.setPlaceholderText("(optional)")
         self.router_netmask_out_input = QLineEdit()
         self.router_netmask_out_input.setText("255.255.255.0")
+        self.router_ip_out_input = QLineEdit()
+        self.router_ip_out_input.setPlaceholderText("")
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
         self.add_pane_button = QPushButton("➕")
