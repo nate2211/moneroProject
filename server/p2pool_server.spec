@@ -41,6 +41,7 @@ datas_list = [
     ('p2pool_managers.py', '.'),
     ('p2pool_router_managers.py', '.'),
     ('p2pool_router_managers_2.py', '.'),
+    ('p2pool_router_managers_3.py', '.'),
     ('p2pool_tools.py', '.'),
     ('p2pool_sniffer.py', '.'),
     ('p2pool_gui_elements.py', '.'),

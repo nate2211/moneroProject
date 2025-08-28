@@ -355,7 +355,7 @@ class WinDivertManager:
         # --- FIX 1: Handle long IPv6 extension header chains ---
         # Increase Scapy's default limit for dissecting chained packet layers.
         # This prevents the "Maximum amount of items reached" error.
-        conf.max_list_count = 512
+        conf.max_list_count = 2048
 
         self.router_manager = router_manager
         self.logger = router_manager.router_logger

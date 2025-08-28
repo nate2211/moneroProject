@@ -1,27 +1,43 @@
+import hashlib
 import json
+import queue
+import random
+import re
+import ssl
 import subprocess
 from collections import defaultdict
+from enum import auto, Enum
 from functools import reduce
+from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set
 import ipaddress
 import threading
 import time
-from typing import Dict, Any, Tuple, Optional, List, Literal
-from scapy.layers.l2 import ARP
+
+import requests
+import zmq
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
-from scapy.fields import ShortField, IP6Field, ByteField
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP6OptDNSServers, DHCP6_Advertise, DHCP6_Reply
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
+from scapy.layers.l2 import ARP, getmacbyip
 from scapy.layers.rip import RIPEntry, RIP
 from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSFinished
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet, Raw
+from scapy.fields import ByteField, ShortField,IP6Field
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import Ether
 import struct
+import socket
+import threading
+import json
+from scapy.packet import Packet, Raw
+from scapy.layers.inet import IP, TCP
+
+from server.p2pool_tools import RandomXLoader, RandomXFlags
 
 
 class MLDQuery(Packet):
@@ -70,105 +86,1306 @@ class ICMPv6(Packet):
             p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
         return p + pay
 
-class StratumManager:
+class ConnectionState(Enum):
+    """Represents the explicit state of the direct pool connection."""
+    DISCONNECTED = auto()
+    CONNECTING = auto()
+    CONNECTED = auto()
+    STOPPING = auto()
+
+class ZMQReader:
     """
-    Monitors Stratum mining traffic (JSON-RPC over TCP).
-    Extracts and tracks miner sessions, job info, and share submissions.
+    A dedicated thread for subscribing to monerod's ZeroMQ feed.
+    Forwards received messages to a callback function.
     """
+    def __init__(self,
+                 zmq_address: str,
+                 message_handler: Callable[[bytes], None],
+                 logger: Any):
+        self.zmq_address = zmq_address
+        self.message_handler = message_handler
+        self.logger = logger
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
 
-    def __init__(self, router_logger):
-        self.logger = router_logger
-        self.sessions: Dict[str, Dict[str, Any]] = {}  # key = src_ip:src_port
-        self._lock = threading.Lock()
-        self.logger.log_message("[Stratum] Initialized.")
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="ZMQReaderThread")
+        self._thread.start()
+        self.logger.log_message(f"[ZMQ] Subscribing to {self.zmq_address}")
 
-    def handle_packet(self, packet, iface: str) -> bool:
-        """Handle a TCP packet and try to extract Stratum messages."""
-        if not packet.haslayer(TCP):
-            return False
+    def stop(self):
+        if not self._running:
+            return
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._running = False
+        self.logger.log_message("[ZMQ] Reader stopped.")
 
-        tcp = packet[TCP]
-        ip = packet.payload
-
-        # Stratum usually runs on TCP port 3333 or 4444
-        if tcp.sport not in (3333, 4444) and tcp.dport not in (3333, 4444):
-            return False
+    def _run_loop(self):
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
 
         try:
-            if hasattr(tcp, "payload") and bytes(tcp.payload):
-                raw_data = bytes(tcp.payload)
-                session_id = f"{ip.src}:{tcp.sport}" if tcp.sport in (3333, 4444) else f"{ip.dst}:{tcp.dport}"
-                self._process_stratum_payload(session_id, raw_data, iface)
-                return True
+            socket.connect(self.zmq_address)
+            while not self._stop_event.is_set():
+                try:
+                    # Non-blocking receive with a timeout
+                    raw_message = socket.recv(flags=zmq.NOBLOCK)
+                    self.message_handler(raw_message)
+                except zmq.Again:
+                    # No message received, check stop event
+                    self._stop_event.wait(0.5)
+                except Exception as e:
+                    self.logger.log_message(f"[ZMQ] ❌ Error receiving message: {e}")
+                    self._stop_event.wait(1)
+
+        except zmq.ZMQError as e:
+            self.logger.log_message(f"[ZMQ] ❌ Failed to connect to ZMQ socket: {e}")
+        finally:
+            socket.close()
+            context.term()
+
+
+class MoneroDaemonManager:
+    """
+    Talks to monerod: listens for ZMQ notifications, fetches new block templates via RPC,
+    distributes jobs to Stratum, and submits blocks found by workers.
+    """
+
+    NONCE_BYTE_OFFSET = 39
+    DEFAULT_RESERVE_SIZE = 60
+    _DAEMON_SESSION_ID = "daemon_local"
+
+    def __init__(
+        self,
+        daemon_url: str,
+        zmq_address: str,
+        stratum_conn_manager: "StratumConnectionManager",
+        logger: Any,
+        reserve_size: int = DEFAULT_RESERVE_SIZE,
+    ):
+        self.daemon_url = daemon_url.rstrip("/")
+        self.zmq_address = zmq_address
+        self.stratum_conn_manager = stratum_conn_manager
+        self.logger = logger
+        self.reserve_size = int(reserve_size)
+
+        self._running = False
+        self._stop_event = threading.Event()
+
+        self.zmq_reader = ZMQReader(self.zmq_address, self._handle_zmq_message, self.logger)
+        self._templates_by_job_id: Dict[str, str] = {}
+        self._difficulty_by_job_id: Dict[str, int] = {}
+
+        # IMPORTANT: attach submitter for the daemon session specifically
+        self.stratum_conn_manager.stratum_manager.attach_submitter(
+            self._DAEMON_SESSION_ID, self.submit_block_to_daemon
+        )
+
+    # ----- Lifecycle -----
+
+    def start(self) -> None:
+        if self._running:
+            self.logger.log_message("[Daemon] Manager is already running.")
+            return
+        self._running = True
+        self._stop_event.clear()
+
+        # Start ZMQ and do an initial template fetch
+        self.zmq_reader.start()
+        threading.Thread(target=self._initial_job_fetch, daemon=True).start()
+        self.logger.log_message("[Daemon] Listening for ZMQ messages...")
+
+    def stop(self) -> None:
+        if not self._running:
+            return
+        self.logger.log_message("[Daemon] Stopping manager...")
+        self._running = False
+        self._stop_event.set()
+        self.zmq_reader.stop()
+
+        # Stop the daemon-local share worker in StratumManager
+        try:
+            self.stratum_conn_manager.stratum_manager.deregister_session(self._DAEMON_SESSION_ID)
         except Exception as e:
-            self.logger.log_message(f"[Stratum] ⚠️ Error processing Stratum packet: {e}")
-            return False
+            self.logger.log_message(f"[Daemon] ⚠️ Failed to stop Stratum worker: {e}")
 
-    def _process_stratum_payload(self, session_id: str, raw_data: bytes, iface: str):
-        """Parses and logs JSON-RPC messages from the raw TCP payload."""
+        self.logger.log_message("[Daemon] Manager stopped.")
+
+    def _initial_job_fetch(self):
+        self.logger.log_message("[Daemon] Performing initial job fetch via RPC...")
         try:
-            text = raw_data.decode("utf-8", errors="ignore")
-            messages = text.split("\n")
+            self._fetch_and_distribute_job()
+        except Exception as e:
+            self.logger.log_message(f"[Daemon] ❌ Initial job fetch failed: {e}")
+
+    # ----- ZMQ -----
+
+    def _handle_zmq_message(self, raw_message: bytes):
+        try:
+            topic = raw_message.split(b" ", 1)[0]
+            if topic in (b"block", b"json-full-chain-main"):
+                self.logger.log_message("[Daemon] ZMQ new block → fetching template...")
+                threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
+            elif topic == b"txpool_add":
+                # Optional: refresh template to include new txs
+                pass
+        except Exception:
+            self.logger.log_message("[Daemon] ⚠️ Malformed ZMQ message received.")
+
+    # ----- RPC -----
+
+    def _rpc_call(self, method: str, params: Optional[Any] = None) -> Dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        payload = {"jsonrpc": "2.0", "id": "0", "method": method, "params": params or {}}
+        r = requests.post(f"{self.daemon_url}/json_rpc", data=json.dumps(payload), headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data and data["error"]:
+            err = data["error"]
+            code = err.get("code")
+            msg = err.get("message") or str(err)
+            raise RuntimeError(f"RPC {method} error {code}: {msg}")
+        return data
+
+    # ----- Template fetch / distribution -----
+
+    def _fetch_and_distribute_job(self) -> None:
+        wa = (self.stratum_conn_manager.wallet_address or "").strip()
+        if not wa:
+            self.logger.log_message("[Daemon] ❌ No wallet_address configured; cannot request block template.")
+            return
+
+        reserve = int(self.reserve_size)
+        if reserve < 0 or reserve > 127:  # keep safe
+            self.logger.log_message(f"[Daemon] ⚠️ reserve_size {reserve} out of range; clamping to 60.")
+            reserve = 60
+
+        params = {"wallet_address": wa, "reserve_size": reserve}
+
+        try:
+            resp = self._rpc_call("get_block_template", params)
+            res = resp.get("result")
+
+            needed = ("blocktemplate_blob", "height")
+            if not res or not all(k in res for k in needed):
+                self.logger.log_message("[Daemon] ⚠️ Template missing required fields (daemon syncing or wrong net?).")
+                return
+
+            tpl = RandomXLoader.norm_hex(res["blocktemplate_blob"])
+            if not tpl or (len(tpl) % 2 != 0):
+                self.logger.log_message("[Daemon] ⚠️ Invalid blocktemplate_blob from daemon.")
+                return
+
+            # Difficulty (prefer 128-bit wide_difficulty)
+            wide = res.get("wide_difficulty")
+            if isinstance(wide, str) and wide.strip():
+                D = int(wide, 16)
+            else:
+                low = int(res.get("difficulty", 0))
+                high = int(res.get("difficulty_top64", 0))
+                D = (high << 64) | low
+                if D <= 0:
+                    self.logger.log_message("[Daemon] ⚠️ Difficulty missing/invalid.")
+                    return
+
+            height = int(res["height"])
+            seed_hash = RandomXLoader.norm_hex(res.get("seed_hash"))
+            prev_hash = RandomXLoader.norm_hex(res.get("prev_hash")) or ""
+            target_hex = RandomXLoader.target_hex_from_difficulty(D)
+
+            # Synthesize a stable local job_id
+            job_id = f"daemon-{height}-{prev_hash[:16]}-{int(time.time()*1000)%1_000_000:06d}"
+
+            stratum_job = {
+                "id": job_id,
+                "blob": tpl,
+                "target": target_hex,
+                "height": height,
+                "difficulty": D,
+            }
+            if seed_hash:
+                stratum_job["seed_hash"] = seed_hash
+
+            self._templates_by_job_id[job_id] = tpl
+            self._difficulty_by_job_id[job_id] = D
+            self._cleanup_templates()
+
+            # Distribute to the daemon session
+            self.stratum_conn_manager.distribute_job_from_daemon(stratum_job)
+            self.logger.log_message(f"[Daemon] ✅ Distributed new job {job_id} (h={height}, diff={D}).")
+
+        except requests.exceptions.RequestException as e:
+            self.logger.log_message(f"[Daemon] ❌ Network error fetching template: {e}")
+        except Exception as e:
+            self.logger.log_message(f"[Daemon] ❌ Error preparing job: {type(e).__name__}: {e}")
+
+    # ----- Submission -----
+
+    def submit_block_to_daemon(self, job_id: str, nonce: str, result_hash: str) -> None:
+        try:
+            tpl = self._templates_by_job_id.get(job_id)
+            if not tpl:
+                self.logger.log_message(f"[Daemon] ⚠️ Missing template for job {job_id}; unable to submit.")
+                return
+
+            nonce = RandomXLoader.norm_hex(nonce)
+            if not nonce or len(nonce) != 8:
+                raise ValueError(f"Invalid nonce hex (need 8 chars LE): {nonce!r}")
+
+            off = self.NONCE_BYTE_OFFSET * 2  # hex chars index
+            if len(tpl) < off + 8:
+                raise ValueError("Template blob too short to write nonce.")
+
+            full_blob_hex = tpl[:off] + nonce + tpl[off + 8:]
+
+            # Optional: client-side difficulty check before RPC submit
+            difficulty = self._difficulty_by_job_id.get(job_id)
+            if difficulty:
+                t_int = RandomXLoader.target_from_difficulty_int(difficulty)
+                hb = bytes.fromhex(result_hash)
+                if int.from_bytes(hb, "little") > t_int:
+                    self.logger.log_message(f"[Daemon] ⚠️ Share for job {job_id} doesn’t meet difficulty. Not submitting.")
+                    return
+                self.logger.log_message(f"[Daemon] Verifying share for job {job_id} meets difficulty {difficulty}.")
+
+            resp = self._rpc_call("submit_block", [full_blob_hex])
+            status = (resp.get("result") or {}).get("status", "")
+            if status.upper() == "OK":
+                self.logger.log_message(f"[Daemon] ✅ Block accepted by daemon for job {job_id}.")
+                self._templates_by_job_id.pop(job_id, None)
+                self._difficulty_by_job_id.pop(job_id, None)
+            else:
+                err = resp.get("error") or {}
+                self.logger.log_message(f"[Daemon] ❗ Block submission not OK for job {job_id}: {status or err}")
+
+        except requests.exceptions.RequestException as e:
+            self.logger.log_message(f"[Daemon] ❌ Network error submitting block: {e}")
+        except Exception as e:
+            self.logger.log_message(f"[Daemon] ❌ Error submitting block: {type(e).__name__}: {e}")
+
+    # ----- Cache -----
+
+    def _cleanup_templates(self):
+        # keep cache bounded
+        if len(self._templates_by_job_id) > 100:
+            oldest = next(iter(self._templates_by_job_id))
+            self._templates_by_job_id.pop(oldest, None)
+            self._difficulty_by_job_id.pop(oldest, None)
+            self.logger.log_message("[Daemon] Cleaning up old block template cache.")
+
+
+class StratumConnectionManager:
+    """
+    Dual-mode Stratum proxy + direct-pool connector.
+    Forwards parsed messages to StratumManager; accepts local jobs from MoneroDaemonManager.
+    """
+    MONERO_ALLOWED_METHODS = {"login", "submit", "job", "keepalived", "getjob"}
+    LIKELY_TLS_PORTS = {443, 3333, 5555, 7443, 8443}
+
+    def __init__(self, router_logger: Any, stratum_manager: "StratumManager", packet_processor_callback: Callable):
+        import threading as _th
+        self.logger = router_logger
+        self.stratum_manager = stratum_manager
+        self.packet_processor = packet_processor_callback
+
+        # Proxy listener
+        self.proxy_host = "127.0.0.1"
+        self.proxy_port = 3333
+
+        # Pool config
+        self.pool_ip: Optional[str] = None
+        self.pool_port: Optional[int] = None
+        self.pool_host: Optional[str] = None  # For TLS SNI
+        self.use_tls: str | bool = "auto"
+        self.wallet_address: Optional[str] = None
+        self.worker_name = "default"
+        self.user_agent = "pystratum/0.5-synergy"
+
+        # State
+        self._threads: list[_th.Thread] = []
+        self._active_sockets: list[socket.socket] = []
+        self._stop_event = _th.Event()
+        self._lock = _th.Lock()
+        self._pending_by_id: Dict[int, str] = {}
+
+        # Direct connection
+        self._direct_conn_state = ConnectionState.DISCONNECTED
+        self.direct_session_id: Optional[str] = None
+        self._pool_socket: Optional[socket.socket] = None
+        self.KEEPALIVE_INTERVAL_S = 30
+        self._next_keepalive_ts = 0.0
+
+        # NEW: track upstream pool session ids for proxy sessions
+        self._proxy_session_ids: Dict[str, str] = {}
+
+        self.logger.log_message("[StratumConn] ⛏️ Synergized Dual-Mode Manager initialized.")
+
+    # ----- Config / lifecycle -----
+
+    def configure(
+        self,
+        pool_ip: str,
+        pool_port: int,
+        wallet: str,
+        worker: str = "default",
+        listen_port: int = 3333,
+        use_tls: str | bool = "auto",
+        pool_host: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
+        self.pool_ip = pool_ip
+        self.pool_port = pool_port
+        self.wallet_address = wallet
+        self.worker_name = worker
+        self.proxy_port = listen_port
+        self.use_tls = use_tls
+        self.pool_host = pool_host or pool_ip
+        if user_agent:
+            self.user_agent = user_agent
+
+        self.logger.log_message(
+            f"[StratumConn] 🎯 Configured for pool {self.pool_ip}:{self.pool_port} "
+            f"(TLS={self.use_tls}, SNI={self.pool_host}). "
+            f"Proxy listening on {self.proxy_host}:{self.proxy_port}"
+        )
+
+        # Ensure RandomX is ready before work arrives
+        self.stratum_manager.rx_start()
+
+    def start(self) -> None:
+        if not all([self.pool_ip, self.wallet_address, self.pool_port]):
+            self.logger.log_message("[StratumConn] ❌ Cannot start: Configuration is incomplete.")
+            return
+        if self._threads:
+            self.logger.log_message("[StratumConn] Manager is already running.")
+            return
+
+        self._stop_event.clear()
+        t1 = threading.Thread(target=self._direct_connection_loop, daemon=True, name="StratumDirectConnector")
+        t2 = threading.Thread(target=self._listen_for_miners, daemon=True, name="StratumProxyListener")
+        self._threads.extend([t1, t2])
+        t1.start()
+        t2.start()
+
+    def stop(self) -> None:
+        if not self._threads:
+            return
+        self.logger.log_message("[StratumConn] 🛑 Stopping all operations...")
+        self._stop_event.set()
+        self.stratum_manager.stop()
+
+        for s in list(self._active_sockets):
+            self._close_socket(s)
+
+        for t in self._threads:
+            if t.is_alive():
+                t.join(timeout=2)
+        self._threads.clear()
+        self.logger.log_message("[StratumConn] ✅ All operations stopped.")
+
+    # ----- Synergy: accept local daemon jobs -----
+
+    def distribute_job_from_daemon(self, job: Dict[str, Any]) -> None:
+        session_id = MoneroDaemonManager._DAEMON_SESSION_ID
+        # normalize expected hex fields via RandomXLoader helpers
+        for k in ("blob", "seed_hash", "target"):
+            if k in job and isinstance(job[k], str):
+                job[k] = RandomXLoader.norm_hex(job[k])
+
+        # Make sure worker exists then forward like an inbound pool message
+        self.stratum_manager.register_session(session_id)
+        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": job}])
+
+    # ----- Socket helpers -----
+
+    def _add_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._active_sockets.append(sock)
+
+    def _remove_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            if sock in self._active_sockets:
+                self._active_sockets.remove(sock)
+
+    def _close_socket(self, sock: Optional[socket.socket]) -> None:
+        if not sock:
+            return
+        self._remove_socket(sock)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _schedule_keepalive(self) -> None:
+        self._next_keepalive_ts = time.time() + self.KEEPALIVE_INTERVAL_S + random.uniform(-5, 5)
+
+    # ----- Network connection helpers -----
+
+    def _open_pool_socket(self) -> socket.socket:
+        assert self.pool_ip and self.pool_port, "Pool IP and port must be configured."
+
+        def connect_plain() -> socket.socket:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(10.0)
+            s.connect((self.pool_ip, self.pool_port))
+            s.settimeout(1.0)
+            self.logger.log_message("[StratumConn] 🔓 Using cleartext TCP to pool.")
+            return s
+
+        want_tls = (self.use_tls is True) or (self.use_tls == "auto" and self.pool_port in self.LIKELY_TLS_PORTS)
+        if not want_tls:
+            return connect_plain()
+
+        ctx = ssl.create_default_context()
+        if not self.pool_host or self.pool_host == self.pool_ip:
+            self.logger.log_message("[StratumConn] ⚠️ No pool hostname; disabling TLS cert verification.")
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+        plain_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        plain_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        plain_socket.settimeout(10.0)
+
+        try:
+            plain_socket.connect((self.pool_ip, self.pool_port))
+            tls_sock = ctx.wrap_socket(plain_socket, server_hostname=self.pool_host)
+            tls_sock.settimeout(1.0)
+            self.logger.log_message(f"[StratumConn] 🔐 Using TLS to pool (SNI: {self.pool_host}).")
+            return tls_sock
+        except (ssl.SSLCertVerificationError, ssl.SSLError, socket.timeout, ConnectionRefusedError) as e:
+            self._close_socket(plain_socket)
+            if self.use_tls is True:
+                self.logger.log_message(f"[StratumConn] ❌ TLS required but failed: {e}")
+                raise
+            self.logger.log_message(f"[StratumConn] ⚠️ TLS failed ({type(e).__name__}); falling back to TCP.")
+            return connect_plain()
+
+    # ----- Direct connection -----
+
+    def _direct_connection_loop(self) -> None:
+        DIRECT_SESSION_ID = "direct_pool_connection"
+        reconnect_delay = 5.0
+        self.stratum_manager.rx_start()
+
+        while not self._stop_event.is_set():
+            pool_socket = None
+            try:
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.CONNECTING
+                self.logger.log_message(f"[StratumConn] 🔌 (Direct) Connecting to {self.pool_ip}:{self.pool_port}...")
+                pool_socket = self._open_pool_socket()
+                self._add_socket(pool_socket)
+                self._pool_socket = pool_socket
+
+                # Attach submitter for the direct session
+                self.stratum_manager.attach_submitter(DIRECT_SESSION_ID, self.submit_share)
+                self.stratum_manager.register_session(DIRECT_SESSION_ID)
+
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.CONNECTED
+                self.logger.log_message("[StratumConn] ✅ (Direct) Connected and session registered.")
+
+                reconnect_delay = 5.0
+                self._send_authorize_request(pool_socket)
+                receive_buffer = b""
+
+                while not self._stop_event.is_set():
+                    if self.direct_session_id and time.time() >= self._next_keepalive_ts:
+                        self._send_keepalive(pool_socket)
+
+                    try:
+                        data = pool_socket.recv(8192)
+                        if not data:
+                            self.logger.log_message("[StratumConn] 💔 (Direct) Connection closed by peer.")
+                            break
+                        receive_buffer += data
+                        receive_buffer = self._process_received_data(receive_buffer, DIRECT_SESSION_ID)
+                    except socket.timeout:
+                        continue
+                    except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                        self.logger.log_message(f"[StratumConn] 💔 (Direct) Connection error: {e}")
+                        break
+
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] ❌ (Direct) Connection loop failed: {e}")
+            finally:
+                self.stratum_manager.deregister_session(DIRECT_SESSION_ID)
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.DISCONNECTED
+                self._close_socket(pool_socket)
+                self._pool_socket = None
+                self.direct_session_id = None
+
+            if not self._stop_event.is_set():
+                self.logger.log_message(f"💤 Reconnecting in {reconnect_delay:.1f} seconds...")
+                self._stop_event.wait(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, 60.0)
+
+    # ----- Proxy mode -----
+
+    def _listen_for_miners(self) -> None:
+        server_socket = None
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind((self.proxy_host, self.proxy_port))
+            server_socket.listen(64)
+            server_socket.settimeout(1.0)
+            # DO NOT add the listener to _active_sockets (avoids WinError 10038 on stop)
+            self.logger.log_message(f"[StratumConn] 👂 (Proxy) Listening on {self.proxy_host}:{self.proxy_port}")
+        except OSError as e:
+            self.logger.log_message(f"[StratumConn] ❌ (Proxy) Failed to start listener: {e}")
+            return
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    miner_conn, miner_addr = server_socket.accept()
+                    miner_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    miner_conn.settimeout(60.0)
+                    self.logger.log_message(f"[StratumConn] 🤝 (Proxy) Miner connected: {miner_addr}")
+
+                    h = threading.Thread(target=self._handle_miner_session, args=(miner_conn,), daemon=True)
+                    h.start()
+                except socket.timeout:
+                    continue
+        finally:
+            self._close_socket(server_socket)
+
+    def _handle_miner_session(self, miner_socket: socket.socket) -> None:
+        pool_socket: Optional[socket.socket] = None
+        miner_addr = miner_socket.getpeername()
+        session_id = f"proxy_{miner_addr[0]}:{miner_addr[1]}"
+
+        try:
+            self._add_socket(miner_socket)
+            self.stratum_manager.register_session(session_id)
+            self.logger.log_message(f"[StratumConn] (Proxy) Session {session_id} registered.")
+
+            send_q: queue.PriorityQueue[tuple[int, bytes]] = queue.PriorityQueue()
+
+            self.logger.log_message(f"[StratumConn] 🔌 (Proxy) Connecting upstream for {session_id}...")
+            pool_socket = self._open_pool_socket()
+            self._add_socket(pool_socket)
+
+            # Per-session submitter for this proxy session
+            def _submit_via_proxy(*, job_id: str, nonce: str, result_hash: str) -> None:
+                params = {"job_id": job_id, "nonce": nonce, "result": result_hash}
+                # Include upstream session id if we have it (p2pool compatibility)
+                upstream_id = self._proxy_session_ids.get(session_id)
+                if upstream_id:
+                    params["id"] = upstream_id
+                msg = {"jsonrpc": "2.0", "id": 4, "method": "submit", "params": params}
+                try:
+                    send_q.put_nowait((1, (json.dumps(msg) + "\n").encode("utf-8")))
+                    self.logger.log_message(
+                        f"[StratumConn] ⛏️ (Proxy) Submitted share for {session_id}, job {job_id}"
+                    )
+                except Exception as e:
+                    self.logger.log_message(
+                        f"[StratumConn] ❌ (Proxy) Failed to enqueue submit for {session_id}: {e}"
+                    )
+
+            self.stratum_manager.attach_submitter(session_id, _submit_via_proxy)
+
+            threading.Thread(target=self._sender_worker, args=(send_q, pool_socket), daemon=True).start()
+            threading.Thread(
+                target=self._relay_data, args=(miner_socket, send_q, "Miner -> Pool", session_id), daemon=True
+            ).start()
+            threading.Thread(
+                target=self._relay_data, args=(pool_socket, miner_socket, "Pool -> Miner", session_id), daemon=True
+            ).start()
+
+        except Exception as e:
+            self.logger.log_message(f"[StratumConn] ❌ (Proxy) Session {session_id} failed: {e}")
+        finally:
+            self.stratum_manager.deregister_session(session_id)
+            self._proxy_session_ids.pop(session_id, None)
+            self.logger.log_message(f"[StratumConn] 💔 (Proxy) Session {session_id} ended.")
+            try:
+                send_q.put_nowait((99, b""))
+            except Exception:
+                pass
+            self._close_socket(miner_socket)
+            self._close_socket(pool_socket)
+
+    def _sender_worker(self, send_queue: queue.PriorityQueue[tuple[int, bytes]], dest_socket: socket.socket) -> None:
+        while not self._stop_event.is_set():
+            try:
+                _, data = send_queue.get(timeout=1.0)
+                if not data:
+                    break
+                dest_socket.sendall(data)
+            except queue.Empty:
+                continue
+            except OSError:
+                self.logger.log_message("[StratumConn] Sender worker socket error.")
+                break
+
+    def _relay_data(self, src_socket: socket.socket, dest: socket.socket | queue.PriorityQueue, direction: str, session_id: str = "") -> None:
+        while not self._stop_event.is_set():
+            try:
+                data = src_socket.recv(8192)
+                if not data:
+                    self.logger.log_message(f"[StratumConn] Relay {direction}: Connection closed.")
+                    break
+
+                if direction == "Pool -> Miner" and session_id:
+                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+                    for line in filter(None, lines):
+                        msgs = self._parse_monero_json(line)
+                        if msgs:
+                            # Capture upstream session id from login result, for this proxy session
+                            for m in msgs:
+                                try:
+                                    res = (m.get("result") or {})
+                                    sid = res.get("id")
+                                    if isinstance(sid, str) and sid:
+                                        self._proxy_session_ids[session_id] = sid
+                                except Exception:
+                                    pass
+                            self.stratum_manager.process_messages(session_id, msgs)
+
+                if isinstance(dest, queue.PriorityQueue):
+                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+                    for line in filter(None, lines):
+                        pr = self._get_message_priority(line)
+                        dest.put_nowait((pr, line + b"\n"))
+                else:
+                    dest.sendall(data)
+
+            except (socket.timeout, ConnectionAbortedError, ConnectionResetError, OSError):
+                break
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] Relay error in {direction} for {session_id}: {e}")
+                break
+
+    # ----- Protocol helpers -----
+
+    def _parse_monero_json(self, line: bytes) -> Optional[list[dict]]:
+        line = line.strip()
+        if not line.startswith((b"{", b"[")):
+            return None
+        try:
+            decoded = json.loads(line)
+            messages = decoded if isinstance(decoded, list) else [decoded]
+            valid: list[dict] = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    self.logger.log_message(f"[StratumConn] ℹ️ Skipping non-dict message: {msg}")
+                    continue
+                valid.append(msg)  # keep unknown methods (p2pool extras)
+            return valid
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.logger.log_message(f"[StratumConn] ❌ JSON decode error: {e} for line: {line[:100]!r}")
+            return None
+
+    def _get_message_priority(self, msg_bytes: bytes) -> int:
+        try:
+            decoded = json.loads(msg_bytes)
+            m = decoded.get("method")
+            if m == "submit":
+                return 1
+            if m == "job":
+                return 2
+        except Exception:
+            pass
+        return 3
+
+    def _note_outgoing(self, msg: dict) -> None:
+        mid = msg.get("id")
+        mth = msg.get("method")
+        if isinstance(mid, int) and isinstance(mth, str):
+            self._pending_by_id[mid] = mth
+
+    def _send_json_rpc_request(self, sock: socket.socket, message: dict) -> None:
+        try:
+            request = json.dumps(message) + "\n"
+            sock.sendall(request.encode("utf-8"))
+            self._note_outgoing(message)
+            method = message.get("method", "response")
+            self.logger.log_message(f"[StratumConn] ➡️ Sent {method} request.")
+        except OSError as e:
+            self.logger.log_message(f"[StratumConn] ❌ Failed to send request: {e}")
+            raise
+
+    def _send_authorize_request(self, sock: socket.socket) -> None:
+        params = {"login": self.wallet_address, "pass": "x", "agent": self.user_agent, "rigid": self.worker_name}
+        self._send_json_rpc_request(sock, {"jsonrpc": "2.0", "id": 1, "method": "login", "params": params})
+        self._schedule_keepalive()
+
+    def _send_keepalive(self, sock: socket.socket) -> None:
+        if self.direct_session_id:
+            self._send_json_rpc_request(sock, {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "keepalived",
+                "params": {"id": self.direct_session_id}  # <— add this
+            })
+            self._schedule_keepalive()
+        else:
+            self.logger.log_message("[StratumConn] ⚠️ Skipping keepalive: No active session ID.")
+
+    def submit_share(self, job_id: str, nonce: str, result_hash: str) -> None:
+        # Direct connection submit
+        with self._lock:
+            if self._direct_conn_state != ConnectionState.CONNECTED or not self._pool_socket:
+                self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: Direct connection not active.")
+                return
+            sock_to_use = self._pool_socket
+
+        if not all([job_id, nonce, result_hash]):
+            self.logger.log_message("[StratumConn] ❌ Cannot submit share: Missing required data.")
+            return
+
+        submit_msg = {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "submit",
+            "params": {
+                "id": self.direct_session_id,  # <— add this
+                "job_id": job_id,
+                "nonce": nonce,
+                "result": result_hash,
+            },
+        }
+
+        if sock_to_use.fileno() != -1:
+            self.logger.log_message(f"[StratumConn] ⛏️ Submitting share for job {job_id}...")
+            self._send_json_rpc_request(sock_to_use, submit_msg)
+        else:
+            self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: Pool socket is closed.")
+
+    def _process_received_data(self, buffer: bytes, session_id: str) -> bytes:
+        buffer = buffer.replace(b"\r\n", b"\n")
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+
+            messages = self._parse_monero_json(line)
+            if not messages:
+                self.logger.log_message(f"[StratumConn] ⚠️ Discarding malformed data: {line[:100]}")
+                continue
 
             for msg in messages:
-                msg = msg.strip()
-                if not msg:
-                    continue
+                try:
+                    if "result" in msg or "error" in msg:
+                        mid = msg.get("id")
+                        last_method = self._pending_by_id.pop(mid, None) if isinstance(mid, int) else None
+                        err = msg.get("error")
+                        if err:
+                            self.logger.log_message(
+                                f"[StratumConn] ❗ RPC error for {last_method or 'unknown'}: "
+                                f"{err.get('code')} {err.get('message')}"
+                            )
+                            self.stratum_manager.process_messages(session_id, [msg])
+                            continue
 
-                data = json.loads(msg)
-                method = data.get("method")
-                params = data.get("params", [])
+                        res = msg.get("result") or {}
+                        if isinstance(res, dict):
+                            if "job" in res and isinstance(res["job"], dict):
+                                j = res["job"]
+                                for k in ("blob", "seed_hash", "next_seed_hash", "target"):
+                                    if k in j and isinstance(j[k], str):
+                                        j[k] = RandomXLoader.norm_hex(j[k])
+                                self.stratum_manager.process_messages(session_id, [{"method": "job", "params": j}])
 
-                if method == "mining.subscribe":
-                    self._track_subscribe(session_id, params)
-                elif method == "mining.authorize":
-                    self._track_authorize(session_id, params)
-                elif method == "mining.set_difficulty":
-                    self._track_difficulty(session_id, params)
-                elif method == "mining.notify":
-                    self._track_job_notify(session_id, params)
-                elif method == "mining.submit":
-                    self._track_submit(session_id, params)
+                            if last_method == "login":
+                                sid = res.get("id")
+                                if isinstance(sid, str):
+                                    self.direct_session_id = sid
+                                    self.logger.log_message(
+                                        f"🔑 (Direct) Login successful. Session ID: {self.direct_session_id}"
+                                    )
+                                    self._schedule_keepalive()
+
+                            if last_method == "submit":
+                                status = (res.get("status") or res.get("state") or "").upper()
+                                accepted = bool(res.get("accepted") or (status == "OK"))
+                                self.logger.log_message(
+                                    f"[StratumConn] 📨 Submit result: {'ACCEPTED' if accepted else status or 'UNKNOWN'}"
+                                )
+                                self.stratum_manager.process_messages(session_id, [msg])
+
+                            if last_method in ("keepalived", "getjob"):
+                                self.stratum_manager.process_messages(session_id, [msg])
+                        continue
+
+                    method = (msg.get("method") or "").lower()
+                    params = msg.get("params") or {}
+
+                    if method == "job" and isinstance(params, dict):
+                        for k in ("blob", "seed_hash", "next_seed_hash", "target"):
+                            if k in params and isinstance(params[k], str):
+                                params[k] = RandomXLoader.norm_hex(params[k])
+                        if "height" in params:
+                            try:
+                                self.logger.log_message(f"[StratumConn] 📦 New job height={int(params['height'])}")
+                            except Exception:
+                                pass
+                        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": params}])
+                        continue
+
+                    if method in ("block_notify", "new_block", "p2pool.block", "p2pool.tip", "pool.stats",
+                                  "set_target", "set_difficulty", "set_extranonce"):
+                        for k in ("target", "seed_hash", "next_seed_hash", "block_hash"):
+                            if k in params and isinstance(params[k], str):
+                                params[k] = RandomXLoader.norm_hex(params[k])
+                        if "height" in params:
+                            try:
+                                self.logger.log_message(f"[StratumConn] ⛓️ {method} height={int(params['height'])}")
+                            except Exception:
+                                self.logger.log_message(f"[StratumConn] ⛓️ {method}")
+                        self.stratum_manager.process_messages(session_id, [msg])
+                        continue
+
+                    # Forward unknown-but-valid pool messages for visibility
+                    self.stratum_manager.process_messages(session_id, [msg])
+
+                except Exception as e:
+                    self.logger.log_message(f"[StratumConn] ❌ Message handling error: {type(e).__name__}: {e}")
+
+        return buffer
+
+
+class StratumManager:
+    """
+    Tracks sessions, feeds jobs to persistent workers, performs RandomX hashing,
+    and calls back to a submitter (daemon/pool) when a solution is found.
+    """
+    NONCE_BYTE_OFFSET = 39
+
+    def __init__(self, router_logger: Any):
+        self.logger = router_logger
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+        self.rx: Optional[RandomXLoader] = None
+        self._rx_seed: Optional[bytes] = None
+        self._rx_started: bool = False
+        self._rx_ready_event = threading.Event()
+
+        self._workers: Dict[str, threading.Thread] = {}
+        self._job_queues: Dict[str, queue.Queue] = {}
+        # Per-session submitters
+        self._submitters: Dict[str, Callable[..., None]] = {}
+
+        self.session_buffers: Dict[str, bytes] = {}
+        self.logger.log_message("[Stratum] Streamlined Manager initialized.")
+
+    # ----- lifecycle -----
+
+    def stop(self):
+        self.logger.log_message("[Stratum] 🛑 Stopping all workers and cleaning up...")
+        # Stop workers first
+        for sid in list(self.sessions.keys()):
+            self.deregister_session(sid)
+        # Extra wait to ensure hashing loops are gone
+        for _ in range(10):  # up to ~5s total
+            alive = any(t.is_alive() for t in list(self._workers.values()))
+            if not alive:
+                break
+            time.sleep(0.5)
+
+        # Now it is safe to destroy RandomX
+        try:
+            if self.rx and hasattr(self.rx, "destroy"):
+                self.rx.destroy()
+
+            with self._lock:
+                self.sessions.clear()
+                self._workers.clear()
+                self._job_queues.clear()
+            self.logger.log_message("[Stratum] ✅ Manager stopped and cleaned up.")
+        finally:
+            self.rx = None   # avoid stale handle on restart
+            self._rx_started = False
+            self._rx_seed = None
+            self._rx_ready_event.set()
+
+
+    def rx_start(self):
+        # Choose flags appropriate for your environment
+        fast_flags = (RandomXFlags.HARD_AES | RandomXFlags.JIT | RandomXFlags.LARGE_PAGES)
+        self.rx = RandomXLoader("tools/randomx.dll", flags=fast_flags, logger=self.logger)
+
+    # ----- pipeline -----
+
+    def attach_submitter(self, session_id: str, submit_func: Callable[..., None]):
+        self._submitters[session_id] = submit_func
+        self.logger.log_message(f"[Stratum] Submitter attached for session: {session_id}")
+
+    def register_session(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self.sessions:
+                return
+            self.sessions[session_id] = {}
+
+            jq = queue.Queue(maxsize=1)
+            self._job_queues[session_id] = jq
+
+            t = threading.Thread(target=self._share_worker, args=(session_id, jq), daemon=True, name=f"rx-{session_id}")
+            self._workers[session_id] = t
+            t.start()
+        self.logger.log_message(f"[Stratum] ✅ Session registered and worker started for: {session_id}")
+
+    def deregister_session(self, session_id: str) -> None:
+        self.logger.log_message(f"[Stratum] 🛑 Deregistering session: {session_id}")
+        with self._lock:
+            if session_id in self._job_queues:
+                self._job_queues[session_id].put(None)
+            w = self._workers.get(session_id)
+            if w and w.is_alive():
+                w.join(timeout=2.0)
+            self.sessions.pop(session_id, None)
+            self._workers.pop(session_id, None)
+            self._job_queues.pop(session_id, None)
+            self._submitters.pop(session_id, None)
+
+    def process_messages(self, session_id: str, messages: list[dict]) -> None:
+        if session_id not in self.sessions:
+            self.register_session(session_id)
+        for msg in messages:
+            if isinstance(msg, dict):
+                self._process_single_message(session_id, msg)
+
+    def _process_single_message(self, session_id: str, data: Dict[str, Any]):
+        method = data.get("method")
+        params = data.get("params") or {}
+        result = data.get("result") or {}
+
+        job_data = result.get("job") if isinstance(result, dict) and "job" in result else (
+            params if method == "job" else None
+        )
+        if job_data:
+            self._handle_job(session_id, job_data)
+        elif method == "submit":
+            self._track_submit(session_id, params)
+
+    # ----- job handling -----
+
+    def _ensure_rx(self):
+        if self.rx is None:
+            self.rx_start()
+
+    def _maybe_reinit_randomx(self, seed_hash_hex: Optional[str]):
+        if not seed_hash_hex:
+            return
+        try:
+            seed = bytes.fromhex(seed_hash_hex)
+        except ValueError:
+            self.logger.log_message(f"[Stratum] ⚠️ Invalid seed_hash: {seed_hash_hex}")
+            return
+        self._ensure_rx()
+        if (not self._rx_started) or (self._rx_seed != seed):
+            self._rx_ready_event.clear()
+            try:
+                self.rx.ensure_started(seed, use_dataset=False)
+                self._rx_seed = seed
+                self._rx_started = True
+                self.logger.log_message(f"[Stratum] ✅ RandomX VM ready, seed: {seed_hash_hex[:12]}...")
+            except Exception as e:
+                self._rx_started = False
+                self.logger.log_message(f"[Stratum] ❌ RandomX init failed: {e}")
+            finally:
+                self._rx_ready_event.set()
+
+    def _handle_job(self, session_id: str, job: Dict[str, Any]):
+        self._maybe_reinit_randomx(job.get("seed_hash"))
+        if session_id in self._job_queues:
+            jq = self._job_queues[session_id]
+            try:
+                jq.get_nowait()  # drop stale
+            except queue.Empty:
+                pass
+            jq.put(job)
+
+    def _track_submit(self, session_id: str, params: dict):
+        with self._lock:
+            s = self.sessions.setdefault(session_id, {})
+            s["shares"] = s.get("shares", 0) + 1
+        self.logger.log_message(f"[Stratum] ⛏️ {session_id} submitted share for job: {params.get('job_id', '?')}")
+
+    # ----- hashing helpers -----
+
+    @staticmethod
+    def _prepare_blob_template(blob_hex: str) -> tuple[bytearray, int]:
+        if len(blob_hex) < (StratumManager.NONCE_BYTE_OFFSET + 4) * 2:
+            raise ValueError("Blob is too short to contain a nonce")
+        return bytearray.fromhex(blob_hex), StratumManager.NONCE_BYTE_OFFSET
+
+    @staticmethod
+    def _write_nonce_le_inplace(buf: bytearray, offset: int, nonce: int):
+        buf[offset:offset + 4] = nonce.to_bytes(4, "little")
+
+    # ----- worker -----
+
+    def _share_worker(self, session_id: str, job_q: queue.Queue):
+        """
+        Throughput-focused worker with optional 3-stage pipeline.
+        Emits SHARE and BLOCK candidates via attached submitter.
+        """
+        from time import perf_counter
+        import time
+        import random
+
+        logger = self.logger
+        submitter = self._submitters.get(session_id)
+
+        # Tuning
+        BATCH = 4
+        PREEMPT_EVERY = 0x3FFF  # check occasionally; won't starve hashing
+        LOG_INTERVAL = 2.0
+        max_backoff = 0.5
+
+        # Odd stride per-session so threads don't collide
+        stride_seed = abs(hash(session_id)) or 1
+        stride = ((stride_seed & 0xFFFF) | 1)
+
+        # --- helpers -------------------------------------------------------------
+        def _u256_le(x) -> int:
+            """Normalize a 32-byte digest (bytes or int) to a Python int as little-endian 256."""
+            if isinstance(x, int):
+                return x
+            if isinstance(x, (bytes, bytearray)):
+                if len(x) != 32:
+                    # Some backends return bytearray of 32. Enforce exact size.
+                    raise ValueError(f"digest length != 32 (got {len(x)})")
+                return int.from_bytes(x, "little")
+            raise TypeError(f"Unsupported digest type: {type(x)}")
+
+        def _target_u256_from_hex_le(hex_str: str | None) -> int | None:
+            if not hex_str:
+                return None
+            b = bytes.fromhex(hex_str)
+            # P2Pool/Monero targets are provided as LE. 32 bytes is full 256-bit target.
+            if len(b) == 32:
+                return int.from_bytes(b, "little")
+            elif len(b) == 8:
+                # 64-bit target: compare against low 64 bits of hash (LE).
+                # We lift to 256 space by zero-extending—equivalent to checking h_low64 <= T64.
+                return int.from_bytes(b, "little")
+            else:
+                # Be permissive: interpret as LE integer anyway.
+                return int.from_bytes(b, "little")
+
+        def _meets_target(d_u256: int, T: int, T_len_bytes: int) -> bool:
+            """Compare respecting width: if target was 8 bytes, compare low 64 bits only."""
+            if T_len_bytes == 8:
+                return (d_u256 & ((1 << 64) - 1)) <= T
+            # 32 bytes or other: full 256-bit compare
+            return d_u256 <= T
+
+        def _target_len_bytes(hex_str: str | None) -> int:
+            if not hex_str:
+                return 0
+            return len(hex_str) // 2
+
+        # ------------------------------------------------------------------------
+
+        while True:
+            job = job_q.get()
+            if job is None:
+                logger.log_message(f"[Stratum] 🛑 Worker received stop signal for session={session_id}")
+                break
+
+            job_id = job.get("id") or job.get("job_id")
+            blob_hex = job.get("blob")
+            share_hex = job.get("target")
+            block_hex = job.get("block_target")
+            diff_val = job.get("network_difficulty") or job.get("block_difficulty") or job.get("difficulty")
+
+            if not all([job_id, blob_hex, share_hex]):
+                logger.log_message(f"[Stratum] ⚠️ Skipping invalid job on {session_id}: missing fields.")
+                continue
+
+            self._rx_ready_event.wait()
+            if not self._rx_started or not self.rx:
+                logger.log_message(f"[Stratum] ⚠️ Worker for {session_id} waiting for RandomX...")
+                continue
+            rx = self.rx
+
+            try:
+                # Targets as LE integers + remember original width for correct compare
+                share_T = _target_u256_from_hex_le(share_hex)
+                share_T_len = _target_len_bytes(share_hex)
+
+                if block_hex:
+                    block_T = _target_u256_from_hex_le(block_hex)
+                    block_T_len = _target_len_bytes(block_hex)
                 else:
-                    self.logger.log_message(f"[Stratum] 📦 {session_id} sent method: {method}")
-        except json.JSONDecodeError:
-            self.logger.log_message("[Stratum] ❌ Failed to decode JSON from payload.")
-        except Exception as e:
-            self.logger.log_message(f"[Stratum] ❌ Unexpected error: {e}")
+                    block_T = None
+                    block_T_len = 0
+                    if diff_val:
+                        # Use your existing difficulty->target converter (LE, 256-bit int)
+                        block_T = RandomXLoader.target_from_difficulty_int(int(diff_val))
+                        block_T_len = 32
 
-    def _track_subscribe(self, session_id: str, params):
-        self.logger.log_message(f"[Stratum] 🤝 {session_id} sent subscribe: {params}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['subscribed'] = time.time()
+                buf, off = self._prepare_blob_template(blob_hex)
+            except Exception as e:
+                logger.log_message(f"[Stratum] ❌ Job setup failed for {job_id}: {e}")
+                continue
 
-    def _track_authorize(self, session_id: str, params):
-        username = params[0] if params else "unknown"
-        self.logger.log_message(f"[Stratum] 🧑‍💻 {session_id} authorized as {username}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['username'] = username
+            # Backend capabilities
+            has_pipe = all(
+                hasattr(rx, m) for m in ("calculate_hash_first", "calculate_hash_next", "calculate_hash_last"))
+            calc_hash = getattr(rx, "calculate_hash", None)
+            if not callable(calc_hash):
+                logger.log_message("[Stratum] ❌ Hashing backend (rx) is not ready.")
+                continue
 
-    def _track_difficulty(self, session_id: str, params):
-        difficulty = params[0] if params else "?"
-        self.logger.log_message(f"[Stratum] 🧱 {session_id} set difficulty: {difficulty}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['difficulty'] = difficulty
+            nonce = random.getrandbits(32)
+            tries, ema_rate, last_log, error_streak = 0, None, perf_counter(), 0
+            submitted_nonces: set[str] = set()
 
-    def _track_job_notify(self, session_id: str, params):
-        job_id = params[0] if params else "?"
-        self.logger.log_message(f"[Stratum] 🚧 {session_id} received job ID: {job_id}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['last_job'] = job_id
+            # Diagnostics: track best observed hashes to sanity-check targets
+            min_h64 = (1 << 64) - 1
+            min_h256 = (1 << 256) - 1
 
-    def _track_submit(self, session_id: str, params):
-        worker = params[0] if params else "unknown"
-        self.logger.log_message(f"[Stratum] ⛏️ {session_id} submitted share from worker: {worker}")
-        with self._lock:
-            self.sessions.setdefault(session_id, {})['last_submit'] = time.time()
+            logger.log_message(f"[Stratum] ▶️ Working job {job_id} (stride={stride}, batch={BATCH if has_pipe else 1})")
 
-    def get_active_sessions(self) -> Dict[str, Any]:
-        """Returns a snapshot of tracked miner sessions."""
-        with self._lock:
-            return dict(self.sessions)
+            while True:
+                # preemption: check occasionally for a newer job
+                if (tries & PREEMPT_EVERY) == 0 and tries != 0:
+                    try:
+                        newj = job_q.get_nowait()
+                        job_q.put(newj)
+                        if (newj.get("id") or newj.get("job_id")) != job_id:
+                            logger.log_message(f"[Stratum] 🔄 New job arrived, switching from {job_id}.")
+                            break
+                    except queue.Empty:
+                        pass
+
+                try:
+                    if has_pipe and BATCH >= 2:
+                        nonces, digests_u256 = [], []
+
+                        # first
+                        self._write_nonce_le_inplace(buf, off, nonce)
+                        nonces.append(nonce)
+                        rx.calculate_hash_first(bytes(buf))
+
+                        cur = nonce
+                        for _ in range(1, BATCH):
+                            cur = (cur + stride) & 0xFFFFFFFF
+                            self._write_nonce_le_inplace(buf, off, cur)
+                            d_prev = rx.calculate_hash_next(bytes(buf))
+                            d_prev_u256 = _u256_le(d_prev)
+                            digests_u256.append(d_prev_u256)
+                            nonces.append(cur)
+
+                        d_last = rx.calculate_hash_last()
+                        digests_u256.append(_u256_le(d_last))
+
+                        # Optional occasional pipeline self-check (cheap & rare)
+                        if (tries & 0xFFFF) == 0:
+                            tn = nonces[-1]
+                            self._write_nonce_le_inplace(buf, off, tn)
+                            d_single = _u256_le(calc_hash(bytes(buf)))
+                            if d_single != digests_u256[-1]:
+                                logger.log_message("[Stratum] ❌ Pipeline mismatch vs single-hash path")
+                                # fallback to single path if you prefer:
+                                # has_pipe = False
+
+                        # decisions
+                        for n_val, d_u256 in zip(nonces, digests_u256):
+                            # diagnostics
+                            h64 = d_u256 & ((1 << 64) - 1)
+                            if h64 < min_h64: min_h64 = h64
+                            if d_u256 < min_h256: min_h256 = d_u256
+
+                            if _meets_target(d_u256, share_T, share_T_len):
+                                n_hex = n_val.to_bytes(4, "little").hex()
+                                if n_hex not in submitted_nonces:
+                                    submitted_nonces.add(n_hex)
+                                    if submitter:
+                                        try:
+                                            result_hex = d_u256.to_bytes(32, "little").hex()
+                                            submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
+                                        except Exception as e:
+                                            logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
+                                    logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
+
+                                    if block_T and _meets_target(d_u256, block_T, block_T_len):
+                                        logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
+
+                        tries += BATCH
+                        nonce = (nonces[-1] + stride) & 0xFFFFFFFF
+
+                    else:
+                        # Single-shot path (no pipeline)
+                        self._write_nonce_le_inplace(buf, off, nonce)
+                        d_single = _u256_le(calc_hash(bytes(buf)))
+
+                        # diagnostics
+                        h64 = d_single & ((1 << 64) - 1)
+                        if h64 < min_h64: min_h64 = h64
+                        if d_single < min_h256: min_h256 = d_single
+
+                        if _meets_target(d_single, share_T, share_T_len):
+                            n_hex = nonce.to_bytes(4, "little").hex()
+                            if n_hex not in submitted_nonces:
+                                submitted_nonces.add(n_hex)
+                                if submitter:
+                                    try:
+                                        result_hex = d_single.to_bytes(32, "little").hex()
+                                        submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
+                                    except Exception as e:
+                                        logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
+                                logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
+
+                                if block_T and _meets_target(d_single, block_T, block_T_len):
+                                    logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
+
+                        tries += 1
+                        nonce = (nonce + stride) & 0xFFFFFFFF
+
+                    now = perf_counter()
+                    if (now - last_log) >= LOG_INTERVAL:
+                        rate = tries / (now - last_log) if now > last_log else 0.0
+                        ema_rate = (0.2 * rate + 0.8 * (ema_rate or rate))
+                        # Show min-hash vs target to catch width/endianness mistakes immediately
+                        msg = f"[Stratum] ⏱️ {session_id} job {job_id}: {ema_rate:.0f} H/s"
+                        try:
+                            sh_bytes = bytes.fromhex(share_hex)
+                            if len(sh_bytes) == 8:
+                                T64 = int.from_bytes(sh_bytes, "little")
+                                msg += f" | min_h64=0x{min_h64:016x} vs T64=0x{T64:016x}"
+                            elif len(sh_bytes) == 32:
+                                T256 = int.from_bytes(sh_bytes, "little")
+                                msg += f" | min_h256=0x{min_h256:064x} vs T256=0x{T256:064x}"
+                        except Exception:
+                            pass
+                        logger.log_message(msg)
+                        tries, last_log = 0, now
+                    error_streak = 0
+
+                except Exception as e:
+                    error_streak = min(error_streak + 1, 10)
+                    backoff = min(max_backoff, 0.01 * (2 ** min(error_streak, 6)))
+                    logger.log_message(
+                        f"[Stratum] ❌ Worker error on {session_id}/{job_id}: {type(e).__name__}: {e} "
+                        f"(backoff {backoff:.3f}s)"
+                    )
+                    time.sleep(backoff)
+
+        logger.log_message(f"[Stratum] ✅ Worker shutdown complete for session={session_id}")
+
 
 class mDNSManager:
     """
@@ -431,12 +1648,570 @@ def _get_canonical_session_key(ip1: str, port1: int, ip2: str, port2: int) -> Tu
     # FIX: Sort the tuples to ensure the key is always the same
     return tuple(sorted([(ip1, port1), (ip2, port2)]))
 
+
+
+class TLSPolicyDecision:
+    __slots__ = ("action", "reason", "tags")
+    def __init__(self, action: str, reason: str = "", tags: Optional[List[str]] = None):
+        self.action = action          # "allow" | "alert" | "block" | "quarantine"
+        self.reason = reason
+        self.tags = tags or []
+
+class TLSPolicyEngine:
+    """
+    Very small rule engine you can tweak on the fly.
+    """
+    def __init__(self):
+        # constraints
+        self.min_tls_version = (3, 3)     # default: TLS 1.2 minimum (3,3)
+        self.block_legacy_ssl = True
+        self.block_weak_ciphers = {
+            # add more as needed
+            0x0004, 0x0005, 0x000A,         # RSA_DES_40, etc. (examples)
+            0x002F, 0x0035,                 # TLS_RSA_WITH_AES_128/256_CBC_SHA (old RSA w/o PFS)
+        }
+        self.sni_denylist = set()          # {"bad.example", ".malware.tld"}
+        self.ja3_denylist = set()          # {"<md5>"}
+        self.alert_on_tls11_or_lower = True
+
+    def set_min_tls(self, major: int, minor: int):
+        self.min_tls_version = (major, minor)
+
+    def add_blocked_sni(self, s: str): self.sni_denylist.add(s.lower())
+    def add_blocked_ja3(self, j: str): self.ja3_denylist.add(j.lower())
+    def add_blocked_cipher(self, c: int): self.block_weak_ciphers.add(int(c))
+
+    def _sni_is_blocked(self, sni: Optional[str]) -> Optional[str]:
+        if not sni: return None
+        q = sni.lower().strip(".")
+        for pat in self.sni_denylist:
+            if pat.startswith("."):
+                if q.endswith(pat[1:]): return f"SNI endswith {pat}"
+            elif q == pat or q.endswith("."+pat):
+                return f"SNI matches {pat}"
+        return None
+
+    def evaluate(self, meta: Dict, rec: "TLSRecord", extra: Optional[Dict]) -> TLSPolicyDecision:
+        """
+        Called on every record. We can use both per-session meta and the current record info.
+        """
+        # Legacy SSL detected by parser sentinel
+        if meta.get("legacy_ssl") and self.block_legacy_ssl:
+            return TLSPolicyDecision("block", "Legacy SSL detected", ["legacy"])
+
+        # ClientHello-derived constraints
+        if meta.get("client_hello"):
+            ch = meta["client_hello"]
+            # min version check (uses ClientHello legacy version)
+            ver = ch.get("version_tuple") or meta.get("negotiated_version_tuple")
+            if ver and ver < self.min_tls_version:
+                return TLSPolicyDecision("block", f"TLS version too low {ver}", ["min-tls"])
+
+            # sni denylist
+            sni = meta.get("sni")
+            sni_reason = self._sni_is_blocked(sni)
+            if sni_reason:
+                return TLSPolicyDecision("block", sni_reason, ["sni"])
+
+            # ja3 denylist
+            if ch.get("ja3_md5") and ch["ja3_md5"].lower() in self.ja3_denylist:
+                return TLSPolicyDecision("block", f"JA3 {ch['ja3_md5']} denylisted", ["ja3"])
+
+            # weak cipher presence (alert if ONLY weak; block if negotiated weak later)
+            offered = set(ch.get("cipher_suites", []))
+            if offered and offered.issubset(self.block_weak_ciphers):
+                return TLSPolicyDecision("alert", "Only weak ciphers offered", ["weak-ciphers"])
+
+        # ServerHello-derived constraints
+        if meta.get("server_hello"):
+            sh = meta["server_hello"]
+            if sh.get("cipher_suite_int") in self.block_weak_ciphers:
+                return TLSPolicyDecision("block", "Weak negotiated cipher", ["weak-cipher"])
+            # alert on tls1.1 or lower
+            nv = sh.get("version_tuple")
+            if self.alert_on_tls11_or_lower and nv and nv < (3, 3):
+                return TLSPolicyDecision("alert", f"Negotiated {nv} (TLS<=1.1)", ["old-tls"])
+
+            if sh.get("ja3s_md5") and sh["ja3s_md5"].lower() in self.ja3_denylist:
+                return TLSPolicyDecision("block", f"JA3S {sh['ja3s_md5']} denylisted", ["ja3s"])
+
+        return TLSPolicyDecision("allow")
+
+class TLSRecord:
+    __slots__ = ("content_type", "version", "length", "payload", "ts",
+                 "src", "dst", "src_port", "dst_port", "direction")
+    def __init__(self, content_type: int, version: Tuple[int, int], length: int, payload: bytes,
+                 ts: float, src: str, dst: str, src_port: int, dst_port: int, direction: str):
+        self.content_type = content_type
+        self.version = version
+        self.length = length
+        self.payload = payload
+        self.ts = ts
+        self.src = src
+        self.dst = dst
+        self.src_port = src_port
+        self.dst_port = dst_port
+        self.direction = direction  # "c2s" or "s2c"
+
+class TLSRecordManager:
+    """
+    Passive TLS/SSL record parser with TCP-stream-aware reassembly… now with:
+      • Per-flow session metadata (SNI/ALPN/version/cipher/JA3/JA3S/counters)
+      • Lightweight policy engine -> decisions (allow/alert/block/quarantine)
+      • Event queue + callbacks (on_event/on_decision) for your app to act on
+      • Optional soft enforcement: suppress app-data callback when blocked
+    """
+
+    # Content types
+    CHANGE_CIPHER_SPEC = 20
+    ALERT               = 21
+    HANDSHAKE           = 22
+    APPLICATION_DATA    = 23
+
+    # Direction keys
+    C2S = "c2s"
+    S2C = "s2c"
+
+    def __init__(self, logger, on_record: Optional[Callable[[TLSRecord], None]] = None):
+        self.log = logger
+        self.on_record = on_record or (lambda rec: None)
+
+        # Buffers keyed by canonical session key and direction
+        self._buffers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, bytearray]] = \
+            defaultdict(lambda: {self.C2S: bytearray(), self.S2C: bytearray()})
+
+        # Minimal stats per session (kept for compatibility)
+        self._stats: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, int]] = \
+            defaultdict(lambda: {"records": 0, "handshakes": 0, "alerts": 0, "appdata": 0, "ccs": 0, "legacy": 0})
+
+        # NEW: per-session metadata (higher-level state)
+        self._meta: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Dict] = defaultdict(lambda: {
+            "first_seen": time.time(), "last_seen": None,
+            "client": None, "server": None,  # (ip,port) filled on first ClientHello or first direction seen
+            "sni": None, "alpn": [],
+            "client_hello": None,   # parsed dict + ja3
+            "server_hello": None,   # parsed dict + ja3s
+            "negotiated_version": None, "negotiated_version_tuple": None,
+            "negotiated_cipher": None,
+            "app_bytes": {self.C2S: 0, self.S2C: 0},
+            "alerts": [], "ccs_seen": False, "legacy_ssl": False,
+            "blocked": False, "quarantined": False,
+            "tags": set()
+        })
+
+        # Optional specialized hooks (set by user)
+        self.on_handshake: Optional[Callable[[TLSRecord, Dict], None]] = None
+        self.on_application_data: Optional[Callable[[TLSRecord], None]] = None
+        self.on_alert: Optional[Callable[[TLSRecord, Dict], None]] = None
+        self.on_change_cipher_spec: Optional[Callable[[TLSRecord], None]] = None
+        self.on_legacy_ssl: Optional[Callable[[TLSRecord], None]] = None
+
+        # NEW: policy engine + callbacks + event queue
+        self.policy = TLSPolicyEngine()
+        self.on_decision: Optional[Callable[[Tuple, TLSRecord, TLSPolicyDecision], None]] = None
+        self.on_event: Optional[Callable[[Dict], None]] = None
+        self._event_queue: List[Dict] = []
+
+    # ------------- Utilities -------------
+
+    @staticmethod
+    def _looks_like_tls_header(buf: bytes) -> bool:
+        if len(buf) < 5: return False
+        ct, vmaj, vmin = buf[0], buf[1], buf[2]
+        return ct in (20, 21, 22, 23) and vmaj == 3
+
+    def _emit_event(self, key, kind: str, payload: Dict):
+        evt = {"ts": time.time(), "flow": key, "kind": kind, "data": payload}
+        self._event_queue.append(evt)
+        if self.on_event:
+            try: self.on_event(evt)
+            except Exception: pass
+
+    def pop_events(self) -> List[Dict]:
+        out, self._event_queue = self._event_queue, []
+        return out
+
+    @staticmethod
+    def _md5(s: str) -> str:
+        return hashlib.md5(s.encode("ascii", "ignore")).hexdigest()
+
+    @staticmethod
+    def _u16(b: bytes, i: int) -> int:
+        return struct.unpack("!H", b[i:i+2])[0]
+
+    def _hs_name(self, t: int) -> str:
+        if "TLS_HANDSHAKE_TYPES" in globals():
+            return globals()["TLS_HANDSHAKE_TYPES"].get(t, f"Unknown({t})")
+        return TLS_HANDSHAKE_TYPES.get(t, f"Unknown({t})")
+
+    # ------------- Parser core -------------
+
+    def _parse_records_from_buffer(self, key, direction, ts, meta):
+        buf = self._buffers[key][direction]
+        out: List[TLSRecord] = []
+
+        def _ssl_v2_hello_possible(b: bytes) -> bool:
+            return bool(b) and (b[0] & 0x80) and len(b) >= 3
+
+        while True:
+            if len(buf) < 5:
+                if _ssl_v2_hello_possible(buf): break
+                return out
+
+            if not self._looks_like_tls_header(buf):
+                if _ssl_v2_hello_possible(buf):
+                    rec_len = ((buf[0] & 0x7F) << 8) | buf[1]
+                    total_len = 2 + rec_len
+                    if len(buf) < total_len: break
+                    payload = bytes(buf[2:total_len]); del buf[:total_len]
+                    rec = TLSRecord(
+                        content_type=0x80, version=(2, 0),
+                        length=len(payload), payload=payload,
+                        ts=ts, src=meta["src_ip"], dst=meta["dst_ip"],
+                        src_port=meta["src_port"], dst_port=meta["dst_port"],
+                        direction=direction
+                    )
+                    out.append(rec)
+                    # mark legacy in meta
+                    self._meta[key]["legacy_ssl"] = True
+                    continue
+                del buf[:1]
+                continue
+
+            ct, vmaj, vmin = buf[0], buf[1], buf[2]
+            rec_len = struct.unpack("!H", buf[3:5])[0]
+            total_len = 5 + rec_len
+            if len(buf) < total_len: break
+
+            payload = bytes(buf[5:total_len])
+            del buf[:total_len]
+            rec = TLSRecord(
+                content_type=ct, version=(vmaj, vmin), length=rec_len, payload=payload,
+                ts=ts, src=meta["src_ip"], dst=meta["dst_ip"],
+                src_port=meta["src_port"], dst_port=meta["dst_port"],
+                direction=direction
+            )
+            out.append(rec)
+        return out
+
+    def feed_tcp_segment(self, canonical_key, is_c2s: bool, payload: bytes,
+                         src_ip: str, src_port: int, dst_ip: str, dst_port: int,
+                         ts: Optional[float] = None):
+        if not payload: return
+        ts = ts or time.time()
+        direction = self.C2S if is_c2s else self.S2C
+
+        # Session meta init/update
+        m = self._meta[canonical_key]
+        m["last_seen"] = ts
+        if m["client"] is None and m["server"] is None:
+            # Seed roles with first direction we see
+            m["client"] = (src_ip, src_port) if is_c2s else (dst_ip, dst_port)
+            m["server"] = (dst_ip, dst_port) if is_c2s else (src_ip, src_port)
+
+        self._buffers[canonical_key][direction].extend(payload)
+        meta = {"src_ip": src_ip, "src_port": src_port, "dst_ip": dst_ip, "dst_port": dst_port}
+        records = self._parse_records_from_buffer(canonical_key, direction, ts, meta)
+
+        for rec in records:
+            self._stats[canonical_key]["records"] += 1
+            self.on_record(rec)
+
+            decision_extra = None
+
+            if rec.content_type == self.HANDSHAKE:
+                self._stats[canonical_key]["handshakes"] += 1
+                hs_info = self._parse_handshake_best_effort(rec.payload, canonical_key, direction)
+                decision_extra = {"handshake": hs_info}
+                if self.on_handshake:
+                    self.on_handshake(rec, hs_info)
+                # Emit high-level event (first time we learn SNI/JA3 etc.)
+                if hs_info.get("messages"):
+                    self._emit_event(canonical_key, "handshake", {"dir": direction, "info": hs_info})
+
+            elif rec.content_type == self.APPLICATION_DATA:
+                self._stats[canonical_key]["appdata"] += 1
+                m["app_bytes"][direction] += rec.length
+                # Soft enforcement: suppress app-data callback if blocked/quarantined
+                if not (m["blocked"] or m["quarantined"]):
+                    if self.on_application_data:
+                        self.on_application_data(rec)
+
+            elif rec.content_type == self.ALERT:
+                self._stats[canonical_key]["alerts"] += 1
+                alert = self._parse_alert(rec.payload)
+                m["alerts"].append(alert)
+                decision_extra = {"alert": alert}
+                if self.on_alert:
+                    self.on_alert(rec, alert)
+                self._emit_event(canonical_key, "alert", {"dir": direction, "alert": alert})
+
+            elif rec.content_type == self.CHANGE_CIPHER_SPEC:
+                self._stats[canonical_key]["ccs"] += 1
+                m["ccs_seen"] = True
+                if self.on_change_cipher_spec:
+                    self.on_change_cipher_spec(rec)
+
+            else:  # legacy / unknown
+                self._stats[canonical_key]["legacy"] += 1
+                m["legacy_ssl"] = True
+                if self.on_legacy_ssl:
+                    self.on_legacy_ssl(rec)
+
+            # Run policy on every record
+            decision = self.policy.evaluate(m, rec, decision_extra)
+            if self.on_decision:
+                try: self.on_decision(canonical_key, rec, decision)
+                except Exception: pass
+
+            if decision.action in ("block", "quarantine"):
+                # mark meta; let outer system actually enforce (drop/ban/etc.)
+                if decision.action == "block":
+                    m["blocked"] = True
+                else:
+                    m["quarantined"] = True
+                m["tags"].update(decision.tags)
+                self._emit_event(canonical_key, decision.action, {
+                    "reason": decision.reason, "tags": decision.tags,
+                    "snapshot": self.get_session_summary(canonical_key)
+                })
+            elif decision.action == "alert":
+                self._emit_event(canonical_key, "policy_alert", {
+                    "reason": decision.reason, "tags": decision.tags
+                })
+
+    def _parse_alert(self, payload: bytes) -> Dict:
+        level = payload[0] if len(payload) > 0 else None
+        desc  = payload[1] if len(payload) > 1 else None
+        return {"level": level, "description": desc}
+
+    # ---------------- Handshake (best-effort) ----------------
+
+    def _compute_ja3(self, ver_u16: int, ciphers: List[int], exts: List[int],
+                     groups: List[int], ecpts: List[int]) -> Tuple[str, str]:
+        # JA3 string: SSLVersion,CipherSuites,Extensions,EllipticCurves,EllipticCurvePointFormats
+        cs = "-".join(str(x) for x in ciphers)
+        ex = "-".join(str(x) for x in exts)
+        gr = "-".join(str(x) for x in groups)
+        pf = "-".join(str(x) for x in ecpts)
+        ja3 = f"{ver_u16},{cs},{ex},{gr},{pf}"
+        return ja3, self._md5(ja3)
+
+    def _compute_ja3s(self, ver_u16: int, cipher: int, exts: List[int]) -> Tuple[str, str]:
+        # JA3S string: SSLVersion,Cipher,Extensions
+        ex = "-".join(str(x) for x in exts)
+        ja3s = f"{ver_u16},{cipher},{ex}"
+        return ja3s, self._md5(ja3s)
+
+    def _parse_handshake_best_effort(self, payload: bytes, key, direction) -> Dict:
+        info = {"messages": []}
+        i = 0
+        while i + 4 <= len(payload):
+            msg_type = payload[i]
+            msg_len = int.from_bytes(payload[i+1:i+4], "big")
+            i += 4
+            if i + msg_len > len(payload): break
+            body = payload[i:i+msg_len]; i += msg_len
+
+            entry = {"type_id": msg_type, "type": self._hs_name(msg_type)}
+            if msg_type == 1:  # ClientHello
+                ch = self._parse_client_hello(body)
+                entry.update(ch)
+                # update session meta
+                m = self._meta[key]
+                m["client_hello"] = ch
+                m["sni"] = ch.get("sni") or m.get("sni")
+                if ch.get("alpn"): m["alpn"] = ch["alpn"]
+                if ch.get("version_tuple"):
+                    m["negotiated_version"] = ch["version"]
+                    m["negotiated_version_tuple"] = ch["version_tuple"]
+                self._emit_event(key, "client_hello", {"dir": direction, "sni": m["sni"], "ja3": ch.get("ja3_md5")})
+
+            elif msg_type == 2:  # ServerHello
+                sh = self._parse_server_hello(body)
+                entry.update(sh)
+                m = self._meta[key]
+                m["server_hello"] = sh
+                if sh.get("version_tuple"):
+                    m["negotiated_version"] = sh["version"]
+                    m["negotiated_version_tuple"] = sh["version_tuple"]
+                m["negotiated_cipher"] = sh.get("cipher_suite")
+                self._emit_event(key, "server_hello", {"dir": direction, "ja3s": sh.get("ja3s_md5")})
+
+            info["messages"].append(entry)
+        return info
+
+    def _parse_client_hello(self, body: bytes) -> Dict:
+        out = {"hello": "client", "sni": None, "version": None, "version_tuple": None,
+               "cipher_suites_count": None, "cipher_suites": [], "extensions": [],
+               "groups": [], "ec_point_formats": [], "alpn": [], "ja3": None, "ja3_md5": None}
+        try:
+            if len(body) < 38: return out
+            # legacy_version
+            ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
+            idx = 2 + 32  # random
+            sid_len = body[idx]; idx += 1 + sid_len
+            cs_len = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
+            out["cipher_suites_count"] = cs_len // 2
+            suites = []
+            for j in range(0, cs_len, 2):
+                suites.append(struct.unpack("!H", body[idx+j:idx+j+2])[0])
+            out["cipher_suites"] = suites
+            idx += cs_len
+            comp_len = body[idx]; idx += 1 + comp_len
+            if idx + 2 > len(body): return out
+            ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
+            end = idx + ext_total
+            ext_types = []
+            groups, ecpts, alpn = [], [], []
+            sni = None
+            while idx + 4 <= end and end <= len(body):
+                ext_type = struct.unpack("!H", body[idx:idx+2])[0]
+                ext_len  = struct.unpack("!H", body[idx+2:idx+4])[0]
+                ext_data = body[idx+4:idx+4+ext_len]
+                idx += 4 + ext_len
+                ext_types.append(ext_type)
+                # SNI
+                if ext_type == 0 and len(ext_data) >= 5:
+                    j = 2
+                    while j + 3 < len(ext_data):
+                        name_type = ext_data[j]; j += 1
+                        nlen = struct.unpack("!H", ext_data[j:j+2])[0]; j += 2
+                        if j + nlen > len(ext_data): break
+                        servername = ext_data[j:j+nlen].decode("idna", errors="ignore"); j += nlen
+                        if name_type == 0 and servername:
+                            sni = servername; break
+                # supported_groups (10)
+                elif ext_type == 10 and len(ext_data) >= 2:
+                    ln = struct.unpack("!H", ext_data[:2])[0]
+                    for k in range(0, min(ln, len(ext_data)-2), 2):
+                        groups.append(struct.unpack("!H", ext_data[2+k:2+k+2])[0])
+                # ec_point_formats (11)
+                elif ext_type == 11 and len(ext_data) >= 1:
+                    ln = ext_data[0]
+                    for k in range(ln):
+                        if 1+k < len(ext_data): ecpts.append(ext_data[1+k])
+                # ALPN (16)
+                elif ext_type == 16 and len(ext_data) >= 2:
+                    ln = struct.unpack("!H", ext_data[:2])[0]
+                    j = 2
+                    while j < 2+ln and j < len(ext_data):
+                        l = ext_data[j]; j += 1
+                        proto = ext_data[j:j+l]
+                        alpn.append(proto.decode("utf-8", "ignore"))
+                        j += l
+            out["extensions"] = ext_types
+            out["groups"] = groups
+            out["ec_point_formats"] = ecpts
+            out["alpn"] = alpn
+            out["sni"] = sni
+            # JA3 uses u16 TLS version (legacy_version here)
+            ver_u16 = (ver[0] << 8) | ver[1]
+            ja3, jmd5 = self._compute_ja3(ver_u16, suites, ext_types, groups, ecpts)
+            out["ja3"] = ja3; out["ja3_md5"] = jmd5
+        except Exception:
+            pass
+        return out
+
+    def _parse_server_hello(self, body: bytes) -> Dict:
+        out = {"hello": "server", "version": None, "version_tuple": None,
+               "cipher_suite": None, "cipher_suite_int": None,
+               "extensions": [], "ja3s": None, "ja3s_md5": None}
+        try:
+            if len(body) < 38: return out
+            ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
+            idx = 2 + 32
+            sid_len = body[idx]; idx += 1 + sid_len
+            cs = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
+            out["cipher_suite_int"] = cs
+            out["cipher_suite"] = f"0x{cs:04x}"
+            # compression(1)
+            if idx < len(body): idx += 1
+            # extensions
+            if idx + 2 <= len(body):
+                ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
+                end = min(len(body), idx + ext_total)
+                ext_types = []
+                while idx + 4 <= end:
+                    et = struct.unpack("!H", body[idx:idx+2])[0]
+                    el = struct.unpack("!H", body[idx+2:idx+4])[0]
+                    idx += 4 + el
+                    ext_types.append(et)
+                out["extensions"] = ext_types
+            ver_u16 = (ver[0] << 8) | ver[1]
+            ja3s, jmd5 = self._compute_ja3s(ver_u16, cs, out["extensions"])
+            out["ja3s"] = ja3s; out["ja3s_md5"] = jmd5
+        except Exception:
+            pass
+        return out
+
+    # -------- Introspection / Control --------
+    def get_stats(self, canonical_key) -> Dict[str, int]:
+        return dict(self._stats.get(canonical_key, {}))
+
+    def get_session_meta(self, canonical_key) -> Dict:
+        m = self._meta.get(canonical_key, {})
+        # make tags printable
+        if "tags" in m and isinstance(m["tags"], set):
+            m = dict(m); m["tags"] = sorted(m["tags"])
+        return m
+
+    def get_session_summary(self, canonical_key) -> Dict:
+        m = self.get_session_meta(canonical_key)
+        return {
+            "first_seen": m.get("first_seen"), "last_seen": m.get("last_seen"),
+            "client": m.get("client"), "server": m.get("server"),
+            "sni": m.get("sni"), "alpn": m.get("alpn"),
+            "version": m.get("negotiated_version"), "cipher": m.get("negotiated_cipher"),
+            "ja3_md5": (m.get("client_hello") or {}).get("ja3_md5"),
+            "ja3s_md5": (m.get("server_hello") or {}).get("ja3s_md5"),
+            "app_bytes": m.get("app_bytes"), "alerts": m.get("alerts"),
+            "ccs_seen": m.get("ccs_seen"), "legacy_ssl": m.get("legacy_ssl"),
+            "blocked": m.get("blocked"), "quarantined": m.get("quarantined"),
+            "tags": m.get("tags"),
+        }
+
+    def sessions(self) -> List[Tuple]:
+        return list(self._meta.keys())
+
+    def reset_session(self, canonical_key):
+        self._buffers.pop(canonical_key, None)
+        self._stats.pop(canonical_key, None)
+        self._meta.pop(canonical_key, None)
+
+    # --- Administrative helpers for “doing more” programmatically ---
+    def block_session(self, canonical_key, reason="manual block"):
+        m = self._meta.get(canonical_key)
+        if not m:
+            return
+        m["blocked"] = True
+        self._emit_event(canonical_key, "block", {"reason": reason})
+
+    def quarantine_session(self, canonical_key, reason="manual quarantine"):
+        m = self._meta.get(canonical_key)
+        if not m:
+            return
+        m["quarantined"] = True
+        self._emit_event(canonical_key, "quarantine", {"reason": reason})
+
+    def allow_session(self, canonical_key, reason="manual allow"):
+        m = self._meta.get(canonical_key)
+        if not m:
+            return
+        m["blocked"] = False
+        m["quarantined"] = False
+        self._emit_event(canonical_key, "allow", {"reason": reason})
+
 class HandshakeManager:
     """
-    Tracks TCP 3-way handshakes and connection teardowns based on observed packets.
-    It can be initialized with references to network managers (ARP, NAT, RIP)
-    to provide broader network context, though its core function remains passive
-    TCP state tracking.
+    Tracks TCP 3-way handshakes and teardowns AND streams TLS bytes into TLSRecordManager.
+    Requires a TLSRecordManager instance (or builds one) and wires its callbacks to:
+      - log ClientHello/ServerHello (SNI, ALPN, JA3/JA3S, version/cipher)
+      - log TLS Alerts
+      - forward TLS Application Data (optional; uses last seen TCP seq/ack)
+      - honor policy decisions (block/quarantine suppresses AppData forwarding)
+
+    NOTE: This class does not depend on Scapy’s TLS layers; TLS parsing is done in TLSRecordManager.
     """
 
     def __init__(self, router_logger,
@@ -444,31 +2219,61 @@ class HandshakeManager:
                  nat_manager,
                  rip_manager,
                  packet_writer,
-                 timeout_half_open: int = 60, timeout_established: int = 300):
+                 tls_record_manager=None,              # NEW: inject or auto-create
+                 timeout_half_open: int = 60,
+                 timeout_established: int = 300):
         self.logger = router_logger
-        self._sessions: Dict[
-            Tuple[Tuple[str, int], Tuple[str, int]], Tuple[HandshakeState, float, str, int, str, int]] = {}
-        self._lock = threading.Lock()
-        self.timeout_half_open = timeout_half_open
-        self.timeout_established = timeout_established
-        self._stop_event = threading.Event()
-        self._tls_streams = defaultdict(list)
         self.arp_manager = arp_manager
         self.nat_manager = nat_manager
         self.rip_manager = rip_manager
         self.packet_writer = packet_writer
+
+        # TCP session state: key -> (state:str, ts:float, src_ip, src_port, dst_ip, dst_port)
+        self._sessions: Dict[Tuple[Tuple[str, int], Tuple[str, int]],
+                             Tuple[str, float, str, int, str, int]] = {}
+
+        self._lock = threading.Lock()
+        self.timeout_half_open = timeout_half_open
+        self.timeout_established = timeout_established
+        self._stop_event = threading.Event()
+
+        # TLS plumbing
+        self._tls_mgr = tls_record_manager or TLSRecordManager(self.logger)
+        self._tls_records: Dict[Tuple, List[TLSRecord]] = defaultdict(list)  # per-flow record store
+        self._tls_streams: Dict[Tuple, List[bytes]] = defaultdict(list)      # per-flow AppData buckets
+        # last observed TCP packet per (flow, direction) to borrow seq/ack when forwarding
+        self._last_tcp_pkt: Dict[Tuple[Tuple, str], Packet] = {}
+
+        # decisions/meta passthrough
+        self._tls_mgr.on_record = self._on_tls_record
+        self._tls_mgr.on_handshake = self._on_tls_handshake
+        self._tls_mgr.on_alert = self._on_tls_alert
+        self._tls_mgr.on_application_data = self._on_tls_application_data
+        self._tls_mgr.on_event = self._on_tls_event
+        self._tls_mgr.on_decision = self._on_tls_decision
+
+        # abuse control
         self.ban_duration = 300
         self.rate_limit_threshold = 20
         self.rate_limit_period = 60
-        self._ban_list: Dict[str, float] = {}  # Maps IP -> ban_expiry_timestamp
+        self._ban_list: Dict[str, float] = {}            # ip -> expiry
         self._connection_rate_tracker: Dict[str, List[float]] = defaultdict(list)
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
+
+        # maintenance thread
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop,
+                                                daemon=True, name="HandshakeCleanup")
         self._cleanup_thread.start()
-        self.logger.log_message("[Handshake] Manager initialized (passive mode, with network context).")
+
+        self.logger.log_message("[Handshake] Manager initialized (TLS wired to TLSRecordManager).")
+
+    def _canon_key(self, ip1: str, pt1: int, ip2: str, pt2: int):
+        return tuple(sorted([(ip1, pt1), (ip2, pt2)]))
+    # ---- lifecycle ------------------------------------------------------------
 
     def start(self):
         if not (self._cleanup_thread and self._cleanup_thread.is_alive()):
-            self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop,
+                                                    daemon=True, name="HandshakeCleanup")
             self._cleanup_thread.start()
             self.logger.log_message("[Handshake] Cleanup thread started.")
         else:
@@ -479,6 +2284,8 @@ class HandshakeManager:
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
         self.logger.log_message("[Handshake] Manager stopped.")
+
+    # ---- cleanup / timeouts / bans -------------------------------------------
 
     def _cleanup_loop(self):
         while not self._stop_event.is_set():
@@ -497,34 +2304,30 @@ class HandshakeManager:
                         f"in state {state_at_timeout}"
                     )
                     del self._sessions[key]
+
                 expired_bans = [ip for ip, expiry_time in self._ban_list.items() if now >= expiry_time]
-
                 for ip in expired_bans:
-                    # Remove the IP from the ban list, effectively unbanning it.
                     del self._ban_list[ip]
-
-                    # If a probe counter exists, reset it for the newly unbanned IP.
                     if hasattr(self, '_probe_counts'):
                         self._probe_counts.pop(ip, None)
-
                     self.logger.log_message(f"[Handshake][BAN] ✅ Ban expired for {ip}. IP is no longer blocked.")
+            # modest cadence
+            self._stop_event.wait(1.0)
 
     def _check_and_apply_rate_limit(self, ip: str, now: float):
-        """Checks the connection rate for an IP and bans it if the limit is exceeded."""
         timestamps = self._connection_rate_tracker[ip]
         timestamps.append(now)
-
-        # Keep only timestamps within the defined period
-        relevant_timestamps = [ts for ts in timestamps if now - ts <= self.rate_limit_period]
-        self._connection_rate_tracker[ip] = relevant_timestamps
-
-        if len(relevant_timestamps) > self.rate_limit_threshold:
+        self._connection_rate_tracker[ip] = [ts for ts in timestamps if now - ts <= self.rate_limit_period]
+        if len(self._connection_rate_tracker[ip]) > self.rate_limit_threshold:
             self.logger.log_message(
-                f"[Handshake][BAN] 🚫 IP {ip} banned for {self.ban_duration}s. Reason: Exceeded connection rate limit (possible scan)."
+                f"[Handshake][BAN] 🚫 IP {ip} banned for {self.ban_duration}s. "
+                f"Reason: Exceeded connection rate limit (possible scan)."
             )
             self._ban_list[ip] = now + self.ban_duration
-            # Clear the tracker for this IP once banned
             del self._connection_rate_tracker[ip]
+
+    # ---- Packet handling ------------------------------------------------------
+
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
         if not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
             return False
@@ -545,15 +2348,17 @@ class HandshakeManager:
             if self._ban_list.get(original_src_ip, 0) > now:
                 return False
 
-        if original_dst_ip == self.nat_manager.public_ip:
-            nat_reversed_dst_tuple = self.nat_manager.get_internal_from_external(original_dst_port, original_src_ip )
+        # NAT reverse: map public dst to internal if it matches our public IP
+        if original_dst_ip == getattr(self.nat_manager, "public_ip", None):
+            nat_reversed_dst_tuple = self.nat_manager.get_internal_from_external(original_dst_port, original_src_ip)
             if nat_reversed_dst_tuple:
                 original_dst_ip, original_dst_port = nat_reversed_dst_tuple
                 self.logger.log_message(
-                    f"[Handshake] NAT reverse applied (DST): {ip_layer.dst}:{tcp_layer.dport} -> {original_dst_ip}:{original_dst_port}"
+                    f"[Handshake] NAT reverse (DST): {ip_layer.dst}:{tcp_layer.dport} -> {original_dst_ip}:{original_dst_port}"
                 )
 
-        canonical_key = _get_canonical_session_key(original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+        canonical_key = _get_canonical_session_key(original_src_ip, original_src_port,
+                                                   original_dst_ip, original_dst_port)
 
         with self._lock:
             current_session_data = self._sessions.get(canonical_key)
@@ -565,291 +2370,273 @@ class HandshakeManager:
                 stored_original_dst_ip = original_dst_ip
                 stored_original_dst_port = original_dst_port
             else:
-                _, _, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port = current_session_data
+                _, _, stored_original_src_ip, stored_original_src_port, \
+                    stored_original_dst_ip, stored_original_dst_port = current_session_data
 
-            # --- TCP Handshake Logic ---
-            if flags == 0x02: # SYN
+            # --- TCP Handshake/Teardown state machine --------------------------
+            if flags == 0x02:  # SYN
                 if session_state is None:
-                    self._sessions[canonical_key] = ("SYN_SENT", now, original_src_ip, original_src_port, original_dst_ip, original_dst_port)
+                    self._sessions[canonical_key] = ("SYN_SENT", now,
+                                                     original_src_ip, original_src_port,
+                                                     original_dst_ip, original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] 🔓 SYN from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} on {inbound_iface}"
+                        f"[Handshake] 🔓 SYN {original_src_ip}:{original_src_port} -> "
+                        f"{original_dst_ip}:{original_dst_port} on {inbound_iface}"
                     )
                 elif session_state == "SYN_SENT":
-                    self._sessions[canonical_key] = (session_state, now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = (session_state, now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] 🔁 SYN retransmission from {original_src_ip}:{original_src_port} on {inbound_iface}"
+                        f"[Handshake] 🔁 SYN retransmit from {original_src_ip}:{original_src_port} on {inbound_iface}"
                     )
                 return False
 
-            elif flags == 0x12: # SYN+ACK
+            elif flags == 0x12:  # SYN+ACK
                 if session_state == "SYN_SENT":
-                    self._sessions[canonical_key] = ("SYN_ACK_RECEIVED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = ("SYN_ACK_RECEIVED", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] 🔐 SYN-ACK from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} "
-                        f"for session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                        f"[Handshake] 🔐 SYN-ACK {original_src_ip}:{original_src_port} -> {original_dst_ip}:{original_dst_port} "
+                        f"for {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
                     )
                 elif session_state == "SYN_ACK_RECEIVED":
-                    self._sessions[canonical_key] = (session_state, now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] 🔁 SYN-ACK retransmission from {original_src_ip}:{original_src_port} on {inbound_iface}"
-                    )
+                    self._sessions[canonical_key] = (session_state, now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
+                    self.logger.log_message(f"[Handshake] 🔁 SYN-ACK retransmit on {inbound_iface}")
                 else:
-                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port,
+                    # fast-path: infer established
+                    self._sessions[canonical_key] = ("ESTABLISHED", now,
+                                                     original_src_ip, original_src_port,
                                                      original_dst_ip, original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ✅ Inferred ESTABLISHED session from ACK ACK: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
-                    self.nat_manager.add_stateful_mapping(
-                        src_ip=stored_original_src_ip, src_port=stored_original_src_port,
-                        dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
+                        f"[Handshake] ✅ Inferred ESTABLISHED: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}"
                     )
+                    # Add/stateful NAT mapping if you want
+                    try:
+                        self.nat_manager.add_stateful_mapping(
+                            src_ip=stored_original_src_ip, src_port=stored_original_src_port,
+                            dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
+                        )
+                    except Exception:
+                        pass
                 return False
 
-            elif flags == 0x10: # ACK
+            elif flags == 0x10:  # ACK
                 if session_state == "SYN_ACK_RECEIVED":
-                    self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = ("ESTABLISHED", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ✅ Connection ESTABLISHED: {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                        f"[Handshake] ✅ ESTABLISHED: {stored_original_src_ip}:{stored_original_src_port} ↔ "
+                        f"{stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
                     )
-                    self.nat_manager.add_stateful_mapping(
-                        src_ip=stored_original_src_ip, src_port=stored_original_src_port,
-                        dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
-                    )
+                    try:
+                        self.nat_manager.add_stateful_mapping(
+                            src_ip=stored_original_src_ip, src_port=stored_original_src_port,
+                            dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
+                        )
+                    except Exception:
+                        pass
+
                 elif session_state == "ESTABLISHED":
-                    self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
-                    # --- TLS Handling (Corrected as discussed) ---
-                    if pkt.haslayer(Raw):
-                        raw_bytes = bytes(pkt[Raw])
-                        if len(raw_bytes) >= 3:
-                            content_type = raw_bytes[0]
-                            version_major = raw_bytes[1]
-                            version_minor = raw_bytes[2]
-
-                            # TLS/SSL record types and versions
-                            if content_type in {20, 21, 22, 23} and version_major == 3:
-                                tls_version_map = {
-                                    0: "SSL 3.0",
-                                    1: "TLS 1.0",
-                                    2: "TLS 1.1",
-                                    3: "TLS 1.2",
-                                    4: "TLS 1.3",
-                                }
-                                tls_version = tls_version_map.get(version_minor, f"TLS {version_major}.{version_minor}")
-
-                                # Try to estimate the TLS record length (3 or 5 bytes header)
-                                try:
-                                    if len(raw_bytes) >= 5:
-                                        record_len = struct.unpack("!H", raw_bytes[3:5])[0]
-                                    else:
-                                        record_len = "unknown"
-                                except Exception:
-                                    record_len = "unknown"
-
-                                msg_type_str = {
-                                    20: "ChangeCipherSpec",
-                                    21: "Alert",
-                                    22: "Handshake",
-                                    23: "Application Data"
-                                }.get(content_type, f"Unknown({content_type})")
-
-                                self.logger.log_message(
-                                    f"[SSL] 🔍 TLS record: type={content_type} ({msg_type_str}), version={tls_version}, length={record_len} "
-                                    f"in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                )
-
-                                # For Application Data, we know it's encrypted — confirm session is truly live
-                                if content_type == 23:
-                                    session_data = self._sessions.get(canonical_key)
-
-                                    # 2. The session_info dictionary is built by unpacking that stored data
-                                    session_info = {
-                                        "src_ip": session_data[2],
-                                        "src_port": session_data[3],
-                                        "dst_ip": session_data[4],
-                                        "dst_port": session_data[5],
-                                        "iface": inbound_iface
-                                    }
-                                    self._forward_tls_application_data(raw_bytes, pkt, session_info, canonical_key)
-
-                                elif content_type == 22:
-                                    try:
-                                        tls_pkt = TLS(raw_bytes)
-                                        tls_handshake = tls_pkt.payload
-                                        if hasattr(tls_handshake, 'msgtype'):
-                                            handshake_type_id = tls_handshake.msgtype
-                                            handshake_name = TLS_HANDSHAKE_TYPES.get(handshake_type_id, f"Unknown({handshake_type_id})")
-                                            if isinstance(tls_handshake, TLSClientHello):
-                                                sni = None
-                                                if hasattr(tls_handshake, "ext") and tls_handshake.ext:
-                                                    for ext in tls_handshake.ext:
-                                                        if hasattr(ext, "servernames") and ext.servernames:
-                                                            sni = ext.servernames[0].servername
-                                                self.logger.log_message(
-                                                    f"[TLS] 🛡 ClientHello (v{tls_handshake.version}, SNI={sni or 'N/A'}, "
-                                                    f"ciphers={tls_handshake.ciphers}) "
-                                                    f"in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                                )
-                                            elif isinstance(tls_handshake, TLSServerHello):
-                                                self.logger.log_message(
-                                                    f"[TLS] 🛡 ServerHello (v{tls_handshake.version}, cipher={tls_handshake.cipher}) "
-                                                    f"in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                                )
-                                            elif isinstance(tls_handshake, TLSFinished):
-                                                self.logger.log_message(
-                                                    f"[TLS] 🛡 Finished handshake message in session "
-                                                    f"{stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                                )
-                                            else:
-                                                self.logger.log_message(
-                                                    f"[TLS] 🛡 {handshake_name} (type={handshake_type_id}) "
-                                                    f"in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                                )
-                                        else:
-                                            self.logger.log_message(
-                                                f"[TLS] ⚠️ Handshake record present but no msgtype field found (possible fragmentation)."
-                                            )
-                                    except Exception as e:
-                                        self.logger.log_message(f"[TLS] ⚠️ Failed to dissect handshake: {e}")
-                                elif content_type == 21:
-                                    alert_level = raw_bytes[5] if len(raw_bytes) > 5 else "?"
-                                    alert_description = raw_bytes[6] if len(raw_bytes) > 6 else "?"
-                                    self.logger.log_message(
-                                        f"[SSL] ⚠️ Alert record (level={alert_level}, description={alert_description}) detected."
-                                    )
-                            elif content_type & 0x80 and version_major in {2, 3}:  # SSLv2 format check
-                                self.logger.log_message(
-                                    f"[SSL] ⚠️ SSLv2 ClientHello or legacy record format detected from {stored_original_src_ip}:{stored_original_src_port} on {inbound_iface}"
-                                )
-
-                            elif version_major == 3 and version_minor == 0:
-                                self.logger.log_message(
-                                    f"[SSL] ⚠️ SSLv3 record detected from {stored_original_src_ip}:{stored_original_src_port} on {inbound_iface}"
-                                )
-                    if pkt.haslayer(TLS):
-                        tls_record = pkt[TLS]
-                        # Check if it's a Handshake content type (22)
-                        # Scapy automatically dissects TLSHandshake as the payload of TLS record if type is 22
-                        if tls_record.type == 22: # TLS Handshake content type
-                            # The payload of a TLS record with type 22 (Handshake) IS the TLSHandshake message.
-                            # So, you can directly access the payload, which should be a TLSHandshake object
-                            # or one of its subclasses (ClientHello, ServerHello, etc.)
-                            handshake_msg = tls_record.payload
-                            if hasattr(handshake_msg, 'msgtype'): # Ensure it's a handshake message with msgtype
-                                handshake_type_id = handshake_msg.msgtype # Get the numeric type ID
-                                tls_msg_name = TLS_HANDSHAKE_TYPES.get(handshake_type_id, f"Unknown({handshake_type_id})")
-
-                                if isinstance(handshake_msg, TLSClientHello):
-                                    self.logger.log_message(
-                                        f"[TLS] 🛡 ClientHello (v{handshake_msg.version}) seen in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                    )
-                                elif isinstance(handshake_msg, TLSServerHello):
-                                     self.logger.log_message(
-                                        f"[TLS] 🛡 ServerHello (v{handshake_msg.version}, cipher={handshake_msg.cipher}) seen in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                    )
-                                elif isinstance(handshake_msg, TLSFinished):
-                                    self.logger.log_message(
-                                        f"[TLS] 🛡 Finished handshake message seen in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                    )
-                                else:
-                                    self.logger.log_message(
-                                        f"[TLS] 🛡 {tls_msg_name} (type={handshake_type_id}) seen in session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                                    )
-                            else: # This should ideally not happen if type is 22 and Scapy dissected correctly
-                                self.logger.log_message(
-                                    f"[TLS] ⚠️ TLS Record (Type: {tls_record.type}) - Payload not recognized as a Handshake message (missing msgtype). on {inbound_iface}"
-                                )
-                        else: # Not a TLS handshake record (e.g., TLS data, Alert, ChangeCipherSpec)
-                            self.logger.log_message(
-                                f"[TLS] ℹ️ TLS Record (Type: {tls_record.type}) - Not a Handshake message. on {inbound_iface}"
-                            )
-                    # --- END TLS Handling ---
-
+                    # refresh timestamp
+                    self._sessions[canonical_key] = ("ESTABLISHED", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                 elif session_state == "CLOSING":
-                    self._sessions[canonical_key] = ("CLOSED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = ("CLOSED", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ❎ Connection CLOSED (ACK after FIN): {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                        f"[Handshake] ❎ CLOSED (ACK after FIN): "
+                        f"{stored_original_src_ip}:{stored_original_src_port} ↔ "
+                        f"{stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
                     )
                     del self._sessions[canonical_key]
                 else:
-                    self._sessions[canonical_key] = ("ESTABLISHED", now, original_src_ip, original_src_port,
+                    # generic keepalive/ack progression
+                    self._sessions[canonical_key] = ("ESTABLISHED", now,
+                                                     original_src_ip, original_src_port,
                                                      original_dst_ip, original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] ✅ Inferred ESTABLISHED session from ACK: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}")
-                return False
 
-            elif flags & 0x01: # FIN
+            elif flags & 0x01:  # FIN
                 if session_state == "ESTABLISHED":
-                    self._sessions[canonical_key] = ("CLOSING", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = ("CLOSING", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] 🔻 CLOSING initiated by {original_src_ip}:{original_src_port} on {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                        f"[Handshake] 🔻 CLOSING by {original_src_ip}:{original_src_port} "
+                        f"for {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port}"
                     )
                     self._check_and_apply_rate_limit(original_src_ip, now)
-
                 elif session_state == "CLOSING":
-                    self._sessions[canonical_key] = ("CLOSED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
+                    self._sessions[canonical_key] = ("CLOSED", now,
+                                                     stored_original_src_ip, stored_original_src_port,
+                                                     stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] ❎ Connection CLOSED (Second FIN): {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
+                        f"[Handshake] ❎ CLOSED (Second FIN): {stored_original_src_ip}:{stored_original_src_port} ↔ "
+                        f"{stored_original_dst_ip}:{stored_original_dst_port}"
                     )
                     del self._sessions[canonical_key]
                 else:
                     self.logger.log_message(
-                        f"[Handshake] ⚠️ Unexpected FIN from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} "
-                        f"in state {session_state} on {inbound_iface}"
+                        f"[Handshake] ⚠️ Unexpected FIN {original_src_ip}:{original_src_port} -> "
+                        f"{original_dst_ip}:{original_dst_port} in state {session_state} on {inbound_iface}"
                     )
                 return False
 
-            elif flags & 0x04: # RST
+            elif flags & 0x04:  # RST
                 if current_session_data:
                     self.logger.log_message(
-                        f"[Handshake] ❌ RST received on session {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port}. Forcibly closing on {inbound_iface}."
+                        f"[Handshake] ❌ RST on {stored_original_src_ip}:{stored_original_src_port} ↔ "
+                        f"{stored_original_dst_ip}:{stored_original_dst_port} (closing)."
                     )
                     del self._sessions[canonical_key]
                 return False
 
-            if current_session_data and session_state == "ESTABLISHED":
-                self._sessions[canonical_key] = ("ESTABLISHED", now, stored_original_src_ip, stored_original_src_port, stored_original_dst_ip, stored_original_dst_port)
-                return False
+        # ---- TLS wiring: feed bytes to TLSRecordManager when we have payload ---
+        if self._sessions.get(canonical_key, (None,))[0] == "ESTABLISHED":
+            # Extract TCP payload (could be empty)
+            tcp_payload_bytes = bytes(tcp_layer.payload) if tcp_layer.payload else b""
+            if tcp_payload_bytes:
+                # Remember last packet for this (flow,direction) so we can reuse seq/ack when forwarding AppData
+                # Determine canonical client→server direction based on stored originals
+                with self._lock:
+                    state, _, s_src_ip, s_src_port, s_dst_ip, s_dst_port = self._sessions[canonical_key]
+                is_c2s = (original_src_ip == s_src_ip and original_src_port == s_src_port)
+                dir_key = (canonical_key, "c2s" if is_c2s else "s2c")
+                self._last_tcp_pkt[dir_key] = pkt
+
+                # Feed the segment to the TLS manager
+                self._tls_mgr.feed_tcp_segment(
+                    canonical_key=canonical_key,
+                    is_c2s=is_c2s,
+                    payload=tcp_payload_bytes,
+                    src_ip=original_src_ip, src_port=original_src_port,
+                    dst_ip=original_dst_ip, dst_port=original_dst_port,
+                    ts=time.time()
+                )
 
         return False
 
-    def normalize_mac(self, mac: str) -> str:
-        return mac.replace('-', ':').lower()
-    def _forward_tls_application_data(self, data: bytes, original_pkt: Packet, session_info: Dict,
-                                      canonical_key: Tuple):
-        """
-        Reconstructs and queues a TLS Application Data packet for forwarding.
-        """
+    # ---- TLSRecordManager callbacks ------------------------------------------
+
+    def _on_tls_record(self, rec: "TLSRecord"):
+        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
+        self._tls_records[key].append(rec)
+        # brief log on first few records
+        if len(self._tls_records[key]) <= 3:
+            self.logger.log_message(
+                f"[TLS] 📄 Record ct={rec.content_type} ver={rec.version} len={rec.length} "
+                f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
+            )
+
+    def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
+        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
+        # Summarize interesting fields (SNI, ALPN, JA3/JA3S, version/cipher)
+        for msg in info.get("messages", []):
+            t = msg.get("type")
+            if t == "client_hello":
+                sni = (msg.get("sni") or
+                       (info.get("client_hello") or {}).get("sni"))
+                ja3 = (info.get("client_hello") or {}).get("ja3_md5")
+                ver = (info.get("client_hello") or {}).get("version")
+                alpn = (info.get("client_hello") or {}).get("alpn") or []
+                self.logger.log_message(
+                    f"[TLS][ClientHello] SNI={sni or 'N/A'} JA3={ja3 or 'N/A'} ver={ver or 'N/A'} ALPN={','.join(alpn) or 'N/A'} "
+                    f"flow={key}"
+                )
+            elif t == "server_hello":
+                ver = (info.get("server_hello") or {}).get("version")
+                cipher = (info.get("server_hello") or {}).get("cipher_suite")
+                ja3s = (info.get("server_hello") or {}).get("ja3s_md5")
+                self.logger.log_message(
+                    f"[TLS][ServerHello] ver={ver or 'N/A'} cipher={cipher or 'N/A'} JA3S={ja3s or 'N/A'} flow={key}"
+                )
+
+    def _on_tls_alert(self, rec: "TLSRecord", alert: Dict):
+        level = alert.get("level")
+        desc = alert.get("description")
         self.logger.log_message(
-            f"[SSL] 🔒 Encrypted Application Data ({len(data)} bytes) detected in session."
+            f"[TLS][Alert] level={level} desc={desc} {rec.direction} "
+            f"{rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
         )
-        self._tls_streams[canonical_key].append(data)
+
+    def _on_tls_application_data(self, rec: "TLSRecord"):
+        """
+        Optional: forward TLS Application Data using the last seen TCP seq/ack for that direction.
+        If the TLS policy blocked/quarantined this flow, TLSRecordManager already suppresses this callback.
+        """
+        # Use the same canonicalizer you use elsewhere
+        key = self._canon_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
+
+        # Cache the payload if you want to reassemble later
+        self._tls_streams.setdefault(key, []).append(rec.payload)
+
+        dir_key = (key, rec.direction)
+        last_pkt = self._last_tcp_pkt.get(dir_key)
+        if not last_pkt:
+            self.logger.log_message(
+                f"[TLS] 🔒 AppData {len(rec.payload)}B (no TCP context for forwarding) "
+                f"{rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+            )
+            return
 
         try:
+            # L2: reuse Ether if we saw it
+            ether = last_pkt[Ether] if last_pkt.haslayer(Ether) else None
+            base_eth = Ether(dst=ether.dst, src=ether.src) if ether else Ether()
 
-            # Build the forwarding packet from scratch to ensure correctness
-            forward_pkt = (
-                    Ether(
-                        dst=self.normalize_mac(original_pkt[Ether].dst),
-                        src=self.normalize_mac(original_pkt[Ether].src)
-                    ) /
-                    IP(src=session_info["src_ip"], dst=session_info["dst_ip"]) /
-                    TCP(
-                        sport=session_info["src_port"],
-                        dport=session_info["dst_port"],
-                        flags="PA",  # Push+Ack is typical for application data
-                        seq=original_pkt[TCP].seq,
-                        ack=original_pkt[TCP].ack,
-                        window=original_pkt[TCP].window
-                    ) /
-                    Raw(load=data)
+            # L3: decide v4 vs v6 WITHOUT indexing IPv6
+            is_v6 = last_pkt.haslayer(IPv6)
+            ip_layer = (IPv6(src=rec.src, dst=rec.dst) if is_v6
+                        else IP(src=rec.src, dst=rec.dst))
+
+            # L4: borrow seq/ack/window from the last observed TCP in this direction
+            if not last_pkt.haslayer(TCP):
+                raise RuntimeError("No TCP layer on last_pkt for forwarding context")
+            tcp_prev = last_pkt[TCP]
+            tcp_seg = TCP(
+                sport=rec.src_port,
+                dport=rec.dst_port,
+                flags="PA",
+                seq=tcp_prev.seq,
+                ack=tcp_prev.ack,
+                window=tcp_prev.window
             )
 
-            self.packet_writer.queue_packet(forward_pkt)
+            # Build full packet (note: conditional now only affects L2, not the whole chain)
+            out = base_eth / ip_layer / tcp_seg / Raw(load=rec.payload)
+
+            # Send via your writer (add iface if your writer requires it)
+            self.packet_writer.queue_packet(out)
             self.logger.log_message(
-                f"[TLS] 🔁 Queued TLS Application Data for forwarding to {session_info['dst_ip']}"
+                f"[TLS] 🔁 Forwarded AppData {len(rec.payload)}B {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+            )
+        except Exception as e:
+            self.logger.log_message(f"[TLS] ❌ Forwarding error: {e}")
+
+    def _on_tls_event(self, evt: Dict):
+        # Optional: compact log of notable events from TLSRecordManager
+        kind = evt.get("kind")
+        data = evt.get("data", {})
+        if kind in ("block", "quarantine", "policy_alert"):
+            self.logger.log_message(f"[TLS][Policy] {kind.upper()} {data}")
+
+    def _on_tls_decision(self, flow_key, rec: "TLSRecord", decision):
+        # Surface decisions (allow/alert/block/quarantine)
+        if decision.action != "allow":
+            self.logger.log_message(
+                f"[TLS][Decision] {decision.action.upper()} flow={flow_key} reason={decision.reason} tags={decision.tags}"
             )
 
-        except Exception as e:
-            self.logger.log_message(f"[TLS] ❌ Exception while building forwarding packet: {e}")
+    # ---- misc helpers ---------------------------------------------------------
+
+    def normalize_mac(self, mac: str) -> str:
+        return mac.replace('-', ':').lower()
 
 class IGMPManager:
     """
@@ -3032,7 +4819,8 @@ class DHCPServer:
 
     def __init__(self, router_logger, packet_writer, router_in_interface_name: str, dhcp_pool_start: str,
                  dhcp_pool_end: str, interfaces_config: dict, dhcp_relay_target_ip: str = None,
-                 dhcp6_prefix: str = None, dhcp6_relay_target_ip: str = None):
+                 dhcp6_prefix: str = None, dhcp6_relay_target_ip: str = None,
+                 *, allow_out_of_pool: bool = True, enforce_same_subnet: bool = True):  # NEW
         self.logger = router_logger
         self.packet_writer = packet_writer
         self.in_iface = router_in_interface_name
@@ -3041,11 +4829,23 @@ class DHCPServer:
         # --- DHCPv4 Configuration ---
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
-        self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}
+        self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}  # mac -> (ip, expiry)
         self.dynamic_ip_pool = list(self._generate_ip_pool(self.lease_pool_start, self.lease_pool_end))
-        self._static_leases: Dict[str, ipaddress.IPv4Address] = {}
+        self.available_ips = set(self.dynamic_ip_pool)
+        self._static_leases: Dict[str, ipaddress.IPv4Address] = {}  # mac -> ip
         self._lease_lock = threading.Lock()
+        self.LEASE_DURATION_SECONDS = 600
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
+
+        # NEW: policy flags
+        self.allow_out_of_pool = bool(allow_out_of_pool)
+        self.enforce_same_subnet = bool(enforce_same_subnet)
+
+        # Track non-pool leases so cleanup doesn't try to “return” them to pool
+        self._non_pool_leases: Set[ipaddress.IPv4Address] = set()  # NEW
+
+        # Reserved IPs (filled on first packet/when iface known)
+        self._reserved_ipv4: Set[ipaddress.IPv4Address] = set()  # NEW
 
         # --- DHCPv6 Configuration ---
         self.dhcp6_prefix = ipaddress.IPv6Network(dhcp6_prefix) if dhcp6_prefix else None
@@ -3056,28 +4856,106 @@ class DHCPServer:
 
         self.logger.log_message(
             f"[DHCP] Server initialized. DHCPv4 Relay target: {self.dhcp_relay_target_ip if self.dhcp_relay_target_ip else 'None'}. "
-            f"DHCPv6 Prefix: {self.dhcp6_prefix if self.dhcp6_prefix else 'None'}. DHCPv6 Relay target: {self.dhcp6_relay_target_ip if self.dhcp6_relay_target_ip else 'None'}")
+            f"DHCPv6 Prefix: {self.dhcp6_prefix if self.dhcp6_prefix else 'None'}. DHCPv6 Relay target: {self.dhcp6_relay_target_ip if self.dhcp6_relay_target_ip else 'None'} | "
+            f"allow_out_of_pool={self.allow_out_of_pool}, enforce_same_subnet={self.enforce_same_subnet}"
+        )
+
+    # --- NEW: admin API to force/pin a specific IPv4 to a MAC (any address) ---
+    def assign_specific_ipv4(self, mac: str, ip: str | ipaddress.IPv4Address, lease_seconds: int | None = None, force: bool = False) -> bool:
+        """
+        Pins 'ip' to 'mac' immediately (creates/updates a lease and static entry).
+        If 'force' is False, refuses if IP is in use by another MAC or reserved.
+        Returns True if assigned.
+        """
+        norm_mac = mac.lower()
+        ip_addr = ipaddress.IPv4Address(ip)
+
+        with self._lease_lock:
+            in_cfg = self._interfaces_config.get(self.in_iface, {})
+            net = in_cfg.get("network")
+            router_ip = in_cfg.get("ip_addr")
+
+            # Fill reserved set once
+            if router_ip and not self._reserved_ipv4:
+                r = ipaddress.IPv4Address(router_ip)
+                self._reserved_ipv4.add(r)
+                if net:
+                    self._reserved_ipv4.add(net.network_address)
+                    self._reserved_ipv4.add(net.broadcast_address)
+
+            # Subnet policy
+            if self.enforce_same_subnet and net and ip_addr not in net:
+                self.logger.log_message(f"[DHCP] ❌ assign_specific_ipv4 refused: {ip_addr} not in {net}")
+                return False
+
+            # Reserved policy
+            if ip_addr in self._reserved_ipv4:
+                self.logger.log_message(f"[DHCP] ❌ assign_specific_ipv4 refused: {ip_addr} is reserved")
+                return False
+
+            # In-use by someone else?
+            for other_mac, (other_ip, _) in self._leases.items():
+                if other_ip == ip_addr and other_mac != norm_mac and not force:
+                    self.logger.log_message(f"[DHCP] ❌ assign_specific_ipv4 refused: {ip_addr} leased to {other_mac}")
+                    return False
+
+            # If the IP is in pool, remove it from available
+            if ip_addr in self.available_ips:
+                self.available_ips.discard(ip_addr)
+            else:
+                # Mark as non-pool lease if it's outside configured pool
+                if ip_addr not in self.dynamic_ip_pool:
+                    self._non_pool_leases.add(ip_addr)
+
+            # Create/refresh lease + static map
+            expiry = time.time() + (lease_seconds if lease_seconds is not None else self.LEASE_DURATION_SECONDS)
+            self._leases[norm_mac] = (ip_addr, expiry)
+            self._static_leases[norm_mac] = ip_addr
+            self.logger.log_message(f"[DHCP] 📌 Pinned {ip_addr} to {norm_mac} (force={force}).")
+            return True
+
+    # --- NEW: admin API to release an IPv4 (by MAC or IP) ---
+    def release_ipv4(self, mac: str | None = None, ip: str | ipaddress.IPv4Address | None = None) -> bool:
+        with self._lease_lock:
+            if mac:
+                mac = mac.lower()
+                if mac in self._leases:
+                    ip_addr, _ = self._leases.pop(mac)
+                    self._static_leases.pop(mac, None)
+                else:
+                    return False
+            elif ip is not None:
+                ip_addr = ipaddress.IPv4Address(ip)
+                target_mac = next((m for m, (i, _) in self._leases.items() if i == ip_addr), None)
+                if target_mac is None:
+                    return False
+                self._leases.pop(target_mac)
+                self._static_leases.pop(target_mac, None)
+            else:
+                return False
+
+            # Return to pool only if it belongs to pool and not statically reserved elsewhere
+            if ip_addr in self.dynamic_ip_pool and ip_addr not in self._reserved_ipv4:
+                self.available_ips.add(ip_addr)
+                self._non_pool_leases.discard(ip_addr)
+            else:
+                self._non_pool_leases.discard(ip_addr)
+            self.logger.log_message(f"[DHCP] 🔓 Released lease for {ip_addr}.")
+            return True
 
     def _generate_ip_pool(self, start: ipaddress.IPv4Address, end: ipaddress.IPv4Address):
-        """Generate all usable IPs in the DHCP range."""
         current = int(start)
         end_int = int(end)
         while current <= end_int:
             yield ipaddress.IPv4Address(current)
             current += 1
+
     def get_ip_to_mac_bindings(self) -> Dict[str, str]:
-        """
-        Returns a thread-safe copy of the current IP-to-MAC lease bindings.
-        This is used by the ARPManager for Dynamic ARP Inspection.
-        The key is the IP address (str) and the value is the MAC address (str).
-        """
         with self._lease_lock:
-            # Invert the lease table for IP -> MAC lookup and filter for active leases
             bindings = {str(ip): mac for mac, (ip, expiry) in self._leases.items() if time.time() < expiry}
         return bindings
 
     def start(self):
-        """Starts the DHCP server's cleanup thread."""
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._cleanup_leases_loop, daemon=True,
                                                 name="DHCPLeaseCleanup")
@@ -3085,7 +4963,6 @@ class DHCPServer:
         self.logger.log_message("[DHCP] Cleanup thread started.")
 
     def stop(self):
-        """Stops the DHCP server's cleanup thread gracefully."""
         self._stop_event.set()
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
@@ -3098,22 +4975,40 @@ class DHCPServer:
                 expired_macs = [mac for mac, (ip, expiry) in self._leases.items() if expiry <= now]
                 for mac in expired_macs:
                     ip, _ = self._leases.pop(mac)
+                    # Only return to available set if the IP was part of the pool
+                    if (ip in self.dynamic_ip_pool) and (ip not in set(self._static_leases.values())):
+                        self.available_ips.add(ip)
+                    self._non_pool_leases.discard(ip)  # forget non-pool lease
+                    self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired.")
             self._stop_event.wait(60)
 
-    def _assign_ip(self, client_mac: str) -> ipaddress.IPv4Address | None:
-        """Assigns an IP address, prioritizing static leases over the dynamic pool."""
+    # --- CHANGED: now accepts an optional preferred_ip hint ---
+    def _assign_ip(self, client_mac: str, preferred_ip: ipaddress.IPv4Address | None = None) -> ipaddress.IPv4Address | None:
         norm_mac = client_mac.lower()
         self.logger.log_message(f"[DHCP] Assigning IP for {norm_mac}")
 
         with self._lease_lock:
-            # 1. Check for a static lease assignment first.
+            in_cfg = self._interfaces_config.get(self.in_iface, {})
+            net = in_cfg.get("network")
+            router_in_ip = in_cfg.get("ip_addr")
+
+            # Initialize reserved set if needed
+            if router_in_ip and not self._reserved_ipv4:
+                r = ipaddress.IPv4Address(router_in_ip)
+                self._reserved_ipv4.add(r)
+                if net:
+                    self._reserved_ipv4.add(net.network_address)
+                    self._reserved_ipv4.add(net.broadcast_address)
+
+            # 1) Static mapping wins
             if norm_mac in self._static_leases:
                 static_ip = self._static_leases[norm_mac]
+                self.available_ips.discard(static_ip)
                 self._leases[norm_mac] = (static_ip, time.time() + self.LEASE_DURATION_SECONDS)
                 self.logger.log_message(f"[DHCP] 📌 Assigned static IP {static_ip} to {norm_mac}.")
                 return static_ip
 
-            # 2. Check for an existing dynamic lease to renew.
+            # 2) Renew existing valid lease
             if norm_mac in self._leases:
                 assigned_ip, expiry = self._leases[norm_mac]
                 if time.time() < expiry:
@@ -3121,17 +5016,56 @@ class DHCPServer:
                     self.logger.log_message(f"[DHCP] 🏠 Renewed dynamic lease for {assigned_ip} to {norm_mac}")
                     return assigned_ip
 
-                    self._leases[norm_mac] = (potential_ip, time.time() + self.LEASE_DURATION_SECONDS)
-                    self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {potential_ip} to {norm_mac}.")
-                    return potential_ip
-        self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
+            # 3) Try preferred_ip (from client request) if allowed
+            if preferred_ip is not None:
+                # Policy checks
+                if preferred_ip in self._reserved_ipv4:
+                    self.logger.log_message(f"[DHCP] ⚠️ Client requested reserved IP {preferred_ip}; ignoring.")
+                elif self.enforce_same_subnet and net and preferred_ip not in net:
+                    self.logger.log_message(f"[DHCP] ⚠️ Client requested {preferred_ip} outside {net}; ignoring.")
+                else:
+                    # Not leased to someone else?
+                    in_use = any((ip == preferred_ip and mac != norm_mac) for mac, (ip, _) in self._leases.items())
+                    if not in_use:
+                        # If in pool, remove from available; else mark as non-pool lease
+                        if preferred_ip in self.available_ips:
+                            self.available_ips.discard(preferred_ip)
+                        elif preferred_ip not in self.dynamic_ip_pool:
+                            if self.allow_out_of_pool:
+                                self._non_pool_leases.add(preferred_ip)
+                            else:
+                                self.logger.log_message(f"[DHCP] ⚠️ Requested {preferred_ip} is out of pool and policy forbids it.")
+                                preferred_ip = None  # fall through to pool assignment
+                        if preferred_ip is not None:
+                            self._leases[norm_mac] = (preferred_ip, time.time() + self.LEASE_DURATION_SECONDS)
+                            self.logger.log_message(f"[DHCP] 🎯 Honored requested IP {preferred_ip} for {norm_mac}")
+                            return preferred_ip
+
+            # 4) Allocate from pool
+            try:
+                ip_from_pool = self.available_ips.pop()
+                self._leases[norm_mac] = (ip_from_pool, time.time() + self.LEASE_DURATION_SECONDS)
+                self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {ip_from_pool} to {norm_mac}.")
+                return ip_from_pool
+            except KeyError:
+                self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
+                return None
+
+    # --- HELPER: parse option 50 from scapy DHCP options (returns IPv4Address or None) ---
+    def _get_requested_ip_opt50(self, dhcp_layer) -> ipaddress.IPv4Address | None:  # NEW
+        try:
+            for opt in dhcp_layer.options:
+                if isinstance(opt, tuple) and opt[0] in ('requested_addr', 'requested_addr_ip', 50):
+                    val = opt[1]
+                    if isinstance(val, bytes):
+                        return ipaddress.IPv4Address(val)
+                    else:
+                        return ipaddress.IPv4Address(val)
+        except Exception:
+            pass
         return None
 
     def handle_packet(self, pkt: Packet, inbound_iface: str, find_route_function) -> bool:
-        """
-        Handles incoming DHCP packets (DISCOVER, REQUEST, SOLICIT, etc.).
-        Returns True if the packet was a DHCP packet handled by the server.
-        """
         in_iface_config = self._interfaces_config.get(self.in_iface)
         if not in_iface_config:
             self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' not found in configuration.")
@@ -3141,7 +5075,6 @@ class DHCPServer:
         router_in_ipv6 = in_iface_config.get("ipv6_addr")
         router_in_mac = in_iface_config.get("mac")
         if not router_in_ip or not router_in_mac:
-            # IPv6 address is optional for DHCPv4 only environments
             if pkt.haslayer(DHCP6) and not router_in_ipv6:
                 self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' missing IPv6 address.")
                 return False
@@ -3149,14 +5082,11 @@ class DHCPServer:
                 self.logger.log_message(f"[DHCP] Error: IN interface '{self.in_iface}' missing IP or MAC in configuration.")
                 return False
 
-        # --- Check for DHCPv4 or DHCPv6 packets ---
         is_dhcpv4 = pkt.haslayer(DHCP) and pkt.haslayer(UDP) and pkt[UDP].dport == 67
         is_dhcpv6 = pkt.haslayer(DHCP6) and pkt.haslayer(UDP) and pkt[UDP].dport == 547
-
         if not is_dhcpv4 and not is_dhcpv6:
             return False
 
-        # Determine if the request is from loopback by checking for an Ethernet layer
         is_loopback_request = not pkt.haslayer(Ether)
 
         # --- DHCPv4 Handling ---
@@ -3177,23 +5107,22 @@ class DHCPServer:
                     f"[DHCP] Received DHCP packet from {client_mac} but no message-type option. Ignoring.")
                 return True
 
-            self.logger.log_message(
-                f"[DHCP] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
+            self.logger.log_message(f"[DHCP] 📨 Received DHCP type {dhcp_message_type} from {client_mac} (xid: {bootp_layer.xid})")
 
-            # DHCPv4 Relay Agent logic
+            # Relay handling unchanged...
             if self.dhcp_relay_target_ip:
                 self.logger.log_message(f"[DHCP] Relaying packet from {client_mac} to {self.dhcp_relay_target_ip}.")
-                # Forward the packet to the relay target
                 relay_packet = IP(src=router_in_ip, dst=self.dhcp_relay_target_ip) / \
                                UDP(sport=67, dport=67) / pkt[BOOTP] / pkt[DHCP]
-                # The DHCP relay packet has a 'giaddr' field to indicate the gateway's IP
                 relay_packet[BOOTP].giaddr = router_in_ip
                 self.packet_writer.queue_packet(relay_packet, self.in_iface)
                 return True
 
-            # DHCPv4 Server Logic
-            if dhcp_message_type == 1:  # DHCP Discover
-                assigned_ip = self._assign_ip(client_mac)
+            # Extract requested IP (option 50) if present
+            requested_ip = self._get_requested_ip_opt50(dhcp_layer)
+
+            if dhcp_message_type == 1:  # DISCOVER
+                assigned_ip = self._assign_ip(client_mac, preferred_ip=requested_ip if self.allow_out_of_pool else None)
                 if assigned_ip:
                     dhcp_options = [
                         ("message-type", "offer"),
@@ -3209,15 +5138,26 @@ class DHCPServer:
                                BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
                                      siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
                                DHCP(options=dhcp_options)
-                    reply_packet = Ether(src=router_in_mac,
-                                         dst="ff:ff:ff:ff:ff:ff") / offer_l3 if not is_loopback_request else offer_l3
+                    reply_packet = Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / offer_l3 if not is_loopback_request else offer_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
                     self.logger.log_message(f"[DHCP] 📝 Sent DHCP Offer for {assigned_ip} to {client_mac}")
                 else:
                     self.logger.log_message(f"[DHCP] 🚫 No IP available for {client_mac}, dropping Discover.")
                 return True
-            elif dhcp_message_type == 3:  # DHCP Request
-                assigned_ip = self._assign_ip(client_mac)
+
+            elif dhcp_message_type == 3:  # REQUEST
+                # Also consider ciaddr on renewals if option 50 is absent
+                ciaddr_ip = None
+                try:
+                    if bootp_layer.ciaddr:
+                        ci = str(bootp_layer.ciaddr)
+                        if ci and ci != "0.0.0.0":
+                            ciaddr_ip = ipaddress.IPv4Address(ci)
+                except Exception:
+                    pass
+
+                preferred = requested_ip or ciaddr_ip
+                assigned_ip = self._assign_ip(client_mac, preferred_ip=preferred if self.allow_out_of_pool else None)
                 if assigned_ip:
                     dhcp_options = [
                         ("message-type", "ack"),
@@ -3233,8 +5173,7 @@ class DHCPServer:
                              BOOTP(op=2, xid=bootp_layer.xid, yiaddr=str(assigned_ip),
                                    siaddr=router_in_ip, chaddr=bootp_layer.chaddr) / \
                              DHCP(options=dhcp_options)
-                    reply_packet = Ether(src=router_in_mac,
-                                         dst=pkt[Ether].src) / ack_l3 if not is_loopback_request else ack_l3
+                    reply_packet = Ether(src=router_in_mac, dst=pkt[Ether].src) / ack_l3 if not is_loopback_request else ack_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
                     self.logger.log_message(f"[DHCP] 🛰️ Sent DHCP ACK for {assigned_ip} to {client_mac}")
                 else:
@@ -3242,8 +5181,7 @@ class DHCPServer:
                              UDP(sport=67, dport=68) / \
                              BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr) / \
                              DHCP(options=[("message-type", "nak"), "end"])
-                    reply_packet = Ether(src=router_in_mac,
-                                         dst="ff:ff:ff:ff:ff:ff") / nak_l3 if not is_loopback_request else nak_l3
+                    reply_packet = Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / nak_l3 if not is_loopback_request else nak_l3
                     self.packet_writer.queue_packet(reply_packet, self.in_iface)
                     self.logger.log_message(f"[DHCP] 🚫 Sent DHCP NAK to {client_mac} (no IP available or valid).")
                 return True

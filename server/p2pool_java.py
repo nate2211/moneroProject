@@ -7,21 +7,13 @@ import sys
 # In "dev" mode, we'll use a local JDK.
 # In "prod" mode (when packaged with PyInstaller), we'll look for the JDK
 # in a directory relative to the executable.
-DEV_MODE = True
 
-if DEV_MODE:
-    # --- Path to your local JDK (for development) ---
-    # Important: Make sure this path is correct for your system.
-    JDK_HOME = r"X:\Users\natem\PycharmProjects\moneroProject\server\tools\jdk-24.0.2"
+if hasattr(sys, '_MEIPASS'):
+    # PyInstaller creates a temp folder and stores path in _MEIPASS
+    base_path = sys._MEIPASS
 else:
-    # --- Path to the bundled JDK (for PyInstaller) ---
-    # This assumes the JDK will be in a 'jdk' folder next to your .exe
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.abspath(".")
-    JDK_HOME = os.path.join(base_path, "jdk-24.0.2")
+    base_path = os.path.abspath("tools")
+JDK_HOME = os.path.join(base_path, "jdk-24.0.2")
 
 
 # --- Platform-specific JVM path ---
