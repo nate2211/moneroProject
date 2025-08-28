@@ -1606,7 +1606,7 @@ class RouterTab(QWidget):
         self._console_panes = {}  # name → QPlainTextEdit
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Stratum/StratumConn" "DNS/mDNS/HTTPS",
+            "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Stratum/StratumConn", "DNS/mDNS/HTTPS",
                      "Handshake/SSL/TCP", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall"],
             "Minimal": ["General"],
         }
