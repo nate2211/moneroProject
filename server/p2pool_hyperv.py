@@ -349,7 +349,7 @@ class WinDivertManager:
     VIRTUAL_IFACE_NAME = "WinDivertBridge"
     DEFAULT_PIPE_NAME = r'\\.\pipe\windivert_to_python'
 
-    def __init__(self, router_manager, pipe_name=DEFAULT_PIPE_NAME,
+    def __init__(self, router_manager, code_output_manager, pipe_name=DEFAULT_PIPE_NAME,
                  idle_timeout=2.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
 
         # --- FIX 1: Handle long IPv6 extension header chains ---
@@ -359,6 +359,7 @@ class WinDivertManager:
 
         self.router_manager = router_manager
         self.logger = router_manager.router_logger
+        self.code_output_manager = code_output_manager
         self.pipe_name = pipe_name
 
         # handles/state (owned/closed by reader thread)
@@ -612,9 +613,14 @@ class WinDivertManager:
                                 if len(pkt) < 20:
                                     self.logger.log_message(
                                         f"[WinDivert] ❗ Skipping runt IPv4 packet of {len(pkt)} bytes.")
+                                    self.code_output_manager.submit_packet(pkt, inbound_iface="win-divert",
+                                                                           phase="skipping-runt-ipv4", component="win-divert-manager")
                                     continue
 
                                 self.router_manager.process_packet(IP(pkt), self.VIRTUAL_IFACE_NAME)
+                                self.code_output_manager.submit_packet(pkt, inbound_iface="win-divert",
+                                                                       phase="process-ipv4",
+                                                                       component="win-divert-manager")
                                 self.logger.log_message(f"[WinDivert] Processing IPv4 Packet")
 
                             elif ver == 6:
@@ -623,9 +629,14 @@ class WinDivertManager:
                                 if len(pkt) < 40:
                                     self.logger.log_message(
                                         f"[WinDivert] ❗ Skipping runt IPv6 packet of {len(pkt)} bytes.")
+                                    self.code_output_manager.submit_packet(pkt, inbound_iface="win-divert",
+                                                                           phase="skipping-runt-ipv6", component="win-divert-manager")
                                     continue
 
                                 self.router_manager.process_packet(IPv6(pkt), self.VIRTUAL_IFACE_NAME)
+                                self.code_output_manager.submit_packet(pkt, inbound_iface="win-divert",
+                                                                       phase="process-ipv6",
+                                                                       component="win-divert-manager")
                                 self.logger.log_message(f"[WinDivert] Processing IPv6 Packet")
 
                         self.frames_processed += 1
@@ -633,6 +644,9 @@ class WinDivertManager:
                         self.logger.log_message(
                             f"[WinDivert] ❗ process_packet error: '{e}' on packet data: {pkt.hex()}"
                         )
+                        self.code_output_manager.submit_packet(pkt, inbound_iface="win-divert",
+                                                               phase="packet-error",
+                                                               component="win-divert-manager")
 
                     frames_this_batch += 1
                     parsed_this_pass += 1

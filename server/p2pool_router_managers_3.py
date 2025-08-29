@@ -123,9 +123,7 @@ class MiniTemplateEngine:
         return "\n".join(lines)
 
 
-# ============================================================
-#   CodeOutputManager (drop-in, protocol-agnostic, self-wired)
-# ============================================================
+
 
 class CodeOutputManager:
     """
@@ -444,7 +442,7 @@ class CodeOutputManager:
         return ", ".join(items)
 
     def _chat_generate(self, prompt: str, retrieved: List[Tuple[str, Dict[str, Any]]]) -> str:
-        return self.chatgen.generate(prompt, retrieved)
+        return self.chatgen.generate(prompt)
 
     def submit_message(self, text: str, role: str = "user", tags: Optional[List[str]] = None) -> None:
         """

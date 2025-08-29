@@ -46,7 +46,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
-    ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
+    ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
     ESPManager
 from p2pool_tools import ParallelPythonTool
@@ -140,7 +140,7 @@ class PythonRouterManager:
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
         self.forwarding_manager = ForwardingManager(self.function_call_tracker, router_logger=self.router_logger,)
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
-        self.https_manager = HTTPSManager(router_logger)
+
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
         self.transport_manager = TransportManager(router_logger, self.packet_signer)
         self.isakmp_manager = None
@@ -156,11 +156,18 @@ class PythonRouterManager:
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(self)
+        self.windivert_manager = WinDivertManager(self, self.code_output_manager)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
+        self.parallel_python.inject_into(self.transport_manager.transport_dns, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_ssdp, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_dhcp)
+        self.parallel_python.inject_into(self.transport_manager.transport_quic)
+        self.parallel_python.inject_into(self.transport_manager.transport_http)
+        self.parallel_python.inject_into(self.transport_manager.transport_ssh)
+        self.parallel_python.inject_into(self.transport_manager.transport_ftp)
+        self.parallel_python.inject_into(self.transport_manager.transport_rdp)
         self.parallel_python.inject_into(self.packet_catcher)
-        self.parallel_python.inject_into(self.https_manager)
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1214,7 +1221,7 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
 
-            if packet.haslayer(TCP) or packet.haslayer(TLSClientHello) or packet.haslayer(TLSServerHello) or packet.haslayer(TLSFinished):
+            if packet.haslayer(TCP) or packet.haslayer(TLS):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet,
@@ -1222,14 +1229,9 @@ class PythonRouterManager:
                         phase="handled",
                         component="handshake",
                     )
+                    return
 
 
-            if packet.haslayer(TLS):
-                    if self.parallel_python.run_parallel(self.https_manager.handle_packet, packet, inbound_iface,
-                                                      return_type="bool", queue_name="https"):
-                        self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                               phase="handled", component="https")
-                        return
 
             if packet.haslayer(DNS) and packet[DNS].qr == 1:
                 if self.dns_manager.handle_response(packet, self._interfaces_config):
@@ -1691,6 +1693,9 @@ class PythonRouterManager:
                 self.interface_in_full_name
             )
             self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
+            self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
+            self.parallel_python.inject_into(self.transport_manager.transport_dhcp._active)
+
             self.isakmp_manager = ISAKMPManager(self.router_logger, self.packet_writer, self.notification_manager, self._interfaces_config)
             self.packet_catcher.notification_manager = self.notification_manager
             self.arp_manager.notification_manager = self.notification_manager
@@ -1710,7 +1715,10 @@ class PythonRouterManager:
 
             self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager,
                                                       self.rip_manager, self.packet_writer)
-
+            self.handshake_manager._tls_mgr.policy.ciphers.set_requirements(
+                require_pfs=True,
+                require_aead=True
+            )
             self.router_logger.log_message("\n--- Python Router Starting Services ---")
             self._stop_sniffing_event.clear()
 

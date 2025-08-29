@@ -1953,82 +1953,115 @@ class TLSPolicyDecision:
 
 class TLSPolicyEngine:
     """
-    Very small rule engine you can tweak on the fly.
+    Tiny, tunable rule engine used by TLSRecordManager on every TLS record.
+    Integrates TLSCipherManager for weak/acceptable cipher logic.
     """
     def __init__(self):
-        # constraints
-        self.min_tls_version = (3, 3)     # default: TLS 1.2 minimum (3,3)
+        # Base constraints / toggles
+        self.min_tls_version = (3, 3)     # default: TLS 1.2 (3,3) minimum
         self.block_legacy_ssl = True
-        self.block_weak_ciphers = {
-            # add more as needed
-            0x0004, 0x0005, 0x000A,         # RSA_DES_40, etc. (examples)
-            0x002F, 0x0035,                 # TLS_RSA_WITH_AES_128/256_CBC_SHA (old RSA w/o PFS)
-        }
+        # Historic hard blocklist (kept for continuity); treated as manual blocks in cipher manager
+        self.block_weak_ciphers = {0x0004, 0x0005, 0x000A, 0x002F, 0x0035}
         self.sni_denylist = set()          # {"bad.example", ".malware.tld"}
         self.ja3_denylist = set()          # {"<md5>"}
         self.alert_on_tls11_or_lower = True
 
+        # Cipher helper and policy
+        self.ciphers = TLSCipherManager()
+        for cid in self.block_weak_ciphers:
+            self.ciphers.block_suite(cid)
+        # Defaults (tweak anytime at runtime)
+        self.ciphers.set_requirements(
+            require_pfs=False,
+            require_aead=False,
+            forbid_cbc_sha1=False
+        )
+
+    # --- admin helpers (optional, nice to have) ---
     def set_min_tls(self, major: int, minor: int):
         self.min_tls_version = (major, minor)
 
     def add_blocked_sni(self, s: str): self.sni_denylist.add(s.lower())
     def add_blocked_ja3(self, j: str): self.ja3_denylist.add(j.lower())
-    def add_blocked_cipher(self, c: int): self.block_weak_ciphers.add(int(c))
+    def add_blocked_cipher(self, c: int):
+        self.block_weak_ciphers.add(int(c) & 0xFFFF)
+        self.ciphers.block_suite(int(c) & 0xFFFF)
 
+    # --- internals ---
     def _sni_is_blocked(self, sni: Optional[str]) -> Optional[str]:
-        if not sni: return None
+        if not sni:
+            return None
         q = sni.lower().strip(".")
         for pat in self.sni_denylist:
             if pat.startswith("."):
-                if q.endswith(pat[1:]): return f"SNI endswith {pat}"
-            elif q == pat or q.endswith("."+pat):
+                if q.endswith(pat[1:]):
+                    return f"SNI endswith {pat}"
+            elif q == pat or q.endswith("." + pat):
                 return f"SNI matches {pat}"
         return None
 
+    # --- MAIN: called by TLSRecordManager on every TLS record ---
     def evaluate(self, meta: Dict, rec: "TLSRecord", extra: Optional[Dict]) -> TLSPolicyDecision:
         """
-        Called on every record. We can use both per-session meta and the current record info.
+        Decide: allow | alert | block | quarantine.
+        Uses per-session 'meta' (built by TLSRecordManager) and the current record.
         """
-        # Legacy SSL detected by parser sentinel
+        # 1) Legacy SSL (incl. SSLv2 hello) -> block if enabled
         if meta.get("legacy_ssl") and self.block_legacy_ssl:
             return TLSPolicyDecision("block", "Legacy SSL detected", ["legacy"])
 
-        # ClientHello-derived constraints
-        if meta.get("client_hello"):
-            ch = meta["client_hello"]
-            # min version check (uses ClientHello legacy version)
+        # 2) ClientHello-derived checks
+        ch = meta.get("client_hello")
+        if ch:
+            # min version (client legacy_version or negotiated if already known)
             ver = ch.get("version_tuple") or meta.get("negotiated_version_tuple")
             if ver and ver < self.min_tls_version:
                 return TLSPolicyDecision("block", f"TLS version too low {ver}", ["min-tls"])
 
-            # sni denylist
+            # SNI denylist
             sni = meta.get("sni")
             sni_reason = self._sni_is_blocked(sni)
             if sni_reason:
                 return TLSPolicyDecision("block", sni_reason, ["sni"])
 
-            # ja3 denylist
+            # JA3 denylist
             if ch.get("ja3_md5") and ch["ja3_md5"].lower() in self.ja3_denylist:
                 return TLSPolicyDecision("block", f"JA3 {ch['ja3_md5']} denylisted", ["ja3"])
 
-            # weak cipher presence (alert if ONLY weak; block if negotiated weak later)
-            offered = set(ch.get("cipher_suites", []))
-            if offered and offered.issubset(self.block_weak_ciphers):
-                return TLSPolicyDecision("alert", "Only weak ciphers offered", ["weak-ciphers"])
+            # Offered-only-weak (heads-up alert, do not block yet)
+            suites = set(ch.get("cipher_suites") or [])
+            try:
+                if suites and self.ciphers.all_weak(suites):
+                    return TLSPolicyDecision("alert", "Only weak ciphers offered", ["weak-ciphers"])
+            except Exception:
+                # If anything goes wrong in classification, don't over-block
+                pass
 
-        # ServerHello-derived constraints
-        if meta.get("server_hello"):
-            sh = meta["server_hello"]
-            if sh.get("cipher_suite_int") in self.block_weak_ciphers:
-                return TLSPolicyDecision("block", "Weak negotiated cipher", ["weak-cipher"])
-            # alert on tls1.1 or lower
+        # 3) ServerHello-derived checks
+        sh = meta.get("server_hello")
+        if sh:
+            # Negotiated cipher strength
+            cs_int = sh.get("cipher_suite_int")
+            if cs_int is not None:
+                weak, reasons = self.ciphers.is_weak(cs_int, negotiated=True)
+                if weak:
+                    tag_str = ["weak-cipher"] + (reasons or [])
+                    return TLSPolicyDecision(
+                        "block",
+                        f"Weak negotiated cipher ({', '.join(reasons)})" if reasons else "Weak negotiated cipher",
+                        tag_str
+                    )
+
+            # Alert on negotiated TLS ≤ 1.1 (if toggle enabled)
             nv = sh.get("version_tuple")
             if self.alert_on_tls11_or_lower and nv and nv < (3, 3):
                 return TLSPolicyDecision("alert", f"Negotiated {nv} (TLS<=1.1)", ["old-tls"])
 
+            # JA3S denylist
             if sh.get("ja3s_md5") and sh["ja3s_md5"].lower() in self.ja3_denylist:
                 return TLSPolicyDecision("block", f"JA3S {sh['ja3s_md5']} denylisted", ["ja3s"])
 
+        # 4) Default
         return TLSPolicyDecision("allow")
 
 class TLSRecord:
@@ -2047,6 +2080,163 @@ class TLSRecord:
         self.dst_port = dst_port
         self.direction = direction  # "c2s" or "s2c"
 
+class TLSCipherManager:
+    """
+    Registry + policy helpers for TLS cipher suites.
+
+    • get_info(id)         -> details for a suite (name, flags)
+    • is_weak(id, …)       -> (bool, reasons[]) under current policy toggles
+    • acceptable(id, …)    -> bool (inverse of is_weak)
+    • all_weak(ids, …)     -> True iff NO acceptable suite exists in 'ids'
+    • to_name(id) / from_name(name)
+
+    Policy toggles (per-instance):
+      - require_pfs (default False)
+      - require_aead (default False)
+      - forbid_rsa_kx (default False)
+      - forbid_rc4 / forbid_3des / forbid_null / forbid_export / forbid_des40
+      - forbid_cbc_sha1 (treat CBC+SHA1 as weak)
+    """
+
+    def __init__(self):
+        # Minimal but practical registry. Extend as needed.
+        # Flags: pfs,aead,rc4,3des,cbc,null,export,des40,md5,sha1,rsa_kx,tls13
+        self._db = {
+            # --- TLS 1.3 ---
+            0x1301: {"name":"TLS_AES_128_GCM_SHA256",       "flags":{"aead","pfs","tls13"}},
+            0x1302: {"name":"TLS_AES_256_GCM_SHA384",       "flags":{"aead","pfs","tls13"}},
+            0x1303: {"name":"TLS_CHACHA20_POLY1305_SHA256", "flags":{"aead","pfs","tls13"}},
+
+            # --- AEAD ECDHE (good) ---
+            0xC02F: {"name":"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",       "flags":{"aead","pfs"}},
+            0xC030: {"name":"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",       "flags":{"aead","pfs"}},
+            0xC02B: {"name":"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",     "flags":{"aead","pfs"}},
+            0xC02C: {"name":"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",     "flags":{"aead","pfs"}},
+            0xCCA8: {"name":"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "flags":{"aead","pfs"}},
+            0xCCA9: {"name":"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256","flags":{"aead","pfs"}},
+
+            # --- Legacy RSA CBC (no PFS) ---
+            0x002F: {"name":"TLS_RSA_WITH_AES_128_CBC_SHA",         "flags":{"cbc","sha1","rsa_kx"}},
+            0x0035: {"name":"TLS_RSA_WITH_AES_256_CBC_SHA",         "flags":{"cbc","sha1","rsa_kx"}},
+
+            # --- Really old / bad ---
+            0x0004: {"name":"TLS_RSA_WITH_RC4_128_MD5",             "flags":{"rc4","md5","rsa_kx"}},
+            0x0005: {"name":"TLS_RSA_WITH_RC4_128_SHA",             "flags":{"rc4","sha1","rsa_kx"}},
+            0x000A: {"name":"TLS_RSA_WITH_3DES_EDE_CBC_SHA",        "flags":{"3des","cbc","sha1","rsa_kx"}},
+            # a few “marker” suites
+            0x0000: {"name":"TLS_NULL_WITH_NULL_NULL",              "flags":{"null"}},
+        }
+
+        # Quick reverse index by name (case-insensitive)
+        self._by_name = {v["name"].lower(): k for k, v in self._db.items()}
+
+        # Manual blocklist you can add to at runtime (IDs)
+        self.manual_block: set[int] = set()
+
+        # Policy toggles (defaults conservative but not too strict)
+        self.require_pfs = False
+        self.require_aead = False
+        self.forbid_rsa_kx = False
+        self.forbid_rc4 = True
+        self.forbid_3des = True
+        self.forbid_null = True
+        self.forbid_export = True
+        self.forbid_des40 = True
+        self.forbid_cbc_sha1 = False  # set True to nudge away from CBC/SHA1
+
+    # ---------- Admin / Lookup ----------
+    def add_suite(self, suite_id: int, name: str, *, flags: set[str]):
+        suite_id = int(suite_id) & 0xFFFF
+        self._db[suite_id] = {"name": name, "flags": set(flags)}
+        self._by_name[name.lower()] = suite_id
+
+    def block_suite(self, suite_id: int):
+        self.manual_block.add(int(suite_id) & 0xFFFF)
+
+    def from_name(self, name: str) -> Optional[int]:
+        return self._by_name.get(name.lower())
+
+    def to_name(self, suite_id: int) -> str:
+        info = self._db.get(int(suite_id) & 0xFFFF)
+        return info["name"] if info else f"0x{int(suite_id)&0xFFFF:04x}"
+
+    def get_info(self, suite_id: int) -> Dict[str, object]:
+        suite_id = int(suite_id) & 0xFFFF
+        info = self._db.get(suite_id, {"name": f"0x{suite_id:04x}", "flags": set()})
+        return {"id": suite_id, "name": info["name"], "flags": set(info["flags"])}
+
+    # ---------- Policy Evaluation ----------
+    def set_requirements(self, *, require_pfs: Optional[bool] = None,
+                         require_aead: Optional[bool] = None,
+                         forbid_rsa_kx: Optional[bool] = None,
+                         forbid_rc4: Optional[bool] = None,
+                         forbid_3des: Optional[bool] = None,
+                         forbid_null: Optional[bool] = None,
+                         forbid_export: Optional[bool] = None,
+                         forbid_des40: Optional[bool] = None,
+                         forbid_cbc_sha1: Optional[bool] = None):
+        for k, v in locals().items():
+            if k in ("self",) or v is None: continue
+            setattr(self, k, v)
+
+    def _reasons_for_suite(self, suite_id: int, *, negotiated: bool = False) -> list[str]:
+        info = self.get_info(suite_id)
+        f = info["flags"]
+        reasons = []
+
+        if suite_id in self.manual_block:
+            reasons.append("manual-block")
+
+        if self.forbid_null and ("null" in f):
+            reasons.append("null-cipher")
+        if self.forbid_export and ("export" in f):
+            reasons.append("export-cipher")
+        if self.forbid_des40 and ("des40" in f):
+            reasons.append("des40")
+        if self.forbid_rc4 and ("rc4" in f):
+            reasons.append("rc4")
+        if self.forbid_3des and ("3des" in f):
+            reasons.append("3des")
+        if self.forbid_cbc_sha1 and ("cbc" in f and "sha1" in f):
+            reasons.append("cbc+sha1")
+
+        if self.require_aead and ("aead" not in f):
+            reasons.append("no-aead")
+        if self.require_pfs:
+            # TLS1.3 implies PFS; for <=1.2 we rely on ECDHE/DHE flag 'pfs'
+            if ("pfs" not in f) and ("tls13" not in f):
+                reasons.append("no-pfs")
+
+        if self.forbid_rsa_kx and ("rsa_kx" in f):
+            reasons.append("rsa-kx")
+
+        return reasons
+
+    def is_weak(self, suite_id: int, *, negotiated: bool = False) -> tuple[bool, list[str]]:
+        reasons = self._reasons_for_suite(suite_id, negotiated=negotiated)
+        return (len(reasons) > 0, reasons)
+
+    def acceptable(self, suite_id: int) -> bool:
+        weak, _ = self.is_weak(suite_id)
+        return not weak
+
+    def all_weak(self, suites: set[int] | list[int]) -> bool:
+        """
+        True if NONE of the suites satisfy current policy (i.e., client only offers weak).
+        Unknown suites are treated as 'possibly acceptable' (don’t cause false alerts).
+        """
+        any_ok = False
+        for s in suites or []:
+            s = int(s) & 0xFFFF
+            # Unknown suite: err on the side of 'maybe OK' (treat as acceptable)
+            if s not in self._db and s not in self.manual_block:
+                any_ok = True
+                break
+            if self.acceptable(s):
+                any_ok = True
+                break
+        return not any_ok
+
 class TLSRecordManager:
     """
     Passive TLS/SSL record parser with TCP-stream-aware reassembly… now with:
@@ -2054,6 +2244,11 @@ class TLSRecordManager:
       • Lightweight policy engine -> decisions (allow/alert/block/quarantine)
       • Event queue + callbacks (on_event/on_decision) for your app to act on
       • Optional soft enforcement: suppress app-data callback when blocked
+
+    Also integrates TLSCipherManager for:
+      • Naming negotiated cipher suites
+      • Weak/acceptable evaluation of offered and negotiated suites
+      • Heads-up policy_alert events when only-weak offered or weak cipher negotiated
     """
 
     # Content types
@@ -2078,7 +2273,7 @@ class TLSRecordManager:
         self._stats: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, int]] = \
             defaultdict(lambda: {"records": 0, "handshakes": 0, "alerts": 0, "appdata": 0, "ccs": 0, "legacy": 0})
 
-        # NEW: per-session metadata (higher-level state)
+        # Per-session metadata (higher-level state)
         self._meta: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Dict] = defaultdict(lambda: {
             "first_seen": time.time(), "last_seen": None,
             "client": None, "server": None,  # (ip,port) filled on first ClientHello or first direction seen
@@ -2087,6 +2282,10 @@ class TLSRecordManager:
             "server_hello": None,   # parsed dict + ja3s
             "negotiated_version": None, "negotiated_version_tuple": None,
             "negotiated_cipher": None,
+            "negotiated_cipher_name": None,
+            "negotiated_cipher_weak": None,
+            "negotiated_cipher_reasons": [],
+            "offered_only_weak": None,
             "app_bytes": {self.C2S: 0, self.S2C: 0},
             "alerts": [], "ccs_seen": False, "legacy_ssl": False,
             "blocked": False, "quarantined": False,
@@ -2100,14 +2299,17 @@ class TLSRecordManager:
         self.on_change_cipher_spec: Optional[Callable[[TLSRecord], None]] = None
         self.on_legacy_ssl: Optional[Callable[[TLSRecord], None]] = None
 
-        # NEW: policy engine + callbacks + event queue
-        self.policy = TLSPolicyEngine()
-        self.on_decision: Optional[Callable[[Tuple, TLSRecord, TLSPolicyDecision], None]] = None
+        # Policy engine + callbacks + event queue
+        # NOTE: Code expects TLSPolicyEngine defined elsewhere with `.evaluate(meta, rec, extra)`
+        self.policy = TLSPolicyEngine()  # provided in your codebase
+        self.on_decision: Optional[Callable[[Tuple, TLSRecord, "TLSPolicyDecision"], None]] = None
         self.on_event: Optional[Callable[[Dict], None]] = None
         self._event_queue: List[Dict] = []
 
-    # ------------- Utilities -------------
+        # Cipher helper (naming + weak/acceptable checks)
+        self.ciphers = TLSCipherManager()
 
+    # ------------- Utilities -------------
 
     @staticmethod
     def _looks_like_tls_header(buf: bytes) -> bool:
@@ -2119,8 +2321,10 @@ class TLSRecordManager:
         evt = {"ts": time.time(), "flow": key, "kind": kind, "data": payload}
         self._event_queue.append(evt)
         if self.on_event:
-            try: self.on_event(evt)
-            except Exception: pass
+            try:
+                self.on_event(evt)
+            except Exception:
+                pass
 
     def pop_events(self) -> List[Dict]:
         out, self._event_queue = self._event_queue, []
@@ -2150,14 +2354,16 @@ class TLSRecordManager:
 
         while True:
             if len(buf) < 5:
-                if _ssl_v2_hello_possible(buf): break
+                if _ssl_v2_hello_possible(buf):
+                    break
                 return out
 
             if not self._looks_like_tls_header(buf):
                 if _ssl_v2_hello_possible(buf):
                     rec_len = ((buf[0] & 0x7F) << 8) | buf[1]
                     total_len = 2 + rec_len
-                    if len(buf) < total_len: break
+                    if len(buf) < total_len:
+                        break
                     payload = bytes(buf[2:total_len]); del buf[:total_len]
                     rec = TLSRecord(
                         content_type=0x80, version=(2, 0),
@@ -2170,13 +2376,15 @@ class TLSRecordManager:
                     # mark legacy in meta
                     self._meta[key]["legacy_ssl"] = True
                     continue
+                # try to re-sync
                 del buf[:1]
                 continue
 
             ct, vmaj, vmin = buf[0], buf[1], buf[2]
             rec_len = struct.unpack("!H", buf[3:5])[0]
             total_len = 5 + rec_len
-            if len(buf) < total_len: break
+            if len(buf) < total_len:
+                break
 
             payload = bytes(buf[5:total_len])
             del buf[:total_len]
@@ -2192,7 +2400,8 @@ class TLSRecordManager:
     def feed_tcp_segment(self, canonical_key, is_c2s: bool, payload: bytes,
                          src_ip: str, src_port: int, dst_ip: str, dst_port: int,
                          ts: Optional[float] = None):
-        if not payload: return
+        if not payload:
+            return
         ts = ts or time.time()
         direction = self.C2S if is_c2s else self.S2C
 
@@ -2256,8 +2465,10 @@ class TLSRecordManager:
             # Run policy on every record
             decision = self.policy.evaluate(m, rec, decision_extra)
             if self.on_decision:
-                try: self.on_decision(canonical_key, rec, decision)
-                except Exception: pass
+                try:
+                    self.on_decision(canonical_key, rec, decision)
+                except Exception:
+                    pass
 
             if decision.action in ("block", "quarantine"):
                 # mark meta; let outer system actually enforce (drop/ban/etc.)
@@ -2305,7 +2516,8 @@ class TLSRecordManager:
             msg_type = payload[i]
             msg_len = int.from_bytes(payload[i+1:i+4], "big")
             i += 4
-            if i + msg_len > len(payload): break
+            if i + msg_len > len(payload):
+                break
             body = payload[i:i+msg_len]; i += msg_len
 
             entry = {"type_id": msg_type, "type": self._hs_name(msg_type)}
@@ -2316,11 +2528,22 @@ class TLSRecordManager:
                 m = self._meta[key]
                 m["client_hello"] = ch
                 m["sni"] = ch.get("sni") or m.get("sni")
-                if ch.get("alpn"): m["alpn"] = ch["alpn"]
+                if ch.get("alpn"):
+                    m["alpn"] = ch["alpn"]
                 if ch.get("version_tuple"):
                     m["negotiated_version"] = ch["version"]
                     m["negotiated_version_tuple"] = ch["version_tuple"]
-                self._emit_event(key, "client_hello", {"dir": direction, "sni": m["sni"], "ja3": ch.get("ja3_md5")})
+
+                # Offered-only-weak detection -> heads-up event
+                m["offered_only_weak"] = ch.get("only_weak_offered")
+                if ch.get("only_weak_offered") is True:
+                    self._emit_event(
+                        key, "policy_alert",
+                        {"reason": "Only weak ciphers offered", "tags": ["weak-ciphers"]}
+                    )
+
+                self._emit_event(key, "client_hello",
+                                 {"dir": direction, "sni": m["sni"], "ja3": ch.get("ja3_md5")})
 
             elif msg_type == 2:  # ServerHello
                 sh = self._parse_server_hello(body)
@@ -2331,7 +2554,24 @@ class TLSRecordManager:
                     m["negotiated_version"] = sh["version"]
                     m["negotiated_version_tuple"] = sh["version_tuple"]
                 m["negotiated_cipher"] = sh.get("cipher_suite")
-                self._emit_event(key, "server_hello", {"dir": direction, "ja3s": sh.get("ja3s_md5")})
+
+                # Name + weakness classification of negotiated cipher
+                cs_int = sh.get("cipher_suite_int")
+                if cs_int is not None:
+                    name = self.ciphers.to_name(cs_int)
+                    weak, reasons = self.ciphers.is_weak(cs_int, negotiated=True)
+                    m["negotiated_cipher_name"] = name
+                    m["negotiated_cipher_weak"] = weak
+                    m["negotiated_cipher_reasons"] = reasons or []
+                    if weak:
+                        self._emit_event(
+                            key, "policy_alert",
+                            {"reason": f"Weak negotiated cipher ({','.join(reasons)})" if reasons else "Weak negotiated cipher",
+                             "tags": ["weak-cipher"], "cipher": name}
+                        )
+
+                self._emit_event(key, "server_hello",
+                                 {"dir": direction, "ja3s": sh.get("ja3s_md5")})
 
             info["messages"].append(entry)
         return info
@@ -2339,9 +2579,11 @@ class TLSRecordManager:
     def _parse_client_hello(self, body: bytes) -> Dict:
         out = {"hello": "client", "sni": None, "version": None, "version_tuple": None,
                "cipher_suites_count": None, "cipher_suites": [], "extensions": [],
-               "groups": [], "ec_point_formats": [], "alpn": [], "ja3": None, "ja3_md5": None}
+               "groups": [], "ec_point_formats": [], "alpn": [], "ja3": None, "ja3_md5": None,
+               "only_weak_offered": None}
         try:
-            if len(body) < 38: return out
+            if len(body) < 38:
+                return out
             # legacy_version
             ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
             idx = 2 + 32  # random
@@ -2354,7 +2596,8 @@ class TLSRecordManager:
             out["cipher_suites"] = suites
             idx += cs_len
             comp_len = body[idx]; idx += 1 + comp_len
-            if idx + 2 > len(body): return out
+            if idx + 2 > len(body):
+                return out
             ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
             end = idx + ext_total
             ext_types = []
@@ -2366,13 +2609,14 @@ class TLSRecordManager:
                 ext_data = body[idx+4:idx+4+ext_len]
                 idx += 4 + ext_len
                 ext_types.append(ext_type)
-                # SNI
+                # SNI (type 0)
                 if ext_type == 0 and len(ext_data) >= 5:
                     j = 2
                     while j + 3 < len(ext_data):
                         name_type = ext_data[j]; j += 1
                         nlen = struct.unpack("!H", ext_data[j:j+2])[0]; j += 2
-                        if j + nlen > len(ext_data): break
+                        if j + nlen > len(ext_data):
+                            break
                         servername = ext_data[j:j+nlen].decode("idna", errors="ignore"); j += nlen
                         if name_type == 0 and servername:
                             sni = servername; break
@@ -2385,7 +2629,8 @@ class TLSRecordManager:
                 elif ext_type == 11 and len(ext_data) >= 1:
                     ln = ext_data[0]
                     for k in range(ln):
-                        if 1+k < len(ext_data): ecpts.append(ext_data[1+k])
+                        if 1+k < len(ext_data):
+                            ecpts.append(ext_data[1+k])
                 # ALPN (16)
                 elif ext_type == 16 and len(ext_data) >= 2:
                     ln = struct.unpack("!H", ext_data[:2])[0]
@@ -2404,16 +2649,24 @@ class TLSRecordManager:
             ver_u16 = (ver[0] << 8) | ver[1]
             ja3, jmd5 = self._compute_ja3(ver_u16, suites, ext_types, groups, ecpts)
             out["ja3"] = ja3; out["ja3_md5"] = jmd5
+
+            # Classify the offered list against current cipher policy
+            try:
+                out["only_weak_offered"] = self.ciphers.all_weak(set(suites))
+            except Exception:
+                out["only_weak_offered"] = None
         except Exception:
             pass
         return out
 
     def _parse_server_hello(self, body: bytes) -> Dict:
         out = {"hello": "server", "version": None, "version_tuple": None,
-               "cipher_suite": None, "cipher_suite_int": None,
+               "cipher_suite": None, "cipher_suite_int": None, "cipher_suite_name": None,
+               "cipher_weak": None, "cipher_reasons": [],
                "extensions": [], "ja3s": None, "ja3s_md5": None}
         try:
-            if len(body) < 38: return out
+            if len(body) < 38:
+                return out
             ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
             idx = 2 + 32
             sid_len = body[idx]; idx += 1 + sid_len
@@ -2421,7 +2674,8 @@ class TLSRecordManager:
             out["cipher_suite_int"] = cs
             out["cipher_suite"] = f"0x{cs:04x}"
             # compression(1)
-            if idx < len(body): idx += 1
+            if idx < len(body):
+                idx += 1
             # extensions
             if idx + 2 <= len(body):
                 ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
@@ -2433,8 +2687,19 @@ class TLSRecordManager:
                     idx += 4 + el
                     ext_types.append(et)
                 out["extensions"] = ext_types
+
+            # Human-friendly name + weakness classification
+            try:
+                name = self.ciphers.to_name(cs)
+                weak, reasons = self.ciphers.is_weak(cs, negotiated=True)
+            except Exception:
+                name, weak, reasons = f"0x{cs:04x}", None, []
+            out["cipher_suite_name"] = name
+            out["cipher_weak"] = weak
+            out["cipher_reasons"] = reasons
+
             ver_u16 = (ver[0] << 8) | ver[1]
-            ja3s, jmd5 = self._compute_ja3s(ver_u16, cs, out["extensions"])
+            ja3s, jmd5 = self._compute_ja3s(ver_u16, cs, out.get("extensions", []))
             out["ja3s"] = ja3s; out["ja3s_md5"] = jmd5
         except Exception:
             pass
@@ -2457,7 +2722,12 @@ class TLSRecordManager:
             "first_seen": m.get("first_seen"), "last_seen": m.get("last_seen"),
             "client": m.get("client"), "server": m.get("server"),
             "sni": m.get("sni"), "alpn": m.get("alpn"),
-            "version": m.get("negotiated_version"), "cipher": m.get("negotiated_cipher"),
+            "version": m.get("negotiated_version"),
+            "cipher": m.get("negotiated_cipher"),
+            "cipher_name": m.get("negotiated_cipher_name"),
+            "cipher_weak": m.get("negotiated_cipher_weak"),
+            "cipher_reasons": m.get("negotiated_cipher_reasons"),
+            "offered_only_weak": m.get("offered_only_weak"),
             "ja3_md5": (m.get("client_hello") or {}).get("ja3_md5"),
             "ja3s_md5": (m.get("server_hello") or {}).get("ja3s_md5"),
             "app_bytes": m.get("app_bytes"), "alerts": m.get("alerts"),
@@ -2496,6 +2766,14 @@ class TLSRecordManager:
         m["blocked"] = False
         m["quarantined"] = False
         self._emit_event(canonical_key, "allow", {"reason": reason})
+
+    # --- Convenience: tweak cipher policy at runtime ---
+    def set_cipher_requirements(self, **kwargs):
+        """
+        Proxy to TLSCipherManager.set_requirements(require_pfs=..., require_aead=...,
+        forbid_cbc_sha1=..., forbid_rc4=..., etc.)
+        """
+        self.ciphers.set_requirements(**kwargs)
 
 class HandshakeManager:
     """

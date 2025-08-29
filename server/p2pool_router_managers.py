@@ -4,6 +4,7 @@ import hmac
 import os
 import queue
 import random
+import re
 import socket
 import string
 import struct
@@ -21,7 +22,7 @@ from scapy.arch import get_if_hwaddr
 from scapy.contrib.ikev2 import IKEv2
 from scapy.fields import StrLenField
 from scapy.layers.dhcp import DHCP, BOOTP
-from scapy.layers.dns import  DNS
+from scapy.layers.dns import DNS, DNSQR, DNSRR
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply
 from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
@@ -1440,6 +1441,1537 @@ class ESPManager:
                     self.log.log_message(f"[ESP] 🧹 Cleanup: removed {len(expired)} {table_name} mappings")
             self._last_cleanup = now
 
+class TransportHTTPManager:
+    def __init__(self, logger): self.logger = logger
+    def handle(self, pkt, src, dst, sport, dport):
+        self.logger.log_message(f"[Transport][🧵 TCP][🌐 HTTP] Port 80 traffic detected from {src}:{sport} to {dst}:{dport}.")
+
+class TransportSSHManager:
+    def __init__(self, logger): self.logger = logger
+    def handle(self, pkt, src, dst, sport, dport):
+        self.logger.log_message(f"[Transport][🧵 TCP][💻 SSH] Port 22 traffic detected from {src}:{sport} to {dst}:{dport}.")
+
+class TransportFTPManager:
+    def __init__(self, logger): self.logger = logger
+    def handle(self, pkt, src, dst, sport, dport):
+        self.logger.log_message(f"[Transport][🧵 TCP][📁 FTP] Port 21 (Control) traffic detected from {src}:{sport} to {dst}:{dport}.")
+
+class TransportRDPManager:
+    def __init__(self, logger): self.logger = logger
+    def handle(self, pkt, src, dst, sport, dport):
+        self.logger.log_message(f"[Transport][🧵 TCP][🖥️ RDP] Port 3389 traffic detected from {src}:{sport} to {dst}:{dport}.")
+
+class TransportQUICManager:
+    """
+    QUIC (UDP/443) parser & logger.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+
+    Features:
+      • Detects Long vs Short header, logs Version/DCID/SCID/spin/key-phase
+      • Best-effort frame peek (STREAM/CRYPTO/ACK/PING/CC/etc.)
+      • De-dupes STREAM logs via a time-based cache (configurable timeout)
+      • Emoji-rich logs consistent with TransportManager style
+    """
+
+    def __init__(self, router_logger, stream_timeout: int = 300):
+        self.logger = router_logger
+        self.logged_quic_streams: Dict[Tuple[str, str, int], float] = {}
+        self.QUIC_STREAM_TIMEOUT = stream_timeout
+        self._last_gc = time.time()
+        self.logger.log_message("[Transport][🌐 QUIC] Manager ready.")
+
+    # -------------------- Public entry point --------------------
+
+    def handle(
+        self,
+        packet: Packet,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        inbound_iface: Optional[str] = None,
+    ) -> bool:
+        """
+        Returns True if handled as QUIC (even if payload missing), else False.
+        """
+        if Raw is None:
+            return False
+
+        # QUIC is typically UDP/443; upstream should gate, but we accept any UDP pair.
+        if not packet.haslayer(Raw):
+            # Keep parity with previous behavior for 443
+            if dport == 443 or sport == 443:
+                self.logger.log_message(
+                    f"[Transport][🚀 UDP][🌐 QUIC] UDP on port 443 detected, but no Raw payload."
+                )
+                return True
+            return False
+
+        raw_data = bytes(packet[Raw].load) or b""
+        if not raw_data:
+            return True
+
+        first_byte = raw_data[0]
+        is_long_header = (first_byte & 0x80) == 0x80
+
+        try:
+            if is_long_header:
+                self._log_long_header(raw_data, first_byte, src_ip, sport)
+                dcid_len, scid_len = self._extract_cid_lengths(raw_data)
+                header_len = 7 + dcid_len + scid_len
+            else:
+                # Short header: heuristic DCID length (commonly 8 in many deployments)
+                dcid_len = 8
+                dcid = raw_data[1:1 + dcid_len].hex() if len(raw_data) > 1 + dcid_len else "?"
+                spin_bit = (first_byte & 0x20) >> 5
+                key_phase_bit = (first_byte & 0x04) >> 2
+                key_phase_str = "Updated Keys" if key_phase_bit else "Initial Keys"
+                self.logger.log_message(
+                    f"[Transport][🚀 UDP][🌐 QUIC] Short Header from {src_ip}:{sport} | "
+                    f"DCID: {dcid} | Spin Bit: {spin_bit} | Key Phase: {key_phase_str}"
+                )
+                header_len = 1 + dcid_len
+
+            if len(raw_data) > header_len:
+                self._inspect_quic_frames(raw_data[header_len:], src_ip, dst_ip)
+        except IndexError:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🌐 QUIC] Malformed QUIC header from {src_ip}:{sport}"
+            )
+        finally:
+            self._maybe_gc()
+        return True
+
+    # -------------------- Header helpers --------------------
+
+    def _log_long_header(self, raw: bytes, first_byte: int, src_ip: str, sport: int) -> None:
+        if len(raw) < 6:
+            raise IndexError
+        packet_type = (first_byte & 0x30) >> 4
+        version_hex = raw[1:5].hex()
+        dcid_len = raw[5]
+        scid_len = raw[6 + dcid_len] if len(raw) > 6 + dcid_len else 0
+        dcid = raw[6:6 + dcid_len].hex() if len(raw) >= 6 + dcid_len else "?"
+        scid = raw[7 + dcid_len:7 + dcid_len + scid_len].hex() if len(raw) >= 7 + dcid_len + scid_len else "?"
+        packet_type_str = {0: "Initial", 1: "0-RTT", 2: "Handshake", 3: "Retry"}.get(packet_type, "Unknown")
+        self.logger.log_message(
+            f"[Transport][🚀 UDP][🌐 QUIC] Long Header ({packet_type_str}) from {src_ip}:{sport} | "
+            f"Version: 0x{version_hex} | DCID: {dcid} | SCID: {scid}"
+        )
+
+    def _extract_cid_lengths(self, raw: bytes) -> Tuple[int, int]:
+        dcid_len = raw[5]
+        scid_len = raw[6 + dcid_len] if len(raw) > 6 + dcid_len else 0
+        return dcid_len, scid_len
+
+    # -------------------- Frame inspector --------------------
+
+    def _inspect_quic_frames(self, data: bytes, src_ip: str, dst_ip: str) -> None:
+        """
+        Best-effort peek at common QUIC frames. De-dupes STREAM logs by (src,dst,stream_id).
+        """
+        i = 0
+        while i < len(data):
+            try:
+                first = data[i]
+                # STREAM frame 0x08..0x0f
+                if 0x08 <= first <= 0x0F:
+                    has_len = (first & 0x02)
+                    has_off = (first & 0x04)
+                    offset = 1
+
+                    stream_id, n = self._parse_quic_varint(data[i + offset:])
+                    if n == 0:
+                        break
+                    offset += n
+
+                    # de-dupe & GC
+                    key = (src_ip, dst_ip, stream_id)
+                    now = time.time()
+                    if key not in self.logged_quic_streams:
+                        self.logger.log_message(f"[Transport][🌐 QUIC][Frame] STREAM | New Stream ID: {stream_id}")
+                    self.logged_quic_streams[key] = now
+
+                    if has_off:
+                        _, n = self._parse_quic_varint(data[i + offset:])
+                        offset += n
+                    if has_len:
+                        data_len, n = self._parse_quic_varint(data[i + offset:])
+                        offset += n
+                    else:
+                        data_len = len(data) - (i + offset)
+                    i += offset + max(0, data_len)
+                    continue
+
+                # A few common/interesting frame types (IDs mirror prior TransportManager)
+                if first == 0x24:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] RESET_STREAM_AT")
+                    i = len(data)
+                elif first == 0x14:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] STREAMS_BLOCKED")
+                    i = len(data)
+                elif first == 0xA4:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK_FREQUENCY")
+                    i = len(data)
+                elif first in (0x02, 0x03):
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK")
+                    i = len(data)
+                elif first == 0x06:
+                    # CRYPTO frame (draft-ish): 1 | offset(4) | len(4) | data
+                    if len(data) >= i + 9:
+                        offset_val, length = struct.unpack("!II", data[i + 1:i + 9])
+                        self.logger.log_message(
+                            f"[Transport][🌐 QUIC][Frame] CRYPTO | Offset: {offset_val} | Length: {length}"
+                        )
+                        i += 9 + length
+                    else:
+                        self.logger.log_message(f"[Transport][🌐 QUIC][Frame] Malformed CRYPTO")
+                        break
+                elif first == 0x00:
+                    i += 1  # PADDING
+                elif first == 0x01:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] PING")
+                    i += 1
+                elif first in (0x1C, 0x1D):
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] CONNECTION_CLOSE")
+                    i = len(data)
+                else:
+                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] Unknown frame type: 0x{first:02x}")
+                    break
+            except (struct.error, IndexError):
+                self.logger.log_message("[Transport][🌐 QUIC][Frame] Malformed frame or end of packet reached.")
+                break
+
+    # -------------------- Varint --------------------
+
+    def _parse_quic_varint(self, data: bytes) -> Tuple[int, int]:
+        """
+        Returns (value, bytes_consumed) or (0,0) on failure.
+        """
+        if not data:
+            return 0, 0
+        b0 = data[0]
+        lbits = b0 >> 6
+        try:
+            if lbits == 0b00:
+                return b0 & 0x3F, 1
+            elif lbits == 0b01:
+                if len(data) < 2:
+                    return 0, 0
+                val = struct.unpack("!H", data[:2])[0]
+                return val & 0x3FFF, 2
+            elif lbits == 0b10:
+                if len(data) < 4:
+                    return 0, 0
+                val = struct.unpack("!I", data[:4])[0]
+                return val & 0x3FFFFFFF, 4
+            else:
+                if len(data) < 8:
+                    return 0, 0
+                val = struct.unpack("!Q", data[:8])[0]
+                return val & 0x3FFFFFFFFFFFFFFF, 8
+        except (struct.error, IndexError):
+            return 0, 0
+
+    # -------------------- GC --------------------
+
+    def _maybe_gc(self) -> None:
+        now = time.time()
+        if now - self._last_gc < 60:
+            return
+        expired = [
+            k for k, ts in self.logged_quic_streams.items()
+            if now - ts > self.QUIC_STREAM_TIMEOUT
+        ]
+        for k in expired:
+            self.logged_quic_streams.pop(k, None)
+        if expired:
+            self.logger.log_message(f"[Transport][🌐 QUIC] 🧹 GC pruned {len(expired)} stream entries")
+        self._last_gc = now
+
+class TransportSSDPManager:
+    """
+    SSDP/UPnP logger & helper.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+          Returns True if this was SSDP and got handled/logged.
+
+    Features:
+      • Parses NOTIFY, M-SEARCH, and 200 OK responses over UDP/1900
+      • Pretty, emoji-rich logs (🔌📣🔎📬)
+      • Extracts key headers: ST/NT/NTS/USN/LOCATION/SERVER/HOST/MAN/MX
+      • Tracks recent announcements by USN with TTL from Cache-Control: max-age
+      • Lightweight GC for stale announcements (dedup noise)
+    """
+
+    # Multicast hints
+    _SSDP_MCAST_V4 = "239.255.255.250"
+    _SSDP_MCAST_PORT = 1900
+    _SSDP_MCAST_V6 = ("ff02::c", "ff05::c", "ff08::c")  # link/site/org-local
+
+    # Default retention for NOTIFY/response entries if no max-age present
+    _DEFAULT_MAX_AGE = 1800  # 30 min
+    _GC_INTERVAL = 60  # seconds
+
+    def __init__(self, router_logger):
+        self.log = router_logger
+        # usn -> info
+        # info = { 'seen': ts, 'expires': ts, 'nt': str, 'st': str, 'location': str, 'server': str, 'src': str }
+        self._announced: Dict[str, Dict[str, Any]] = {}
+        self._last_gc = time.time()
+        self.log.log_message("[Transport][🔌 SSDP] Manager ready.")
+
+    # -------------------- Public entry point --------------------
+
+    def handle(
+        self,
+        packet: Packet,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        inbound_iface: str,
+    ) -> bool:
+        if UDP is None or Raw is None:
+            return False
+        if not packet.haslayer(UDP) or dport != self._SSDP_MCAST_PORT:
+            # Some devices unicast replies from random ports →1900 or 1900→random,
+            # but we call this only for :1900 in your TransportManager.
+            pass
+        if not packet.haslayer(Raw):
+            # No payload → nothing to parse
+            return False
+
+        raw = bytes(packet[Raw].load)
+        if not raw:
+            return False
+
+        text = self._safe_decode(raw)
+        first_line, headers = self._parse_httpu(text)
+
+        if not first_line:
+            return False
+
+        # Determine type
+        if first_line.startswith("NOTIFY "):
+            self._log_notify(first_line, headers, src_ip, dst_ip, sport, dport, inbound_iface)
+        elif first_line.startswith("M-SEARCH "):
+            self._log_search(first_line, headers, src_ip, dst_ip, sport, dport, inbound_iface)
+        elif first_line.startswith("HTTP/1.1 200"):
+            self._log_response(first_line, headers, src_ip, dst_ip, sport, dport, inbound_iface)
+        else:
+            self.log.log_message(
+                f"[Transport][🔌 SSDP][❔ Unknown] if={self._iface_short(inbound_iface)} "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} | line='{first_line[:80]}'"
+            )
+
+        self._maybe_gc()
+        return True
+
+    # -------------------- Loggers --------------------
+
+    def _log_notify(
+        self,
+        line: str,
+        h: Dict[str, str],
+        sip: str, dip: str, sport: int, dport: int,
+        inbound_iface: str,
+    ):
+        iface = self._iface_short(inbound_iface)
+        nt = h.get("nt", "-")
+        nts = h.get("nts", "-")
+        usn = h.get("usn", "-")
+        loc = h.get("location", "-")
+        srv = h.get("server", "-")
+        cc = h.get("cache-control", "")
+        max_age = self._parse_max_age(cc) or self._DEFAULT_MAX_AGE
+
+        # Track announcement by USN (if present) to reduce log noise
+        if usn != "-":
+            self._announced[usn] = {
+                "seen": time.time(),
+                "expires": time.time() + max_age,
+                "nt": nt, "st": h.get("st", ""),
+                "location": loc, "server": srv, "src": sip,
+            }
+
+        mcast = self._mcast_tag(dip)
+        self.log.log_message(
+            f"[Transport][🔌 SSDP][📣 NOTIFY]{mcast} if={iface} {sip}:{sport} → {dip}:{dport} "
+            f"NT={nt} NTS={nts} USN={usn} LOCATION={loc} SERVER='{srv}' max-age={max_age}s"
+        )
+
+    def _log_search(
+        self,
+        line: str,
+        h: Dict[str, str],
+        sip: str, dip: str, sport: int, dport: int,
+        inbound_iface: str,
+    ):
+        iface = self._iface_short(inbound_iface)
+        st = h.get("st", "-")
+        man = h.get("man", "-")
+        mx = h.get("mx", "-")
+        host = h.get("host", "-")
+        mcast = self._mcast_tag(dip)
+        self.log.log_message(
+            f"[Transport][🔌 SSDP][🔎 M-SEARCH]{mcast} if={iface} {sip}:{sport} → {dip}:{dport} "
+            f"ST={st} MAN={man} MX={mx} HOST={host}"
+        )
+
+    def _log_response(
+        self,
+        line: str,
+        h: Dict[str, str],
+        sip: str, dip: str, sport: int, dport: int,
+        inbound_iface: str,
+    ):
+        iface = self._iface_short(inbound_iface)
+        st = h.get("st", "-")
+        usn = h.get("usn", "-")
+        loc = h.get("location", "-")
+        srv = h.get("server", "-")
+        cc = h.get("cache-control", "")
+        max_age = self._parse_max_age(cc) or self._DEFAULT_MAX_AGE
+
+        if usn != "-":
+            self._announced[usn] = {
+                "seen": time.time(),
+                "expires": time.time() + max_age,
+                "nt": h.get("nt", ""), "st": st,
+                "location": loc, "server": srv, "src": sip,
+            }
+
+        mcast = self._mcast_tag(dip)
+        self.log.log_message(
+            f"[Transport][🔌 SSDP][📬 Response]{mcast} if={iface} {sip}:{sport} → {dip}:{dport} "
+            f"ST={st} USN={usn} LOCATION={loc} SERVER='{srv}' max-age={max_age}s"
+        )
+
+    # -------------------- Helpers --------------------
+
+    def _safe_decode(self, b: bytes) -> str:
+        # SSDP is HTTP-like; headers are ASCII/Latin-1
+        try:
+            return b.decode("utf-8", errors="ignore")
+        except Exception:
+            return repr(b)
+
+    def _parse_httpu(self, text: str) -> Tuple[str, Dict[str, str]]:
+        """
+        Parse HTTPU-style start-line + headers into a dict with lowercased keys.
+        """
+        # Split at first blank line
+        parts = text.split("\r\n\r\n", 1)
+        header_blob = parts[0]
+        lines = header_blob.split("\r\n")
+        if not lines:
+            return "", {}
+        first = lines[0].strip()
+        headers: Dict[str, str] = {}
+        # Join folded headers (rare in SSDP but be safe)
+        cur_key = None
+        for raw in lines[1:]:
+            if not raw:
+                continue
+            if raw.startswith((" ", "\t")) and cur_key:
+                headers[cur_key] += " " + raw.strip()
+                continue
+            if ":" in raw:
+                k, v = raw.split(":", 1)
+                key = k.strip().lower()
+                val = v.strip()
+                cur_key = key
+                # Allow repeated headers (rare) by concatenation
+                if key in headers:
+                    headers[key] += f", {val}"
+                else:
+                    headers[key] = val
+        return first, headers
+
+    def _parse_max_age(self, cache_control: str) -> Optional[int]:
+        """
+        Extracts max-age=N from Cache-Control (any order/case).
+        """
+        if not cache_control:
+            return None
+        m = re.search(r"max-age\s*=\s*(\d+)", cache_control, flags=re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _mcast_tag(self, dip: str) -> str:
+        if self._is_ipv4_mcast(dip) or self._is_ipv6_mcast(dip):
+            return " [mcast]"
+        return ""
+
+    def _is_ipv4_mcast(self, ip: str) -> bool:
+        return ip == self._SSDP_MCAST_V4
+
+    def _is_ipv6_mcast(self, ip: str) -> bool:
+        ip_l = (ip or "").lower()
+        return any(ip_l.startswith(prefix) for prefix in self._SSDP_MCAST_V6)
+
+    def _iface_short(self, name: str) -> str:
+        return name.split("_")[-1] if name else "?"
+
+    # -------------------- GC --------------------
+
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < self._GC_INTERVAL:
+            return
+        expired = [usn for usn, info in self._announced.items() if now >= info.get("expires", 0)]
+        for usn in expired:
+            self._announced.pop(usn, None)
+        if expired:
+            self.log.log_message(f"[Transport][🔌 SSDP] 🧹 GC expired {len(expired)} announcement(s)")
+        self._last_gc = now
+
+class TransportDNSManager:
+    """
+    DNS-focused helper that parses, summarizes, and tracks DNS queries/responses
+    over UDP and TCP.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+            Returns True if the packet carried DNS and was handled/logged.
+
+    Features:
+      • Query/Response summaries with emojis 🧭📦
+      • RCODE/flags (RD, RA, AA, TC), EDNS(0) OPT summary (DO bit, UDP size)
+      • Answer preview (A/AAAA/CNAME/TXT/MX/SRV/NS/PTR/SOA…)
+      • Basic latency tracking by (client_ip, client_port, txid, proto)
+      • Lightweight GC for old pending queries
+    """
+
+    # rcode → (name, emoji)
+    _RCODES = {
+        0:  ("NOERROR",  "✅"),
+        1:  ("FORMERR",  "🧩"),
+        2:  ("SERVFAIL", "🔥"),
+        3:  ("NXDOMAIN", "❌"),
+        4:  ("NOTIMP",   "🚫"),
+        5:  ("REFUSED",  "⛔"),
+        9:  ("NOTAUTH",  "🔒"),
+        10: ("NOTZONE",  "📍"),
+    }
+
+    # qtype to string (common only; scapy prints numeric otherwise)
+    _QT = {
+        1:  "A",
+        2:  "NS",
+        5:  "CNAME",
+        6:  "SOA",
+        12: "PTR",
+        15: "MX",
+        16: "TXT",
+        28: "AAAA",
+        33: "SRV",
+        41: "OPT",
+        43: "DS",
+        46: "RRSIG",
+        47: "NSEC",
+        48: "DNSKEY",
+        65: "HTTPS",   # SVCB=64 / HTTPS=65 (newer)
+        64: "SVCB",
+    }
+
+    def __init__(
+        self,
+        router_logger,
+        *,
+        pending_ttl_sec: int = 30,
+        gc_interval_sec: int = 10,
+        max_preview_answers: int = 4,
+    ):
+        self.log = router_logger
+        self._pending_ttl = pending_ttl_sec
+        self._gc_interval = gc_interval_sec
+        self._max_ans = max_preview_answers
+
+        # key = (client_ip, client_port, txid, proto) → {ts, names:[...], server:ip}
+        self._pending: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
+
+        self._last_gc = time.time()
+        self.log.log_message("[Transport][🔎 DNS] Manager ready.")
+
+    # ---------- Public entry point ----------
+
+    def handle(
+        self,
+        packet: Packet,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        inbound_iface: str,
+    ) -> bool:
+        """
+        Parse and log DNS carried by this packet (UDP/TCP). Returns True if handled.
+        """
+        if DNS is None:
+            return False
+        if not packet.haslayer(DNS):
+            return False
+
+        dns = packet[DNS]
+        proto = "udp" if UDP is not None and packet.haslayer(UDP) else "tcp" if TCP is not None and packet.haslayer(TCP) else "ip"
+        iface = inbound_iface.split("_")[-1]
+        txid = int(getattr(dns, "id", 0))
+        qr = int(getattr(dns, "qr", 0))  # 0=query, 1=response
+
+        try:
+            if qr == 0:
+                # ---- QUERY ----
+                qnames, qtypes = self._extract_questions(dns)
+                self._log_query(iface, src_ip, sport, dst_ip, dport, txid, proto, dns, qnames, qtypes)
+                # Track for latency on reply
+                if qnames:
+                    key = (src_ip, sport, txid, proto)
+                    self._pending[key] = {
+                        "ts": time.time(),
+                        "names": qnames,
+                        "types": qtypes,
+                        "server": dst_ip,
+                    }
+            else:
+                # ---- RESPONSE ----
+                latency_ms = None
+                key = (dst_ip, dport, txid, proto)  # reverse: dst/dport now match original client src/sport
+                pend = self._pending.pop(key, None)
+                if pend:
+                    latency_ms = int((time.time() - pend["ts"]) * 1000)
+                self._log_response(iface, src_ip, sport, dst_ip, dport, txid, proto, dns, latency_ms)
+        finally:
+            self._maybe_gc()
+        return True
+
+    # ---------- Query logging ----------
+
+    def _log_query(
+        self,
+        iface: str,
+        sip: str, sport: int,
+        dip: str, dport: int,
+        txid: int, proto: str,
+        dns: Any,
+        qnames: List[str],
+        qtypes: List[str],
+    ) -> None:
+        # flags
+        rd = bool(getattr(dns, "rd", 0))
+        ad = bool(getattr(dns, "ad", 0))
+        cd = bool(getattr(dns, "cd", 0))
+        tc = bool(getattr(dns, "tc", 0))
+
+        edns = self._extract_edns(dns)
+        edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''})" if edns else ""
+
+        # Query preview (first name/type)
+        head = qnames[0] if qnames else "?"
+        qtype0 = qtypes[0] if qtypes else "?"
+        more = f" +{len(qnames)-1} more" if len(qnames) > 1 else ""
+
+        self.log.log_message(
+            f"[Transport][🔎 DNS][🧭 Query] if={iface} {sip}:{sport} → {dip}:{dport} "
+            f"txid=0x{txid:04x} proto={proto.upper()} name={head} type={qtype0}{more} "
+            f"flags={'RD' if rd else '-'}{'|AD' if ad else ''}{'|CD' if cd else ''}{'|TC' if tc else ''}{edns_str}"
+        )
+
+    # ---------- Response logging ----------
+
+    def _log_response(
+        self,
+        iface: str,
+        sip: str, sport: int,  # server:port
+        dip: str, dport: int,  # client:port
+        txid: int, proto: str,
+        dns: Any,
+        latency_ms: Optional[int],
+    ) -> None:
+        rcode = int(getattr(dns, "rcode", 0))
+        name, r_emoji = self._RCODES.get(rcode, (f"RCODE{rcode}", "❔"))
+
+        aa = bool(getattr(dns, "aa", 0))
+        ra = bool(getattr(dns, "ra", 0))
+        tc = bool(getattr(dns, "tc", 0))
+        ad = bool(getattr(dns, "ad", 0))
+
+        qn_preview = self._preview_qname(dns)
+        edns = self._extract_edns(dns)
+        edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''})" if edns else ""
+
+        # Counts
+        an, ns, ar = int(getattr(dns, "ancount", 0)), int(getattr(dns, "nscount", 0)), int(getattr(dns, "arcount", 0))
+        lat = f" {latency_ms}ms" if latency_ms is not None else ""
+        trunc = " TC" if tc else ""
+
+        # Header line
+        self.log.log_message(
+            f"[Transport][🔎 DNS][📦 Response] if={iface} {sip}:{sport} → {dip}:{dport} "
+            f"txid=0x{txid:04x} proto={proto.upper()} q={qn_preview} "
+            f"rcode={name}{trunc} {r_emoji} an={an} ns={ns} ar={ar}{lat}{edns_str} "
+            f"flags={'AA' if aa else '-'}{'|RA' if ra else ''}{'|AD' if ad else ''}"
+        )
+
+        # Answers preview
+        if an:
+            answers = self._iter_rr(dns.an, an)
+            lines = []
+            for i, rr in enumerate(answers):
+                if i >= self._max_ans:
+                    lines.append(f"… +{an - self._max_ans} more")
+                    break
+                lines.append(self._fmt_rr(rr))
+            for ln in lines:
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Answer] {ln}")
+
+        # Authority (NS/SOA) preview
+        if ns:
+            auths = self._iter_rr(dns.ns, ns)
+            for i, rr in enumerate(auths):
+                if i >= 2:
+                    self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] … +{ns - 2} more")
+                    break
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] {self._fmt_rr(rr)}")
+
+        # Additional preview
+        if ar:
+            adds = self._iter_rr(dns.ar, ar)
+            shown = 0
+            for rr in adds:
+                # Skip OPT detailed spam, we already summarized EDNS
+                if getattr(rr, "type", 0) == 41:
+                    continue
+                if shown >= 3:
+                    self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] … +{ar - shown} more")
+                    break
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] {self._fmt_rr(rr)}")
+                shown += 1
+
+    # ---------- Utilities ----------
+
+    def _extract_questions(self, dns: Any) -> Tuple[List[str], List[str]]:
+        names: List[str] = []
+        types: List[str] = []
+        try:
+            qdcount = int(getattr(dns, "qdcount", 0))
+            qd = getattr(dns, "qd", None)
+            # scapy represents multiple questions as a chained/stacked DNSQR list
+            for i, qr in enumerate(self._iter_qr(qd, qdcount)):
+                name = self._safe_name(getattr(qr, "qname", b""))
+                qtype = int(getattr(qr, "qtype", 0))
+                names.append(name)
+                types.append(self._QT.get(qtype, str(qtype)))
+        except Exception:
+            pass
+        return names, types
+
+    def _preview_qname(self, dns: Any) -> str:
+        try:
+            if int(getattr(dns, "qdcount", 0)) and getattr(dns, "qd", None):
+                q = dns.qd
+                nm = self._safe_name(getattr(q, "qname", b""))
+                qt = self._QT.get(int(getattr(q, "qtype", 0)), str(int(getattr(q, "qtype", 0))))
+                return f"{nm} {qt}"
+        except Exception:
+            pass
+        return "-"
+
+    def _extract_edns(self, dns: Any) -> Optional[Dict[str, Any]]:
+        """
+        Look for OPT (type 41) in additional; return {'size': int, 'do': bool} if present.
+        """
+        try:
+            arcount = int(getattr(dns, "arcount", 0))
+            rr = getattr(dns, "ar", None)
+            for r in self._iter_rr(rr, arcount):
+                if int(getattr(r, "type", 0)) == 41:
+                    # In OPT, 'rclass' is UDP payload size; DO bit is in the Z field (scapy uses 'ttl')
+                    size = int(getattr(r, "rclass", 0))
+                    z = int(getattr(r, "ttl", 0))
+                    do = bool(z & 0x8000)
+                    return {"size": size, "do": do}
+        except Exception:
+            pass
+        return None
+
+    def _iter_qr(self, qd: Any, count: int):
+        """Iterate DNSQR chain safely."""
+        cur = qd
+        n = 0
+        while cur is not None and n < count:
+            yield cur
+            cur = getattr(cur, "payload", None)
+            if cur is qd:  # safety
+                break
+            if not isinstance(cur, DNSQR):
+                break
+            n += 1
+
+    def _iter_rr(self, rr: Any, count: int):
+        """Iterate DNSRR chain safely."""
+        cur = rr
+        n = 0
+        while cur is not None and n < count:
+            yield cur
+            cur = getattr(cur, "payload", None)
+            if cur is rr:  # safety
+                break
+            if not isinstance(cur, DNSRR):
+                break
+            n += 1
+
+    def _fmt_rr(self, rr: Any) -> str:
+        """Compact one-line RR rendering with emojis by type."""
+        try:
+            name = self._safe_name(getattr(rr, "rrname", b""))
+            rtype = int(getattr(rr, "type", 0))
+            rttl = int(getattr(rr, "ttl", 0))
+            cls = int(getattr(rr, "rclass", 1))
+            tstr = self._QT.get(rtype, str(rtype))
+
+            # Value by type
+            val = "?"
+            if tstr in ("A", "AAAA", "NS", "CNAME", "PTR"):
+                val = self._safe_name(getattr(rr, "rdata", b"")) if tstr != "A" and tstr != "AAAA" else getattr(rr, "rdata", "?")
+            elif tstr == "MX":
+                pref = getattr(rr, "preference", None)
+                exch = self._safe_name(getattr(rr, "exchange", b""))
+                val = f"{pref} {exch}" if pref is not None else exch
+            elif tstr == "TXT":
+                val = self._fmt_txt(getattr(rr, "rdata", b""))
+            elif tstr == "SRV":
+                tgt = self._safe_name(getattr(rr, "target", b""))
+                port = getattr(rr, "port", "?")
+                prio = getattr(rr, "priority", None)
+                weight = getattr(rr, "weight", None)
+                val = f"{tgt}:{port}"
+                if prio is not None and weight is not None:
+                    val += f" prio={prio} w={weight}"
+            elif tstr == "SOA":
+                mname = self._safe_name(getattr(rr, "mname", b""))
+                rname = self._safe_name(getattr(rr, "rname", b""))
+                serial = getattr(rr, "serial", "?")
+                val = f"{mname} {rname} serial={serial}"
+            elif rtype == 41:
+                # OPT already summarized separately
+                val = "OPT"
+            else:
+                # Fallback
+                v = getattr(rr, "rdata", None)
+                if isinstance(v, bytes):
+                    val = self._safe(v)
+                else:
+                    val = str(v)
+
+            # Emoji by common types
+            emo = {
+                "A": "🧭",
+                "AAAA": "🧭",
+                "CNAME": "🔁",
+                "NS": "📌",
+                "MX": "✉️",
+                "TXT": "📝",
+                "SRV": "🎯",
+                "PTR": "↩️",
+                "SOA": "📜",
+                "OPT": "⚙️",
+            }.get(tstr, "📦")
+
+            return f"{emo} {name} {tstr} {val} (ttl={rttl})"
+        except Exception:
+            return "📦 (unprintable RR)"
+
+    def _fmt_txt(self, rdata: Any) -> str:
+        # TXT can be bytes or list of bytes; render compact
+        try:
+            if isinstance(rdata, (bytes, bytearray)):
+                s = self._safe(rdata)
+                return f"\"{s}\""
+            if isinstance(rdata, list):
+                parts = [self._safe(x) for x in rdata[:3]]
+                more = f" +{len(rdata)-3}" if len(rdata) > 3 else ""
+                return "[" + ", ".join(f"\"{p}\"" for p in parts) + "]" + more
+        except Exception:
+            pass
+        return "\"?\""
+
+    def _safe_name(self, val: Any) -> str:
+        if isinstance(val, (bytes, bytearray)):
+            s = val.decode("utf-8", errors="ignore").rstrip(".")
+            return s or "."
+        if isinstance(val, str):
+            return val.rstrip(".")
+        return str(val)
+
+    def _safe(self, b: Any) -> str:
+        try:
+            if isinstance(b, (bytes, bytearray)):
+                s = b.decode("utf-8", errors="ignore")
+                # compact long strings
+                return s if len(s) <= 80 else s[:77] + "…"
+            return str(b)
+        except Exception:
+            return "?"
+
+    # ---------- GC ----------
+
+    def _maybe_gc(self) -> None:
+        now = time.time()
+        if now - self._last_gc < self._gc_interval:
+            return
+        dead = []
+        for k, v in self._pending.items():
+            if now - v.get("ts", 0) > self._pending_ttl:
+                dead.append(k)
+        for k in dead:
+            _ = self._pending.pop(k, None)
+        if dead:
+            self.log.log_message(f"[Transport][🔎 DNS] 🧹 GC expired {len(dead)} pending query slots")
+        self._last_gc = now
+
+class TransportDHCPActiveAgent:
+    """
+    Small DHCP active helper:
+      - Client mode: discover/request
+      - Server mode: respond with offer/ack from a pool
+    Uses sniffer.sendp/sr2 to emit frames.
+    """
+
+    def _mac_bytes(self,mac: str) -> bytes:
+        return bytes(int(b, 16) for b in mac.split(":"))
+
+    def _chaddr(self,mac: str) -> bytes:
+        # BOOTP chaddr field is 16 bytes; pad MAC to 16
+        b = self._mac_bytes(mac)
+        return b + b"\x00" * (16 - len(b))
+
+    def _iface_ipv4(self,iface: str) -> Optional[str]:
+        # Light, portable IPv4-on-interface helper
+        try:
+            import psutil
+            for nic, addrs in psutil.net_if_addrs().items():
+                if iface in nic:
+                    for a in addrs:
+                        if getattr(a, "family", None) == 2 and a.address != "127.0.0.1":
+                            return a.address
+        except Exception:
+            pass
+        return None
+    def __init__(self, *, sniffer, logger, pool_cidr: Optional[str] = None, server_ip: Optional[str] = None):
+        self.sniffer = sniffer
+        self.log = logger
+        # Client-side outstanding transactions by xid
+        self._pending_client: Dict[int, Dict[str, Any]] = {}
+        # Server-side leases: mac -> {ip, expires, xid}
+        self._leases: Dict[str, Dict[str, Any]] = {}
+        self._pool = None
+        self._server_ip_static = server_ip
+        if pool_cidr:
+            self._pool = [str(ip) for ip in ipaddress.ip_network(pool_cidr, strict=False).hosts()]
+
+    # ---------------- Client mode ----------------
+
+    def client_discover(self, iface: str, *, prl: Optional[List[int]] = None) -> int:
+        """
+        Send DHCPDISCOVER on 'iface'. Returns xid used.
+        """
+        mac = get_if_hwaddr(iface)
+        xid = random.getrandbits(32)
+        if prl is None:
+            prl = [1, 3, 6, 15, 51, 54, 58, 59, 119, 121, 249, 252, 44]  # mask, router, dns, domain, lease, server id, T1,T2,...
+
+        pkt = (
+            Ether(dst="ff:ff:ff:ff:ff:ff", src=mac) /
+            IP(src="0.0.0.0", dst="255.255.255.255") /
+            UDP(sport=68, dport=67) /
+            BOOTP(op=1, chaddr=self._chaddr(mac), xid=xid, flags=0x8000, htype=1, hlen=6) /
+            DHCP(options=[
+                ("message-type", "discover"),
+                ("client_id", b"\x01" + self._mac_bytes(mac)),
+                ("param_req_list", prl),
+                "end"
+            ])
+        )
+
+        self.sniffer.sendp(pkt, iface=iface)
+        self._pending_client[xid] = {"iface": iface, "state": "DISCOVER", "ts": time.time(), "mac": mac}
+        self.log.log_message(f"[DHCP][client] 📡 DISCOVER sent on {iface} | xid=0x{xid:08x} | mac={mac}")
+        return xid
+
+    def _client_send_request(self, *, iface: str, xid: int, server_ip: str, offered_ip: str, mac: str):
+        pkt = (
+            Ether(dst="ff:ff:ff:ff:ff:ff", src=mac) /
+            IP(src="0.0.0.0", dst="255.255.255.255") /
+            UDP(sport=68, dport=67) /
+            BOOTP(op=1, chaddr=self._chaddr(mac), xid=xid, flags=0x8000, htype=1, hlen=6) /
+            DHCP(options=[
+                ("message-type", "request"),
+                ("client_id", b"\x01" + self._mac_bytes(mac)),
+                ("server_id", server_ip),
+                ("requested_addr", offered_ip),
+                "end"
+            ])
+        )
+        self.sniffer.sendp(pkt, iface=iface)
+        self.log.log_message(f"[DHCP][client] 🙋 REQUEST sent on {iface} | xid=0x{xid:08x} | req={offered_ip} | server={server_ip}")
+
+    def on_offer(self, *, iface: str, xid: int, server_ip: Optional[str], yiaddr: Optional[str], mac: str):
+        # React to OFFER with REQUEST (client mode)
+        pend = self._pending_client.get(xid)
+        if not pend:
+            # Not our transaction; ignore
+            return
+        srv = server_ip
+        ip = yiaddr
+        if not srv or not ip:
+            self.log.log_message(f"[DHCP][client] ⚠️ OFFER missing server_id/yiaddr (xid=0x{xid:08x}); ignoring")
+            return
+        self._client_send_request(iface=iface, xid=xid, server_ip=srv, offered_ip=ip, mac=mac)
+        pend.update({"state": "REQUEST", "server_id": srv, "requested_ip": ip})
+
+    def on_ack(self, *, xid: int, yiaddr: str, lease_time: Optional[int]):
+        pend = self._pending_client.get(xid)
+        if not pend:
+            return
+        iface = pend["iface"]
+        self.log.log_message(
+            f"[DHCP][client] ✅ ACK on {iface} | xid=0x{xid:08x} | ip={yiaddr} | lease={lease_time or '-'}s"
+        )
+        # You could configure the OS IP here (platform-specific). For now we just mark complete.
+        pend["state"] = "BOUND"
+        pend["bound_ip"] = yiaddr
+        pend["lease_time"] = lease_time
+
+    # ---------------- Server mode ----------------
+
+    def _server_ip(self, iface: str) -> Optional[str]:
+        return self._server_ip_static or self._iface_ipv4(iface)
+
+    def _pool_take(self) -> Optional[str]:
+        if not self._pool:
+            return None
+        for ip in self._pool:
+            # naive: not tracking in-use at this moment (we track on ACK)
+            return ip
+        return None
+
+    def _server_reply_common(self, *, dst_mac: str, client_mac: str, xid: int, yiaddr: str,
+                             server_ip: str, msg_type: str, lease_time: int,
+                             subnet_mask: Optional[str], router: Optional[str], dns: Optional[List[str]],
+                             broadcast: bool) -> Ether:
+        # If client set broadcast flag, we broadcast. Otherwise unicast to client MAC.
+        ether_dst = "ff:ff:ff:ff:ff:ff" if broadcast else dst_mac
+        ip_dst = "255.255.255.255" if broadcast else "0.0.0.0"
+        opts = [
+            ("message-type", msg_type),
+            ("server_id", server_ip),
+            ("lease_time", lease_time),
+        ]
+        if subnet_mask:
+            opts.append(("subnet_mask", subnet_mask))
+        if router:
+            opts.append(("router", router))
+        if dns:
+            opts.append(("name_server", dns))
+        opts.append("end")
+
+        src_mac = get_if_hwaddr(self._find_iface_by_mac(dst_mac) or "")
+        if not src_mac:
+            # Best-effort; many drivers accept any src MAC set by the NIC; fallback to interface that will be used in sendp call
+            src_mac = get_if_hwaddr(self._last_iface_for_send or "")
+
+        pkt = (
+            Ether(dst=ether_dst, src=src_mac) /
+            IP(src=server_ip, dst=ip_dst) /
+            UDP(sport=67, dport=68) /
+            BOOTP(op=2, yiaddr=yiaddr, siaddr=server_ip, chaddr=self._chaddr(client_mac), xid=xid, htype=1, hlen=6) /
+            DHCP(options=opts)
+        )
+        return pkt
+
+    def _find_iface_by_mac(self, mac: str) -> Optional[str]:
+        try:
+            import psutil
+            for nic, addrs in psutil.net_if_addrs().items():
+                for a in addrs:
+                    if getattr(a, "address", "").lower() == mac.lower():
+                        return nic
+        except Exception:
+            pass
+        return None
+
+    def server_offer(self, *, iface: str, xid: int, client_mac: str, broadcast: bool,
+                     yiaddr: Optional[str] = None, lease_time: int = 3600,
+                     subnet_mask: Optional[str] = None, router: Optional[str] = None, dns: Optional[List[str]] = None):
+        if yiaddr is None:
+            yiaddr = self._pool_take()
+        server_ip = self._server_ip(iface)
+        if not server_ip or not yiaddr:
+            self.log.log_message("[DHCP][server] ❌ cannot send OFFER: missing server_ip or pool address")
+            return
+        pkt = self._server_reply_common(
+            dst_mac=client_mac, client_mac=client_mac, xid=xid, yiaddr=yiaddr, server_ip=server_ip,
+            msg_type="offer", lease_time=lease_time, subnet_mask=subnet_mask, router=router, dns=dns,
+            broadcast=broadcast
+        )
+        self._last_iface_for_send = iface
+        self.sniffer.sendp(pkt, iface=iface)
+        self.log.log_message(
+            f"[DHCP][server] 🎁 OFFER on {iface} | xid=0x{xid:08x} | yiaddr={yiaddr} | to={client_mac}"
+        )
+        # Track what we offered (simplified)
+        self._leases.setdefault(client_mac, {})["pending_offer"] = {"xid": xid, "yiaddr": yiaddr, "ts": time.time()}
+
+    def server_ack(self, *, iface: str, xid: int, client_mac: str, yiaddr: str, broadcast: bool,
+                   lease_time: int = 3600, subnet_mask: Optional[str] = None, router: Optional[str] = None,
+                   dns: Optional[List[str]] = None):
+        server_ip = self._server_ip(iface)
+        if not server_ip:
+            self.log.log_message("[DHCP][server] ❌ cannot send ACK: missing server_ip")
+            return
+        pkt = self._server_reply_common(
+            dst_mac=client_mac, client_mac=client_mac, xid=xid, yiaddr=yiaddr, server_ip=server_ip,
+            msg_type="ack", lease_time=lease_time, subnet_mask=subnet_mask, router=router, dns=dns,
+            broadcast=broadcast
+        )
+        self._last_iface_for_send = iface
+        self.sniffer.sendp(pkt, iface=iface)
+        # Record lease
+        self._leases[client_mac] = {"ip": yiaddr, "granted": time.time(), "expires": time.time()+lease_time, "xid": xid}
+        self.log.log_message(
+            f"[DHCP][server] ✅ ACK on {iface} | xid=0x{xid:08x} | yiaddr={yiaddr} | to={client_mac}"
+        )
+
+    def server_nak(self, *, iface: str, xid: int, client_mac: str, broadcast: bool, msg: str = "NAK"):
+        server_ip = self._server_ip(iface)
+        if not server_ip:
+            self.log.log_message("[DHCP][server] ❌ cannot send NAK: missing server_ip")
+            return
+        ether_dst = "ff:ff:ff:ff:ff:ff" if broadcast else client_mac
+        pkt = (
+            Ether(dst=ether_dst, src=get_if_hwaddr(iface)) /
+            IP(src=server_ip, dst="255.255.255.255") /
+            UDP(sport=67, dport=68) /
+            BOOTP(op=2, siaddr=server_ip, chaddr=self._chaddr(client_mac), xid=xid, htype=1, hlen=6) /
+            DHCP(options=[("message-type", "nak"), ("message", msg), ("server_id", server_ip), "end"])
+        )
+        self._last_iface_for_send = iface
+        self.sniffer.sendp(pkt, iface=iface)
+        self.log.log_message(f"[DHCP][server] ⛔ NAK on {iface} | xid=0x{xid:08x} | to={client_mac} | msg={msg}")
+class TransportDHCPManager:
+    """
+    (Your existing class) + active send support via self.sniffer.
+    Enable client mode:  self.enable_client(sniffer)
+    Enable server mode:  self.enable_server(sniffer, pool_cidr="192.168.50.0/24", server_ip="192.168.50.1")
+    """
+
+    # Message map kept the same...
+    _MTYPES = {
+        1: ("DISCOVER", "🛰️"),
+        2: ("OFFER",    "🎁"),
+        3: ("REQUEST",  "🙋"),
+        4: ("DECLINE",  "🙅"),
+        5: ("ACK",      "✅"),
+        6: ("NAK",      "⛔"),
+        7: ("RELEASE",  "🧹"),
+        8: ("INFORM",   "📝"),
+    }
+
+    def __init__(self, router_logger, *, txn_ttl_sec: int = 180, lease_ttl_sec: int = 24*3600):
+        self.logger = router_logger
+        self.txn_ttl = txn_ttl_sec
+        self.lease_ttl = lease_ttl_sec
+        self._txns: Dict[int, Dict[str, Any]] = {}
+        self._leases: Dict[str, Dict[str, Any]] = {}
+        self._last_gc = time.time()
+        self._gc_interval = 30
+        self.logger.log_message("[Transport][⚙️ DHCP] Manager ready.")
+        # NEW:
+        self._active: Optional[TransportDHCPActiveAgent] = None
+        self._client_mode = False
+        self._server_mode = False
+
+    # -------- enable active modes --------
+    def enable_client(self, sniffer) -> None:
+        self._active = TransportDHCPActiveAgent(sniffer=sniffer, logger=self.logger)
+        self._client_mode = True
+        self.logger.log_message("[Transport][⚙️ DHCP] Client mode enabled.")
+
+    def enable_server(self, sniffer, *, pool_cidr: str, server_ip: Optional[str] = None) -> None:
+        self._active = TransportDHCPActiveAgent(sniffer=sniffer, logger=self.logger, pool_cidr=pool_cidr, server_ip=server_ip)
+        self._server_mode = True
+        self.logger.log_message(f"[Transport][⚙️ DHCP] Server mode enabled (pool={pool_cidr}, server_ip={server_ip or 'auto'})")
+
+    # Simple helper for client: kick off a discover now
+    def client_start(self, iface: str) -> Optional[int]:
+        if not (self._active and self._client_mode):
+            self.logger.log_message("[Transport][⚙️ DHCP] client_start ignored (client mode not enabled)")
+            return None
+        return self._active.client_discover(iface)
+
+    # ---------- Public entry point (unchanged signature) ----------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        from scapy.layers.dhcp import DHCP as _DHCP
+        from scapy.layers.inet import UDP as _UDP
+
+        if _DHCP is None or BOOTP is None:
+            return False
+        if not packet.haslayer(BOOTP) or not packet.haslayer(_DHCP):
+            return False
+        if not (67 in (sport, dport) or 68 in (sport, dport)):
+            return False
+
+        bp = packet[BOOTP]
+        dh = packet[_DHCP]
+        xid = int(getattr(bp, "xid", 0))
+        mac = self._mac_from_bootp(bp)
+        msg_id, msg_name, emoji = self._message_type(dh)
+
+        yiaddr = getattr(bp, "yiaddr", "0.0.0.0")
+        siaddr = getattr(bp, "siaddr", "0.0.0.0")
+        req_ip = self._opt_value(dh.options, "requested_addr")
+        server_id = self._opt_value(dh.options, "server_id")
+        lease_time = self._opt_value(dh.options, "lease_time")
+        prl = self._opt_value(dh.options, "param_req_list") or []
+        host = self._opt_value(dh.options, "hostname")
+        agent = self._opt_value(dh.options, "agent_info")
+
+        role = self._guess_role(sport, dport)
+        iface = inbound_iface.split("_")[-1]
+        self._log_summary(
+            emoji=emoji, msg=msg_name, iface=iface,
+            src=f"{src_ip}:{sport}", dst=f"{dst_ip}:{dport}",
+            mac=mac, xid=xid, yiaddr=yiaddr, req_ip=req_ip,
+            srv=server_id or siaddr, host=host, lease=lease_time, prl=prl, vend=self._opt_value(dh.options, "vendor_class_id"),
+            agent=agent, role=role
+        )
+
+        # --- ACTIVE REACTIONS ---
+        if self._active:
+            # Client reactions
+            if self._client_mode:
+                if msg_name == "OFFER":
+                    self._active.on_offer(
+                        iface=iface, xid=xid, server_ip=server_id or siaddr,
+                        yiaddr=yiaddr if yiaddr != "0.0.0.0" else req_ip, mac=get_if_hwaddr(iface)
+                    )
+                elif msg_name == "ACK":
+                    self._active.on_ack(xid=xid, yiaddr=yiaddr, lease_time=lease_time)
+
+            # Server reactions
+            if self._server_mode:
+                # broadcast flag in BOOTP (bit 15)
+                broadcast = bool(getattr(bp, "flags", 0) & 0x8000)
+                if msg_name == "DISCOVER":
+                    self._active.server_offer(
+                        iface=iface, xid=xid, client_mac=mac, broadcast=broadcast
+                    )
+                elif msg_name == "REQUEST":
+                    # If client requested a specific IP and the server_id matches us (or is absent), ACK it if available
+                    our_ip = self._active._server_ip(iface)
+                    if (not server_id) or (our_ip and server_id == our_ip):
+                        yi = req_ip or yiaddr
+                        if yi:
+                            self._active.server_ack(
+                                iface=iface, xid=xid, client_mac=mac, yiaddr=yi, broadcast=broadcast
+                            )
+                        else:
+                            self._active.server_nak(iface=iface, xid=xid, client_mac=mac, broadcast=broadcast, msg="No requested address")
+                # You can add DECLINE/RELEASE handling if desired
+
+        # Passive state/lease tracking (unchanged)
+        self._update_transaction(xid=xid, msg=msg_name, mac=mac, req_ip=req_ip, yiaddr=yiaddr,
+                                 server=server_id or siaddr, host=host, lease_time=lease_time)
+        self._maybe_update_lease(msg_name, mac, yiaddr, lease_time, server_id or siaddr)
+        self._maybe_gc()
+        return True
+
+    # ---------- Existing helpers from your class (unchanged) ----------
+    def _fmt_prl(self, prl: list) -> str:
+        try: return ",".join(str(x) for x in prl)
+        except Exception: return "-"
+
+    def _mac_from_bootp(self, bp: Any) -> str:
+        try:
+            raw: bytes = bytes(bp.chaddr)
+            hlen = int(getattr(bp, "hlen", 6)) or 6
+            return ":".join(f"{b:02x}" for b in raw[:hlen])
+        except Exception:
+            return "00:00:00:00:00:00"
+
+    def _message_type(self, dh_opts: Any) -> Tuple[int, str, str]:
+        mval = self._opt_value(dh_opts.options if hasattr(dh_opts, "options") else dh_opts, "message-type")
+        if isinstance(mval, (bytes, bytearray)):
+            try: mval = int(mval[0])
+            except Exception: mval = None
+        if isinstance(mval, str):
+            name = mval.upper(); inv = {v[0]: k for k, v in self._MTYPES.items()}
+            mid = inv.get(name)
+            if mid is not None: return mid, name, self._MTYPES[mid][1]
+        if isinstance(mval, int) and mval in self._MTYPES:
+            name, emoji = self._MTYPES[mval]; return mval, name, emoji
+        return 0, "UNKNOWN", "❔"
+
+    def _opt_value(self, options: list, key: str):
+        if not options: return None
+        for opt in options:
+            if isinstance(opt, tuple) and opt and opt[0] == key:
+                return opt[1]
+        return None
+
+    def _guess_role(self, sport: int, dport: int) -> str:
+        if sport == 68 and dport == 67: return "client→server"
+        if sport == 67 and dport == 68: return "server→client"
+        return "peer"
+
+    def _log_summary(self, *, emoji: str, msg: str, iface: str, src: str, dst: str, mac: str, xid: int,
+                     yiaddr: str, req_ip: Optional[str], srv: Optional[str], host: Optional[str],
+                     lease: Optional[int], prl: list, vend: Optional[str], agent: Any, role: str) -> None:
+        parts = [
+            f"{emoji} {msg}", f"if={iface}", f"{src} → {dst}", f"MAC={mac}", f"xid=0x{xid:08x}",
+        ]
+        if req_ip: parts.append(f"req={req_ip}")
+        if yiaddr and yiaddr != "0.0.0.0": parts.append(f"yiaddr={yiaddr}")
+        if srv and srv != "0.0.0.0": parts.append(f"server={srv}")
+        if host: parts.append(f"host={host}")
+        if lease: parts.append(f"lease={lease}s")
+        if vend: parts.append(f"vcid={vend}")
+        if prl:  parts.append(f"prl={self._fmt_prl(prl)}")
+        if agent: parts.append("opt82")
+        parts.append(f"role={role}")
+        self.logger.log_message("[Transport][🚀 UDP][⚙️ DHCP] " + " | ".join(parts))
+
+    # ---------- Helpers: state & leases ----------
+
+    def _update_transaction(
+        self, *, xid: int, msg: str, mac: str, req_ip: Optional[str], yiaddr: str,
+        server: Optional[str], host: Optional[str], lease_time: Optional[int],
+    ) -> None:
+        now = time.time()
+        t = self._txns.get(xid) or {
+            "created": now,
+            "mac": mac,
+            "history": [],
+        }
+        t["last"] = now
+        t["server"] = server or t.get("server")
+        t["host"] = host or t.get("host")
+        t["req_ip"] = req_ip or t.get("req_ip")
+        if yiaddr and yiaddr != "0.0.0.0":
+            t["yiaddr"] = yiaddr
+        if lease_time:
+            t["lease_time"] = lease_time
+        t["history"].append(msg)
+        self._txns[xid] = t
+
+    def _maybe_update_lease(self, msg: str, mac: str, yiaddr: str, lease_time: Optional[int], server: Optional[str]) -> None:
+        # On ACK, record/refresh lease
+        if msg == "ACK" and yiaddr and yiaddr != "0.0.0.0":
+            now = time.time()
+            ttl = int(lease_time or self.lease_ttl)
+            self._leases[mac] = {
+                "ip": yiaddr,
+                "server": server,
+                "granted": now,
+                "expires": now + ttl,
+            }
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][⚙️ DHCP] 🗂️ lease | MAC={mac} → IP={yiaddr} | server={server or '-'} | ttl={ttl}s"
+            )
+        elif msg == "NAK":
+            # On NAK, clear any pending lease idea (soft)
+            if mac in self._leases:
+                self.logger.log_message(
+                    f"[Transport][🚀 UDP][⚙️ DHCP] 🗑️ lease | NAK for MAC={mac} cleared cached lease {self._leases[mac].get('ip','-')}"
+                )
+                self._leases.pop(mac, None)
+
+    def _maybe_gc(self) -> None:
+        now = time.time()
+        if now - self._last_gc < self._gc_interval:
+            return
+        # GC transactions
+        expired_xids = [x for x, t in self._txns.items() if now - t.get("last", t.get("created", 0)) > self.txn_ttl]
+        for x in expired_xids:
+            self._txns.pop(x, None)
+        # GC leases (soft expiry notice)
+        expired_macs = [m for m, l in self._leases.items() if now >= l.get("expires", 0)]
+        for m in expired_macs:
+            ip = self._leases[m].get("ip", "-")
+            self.logger.log_message(f"[Transport][🚀 UDP][⚙️ DHCP] ⏳ lease-expired | MAC={m} IP={ip}")
+            self._leases.pop(m, None)
+        self._last_gc = now
+
+class TransportRTPManager:
+    """
+    Standalone RTP (VoIP) parser & logger.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+
+    What it does:
+      • Best-effort RTP v2 header parsing (version/PT/marker/seq/ts/ssrc)
+      • CSRC & Extension header skipping (keeps offset correct)
+      • Optional DTMF (RFC 4733 / 'telephone-event') peek when PT==101
+      • Per-SSRC stream cache to de-dupe "new stream" logs + light stats
+      • Periodic GC of stale stream entries (configurable timeout)
+
+    Log style matches TransportManager:
+      [Transport][🚀 UDP][🔊 RTP] ...
+    """
+
+    # Common/static PTs + friendly names (dynamic 96–127 shown as "Dynamic(n)")
+    RTP_PT_NAMES = {
+        0: "PCMU",   3: "GSM",   4: "G723",  8: "PCMA",   9: "G722",
+        10: "L16/2ch", 11: "L16/1ch", 15: "G728", 18: "G729",
+        26: "JPEG", 31: "H261", 32: "MPV", 33: "MP2T", 34: "H263",
+        96: "H264", 97: "H264", 98: "H265/HEVC", 100: "VP8", 101: "Telephone-Event", 103: "Opus",
+    }
+
+    def __init__(self, router_logger, stream_timeout: int = 300):
+        self.logger = router_logger
+        self._stream_timeout = stream_timeout
+        # Keyed by SSRC (int) → dict(state)
+        self._streams: Dict[int, Dict[str, int]] = {}
+        self._last_gc = time.time()
+        self.logger.log_message("[Transport][🔊 RTP] Manager ready.")
+
+    # -------------------- Public entry point --------------------
+
+    def handle(
+        self,
+        packet: Packet,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        inbound_iface: Optional[str] = None,
+    ) -> bool:
+        """Returns True if the packet looked like RTP and was handled (logged)."""
+        if Raw is None or not packet.haslayer(Raw):
+            # Nothing to parse; not necessarily an error (could be too short)
+            return False
+
+        payload = bytes(packet[Raw].load)
+        if len(payload) < 12:
+            # Too short for a valid RTP v2 header
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🔊 RTP] Short/Non-RTP packet from {src_ip}:{sport} (len={len(payload)})"
+            )
+            return True
+
+        try:
+            b1, b2, seq, ts, ssrc = struct.unpack("!BBHII", payload[:12])
+        except struct.error:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🔊 RTP] Malformed header from {src_ip}:{sport}"
+            )
+            return True
+
+        version = (b1 >> 6) & 0x03
+        padding = (b1 >> 5) & 0x01
+        extension = (b1 >> 4) & 0x01
+        csrc_count = b1 & 0x0F
+        marker = (b2 >> 7) & 0x01
+        pt = b2 & 0x7F
+
+        if version != 2:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🔊 RTP] Non-RTPv2/unknown version={version} from {src_ip}:{sport}"
+            )
+            return True
+
+        # Calculate header offset (12 + 4*CSRC + ext header if present)
+        offset = 12 + (csrc_count * 4)
+        if extension:
+            # Extension header: 16-bit profile, 16-bit length (in 32-bit words), then data
+            if len(payload) >= offset + 4:
+                _, ext_len_words = struct.unpack("!HH", payload[offset:offset + 4])
+                offset += 4 + (ext_len_words * 4)
+            else:
+                # Malformed but still log the core header fields
+                pass
+
+        # Name the payload type
+        pt_name = self.RTP_PT_NAMES.get(pt, f"Dynamic({pt})" if 96 <= pt <= 127 else f"PT({pt})")
+
+        # Initialize/update per-SSRC stream state
+        new_stream = False
+        st = self._streams.get(ssrc)
+        if st is None:
+            new_stream = True
+            st = {"last_seq": seq, "last_ts": ts}
+            self._streams[ssrc] = st
+        else:
+            st["last_seq"] = seq
+            st["last_ts"] = ts
+
+        # Build log details
+        details = [f"Ver:{version}", f"PT:{pt_name}", f"Seq:{seq}", f"TS:{ts}", f"SSRC:0x{ssrc:08x}"]
+        if csrc_count:
+            details.append(f"CSRCs:{csrc_count}")
+        if extension:
+            details.append("Ext")
+        if padding:
+            details.append("Pad")
+        if marker:
+            details.append("[Marker]")
+
+        prefix = "[Transport][🚀 UDP][🔊 RTP]"
+        if new_stream:
+            self.logger.log_message(
+                f"{prefix} New stream {src_ip}:{sport} → {dst_ip}:{dport} | " + ", ".join(details)
+            )
+        else:
+            self.logger.log_message(
+                f"{prefix} {src_ip}:{sport} → {dst_ip}:{dport} | " + ", ".join(details)
+            )
+
+        # Optional: Peek DTMF when PT==101 (telephone-event, unencrypted)
+        if pt == 101 and len(payload) >= offset + 4:
+            event_id = payload[offset]
+            end_bit = (payload[offset + 1] >> 7) & 0x01
+            volume = payload[offset + 1] & 0x3F
+            duration = struct.unpack("!H", payload[offset + 2:offset + 4])[0]
+            evt_name = self._dtmf_name(event_id)
+            self.logger.log_message(
+                f"{prefix} DTMF event={evt_name} ({event_id}) vol={volume} dur={duration} end={end_bit}"
+            )
+
+        self._maybe_gc()
+        return True
+
+    # -------------------- Helpers --------------------
+
+    def _dtmf_name(self, event_id: int) -> str:
+        mapping = {
+            0: "0", 1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7",
+            8: "8", 9: "9", 10: "*", 11: "#", 12: "A", 13: "B", 14: "C", 15: "D"
+        }
+        return mapping.get(event_id, f"ev{event_id}")
+
+    def _maybe_gc(self) -> None:
+        now = time.time()
+        if now - self._last_gc < 60:
+            return
+        # Here we don't track last-seen timestamps per SSRC; add if desired.
+        # For a simple GC, just clear entries older than _stream_timeout since last GC.
+        # (Lightweight: avoids unbounded growth without per-packet timestamps.)
+        if self._streams and (now - self._last_gc) > self._stream_timeout:
+            count = len(self._streams)
+            self._streams.clear()
+            self.logger.log_message(f"[Transport][🔊 RTP] 🧹 GC pruned {count} stream entries")
+        self._last_gc = now
+
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -1479,6 +3011,15 @@ class TransportManager:
             51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
             80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
         }
+        self.transport_dhcp = TransportDHCPManager(self.logger)
+        self.transport_dns = TransportDNSManager(self.logger)
+        self.transport_ssdp = TransportSSDPManager(self.logger)
+        self.transport_quic = TransportQUICManager(self.logger)
+        self.transport_http = TransportHTTPManager(self.logger)
+        self.transport_ssh = TransportSSHManager(self.logger)
+        self.transport_ftp = TransportFTPManager(self.logger)
+        self.transport_rdp = TransportRDPManager(self.logger)
+        self.transport_rtp = TransportRTPManager(self.logger)
     def _on_tls_policy_decision(self, key, rec, decision):
         """
         Called on EVERY TLS record after the policy engine evaluates it.
@@ -1633,6 +3174,101 @@ class TransportManager:
         self.tls_manager.on_decision = self._on_tls_policy_decision
         self.tls_manager.on_event = self._on_tls_event
 
+    def _handle_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        """Dispatches TCP packets to the correct handler based on port."""
+        tcp = packet[TCP]
+        flags = tcp.sprintf("%TCP.flags%")
+        flag_details = [flag for flag, name in [('S', 'SYN'), ('F', 'FIN'), ('A', 'ACK'), ('R', 'RST')] if
+                        flag in flags]
+
+        self.logger.log_message(
+            f"[Transport][🧵 TCP] Packet on {iface_short}: {src_ip}:{sport} → {dst_ip}:{dport} | "
+            f"Flags: {','.join(flag_details) or flags} | Payload: {len(tcp.payload)}"
+        )
+
+        if "S" in flags and "A" not in flags:
+            key = _canon_key(src_ip, sport, dst_ip, dport)
+            self._initiators[key] = (src_ip, sport)
+
+        port_map = {
+            80: self._handle_http_packet,
+            443: self._handle_https_packet,
+            22: self._handle_ssh_packet,
+            21: self._handle_ftp_packet,
+            3389: self._handle_rdp_packet,
+        }
+        handler = port_map.get(sport) or port_map.get(dport)
+
+        if handler:
+            handler(packet, src_ip, dst_ip, sport, dport)
+        else:
+            # For unknown ports, still check for TLS in case of non-standard ports
+            self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+            self.logger.log_message(
+                f"[Transport][🧵 TCP][❔ Undecoded] Unknown TCP protocol on ports {sport} → {dport}."
+            )
+    def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport):
+        self.transport_http.handle(packet, src_ip, dst_ip, sport, dport)
+
+    def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport):
+        self.logger.log_message(f"[Transport][🧵 TCP][🔒 HTTPS] Traffic on port 443 detected from {src_ip}:{sport} to {dst_ip}:{dport}.")
+        self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+
+    def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport):
+        self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport)
+
+    def _handle_ftp_packet(self, packet, src_ip, dst_ip, sport, dport):
+        self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport)
+
+    def _handle_rdp_packet(self, packet, src_ip, dst_ip, sport, dport):
+        self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport)
+
+    def _canonical_flow_key(self, a_ip, a_port, b_ip, b_port):
+        """Canonical 4-tuple key ((low),(high)) so lookups are direction-agnostic."""
+        t1 = (a_ip, a_port)
+        t2 = (b_ip, b_port)
+        return (t1, t2) if t1 <= t2 else (t2, t1)
+
+    def _feed_to_tls_manager(self, packet, src_ip, dst_ip, sport, dport, *, reason: str = "auto", log: bool = True):
+        """
+        Best-effort feed of TCP payload to TLSRecordManager with stable direction.
+        reason: short tag for why we're feeding (e.g., 'https', 'fallback', 'alt443').
+        """
+        from scapy.packet import Raw  # lazy import to avoid hard dep at module load
+
+        if not packet.haslayer(Raw):
+            return
+
+        raw_bytes = bytes(packet[Raw].load or b"")
+        if not raw_bytes:
+            return
+
+        key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
+
+        # Direction: prefer the SYN-seen initiator; fallback to heuristic.
+        client_tuple = self._initiators.get(key)
+        if client_tuple:
+            is_c2s = (src_ip, sport) == client_tuple
+        else:
+            # Heuristic: ephemeral→well-known tends to be client→server
+            well_known = (dport in (443, 853, 993, 995, 465, 8443, 8883, 10443))
+            is_c2s = True if well_known else (sport <= dport)
+
+        # Ship it to the TLS parser
+        self.tls_manager.feed_tcp_segment(
+            canonical_key=key,
+            is_c2s=is_c2s,
+            payload=raw_bytes,
+            src_ip=src_ip, src_port=sport,
+            dst_ip=dst_ip, dst_port=dport,
+            ts=time.time()
+        )
+
+        if log:
+            dir_str = "c2s" if is_c2s else "s2c"
+            self.logger.log_message(
+                f"[Transport][🔐 TLS] fed {len(raw_bytes)}B ({reason}) {src_ip}:{sport} → {dst_ip}:{dport} [{dir_str}]"
+            )
     # --------------------- Main packet handler ------------------------
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
@@ -1653,315 +3289,65 @@ class TransportManager:
         # --- TCP ---
         if packet.haslayer(TCP):
             tcp = packet[TCP]
-            flags = tcp.sprintf("%TCP.flags%")
-            payload_len = len(tcp.payload)
-            flag_details = []
-            if "S" in flags: flag_details.append("SYN")
-            if "F" in flags: flag_details.append("FIN")
-            if "A" in flags: flag_details.append("ACK")
-            if "R" in flags: flag_details.append("RST")
-
-            self.logger.log_message(
-                f"[Transport][🧵 TCP] Packet on {iface_short}: {src_ip}:{tcp.sport} → {dst_ip}:{tcp.dport} | "
-                f"Flags: {','.join(flag_details)} | Payload: {payload_len}"
-            )
-
-            # Track initiator when we see initial SYN (no ACK)
-            if "S" in flags and "A" not in flags:
-                key = _canon_key(src_ip, tcp.sport, dst_ip, tcp.dport)
-                self._initiators[key] = (src_ip, tcp.sport)
-
-            # Feed TLS bytes (if present) to TLSRecordManager
-            if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
-                raw_bytes = bytes(packet[Raw].load)
-                key = _canon_key(src_ip, tcp.sport, dst_ip, tcp.dport)
-                client_tuple = self._initiators.get(key)
-
-                # Decide direction: c2s if (src_ip,src_port) == client_tuple
-                if client_tuple:
-                    is_c2s = (src_ip, tcp.sport) == client_tuple
-                else:
-                    # Fallback heuristic if we never saw the SYN
-                    is_c2s = (tcp.sport <= tcp.dport)
-
-                self.tls_manager.feed_tcp_segment(
-                    canonical_key=key,
-                    is_c2s=is_c2s,
-                    payload=raw_bytes,
-                    src_ip=src_ip, src_port=tcp.sport,
-                    dst_ip=dst_ip, dst_port=tcp.dport,
-                    ts=time.time()
-                )
-
-            # Example hook: Detect SYN scan
-            if "SYN" in flag_details and payload_len == 0:
-                self.logger.log_message(
-                    f"[Transport][🧵 TCP][⚠️ SCAN] SYN scan suspected from {src_ip} → {dst_ip}:{tcp.dport}"
-                )
-
-            # Check for dynamic port 56709
-            if tcp.sport == 56709 or tcp.dport == 56709:
-                self.logger.log_message(
-                    f"[Transport][🧵 TCP][❔ Dynamic Port] TCP Port 56709 detected from {src_ip}:{tcp.sport} to {dst_ip}:{tcp.dport}."
-                )
-
+            self._handle_tcp_packet(packet, src_ip, dst_ip,tcp.dport, tcp.sport, inbound_iface)
             processed = True
 
         # --- UDP ---
         elif packet.haslayer(UDP):
             udp = packet[UDP]
-            payload_len = len(udp.payload)
-
-            self.logger.log_message(
-                f"[Transport][🚀 UDP] Packet on {iface_short}: {src_ip}:{udp.sport} → {dst_ip}:{udp.dport} | "
-                f"Payload: {payload_len}"
-            )
-
-            # Check for specific known UDP protocols
-            if udp.dport == 53 and packet.haslayer(DNS):
-                self._handle_dns_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.sport == 67 or udp.dport == 68:
-                self._handle_dhcp_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 443 or udp.sport == 443:
-                self._handle_quic_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 123 and packet.haslayer(Raw):
-                self._handle_ntp_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 69 and packet.haslayer(Raw):
-                self._handle_tftp_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 5060 or udp.sport == 5060:
-                self._handle_sip_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport in self.voip_port_range or udp.sport in self.voip_port_range:
-                self._handle_rtp_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 9993 or udp.sport == 9993:
-                self._handle_zerotier_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 1900 or udp.sport == 1900:
-                self._handle_ssdp_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 3702 or udp.sport == 3702:
-                self._handle_ws_discovery_packet(packet, src_ip, dst_ip, udp.sport, udp.dport)
-            elif udp.dport == 51163 or udp.sport == 51163:
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][❔ Ephemeral Port] UDP Port 51163 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}. "
-                    "This is an ephemeral port, often used by client applications."
-                )
-            elif udp.dport == 54742 or udp.sport == 54742:
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][❔ Ephemeral Port] UDP Port 54742 detected from {src_ip}:{udp.sport} to {dst_ip}:{udp.dport}."
-                )
-            else:
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {udp.sport} → {udp.dport}. "
-                    f"Payload size: {payload_len}"
-                )
-
+            self._handle_udp_packet(packet, src_ip, dst_ip,udp.dport, udp.sport, inbound_iface)
             processed = True
 
         return processed
+
+    def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        """Dispatches UDP packets to the correct handler based on port."""
+        self.logger.log_message(
+            f"[Transport][🚀 UDP] Packet on {iface_short}: {src_ip}:{sport} → {dst_ip}:{dport} | "
+            f"Payload: {len(packet[UDP].payload)}"
+        )
+
+        port_map = {
+            53: self._handle_dns_packet,
+            67: self._handle_dhcp_packet,
+            68: self._handle_dhcp_packet,
+            443: self._handle_quic_packet,
+            123: self._handle_ntp_packet,
+            69: self._handle_tftp_packet,
+            5060: self._handle_sip_packet,
+            9993: self._handle_zerotier_packet,
+            1900: self._handle_ssdp_packet,
+            3702: self._handle_ws_discovery_packet,
+        }
+        handler = port_map.get(sport) or port_map.get(dport)
+
+        if handler:
+            handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+        elif sport in self.voip_port_range or dport in self.voip_port_range:
+            self._handle_rtp_packet(packet, src_ip, dst_ip, sport, dport)
+        else:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {sport} → {dport}."
+            )
 
     # ---------------------- UDP protocol handlers ---------------------
     def _bytes_to_str(self, data: bytes) -> str:
         """Safely decodes bytes to a string, ignoring any decoding errors."""
         return data.decode('utf-8', errors='ignore')
 
-    def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DNS packets."""
-        dns = packet[DNS]
-        query_name = "N/A"
-        if dns.qr == 0 and dns.qd:
-            query_name = self._bytes_to_str(dns.qd.qname)
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][🔍 DNS] Query from {src_ip}:{sport} for domain '{query_name}'"
-            )
-        elif dns.qr == 1 and dns.an:
-            query_name = self._bytes_to_str(dns.qd.qname) if dns.qd else "N/A"
-            answers = dns.ancount
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][🔍 DNS] Response to {dst_ip}:{dport} for '{query_name}' with {answers} answers."
-            )
-        else:
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][🔍 DNS] Malformed or unrecognized DNS packet from {src_ip}:{sport}"
-            )
+        self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
-    def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DHCP packets."""
-        if packet.haslayer(BOOTP):
-            bootp = packet[BOOTP]
-            dhcp_message_type = "N/A"
-            if packet.haslayer(DHCP):
-                for opt in packet[DHCP].options:
-                    if isinstance(opt, tuple) and opt[0] == 'message-type':
-                        dhcp_message_type = opt[1]
-                        break
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][⚙️ DHCP] {dhcp_message_type} packet from {src_ip}:{sport} to {dst_ip}:{dport} "
-                f"Client MAC: {bootp.chaddr.hex()}"
-            )
-        else:
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][⚙️ DHCP] DHCP-related UDP packet from {src_ip}:{sport}, no BOOTP layer found."
-            )
+        self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
-    def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for QUIC packets."""
-        if packet.haslayer(Raw):
-            raw_data = bytes(packet[Raw].load)
-            dcid_len = 0
-            scid_len = 0
-            is_long_header = False
+        self.transport_quic.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
-            if len(raw_data) >= 1:
-                first_byte = raw_data[0]
-                is_long_header = (first_byte & 0x80) == 0x80
-
-                if is_long_header and len(raw_data) >= 6:
-                    packet_type = (first_byte & 0x30) >> 4
-                    version_bytes = raw_data[1:5]
-                    version_hex = version_bytes.hex()
-                    dcid_len = raw_data[5]
-                    if len(raw_data) > 6 + dcid_len:
-                        scid_len = raw_data[6 + dcid_len]
-                    try:
-                        dcid = raw_data[6:6 + dcid_len].hex()
-                        scid = raw_data[7 + dcid_len:7 + dcid_len + scid_len].hex()
-                        packet_type_str = {
-                            0: "Initial", 1: "0-RTT", 2: "Handshake", 3: "Retry"
-                        }.get(packet_type, "Unknown")
-                        self.logger.log_message(
-                            f"[Transport][🚀 UDP][🌐 QUIC] Long Header ({packet_type_str}) from {src_ip}:{sport} | "
-                            f"Version: 0x{version_hex} | DCID: {dcid} | SCID: {scid}"
-                        )
-                    except IndexError:
-                        self.logger.log_message(
-                            f"[Transport][🚀 UDP][🌐 QUIC] Malformed Long Header from {src_ip}:{sport}"
-                        )
-                elif not is_long_header:
-                    dcid_len = 8
-                    dcid = raw_data[1:1 + dcid_len].hex() if len(raw_data) > 1 + dcid_len else "?"
-                    spin_bit = (first_byte & 0x20) >> 5
-                    key_phase_bit = (first_byte & 0x04) >> 2
-                    key_phase_str = "Updated Keys" if key_phase_bit else "Initial Keys"
-                    self.logger.log_message(
-                        f"[Transport][🚀 UDP][🌐 QUIC] Short Header from {src_ip}:{sport} | "
-                        f"DCID: {dcid} | Spin Bit: {spin_bit} | Key Phase: {key_phase_str}"
-                    )
-                if is_long_header:
-                    header_len = 7 + dcid_len + scid_len
-                else:
-                    header_len = 1 + dcid_len
-                if len(raw_data) > header_len:
-                    self._inspect_quic_frames(raw_data[header_len:], src_ip, dst_ip, dport)
-        else:
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][🌐 QUIC] UDP on port 443 detected, but no Raw payload."
-            )
-
-    def _inspect_quic_frames(self, data: bytes, src_ip: str, dst_ip: str, dport: int):
-        """
-        Parses and logs details of QUIC frames within a packet payload. This version
-        prevents spam by only logging new STREAM frames and using a time-based
-        cache to expire old stream entries.
-        """
-        i = 0
-        while i < len(data):
-            try:
-                first_byte = data[i]
-                if 0x08 <= first_byte <= 0x0f:
-                    has_len_bit = (first_byte & 0x02)
-                    has_off_bit = (first_byte & 0x04)
-                    offset = 1
-                    stream_id, bytes_read = self._parse_quic_varint(data[i + offset:])
-                    if bytes_read == 0: break
-                    stream_key = (src_ip, dst_ip, stream_id)
-                    current_time = time.time()
-                    if stream_key not in self.logged_quic_streams:
-                        log_msg = f"[Transport][🌐 QUIC][Frame] STREAM | New Stream ID: {stream_id}"
-                        self.logger.log_message(log_msg)
-                        if current_time - self.last_quic_cleanup_time > 60:
-                            expired_keys = [
-                                key for key, timestamp in self.logged_quic_streams.items()
-                                if current_time - timestamp > self.QUIC_STREAM_TIMEOUT
-                            ]
-                            if expired_keys:
-                                self.logger.log_message(
-                                    f"[Transport] Pruning {len(expired_keys)} expired QUIC stream entries from cache."
-                                )
-                                for key in expired_keys:
-                                    self.logged_quic_streams.pop(key, None)
-                            self.last_quic_cleanup_time = current_time
-                    self.logged_quic_streams[stream_key] = current_time
-                    offset += bytes_read
-                    data_len = 0
-                    if has_off_bit:
-                        _, bytes_read = self._parse_quic_varint(data[i + offset:])
-                        offset += bytes_read
-                    if has_len_bit:
-                        data_len, bytes_read = self._parse_quic_varint(data[i + offset:])
-                        offset += bytes_read
-                    else:
-                        data_len = len(data) - (i + offset)
-                    i += offset + data_len
-                    continue
-                frame_type = first_byte
-                if frame_type == 0x24:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] RESET_STREAM_AT")
-                    i = len(data)
-                elif frame_type == 0x14:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] STREAMS_BLOCKED")
-                    i = len(data)
-                elif frame_type == 0xa4:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK_FREQUENCY")
-                    i = len(data)
-                elif frame_type == 0x02 or frame_type == 0x03:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] ACK")
-                    i = len(data)
-                elif frame_type == 0x06:
-                    offset, length = struct.unpack("!II", data[i + 1:i + 9])
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] CRYPTO | Offset: {offset} | Length: {length}")
-                    i += 9 + length
-                elif frame_type == 0x00:
-                    i += 1
-                elif frame_type == 0x01:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] PING")
-                    i += 1
-                elif frame_type == 0x1C or frame_type == 0x1D:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] CONNECTION_CLOSE")
-                    i = len(data)
-                else:
-                    self.logger.log_message(f"[Transport][🌐 QUIC][Frame] Unknown frame type: 0x{first_byte:02x}")
-                    break
-            except (struct.error, IndexError):
-                self.logger.log_message("[Transport][🌐 QUIC][Frame] Malformed frame or end of packet reached.")
-                break
-
-    def _parse_quic_varint(self, data: bytes) -> tuple[int, int]:
-        """
-        Parses a QUIC variable-length integer from the beginning of a byte string.
-        Returns (value, bytes_consumed), or (0,0) on failure.
-        """
-        if not data:
-            return 0, 0
-        first_byte = data[0]
-        length_bits = first_byte >> 6
-        try:
-            if length_bits == 0b00:
-                return first_byte & 0x3F, 1
-            elif length_bits == 0b01:
-                if len(data) < 2: return 0, 0
-                val = struct.unpack("!H", data[:2])[0]
-                return val & 0x3FFF, 2
-            elif length_bits == 0b10:
-                if len(data) < 4: return 0, 0
-                val = struct.unpack("!I", data[:4])[0]
-                return val & 0x3FFFFFFF, 4
-            elif length_bits == 0b11:
-                if len(data) < 8: return 0, 0
-                val = struct.unpack("!Q", data[:8])[0]
-                return val & 0x3FFFFFFFFFFFFFFF, 8
-        except (struct.error, IndexError):
-            return 0, 0
-        return 0, 0
-
-    def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """Handles and logs details for NTP packets."""
         raw_data = bytes(packet[Raw].load)
         if len(raw_data) >= 48:
@@ -1982,7 +3368,7 @@ class TransportManager:
                     f"[Transport][🚀 UDP][🕰️ NTP] Malformed NTP packet from {src_ip}:{sport}"
                 )
 
-    def _handle_tftp_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_tftp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """Handles and logs details for TFTP packets."""
         raw_data = bytes(packet[Raw].load)
         if len(raw_data) >= 2:
@@ -2010,7 +3396,7 @@ class TransportManager:
                     f"[Transport][🚀 UDP][📄 TFTP] Malformed TFTP packet from {src_ip}:{sport}"
                 )
 
-    def _handle_sip_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_sip_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """Handles and logs details for SIP packets."""
         if packet.haslayer(Raw):
             raw_data = bytes(packet[Raw].load)
@@ -2032,57 +3418,19 @@ class TransportManager:
                     f"[Transport][🚀 UDP][📞 SIP] Malformed or undecodable SIP packet from {src_ip}:{sport}"
                 )
 
-    def _handle_rtp_packet(self, packet, src_ip, dst_ip, sport, dport):
-        """
-        Handles and logs details for RTP packets with full header parsing.
-        This enhanced version decodes the SSRC, sequence number, and marker bit.
-        """
-        if packet.haslayer(Raw) and len(packet[Raw].load) >= 12:
-            raw_data = bytes(packet[Raw].load)
-            RTP_PAYLOAD_TYPES = {
-                0: "PCMU", 3: "GSM", 4: "G723", 8: "PCMA", 9: "G722",
-                10: "L16/2ch", 11: "L16/1ch", 15: "G728", 18: "G729",
-                26: "JPEG", 31: "H261", 32: "MPV", 33: "MP2T", 34: "H263",
-                96: "H264", 97: "H264", 98: "H265/HEVC", 100: "VP8", 101: "VP9", 103: "Opus"
-            }
-            try:
-                byte1, byte2, seq_num, timestamp, ssrc = struct.unpack('!BBHII', raw_data[:12])
-                version = (byte1 >> 6) & 0x03
-                marker = (byte2 >> 7) & 0x01
-                payload_type = byte2 & 0x7F
-                if version == 2:
-                    payload_type_str = RTP_PAYLOAD_TYPES.get(payload_type, f"Dynamic({payload_type})")
-                    log_details = (
-                        f"Ver: {version}, PT: {payload_type_str}, "
-                        f"Seq: {seq_num}, SSRC: 0x{ssrc:08x}"
-                    )
-                    if marker:
-                        log_details += " [Marker]"
-                    self.logger.log_message(
-                        f"[Transport][🚀 UDP][🔊 RTP] Media Stream from {src_ip}:{sport} to {dst_ip}:{dport} | {log_details}"
-                    )
-                else:
-                    self.logger.log_message(
-                        f"[Transport][🚀 UDP][🔊 RTP] Non-RTP packet on VoIP port, or unknown version {version}"
-                    )
-            except (struct.error, IndexError):
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][🔊 RTP] Malformed RTP packet from {src_ip}:{sport}"
-                )
+    def _handle_rtp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface, iface_short):
+        self.transport_rtp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
-    def _handle_zerotier_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_zerotier_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """Handles and logs details for ZeroTier-like packets on UDP port 9993."""
         self.logger.log_message(
             f"[Transport][🚀 UDP][🛰️ ZeroTier] UDP port 9993 traffic detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
             "Likely ZeroTier, Cisco ACS, or other application."
         )
 
-    def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport):
+    def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for SSDP/UPnP packets on UDP port 1900."""
-        self.logger.log_message(
-            f"[Transport][🚀 UDP][🔌 SSDP] SSDP/UPnP packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
-            "Likely for device discovery."
-        )
+        self.transport_ssdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_ws_discovery_packet(self, packet, src_ip, dst_ip, sport, dport):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
@@ -2091,311 +3439,7 @@ class TransportManager:
             "Likely for dynamic device discovery."
         )
 
-class HTTPSManager:
-    """
-    Passive HTTPS/TLS + TCP monitor that **does not** rely on Scapy's TLS layers.
-    Instead, it feeds TCP payload bytes into TLSRecordManager, which performs
-    stream-aware reassembly and best-effort TLS record/handshake parsing (e.g., SNI).
-    """
 
-    # Pretty names for TLS content types
-    _CT_NAMES = {20: "ChangeCipherSpec", 21: "Alert", 22: "Handshake", 23: "ApplicationData"}
-
-    # Common TLS server ports (used as a light prefilter; parsing still works on any port)
-    _TLS_LIKE_PORTS = {443, 8443, 9443, 10443, 444, 8444}
-
-    def __init__(self, router_logger):
-        self.router_logger = router_logger
-        self.cipher_map = self._build_cipher_suite_map()
-        self.router_logger.log_message("[HTTPS] 🔒 Initialized for passive TLS/TCP monitoring.")
-        self.router_logger.log_message(f"[HTTPS] 🗺️  Cipher map has {len(self.cipher_map)} entries.")
-
-        # For nicer alert logs
-        self.TLS_ALERT_LEVEL = {1: "warning", 2: "fatal"}
-        self.TLS_ALERT_DESCRIPTION = {
-            0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
-            22: "record_overflow", 40: "handshake_failure", 42: "bad_certificate",
-            43: "unsupported_certificate", 46: "certificate_unknown", 47: "illegal_parameter",
-            48: "unknown_ca", 49: "access_denied", 50: "decode_error",
-            51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
-            80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
-        }
-
-        # TCP state tracking (simple)
-        self.tcp_state_map: Dict[Tuple[str, int, str, int], str] = {}
-        self.TCP_FLAGS = {'S': 'SYN', 'A': 'ACK', 'F': 'FIN', 'R': 'RST', 'P': 'PSH', 'U': 'URG'}
-
-        # Track TCP initiators so we can label TLS direction (c2s vs s2c)
-        # key = canonical 4-tuple (two endpoint pairs in sorted order) -> (client_ip, client_port)
-        self._initiators: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
-
-        # TLS record parser/manager
-        self.tls_manager = TLSRecordManager(self.router_logger)
-        self._wire_tls_callbacks()
-
-    # ------------ Public ------------
-
-    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
-        """
-        Handle one packet: log TCP, parse TCP options/state, and feed any TCP payload
-        bytes into TLSRecordManager (direction-aware) for passive TLS parsing.
-        """
-        processed = False
-
-        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            return processed
-
-        ip = packet.getlayer(IP) or packet.getlayer(IPv6)
-
-        # ---------- TCP ----------
-        if packet.haslayer(TCP):
-            tcp = packet[TCP]
-            self.router_logger.log_message(self._generate_tcp_summary(packet, inbound_iface))
-            self._handle_tcp_options(packet)
-            self._handle_tcp_state(packet)
-
-            # Record the initiator on a bare SYN (no ACK)
-            flags_txt = tcp.sprintf("%TCP.flags%")
-            if "S" in flags_txt and "A" not in flags_txt:
-                key = self._canon_key(ip.src, tcp.sport, ip.dst, tcp.dport)
-                self._initiators[key] = (ip.src, tcp.sport)
-
-            # Feed possible TLS bytes (Raw) into TLSRecordManager
-            if packet.haslayer(Raw) and len(packet[Raw].load) > 0:
-                raw = bytes(packet[Raw].load)
-                if self._looks_tlsish(raw, tcp.sport, tcp.dport):
-                    key = self._canon_key(ip.src, tcp.sport, ip.dst, tcp.dport)
-                    client_tuple = self._initiators.get(key)
-                    is_c2s = (client_tuple is not None and (ip.src, tcp.sport) == client_tuple)
-                    # Fallback heuristic if initiator unknown
-                    if client_tuple is None:
-                        is_c2s = (tcp.sport <= tcp.dport)
-
-                    self.tls_manager.feed_tcp_segment(
-                        canonical_key=key,
-                        is_c2s=is_c2s,
-                        payload=raw,
-                        src_ip=ip.src, src_port=tcp.sport,
-                        dst_ip=ip.dst, dst_port=tcp.dport,
-                        ts=time.time()
-                    )
-            processed = True
-
-        return processed
-
-    # ------------ TLS wiring & callbacks ------------
-
-    def _wire_tls_callbacks(self):
-        def fmt_flow(rec):
-            return f"{rec.src}:{rec.src_port} → {rec.dst}:{rec.dst_port} [{rec.direction}]"
-
-        # Generic TLS record callback
-        def on_record(rec):
-            ct_name = self._CT_NAMES.get(rec.content_type, f"ct={rec.content_type}")
-            self.router_logger.log_message(
-                f"[HTTPS][TLS] 📦 {ct_name} v={rec.version[0]}.{rec.version[1]} len={rec.length} on {fmt_flow(rec)}"
-            )
-
-        # Handshake messages (best-effort summaries from TLSRecordManager)
-        def on_handshake(rec, info):
-            for m in info.get("messages", []):
-                if m.get("hello") == "client":
-                    v = m.get("version") or "?"
-                    sni = m.get("sni") or "N/A"
-                    suites = m.get("cipher_suites_count")
-                    self.router_logger.log_message(
-                        f"[HTTPS][TLS] 🤝 ClientHello v={v} SNI={sni} suites≈{suites} on {fmt_flow(rec)}"
-                    )
-                elif m.get("hello") == "server":
-                    v = m.get("version") or "?"
-                    cs_id_hex = (m.get("cipher_suite") or "").lower()  # "0xNNNN"
-                    cs_name = None
-                    try:
-                        if cs_id_hex.startswith("0x"):
-                            cs_val = int(cs_id_hex, 16)
-                            cs_name = self.cipher_map.get(cs_val)
-                    except Exception:
-                        pass
-                    cs_display = f"{cs_name} ({cs_id_hex})" if cs_name else (cs_id_hex or "?")
-                    self.router_logger.log_message(
-                        f"[HTTPS][TLS] 🤝 ServerHello v={v} cipher={cs_display} on {fmt_flow(rec)}"
-                    )
-                else:
-                    t = m.get("type") or f"type={m.get('type_id')}"
-                    self.router_logger.log_message(
-                        f"[HTTPS][TLS] 🤝 Handshake: {t} on {fmt_flow(rec)}"
-                    )
-
-        def on_app(rec):
-            self.router_logger.log_message(
-                f"[HTTPS][TLS] 🔒 Application Data {rec.length}B on {fmt_flow(rec)}"
-            )
-
-        def on_alert(rec, alert):
-            lvl = self.TLS_ALERT_LEVEL.get(alert.get("level"), str(alert.get("level")))
-            desc = self.TLS_ALERT_DESCRIPTION.get(alert.get("description"), str(alert.get("description")))
-            self.router_logger.log_message(
-                f"[HTTPS][TLS] ⚠️ Alert on {fmt_flow(rec)}: level={lvl}, desc={desc}"
-            )
-
-        def on_ccs(rec):
-            self.router_logger.log_message(
-                f"[HTTPS][TLS] 🔁 ChangeCipherSpec on {fmt_flow(rec)}"
-            )
-
-        def on_legacy(rec):
-            self.router_logger.log_message(
-                f"[HTTPS][TLS] 🧓 Legacy/SSLv2-like record len={rec.length} on {fmt_flow(rec)}"
-            )
-
-        self.tls_manager.on_record = on_record
-        self.tls_manager.on_handshake = on_handshake
-        self.tls_manager.on_application_data = on_app
-        self.tls_manager.on_alert = on_alert
-        self.tls_manager.on_change_cipher_spec = on_ccs
-        self.tls_manager.on_legacy_ssl = on_legacy
-
-    # ------------ TCP helpers/logging ------------
-
-    def _generate_tcp_summary(self, packet: Packet, inbound_iface: str) -> str:
-        iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        tcp = packet.getlayer(TCP)
-
-        if not ip_layer or not tcp:
-            return f"[TCP] 🔄 TCP packet on {iface_short} (no IP/TCP layer?)"
-
-        src_ip, dst_ip = ip_layer.src, ip_layer.dst
-        flags_str = ",".join([self.TCP_FLAGS.get(f, f) for f in str(tcp.flags)])
-        return (f"[TCP] 🔄 {src_ip}:{tcp.sport} -> {dst_ip}:{tcp.dport} on {iface_short} | "
-                f"Flags: {flags_str} | Seq: {tcp.seq} | Ack: {tcp.ack}")
-
-    def _handle_tcp_options(self, packet: Packet):
-        tcp = packet.getlayer(TCP)
-        if hasattr(tcp, 'options') and tcp.options:
-            self.router_logger.log_message(f"[TCP]   - Options ({len(tcp.options)} total):")
-            for opt in tcp.options:
-                name = opt[0]
-                if name == 'WScale':
-                    self.router_logger.log_message(f"[TCP]     - Window Scale: {opt[1]} 📈")
-                elif name == 'Timestamp':
-                    ts_val, ts_ecr = opt[1]
-                    self.router_logger.log_message(f"[TCP]     - Timestamps: TSval={ts_val}, TSecr={ts_ecr} ⏰")
-                elif name == 'SAckOK':
-                    self.router_logger.log_message(f"[TCP]     - SACK Permitted ✅")
-                elif name == 'MSS':
-                    self.router_logger.log_message(f"[TCP]     - MSS: {opt[1]} 📝")
-                elif name == 'NOP':
-                    continue
-                else:
-                    self.router_logger.log_message(f"[TCP]     - Option: {name} ❓")
-
-    def _handle_tcp_state(self, packet: Packet):
-        ip = packet.getlayer(IP) or packet.getlayer(IPv6)
-        tcp = packet.getlayer(TCP)
-        if not ip or not tcp:
-            return
-
-        src_ip, src_port = ip.src, tcp.sport
-        dst_ip, dst_port = ip.dst, tcp.dport
-
-        # Direction-agnostic key
-        conn_key = (src_ip, src_port, dst_ip, dst_port) if src_port < dst_port else (dst_ip, dst_port, src_ip, src_port)
-        cur = self.tcp_state_map.get(conn_key, "CLOSED")
-        flags = tcp.flags
-
-        if flags == 0x02:  # SYN
-            if cur == "CLOSED":
-                self.router_logger.log_message(
-                    f"[TCP] Handshake Initiated: {src_ip}:{src_port} sent SYN. ➡️ State: SYN-SENT."
-                )
-                self.tcp_state_map[conn_key] = "SYN-SENT"
-        elif flags == 0x12:  # SYN-ACK
-            if cur == "SYN-SENT":
-                self.router_logger.log_message(
-                    f"[TCP] Handshake Progress: {src_ip}:{src_port} replied with SYN-ACK. 🔄 State: SYN-RECEIVED."
-                )
-                self.tcp_state_map[conn_key] = "SYN-RECEIVED"
-        elif flags == 0x10 and cur == "SYN-RECEIVED":  # ACK
-            self.router_logger.log_message(
-                f"[TCP] Handshake Completed: {src_ip}:{src_port} sent ACK. ✅ ESTABLISHED."
-            )
-            self.tcp_state_map[conn_key] = "ESTABLISHED"
-        elif 'F' in str(flags):
-            if cur == "ESTABLISHED":
-                self.router_logger.log_message(
-                    f"[TCP] Termination Started: {src_ip}:{src_port} sent FIN. ✂️ FIN-WAIT-1."
-                )
-                self.tcp_state_map[conn_key] = "FIN-WAIT-1"
-        elif 'R' in str(flags):
-            self.router_logger.log_message(
-                f"[TCP] Connection Aborted: {src_ip}:{src_port} sent RST. ⚠️ Reset."
-            )
-            self.tcp_state_map.pop(conn_key, None)
-
-        def on_decision(key, rec, decision):
-            flow = f"{rec.src}:{rec.src_port} → {rec.dst}:{rec.dst_port} [{rec.direction}]"
-            if decision.action == "allow":
-                return
-            self.router_logger.log_message(
-                f"[HTTPS][Policy] {decision.action.upper()} on {flow} "
-                f"reason={decision.reason} tags={decision.tags}"
-            )
-
-        def on_event(evt):
-            flow = evt.get("flow")
-            kind = evt.get("kind")
-            data = evt.get("data", {})
-            self.router_logger.log_message(
-                f"[HTTPS][Event] kind={kind} flow={flow} data={data}"
-            )
-
-        self.tls_manager.on_decision = on_decision
-        self.tls_manager.on_event = on_event
-    # ------------ Utils ------------
-
-    @staticmethod
-    def _canon_key(ip1: str, pt1: int, ip2: str, pt2: int) -> Tuple[Tuple[str, int], Tuple[str, int]]:
-        """Order-independent session key: ((a,pa),(b,pb)) sorted by tuple."""
-        a, b = (ip1, pt1), (ip2, pt2)
-        return (a, b) if a <= b else (b, a)
-
-    def _looks_tlsish(self, buf: bytes, sport: int, dport: int) -> bool:
-        """
-        Cheap prefilter to avoid feeding obviously non-TLS payloads.
-        Still safe to return True liberally—TLSRecordManager will resync/drop non-TLS.
-        """
-        if len(buf) >= 5 and buf[1] == 3 and buf[0] in (20, 21, 22, 23):
-            return True  # TLS1.x record header
-        if len(buf) >= 2 and (buf[0] & 0x80):  # SSLv2 length MSB set
-            return True
-        if sport in self._TLS_LIKE_PORTS or dport in self._TLS_LIKE_PORTS:
-            return True
-        return False
-
-    def _build_cipher_suite_map(self) -> dict:
-        """
-        Build a minimal cipher map; extend from scapy's tls_ciphersuites if present.
-        """
-        cipher_map = {
-            # TLS 1.3
-            0x1301: "TLS_AES_128_GCM_SHA256",
-            0x1302: "TLS_AES_256_GCM_SHA384",
-            0x1303: "TLS_CHACHA20_POLY1305_SHA256",
-            # Common TLS 1.2 ECDHE
-            0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-            0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-            0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-        }
-        if 'tls_ciphersuites' in globals():
-            try:
-                cipher_map.update(globals()['tls_ciphersuites'])
-            except Exception:
-                pass
-        return cipher_map
 
 class _MsgTypeShim:
     def __init__(self, val: int): self.val = val
