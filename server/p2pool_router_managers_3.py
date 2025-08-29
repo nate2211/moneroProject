@@ -11,7 +11,8 @@ import re
 import traceback
 from collections import deque, defaultdict, Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, Tuple, Mapping, Iterator
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, Tuple, Mapping, Iterator, Sequence, \
+    DefaultDict
 
 # NumPy for analysis (only used during analysis; raw values stay as Python lists)
 import numpy as np
@@ -291,12 +292,14 @@ class CodeOutputManager:
             "writing pcap","emitting metrics","updating dashboard","acknowledging event","compiling signature","testing hypothesis",
             "verifying fix","rolling update","committing change","synchronizing clocks","aligning windows","applying policy","enforcing rules",
         ]
+        self.ask_manager = AskManager(rng_seed=9999)
         self.chatgen = ChatGenManager(
+            ask_manager=self.ask_manager,
             format_kv=lambda attrs, limit=8: self._format_kv(attrs, limit=8),
             history_getter=lambda: self._chat_history,
             persona=self._chat_persona,
             seed_corpus=self._chat_seed_corpus,
-            max_chars=1000,
+            max_chars=250,
         )
 
         self.packet_learner = PacketLearnerManager(
@@ -305,8 +308,8 @@ class CodeOutputManager:
 
         self.method_generator = SnapshotMethodGenerator()
         self.stats_manager = StatisticsManager()
-        self.snapshot_builder = SnapshotBuilder(self._log)
-        self.ask_manager = AskManager(rng_seed=9999)
+        self.snapshot_builder = SnapshotBuilder(logger=self._log, ask_manager=self.ask_manager, rng_seed=2342)
+
         self.log_message("[CodeOutput] Manager initialized (drop-in, protocol-agnostic, NumPy stats ready).")
 
     def ask(self, prompt: str) -> str:
@@ -600,7 +603,6 @@ class CodeOutputManager:
 
                 h = hashlib.sha256(code.encode("utf-8")).hexdigest()
                 self._log(f"[CodeOutput] 🔁 Auto-emitter produced hash={h[:10]}… len={len(code)} bytes.", 1)
-                self.ask("inspect")
                 self.ask("sensitive")
                 self.ask("stats")
                 self.ask("emit")
@@ -2025,20 +2027,50 @@ class StatisticsManager:
             "top_k": [(str(val), int(cnt)) for val, cnt in top_values],
         }
 
+
 class SnapshotBuilder:
     """
-    An advanced manager that builds a Python class by learning from observed
-    code examples to procedurally generate new, descriptive docstrings.
+    SnapshotBuilder (AskManager-aware)
 
-    This class uses a NumPy-powered Markov Chain model to function like a
-    mini "code chatbot," creating unique summaries for each generated snapshot.
+    An advanced manager that builds a Python class by learning from observed code
+    examples and AskManager knowledge to procedurally generate new,
+    descriptive docstrings.
+
+    Key differences vs. your original:
+      • Uses AskManager for tokenization, topic detection, redaction & retrieval
+      • Trains the Markov generator from (a) provided code examples,
+        (b) AskManager token bank lines, and (c) live knowledge payloads
+      • Optionally includes AskManager insights & statistics
+      • Produces a compact, readable class string using AskManager’s payload
+        formatter and redaction where appropriate
     """
 
-    def __init__(self, logger: Callable[[str, int], None]):
+    def __init__(
+        self,
+        logger: Callable[[str, int], None],
+        *,
+        ask_manager: Optional[object] = None,
+        rng_seed: Optional[int] = None,
+        max_corpus_lines: int = 200,
+        max_payload_chars: int = 1200,
+        doc_max_len: int = 28,
+    ):
         self._log = logger
+        self._am = ask_manager
+        self._rng = random.Random(rng_seed)
+        self._np_rng = np.random.default_rng(rng_seed)
         self._markov_model: Dict[str, Dict[str, int]] = {}
         self._starters: List[str] = []
+        self._max_corpus_lines = int(max_corpus_lines)
+        self._max_payload_chars = int(max_payload_chars)
+        self._doc_max_len = int(doc_max_len)
 
+        # fallbacks if AskManager absent
+        self._fallback_token_re = re.compile(r"[A-Za-z0-9_]+")
+
+    # -------------------------------------------------------------------------
+    # Public API (unchanged signature)
+    # -------------------------------------------------------------------------
     def build(
         self,
         config: Dict[str, Any],
@@ -2050,43 +2082,134 @@ class SnapshotBuilder:
         """
         The main public method to generate the class code string.
         """
-        # 1. Parse config and gather all knowledge
+        # 1) Parse config and gather knowledge (base + external)
         class_name, base_attrs, base_methods, topics, policies = self._parse_config(config)
-        merged_attrs, merged_methods = self._gather_and_merge_knowledge(
+        k_attrs, k_methods = self._gather_external_knowledge(
             knowledge_gatherer, base_attrs, base_methods, topics, policies
         )
 
-        # 2. Learn from existing code to power the generator
-        # We extract text from method bodies to learn from
-        code_examples = [
-            m.get("body") for m in knowledge_gatherer(topics=topics)[1].values()
-            if isinstance(m.get("body"), str)
-        ]
+        # 2) Ingest AskManager knowledge (if present) and merge
+        am_attrs, am_methods, code_examples = self._ingest_from_ask_manager(topics, policies)
+        merged_attrs = self._merge_attrs(base_attrs, k_attrs, am_attrs, policies)
+        merged_methods = self._merge_methods(base_methods, k_methods, am_methods, policies)
+
+        # 3) Learn from code examples + token bank + payloads
         self._train_generative_model(code_examples)
 
-        # 3. Add insights, stats, and standard methods
+        # 4) Add insights, stats, and standard methods
         if policies.get("include_insights"):
-            insights = insights_fetcher(topics=topics)
+            insights = self._fetch_insights(insights_fetcher, topics)
             if insights:
                 merged_attrs["_insights"] = insights
 
         stats = {}
         if policies.get("include_statistics"):
-            stats = stats_computer()
+            stats = self._compute_stats(stats_computer)
             if stats:
                 merged_attrs["_statistics"] = stats
 
         merged_methods.update(method_generator(stats=stats))
 
-        # 4. Use the generative model to write a unique class docstring
-        generative_docstring = self._generate_text(max_length=20)
+        # 5) Use the generative model to write a unique class docstring
+        generative_docstring = self._generate_text(max_length=self._doc_max_len)
 
-        # 5. Log and render the final class string with the new docstring
+        # 6) Log and render
         self._log_summary(class_name, topics, merged_attrs, merged_methods, policies)
         return self._render_class(class_name, merged_attrs, merged_methods, generative_docstring)
 
-    # --------------------------- Generative Model Methods ---------------------------
+    # -------------------------------------------------------------------------
+    # AskManager synergy
+    # -------------------------------------------------------------------------
+    def _ingest_from_ask_manager(
+        self,
+        topics: List[str],
+        policies: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+        """
+        Pulls material from AskManager for attributes/methods and a corpus for the generator.
+        """
+        if not self._am:
+            return {}, {}, []
 
+        # 1) Export live knowledge (redacted text used to build summaries)
+        try:
+            knowledge = self._am._export_knowledge()  # {topic: [{payload,...}, ...]}
+        except Exception:
+            knowledge = {}
+
+        # 2) Build attributes/methods from knowledge (compact)
+        attrs: Dict[str, Any] = {}
+        methods: Dict[str, Any] = {}
+        corpus: List[str] = []
+
+        # Include per-topic payload previews and tags
+        for topic, rows in (knowledge or {}).items():
+            # respect requested topics if provided
+            if topics and topic not in topics:
+                continue
+
+            previews: List[str] = []
+            tags: List[str] = []
+            for row in rows[:12]:
+                payload = row.get("payload") or {}
+                # textual preview via AskManager formatter (redacted by default)
+                preview = self._payload_to_text(payload, redact=True)
+                if preview:
+                    preview = preview if len(preview) <= self._max_payload_chars else preview[: self._max_payload_chars] + "…"
+                    previews.append(preview)
+                    corpus.append(preview)
+                tg = row.get("tags") or []
+                if tg: tags.extend(tg[:4])
+
+            if previews:
+                attrs[f"{topic}_previews"] = previews[:20]
+            if tags:
+                attrs[f"{topic}_tags"] = list(dict.fromkeys(tags))[:20]  # dedupe-preserve order
+
+        # 3) Mine token-bank lines from AskManager for Markov training
+        #    The token bank structure: token -> deque[(role, raw, ts), ...]
+        try:
+            token_bank = getattr(self._am, "_token_bank", {})
+            # favor newest lines across the whole bank
+            merged_lines: List[Tuple[float, str]] = []
+            for dq in token_bank.values():
+                for role, line, ts in dq:
+                    if role == "user" and line and not self._is_boilerplate(line):
+                        merged_lines.append((ts, line))
+            merged_lines.sort(key=lambda x: x[0], reverse=True)
+            for _, line in merged_lines[: self._max_corpus_lines]:
+                corpus.append(line)
+        except Exception:
+            pass
+
+        # 4) Add a small helper method that surfaces an AskManager tip for a topic
+        def _tip_body(topic_var: str = "topic"):
+            return (
+                "t = topic or 'misc'\n"
+                "try:\n"
+                "    return self._am._actionable_tip('snapshot', t) if hasattr(self, '_am') and self._am else 'No tip.'\n"
+                "except Exception:\n"
+                "    return 'No tip.'"
+            )
+        methods["ask_tip"] = {"body": _tip_body()}
+
+        # 5) Add a helper to list top keywords seen recently (via token bank density)
+        def _kw_body():
+            return (
+                "from collections import Counter\n"
+                "if not hasattr(self, '_am') or not self._am:\n"
+                "    return []\n"
+                "tb = getattr(self._am, '_token_bank', {}) or {}\n"
+                "cnt = Counter({k: len(v) for k, v in tb.items()})\n"
+                "return [w for w,_ in cnt.most_common(16)]"
+            )
+        methods["top_tokens"] = {"body": _kw_body()}
+
+        return attrs, methods, corpus
+
+    # -------------------------------------------------------------------------
+    # Generative Model (unchanged interface, richer inputs)
+    # -------------------------------------------------------------------------
     def _train_generative_model(self, texts: List[str]):
         """Builds a word-level Markov Chain model from example code/text."""
         self._markov_model = {}
@@ -2094,58 +2217,105 @@ class SnapshotBuilder:
         if not texts:
             return
 
-        for text in texts:
-            words = text.strip().lower().split()
+        # lightweight cleanup & cap
+        cap = min(len(texts), self._max_corpus_lines)
+        for text in texts[:cap]:
+            words = (text or "").strip().split()
             if not words:
                 continue
-
-            self._starters.append(words[0])
-
+            self._starters.append(words[0].lower())
             for i in range(len(words) - 1):
-                current_word = words[i]
-                next_word = words[i+1]
-
-                if current_word not in self._markov_model:
-                    self._markov_model[current_word] = {}
-
-                transitions = self._markov_model[current_word]
-                transitions[next_word] = transitions.get(next_word, 0) + 1
+                cur = words[i].lower()
+                nxt = words[i + 1].lower()
+                self._markov_model.setdefault(cur, {})
+                self._markov_model[cur][nxt] = self._markov_model[cur].get(nxt, 0) + 1
 
     def _generate_text(self, max_length: int = 15, seed_word: Optional[str] = None) -> str:
         """Generates a new text string using the trained probabilistic model."""
         if not self._markov_model:
             return "A generated class snapshot."
 
-        # Choose a starting word
+        # Choose a starting word with a bias toward AskManager topic guess
         if seed_word and seed_word in self._markov_model:
             current_word = seed_word
-        elif self._starters:
-            current_word = random.choice(self._starters)
         else:
-            return "A generated class snapshot."
+            # try to pick a plausible starter from AskManager topic guess words
+            if self._am:
+                try:
+                    candidates = ["dns", "tls", "esp", "router", "kerberos", "quic", "dhcp", "misc"]
+                    self._rng.shuffle(candidates)
+                    for c in candidates:
+                        if c in self._markov_model:
+                            current_word = c
+                            break
+                    else:
+                        current_word = self._rng.choice(self._starters or list(self._markov_model.keys()))
+                except Exception:
+                    current_word = self._rng.choice(self._starters or list(self._markov_model.keys()))
+            else:
+                current_word = self._rng.choice(self._starters or list(self._markov_model.keys()))
 
         sentence = [current_word.capitalize()]
-
         for _ in range(max_length - 1):
-            if current_word not in self._markov_model:
+            nxts = self._markov_model.get(current_word)
+            if not nxts:
                 break
-
-            # Use NumPy to probabilistically choose the next word
-            next_word_options = self._markov_model[current_word]
-            words = list(next_word_options.keys())
-            counts = np.array(list(next_word_options.values()), dtype=np.float32)
-            probabilities = counts / counts.sum()
-
-            # The core of the generative logic
-            next_word = np.random.choice(words, p=probabilities)
-
+            words = list(nxts.keys())
+            counts = np.array(list(nxts.values()), dtype=np.float32)
+            probs = counts / counts.sum()
+            next_word = str(self._np_rng.choice(words, p=probs))
             sentence.append(next_word)
             current_word = next_word
 
-        return " ".join(sentence) + "."
+        out = " ".join(sentence)
+        if not out.endswith("."):
+            out += "."
+        return out
 
-    # --------------------------- Private Helper Methods (Unchanged) ---------------------------
+    # -------------------------------------------------------------------------
+    # Private helper methods (AskManager-aware)
+    # -------------------------------------------------------------------------
+    def _payload_to_text(self, payload: Dict[str, Any], *, redact: bool) -> str:
+        if self._am and hasattr(self._am, "_payload_to_text"):
+            try:
+                return self._am._payload_to_text(payload, redact=redact, include_raw=not redact)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # fallback compact flattener
+        parts = []
+        for k, v in (payload or {}).items():
+            if k == "raw_text" and redact:
+                continue
+            s = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
+            if redact:
+                s = self._redact_text(s)
+            parts.append(f"{k}:{s if len(s) <= 80 else s[:77] + '…'}")
+        return " ".join(parts)
 
+    def _redact_text(self, s: str) -> str:
+        if self._am and hasattr(self._am, "_redact_text"):
+            try:
+                return self._am._redact_text(s)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # simple fallback
+        s = re.sub(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.|$)){4}\b", "[IP]", s)
+        s = re.sub(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b", "[MAC]", s)
+        s = re.sub(r"\b(?:0x)?[0-9a-fA-F]{16,}\b", "[HEX]", s)
+        return s
+
+    def _is_boilerplate(self, s: str) -> bool:
+        if not s:
+            return True
+        bp = re.compile(
+            r"^(using token matches|pulled context|found relevant raw lines|here’s what i’m seeing|got it — here’s a quick take|alright, quick technical readout|okay, here’s the gist)",
+            re.IGNORECASE,
+        )
+        return bool(bp.match(s.strip()))
+
+    # -------------------------------------------------------------------------
+    # Original helpers (adapted)
+    # -------------------------------------------------------------------------
     def _parse_config(self, config: Dict[str, Any]) -> Tuple:
         class_name = config.get("class_name", "GeneratedClass")
         base_attrs = dict(config.get("attributes", {}))
@@ -2161,29 +2331,67 @@ class SnapshotBuilder:
         }
         return class_name, base_attrs, base_methods, topics, policies
 
-    def _gather_and_merge_knowledge(self, gatherer: Callable, base_attrs: Dict, base_methods: Dict, topics: List, policies: Dict) -> Tuple[Dict, Dict]:
-        k_attrs, k_methods = gatherer(topics=topics)
-        merged_attrs = {**base_attrs, **(k_attrs or {})}
+    def _gather_external_knowledge(
+        self,
+        gatherer: Callable,
+        base_attrs: Dict,
+        base_methods: Dict,
+        topics: List,
+        policies: Dict
+    ) -> Tuple[Dict, Dict]:
+        try:
+            k_attrs, k_methods = gatherer(topics=topics)
+        except Exception:
+            k_attrs, k_methods = {}, {}
+
+        # Extract code example bodies (string) for training
+        self._external_code_examples = [
+            m.get("body") for m in (k_methods or {}).values() if isinstance(m, dict) and isinstance(m.get("body"), str)
+        ]
+        return k_attrs, k_methods
+
+    def _merge_attrs(self, base: Dict, ext: Dict, am: Dict, policies: Dict) -> Dict:
+        merged = {**base, **(ext or {}), **(am or {})}
         if policies["attr_policy"] == "override":
-            merged_attrs = (k_attrs or {}) or base_attrs
+            merged = (am or {}) or (ext or {}) or base
         if policies["attr_aggregate"] == "list" and policies["listify_singletons"]:
-            for k, v in list(merged_attrs.items()):
+            for k, v in list(merged.items()):
                 if not isinstance(v, list):
-                    merged_attrs[k] = [v]
-        merged_methods = {**base_methods, **(k_methods or {})}
+                    merged[k] = [v]
+        return merged
+
+    def _merge_methods(self, base: Dict, ext: Dict, am: Dict, policies: Dict) -> Dict:
+        merged = {**base, **(ext or {}), **(am or {})}
         if policies["method_policy"] == "override":
-            merged_methods = (k_methods or {}) or base_methods
-        return merged_attrs, merged_methods
+            merged = (am or {}) or (ext or {}) or base
+        return merged
+
+    def _fetch_insights(self, fetcher: Callable[..., Dict], topics: List[str]) -> Dict:
+        try:
+            return fetcher(topics=topics) or {}
+        except Exception:
+            return {}
+
+    def _compute_stats(self, compute: Callable[..., Dict]) -> Dict:
+        try:
+            return compute() or {}
+        except Exception:
+            return {}
 
     def _log_summary(self, name: str, topics: List, attrs: Dict, methods: Dict, policies: Dict):
+        n_attrs, n_methods = len(attrs), len(methods)
+        t_str = ",".join(topics) if topics else "ALL"
+        flags = []
+        if policies.get("include_insights"): flags.append("insights")
+        if policies.get("include_statistics"): flags.append("stats")
         self._log(
-            f"[CodeOutput] 🧠 Generating class '{name}' with a unique docstring, "
-            f"attrs={len(attrs)}, methods={len(methods)}", 1
+            f"[CodeOutput] 🧠 Generating class '{name}' (topics={t_str}; attrs={n_attrs}; methods={n_methods}; opts={'+'.join(flags) or 'none'})",
+            1,
         )
 
     @staticmethod
     def _render_class(class_name: str, attributes: Dict, methods: Dict, doc: str) -> str:
-        lines = [f"class {class_name}:", f'    """{doc}"""', "", "    def __init__(self):"]
+        lines = [f"class {class_name}:", f'    """{doc}"""', "", "    def __init__(self, ask_manager=None):", "        self._am = ask_manager"]
         if not attributes:
             lines.append("        pass")
         else:
@@ -2202,70 +2410,212 @@ class SnapshotBuilder:
             lines.append("")
         return "\n".join(lines)
 
+    # -------------------------------------------------------------------------
+    # Corpus construction source
+    # -------------------------------------------------------------------------
+    def _train_from_sources(self, extra_texts: List[str]) -> None:
+        texts = list(extra_texts or [])
+        texts.extend(self._external_code_examples or [])
+        self._train_generative_model(texts)
+
 class ChatGenManager:
     """
-    Higher-order Markov generator with contextual backoff and multi-config,
-    one-line renderings for each retrieved record.
+    A snapshot/line generator that *synergizes* with AskManager.
 
-    This version adds controlled randomness so repeated inputs don't look identical:
+    Key integrations when an AskManager instance is provided:
+      - Token-first context: uses AskManager._tokenize and _fetch_token_lines
+      - Retrieval: uses AskManager._retrieve_snippets (respects TTL/importance)
+      - Redaction: uses AskManager._redact_text
+      - Topic guess & actionable tip: uses AskManager._guess_topic and _actionable_tip
+      - Payload preview: uses AskManager._payload_to_text (to align formatting)
+
+    If AskManager is not provided, the class gracefully falls back to
+    internal minimal implementations.
+
+    Variety features preserved/improved from your prior version:
       • Randomizes style choice and order per call
       • Randomizes which attributes are shown, and how many
       • Slightly varies quoting/compaction (e.g., shorten long values)
       • Occasionally paraphrases the tail text
+      • Per-line soft character caps with word-aware truncation
     """
+    # ------------------------ Utilities ------------------------
 
+    def _identity(self, x: str) -> str:
+        return x
+
+    def _default_history_getter(self) -> Iterable[Dict[str, Any]]:
+        return ()
+    # -------- Construction --------
     def __init__(
         self,
-        format_kv: Callable[[Dict[str, Any]], str] | None,
-        history_getter: Callable[[], Iterable[Dict[str, Any]]],
+        *,
+        ask_manager: Optional[object] = None,
+        format_kv: Optional[Callable[[Dict[str, Any]], str]] = None,
+        history_getter: Callable[[], Iterable[Dict[str, Any]]] = _default_history_getter,
         persona: str = "Assistant",
         seed_corpus: Iterable[str] = (),
         max_chars: int = 250,
         max_history: int = 8,
         sample_len: int = 24,
         state_size: int = 2,  # 2-word context by default
-        config_styles: tuple[str, ...] = ("kv", "yaml", "ini", "shell", "json"),
+        config_styles: Sequence[str] = ("kv", "yaml", "ini", "shell", "json"),
         preview_pairs: int = 8,        # nominal max k/v pairs per line
         per_line_char_max: int = 160,  # soft cap per rendered line
-
-        # --- new knobs for variety ---
-        min_pairs: int = 3,            # min pairs per rendered line (randomized up to preview_pairs)
-        vary_styles: bool = True,      # randomly choose style per-line (vs strict round-robin)
-        shuffle_pairs: bool = True,    # shuffle attributes before selecting
-        style_weights: Optional[Dict[str, float]] = None,  # bias style selection (e.g., {"kv": 2.0, "json": 0.5})
-        paraphrase_tail_prob: float = 0.30,  # chance to lightly paraphrase tail
-        compact_value_prob: float = 0.35,    # chance to compact/abbreviate long-ish values
-    ):
+        # variety knobs
+        min_pairs: int = 3,
+        vary_styles: bool = True,
+        shuffle_pairs: bool = True,
+        style_weights: Optional[Dict[str, float]] = None,
+        paraphrase_tail_prob: float = 0.30,
+        compact_value_prob: float = 0.35,
+        redact_by_default: bool = True,
+        rng_seed: Optional[int] = None,
+    ) -> None:
+        self._am = ask_manager
         self._format_kv = format_kv
         self._get_history = history_getter
         self._persona = persona
         self._seed_corpus = list(seed_corpus)
-        self._max_chars = max_chars
-        self._max_history = max_history
-        self._sample_len = sample_len
-        self._state_size = max(1, state_size)
-        self._np_rng = np.random.default_rng()
-        self._config_styles = config_styles or ("kv",)
-        self._preview_pairs = max(1, preview_pairs)
-        self._per_line_char_max = max(40, per_line_char_max)
-
-        # variety knobs
-        self._min_pairs = max(1, min_pairs)
+        self._max_chars = int(max_chars)
+        self._max_history = int(max_history)
+        self._sample_len = int(sample_len)
+        self._state_size = max(1, int(state_size))
+        self._np_rng = np.random.default_rng(rng_seed)
+        self._config_styles = tuple(config_styles) or ("kv",)
+        self._preview_pairs = max(1, int(preview_pairs))
+        self._per_line_char_max = max(40, int(per_line_char_max))
+        # variety
+        self._min_pairs = max(1, int(min_pairs))
         self._vary_styles = bool(vary_styles)
         self._shuffle_pairs = bool(shuffle_pairs)
         self._style_weights = dict(style_weights or {})
         self._paraphrase_tail_prob = float(paraphrase_tail_prob)
         self._compact_value_prob = float(compact_value_prob)
+        self._redact_default = bool(redact_by_default)
+        # local fallbacks if AskManager is absent
+        self._fallback_token_re = re.compile(r"[A-Za-z0-9_]+")
 
-    # ---------- Public ----------
-    def generate(self, prompt: str, retrieved: List[Tuple[str, Dict[str, Any]]]) -> str:
+    # -------- Public API --------
+    def generate(self, prompt: str, redact: Optional[bool] = None) -> str:
+        """High-level one-shot generation using token-first + retrieval."""
+        redact = self._redact_default if redact is None else bool(redact)
+
+        # Tail text (Markov) built from history + seed corpus
         corpus = self._build_corpus()
         model, starters = self._train_markov(corpus)
         tail = self._sample(model, starters)
-        text = self._stitch(retrieved, tail)
-        return self._truncate(text, self._max_chars)
 
-    # ---------- Helpers: corpus / model ----------
+        # Token-first context and retrieval
+        token_lines: List[str] = []
+        retrieved: List[Any] = []
+        topic = "misc"
+        redactor = self._identity
+        payload_to_text = None
+        actionable_tip = None
+
+        if self._am is not None:
+            try:
+                q_toks = [t for t in self._am._tokenize(prompt) if t and not t.isdigit()]  # type: ignore[attr-defined]
+                token_lines = self._am._fetch_token_lines(q_toks, per_token_limit=6)       # type: ignore[attr-defined]
+                retrieved = self._am._retrieve_snippets(prompt, topk=12, per_topic_limit=6)  # type: ignore[attr-defined]
+                topic = self._am._guess_topic(prompt)                                      # type: ignore[attr-defined]
+                redactor = (self._am._redact_text if redact else _identity)               # type: ignore[attr-defined]
+                payload_to_text = self._am._payload_to_text                                # type: ignore[attr-defined]
+                actionable_tip = lambda: self._am._actionable_tip(prompt, topic)          # type: ignore[attr-defined]
+            except Exception:
+                # If any private AskManager API changes, fall back silently
+                token_lines, retrieved, topic = [], [], "misc"
+                redactor, payload_to_text, actionable_tip = self._identity, None, None
+        else:
+            # local fallbacks
+            q_toks = [t for t in self._fallback_tokenize(prompt) if t and not t.isdigit()]
+            # no token bank available without AskManager
+            token_lines = []
+            retrieved = []
+            topic = self._fallback_guess_topic(prompt)
+            redactor = self._fallback_redact if redact else self._identity
+            payload_to_text = None
+            actionable_tip = None
+
+        # Stitch, preferring token-first evidence
+        if token_lines:
+            lines = [self._np_rng.choice([
+                "Using token matches from history:",
+                "Pulled context from your recent tokens:",
+                "Found relevant raw lines via tokens:",
+            ])]
+            for s in token_lines[:8]:
+                s = redactor(s)
+                if len(s) > 240:
+                    s = s[:237] + "..."
+                lines.append(f"• {s}")
+            lines.append("")
+            if actionable_tip is not None:
+                lines.append(actionable_tip())
+            # add a compacted tail for variety
+            if self._np_rng.random() < 0.6:
+                lines.append(self._rephrase_tail(tail) if self._np_rng.random() < self._paraphrase_tail_prob else tail)
+            return self._truncate("\n".join(lines), self._max_chars)
+
+        # Otherwise, render retrieved payloads in one-line multi-style format
+        one_lines: List[str] = []
+        if retrieved:
+            # Shuffle which records render first
+            order = list(range(len(retrieved)))
+            self._np_rng.shuffle(order)
+
+            for out_idx, i in enumerate(order):
+                pkt = retrieved[i]
+                payload = getattr(pkt, "payload", None) or {}
+
+                # style choice
+                style = self._choose_style(out_idx)
+
+                # how many pairs this line will show
+                n_pairs = int(self._np_rng.integers(self._min_pairs, self._preview_pairs + 1))
+
+                line = self._format_attrs_one_line(
+                    payload,
+                    style,
+                    n_pairs,
+                    line_index=out_idx,
+                    shuffle_pairs=self._shuffle_pairs,
+                )
+                one_lines.append(self._limit_line(line, self._per_line_char_max))
+
+        # Header + lines + tail
+        lines = [f"({self._persona})"]
+        if one_lines:
+            lines.append(self._np_rng.choice([
+                "Here’s what I’m seeing right now:",
+                "Current snapshot:",
+                "Live view:",
+                "Latest extract:",
+            ]))
+            lines.extend(one_lines)
+        else:
+            lines.append(self._np_rng.choice([
+                "No retrieved context; reasoning from prompt.",
+                "No live records matched; continuing with prompt only.",
+                "Still waiting on inputs; using context and prompt for now.",
+            ]))
+
+        # Occasionally paraphrase the tail
+        if self._np_rng.random() < self._paraphrase_tail_prob:
+            tail = self._rephrase_tail(tail)
+
+        # Respect redaction for tail too (conservative)
+        lines.append(redactor(tail))
+
+        # Optional actionable tip when available
+        if actionable_tip is not None:
+            lines.append("")
+            lines.append(actionable_tip())
+
+        return self._truncate("\n".join(lines), self._max_chars)
+
+    # -------- Helpers: corpus / model --------
     def _build_corpus(self) -> List[str]:
         history = list(self._get_history())[-self._max_history:]
         lines = [h.get("text", "") for h in history if h.get("text")]
@@ -2275,7 +2625,7 @@ class ChatGenManager:
     def _train_markov(
         self, corpus: List[str]
     ) -> Tuple[Dict[Tuple[str, ...], Dict[str, int]], List[Tuple[str, ...]]]:
-        model = collections.defaultdict(lambda: collections.defaultdict(int))
+        model: DefaultDict[Tuple[str, ...], DefaultDict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
         starters: List[Tuple[str, ...]] = []
         for text in corpus:
             words = text.strip().lower().split()
@@ -2286,7 +2636,7 @@ class ChatGenManager:
                 state = tuple(words[i : i + self._state_size])
                 nxt = words[i + self._state_size]
                 model[state][nxt] += 1
-        return model, starters
+        return model, starters or [("acknowledged",)]
 
     def _sample(
         self,
@@ -2294,13 +2644,13 @@ class ChatGenManager:
         starters: List[Tuple[str, ...]],
     ) -> str:
         if not model:
-            return random.choice(self._seed_corpus) if self._seed_corpus else "Acknowledged. I'm awaiting more data to analyze."
+            return (self._np_rng.choice(self._seed_corpus) if self._seed_corpus else "Acknowledged. I'm awaiting more data to analyze.")
 
-        current_state = random.choice(starters)
+        current_state = starters[self._np_rng.integers(0, len(starters))]
         words = list(current_state)
 
         for _ in range(self._sample_len - self._state_size):
-            next_opts = model.get(current_state)
+            next_opts = model.get(tuple(current_state))
             if not next_opts and self._state_size > 1:
                 shorter = current_state[-(self._state_size - 1):]
                 next_opts = model.get(tuple(shorter))
@@ -2312,60 +2662,14 @@ class ChatGenManager:
                 words.append(nxt)
                 current_state = tuple(words[-self._state_size:])
             else:
-                current_state = random.choice(starters)
+                current_state = starters[self._np_rng.integers(0, len(starters))]
 
         sentence = " ".join(words).capitalize()
         if sentence and sentence[-1].isalnum():
             sentence += "."
         return sentence
 
-    # ---------- Helpers: multi-config stitching ----------
-    def _stitch(self, retrieved: List[Tuple[str, Dict[str, Any]]], tail: str) -> str:
-        lines = [f"({self._persona})"]
-
-        if retrieved:
-            # Randomize intro line a bit
-            lines.append(self._np_rng.choice([
-                "Here’s what I’m seeing right now:",
-                "Current snapshot:",
-                "Live view:",
-                "Latest extract:"
-            ]))
-
-            # Shuffle which records render first
-            order = list(range(len(retrieved)))
-            self._np_rng.shuffle(order)
-
-            for out_idx, i in enumerate(order):
-                _topic, attrs = retrieved[i]
-                # style choice
-                style = self._choose_style(out_idx)
-
-                # how many pairs this line will show
-                n_pairs = int(self._np_rng.integers(self._min_pairs, self._preview_pairs + 1))
-
-                line = self._format_attrs_one_line(
-                    attrs,
-                    style,
-                    n_pairs,
-                    line_index=out_idx,
-                    shuffle_pairs=self._shuffle_pairs,
-                )
-                lines.append(self._limit_line(line, self._per_line_char_max))
-        else:
-            lines.append(self._np_rng.choice([
-                "I don’t have fresh packets yet; I’ll reason from the prompt.",
-                "No new records available; continuing with prompt-only reasoning.",
-                "Still waiting on inputs; using context and prompt for now."
-            ]))
-
-        # Occasionally paraphrase the tail
-        if self._np_rng.random() < self._paraphrase_tail_prob:
-            tail = self._rephrase_tail(tail)
-
-        lines.append(tail)
-        return "\n".join(lines)
-
+    # -------- Helpers: style selection & formatting --------
     def _choose_style(self, line_index: int) -> str:
         # Weighted random style selection if vary_styles=True; otherwise round-robin
         if not self._vary_styles:
@@ -2379,12 +2683,12 @@ class ChatGenManager:
         weights = weights / weights.sum()
         return str(self._np_rng.choice(styles, p=weights))
 
-    # ---------- Helpers: attribute selection & formatting ----------
     def _format_attrs_one_line(
         self,
         attrs: Mapping[str, Any],
         style: str,
         limit: int,
+        *,
         line_index: int = 0,
         shuffle_pairs: bool = False,
     ) -> str:
@@ -2392,7 +2696,6 @@ class ChatGenManager:
         pairs = self._select_pairs(flat, limit, line_index, shuffle_pairs=shuffle_pairs)
 
         if style == "kv":
-            # Randomize quoting of values a bit
             parts = []
             for k, v in pairs:
                 if self._np_rng.random() < 0.5 and not self._needs_quotes(v):
@@ -2402,9 +2705,7 @@ class ChatGenManager:
             return ", ".join(parts)
 
         elif style == "yaml":  # flow-style YAML on one line
-            items = []
-            for k, v in pairs:
-                items.append(f"{k}: {self._yaml_scalar(v)}")
+            items = [f"{k}: {self._yaml_scalar(v)}" for k, v in pairs]
             return "{ " + ", ".join(items) + " }"
 
         elif style == "ini":   # INI-ish inline
@@ -2415,24 +2716,17 @@ class ChatGenManager:
 
         elif style == "json":
             obj = {k: v for k, v in pairs}
-            # Sometimes tighten/loosen separators slightly
             tight = (self._np_rng.random() < 0.5)
             seps = (",", ":") if tight else (", ", ": ")
             return json.dumps(obj, separators=seps, ensure_ascii=False)
 
         elif style == "ext" and self._format_kv:
-            # user-provided formatter
             return self._format_kv(dict(pairs))
 
         else:
-            # fallback
             return ", ".join(f"{k}={v}" for k, v in pairs)
 
     def _flatten(self, obj: Any, prefix: str = "", *, compact_prob: float = 0.0) -> List[Tuple[str, str]]:
-        """
-        Flattens nested mappings/lists into dot/bracket paths: a.b[0].c
-        Converts values to compact strings with a chance to abbreviate.
-        """
         out: List[Tuple[str, str]] = []
         if isinstance(obj, Mapping):
             for k, v in obj.items():
@@ -2443,7 +2737,6 @@ class ChatGenManager:
                 key = f"{prefix}[{i}]"
                 out.extend(self._flatten(v, key, compact_prob=compact_prob))
         else:
-            # leaf
             sval = self._to_scalar(obj, compact_prob=compact_prob)
             if prefix:
                 out.append((prefix, sval))
@@ -2457,8 +2750,6 @@ class ChatGenManager:
         if isinstance(v, (int, float)):
             return str(v)
         s = str(v)
-
-        # Occasionally compact/abbreviate
         if self._np_rng.random() < compact_prob:
             s = self._compact_value(s)
         else:
@@ -2467,22 +2758,16 @@ class ChatGenManager:
         return s
 
     def _compact_value(self, s: str) -> str:
-        """
-        Heuristics to compact values: shorten MAC/IP, collapse long paths, compress hex, etc.
-        """
         # hex-ish long strings
         if len(s) > 40 and all(ch in "0123456789abcdefABCDEF:" for ch in s if ch.isalnum() or ch == ":"):
             return s[:16] + "…" + s[-8:]
-
         # MAC like 'aa:bb:cc:dd:ee:ff'
         if s.count(":") == 5 and all(len(part) == 2 for part in s.split(":")):
             parts = s.split(":")
             return f"{parts[0]}:{parts[1]}:..:{parts[-2]}:{parts[-1]}"
-
         # Very long file path / uri / text
         if len(s) > 48:
             return s[:20] + "…" + s[-12:]
-
         return s
 
     def _select_pairs(
@@ -2493,9 +2778,6 @@ class ChatGenManager:
         *,
         shuffle_pairs: bool = False,
     ) -> List[Tuple[str, str]]:
-        """
-        Variety: optionally shuffle; otherwise rotate. Takes 'limit' items.
-        """
         if not flat:
             return []
         items = list(flat)
@@ -2503,23 +2785,20 @@ class ChatGenManager:
             self._np_rng.shuffle(items)
         else:
             items.sort(key=lambda kv: kv[0])
-            # rotate by a pseudo-random offset derived from line_index
             offset = (line_index * 3) % len(items)
             items = items[offset:] + items[:offset]
         return items[:max(1, limit)]
 
-    # ---------- Small formatting helpers ----------
+    # -------- Small formatting helpers --------
     def _needs_quotes(self, v: str) -> bool:
         if not v:
             return True
-        # needs quotes if it has spaces or punctuation beyond common token chars
         for ch in v:
             if not (ch.isalnum() or ch in "-._:/"):
                 return True
         return False
 
     def _yaml_scalar(self, v: str) -> str:
-        # quote only when necessary
         if not v or any(ch in v for ch in " \t,:{}[]#&*!|>'\"%@`"):
             return '"' + v.replace('"', '\\"') + '"'
         return v
@@ -2529,7 +2808,7 @@ class ChatGenManager:
             return v
         return "'" + v.replace("'", "'\\''") + "'"
 
-    # ---------- Helpers: tail paraphrase ----------
+    # -------- Tail paraphrase & truncation --------
     def _rephrase_tail(self, s: str) -> str:
         if not s:
             return s
@@ -2542,12 +2821,10 @@ class ChatGenManager:
         ]
         fn = self._np_rng.choice(candidates)
         out = fn(s.lower())
-        # Capitalize first letter if we lowercased
         if out:
             out = out[0].upper() + out[1:]
         return out
 
-    # ---------- Helpers: final truncation ----------
     def _limit_line(self, s: str, maxlen: int) -> str:
         if len(s) <= maxlen:
             return s
@@ -2564,7 +2841,29 @@ class ChatGenManager:
             cut = maxlen - 1
         return s[:cut].rstrip() + "…"
 
+    # -------- Local fallbacks when AskManager is absent --------
+    def _fallback_tokenize(self, text: str) -> List[str]:
+        return [t.lower() for t in self._fallback_token_re.findall(text or "")]
 
+    def _fallback_guess_topic(self, text: str) -> str:
+        toks = set(self._fallback_tokenize(text))
+        for t in ("tls", "dns", "dhcp", "router", "transport", "quic", "esp", "kerberos"):
+            if t in toks:
+                return t
+        return "misc"
+
+    _RE_IPv4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
+    _RE_MAC  = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+    _RE_SPI  = re.compile(r"\bspi=([0-9]{1,10})\b", re.IGNORECASE)
+    _RE_HEX  = re.compile(r"\b(?:0x)?[0-9a-fA-F]{16,}\b")
+
+    def _fallback_redact(self, s: str) -> str:
+        out = s
+        out = self._RE_IPv4.sub("[IP]", out)
+        out = self._RE_MAC.sub("[MAC]", out)
+        out = self._RE_SPI.sub("spi=[SPI]", out)
+        out = self._RE_HEX.sub("[HEX]", out)
+        return out
 
 class PacketLearnerManager:
     # --------------------- Regexes & constants ---------------------
@@ -2958,8 +3257,6 @@ class PacketLearnerManager:
                             dq.append(s)
                     self._raw_samples[t] = dq
 
-
-
 class AskManager:
     """
     Public API:
@@ -3025,6 +3322,7 @@ class AskManager:
             re.IGNORECASE,
         )
         self._max_raw_line_len = 2000  # cap per raw line stored
+        self.ask_manager_chat_generator = AskManagerChatGenerator(token_store=self._token_bank, rng_seed=42)
 
     # ----------------- Public entrypoint -----------------
 
@@ -3327,68 +3625,7 @@ class AskManager:
         return f"{head}\n{body}"
 
     def _chat_generate(self, prompt: str, retrieved: List["KnowledgePacket"], *, redact: bool) -> str:
-        """
-        Prioritize token-bank cleartext first; if nothing is found, fall back
-        to packet-snippet hints.
-        """
-        # 1) Token-first path (UNREDACTED lines; redact at presentation if needed)
-        q_toks = [t for t in self._tokenize(prompt) if t and not t.isdigit()]
-        token_lines = self._fetch_token_lines(q_toks, per_token_limit=6)
-
-        if token_lines:
-            def R(s: str) -> str:
-                return self._redact_text(s) if redact else s
-
-            opener = self._rng.choice([
-                "Using token matches from history:",
-                "Pulled context from your recent tokens:",
-                "Found relevant raw lines via tokens:",
-            ])
-            lines = [opener]
-            for i, s in enumerate(token_lines[:8], 1):
-                s = R(s)
-                if len(s) > 240:
-                    s = s[:237] + "..."
-                lines.append(f"• {s}")
-            lines.append("")
-            topic = self._guess_topic(prompt)
-            lines.append(self._actionable_tip(prompt, topic))
-            return "\n".join(lines)
-
-        # 2) Fallback: packet-based hints (redacted by default)
-        topic = self._guess_topic(prompt)
-        hints = []
-        for pkt in retrieved:
-            payload = pkt.payload or {}
-            for k in ("summary", "attributes", "methods", "keywords"):
-                v = payload.get(k)
-                if not v:
-                    continue
-                if isinstance(v, dict):
-                    hints.append(f"{k}: {', '.join([f'{kk}' for kk in list(v)[:4]])}")
-                elif isinstance(v, (list, tuple, set)):
-                    hints.append(f"{k}: {', '.join(map(str, list(v)[:6]))}")
-                elif isinstance(v, str):
-                    s = v.strip()
-                    s = self._redact_text(s) if redact else s
-                    if len(s) > 160:
-                        s = s[:157] + "..."
-                    hints.append(f"{k}: {s}")
-
-        opener = self._rng.choice([
-            "Here’s what I’m seeing.",
-            "Got it — here’s a quick take.",
-            "Alright, quick technical readout:",
-            "Okay, here’s the gist:",
-        ])
-        lines = [opener]
-        if hints:
-            lines.append(f"Topic guess: {topic}")
-            lines.append("Relevant bits I can use:")
-            lines += [f"• {h}" for h in hints[:8]]
-            lines.append("")
-        lines.append(self._actionable_tip(prompt, topic))
-        return "\n".join(lines)
+       return self.ask_manager_chat_generator._chat_generate(prompt, retrieved, redact=True)
 
     # ----------------- Stats (pure-Python) -----------------
 
@@ -3736,4 +3973,243 @@ class AskManager:
                 lines.append(f"    {k}: {v} = {default}")
         return "\n".join(lines)
 
+class AskManagerChatGenerator:
+    """
+    A focused helper around chat generation that:
+      - tokenizes queries
+      - fetches lines by tokens from a pluggable token store
+      - redacts sensitive bits (IPs, MACs, emails, keys)
+      - guesses topic heuristically
+      - emits short actionable tips per topic
+    """
 
+    # Default openers / phrases (extend freely)
+    OPENERS_TOKEN = [
+        "Using token matches from history:",
+        "Pulled context from your recent tokens:",
+        "Found relevant raw lines via tokens:",
+    ]
+    OPENERS_HINTS = [
+        "Here’s what I’m seeing.",
+        "Got it — here’s a quick take.",
+        "Alright, quick technical readout:",
+        "Okay, here’s the gist:",
+    ]
+
+    # Simple topic dictionary -> tip templates
+    TOPIC_TIPS = {
+        "dns": "If you’re debugging DNS, capture both query and response and compare TXID; also check for EDNS(0) and truncation.",
+        "dhcp": "For DHCP issues, compare Discover/Offer/Request/Ack and ensure the relay (giaddr) and option 82 are consistent.",
+        "tls": "For TLS, verify the SNI and ALPN; mismatches or version intolerance often hint at middlebox interference.",
+        "esp": "For IPsec ESP over UDP/4500, confirm NAT-T keepalives and SPI mapping on both ends.",
+        "quic": "QUIC oddities? Confirm version negotiation and retry; track by 5-tuple plus DCID.",
+        "kerberos": "Kerberos: confirm clock skew (<5 minutes), and watch AS-REQ/TGS-REQ error codes for hints.",
+        "router": "Router path: check ARP/ND cache, RIB vs FIB, then NAT and firewall counters.",
+        "default": "Try to reproduce with a minimal path; capture both directions and compare sequence/state transitions.",
+    }
+
+    # Redaction regexes (ordered)
+    DEFAULT_REDACTIONS: List[Tuple[re.Pattern, str]] = [
+        # IPv4
+        (re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.|$)){4}\b"), "<IP4>"),
+        # IPv6 (very permissive)
+        (re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b"), "<IP6>"),
+        # MAC
+        (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
+        # Emails
+        (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<EMAIL>"),
+        # Keys / secrets-ish (very rough)
+        (re.compile(r"\b(sk|pk|key|secret|token|bearer)[=:]\s*[A-Za-z0-9_\-+/=]{12,}\b", re.I), r"\1:<SECRET>"),
+    ]
+
+    # Basic tokenization pattern (words, hex-like, dotted labels)
+    TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_./:-]+")
+
+    def __init__(
+        self,
+        token_store: Optional[Callable[[str, int], Sequence[str]]] = None,
+        *,
+        per_token_limit: int = 6,
+        max_token_lines: int = 8,
+        max_hint_lines: int = 8,
+        rng_seed: Optional[int] = None,
+        redactions: Optional[List[Tuple[re.Pattern, str]]] = None,
+    ) -> None:
+        """
+        Args:
+          token_store: callable(token: str, limit: int) -> Sequence[str]
+                       Return raw lines associated with a token. Required for token path.
+          per_token_limit: max lines to fetch per token.
+          max_token_lines: max lines to include from token-based path.
+          max_hint_lines: max hint lines from packets.
+          rng_seed: seed for deterministic opener selection (tests).
+          redactions: optional custom redaction patterns (pattern, replacement).
+        """
+        self._token_store = token_store
+        self._per_token_limit = int(per_token_limit)
+        self._max_token_lines = int(max_token_lines)
+        self._max_hint_lines = int(max_hint_lines)
+        self._rng = random.Random(rng_seed)
+        self._redactions = redactions or list(self.DEFAULT_REDACTIONS)
+
+    # --- Public entry point (your original function, now a method) -----------------
+
+    def _chat_generate(
+        self,
+        prompt: str,
+        retrieved: List["KnowledgePacket"],
+        *,
+        redact: bool,
+    ) -> str:
+        """
+        Prioritize token-bank cleartext first; if nothing is found, fall back
+        to packet-snippet hints.
+        """
+        # 1) Token-first path (UNREDACTED lines; redact at presentation if needed)
+        q_toks = [t for t in self._tokenize(prompt) if t and not t.isdigit()]
+        token_lines = self._fetch_token_lines(q_toks, per_token_limit=self._per_token_limit)
+
+        if token_lines:
+            def R(s: str) -> str:
+                return self._redact_text(s) if redact else s
+
+            opener = self._rng.choice(self.OPENERS_TOKEN)
+            lines = [opener]
+            for i, s in enumerate(token_lines[: self._max_token_lines], 1):
+                s = R(self._clip(s, 240))
+                lines.append(f"• {s}")
+            lines.append("")
+            topic = self._guess_topic(prompt)
+            lines.append(self._actionable_tip(prompt, topic))
+            return "\n".join(lines)
+
+        # 2) Fallback: packet-based hints (redacted by default)
+        topic = self._guess_topic(prompt)
+        hints = self._collect_packet_hints(retrieved, redact=redact)
+
+        opener = self._rng.choice(self.OPENERS_HINTS)
+        lines = [opener]
+        if hints:
+            lines.append(f"Topic guess: {topic}")
+            lines.append("Relevant bits I can use:")
+            lines += [f"• {h}" for h in hints[: self._max_hint_lines]]
+            lines.append("")
+        lines.append(self._actionable_tip(prompt, topic))
+        return "\n".join(lines)
+
+    # --- Helpers ---------------------------------------------------------------
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Lightweight tokenizer that keeps protocol-ish tokens (dns, tls1.3, 192.168.0.1, etc.)."""
+        return self.TOKEN_PATTERN.findall(text.lower())
+
+    def _fetch_token_lines(self, tokens: Iterable[str], *, per_token_limit: int) -> List[str]:
+        """
+        Fetch lines from the token store and deduplicate while preserving order.
+        Most-repeated tokens are queried first to bias toward salient terms.
+        """
+        if not self._token_store:
+            return []
+
+        # Count frequency to prioritize
+        freq = Counter(tokens)
+        ordered_tokens = [t for t, _ in freq.most_common()]
+
+        seen = set()
+        out: List[str] = []
+        for tok in ordered_tokens:
+            try:
+                candidates = self._token_store(tok, per_token_limit) or []
+            except Exception:
+                # Token store is user-provided; be defensive
+                candidates = []
+            for line in candidates:
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                out.append(line)
+                if len(out) >= self._max_token_lines:
+                    return out
+        return out
+
+    def _collect_packet_hints(self, retrieved: List["KnowledgePacket"], *, redact: bool) -> List[str]:
+        """Extract short, readable hints from retrieved packets."""
+        hints: List[str] = []
+        for pkt in retrieved or []:
+            payload = pkt.payload or {}
+            for k in ("summary", "attributes", "methods", "keywords"):
+                v = payload.get(k)
+                if not v:
+                    continue
+                if isinstance(v, dict):
+                    keys = list(v)[:4]
+                    hints.append(self._maybe_redact(f"{k}: {', '.join(map(str, keys))}", redact))
+                elif isinstance(v, (list, tuple, set)):
+                    vals = list(v)[:6]
+                    hints.append(self._maybe_redact(f"{k}: {', '.join(map(str, vals))}", redact))
+                elif isinstance(v, str):
+                    s = v.strip()
+                    s = self._clip(s, 160)
+                    hints.append(self._maybe_redact(f"{k}: {s}", redact))
+        return hints
+
+    def _maybe_redact(self, s: str, redact: bool) -> str:
+        return self._redact_text(s) if redact else s
+
+    def _redact_text(self, s: str) -> str:
+        """Apply all redaction patterns in sequence."""
+        out = s
+        for pat, repl in self._redactions:
+            out = pat.sub(repl, out)
+        return out
+
+    def _guess_topic(self, text: str) -> str:
+        """
+        Heuristic topic guesser. Extend this as you see fit.
+        """
+        t = text.lower()
+
+        def has(*words: str) -> bool:
+            return any(w in t for w in words)
+
+        if has("dns", "resolver", "edns", "rr", "nslookup", "bind"):
+            return "dns"
+        if has("dhcp", "lease", "offer", "discover", "option 82"):
+            return "dhcp"
+        if has("tls", "alpn", "sni", "handshake", "cipher", "quic-tls"):
+            return "tls"
+        if has("esp", "ipsec", "spi", "nat-t", "ike", "isakmp"):
+            return "esp"
+        if has("quic", "http/3", "hq-interop", "dcid", "scid"):
+            return "quic"
+        if has("krb", "kerberos", "as-req", "tgs-req", "kdc"):
+            return "kerberos"
+        if has("route", "rib", "fib", "bgp", "ospf", "rip"):
+            return "router"
+        return "default"
+
+    def _actionable_tip(self, prompt: str, topic: str) -> str:
+        """Return a short, concrete next step per topic."""
+        tip = self.TOPIC_TIPS.get(topic) or self.TOPIC_TIPS["default"]
+        return f"Next step: {tip}"
+
+    @staticmethod
+    def _clip(s: str, max_len: int) -> str:
+        if len(s) <= max_len:
+            return s
+        return s[: max_len - 3] + "..."
+
+    # --- Optional extension points --------------------------------------------
+
+    def set_token_store(self, token_store: Callable[[str, int], Sequence[str]]) -> None:
+        """Swap in a different token store at runtime."""
+        self._token_store = token_store
+
+    def add_redaction(self, pattern: Union[str, re.Pattern], replacement: str) -> None:
+        """Append a redaction rule."""
+        pat = re.compile(pattern) if isinstance(pattern, str) else pattern
+        self._redactions.append((pat, replacement))
+
+    def set_rng_seed(self, seed: Optional[int]) -> None:
+        """Set RNG seed for deterministic opener selection (tests)."""
+        self._rng.seed(seed if seed is not None else random.randrange(1 << 30))

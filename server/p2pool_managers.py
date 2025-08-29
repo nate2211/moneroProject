@@ -34,17 +34,17 @@ from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.ipsec import ESP, AH
 from scapy.layers.l2 import Ether, GRE, ARP
+from scapy.layers.tls.handshake import TLSClientHello, TLSFinished, TLSServerHello
 from scapy.layers.tls.record import TLS
 from scapy.packet import Packet
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict
 import xml.etree.ElementTree as ET
-from scapy.layers.kerberos import (Kerberos)
 from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
-    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager
+    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, HTTPSManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -155,6 +155,7 @@ class PythonRouterManager:
         self.daemon_manager = None
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
+        self.broadcast_manager = BroadcastManager(self.router_logger)
         self.windivert_manager = WinDivertManager(self)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
@@ -951,6 +952,8 @@ class PythonRouterManager:
             self.add_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             link_group.append(self.interface_lac_2_full_name)
 
+        self.broadcast_manager.ensure_broadcast_for_pcap(self.interface_out_full_name)
+
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
@@ -1211,7 +1214,7 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
 
-            if packet.haslayer(TCP):
+            if packet.haslayer(TCP) or packet.haslayer(TLSClientHello) or packet.haslayer(TLSServerHello) or packet.haslayer(TLSFinished):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet,
@@ -1437,9 +1440,11 @@ class PythonRouterManager:
                             }
                             self.notification_manager.send_notification(event_data)
                         return
+            # Check for Keep-Alive requests first
+            if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
+                self.nat_manager.handle_keep_alive(packet)
+                return
 
-            # Optional: Gratuitous ARP for our translated source IP
-            # Perform dynamic NAT: translate src IP and src port
             self.nat_manager.translate_outbound(packet)
 
             # Gratuitous ARP for the translated public IP (only once per IP/interface ideally)
@@ -1677,7 +1682,7 @@ class PythonRouterManager:
             self.packet_writer.update_interfaces(self._interfaces_config)
             self._enable_nat_forwarding()
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
-
+            self.nat_manager.set_router_internal_ip("192.168.1.1")
 
             self.notification_manager = NotificationManager(
                 self.router_logger,

@@ -1439,6 +1439,7 @@ class ESPManager:
                 if expired:
                     self.log.log_message(f"[ESP] 🧹 Cleanup: removed {len(expired)} {table_name} mappings")
             self._last_cleanup = now
+
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -4074,23 +4075,131 @@ class ICMPManager:
     """
     Responds to ICMP Echo-Requests (ping) and logs both
     reception and replies, using PacketWriter to send.
-    Enhanced with rate limiting and handling of other ICMP types.
+    Enhanced with rate limiting, IPv4 reassembly for router-destined
+    datagrams, and safe fragmentation of Echo-Replies to MTU.
     """
+
+    # Reassembly tuning
+    REASM_TIMEOUT_SEC = 5.0  # RFC says 30s typical; we keep it short in user-space
+    _EIGHT = 8
 
     def __init__(self, router_logger, packet_writer, sendback_manager, interfaces_config: dict, rate_limit_pps: int = 5):
         self.log = router_logger
         self.pw = packet_writer
-        self.ifaces = interfaces_config  # to know MAC & IP
-
-        # Rate Limiting for Echo Replies
+        self.ifaces = interfaces_config  # expects per-iface dicts; if present, may include 'mtu'
         self.rate_limit_pps = rate_limit_pps
-        self._last_reply_time = defaultdict(float)  # Key: (src_ip, dst_ip) -> last_reply_timestamp
+        self._last_reply_time = defaultdict(float)  # (src_ip, dst_ip) -> ts
         self._rate_limit_lock = threading.Lock()
         self.sendback_manager = sendback_manager
-        self.log.log_message("[ICMP] Manager initialized.")
+
+        # IPv4 reassembly buffers keyed by (src,dst,proto,id)
+        # Each value: {"first_hdr": IP, "parts": {offset_bytes: bytes}, "total": Optional[int], "t0": float, "iface": str}
+        self._reasm: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+        self._reasm_lock = threading.Lock()
+
+        self.log.log_message("[ICMP] Manager initialized (frag reasm + reply fragmenter enabled).")
+
+    # ---------- Public entry ----------
+
+    def handle_packet(self, pkt, inbound_iface: str) -> bool:
+        """
+        Handles incoming ICMP packets (including fragmented ones).
+        Returns True if the packet was handled (consumed) by the manager.
+        """
+
+        # Only IPv4 here (IPv6 has different frag mechanics/ICMPv6)
+        if not pkt.haslayer(IP):
+            return False
+
+        ip = pkt[IP]
+        dst_ip = ip.dst
+
+        # Is this datagram addressed to the router?
+        is_for_router, router_mac_for_reply, router_ip_for_reply = self._match_router_ip(dst_ip)
+
+        # If this is a fragmented IPv4 datagram destined to us, reassemble first.
+        if self._is_ipv4_fragment(ip) and is_for_router:
+            assembled = self._reassemble_ipv4(pkt, inbound_iface)
+            # If not complete yet, we "handled" it by buffering.
+            if assembled is None:
+                return True
+            # Continue with the reassembled full packet
+            pkt = assembled
+            ip = pkt[IP]
+
+        # From here, only ICMP packets interest us.
+        if not pkt.haslayer(ICMP):
+            # Not ICMP (or later fragments that we didn’t buffer) -> not our job
+            return False
+
+        icmp = pkt[ICMP]
+        src_ip = ip.src
+        icmp_type = icmp.type
+        icmp_code = getattr(icmp, "code", 0)
+
+        if not is_for_router:
+            self.log.log_message(f"[ICMP] 📭 ICMP type {icmp_type} to {dst_ip} (not router IP) on {inbound_iface.split('_')[-1]}; skipping.")
+            return False
+
+        # ---------- ICMP type handling ----------
+
+        # Echo Request (type 8) -> send Echo Reply (type 0); fragment reply if needed
+        if icmp_type == 8:
+            self.log.log_message(f"[ICMP] 📨 Echo-Request from {src_ip} → {dst_ip} on {inbound_iface.split('_')[-1]} (len={len(bytes(pkt))})")
+
+            if self._is_rate_limited(src_ip, dst_ip):
+                return True
+
+            # Build the reply (mirror payload, keep id/seq)
+            if pkt.haslayer(Ether) and not self._is_loopback_name(inbound_iface):
+                l2dst = pkt[Ether].src
+                l2src = router_mac_for_reply or "00:00:00:00:00:00"
+                reply = (
+                    Ether(src=l2src, dst=l2dst) /
+                    IP(src=dst_ip, dst=src_ip) /
+                    ICMP(type=0, id=icmp.id, seq=icmp.seq) /
+                    icmp.payload
+                )
+            else:
+                reply = IP(src=dst_ip, dst=src_ip) / ICMP(type=0, id=icmp.id, seq=icmp.seq) / icmp.payload
+
+            # Ensure reply fits MTU (fragment if necessary)
+            self._maybe_fragment_and_queue(reply, inbound_iface)
+            self.log.log_message(f"[ICMP] ✅ Echo-Reply queued on {inbound_iface.split('_')[-1]} for {src_ip}")
+            return True
+
+        # Destination Unreachable
+        if icmp_type == 3:
+            if icmp_code == 4:
+                # Fragmentation needed (DF set); RFC 1191/4821 PMTUD signal
+                # MTU may be carried in 'unused'/nexthopmtu field depending on Scapy version
+                hinted_mtu = getattr(icmp, "unused", None) or getattr(icmp, "nexthopmtu", None)
+                self.log.log_message(f"[ICMP] 📦 Frag-needed (DF) from {src_ip} on {inbound_iface.split('_')[-1]} (mtu={hinted_mtu})")
+            else:
+                self.log.log_message(f"[ICMP] 🔌 Dest Unreachable (code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}")
+            # Optionally forward upstream:
+            if hasattr(self.sendback_manager, "send_icmp_packet"):
+                self.sendback_manager.send_icmp_packet(pkt, icmp_type=3, icmp_code=icmp_code)
+            return True
+
+        # Time Exceeded
+        if icmp_type == 11:
+            self.log.log_message(f"[ICMP] ⏳ Time Exceeded (code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}")
+            if hasattr(self.sendback_manager, "send_icmp_packet"):
+                self.sendback_manager.send_icmp_packet(pkt, icmp_type=11, icmp_code=icmp_code)
+            return True
+        elif icmp_type == 3:  # Destination Unreachable
+            if icmp_code == 13:
+                self._log_admin_block(pkt, inbound_iface)
+                # Optionally fail fast to the client (see below)
+                return True
+        # Others: log & ignore
+        self.log.log_message(f"[ICMP] ❔ Unhandled ICMP type {icmp_type} from {src_ip} on {inbound_iface.split('_')[-1]}. Summary: {pkt.summary()}")
+        return False
+
+    # ---------- Rate limiting ----------
 
     def _is_rate_limited(self, src_ip: str, dst_ip: str) -> bool:
-        """Checks if an ICMP Echo-Reply should be rate-limited."""
         with self._rate_limit_lock:
             now = time.time()
             key = (src_ip, dst_ip)
@@ -4100,80 +4209,236 @@ class ICMPManager:
             self._last_reply_time[key] = now
             return False
 
-    def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
+    # ---------- Fragmentation helpers ----------
+
+    def _is_ipv4_fragment(self, ip) -> bool:
+        # MF flag or non-zero fragment offset means "fragment"
+        try:
+            mf = bool(int(ip.flags) & 0x1)  # MF
+        except Exception:
+            # scapy flags can be flag objects; fall back
+            mf = getattr(ip.flags, "MF", False)
+        return mf or (int(ip.frag) > 0)
+
+    def _reassemble_ipv4(self, pkt, inbound_iface: str):
         """
-        Handles incoming ICMP packets.
-        Returns True if the packet was an ICMP packet handled by the manager.
+        Buffer IPv4 fragments for datagrams destined to the router.
+        Returns a fully reassembled packet when complete, else None.
         """
-        if not pkt.haslayer(ICMP) or not pkt.haslayer(IP):
-            return False
+        ip = pkt[IP]
+        key = (ip.src, ip.dst, int(ip.proto), int(ip.id))
+        now = time.time()
 
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        icmp_type = pkt[ICMP].type
-        icmp_code = pkt[ICMP].code if hasattr(pkt[ICMP], 'code') else 0
+        # Housekeeping: drop stale buffers
+        self._cleanup_reasm(now)
 
-        # Ensure the packet's destination IP is one of our router's IPs
-        is_for_router = False
-        router_mac_for_reply = None
-        router_ip_for_reply = None
-        for iface_full_name, cfg in self.ifaces.items():
-            if cfg.get("ip_addr") == dst_ip:
-                is_for_router = True
-                router_mac_for_reply = cfg.get("mac")
-                router_ip_for_reply = cfg.get("ip_addr")
-                break
+        # Extract fragment info
+        try:
+            mf = bool(int(ip.flags) & 0x1)
+        except Exception:
+            mf = getattr(ip.flags, "MF", False)
+        off_bytes = int(ip.frag) * self._EIGHT
+        frag_payload = bytes(ip.payload)
 
-        if not is_for_router:
+        with self._reasm_lock:
+            st = self._reasm.get(key)
+            if not st:
+                st = self._reasm[key] = {
+                    "first_hdr": ip.copy(),   # keep a copy of the first-seen header (may be non-zero offset; we’ll normalize)
+                    "parts": {},
+                    "total": None,            # known once we see MF==0 (last fragment)
+                    "t0": now,
+                    "iface": inbound_iface,
+                }
+
+            st["parts"][off_bytes] = frag_payload
+            st["t0"] = now  # touch
+
+            if not mf:
+                # last fragment => total length is end of this fragment
+                st["total"] = off_bytes + len(frag_payload)
+
+            # If we don't have total length yet, we can't know completion
+            total = st["total"]
+            if total is None:
+                return None
+
+            # Check if we have a full contiguous coverage [0, total)
+            covered = 0
+            while covered in st["parts"]:
+                covered += len(st["parts"][covered])
+
+            if covered < total:
+                return None
+
+            # Reassemble payload bytes
+            assembled_payload = bytearray(total)
+            for off, data in st["parts"].items():
+                assembled_payload[off:off+len(data)] = data
+
+            # Build a normalized IP datagram with frag/flags cleared
+            base = st["first_hdr"].copy()
+            base.flags = 0
+            base.frag = 0
+            # Rebuild as IP()/Raw(...) so Scapy can decode inner (ICMP) again
+            full = IP(bytes(base)) / Raw(bytes(assembled_payload))
+            try:
+                full = IP(bytes(full))  # force full decode
+            except Exception:
+                pass
+
+            # Done with this buffer
+            del self._reasm[key]
+
+            self.log.log_message(f"[ICMP] 🔧 Reassembled IPv4 fragments from {ip.src} → {ip.dst} (len={len(bytes(full))}) on {inbound_iface.split('_')[-1]}")
+            return full
+
+    def _cleanup_reasm(self, now: float) -> None:
+        with self._reasm_lock:
+            dead = []
+            for key, st in self._reasm.items():
+                if now - st.get("t0", now) > self.REASM_TIMEOUT_SEC:
+                    dead.append(key)
+            for key in dead:
+                st = self._reasm.pop(key, None)
+                if st:
+                    src, dst, proto, _ = key
+                    self.log.log_message(f"[ICMP] ⏳ Reassembly timeout for {src}→{dst} proto={proto} on {st.get('iface')}. Dropping partial datagram.")
+
+    def _log_admin_block(self, pkt, inbound_iface: str):
+        icmp = pkt[ICMP]
+        inner = icmp.payload
+        if IP in inner:
+            ip2 = inner[IP]
+            l4 = ip2.payload
+            sport = getattr(l4, "sport", None)
+            dport = getattr(l4, "dport", None)
+            proto = "TCP" if TCP in inner else ("UDP" if UDP in inner else str(ip2.proto))
             self.log.log_message(
-                f"[ICMP] 📭 Received {icmp_type} for {dst_ip} (not router's IP). Not handled by ICMP Manager directly."
+                f"[ICMP] 🔒 Admin-prohibited on {inbound_iface.split('_')[-1]}: "
+                f"{ip2.src}:{sport} → {ip2.dst}:{dport} proto={proto}"
             )
-            return False
-
-        # --- Handle specific ICMP types ---
-        if icmp_type == 8:  # Echo Request
-            self.log.log_message(
-                f"[ICMP] 📨 Echo-Request from {src_ip} to {dst_ip} on {inbound_iface.split('_')[-1]}"
-            )
-
-            if self._is_rate_limited(src_ip, dst_ip):
-                return True
-
-            reply_src_mac = router_mac_for_reply if router_mac_for_reply else "00:00:00:00:00:00"
-            reply_dst_mac = pkt[Ether].src if pkt.haslayer(Ether) else "00:00:00:00:00:00"
-
-            if "loopback" in inbound_iface.lower() or "lo" == inbound_iface.lower() or not pkt.haslayer(Ether):
-                reply = IP(src=dst_ip, dst=src_ip) / \
-                        ICMP(type=0, id=pkt[ICMP].id, seq=pkt[ICMP].seq) / \
-                        pkt[ICMP].payload
-            else:
-                reply = Ether(src=reply_src_mac, dst=reply_dst_mac) / \
-                        IP(src=dst_ip, dst=src_ip) / \
-                        ICMP(type=0, id=pkt[ICMP].id, seq=pkt[ICMP].seq) / \
-                        pkt[ICMP].payload
-
-            self.pw.queue_packet(reply, inbound_iface)
-            self.log.log_message(
-                f"[ICMP] ✅ Echo-Reply queued on {inbound_iface.split('_')[-1]} for {src_ip}"
-            )
-            return True
-
-        elif icmp_type == 3:  # Destination Unreachable
-            self.log.log_message(
-                f"[ICMP] 🔌 Destination Unreachable (Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
-            )
-            self.sendback_manager.send_icmp_packet(pkt, icmp_type=3, icmp_code=icmp_code)
-            return True
-
-        elif icmp_type == 11:  # Time Exceeded
-            self.log.log_message(
-                f"[ICMP] ⏳ Time Exceeded (Code {icmp_code}) from {src_ip} on {inbound_iface.split('_')[-1]}"
-            )
-            self.sendback_manager.send_icmp_packet(pkt, icmp_type=11, icmp_code=icmp_code)
-            return True
-
         else:
+            self.log.log_message(f"[ICMP] 🔒 Admin-prohibited (no inner IP decode) on {inbound_iface.split('_')[-1]}")
+    def _maybe_fragment_and_queue(self, reply_pkt, outbound_iface: str) -> None:
+        """
+        Ensure reply fits iface MTU. If too large and IPv4, fragment manually.
+        """
+        # Get iface MTU (fallback 1500)
+        try:
+            mtu = int(self.ifaces.get(outbound_iface, {}).get("mtu", 1500))
+        except Exception:
+            mtu = 1500
+
+        raw_len = len(bytes(reply_pkt))
+        if raw_len <= mtu:
+            self.pw.queue_packet(reply_pkt, outbound_iface)
+            return
+
+        # Effective IP MTU subtracting L2 header if present
+        l2_overhead = 14 if reply_pkt.haslayer(Ether) else 0
+        ip_mtu = max(576, mtu - l2_overhead)  # safe lower bound per IPv4 reassembly
+
+        if not reply_pkt.haslayer(IP):
+            # Not IPv4; just send (or drop) — we log and send to keep behavior simple
             self.log.log_message(
-                f"[ICMP] ❔ Unhandled ICMP type {icmp_type} from {src_ip} on {inbound_iface.split('_')[-1]}. Summary: {pkt.summary()}"
-            )
-            return False
+                f"[ICMP] ⚠ Oversize non-IPv4 reply ({raw_len}B) > MTU {mtu} on {outbound_iface}; sending as-is.")
+            self.pw.queue_packet(reply_pkt, outbound_iface)
+            return
+
+        ip_part = reply_pkt[IP].copy()
+        # Clear DF if set; for router-originated replies it shouldn't be set anyway
+        try:
+            if int(ip_part.flags) & 0x2:
+                ip_part.flags = int(ip_part.flags) & ~0x2
+        except Exception:
+            # Scapy flags obj: just force-clear DF by reassigning numeric 0
+            ip_part.flags = 0
+
+        try:
+            ip_frags = self._ipv4_fragment_datagram(ip_part, ip_mtu)
+        except Exception as e:
+            self.log.log_message(f"[ICMP] ❌ Fragmentation failed ({e}); sending unfragmented.")
+            self.pw.queue_packet(reply_pkt, outbound_iface)
+            return
+
+        if reply_pkt.haslayer(Ether):
+            eth = reply_pkt[Ether]
+            for ipf in ip_frags:
+                self.pw.queue_packet(Ether(src=eth.src, dst=eth.dst) / ipf, outbound_iface)
+        else:
+            for ipf in ip_frags:
+                self.pw.queue_packet(ipf, outbound_iface)
+
+        self.log.log_message(
+            f"[ICMP] ✂ Fragmented Echo-Reply into {len(ip_frags)} frags for {outbound_iface} (MTU={mtu}, IP-MTU={ip_mtu}).")
+
+    def _ipv4_fragment_datagram(self, ip_pkt: IP, ip_mtu: int):
+        """
+        Fragment an IPv4 datagram into a list of IP fragments that each fit <= ip_mtu.
+        - Honors 8-byte alignment for offsets
+        - Clears DF on fragments; sets MF on all but the last
+        - Preserves IP id/tos/ttl/proto/options
+        - Does NOT touch L4 checksums (correct for fragmentation)
+        """
+        # Header length (handles options)
+        ihl_bytes = int(getattr(ip_pkt, "ihl", 5)) * 4
+        if ihl_bytes <= 0:
+            ihl_bytes = 20
+
+        # Max payload per fragment must be 8-byte aligned
+        max_payload = (max(ip_mtu - ihl_bytes, 0) // 8) * 8
+        if max_payload <= 0:
+            raise ValueError(f"ip_mtu too small ({ip_mtu}) for header size {ihl_bytes}")
+
+        full_payload = bytes(ip_pkt.payload)  # everything after IP header
+        total = len(full_payload)
+        frags = []
+        offset = 0
+
+        while offset < total:
+            chunk = full_payload[offset: offset + max_payload]
+            more = (offset + len(chunk)) < total
+
+            frag = IP(
+                version=ip_pkt.version,
+                ihl=ip_pkt.ihl,
+                tos=ip_pkt.tos,
+                id=ip_pkt.id,
+                flags=0,  # DF cleared on fragments
+                frag=offset // 8,  # 8-byte units
+                ttl=ip_pkt.ttl,
+                proto=ip_pkt.proto,
+                src=ip_pkt.src,
+                dst=ip_pkt.dst,
+                options=getattr(ip_pkt, "options", b"") or b"",
+            ) / Raw(chunk)
+
+            if more:
+                # set MF
+                try:
+                    frag.flags = int(frag.flags) | 0x1
+                except Exception:
+                    frag.flags = 0x1
+
+            # let Scapy recompute len/chksum
+            try:
+                del frag.len, frag.chksum
+            except Exception:
+                pass
+
+            frags.append(frag)
+            offset += len(chunk)
+
+        return frags
+    # ---------- small helpers ----------
+
+    def _match_router_ip(self, dst_ip: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        for iface_full_name, cfg in (self.ifaces or {}).items():
+            if cfg.get("ip_addr") == dst_ip:
+                return True, cfg.get("mac"), cfg.get("ip_addr")
+        return False, None, None
+
+    def _is_loopback_name(self, name: str) -> bool:
+        n = (name or "").lower()
+        return "loopback" in n or n == "lo"

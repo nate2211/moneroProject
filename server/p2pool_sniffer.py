@@ -15,6 +15,7 @@ from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNS
 from scapy.layers.eap import EAPOL, EAP
 from scapy.layers.ipsec import ESP, AH
+from scapy.layers.kerberos import Kerberos
 from scapy.layers.l2tp import L2TP
 from scapy.layers.mobileip import MobileIP
 from scapy.layers.ppp import PPP
@@ -231,6 +232,10 @@ class SnifferSoftware:
         bind_layers(UDP, MobileIP, sport=434)
         bind_layers(EAPOL, EAP, type=0)
         bind_layers(PPP, EAP, proto=0xC227)
+        bind_layers(UDP, Kerberos, sport=88)
+        bind_layers(UDP, Kerberos, dport=88)
+        bind_layers(TCP, Kerberos, sport=88)
+        bind_layers(TCP, Kerberos, dport=88)
         #-
         bind_layers(Ether, EAPOL, type=0x888E)
         load_layer("vxlan")

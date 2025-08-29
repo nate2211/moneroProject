@@ -1,5 +1,4 @@
 import hashlib
-import json
 import queue
 import random
 import re
@@ -8,14 +7,14 @@ import subprocess
 from collections import defaultdict, deque
 from enum import auto, Enum
 from functools import reduce
-from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set
+from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set, Iterable
 import ipaddress
-import threading
 import time
 
 import requests
 import zmq
-from scapy.arch import get_if_hwaddr
+from scapy.arch import get_if_hwaddr, get_windows_if_list
+from scapy.config import conf
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6OptIAPrefix, DHCP6OptDNSServers, DHCP6_Advertise, DHCP6_Reply
@@ -1441,6 +1440,238 @@ class StratumManager:
 
         logger.log_message(f"[Stratum] ✅ Worker shutdown complete for session={session_id}")
 
+class BroadcastManager:
+    """
+    Windows/NPcap-focused broadcast helper.
+
+    What it does:
+      - Maps a pcap name (\\Device\\NPF_{GUID}) to the Windows iface record.
+      - Computes IPv4 broadcast (from ip + netmask).
+      - Tries to locate the Scapy iface by GUID and set useful attributes:
+          * iface.broadcast / iface.l2broadcast (best-effort) -> 'ff:ff:ff:ff:ff:ff'
+          * iface.ipv4_broadcast (aux field, for your code)    -> IPv4 broadcast string
+      - Provides a safe ARP-based MAC resolver that doesn’t rely on getmacbyip().
+
+    You can pass `iface=pcap_name` directly to srp/sendp even if Scapy’s iface table
+    doesn’t contain that device; this class still returns the computed broadcast.
+    """
+    _GUID_RE = re.compile(r"\{([0-9A-Fa-f\-]{36})\}")
+    def __init__(self, logger=None, sniffer=None):
+        self._logger = logger or (lambda s: None)
+        self.sniffer = sniffer
+
+    # ------------- Public API -------------
+
+    def ensure_broadcast_for_pcap(self, pcap_name: str) -> Dict[str, Any]:
+        """
+        Ensure broadcast info is available. Returns a dict with:
+          {
+            'pcap_name': str,
+            'ipv4_broadcast': Optional[str],
+            'scapy_iface_name': Optional[str],
+            'scapy_iface_set': bool,         # whether we set attrs on the scapy iface
+            'note': str
+          }
+        """
+        self._refresh_ifaces()
+
+        rec = self._find_windows_rec(pcap_name)
+        if not rec:
+            note = "Windows interface record not found"
+            self._logger.log_message(f"[Broadcast] {note}: {pcap_name}")
+            return self._ret(pcap_name, None, None, False, note)
+
+        ipv4_bcast = self._compute_ipv4_broadcast(rec)
+
+        sc_if = self._find_scapy_iface_by_guid(self._extract_guid(pcap_name))
+        if not sc_if:
+            note = "Scapy iface not found; computed IPv4 broadcast only"
+            self._logger.log_message(f"[Broadcast] {note}: {pcap_name} -> {ipv4_bcast}")
+            return self._ret(pcap_name, ipv4_bcast, None, False, note)
+
+        # Try to set L2 broadcast and stash IPv4 broadcast for your code.
+        set_ok = False
+        try:
+            set_ok |= self._try_set_attr(sc_if, "broadcast", "ff:ff:ff:ff:ff:ff")
+            set_ok |= self._try_set_attr(sc_if, "l2broadcast", "ff:ff:ff:ff:ff:ff")
+            # auxiliary: we keep this for your own logic; Scapy won’t use it internally
+            set_ok |= self._try_set_attr(sc_if, "ipv4_broadcast", ipv4_bcast)
+        except Exception:
+            pass
+
+        name_hint = getattr(sc_if, "name", None) or getattr(sc_if, "pcap_name", None)
+        note = "broadcast fields set on scapy iface" if set_ok else "scapy iface found; fields not set"
+        self._logger.log_message(f"[Broadcast] {note}: {name_hint} -> {ipv4_bcast}")
+        return self._ret(pcap_name, ipv4_bcast, name_hint, bool(set_ok), note)
+
+    def resolve_mac(self, ip: str, pcap_name: str, timeout: float = 1.5) -> Optional[str]:
+        """
+        Resolve a target's MAC via an explicit ARP probe on the given NPcap device.
+        Avoids getmacbyip() / filter issues on Windows.
+        """
+        try:
+            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+            ans = self.sniffer.sr2(pkt, iface=pcap_name, timeout=timeout, verbose=0)
+            mac = ans[ARP].hwsrc if ans and ARP in ans else None
+            if mac:
+                self._logger.log_message(f"[Broadcast] ARP resolved {ip} -> {mac} on {pcap_name}")
+            else:
+                self._logger.log_messager(f"[Broadcast] ARP unresolved {ip} on {pcap_name}")
+            return mac
+        except Exception as e:
+            self._logger.log_message(f"[Broadcast] ARP resolve error: {e}")
+            return None
+
+    def debug_dump_windows_mapping(self, limit: int = 50) -> str:
+        lines = []
+        for i, rec in enumerate(get_windows_if_list()[:limit], 1):
+            lines.append(f"{i}. friendly={rec.get('friendly_name')}  guid={rec.get('guid')}  name={rec.get('name')}")
+            lines.append(f"    mac={rec.get('mac')}  win_index={rec.get('win_index')}")
+            lines.append(f"    ips={rec.get('ips')}")
+        return "\n".join(lines)
+
+    # ------------- Internals -------------
+
+    def _refresh_ifaces(self) -> None:
+        try:
+            conf.ifaces.reload()
+        except Exception:
+            pass
+
+    def _extract_guid(self, pcap_name: str) -> Optional[str]:
+        m = self._GUID_RE.search(pcap_name or "")
+        return m.group(1).upper() if m else None
+
+    def _iter_if_recs(self, items: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+        """
+        Yield only dict-like records; coerce non-dicts into dicts when possible.
+        This prevents `.get(...)` on strings.
+        """
+        for it in (items or []):
+            if isinstance(it, dict):
+                yield it
+            else:
+                # best-effort coercion; skip if we can't
+                try:
+                    # some Scapy versions may return objects with attributes
+                    rec = {
+                        "name": getattr(it, "name", None),
+                        "guid": getattr(it, "guid", None),
+                        "friendly_name": getattr(it, "friendly_name", None),
+                        "description": getattr(it, "description", None),
+                        "mac": getattr(it, "mac", None),
+                        "ips": getattr(it, "ips", None),
+                        "win_index": getattr(it, "win_index", None),
+                    }
+                    if any(v is not None for v in rec.values()):
+                        yield rec
+                except Exception:
+                    continue
+    def _find_windows_rec(self, pcap_name: str) -> Optional[dict]:
+        p_norm = self._norm(pcap_name)
+        guid = self._extract_guid(pcap_name)
+
+        recs = list(self._iter_if_recs(get_windows_if_list()))
+
+        # 1) direct name match
+        for rec in recs:
+            if self._norm(rec.get("name")) == p_norm:
+                return rec
+
+        # 2) GUID match (with/without braces)
+        if guid:
+            g_up = guid.upper()
+            for rec in recs:
+                rg = rec.get("guid")
+                if rg and self._extract_guid(str(rg)) == g_up:
+                    return rec
+
+        # 3) friendly/description contains GUID
+        if guid:
+            g_low = guid.lower()
+            for rec in recs:
+                for key in ("friendly_name", "description", "name"):
+                    val = self._norm(rec.get(key))
+                    if val and g_low in val:
+                        return rec
+
+        # 4) as a last resort, match by MAC from Scapy iface
+        sc_if = self._find_scapy_iface_by_guid(guid) if guid else None
+        mac = getattr(sc_if, "mac", None) if sc_if else None
+        if mac:
+            m_norm = self._norm(mac)
+            for rec in recs:
+                if self._norm(rec.get("mac")) == m_norm:
+                    return rec
+
+        return None
+
+    def _find_scapy_iface_by_guid(self, guid: Optional[str]):
+        if not guid:
+            return None
+        g = guid.upper()
+        # exact GUID match
+        for iface in conf.ifaces.values():
+            ig = getattr(iface, "guid", None)
+            if ig and str(ig).upper() == g:
+                return iface
+        # fallback: GUID text present in pcap_name
+        for iface in conf.ifaces.values():
+            pn = getattr(iface, "pcap_name", "") or ""
+            if g in pn.upper():
+                return iface
+        return None
+
+
+    def _compute_ipv4_broadcast(self, rec: dict) -> Optional[str]:
+        """
+        Accepts both shapes:
+          rec['ips'] == [{'ip': 'x.x.x.x', 'netmask': 'y.y.y.y'}, ...]
+          rec['ips'] == ['x.x.x.x/yy', ...]   (slash form)
+        """
+        ips = rec.get("ips") or []
+        for addr in ips:
+            ip, mask = None, None
+            if isinstance(addr, dict):
+                ip, mask = addr.get("ip"), addr.get("netmask")
+            elif isinstance(addr, str):
+                # Try CIDR form like '192.168.1.10/24'
+                try:
+                    if "/" in addr and ":" not in addr:
+                        net = ipaddress.IPv4Interface(addr)
+                        ip = str(net.ip)
+                        mask = str(net.network.netmask)
+                except Exception:
+                    pass
+            if ip and mask and ":" not in ip:
+                try:
+                    net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+                    return str(net.broadcast_address)
+                except Exception:
+                    continue
+        return None
+
+    # -------- small helpers --------
+    def _try_set_attr(self, obj, name: str, value) -> bool:
+        try:
+            old = getattr(obj, name, None)
+            if old != value and value is not None:
+                setattr(obj, name, value)
+            return True
+        except Exception:
+            return False
+
+    def _ret(self, pcap: str, ip_bcast: Optional[str], sc_name: Optional[str], set_ok: bool, note: str) -> Dict[str, Any]:
+        return {
+            "pcap_name": pcap,
+            "ipv4_broadcast": ip_bcast,
+            "scapy_iface_name": sc_name,
+            "scapy_iface_set": set_ok,
+            "note": note,
+        }
+
+    def _norm(self,s: Optional[str]) -> str:
+        return (s or "").replace("\\\\", "\\").lower()
 
 class mDNSManager:
     """
@@ -3914,7 +4145,7 @@ class NATManager:
     Manages Network Address Translation (NAT) with both:
       - dynamic NAT for outbound connections, and
       - static port‐forwarding mappings for inbound services.
-    Enhanced with NAT timeouts and a basic ALG placeholder.
+    Enhanced with NAT timeouts, keep-alive handling, and a basic ALG placeholder.
     Includes port scan detection, IP banning, and temporary NAT leases.
     """
 
@@ -3948,6 +4179,10 @@ class NATManager:
         self.NAT_PORT_MAX = 65535
         self.NAT_TIMEOUT_SECONDS = 300
         self._next_port = self.NAT_PORT_MIN
+
+        # --- Keep-Alive Configuration ---
+        self.KEEP_ALIVE_PORT = 19999  # Dedicated UDP port for keep-alive signals
+        self.KEEP_ALIVE_PAYLOAD_FORMAT = "!H"  # Network byte order, unsigned short (for the target port)
 
         # --- NAT Tables ---
         self._nat_table: Dict[
@@ -3988,7 +4223,6 @@ class NATManager:
 
         self.router_logger.log_message("[NAT] 🚀 Manager initialized with port scan detection and temporary leases.")
 
-
     def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
         """Creates a stateful NAT mapping for an established connection."""
         canonical_key = _get_canonical_session_key(src_ip, src_port, dst_ip, dst_port)
@@ -3999,7 +4233,7 @@ class NATManager:
                 translated_port, _ = existing_mapping
                 self._stateful_nat_outbound[canonical_key] = (translated_port, time.time())
                 self._stateful_nat_inbound[translated_port] = canonical_key
-                self.logger.log_message(
+                self.router_logger.log_message(
                     f"[NAT][STATEFUL] ✅ Created stateful mapping for {src_ip}:{src_port} -> {self.public_ip}:{translated_port}"
                 )
 
@@ -4125,6 +4359,50 @@ class NATManager:
         if packet.haslayer(UDP) and packet.haslayer(DNS) and (packet[UDP].dport == 53 or packet[UDP].sport == 53):
             self.router_logger.log_message(
                 f"[NAT][ALG] ❓ DNS traffic observed ({direction}). (No DNS payload rewriting by NAT.)")
+
+    def handle_keep_alive(self, packet: Packet):
+        """
+        Handles an incoming keep-alive request to refresh a dynamic NAT mapping.
+
+        Expects a UDP packet on KEEP_ALIVE_PORT with the target external port
+        in the payload. This method should be called by the main router logic
+        when a UDP packet destined for self.KEEP_ALIVE_PORT is received.
+        """
+        if not packet.haslayer(UDP) or not packet.haslayer(Raw):
+            return
+
+        payload = packet[Raw].load
+        payload_size = struct.calcsize(self.KEEP_ALIVE_PAYLOAD_FORMAT)
+
+        if len(payload) != payload_size:
+            self.router_logger.log_message(
+                f"[NAT][KEEP-ALIVE] ⚠️ Received keep-alive with invalid payload size from {packet[IP].src}. "
+                f"Expected {payload_size}, got {len(payload)}."
+            )
+            return
+
+        try:
+            target_port, = struct.unpack(self.KEEP_ALIVE_PAYLOAD_FORMAT, payload)
+        except struct.error:
+            self.router_logger.log_message(
+                f"[NAT][KEEP-ALIVE] ⚠️ Failed to unpack keep-alive payload from {packet[IP].src}."
+            )
+            return
+
+        with self._lock:
+            internal_key = self._nat_reverse_table.get(target_port)
+            if internal_key and internal_key in self._nat_table:
+                # Mapping exists, refresh its timestamp
+                self._nat_table[internal_key] = (target_port, time.time())
+                self.router_logger.log_message(
+                    f"[NAT][KEEP-ALIVE] 💓 Refreshed mapping for port {target_port} "
+                    f"({internal_key[0]}:{internal_key[1]}) from {packet[IP].src}."
+                )
+            else:
+                self.router_logger.log_message(
+                    f"[NAT][KEEP-ALIVE] ❓ Received keep-alive for unknown/stale port {target_port} "
+                    f"from {packet[IP].src}."
+                )
 
     def translate_outbound(self, packet: Packet):
         """
