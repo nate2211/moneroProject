@@ -1381,9 +1381,6 @@ class PythonRouterManager:
         if self.forwarding_manager.is_duplicate(src_ip, dst_ip, sport, dport, proto):
             return
 
-        # --- [1] Routing Lookup ---
-        route = self.rip_manager.find_route(dst_ip)
-
         if not route:
             self.function_call_tracker.track(
                 identifier='DroppedRoute',
