@@ -1028,6 +1028,417 @@ class PacketSigningManager:
         except Exception as e:
             pass
 
+class ESPManager:
+    """
+    Transparent ESP/NAT-T forwarder and flow tracker.
+
+    Key features:
+      - Pass-through routing for native ESP (IP proto 50) and NAT-T (UDP/4500).
+      - Tracks outbound flows so inbound replies are delivered to the right LAN iface/MAC.
+      - Parses ESP SPI from header (first 4 bytes) and associates it with a (peer, direction).
+      - Detects and drops NAT-T keepalives (single 0xFF byte) and can log them.
+      - Handles NAT-T Non-ESP Marker (first 4 bytes == 0x00000000) before ESP header.
+      - Optional peer allow-list for ingress protection.
+      - Minimal anti-replay window bookkeeping (sequence numbers per (peer, spi, dir)).
+      - Zero cryptography: this is a transparent forwarder, not an IPsec endpoint.
+
+    Integration points expected from your router:
+      - router_logger: has .log_message(str)
+      - packet_writer: has .queue_packet(pkt, egress_iface_name)
+      - get_mac_function(ip, iface_name) -> dst_mac or None
+      - find_route_function(ip) -> {"interface": name, "next_hop": ip or None} or None
+      - router_interfaces: {iface_name: {"ip_addr": "...", "mac": "..."}}
+    """
+
+    NAT_T_PORT = 4500
+
+    def __init__(self, router_logger, packet_writer):
+        self.log = router_logger
+        self.pw = packet_writer
+
+        # Map for native ESP (no ports), so we rely on SPI + peer direction.
+        # Key: ("ESP", dst_ip, spi) for outbound (LAN->WAN) learned mapping
+        # Val: {"lan_iface": str, "lan_mac": str, "lan_ip": str, "ts": float}
+        self._esp_out_map = {}
+
+        # NAT-T map (has ports). We track 5-tuple to route replies.
+        # Key: ("NATT", remote_ip, remote_port, local_ip, local_port)
+        # Val: {"lan_iface": str, "lan_mac": str, "lan_ip": str, "ts": float}
+        self._natt_out_map = {}
+
+        # Anti-replay lite: per (peer_ip, spi, dir) we remember a small sliding window.
+        # dir ∈ {"out", "in"} relative to LAN side perspective.
+        # Val: {"last": int, "seen": set[int] or deque, "win": int}
+        self._replay = defaultdict(lambda: {"last": 0, "seen": set(), "win": 64})
+
+        # Optional peer allow-list (string IPs or CIDRs). Empty = allow all.
+        self._peer_allowlist = set()
+
+        # Timeouts
+        self.MAP_TTL = 300  # seconds to keep mappings
+        self.CLEANUP_INTERVAL = 60
+        self._last_cleanup = 0.0
+
+        # Concurrency
+        self._lock = threading.RLock()
+
+        self.log.log_message("[ESP] Manager initialized.")
+
+    # -------------------------
+    # Public config methods
+    # -------------------------
+    def allow_peer(self, ip_or_cidr: str):
+        """Allow inbound ESP/NAT-T from a specific peer IP or CIDR."""
+        with self._lock:
+            self._peer_allowlist.add(ip_or_cidr)
+        self.log.log_message(f"[ESP] Allow-listed peer/net: {ip_or_cidr}")
+
+    def deny_peer(self, ip_or_cidr: str):
+        """Remove from allow-list (if present). If list becomes empty, all peers allowed."""
+        with self._lock:
+            self._peer_allowlist.discard(ip_or_cidr)
+        self.log.log_message(f"[ESP] Removed from allow-list: {ip_or_cidr}")
+
+    # -------------------------
+    # Main entry
+    # -------------------------
+    def handle_packet(self, pkt, inbound_iface: str, router_interfaces: dict,
+                      get_mac_function, find_route_function) -> bool:
+        """
+        Intercept and forward ESP/NAT-T. Return True if handled (consumed or forwarded).
+        """
+        try:
+            handled = False
+            ip, ipv6 = pkt.getlayer(IP), pkt.getlayer(IPv6)
+            if not (ip or ipv6):
+                return False
+
+            if self._is_natt(pkt):
+                handled = self._handle_natt(pkt, inbound_iface, router_interfaces, get_mac_function, find_route_function)
+            elif self._is_esp(pkt):
+                handled = self._handle_native_esp(pkt, inbound_iface, router_interfaces, get_mac_function, find_route_function)
+
+            # Periodic GC
+            now = time.time()
+            if now - self._last_cleanup > self.CLEANUP_INTERVAL:
+                self._cleanup(now)
+
+            return handled
+        except Exception as e:
+            self.log.log_message(f"[ESP] ❌ Exception in handle_packet: {e}")
+            return False
+
+    # -------------------------
+    # Detection helpers
+    # -------------------------
+    @staticmethod
+    def _is_esp(pkt) -> bool:
+        ip = pkt.getlayer(IP)
+        if ip and getattr(ip, "proto", None) == 50:
+            return True
+        v6 = pkt.getlayer(IPv6)
+        if v6 and getattr(v6, "nh", None) == 50:
+            return True
+        return False
+
+    def _is_natt(self, pkt) -> bool:
+        udp = pkt.getlayer(UDP)
+        if not udp:
+            return False
+        if udp.sport == self.NAT_T_PORT or udp.dport == self.NAT_T_PORT:
+            # NAT-T keepalive is 1 byte 0xFF; Non-ESP Marker is 4 zero bytes.
+            raw = pkt.getlayer(Raw)
+            if raw:
+                payload = bytes(raw.load)
+                if payload == b"\xff":  # keepalive
+                    return True
+                if len(payload) >= 8:
+                    # Non-ESP marker (4 zero bytes) followed by ESP header
+                    if payload[:4] == b"\x00\x00\x00\x00":
+                        return True
+            else:
+                # No Raw layer: still treat as NAT-T (some stacks may send empty keepalive frames)
+                return True
+        return False
+
+    # -------------------------
+    # NAT-T handling
+    # -------------------------
+    def _handle_natt(self, pkt, inbound_iface: str, router_ifaces: dict,
+                     get_mac_function, find_route_function) -> bool:
+        udp = pkt[UDP]
+        raw = pkt.getlayer(Raw)
+        ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+
+        # Keepalive handling
+        if raw and bytes(raw.load) == b"\xff":
+            self.log.log_message(f"[ESP] 🔸 NAT-T keepalive from {self._src(ip)}:{udp.sport} -> {self._dst(ip)}:{udp.dport} on {inbound_iface.split('_')[-1]}")
+            # Drop (do not forward) or forward based on preference; here we forward to keep NAT bindings alive.
+            # fallthrough to forward
+
+        # Parse SPI (if Non-ESP Marker present)
+        spi = None
+        if raw and len(raw.load) >= 12:
+            data = bytes(raw.load)
+            if data[:4] == b"\x00\x00\x00\x00":  # Non-ESP marker
+                spi = int.from_bytes(data[4:8], "big", signed=False)
+                seq = int.from_bytes(data[8:12], "big", signed=False)
+                self._note_seq(self._peer(ip, outbound=(self._is_lan_src(pkt, inbound_iface, router_ifaces))), spi, seq,
+                               dir_out=self._is_lan_src(pkt, inbound_iface, router_ifaces))
+
+        # Choose routing direction
+        is_from_lan = self._is_lan_src(pkt, inbound_iface, router_ifaces)
+        if is_from_lan:
+            # Outbound (LAN -> remote)
+            key = ("NATT", self._dst(ip), udp.dport, self._src(ip), udp.sport)
+            with self._lock:
+                self._natt_out_map[key] = {
+                    "lan_iface": inbound_iface,
+                    "lan_mac": pkt[Ether].src if pkt.haslayer(Ether) else None,
+                    "lan_ip": self._src(ip),
+                    "ts": time.time()
+                }
+            # Forward out according to route to remote IP
+            return self._forward(pkt, outbound_to=self._dst(ip), router_ifaces=router_ifaces,
+                                 get_mac_function=get_mac_function, find_route_function=find_route_function,
+                                 inbound_iface=inbound_iface, note="[ESP] ➡️ NAT-T")
+        else:
+            # Inbound (remote -> LAN). Find matching mapping by reversing tuple.
+            key = ("NATT", self._src(ip), udp.sport, self._dst(ip), udp.dport)
+            with self._lock:
+                entry = self._natt_out_map.get(key)
+
+            if not entry:
+                # Unknown flow; if allow-list enabled, drop unless peer allowed.
+                if not self._peer_is_allowed(self._src(ip)):
+                    self.log.log_message(f"[ESP] 🚫 NAT-T inbound from disallowed peer {self._src(ip)}")
+                    return False
+                # Otherwise just route via normal path (let IP routing decide)
+                return self._forward(pkt, outbound_to=self._src(ip), router_ifaces=router_ifaces,
+                                     get_mac_function=get_mac_function, find_route_function=find_route_function,
+                                     inbound_iface=inbound_iface, note="[ESP] ↔ NAT-T (stateless)")
+            # Deliver back to the learned LAN iface/MAC
+            return self._deliver_to_lan(pkt, entry, router_ifaces, note="[ESP] ⬅️ NAT-T")
+
+    # -------------------------
+    # Native ESP handling
+    # -------------------------
+    def _handle_native_esp(self, pkt, inbound_iface: str, router_ifaces: dict,
+                           get_mac_function, find_route_function) -> bool:
+        ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        # Extract SPI: first 4 bytes of ESP header are right after IP header.
+        spi = self._extract_spi_native_esp(pkt)
+        if spi is None:
+            self.log.log_message(f"[ESP] ❓ Could not parse SPI for {self._src(ip)} -> {self._dst(ip)} on {inbound_iface.split('_')[-1]}")
+            # Still forward statelessly
+            return self._forward(pkt, outbound_to=self._dst(ip), router_ifaces=router_ifaces,
+                                 get_mac_function=get_mac_function, find_route_function=find_route_function,
+                                 inbound_iface=inbound_iface, note="[ESP] ↔ ESP (no SPI)")
+
+        is_from_lan = self._is_lan_src(pkt, inbound_iface, router_ifaces)
+        if is_from_lan:
+            # Learn mapping so replies (same SPI, reversed direction) make it back.
+            key = ("ESP", self._dst(ip), spi)
+            with self._lock:
+                self._esp_out_map[key] = {
+                    "lan_iface": inbound_iface,
+                    "lan_mac": pkt[Ether].src if pkt.haslayer(Ether) else None,
+                    "lan_ip": self._src(ip),
+                    "ts": time.time()
+                }
+            return self._forward(pkt, outbound_to=self._dst(ip), router_ifaces=router_ifaces,
+                                 get_mac_function=get_mac_function, find_route_function=find_route_function,
+                                 inbound_iface=inbound_iface, note=f"[ESP] ➡️ ESP spi=0x{spi:08x}")
+        else:
+            # Remote -> LAN. Look up mapping by (remote_ip_as_dst_in_outbound, spi)
+            key = ("ESP", self._src(ip), spi)
+            with self._lock:
+                entry = self._esp_out_map.get(key)
+
+            if not entry:
+                if not self._peer_is_allowed(self._src(ip)):
+                    self.log.log_message(f"[ESP] 🚫 ESP inbound from disallowed peer {self._src(ip)} spi=0x{spi:08x}")
+                    return False
+                # Stateless forward (normal routing) if no mapping
+                return self._forward(pkt, outbound_to=self._src(ip), router_ifaces=router_ifaces,
+                                     get_mac_function=get_mac_function, find_route_function=find_route_function,
+                                     inbound_iface=inbound_iface, note=f"[ESP] ↔ ESP spi=0x{spi:08x} (stateless)")
+            # Deliver back to learned LAN iface/MAC
+            return self._deliver_to_lan(pkt, entry, router_ifaces, note=f"[ESP] ⬅️ ESP spi=0x{spi:08x}")
+
+    # -------------------------
+    # Forwarding helpers
+    # -------------------------
+    def _forward(self, pkt, outbound_to: str, router_ifaces: dict,
+                 get_mac_function, find_route_function, inbound_iface: str, note: str) -> bool:
+        """
+        Route-based forwarding: set Ether src to egress iface MAC and dst via ARP/ND.
+        IP headers remain unchanged (we are routing, not proxying).
+        """
+        route = find_route_function(outbound_to)
+        if not route or not route.get("interface"):
+            self.log.log_message(f"{note} ❌ No route to {outbound_to}")
+            return False
+
+        egress = route["interface"]
+        cfg = router_ifaces.get(egress)
+        if not cfg:
+            self.log.log_message(f"{note} ❌ Missing iface config for {egress}")
+            return False
+
+        fwd = pkt.copy()
+        # L2 rewrite
+        if fwd.haslayer(Ether):
+            fwd[Ether].src = cfg["mac"]
+            nh = route.get("next_hop") or outbound_to
+            mac = get_mac_function(nh, egress)
+            if not mac:
+                self.log.log_message(f"{note} ❌ Unknown MAC for next-hop {nh} (iface {egress.split('_')[-1]})")
+                return True  # ARP resolution will be triggered elsewhere; we consumed the packet.
+            fwd[Ether].dst = mac
+
+        # (We do NOT change IP src/dst; checksums not touched)
+        self.log.log_message(f"{note} {self._five_tuple_str(fwd)} via {egress.split('_')[-1]}")
+        self.pw.queue_packet(fwd, egress)
+        return True
+
+    def _deliver_to_lan(self, pkt, entry: dict, router_ifaces: dict, note: str) -> bool:
+        lan_if = entry.get("lan_iface")
+        lan_mac = entry.get("lan_mac")
+        cfg = router_ifaces.get(lan_if)
+        if not cfg:
+            self.log.log_message(f"{note} ❌ Original LAN iface missing")
+            return False
+
+        out = pkt.copy()
+        if out.haslayer(Ether):
+            out[Ether].src = cfg["mac"]
+            if lan_mac:
+                out[Ether].dst = lan_mac
+        # (Keep IP headers unchanged)
+        self.log.log_message(f"{note} {self._five_tuple_str(out)} via {lan_if.split('_')[-1]}")
+        self.pw.queue_packet(out, lan_if)
+        return True
+
+    # -------------------------
+    # Utilities
+    # -------------------------
+    @staticmethod
+    def _src(ip_layer) -> str:
+        return getattr(ip_layer, "src", "")
+
+    @staticmethod
+    def _dst(ip_layer) -> str:
+        return getattr(ip_layer, "dst", "")
+
+    @staticmethod
+    def _is_v6(ip_layer) -> bool:
+        from scapy.layers.inet6 import IPv6 as _IPv6  # local import to avoid top-level hard dep
+        return isinstance(ip_layer, _IPv6)
+
+    @staticmethod
+    def _is_lan_src(pkt, inbound_iface: str, router_ifaces: dict) -> bool:
+        """
+        Heuristic: packets arriving on a non-WAN iface are considered LAN-origin.
+        If you already tag ifaces (e.g., router_ifaces[name]['role'] == 'lan'), use that.
+        """
+        cfg = router_ifaces.get(inbound_iface, {})
+        role = cfg.get("role")
+        if role == "lan":
+            return True
+        if role == "wan":
+            return False
+        # Fallback: treat non-WAN as LAN.
+        return True
+
+    @staticmethod
+    def _peer(ip_layer, outbound: bool) -> str:
+        """Return the 'remote' peer IP for replay keying."""
+        return getattr(ip_layer, "dst" if outbound else "src", "")
+
+    @staticmethod
+    def _extract_spi_native_esp(pkt) -> int | None:
+        """
+        Extracts SPI from native ESP packet (no UDP).
+        SPI is the first 32-bit word after the IP header.
+        """
+        # Use raw bytes to avoid needing scapy's ESP layer.
+        try:
+            ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+            raw = bytes(bytes(pkt[IP]) if ip and isinstance(ip, IP) else bytes(pkt[IPv6]))  # serialize the IP packet
+            # Compute IP header length
+            if isinstance(ip, IP):
+                ihl = (ip.ihl or 5) * 4
+                if len(raw) < ihl + 4:
+                    return None
+                return int.from_bytes(raw[ihl:ihl + 4], "big", signed=False)
+            else:
+                # IPv6 header is fixed 40 bytes; next header should be ESP (already verified)
+                offset = 40
+                if len(raw) < offset + 4:
+                    return None
+                return int.from_bytes(raw[offset:offset + 4], "big", signed=False)
+        except Exception:
+            return None
+
+    def _five_tuple_str(self, pkt) -> str:
+        ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        if pkt.haslayer(UDP):
+            u = pkt[UDP]
+            return f"{self._src(ip)}:{u.sport} -> {self._dst(ip)}:{u.dport}"
+        return f"{self._src(ip)} -> {self._dst(ip)} proto={'50/ESP' if self._is_esp(pkt) else 'udp/4500' if self._is_natt(pkt) else 'ip'}"
+
+    def _peer_is_allowed(self, peer_ip: str) -> bool:
+        with self._lock:
+            if not self._peer_allowlist:
+                return True
+            try:
+                pip = ipaddress.ip_address(peer_ip)
+            except Exception:
+                return False
+            for item in self._peer_allowlist:
+                try:
+                    if "/" in item:
+                        if pip in ipaddress.ip_network(item, strict=False):
+                            return True
+                    else:
+                        if pip == ipaddress.ip_address(item):
+                            return True
+                except Exception:
+                    continue
+            return False
+
+    def _note_seq(self, peer: str, spi: int, seq: int, dir_out: bool):
+        """
+        Minimal anti-replay note (does NOT enforce drops—add policy if desired).
+        """
+        k = (peer, spi, "out" if dir_out else "in")
+        with self._lock:
+            rec = self._replay[k]
+            win = rec["win"]
+            # keep only a small window of seen seqs
+            if len(rec["seen"]) > 2 * win:
+                # prune oldest-ish: for set, rebuild a tighter set around last
+                if isinstance(rec["seen"], set):
+                    last = rec["last"]
+                    rec["seen"] = {s for s in rec["seen"] if last - win <= s <= last}
+            rec["seen"].add(int(seq))
+            if seq > rec["last"]:
+                rec["last"] = int(seq)
+
+    def _cleanup(self, now: float):
+        with self._lock:
+            # Expire old mappings
+            for table_name, table in (("ESP", self._esp_out_map), ("NAT-T", self._natt_out_map)):
+                expired = []
+                for k, v in table.items():
+                    if now - v.get("ts", 0) > self.MAP_TTL:
+                        expired.append(k)
+                for k in expired:
+                    table.pop(k, None)
+                if expired:
+                    self.log.log_message(f"[ESP] 🧹 Cleanup: removed {len(expired)} {table_name} mappings")
+            self._last_cleanup = now
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -2836,58 +3247,78 @@ class PacketWriter:
 
     def _heal_dst_mac_before_queue(self, packet, final_iface: str) -> bool:
         """
-        If Ether.dst is invalid (e.g., 'dynamic'), attempt to repair it based on L3.
-        Returns True if dst MAC is now valid, False otherwise.
+        If Ether.dst is invalid (e.g., 'dynamic', 'static', 'unknown'), attempt to repair it.
+        Uses ARPManager.resolve() first, then multicast/broadcast, then getmacbyip().
         """
         if not packet.haslayer(Ether):
             return False
 
         eth = packet[Ether]
+        raw_dst = str(eth.dst).lower().strip()
+
+        # Normalize first
         dst_fixed = self._normalize_mac(eth.dst)
         if dst_fixed:
             eth.dst = dst_fixed
             return True
 
-        # Broadcast allowed?
-        if bool(getattr(packet, "_pw_allow_broadcast", False)):
-            eth.dst = "ff:ff:ff:ff:ff:ff"
-            return True
-
-        # L3-derived mappings
-        try:
-            if IP in packet:
-                dip = packet[IP].dst
-                # IPv4 broadcast/multicast
-                if dip == "255.255.255.255":
-                    eth.dst = "ff:ff:ff:ff:ff:ff"
-                    return True
-                if ipaddress.IPv4Address(dip).is_multicast:
-                    eth.dst = self._ipv4_mcast_mac(dip)
-                    return True
-            elif IPv6 in packet:
-                dip6 = packet[IPv6].dst
-                if ipaddress.IPv6Address(dip6).is_multicast:
-                    eth.dst = self._ipv6_mcast_mac(dip6)
-                    return True
-        except Exception:
-            pass
-
-        # Try next-hop resolution (ARP/ND)
-        nh_ip, af = self._infer_next_hop(final_iface, packet)
-        if nh_ip:
+        # Handle placeholders like 'static', 'dynamic', 'unknown'
+        if raw_dst in ("static", "dynamic", "unknown"):
+            # Try to resolve via ARPManager
             try:
-                if af == "ipv4":
-                    mac = self._normalize_mac(getmacbyip(nh_ip))
-                else:
-                    # For ND resolution, scapy has functions; as a simple fallback, leave for OS/neigh cache.
-                    mac = None
-                if mac:
-                    eth.dst = mac
-                    return True
+                nh_ip, af = self._infer_next_hop(final_iface, packet)
+                if nh_ip and af == "ipv4" and self.arp_manager:
+                    mac = self.arp_manager.resolve(nh_ip, final_iface)
+                    mac_norm = self._normalize_mac(mac)
+                    if mac_norm:
+                        eth.dst = mac_norm
+                        self.logger.log_message(
+                            f"[PacketWriter] 🔍 Resolved placeholder Ether.dst '{raw_dst}' to {mac_norm} via ARPManager"
+                        )
+                        return True
+            except Exception as e:
+                self.logger.log_message(f"[PacketWriter] ⚠️ ARPManager.resolve failed: {e}")
+
+            # Allow broadcast if caller says so
+            if getattr(packet, "_pw_allow_broadcast", False):
+                eth.dst = "ff:ff:ff:ff:ff:ff"
+                return True
+
+            # Derive from L3 multicast/broadcast
+            try:
+                if IP in packet:
+                    dip = packet[IP].dst
+                    if dip == "255.255.255.255":
+                        eth.dst = "ff:ff:ff:ff:ff:ff"
+                        return True
+                    if ipaddress.IPv4Address(dip).is_multicast:
+                        eth.dst = self._ipv4_mcast_mac(dip)
+                        return True
+                elif IPv6 in packet:
+                    dip6 = packet[IPv6].dst
+                    if ipaddress.IPv6Address(dip6).is_multicast:
+                        eth.dst = self._ipv6_mcast_mac(dip6)
+                        return True
             except Exception:
                 pass
 
-        # Could not heal
+            # Last chance: raw getmacbyip
+            nh_ip, af = self._infer_next_hop(final_iface, packet)
+            if nh_ip and af == "ipv4":
+                mac = self._normalize_mac(getmacbyip(nh_ip))
+                if mac:
+                    eth.dst = mac
+                    self.logger.log_message(
+                        f"[PacketWriter] ⚠️ Healed placeholder Ether.dst '{raw_dst}' with getmacbyip → {mac}"
+                    )
+                    return True
+
+            # Final fallback: broadcast
+            eth.dst = "ff:ff:ff:ff:ff:ff"
+            self.logger.log_message(f"[PacketWriter] ⚠️ Healed placeholder Ether.dst '{raw_dst}' as broadcast")
+            return True
+
+        # If dst was something else invalid, fail
         return False
     def __init__(self, logger, interfaces_config, packet_signer, outbound_load_balancer):
         """

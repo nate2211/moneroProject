@@ -2,6 +2,7 @@ import collections
 import inspect
 import json
 import math
+import os
 import queue
 import random
 import threading
@@ -15,6 +16,7 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, 
 # NumPy for analysis (only used during analysis; raw values stay as Python lists)
 import numpy as np
 import tiktoken
+from scapy.packet import Raw
 
 
 # ---------- Knowledge model ----------
@@ -298,91 +300,17 @@ class CodeOutputManager:
         )
 
         self.packet_learner = PacketLearnerManager(
-            default_ttls={"kerberos": 180.0, "dns": 60.0},
-            ttl_boost_factor=1.5,
-            ttl_boost_threshold=20,
-            logger=lambda s: print(s),
+            keep_raw_samples=True, log_level=2
         )
 
         self.method_generator = SnapshotMethodGenerator()
         self.stats_manager = StatisticsManager()
         self.snapshot_builder = SnapshotBuilder(self._log)
+        self.ask_manager = AskManager(rng_seed=9999)
         self.log_message("[CodeOutput] Manager initialized (drop-in, protocol-agnostic, NumPy stats ready).")
 
     def ask(self, prompt: str) -> str:
-        """
-        Chat-style interface:
-          - stores the user message,
-          - does tiny intent detection,
-          - retrieves relevant transient knowledge,
-          - answers in a friendly technical tone,
-          - may call stats/snapshot paths when asked.
-        """
-        prompt = (prompt or "").strip()
-        if not prompt:
-            return "Say something and I’ll analyze it."
-
-        # Ingest the message so it participates in learning
-        self.submit_message(prompt, role="user")
-        intent = self._infer_intent(prompt)
-
-        try:
-            if intent == "purge":
-                # try to detect a topic to purge; fallback 'misc'
-                toks = self._tokenize(prompt)
-                candidates = [t for t in toks if t in self._knowledge_by_topic]
-                topic = candidates[0] if candidates else "misc"
-                n = self.purge_topic(topic)
-                reply = f"Purged topic '{topic}' (removed {n} items)."
-            elif intent == "inspect":
-                snap = self.export_knowledge()
-                if not snap:
-                    reply = "I don’t have non-expired knowledge yet."
-                else:
-                    # Summarize compactly
-                    parts = []
-                    for t, arr in snap.items():
-                        parts.append(f"[{t}] {len(arr)} item(s)")
-                    reply = "Knowledge summary: " + ", ".join(parts)
-            elif intent == "stats":
-                # quick stats over all topics; reuse your manager
-                stats = self._compute_statistics_with_numpy(
-                    topics=[], percentiles=[5, 25, 50, 75, 95], topk_categorical=8, min_count_for_stats=2
-                )
-                if not stats:
-                    reply = "No numeric feature has enough samples to compute stats yet."
-                else:
-                    # pick a few headline numbers
-                    lines = ["Statistics (headlines):"]
-                    shown = 0
-                    for topic, blocks in stats.items():
-                        num = blocks.get("numeric") or {}
-                        for feat, fs in num.items():
-                            lines.append(
-                                f"• [{topic}.{feat}] count={fs.get('count')} mean={fs.get('mean'):.3g} std={fs.get('std'):.3g}")
-                            shown += 1
-                            if shown >= 8:
-                                break
-                        if shown >= 8:
-                            break
-                    reply = "\n".join(lines)
-            elif intent == "emit":
-                cfg = self._default_emit_builder()
-                code = self.generate_class_from_config(cfg)
-                # Store assistant reply
-                self.submit_message("[snapshot emitted]", role="assistant")
-                reply = f"Emitted snapshot class '{cfg.get('class_name')}' ({len(code)} bytes)."
-            else:
-                # 'gen' fallback: retrieval + tiny generation
-                retrieved = self._retrieve_snippets(prompt)
-                reply = self._chat_generate(prompt, retrieved)
-        except Exception as ex:
-            self._stats.errors += 1
-            reply = f"Internal error while answering: {ex}"
-
-        # Store and return assistant message
-        self.submit_message(reply, role="assistant")
-        return reply
+        return self.ask_manager.ask(prompt)
     # ---------- Chatbot core ----------
 
     def _chat_now(self) -> float:
@@ -413,6 +341,62 @@ class CodeOutputManager:
             return "inspect"
         return "gen"
 
+    def ask_file_cleartext(self, filepath: str, *, encoding: str = "utf-8",
+                           sensitive: bool = True, do_stats: bool = False) -> str:
+        """
+        Read a file as cleartext, feed it to the chatbot, then run inspect (and optional stats).
+        Returns a compact, log-friendly summary string.
+
+        Usage (inside auto-emit loop or anywhere):
+            s = self.ask_file_cleartext("/path/to/file.py", sensitive=True, do_stats=False)
+            self._log(f"[CodeOutput] 🔁 {s}", 1)
+        """
+        try:
+            with open(filepath, "r", encoding=encoding, errors="replace") as f:
+                text = f.read()
+        except Exception as ex:
+            return f"ask_file_cleartext: failed to read '{filepath}': {ex}"
+
+        # 1) Feed the raw file content
+        try:
+            r_ingest = self.ask_manager.ask(text)
+        except Exception as ex:
+            return f"ask_file_cleartext: ask(ingest) error: {ex}"
+
+        # 2) Inspect (redacted vs sensitive)
+        try:
+            inspect_cmd = "inspect sensitive" if sensitive else "inspect"
+            r_inspect = self.ask_manager.ask(inspect_cmd)
+        except Exception as ex:
+            return f"ask_file_cleartext: ask({inspect_cmd}) error: {ex}"
+
+        # 3) Optional stats
+        r_stats = None
+        if do_stats:
+            try:
+                r_stats = self.ask_manager.ask("stats")
+            except Exception as ex:
+                r_stats = f"(stats error: {ex})"
+
+        # Compact the outputs for logging
+        def _clip(s: str, n: int = 200) -> str:
+            s = (s or "").strip().replace("\n", " ")
+            return (s[:n] + "…") if len(s) > n else s
+
+        fed_len = len(text)
+        mode = "sensitive" if sensitive else "redacted"
+        parts = [
+            f"fed={fed_len} chars",
+            f"inspect={mode}: {_clip(r_inspect)}",
+        ]
+        if do_stats and r_stats:
+            parts.append(f"stats: {_clip(r_stats)}")
+
+        # Include a tiny hint of the initial ingest reply (often a friendly summary)
+        if r_ingest:
+            parts.append(f"ingest: {_clip(r_ingest, 120)}")
+
+        return " | ".join(parts)
     def _retrieve_snippets(self, query: str) -> List[Tuple[str, Dict[str, Any]]]:
         """
         Very small retrieval: pick most frequent concepts overlapping the query
@@ -616,7 +600,24 @@ class CodeOutputManager:
 
                 h = hashlib.sha256(code.encode("utf-8")).hexdigest()
                 self._log(f"[CodeOutput] 🔁 Auto-emitter produced hash={h[:10]}… len={len(code)} bytes.", 1)
-                self._log(f"[CodeOutput] 🔁 {self.ask("Output some code")}")
+                self.ask("inspect")
+                self.ask("sensitive")
+                self.ask("stats")
+                self.ask("emit")
+                self.ask(self.ask_file_cleartext("p2pool_managers.py",
+                                                sensitive=True, do_stats=False))
+                self._log(f"[CodeOutput] 🔁 Reading Managers ", 1)
+                self.ask(self.ask_file_cleartext("p2pool_router_managers.py",
+                                                sensitive=True, do_stats=False))
+                self._log(f"[CodeOutput] 🔁 Reading Router Managers ", 1)
+                self.ask(self.ask_file_cleartext("p2pool_router_managers_2.py",
+                                                sensitive=True, do_stats=False))
+                self._log(f"[CodeOutput] 🔁 Reading Router Managers 2", 1)
+                self.ask(self.ask_file_cleartext("p2pool_router_managers_3.py",
+                                                sensitive=True, do_stats=False))
+                self._log(f"[CodeOutput] 🔁 Reading Router Managers 3", 1)
+
+                self._log(f"[CodeOutput] 🔁 {self.ask("output everything you know")}")
                 if h != self._last_emitted_hash:
                     self._emit_sink(code, cfg)
                     self._fire_hooks("post_emit", code=code, cfg=cfg)
@@ -1539,6 +1540,16 @@ class CodeOutputManager:
         except Exception:
             pass
 
+        # NEW: accept dicts as-is
+        if isinstance(raw, dict):
+            try:
+                import json as _json
+                data = _json.dumps(raw, default=str, ensure_ascii=False).encode("utf-8")
+                return Raw(load=data)
+            except Exception as e:
+                self._log(f"[CodeOutput] 🟥 Could not JSON-wrap dict as Raw: {e}", 1)
+                return None
+
         if inspect.isclass(raw):
             self._log(f"[CodeOutput] 🟨 Got a Packet CLASS '{getattr(raw, '__name__', raw)}' – expected an instance.", 1)
             return None
@@ -1883,7 +1894,6 @@ Returns:
             s = f"f_{s}" if s else "f"
         return s
 
-
 class StatisticsManager:
     """
     A stateless manager to compute numeric and categorical statistics from
@@ -2014,7 +2024,6 @@ class StatisticsManager:
             "total_count": int(total_count),
             "top_k": [(str(val), int(cnt)) for val, cnt in top_values],
         }
-
 
 class SnapshotBuilder:
     """
@@ -2193,12 +2202,16 @@ class SnapshotBuilder:
             lines.append("")
         return "\n".join(lines)
 
-
 class ChatGenManager:
     """
     Higher-order Markov generator with contextual backoff and multi-config,
-    one-line renderings for each retrieved record. Each line uses a different
-    style and a rotated subset of attributes to avoid repetition.
+    one-line renderings for each retrieved record.
+
+    This version adds controlled randomness so repeated inputs don't look identical:
+      • Randomizes style choice and order per call
+      • Randomizes which attributes are shown, and how many
+      • Slightly varies quoting/compaction (e.g., shorten long values)
+      • Occasionally paraphrases the tail text
     """
 
     def __init__(
@@ -2212,8 +2225,16 @@ class ChatGenManager:
         sample_len: int = 24,
         state_size: int = 2,  # 2-word context by default
         config_styles: tuple[str, ...] = ("kv", "yaml", "ini", "shell", "json"),
-        preview_pairs: int = 8,        # how many k/v pairs per line
+        preview_pairs: int = 8,        # nominal max k/v pairs per line
         per_line_char_max: int = 160,  # soft cap per rendered line
+
+        # --- new knobs for variety ---
+        min_pairs: int = 3,            # min pairs per rendered line (randomized up to preview_pairs)
+        vary_styles: bool = True,      # randomly choose style per-line (vs strict round-robin)
+        shuffle_pairs: bool = True,    # shuffle attributes before selecting
+        style_weights: Optional[Dict[str, float]] = None,  # bias style selection (e.g., {"kv": 2.0, "json": 0.5})
+        paraphrase_tail_prob: float = 0.30,  # chance to lightly paraphrase tail
+        compact_value_prob: float = 0.35,    # chance to compact/abbreviate long-ish values
     ):
         self._format_kv = format_kv
         self._get_history = history_getter
@@ -2227,6 +2248,14 @@ class ChatGenManager:
         self._config_styles = config_styles or ("kv",)
         self._preview_pairs = max(1, preview_pairs)
         self._per_line_char_max = max(40, per_line_char_max)
+
+        # variety knobs
+        self._min_pairs = max(1, min_pairs)
+        self._vary_styles = bool(vary_styles)
+        self._shuffle_pairs = bool(shuffle_pairs)
+        self._style_weights = dict(style_weights or {})
+        self._paraphrase_tail_prob = float(paraphrase_tail_prob)
+        self._compact_value_prob = float(compact_value_prob)
 
     # ---------- Public ----------
     def generate(self, prompt: str, retrieved: List[Tuple[str, Dict[str, Any]]]) -> str:
@@ -2293,89 +2322,201 @@ class ChatGenManager:
     # ---------- Helpers: multi-config stitching ----------
     def _stitch(self, retrieved: List[Tuple[str, Dict[str, Any]]], tail: str) -> str:
         lines = [f"({self._persona})"]
+
         if retrieved:
-            lines.append("Here’s what I’m seeing right now:")
-            for i, (_topic, attrs) in enumerate(retrieved):
-                style = self._config_styles[i % len(self._config_styles)]
-                line = self._format_attrs_one_line(attrs, style, self._preview_pairs, line_index=i)
+            # Randomize intro line a bit
+            lines.append(self._np_rng.choice([
+                "Here’s what I’m seeing right now:",
+                "Current snapshot:",
+                "Live view:",
+                "Latest extract:"
+            ]))
+
+            # Shuffle which records render first
+            order = list(range(len(retrieved)))
+            self._np_rng.shuffle(order)
+
+            for out_idx, i in enumerate(order):
+                _topic, attrs = retrieved[i]
+                # style choice
+                style = self._choose_style(out_idx)
+
+                # how many pairs this line will show
+                n_pairs = int(self._np_rng.integers(self._min_pairs, self._preview_pairs + 1))
+
+                line = self._format_attrs_one_line(
+                    attrs,
+                    style,
+                    n_pairs,
+                    line_index=out_idx,
+                    shuffle_pairs=self._shuffle_pairs,
+                )
                 lines.append(self._limit_line(line, self._per_line_char_max))
         else:
-            lines.append("I don’t have fresh packets yet; I’ll reason from the prompt.")
+            lines.append(self._np_rng.choice([
+                "I don’t have fresh packets yet; I’ll reason from the prompt.",
+                "No new records available; continuing with prompt-only reasoning.",
+                "Still waiting on inputs; using context and prompt for now."
+            ]))
+
+        # Occasionally paraphrase the tail
+        if self._np_rng.random() < self._paraphrase_tail_prob:
+            tail = self._rephrase_tail(tail)
+
         lines.append(tail)
         return "\n".join(lines)
 
+    def _choose_style(self, line_index: int) -> str:
+        # Weighted random style selection if vary_styles=True; otherwise round-robin
+        if not self._vary_styles:
+            return self._config_styles[line_index % len(self._config_styles)]
+        styles = list(self._config_styles)
+        if not styles:
+            return "kv"
+        weights = np.array([self._style_weights.get(s, 1.0) for s in styles], dtype=np.float32)
+        if np.all(weights <= 0):
+            weights[:] = 1.0
+        weights = weights / weights.sum()
+        return str(self._np_rng.choice(styles, p=weights))
+
+    # ---------- Helpers: attribute selection & formatting ----------
     def _format_attrs_one_line(
         self,
         attrs: Mapping[str, Any],
         style: str,
         limit: int,
         line_index: int = 0,
+        shuffle_pairs: bool = False,
     ) -> str:
-        flat = self._flatten(attrs)
-        pairs = self._select_pairs(flat, limit, line_index)
+        flat = self._flatten(attrs, compact_prob=self._compact_value_prob)
+        pairs = self._select_pairs(flat, limit, line_index, shuffle_pairs=shuffle_pairs)
 
         if style == "kv":
-            return ", ".join(f"{k}='{v}'" for k, v in pairs)
+            # Randomize quoting of values a bit
+            parts = []
+            for k, v in pairs:
+                if self._np_rng.random() < 0.5 and not self._needs_quotes(v):
+                    parts.append(f"{k}={v}")
+                else:
+                    parts.append(f"{k}='{v}'")
+            return ", ".join(parts)
+
         elif style == "yaml":  # flow-style YAML on one line
-            return "{ " + ", ".join(f"{k}: {self._yaml_scalar(v)}" for k, v in pairs) + " }"
+            items = []
+            for k, v in pairs:
+                items.append(f"{k}: {self._yaml_scalar(v)}")
+            return "{ " + ", ".join(items) + " }"
+
         elif style == "ini":   # INI-ish inline
             return "; ".join(f"{k}={v}" for k, v in pairs)
+
         elif style == "shell": # shell env-style
             return " ".join(f"{k.upper()}={self._shell_quote(v)}" for k, v in pairs)
+
         elif style == "json":
             obj = {k: v for k, v in pairs}
-            return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+            # Sometimes tighten/loosen separators slightly
+            tight = (self._np_rng.random() < 0.5)
+            seps = (",", ":") if tight else (", ", ": ")
+            return json.dumps(obj, separators=seps, ensure_ascii=False)
+
         elif style == "ext" and self._format_kv:
-            # user-provided formatter if you want to plug your own
+            # user-provided formatter
             return self._format_kv(dict(pairs))
+
         else:
             # fallback
             return ", ".join(f"{k}={v}" for k, v in pairs)
 
-    # ---------- Helpers: attribute selection & formatting ----------
-    def _flatten(self, obj: Any, prefix: str = "") -> List[Tuple[str, str]]:
+    def _flatten(self, obj: Any, prefix: str = "", *, compact_prob: float = 0.0) -> List[Tuple[str, str]]:
         """
         Flattens nested mappings/lists into dot/bracket paths: a.b[0].c
-        Converts values to compact strings.
+        Converts values to compact strings with a chance to abbreviate.
         """
         out: List[Tuple[str, str]] = []
         if isinstance(obj, Mapping):
             for k, v in obj.items():
                 key = f"{prefix}.{k}" if prefix else str(k)
-                out.extend(self._flatten(v, key))
+                out.extend(self._flatten(v, key, compact_prob=compact_prob))
         elif isinstance(obj, (list, tuple)):
             for i, v in enumerate(obj):
                 key = f"{prefix}[{i}]"
-                out.extend(self._flatten(v, key))
+                out.extend(self._flatten(v, key, compact_prob=compact_prob))
         else:
             # leaf
-            sval = self._to_scalar(obj)
+            sval = self._to_scalar(obj, compact_prob=compact_prob)
             if prefix:
                 out.append((prefix, sval))
         return out
 
-    def _to_scalar(self, v: Any) -> str:
+    def _to_scalar(self, v: Any, *, compact_prob: float = 0.0) -> str:
         if v is None:
             return "null"
-        if isinstance(v, (int, float, bool)):
-            return str(v).lower() if isinstance(v, bool) else str(v)
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
         s = str(v)
-        # tiny compaction (e.g., long MAC/IP strings still visible but shorter)
-        if len(s) > 64:
-            s = s[:61] + "…"
+
+        # Occasionally compact/abbreviate
+        if self._np_rng.random() < compact_prob:
+            s = self._compact_value(s)
+        else:
+            if len(s) > 64:
+                s = s[:61] + "…"
         return s
 
-    def _select_pairs(self, flat: List[Tuple[str, str]], limit: int, line_index: int) -> List[Tuple[str, str]]:
+    def _compact_value(self, s: str) -> str:
         """
-        Deterministic rotation so each line gets a different slice of attributes:
-        sort by key, then rotate by line_index, then take 'limit' pairs.
+        Heuristics to compact values: shorten MAC/IP, collapse long paths, compress hex, etc.
+        """
+        # hex-ish long strings
+        if len(s) > 40 and all(ch in "0123456789abcdefABCDEF:" for ch in s if ch.isalnum() or ch == ":"):
+            return s[:16] + "…" + s[-8:]
+
+        # MAC like 'aa:bb:cc:dd:ee:ff'
+        if s.count(":") == 5 and all(len(part) == 2 for part in s.split(":")):
+            parts = s.split(":")
+            return f"{parts[0]}:{parts[1]}:..:{parts[-2]}:{parts[-1]}"
+
+        # Very long file path / uri / text
+        if len(s) > 48:
+            return s[:20] + "…" + s[-12:]
+
+        return s
+
+    def _select_pairs(
+        self,
+        flat: List[Tuple[str, str]],
+        limit: int,
+        line_index: int,
+        *,
+        shuffle_pairs: bool = False,
+    ) -> List[Tuple[str, str]]:
+        """
+        Variety: optionally shuffle; otherwise rotate. Takes 'limit' items.
         """
         if not flat:
             return []
-        flat_sorted = sorted(flat, key=lambda kv: kv[0])
-        offset = line_index % len(flat_sorted)
-        rotated = flat_sorted[offset:] + flat_sorted[:offset]
-        return rotated[:limit]
+        items = list(flat)
+        if shuffle_pairs:
+            self._np_rng.shuffle(items)
+        else:
+            items.sort(key=lambda kv: kv[0])
+            # rotate by a pseudo-random offset derived from line_index
+            offset = (line_index * 3) % len(items)
+            items = items[offset:] + items[:offset]
+        return items[:max(1, limit)]
+
+    # ---------- Small formatting helpers ----------
+    def _needs_quotes(self, v: str) -> bool:
+        if not v:
+            return True
+        # needs quotes if it has spaces or punctuation beyond common token chars
+        for ch in v:
+            if not (ch.isalnum() or ch in "-._:/"):
+                return True
+        return False
 
     def _yaml_scalar(self, v: str) -> str:
         # quote only when necessary
@@ -2384,10 +2525,29 @@ class ChatGenManager:
         return v
 
     def _shell_quote(self, v: str) -> str:
-        if v and v.isalnum():
+        if v and v.replace("_", "").replace("-", "").isalnum():
             return v
         return "'" + v.replace("'", "'\\''") + "'"
 
+    # ---------- Helpers: tail paraphrase ----------
+    def _rephrase_tail(self, s: str) -> str:
+        if not s:
+            return s
+        candidates = [
+            lambda x: x.replace("i'm", "i am"),
+            lambda x: x.replace("we're", "we are"),
+            lambda x: x.replace("let's", "let us"),
+            lambda x: x.replace("acknowledged", "noted"),
+            lambda x: x.replace("observing", "seeing"),
+        ]
+        fn = self._np_rng.choice(candidates)
+        out = fn(s.lower())
+        # Capitalize first letter if we lowercased
+        if out:
+            out = out[0].upper() + out[1:]
+        return out
+
+    # ---------- Helpers: final truncation ----------
     def _limit_line(self, s: str, maxlen: int) -> str:
         if len(s) <= maxlen:
             return s
@@ -2396,7 +2556,6 @@ class ChatGenManager:
             cut = maxlen - 1
         return s[:cut].rstrip() + "…"
 
-    # ---------- Helpers: final truncation ----------
     def _truncate(self, s: str, maxlen: int) -> str:
         if len(s) <= maxlen:
             return s
@@ -2406,493 +2565,1175 @@ class ChatGenManager:
         return s[:cut].rstrip() + "…"
 
 
+
 class PacketLearnerManager:
-    """
-    Learns concept frequencies & structure from packet attributes and adjusts TTL.
+    # --------------------- Regexes & constants ---------------------
+    _TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{1,31}", re.IGNORECASE)  # 1–32 chars, starts alpha
+    _STOPWORDS = {
+        "the","a","an","of","and","or","to","in","on","for","with","by","at","as",
+        "is","are","was","were","be","been","being","this","that","these","those",
+        "it","its","from","into","over","under","about","via","per","not","no",
+    }
 
-    Additions over basic version:
-      • Heuristic extraction of IP/MAC/ports/proto/VLAN/TTL/length.
-      • Counters for categorical fields (ips, macs, ports, protos).
-      • Online numeric stats for ttl/length.
-      • Size histogram (power-of-two buckets).
-      • Per-topic EWMA rate + spike detection (z-score).
-      • Hot/cold TTL adjustment (boost on spikes/hot tokens, decay when cold).
-      • Accepts KnowledgePacket OR raw Scapy Packet (duck-typed) OR plain dict.
-      • Snapshot/restore of learned state.
-    """
+    _IP_RE   = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    _MAC_RE  = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+    _PORT_RE = re.compile(r"\b(?:port|sport|dport|src_port|dst_port)\s*[:=]?\s*(\d{1,5})\b", re.IGNORECASE)
+    _PROTO_RE= re.compile(r"\b(tcp|udp|icmp|igmp|quic|tls|http|https|dns|dhcp|ssh)\b", re.IGNORECASE)
 
-    class OnlineStats:
-        """Welford online variance + min/max."""
-        __slots__ = ("n", "mean", "M2", "min", "max")
+    DEFAULT_BINS = tuple(2**k for k in range(5, 17))  # 32..65536
+    EWMA_ALPHA = 0.25
 
-        def __init__(self) -> None:
-            self.n = 0;
-            self.mean = 0.0;
-            self.M2 = 0.0;
-            self.min = float("inf");
-            self.max = float("-inf")
+    # --------------------- Online helpers ---------------------
+    @dataclass
+    class _OnlineStats:
+        n: int = 0
+        mean: float = 0.0
+        M2: float = 0.0
+        min: float = float("inf")
+        max: float = float("-inf")
 
         def add(self, x: float) -> None:
             self.n += 1
-            delta = x - self.mean
-            self.mean += delta / self.n
-            self.M2 += delta * (x - self.mean)
+            d = x - self.mean
+            self.mean += d / self.n
+            self.M2 += d * (x - self.mean)
             if x < self.min: self.min = x
             if x > self.max: self.max = x
 
         def std(self) -> float:
             return math.sqrt(self.M2 / (self.n - 1)) if self.n > 1 else 0.0
 
-    class EWMA:
-        """Exponentially weighted moving average of event rate (events/sec)."""
+    class _EWMA:
         __slots__ = ("alpha", "value", "last_t")
-
-        def __init__(self, alpha: float = 0.3) -> None:
-            self.alpha = float(alpha);
-            self.value = 0.0;
-            self.last_t = None
-
+        def __init__(self, alpha: float = 0.25) -> None:
+            self.alpha = float(alpha)
+            self.value = 0.0
+            self.last_t: Optional[float] = None
         def tick(self, now: float) -> float:
             if self.last_t is None:
-                self.last_t = now;
+                self.last_t = now
                 return self.value
             dt = max(1e-3, now - self.last_t)
-            inst_rate = 1.0 / dt
-            self.value = self.alpha * inst_rate + (1 - self.alpha) * self.value
+            inst = 1.0 / dt
+            self.value = self.alpha * inst + (1 - self.alpha) * self.value
             self.last_t = now
             return self.value
-    # ---------------- Configuration ----------------
-    DEFAULT_BASE_TTL = 120.0
-    DEFAULT_TTL_BOOST_FACTOR = 1.5
-    DEFAULT_TTL_BOOST_THRESHOLD = 20      # dominant token count
-    DEFAULT_MAX_VOCAB_PER_TOPIC = 5000
-    DEFAULT_DECAY_ON_OVERFLOW = 0.5
-    DEFAULT_RATE_SPIKE_Z = 3.0            # z-score threshold for spikes
-    DEFAULT_COLD_SECONDS = 180.0          # if no events > this, treat cold
-    DEFAULT_MIN_TTL = 10.0
-    DEFAULT_MAX_TTL_MULT = 3.0            # cap TTL at default * MAX_TTL_MULT
-    DEFAULT_BINS = tuple(2**k for k in range(5, 17))  # 32..65536
-    EWMA_ALPHA = 0.25
 
-    _STOPWORDS = {
-        "the","a","an","of","and","or","to","in","on","for","with","by","at","as",
-        "is","are","was","were","be","been","being","this","that","these","those",
-        "it","its","from","into","over","under","about","via","per","not","no",
-    }
-    _TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")  # 2–32 chars, starts alpha
-    _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-    _MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
-
-    def _now(self) -> float:
+    # --------------------- Static utilities ---------------------
+    @staticmethod
+    def _now() -> float:
         return time.time()
+
+    @staticmethod
+    def _safe_decode(buf: Union[bytes, bytearray, memoryview, str]) -> str:
+        if isinstance(buf, str):
+            return buf
+        if isinstance(buf, memoryview):
+            buf = buf.tobytes()
+        try:
+            return bytes(buf).decode("utf-8", errors="strict")
+        except Exception:
+            # latin-1 never fails and preserves byte values
+            return bytes(buf).decode("latin-1", errors="replace")
+
+    @staticmethod
+    def _byte_entropy(b: bytes) -> float:
+        if not b:
+            return 0.0
+        counts = [0]*256
+        for x in b:
+            counts[x] += 1
+        n = len(b)
+        ent = 0.0
+        for c in counts:
+            if c:
+                p = c / n
+                ent -= p * math.log2(p)
+        return ent
+
+    # --------------------- Init ---------------------
     def __init__(
         self,
         *,
-        default_ttls: Optional[Mapping[str, float]] = None,
-        ttl_boost_factor: float = DEFAULT_TTL_BOOST_FACTOR,
-        ttl_boost_threshold: int = DEFAULT_TTL_BOOST_THRESHOLD,
-        max_vocab_per_topic: int = DEFAULT_MAX_VOCAB_PER_TOPIC,
-        decay_on_overflow: float = DEFAULT_DECAY_ON_OVERFLOW,
-        rate_spike_z: float = DEFAULT_RATE_SPIKE_Z,
-        cold_seconds: float = DEFAULT_COLD_SECONDS,
-        min_ttl: float = DEFAULT_MIN_TTL,
-        max_ttl_mult: float = DEFAULT_MAX_TTL_MULT,
+        keep_raw_samples: bool = True,
+        max_samples_per_topic: int = 32,
+        max_sample_chars: int = 2000,
+        spike_z_threshold: float = 3.0,
         logger: Optional[Callable[[str], None]] = None,
-        log_level: int = 2,
+        log_level: int = 1,
     ) -> None:
-        self.default_ttls: Dict[str, float] = dict(default_ttls or {})
-        self.ttl_boost_factor = float(ttl_boost_factor)
-        self.ttl_boost_threshold = int(ttl_boost_threshold)
-        self.max_vocab_per_topic = int(max_vocab_per_topic)
-        self.decay_on_overflow = float(decay_on_overflow)
-        self.rate_spike_z = float(rate_spike_z)
-        self.cold_seconds = float(cold_seconds)
-        self.min_ttl = float(min_ttl)
-        self.max_ttl_mult = float(max_ttl_mult)
-
-        self._concept_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
-        self._cat_counts: Dict[str, Dict[str, Counter]] = defaultdict(lambda: {
-            "ip": Counter(), "mac": Counter(), "proto": Counter(), "port": Counter(), "vlan": Counter()
-        })
-        self._num_stats: Dict[str, Dict[str, PacketLearnerManager.OnlineStats]] = defaultdict(lambda: {
-            "ttl": self.OnlineStats(), "length": self.OnlineStats()
-        })
-        self._size_hist: Dict[str, List[int]] = defaultdict(lambda: [0]*len(self.DEFAULT_BINS))
-        self._rate: Dict[str, PacketLearnerManager.EWMA] = defaultdict(lambda: self.EWMA(self.EWMA_ALPHA))
-        self._rate_mean_std: Dict[str, Tuple[PacketLearnerManager.OnlineStats, PacketLearnerManager.OnlineStats]] = defaultdict(lambda: (self.OnlineStats(), self.OnlineStats()))
-        self._last_seen: Dict[str, float] = {}
-        self._lock = threading.Lock()
+        self.keep_raw_samples = bool(keep_raw_samples)
+        self.max_samples_per_topic = int(max_samples_per_topic)
+        self.max_sample_chars = int(max_sample_chars)
+        self.spike_z_threshold = float(spike_z_threshold)
         self._logger = logger or (lambda s: None)
-        self._log_level = log_level
+        self._log_level = int(log_level)
 
-    # --------------- Public API ----------------
+        # Learned state
+        self._vocab: Dict[str, Dict[str, int]] = defaultdict(dict)  # topic -> token -> count
+        self._cats: Dict[str, Dict[str, Counter]] = defaultdict(lambda: {
+            "ip": Counter(), "mac": Counter(), "port": Counter(), "proto": Counter()
+        })
+        self._num: Dict[str, Dict[str, PacketLearnerManager._OnlineStats]] = defaultdict(lambda: {
+            "length": self._OnlineStats(), "entropy": self._OnlineStats()
+        })
+        self._hist: Dict[str, List[int]] = defaultdict(lambda: [0]*len(self.DEFAULT_BINS))
+        self._rate: Dict[str, PacketLearnerManager._EWMA] = defaultdict(lambda: self._EWMA(self.EWMA_ALPHA))
+        self._rate_mean: Dict[str, PacketLearnerManager._OnlineStats] = defaultdict(self._OnlineStats)
+        self._rate_std: Dict[str, PacketLearnerManager._OnlineStats] = defaultdict(self._OnlineStats)
+        self._raw_samples: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=self.max_samples_per_topic))
+
+        self._lock = threading.Lock()
+
+    # --------------------- Public API ---------------------
     def learn_from_packet(self, pkt: Any) -> Any:
         """
-        Accepts KnowledgePacket, Scapy Packet, or dict-like payload.
-        Learns features and (if KnowledgePacket) may adjust pkt.ttl.
-        Returns the same object for chaining.
+        Accepts KnowledgePacket-like, Scapy Packet, dict, bytes/bytearray/memoryview, or str.
+        Decodes raw bytes -> text, learns tokens & signals from the raw text only.
+        Returns the input pkt for chaining.
         """
-        topic, attrs, initial_ttl, is_kp = self._coerce_input(pkt)
-        if not attrs:
+        topic, raw_bytes = self._coerce_input(pkt)
+        if raw_bytes is None:
             return pkt
+
+        raw_len = len(raw_bytes)
+        raw_text = self._safe_decode(raw_bytes)
+
+        tokens = self._tokens_from_text(raw_text)
+        ips, macs, ports, protos = self._signals_from_text(raw_text)
+
+        ent = self._byte_entropy(raw_bytes)
 
         now = self._now()
-        tokens = self._collect_tokens(attrs)
-        signals = self._extract_signals(attrs)
-
-        if not tokens and not any(signals.values()):
-            return pkt
-
         with self._lock:
-            # 1) token vocab
-            cc = self._concept_counts[topic]
-            self._update_counts(cc, tokens)
-            self._maybe_compact_vocab(cc)
-            dominant = max(cc.values()) if cc else 0
+            # vocab
+            v = self._vocab[topic]
+            for t in tokens:
+                v[t] = v.get(t, 0) + 1
 
-            # 2) categorical tallies
-            self._update_categoricals(topic, signals)
+            # categoricals
+            cats = self._cats[topic]
+            for ip in ips: cats["ip"][ip] += 1
+            for mac in macs: cats["mac"][mac] += 1
+            for p in ports: cats["port"][str(p)] += 1
+            for pr in protos: cats["proto"][pr.lower()] += 1
 
-            # 3) numeric stats & histograms
-            self._update_numeric(topic, signals)
-            self._update_histogram(topic, signals)
+            # numerics
+            stats = self._num[topic]
+            stats["length"].add(float(raw_len))
+            stats["entropy"].add(float(ent))
 
-            # 4) rate tracking & spike detection
+            # histogram (length in bytes)
+            self._bump_hist(topic, raw_len)
+
+            # rate & spike
             rate = self._rate[topic].tick(now)
-            mean_s, std_s = self._rate_mean_std[topic]
-            mean_s.add(rate)
-            std_s.add(rate)  # reuse container to track dispersion similarly
+            self._rate_mean[topic].add(rate)
+            self._rate_std[topic].add(rate)
             z = 0.0
-            if mean_s.n > 10 and std_s.std() > 1e-6:
-                z = (rate - mean_s.mean) / std_s.std()
+            stdev = self._rate_std[topic].std()
+            if self._rate_mean[topic].n > 10 and stdev > 1e-6:
+                z = (rate - self._rate_mean[topic].mean) / stdev
+                if z >= self.spike_z_threshold and self._log_level >= 2:
+                    self._logger(f"[RawLearner] spike topic='{topic}' rate={rate:.2f}/s z={z:.2f}")
 
-            # 5) TTL logic (KnowledgePacket only)
-            if is_kp:
-                default_ttl = float(self.default_ttls.get(topic, self.DEFAULT_BASE_TTL))
-                old_ttl = float(initial_ttl if initial_ttl is not None else default_ttl)
-
-                new_ttl = self._ttl_adjust(
-                    current_ttl=old_ttl,
-                    dominant=dominant,
-                    default_ttl=default_ttl,
-                    last_seen=self._last_seen.get(topic),
-                    now=now,
-                    spike_z=z,
-                )
-                if new_ttl != old_ttl:
-                    try:
-                        pkt.ttl = new_ttl
-                    except Exception:
-                        pass  # be defensive if caller object is immutable
-                    self._log(
-                        f"[PacketLearner] TTL {'boosted' if new_ttl>old_ttl else 'adjusted'} "
-                        f"topic='{topic}' ({old_ttl:.1f} -> {new_ttl:.1f}); "
-                        f"dominant={dominant}, rate={rate:.2f}/s z={z:.2f}", 2
-                    )
-
-            # 6) housekeeping
-            self._last_seen[topic] = now
+            # raw samples (optional)
+            if self.keep_raw_samples and raw_text:
+                if len(raw_text) > self.max_sample_chars:
+                    raw_text = raw_text[: self.max_sample_chars] + "…"
+                self._raw_samples[topic].append(raw_text)
 
         return pkt
 
-    # --------------- Input coercion ----------------
-    def _coerce_input(self, pkt: Any) -> Tuple[str, Dict[str, Any], Optional[float], bool]:
+    # --------------------- Input coercion ---------------------
+    def _coerce_input(self, pkt: Any) -> Tuple[str, Optional[bytes]]:
         """
-        Returns: (topic, attrs, ttl, is_knowledge_packet)
-        Accepts:
-          - KnowledgePacket: use pkt.topic, pkt.payload['attributes']
-          - Scapy Packet: builds attributes from typical fields (best-effort)
-          - dict: treat as {'attributes': {...}} or raw attrs mapping
+        Returns (topic, raw_bytes or None).
+        Known forms:
+          - KnowledgePacket-like: .topic and .payload dict containing 'raw'|'bytes'|'data'
+          - Scapy Packet: bytes(pkt) if scapy is installed; otherwise ignored
+          - dict: {'raw'|'bytes'|'data': bytes|bytearray|memoryview|str}
+          - bytes/bytearray/memoryview/str: direct, topic='default'
         """
-        # KnowledgePacket-like?
-        topic = "default"
-        ttl = None
-        is_kp = False
-        if hasattr(pkt, "topic") and hasattr(pkt, "payload"):
-            is_kp = True
+        # KnowledgePacket-like
+        if hasattr(pkt, "payload"):
             topic = getattr(pkt, "topic", "default") or "default"
-            ttl = getattr(pkt, "ttl", None)
-            attrs = self._extract_attributes(getattr(pkt, "payload", None))
-            return topic, attrs, ttl, True
+            pl = getattr(pkt, "payload", None)
+            if isinstance(pl, Mapping):
+                for k in ("raw", "bytes", "data"):
+                    if k in pl:
+                        val = pl[k]
+                        if isinstance(val, str):
+                            return topic, val.encode("utf-8", errors="replace")
+                        if isinstance(val, (bytes, bytearray, memoryview)):
+                            return topic, bytes(val if not isinstance(val, memoryview) else val.tobytes())
+            return topic, None
 
-        # Scapy Packet (duck-typed): use .fields / layers if present
+        # Scapy Packet (duck-typed) — optional
         try:
             from scapy.packet import Packet as ScapyPacket  # type: ignore
-            from scapy.layers.inet import IP, TCP, UDP  # type: ignore
-            from scapy.layers.l2 import Ether, Dot1Q  # type: ignore
-            is_scapy = isinstance(pkt, ScapyPacket)
+            if isinstance(pkt, ScapyPacket):
+                try:
+                    return "default", bytes(pkt)
+                except Exception:
+                    return "default", None
         except Exception:
-            is_scapy = False
-
-        if is_scapy:
-            attrs: Dict[str, Any] = {}
-            try:
-                if pkt.haslayer("Ether"):
-                    eth = pkt.getlayer("Ether")
-                    attrs["eth_src"] = getattr(eth, "src", None)
-                    attrs["eth_dst"] = getattr(eth, "dst", None)
-                if pkt.haslayer("Dot1Q"):
-                    q = pkt.getlayer("Dot1Q")
-                    attrs["vlan"] = getattr(q, "vlan", None)
-                    attrs["vlan_prio"] = getattr(q, "prio", None)
-                if pkt.haslayer("IP"):
-                    ip = pkt.getlayer("IP")
-                    attrs["saddr"] = getattr(ip, "src", None)
-                    attrs["daddr"] = getattr(ip, "dst", None)
-                    attrs["ttl"] = getattr(ip, "ttl", None)
-                    attrs["length"] = getattr(ip, "len", None)
-                if pkt.haslayer("TCP"):
-                    tcp = pkt.getlayer("TCP")
-                    attrs["proto"] = "tcp"
-                    attrs["sport"] = getattr(tcp, "sport", None)
-                    attrs["dport"] = getattr(tcp, "dport", None)
-                elif pkt.haslayer("UDP"):
-                    udp = pkt.getlayer("UDP")
-                    attrs["proto"] = "udp"
-                    attrs["sport"] = getattr(udp, "sport", None)
-                    attrs["dport"] = getattr(udp, "dport", None)
-            except Exception:
-                pass
-            return "default", {k: v for k, v in attrs.items() if v is not None}, None, False
+            pass
 
         # dict-like
         if isinstance(pkt, Mapping):
-            attrs = self._extract_attributes(pkt)
-            return "default", attrs, None, False
+            for k in ("raw", "bytes", "data"):
+                if k in pkt:
+                    val = pkt[k]
+                    if isinstance(val, str):
+                        return "default", val.encode("utf-8", errors="replace")
+                    if isinstance(val, (bytes, bytearray, memoryview)):
+                        return "default", bytes(val if not isinstance(val, memoryview) else val.tobytes())
+            return "default", None
 
-        # fallback
-        return "default", {}, None, False
+        # raw buffers & strings
+        if isinstance(pkt, str):
+            return "default", pkt.encode("utf-8", errors="replace")
+        if isinstance(pkt, (bytes, bytearray, memoryview)):
+            return "default", bytes(pkt if not isinstance(pkt, memoryview) else pkt.tobytes())
 
-    # --------------- Helpers: attributes & tokens ----------------
-    def _extract_attributes(self, payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-        if not isinstance(payload, Mapping):
-            return {}
-        attrs = payload.get("attributes") if isinstance(payload, Mapping) else None
-        return attrs if isinstance(attrs, Mapping) else {}
+        # unknown
+        return "default", None
 
-    def _collect_tokens(self, attrs: Mapping[str, Any]) -> List[str]:
-        tokens: List[str] = []
-        # keys
-        for k in attrs.keys():
-            tokens.extend(self._tokenize(str(k)))
-        # values (strings anywhere within nested structures)
-        for s in self._iter_string_values(attrs):
-            tokens.extend(self._tokenize(s))
-        return tokens
+    # --------------------- Text mining ---------------------
+    def _tokens_from_text(self, text: str) -> Iterable[str]:
+        for t in self._TOKEN_RE.findall(text or ""):
+            tl = t.lower()
+            if tl not in self._STOPWORDS:
+                yield tl
 
-    def _iter_string_values(self, obj: Any, _depth: int = 0, _max_depth: int = 3) -> Iterator[str]:
-        if _depth > _max_depth:
-            return
-        if isinstance(obj, str):
-            yield obj
-        elif isinstance(obj, Mapping):
-            for v in obj.values():
-                yield from self._iter_string_values(v, _depth + 1, _max_depth)
-        elif isinstance(obj, (list, tuple, set)):
-            for v in obj:
-                yield from self._iter_string_values(v, _depth + 1, _max_depth)
+    def _signals_from_text(self, text: str) -> Tuple[List[str], List[str], List[int], List[str]]:
+        ips = self._IP_RE.findall(text or "") or []
+        macs = [m.lower() for m in self._MAC_RE.findall(text or "")] or []
+        ports: List[int] = []
+        for m in self._PORT_RE.finditer(text or ""):
+            try:
+                p = int(m.group(1))
+                if 0 < p < 65536:
+                    ports.append(p)
+            except Exception:
+                pass
+        protos = [m.group(1).lower() for m in self._PROTO_RE.finditer(text or "")]
+        return ips, macs, ports, protos
 
-    def _tokenize(self, text: str) -> List[str]:
-        text = text.lower()
-        toks = [t for t in self._TOKEN_RE.findall(text) if t not in self._STOPWORDS]
-        return toks
-
-    # --------------- Helpers: signals extraction ----------------
-    def _extract_signals(self, attrs: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Pull common fields out of typical network attrs. Best-effort heuristics.
-        """
-        as_str = lambda k: str(attrs.get(k)) if attrs.get(k) is not None else ""
-        sig: Dict[str, Any] = {
-            "ips": [],
-            "macs": [],
-            "proto": None,
-            "ports": [],
-            "vlan": None,
-            "ttl": None,
-            "length": None,
-        }
-
-        # IPs
-        for k in ("saddr","src","source","ip_src","daddr","dst","dest","ip_dst"):
-            v = attrs.get(k)
-            if isinstance(v, str):
-                for ip in self._IP_RE.findall(v): sig["ips"].append(ip)
-
-        # MACs
-        for k in ("eth_src","ether_src","mac_src","eth_dst","ether_dst","mac_dst"):
-            v = as_str(k)
-            if v:
-                for m in self._MAC_RE.findall(v): sig["macs"].append(m.lower())
-
-        # Proto
-        proto = attrs.get("proto") or attrs.get("l4_proto") or attrs.get("protocol")
-        if isinstance(proto, str): sig["proto"] = proto.lower()
-        elif isinstance(proto, int): sig["proto"] = str(proto)
-
-        # Ports
-        for k in ("sport","src_port","source_port","dport","dst_port","dest_port"):
-            v = attrs.get(k)
-            if isinstance(v, (int, str)) and str(v).isdigit():
-                val = int(v)
-                if 0 < val < 65536: sig["ports"].append(val)
-
-        # VLAN
-        vlan = attrs.get("vlan")
-        if isinstance(vlan, int): sig["vlan"] = vlan
-
-        # TTL & length
-        ttl = attrs.get("ttl")
-        if isinstance(ttl, int): sig["ttl"] = ttl
-        length = attrs.get("length") or attrs.get("len") or attrs.get("payload_len")
-        if isinstance(length, int): sig["length"] = length
-
-        return sig
-
-    # --------------- Helpers: counts & vocab mgmt ----------------
-    def _update_counts(self, cc: Dict[str, int], tokens: Iterable[str]) -> None:
-        for t in tokens:
-            cc[t] = cc.get(t, 0) + 1
-
-    def _maybe_compact_vocab(self, cc: Dict[str, int]) -> None:
-        if len(cc) <= self.max_vocab_per_topic:
-            return
-        # Decay counts
-        if 0.0 < self.decay_on_overflow < 1.0:
-            for k in list(cc.keys()):
-                cc[k] = max(1, int(cc[k] * self.decay_on_overflow))
-        # Drop the tail if still too big
-        if len(cc) > self.max_vocab_per_topic:
-            items = sorted(cc.items(), key=lambda kv: kv[1], reverse=True)[: self.max_vocab_per_topic]
-            cc.clear()
-            cc.update(items)
-
-    def _update_categoricals(self, topic: str, sig: Dict[str, Any]) -> None:
-        cats = self._cat_counts[topic]
-        for ip in sig.get("ips", []): cats["ip"][ip] += 1
-        for mac in sig.get("macs", []): cats["mac"][mac] += 1
-        if sig.get("proto"): cats["proto"][sig["proto"]] += 1
-        for p in sig.get("ports", []): cats["port"][str(p)] += 1
-        if sig.get("vlan") is not None: cats["vlan"][str(sig["vlan"])] += 1
-
-    def _update_numeric(self, topic: str, sig: Dict[str, Any]) -> None:
-        stats = self._num_stats[topic]
-        if sig.get("ttl") is not None: stats["ttl"].add(float(sig["ttl"]))
-        if sig.get("length") is not None: stats["length"].add(float(sig["length"]))
-
-    def _update_histogram(self, topic: str, sig: Dict[str, Any]) -> None:
-        length = sig.get("length")
-        if length is None: return
-        bins = self.DEFAULT_BINS
-        hist = self._size_hist[topic]
-        # place into first bucket >= length
-        for i, b in enumerate(bins):
+    def _bump_hist(self, topic: str, length: int) -> None:
+        hist = self._hist[topic]
+        for i, b in enumerate(self.DEFAULT_BINS):
             if length <= b:
                 hist[i] += 1
                 return
-        # overflow: ignore or extend (keep simple)
         hist[-1] += 1
 
-    # --------------- Helpers: TTL logic ----------------
-    def _ttl_adjust(
-        self,
-        *,
-        current_ttl: float,
-        dominant: int,
-        default_ttl: float,
-        last_seen: Optional[float],
-        now: float,
-        spike_z: float,
-    ) -> float:
-        limit = default_ttl * self.max_ttl_mult
-        ttl = max(self.min_ttl, current_ttl)
-
-        # Boost for hot tokens
-        if dominant >= self.ttl_boost_threshold and ttl < default_ttl * self.ttl_boost_factor:
-            ttl = min(limit, ttl * self.ttl_boost_factor)
-
-        # Boost for spikes
-        if spike_z >= self.rate_spike_z:
-            ttl = min(limit, ttl * self.ttl_boost_factor)
-
-        # Decay when cold (no events recently)
-        if last_seen is not None and (now - last_seen) > self.cold_seconds:
-            ttl = max(self.min_ttl, ttl / self.ttl_boost_factor)
-
-        return ttl
-
-    # --------------- Logging ----------------
-    def _log(self, msg: str, level: int = 2) -> None:
-        if self._log_level >= level:
-            self._logger(msg)
-
-    # --------------- Inspection APIs ----------------
-    def snapshot_counts(self, topic: Optional[str] = None, top_k: int = 20) -> List[Tuple[str, int]]:
+    # --------------------- Snapshots ---------------------
+    def snapshot_vocab(self, topic: Optional[str] = None, top_k: int = 20) -> List[Tuple[str, int]]:
         with self._lock:
             if topic is not None:
-                cc = self._concept_counts.get(topic, {})
-                return sorted(cc.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+                v = self._vocab.get(topic, {})
+                return sorted(v.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
             merged: Dict[str, int] = defaultdict(int)
-            for cc in self._concept_counts.values():
-                for k, v in cc.items():
-                    merged[k] += v
+            for v in self._vocab.values():
+                for k, c in v.items():
+                    merged[k] += c
             return sorted(merged.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
 
     def snapshot_categoricals(self, topic: str, top_k: int = 10) -> Dict[str, List[Tuple[str, int]]]:
         with self._lock:
-            cats = self._cat_counts.get(topic, {})
-            return {k: cats.get(k, Counter()).most_common(top_k) for k in ("ip","mac","proto","port","vlan")}
+            cats = self._cats.get(topic, {})
+            return {
+                k: cats.get(k, Counter()).most_common(top_k)
+                for k in ("ip", "mac", "port", "proto")
+            }
 
     def snapshot_numeric(self, topic: str) -> Dict[str, Dict[str, float]]:
         with self._lock:
-            ns = self._num_stats.get(topic, {})
-            out = {}
+            ns = self._num.get(topic, {})
+            out: Dict[str, Dict[str, float]] = {}
             for k, st in ns.items():
                 out[k] = {"n": st.n, "mean": st.mean, "std": st.std(), "min": st.min, "max": st.max}
             return out
 
     def snapshot_histogram(self, topic: str) -> List[Tuple[int, int]]:
-        """Return (upper_bound, count) pairs for size histogram."""
         with self._lock:
-            hist = list(self._size_hist.get(topic, []))
+            hist = list(self._hist.get(topic, []))
         return list(zip(self.DEFAULT_BINS, hist))
 
-    def save_state(self) -> Dict[str, Any]:
+    def snapshot_rate(self, topic: str) -> Dict[str, float]:
         with self._lock:
-            return {
-                "concept_counts": {t: dict(cc) for t, cc in self._concept_counts.items()},
-                "cat_counts": {t: {k: dict(v) for k, v in cats.items()} for t, cats in self._cat_counts.items()},
-                "num_stats": {t: {k: {"n": st.n, "mean": st.mean, "M2": st.M2, "min": st.min, "max": st.max}
-                                  for k, st in stats.items()} for t, stats in self._num_stats.items()},
-                "size_hist": {t: list(h) for t, h in self._size_hist.items()},
+            mean = self._rate_mean[topic].mean
+            std = self._rate_std[topic].std()
+            cur = self._rate[topic].value
+        return {"current_rps": cur, "mean_rps": mean, "std_rps": std}
+
+    def snapshot_raw(self, topic: str, limit: int = 10) -> List[str]:
+        """Return recent decoded raw samples (bounded ring)."""
+        if not self.keep_raw_samples:
+            return []
+        with self._lock:
+            dq = self._raw_samples.get(topic, deque())
+            return list(list(dq)[-max(0, int(limit)):])
+
+    # --------------------- Persistence ---------------------
+    def save_state(self, *, persist_raw: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            state: Dict[str, Any] = {
+                "vocab": {t: dict(v) for t, v in self._vocab.items()},
+                "cats": {t: {k: dict(c) for k, c in cats.items()} for t, cats in self._cats.items()},
+                "num": {
+                    t: {k: {"n": st.n, "mean": st.mean, "M2": st.M2, "min": st.min, "max": st.max}
+                        for k, st in stats.items()}
+                    for t, stats in self._num.items()
+                },
+                "hist": {t: list(h) for t, h in self._hist.items()},
                 "rate": {t: {"value": ew.value, "last_t": ew.last_t} for t, ew in self._rate.items()},
-                "last_seen": dict(self._last_seen),
+                "rate_mean": {t: {"n": s.n, "mean": s.mean, "M2": s.M2, "min": s.min, "max": s.max} for t, s in self._rate_mean.items()},
+                "rate_std":  {t: {"n": s.n, "mean": s.mean, "M2": s.M2, "min": s.min, "max": s.max} for t, s in self._rate_std.items()},
             }
+            if persist_raw and self.keep_raw_samples:
+                state["raw_samples"] = {t: list(dq) for t, dq in self._raw_samples.items()}
+            return state
 
     def load_state(self, state: Mapping[str, Any]) -> None:
         with self._lock:
-            self._concept_counts.clear()
-            for t, cc in state.get("concept_counts", {}).items():
-                self._concept_counts[t] = dict(cc)
+            self._vocab = defaultdict(dict, {t: dict(v) for t, v in state.get("vocab", {}).items()})
+            self._cats = defaultdict(lambda: {"ip": Counter(), "mac": Counter(), "port": Counter(), "proto": Counter()})
+            for t, cats in state.get("cats", {}).items():
+                self._cats[t] = {k: Counter(v) for k, v in cats.items()}
 
-            self._cat_counts.clear()
-            for t, cats in state.get("cat_counts", {}).items():
-                self._cat_counts[t] = {k: Counter(v) for k, v in cats.items()}
-
-            self._num_stats.clear()
-            for t, stats in state.get("num_stats", {}).items():
-                self._num_stats[t] = {}
+            self._num = defaultdict(lambda: {"length": self._OnlineStats(), "entropy": self._OnlineStats()})
+            for t, stats in state.get("num", {}).items():
+                inner: Dict[str, PacketLearnerManager._OnlineStats] = {}
                 for k, d in stats.items():
-                    st = self.OnlineStats()
-                    st.n, st.mean, st.M2 = int(d.get("n", 0)), float(d.get("mean", 0.0)), float(d.get("M2", 0.0))
-                    st.min, st.max = float(d.get("min", float("inf"))), float(d.get("max", float("-inf")))
-                    self._num_stats[t][k] = st
+                    st = self._OnlineStats(
+                        n=int(d.get("n", 0)),
+                        mean=float(d.get("mean", 0.0)),
+                        M2=float(d.get("M2", 0.0)),
+                        min=float(d.get("min", float("inf"))),
+                        max=float(d.get("max", float("-inf"))),
+                    )
+                    inner[k] = st
+                self._num[t] = inner
 
-            self._size_hist = defaultdict(lambda: [0]*len(self.DEFAULT_BINS),
-                                          {t: list(h) for t, h in state.get("size_hist", {}).items()})
+            self._hist = defaultdict(lambda: [0]*len(self.DEFAULT_BINS),
+                                     {t: list(h) for t, h in state.get("hist", {}).items()})
+
             self._rate.clear()
             for t, d in state.get("rate", {}).items():
-                ew = self.EWMA(self.EWMA_ALPHA); ew.value = float(d.get("value", 0.0)); ew.last_t = d.get("last_t", None)
+                ew = self._EWMA(self.EWMA_ALPHA)
+                ew.value = float(d.get("value", 0.0))
+                ew.last_t = d.get("last_t", None)
                 self._rate[t] = ew
 
-            self._last_seen = dict(state.get("last_seen", {}))
+            self._rate_mean.clear()
+            for t, d in state.get("rate_mean", {}).items():
+                self._rate_mean[t] = self._OnlineStats(
+                    n=int(d.get("n", 0)),
+                    mean=float(d.get("mean", 0.0)),
+                    M2=float(d.get("M2", 0.0)),
+                    min=float(d.get("min", float("inf"))),
+                    max=float(d.get("max", float("-inf"))),
+                )
+
+            self._rate_std.clear()
+            for t, d in state.get("rate_std", {}).items():
+                self._rate_std[t] = self._OnlineStats(
+                    n=int(d.get("n", 0)),
+                    mean=float(d.get("mean", 0.0)),
+                    M2=float(d.get("M2", 0.0)),
+                    min=float(d.get("min", float("inf"))),
+                    max=float(d.get("max", float("-inf"))),
+                )
+
+            raw_samples = state.get("raw_samples")
+            self._raw_samples = defaultdict(lambda: deque(maxlen=self.max_samples_per_topic))
+            if isinstance(raw_samples, Mapping):
+                for t, arr in raw_samples.items():
+                    dq: Deque[str] = deque(maxlen=self.max_samples_per_topic)
+                    for s in arr or []:
+                        if isinstance(s, str):
+                            dq.append(s)
+                    self._raw_samples[t] = dq
+
+
+
+class AskManager:
+    """
+    Public API:
+        ask(prompt: str) -> str
+
+    Examples:
+        mgr = AskManager()
+        mgr.ask("inspect")              # redacted snapshot
+        mgr.ask("inspect sensitive")    # UNREDACTED snapshot
+        mgr.ask("sensitive dump")       # UNREDACTED snapshot
+        mgr.ask("stats")                # pure-Python stats
+
+    This version prioritizes token-first cleartext retrieval in _chat_generate().
+    """
+
+    # Redaction regexes (applied unless `sensitive` intent)
+    _RE_IPv4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
+    _RE_MAC  = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+    _RE_SPI  = re.compile(r"\bspi=([0-9]{1,10})\b", re.IGNORECASE)
+    _RE_HEX  = re.compile(r"\b(?:0x)?[0-9a-fA-F]{16,}\b")
+    _RE_KEY  = re.compile(r"(?:psk|key|secret|token|auth|cookie|session_id)\s*[:=]\s*([^\s,;]+)", re.IGNORECASE)
+
+    # Tokenizer for features & token-bank
+    _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
+
+    def __init__(
+        self,
+        *,
+        max_messages: int = 500,
+        max_per_topic: int = 250,
+        default_ttl: float = 180.0,
+        rng_seed: Optional[int] = None,
+        allow_sensitive_by_default: bool = False,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._messages: Deque[Tuple[str, str]] = deque(maxlen=max_messages)
+        self._knowledge_by_topic: Dict[str, Deque["KnowledgePacket"]] = defaultdict(
+            lambda: deque(maxlen=max_per_topic)
+        )
+        self._default_ttl = float(default_ttl)
+        self._stats = type("Stats", (), {"errors": 0, "asks": 0, "last_error": "", "last_ask_time": 0.0})()
+        self._rng = random.Random(rng_seed if rng_seed is not None else os.getpid() ^ int(time.time()))
+        self._allow_sensitive_by_default = bool(allow_sensitive_by_default)
+
+        # Simple intent lexicon
+        self._intent_map = {
+            "purge": {"purge", "clear", "forget", "flush", "erase"},
+            "inspect": {"inspect", "dump", "show", "summary", "summarize", "status"},
+            "stats": {"stats", "statistics", "numbers", "metrics"},
+            "emit": {"emit", "snapshot", "generate snapshot", "codegen"},
+            "sensitive": {"sensitive", "unredacted", "no redaction", "full details", "raw"},
+            "tokens": {"tokens", "token dump", "token lines"},
+        }
+        self._known_topics = {"tls", "dns", "dhcp", "router", "transport", "quic", "esp", "kerberos", "misc"}
+
+        # ---------- Token bank (PRIORITY CONTEXT) ----------
+        # token -> recent raw lines (user/assistant/system), unredacted; newest last
+        self._token_bank: Dict[str, Deque[Tuple[str, str, float]]] = defaultdict(lambda: deque(maxlen=50000))
+
+        # 2) add boilerplate detector
+        self._BOILERPLATE_RE = re.compile(
+            r"^(using token matches|pulled context|found relevant raw lines|here’s what i’m seeing|got it — here’s a quick take|alright, quick technical readout|okay, here’s the gist)",
+            re.IGNORECASE,
+        )
+        self._max_raw_line_len = 2000  # cap per raw line stored
+
+    # ----------------- Public entrypoint -----------------
+
+    def ask(self, prompt: str) -> str:
+        """
+        Single public entrypoint:
+          - stores the user message (and indexes to token bank),
+          - tiny intent detection,
+          - separate handling for 'inspect' (redacted) vs 'sensitive' (unredacted),
+          - token-first generation in _chat_generate(),
+          - robust error handling.
+        """
+        with self._lock:
+            self._stats.asks += 1
+            self._stats.last_ask_time = time.time()
+
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return "Say something and I’ll analyze it."
+
+        # Ingest message so it participates in learning (even if error later)
+        self._submit_message(prompt, role="user")
+
+        intent = self._infer_intent(prompt)
+
+        try:
+            if intent == "purge":
+                topic = self._detect_topic_for_purge(prompt)
+                n_removed = self._purge_topic(topic)
+                reply = f"Purged topic '{topic}' (removed {n_removed} item{'s' if n_removed != 1 else ''})."
+
+            elif intent == "inspect":
+                # Always REDACTED
+                snap = self._export_knowledge()
+                reply = self._format_inspect_reply(
+                    snap, max_topics=8, max_items_per_topic=6, max_payload_chars=1000, redact=True
+                )
+
+            elif intent == "sensitive":
+                # Always UNREDACTED
+                snap = self._export_knowledge()
+                reply = self._format_inspect_reply(
+                    snap, max_topics=8, max_items_per_topic=6, max_payload_chars=1000, redact=False
+                )
+
+            elif intent == "stats":
+                stats = self._compute_statistics(
+                    topics=[],  # all topics
+                    percentiles=(5, 25, 50, 75, 95),
+                    topk_categorical=8,
+                    min_count_for_stats=2,
+                )
+                reply = (
+                    self._format_stats_headlines(stats, limit=8)
+                    if stats
+                    else "No numeric feature has enough samples to compute stats yet."
+                )
+
+            elif intent == "emit":
+                cfg = self._default_emit_builder()
+                code = self._generate_class_from_config(cfg)
+                self._submit_message("[snapshot emitted]", role="assistant")
+                reply = f"Emitted snapshot class '{cfg.get('class_name')}' ({len(code)} bytes)."
+
+            elif intent == "tokens":
+                reply = self._raw_from_tokens(prompt, limit=12)
+
+            else:
+                # Retrieval (packet-based) is computed, but _chat_generate will try token bank first.
+                retrieved = self._retrieve_snippets(prompt, topk=12, per_topic_limit=8)
+                # default behavior for 'gen' keeps things redacted (safe)
+                reply = self._chat_generate(prompt, retrieved, redact=True)
+
+        except Exception as ex:
+            with self._lock:
+                self._stats.errors += 1
+                self._stats.last_error = f"{type(ex).__name__}: {ex}"
+            reply = f"Internal error while answering: {ex}"
+
+        # Store and return assistant message (and index to token bank)
+        self._submit_message(reply, role="assistant")
+        return reply
+
+    # ----------------- Inspect (redaction-aware) -----------------
+
+    def _format_inspect_reply(
+        self,
+        snap: Dict[str, List[Dict[str, Any]]],
+        *,
+        max_topics: int = 8,
+        max_items_per_topic: int = 6,
+        max_payload_chars: int = 240,
+        redact: bool = True,
+    ) -> str:
+        if not snap:
+            return "I don’t have non-expired knowledge yet."
+
+        header = "Knowledge snapshot (redacted):" if redact else "Knowledge snapshot (UNREDACTED):"
+        lines: List[str] = [header]
+        for topic, items in sorted(snap.items(), key=lambda kv: kv[0])[:max_topics]:
+            lines.append(f"[{topic}] {len(items)} item(s)")
+            # newest first
+            ordered = sorted(items, key=lambda r: -r.get("age_sec", 0.0))[:max_items_per_topic]
+            for i, row in enumerate(ordered, 1):
+                age = row.get("age_sec", 0.0)
+                tags = row.get("tags") or []
+                imp = row.get("importance", 0)
+                payload = row.get("payload") or {}
+
+                common = self._format_common_net_fields(payload, redact=redact)
+                preview = self._payload_to_text(payload, redact=redact, include_raw=not redact)
+                if len(preview) > max_payload_chars:
+                    preview = preview[: max_payload_chars - 3] + "..."
+
+                lines.append(f"  {i}. age={age:.1f}s, importance={imp}, tags={tags[:6]}")
+                if common:
+                    lines.append(f"     net: {common}")
+                lines.append(f"     payload: {preview}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def _format_common_net_fields(self, payload: Dict[str, Any], *, redact: bool) -> str:
+        def R(x: str) -> str:
+            return self._redact_text(x) if redact else x
+
+        parts = []
+        for k in ("src_ip", "dst_ip", "client_ip", "server_ip", "ip"):
+            if k in payload:
+                parts.append(f"{k}={R(str(payload[k]))}")
+
+        if "ips" in payload:
+            parts.append("ips=[" + ", ".join(R(x) for x in payload["ips"][:8]) + "]")
+        if "macs" in payload:
+            parts.append("macs=[" + ", ".join(R(x) for x in payload["macs"][:8]) + "]")
+        if "spis" in payload:
+            parts.append("spis=[" + ", ".join(R(str(x)) for x in payload["spis"][:8]) + "]")
+
+        for k in ("src_port", "dst_port", "port", "proto", "protocol", "spi"):
+            if k in payload:
+                parts.append(f"{k}={R(str(payload[k]))}")
+
+        return " | ".join(parts)
+
+    # ----------------- Core helpers -----------------
+    def _is_boilerplate(self, s: str) -> bool:
+        s = (s or "").strip()
+        if not s:
+            return True
+        if self._BOILERPLATE_RE.match(s):
+            return True
+        # also ignore our standard tip
+        if "ask ‘inspect sensitive’" in s.lower() or "ask 'inspect sensitive'" in s.lower():
+            return True
+        return False
+
+    def _submit_message(self, text: str, *, role: str) -> None:
+        role = "user" if role not in {"user", "assistant", "system"} else role
+        with self._lock:
+            self._messages.append((role, text))
+        # index USER ONLY to avoid echo loops
+        if role == "user":
+            self._index_tokens(text, role=role)
+        topic = self._guess_topic(text)
+        pkt = KnowledgePacket(
+            topic=topic,
+            payload=self._extract_features(text),
+            ttl=self._default_ttl,
+            source=role,
+            tags=self._infer_tags(text),
+            importance=self._importance_score(text),
+        )
+        self._add_packet(pkt)
+    def _infer_intent(self, prompt: str) -> str:
+        p = prompt.lower().strip()
+        if p in {"purge", "inspect", "stats", "emit", "sensitive", "tokens"}:
+            return p
+        for name, words in self._intent_map.items():
+            if any(w in p for w in words):
+                return name
+        return "gen"
+
+    def _detect_topic_for_purge(self, prompt: str) -> str:
+        toks = self._tokenize(prompt)
+        with self._lock:
+            candidates = [t for t in toks if t in self._knowledge_by_topic]
+        return candidates[0] if candidates else "misc"
+
+    def _add_packet(self, pkt: "KnowledgePacket") -> None:
+        now = time.time()
+        with self._lock:
+            dq = self._knowledge_by_topic[pkt.topic]
+            dq.append(pkt)
+            self._expire_topic_locked(pkt.topic, now)
+
+    def _expire_topic_locked(self, topic: str, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        dq = self._knowledge_by_topic.get(topic)
+        if not dq:
+            return
+        while dq and dq[0].is_expired(now):
+            dq.popleft()
+
+    def _purge_topic(self, topic: str) -> int:
+        with self._lock:
+            dq = self._knowledge_by_topic.get(topic)
+            if not dq:
+                return 0
+            n = len(dq)
+            dq.clear()
+            return n
+
+    def _export_knowledge(self) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        now = time.time()
+        with self._lock:
+            for topic, dq in self._knowledge_by_topic.items():
+                items = []
+                for pkt in list(dq):
+                    if pkt.is_expired(now):
+                        continue
+                    items.append({
+                        "source": pkt.source,
+                        "tags": pkt.tags,
+                        "importance": pkt.importance,
+                        "payload": pkt.payload,
+                        "ttl": pkt.ttl,
+                        "age_sec": max(0.0, now - pkt.ts),
+                    })
+                if items:
+                    out[topic] = items
+        return out
+
+    # ----------------- Retrieval & Generation -----------------
+
+    def _retrieve_snippets(self, prompt: str, *, topk: int = 6, per_topic_limit: int = 3) -> List["KnowledgePacket"]:
+        query_toks = set(self._tokenize(prompt))
+        scored: List[Tuple[float, "KnowledgePacket"]] = []
+        now = time.time()
+        with self._lock:
+            for topic, dq in self._knowledge_by_topic.items():
+                self._expire_topic_locked(topic, now)
+                if not dq:
+                    continue
+                topic_bonus = 0.5 if topic in query_toks else 0.0
+                for pkt in list(dq)[-per_topic_limit:]:
+                    if pkt.is_expired(now):
+                        continue
+                    payload_text = self._payload_to_text(pkt.payload, redact=True)  # score on redacted text
+                    toks = set(self._tokenize(payload_text))
+                    overlap = len(query_toks & toks)
+                    recency = 1.0 / (1.0 + (now - pkt.ts) / 60.0)
+                    imp = max(0, pkt.importance)
+                    score = overlap + recency + (0.25 * imp) + topic_bonus
+                    scored.append((score, pkt))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [pkt for _, pkt in scored[:topk]]
+
+    # ---------- TOKEN-FIRST CHAT GENERATION ----------
+
+    def _index_tokens(self, text: str, *, role: str) -> None:
+        if not text:
+            return
+        # drop boilerplate-like content before tokenizing
+        if self._is_boilerplate(text):
+            return
+        raw = text if len(text) <= self._max_raw_line_len else (text[: self._max_raw_line_len] + "...")
+        ts = time.time()
+        for tok in self._tokenize(text):
+            if tok and not tok.isdigit():
+                self._token_bank[tok].append((role, raw, ts))
+
+    def _fetch_token_lines(self, query_toks: Iterable[str], *, per_token_limit: int = 6) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for tok in query_toks:
+            dq = self._token_bank.get(tok)
+            if not dq:
+                continue
+            # newest-first from tail
+            for role, line, _ts in list(dq)[-per_token_limit:][::-1]:
+                if role != "user":
+                    continue  # only user-originated lines
+                if self._is_boilerplate(line):
+                    continue
+                if line in seen:
+                    continue
+                seen.add(line)
+                out.append(line)
+        return out
+
+    def _raw_from_tokens(self, query: str, *, limit: int = 12) -> str:
+        qtok = [t for t in self._tokenize(query) if t and not t.isdigit()]
+        if not qtok:
+            return "No tokens in query."
+        lines = self._fetch_token_lines(qtok, per_token_limit=limit)
+        if not lines:
+            return "No raw lines matched those tokens yet."
+        head = "Raw token matches (unredacted):"
+        body = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(lines[:limit]))
+        return f"{head}\n{body}"
+
+    def _chat_generate(self, prompt: str, retrieved: List["KnowledgePacket"], *, redact: bool) -> str:
+        """
+        Prioritize token-bank cleartext first; if nothing is found, fall back
+        to packet-snippet hints.
+        """
+        # 1) Token-first path (UNREDACTED lines; redact at presentation if needed)
+        q_toks = [t for t in self._tokenize(prompt) if t and not t.isdigit()]
+        token_lines = self._fetch_token_lines(q_toks, per_token_limit=6)
+
+        if token_lines:
+            def R(s: str) -> str:
+                return self._redact_text(s) if redact else s
+
+            opener = self._rng.choice([
+                "Using token matches from history:",
+                "Pulled context from your recent tokens:",
+                "Found relevant raw lines via tokens:",
+            ])
+            lines = [opener]
+            for i, s in enumerate(token_lines[:8], 1):
+                s = R(s)
+                if len(s) > 240:
+                    s = s[:237] + "..."
+                lines.append(f"• {s}")
+            lines.append("")
+            topic = self._guess_topic(prompt)
+            lines.append(self._actionable_tip(prompt, topic))
+            return "\n".join(lines)
+
+        # 2) Fallback: packet-based hints (redacted by default)
+        topic = self._guess_topic(prompt)
+        hints = []
+        for pkt in retrieved:
+            payload = pkt.payload or {}
+            for k in ("summary", "attributes", "methods", "keywords"):
+                v = payload.get(k)
+                if not v:
+                    continue
+                if isinstance(v, dict):
+                    hints.append(f"{k}: {', '.join([f'{kk}' for kk in list(v)[:4]])}")
+                elif isinstance(v, (list, tuple, set)):
+                    hints.append(f"{k}: {', '.join(map(str, list(v)[:6]))}")
+                elif isinstance(v, str):
+                    s = v.strip()
+                    s = self._redact_text(s) if redact else s
+                    if len(s) > 160:
+                        s = s[:157] + "..."
+                    hints.append(f"{k}: {s}")
+
+        opener = self._rng.choice([
+            "Here’s what I’m seeing.",
+            "Got it — here’s a quick take.",
+            "Alright, quick technical readout:",
+            "Okay, here’s the gist:",
+        ])
+        lines = [opener]
+        if hints:
+            lines.append(f"Topic guess: {topic}")
+            lines.append("Relevant bits I can use:")
+            lines += [f"• {h}" for h in hints[:8]]
+            lines.append("")
+        lines.append(self._actionable_tip(prompt, topic))
+        return "\n".join(lines)
+
+    # ----------------- Stats (pure-Python) -----------------
+
+    def _maybe_collect(
+        self,
+        num_vals: Dict[str, List[float]],
+        cat_vals: Dict[str, Counter],
+        feat: str,
+        value: Any,
+    ) -> None:
+        MAX_NUM_PER_FEAT = 10000
+        MAX_CAT_UNIQUE = 10000
+        MAX_CAT_TOKEN_LEN = 64
+
+        if value is None:
+            return
+
+        def _num_room() -> bool:
+            return len(num_vals[feat]) < MAX_NUM_PER_FEAT
+
+        def _cat_room() -> bool:
+            return len(cat_vals[feat]) < MAX_CAT_UNIQUE
+
+        if isinstance(value, bool):
+            if _num_room(): num_vals[feat].append(1.0 if value else 0.0)
+            if _cat_room(): cat_vals[feat].update([str(value)])
+            return
+
+        if isinstance(value, (int, float)) and self._is_finite_number(value):
+            if _num_room(): num_vals[feat].append(float(value))
+            return
+
+        try:
+            ts = getattr(value, "timestamp", None)
+            if callable(ts):
+                val = float(ts())
+                if self._is_finite_number(val) and _num_room():
+                    num_vals[feat].append(val)
+                return
+        except Exception:
+            pass
+
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8", errors="replace")
+            except Exception:
+                value = repr(value)
+
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return
+            s_plain = s.replace(",", "")
+            is_percent = s_plain.endswith("%")
+            s_num = s_plain[:-1].strip() if is_percent else s_plain
+
+            if re.fullmatch(r"[+-]?((\d+(\.\d+)?)|(\.\d+))", s_num or ""):
+                try:
+                    val = float(s_num)
+                    if is_percent: val /= 100.0
+                    if self._is_finite_number(val) and _num_room():
+                        num_vals[feat].append(val)
+                        return
+                except Exception:
+                    pass
+
+            if _cat_room():
+                cat = " ".join(s.lower().split())
+                if len(cat) > MAX_CAT_TOKEN_LEN: cat = cat[: MAX_CAT_TOKEN_LEN - 1] + "…"
+                cat_vals[feat].update([cat])
+            return
+
+        if _cat_room():
+            r = repr(value)
+            if len(r) > MAX_CAT_TOKEN_LEN: r = r[: MAX_CAT_TOKEN_LEN - 1] + "…"
+            cat_vals[feat].update([r])
+
+    def _compute_statistics(
+        self,
+        *,
+        topics: Iterable[str],
+        percentiles: Tuple[int, ...] = (5, 25, 50, 75, 95),
+        topk_categorical: int = 5,
+        min_count_for_stats: int = 2,
+    ) -> Dict[str, Dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            topic_list = list(self._knowledge_by_topic.keys()) if not topics else list(topics)
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for topic in topic_list:
+            num_vals: Dict[str, List[float]] = defaultdict(list)
+            cat_vals: Dict[str, Counter] = defaultdict(Counter)
+
+            with self._lock:
+                dq = self._knowledge_by_topic.get(topic)
+                rows = [pkt for pkt in (list(dq) if dq else []) if not pkt.is_expired(now)]
+            if not rows:
+                continue
+
+            for pkt in rows:
+                pl = pkt.payload or {}
+                for k, v in pl.items():
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            self._maybe_collect(num_vals, cat_vals, f"{k}.{kk}", vv)
+                    elif isinstance(v, (list, tuple)):
+                        for idx, vv in enumerate(v[:8]):
+                            self._maybe_collect(num_vals, cat_vals, f"{k}[{idx}]", vv)
+                    else:
+                        self._maybe_collect(num_vals, cat_vals, k, v)
+
+            numeric_stats: Dict[str, Any] = {}
+            for feat, vals in num_vals.items():
+                clean = [float(x) for x in vals if self._is_finite_number(x)]
+                if len(clean) < min_count_for_stats:
+                    continue
+                n = len(clean)
+                s = sum(clean)
+                mu = s / n
+                std = math.sqrt(sum((x - mu) ** 2 for x in clean) / (n - 1)) if n > 1 else 0.0
+                numeric_stats[feat] = {
+                    "count": n,
+                    "mean": mu,
+                    "std": std,
+                    "min": min(clean),
+                    "max": max(clean),
+                    **self._percentiles_py(clean, percentiles),
+                }
+
+            categorical_stats: Dict[str, Any] = {}
+            for feat, counter in cat_vals.items():
+                if not counter:
+                    continue
+                categorical_stats[feat] = {"top": counter.most_common(topk_categorical), "unique": len(counter)}
+
+            if numeric_stats or categorical_stats:
+                result[topic] = {"numeric": numeric_stats, "categorical": categorical_stats}
+        return result
+
+    def _format_stats_headlines(self, stats: Dict[str, Dict[str, Any]], *, limit: int = 8) -> str:
+        lines = ["Statistics (headlines):"]
+        shown = 0
+        for topic, blocks in stats.items():
+            for feat, fs in (blocks.get("numeric") or {}).items():
+                try:
+                    lines.append(f"• [{topic}.{feat}] count={fs.get('count')} mean={fs.get('mean'):.3g} std={fs.get('std'):.3g}")
+                    shown += 1
+                except Exception:
+                    continue
+                if shown >= limit:
+                    break
+            if shown >= limit:
+                break
+        return "\n".join(lines) if shown else "No numeric feature has enough samples to compute stats yet."
+
+    # ----------------- Feature extraction & utilities -----------------
+
+    def _extract_features(self, text: str) -> Dict[str, Any]:
+        toks = self._tokenize(text)
+        numeric = [self._safe_float(tok) for tok in toks]
+        numeric = [x for x in numeric if x is not None]
+
+        features = {
+            "summary": self._summarize_text(text, max_len=160),
+            "length": len(text),
+            "digits.count": sum(ch.isdigit() for ch in text),
+            "keywords": list(self._top_keywords(toks, k=10)),
+            "numeric.values": numeric[:8],
+            "attributes": {"uppercase_ratio": self._uppercase_ratio(text)},
+            "methods": {"has_question": "?" in text, "has_code_block": "```" in text or "    " in text},
+        }
+        # raw + extracted sensitive tokens
+        features["raw_text"] = text if len(text) <= 2000 else (text[:2000] + "...")
+        features.update(self._gather_sensitive_tokens(text))
+        return features
+
+    def _gather_sensitive_tokens(self, text: str) -> Dict[str, Any]:
+        ips = self._RE_IPv4.findall(text) or []
+        macs = self._RE_MAC.findall(text) or []
+        spis = [m.group(1) if m.lastindex else m.group(0) for m in self._RE_SPI.finditer(text)]
+        hexs = self._RE_HEX.findall(text) or []
+        keys = [m.group(1) for m in self._RE_KEY.finditer(text)]
+        out: Dict[str, Any] = {}
+        if ips:  out["ips"] = ips
+        if macs: out["macs"] = macs
+        if spis: out["spis"] = spis
+        if hexs: out["hex_tokens"] = hexs
+        if keys: out["keys"] = keys
+        return out
+
+    def _infer_tags(self, text: str) -> List[str]:
+        tags = []
+        l = text.lower()
+        for tag in ("error", "fix", "bug", "design", "code", "stats", "emit", "purge", "inspect", "sensitive"):
+            if tag in l: tags.append(tag)
+        for t in ("tls", "dns", "dhcp", "quic", "esp", "kerberos"):
+            if t in l: tags.append(t)
+        return tags[:8]
+
+    def _importance_score(self, text: str) -> int:
+        score = 0
+        l = text.lower()
+        score += min(5, len(text) // 120)
+        if "```" in text or "class " in l or "def " in l: score += 2
+        if any(t in l for t in self._known_topics): score += 1
+        return min(score, 9)
+
+    def _guess_topic(self, text: str) -> str:
+        toks = set(self._tokenize(text))
+        for t in sorted(self._known_topics):
+            if t in toks:
+                return t
+        return "misc"
+
+    def _tokenize(self, text: str) -> List[str]:
+        toks = [t.lower() for t in self._TOKEN_RE.findall(text or "")]
+        out = []
+        for t in toks:
+            t = re.sub(r"_+", "_", t).strip("_")
+            if t: out.append(t)
+        return out
+
+    def _payload_to_text(self, payload: Dict[str, Any], *, redact: bool = False, include_raw: bool = False) -> str:
+        parts = []
+        for k, v in (payload or {}).items():
+            if k == "raw_text" and not include_raw:
+                continue
+            if isinstance(v, dict):
+                pv = ",".join(f"{kk}={v[kk]}" for kk in list(v)[:4])
+            elif isinstance(v, (list, tuple, set)):
+                pv = ",".join(map(str, list(v)[:6]))
+            else:
+                pv = str(v)
+            if redact:
+                pv = self._redact_text(pv)
+            parts.append(f"{k}:{pv if len(pv) <= 80 else pv[:77] + '...'}")
+        return " ".join(parts)
+
+    def _redact_text(self, s: str) -> str:
+        out = s
+        out = self._RE_IPv4.sub("[IP]", out)
+        out = self._RE_MAC.sub("[MAC]", out)
+        out = self._RE_SPI.sub("spi=[SPI]", out)
+        out = self._RE_HEX.sub("[HEX]", out)
+        out = self._RE_KEY.sub(lambda m: m.group(0).split(m.group(1))[0] + "[SECRET]", out)
+        return out
+
+    def _uppercase_ratio(self, text: str) -> float:
+        if not text: return 0.0
+        upp = sum(1 for ch in text if ch.isupper())
+        letters = sum(1 for ch in text if ch.isalpha())
+        return upp / letters if letters else 0.0
+
+    def _summarize_text(self, text: str, *, max_len: int = 160) -> str:
+        text = (text or "").strip()
+        if len(text) <= max_len: return text
+        cut = text[:max_len]
+        cut = re.sub(r"\s+\S*$", "", cut).rstrip(",.;:-")
+        return cut + "..."
+
+    def _safe_float(self, token: str) -> Optional[float]:
+        try:
+            if re.fullmatch(r"[+-]?\d+(\.\d+)?", token):
+                return float(token)
+        except Exception:
+            return None
+        return None
+
+    def _top_keywords(self, toks: Iterable[str], k: int = 10) -> Iterable[str]:
+        c = Counter(t for t in toks if len(t) >= 3)
+        for w, _ in c.most_common(k):
+            yield w
+
+    def _is_finite_number(self, v: Any) -> bool:
+        try:
+            x = float(v)
+            return math.isfinite(x)
+        except Exception:
+            return False
+
+    def _percentiles_py(self, values: List[float], pcts: Iterable[int]) -> Dict[str, float]:
+        if not values:
+            return {f"p{p}": math.nan for p in pcts}
+        arr = sorted(values)
+        n = len(arr)
+        out = {}
+        for p in pcts:
+            if n == 1:
+                out[f"p{p}"] = arr[0]
+            else:
+                rank = (p / 100) * (n - 1)
+                lo = int(math.floor(rank))
+                hi = int(math.ceil(rank))
+                if lo == hi:
+                    out[f"p{p}"] = arr[lo]
+                else:
+                    frac = rank - lo
+                    out[f"p{p}"] = arr[lo] * (1 - frac) + arr[hi] * frac
+        return out
+
+    def _actionable_tip(self, prompt: str, topic: str) -> str:
+        if topic == "dns":
+            return "Tip: Capture both the query and retries; high RTTs or NXDOMAIN spikes can look like timeouts."
+        if topic == "tls":
+            return "Tip: Track ClientHello SNI and JA3/JA4 fingerprints to correlate flows without decryption."
+        if topic == "esp":
+            return "Tip: With IPsec/ESP over UDP/4500, watch NAT-T keepalives and SPI churn if tunnels flap."
+        if topic == "router":
+            return "Tip: Validate L2/L3 with a minimal synthetic path before enabling advanced managers."
+        return "If you want, ask ‘inspect sensitive’ to see unredacted details."
+
+    # ----------------- Emit/codegen (toy) -----------------
+
+    def _default_emit_builder(self) -> Dict[str, Any]:
+        return {
+            "class_name": "SnapshotModel",
+            "fields": {"ts": "float", "topic": "str", "payload": "dict", "tags": "list", "importance": "int"},
+            "doc": "Auto-emitted snapshot model (toy example).",
+        }
+
+    def _generate_class_from_config(self, cfg: Dict[str, Any]) -> str:
+        name = cfg.get("class_name", "SnapshotModel")
+        fields: Dict[str, str] = cfg.get("fields", {})
+        doc = cfg.get("doc", "")
+        need_field_import = any(v in {"dict", "list"} for v in fields.values())
+        lines = []
+        if need_field_import:
+            lines.append("from dataclasses import dataclass, field")
+        else:
+            lines.append("from dataclasses import dataclass")
+        lines.append("from typing import Any, Dict, List, Optional")
+        lines.append("")
+        lines.append("@dataclass")
+        lines.append(f"class {name}:")
+        if doc:
+            lines.append(f'    """{doc}"""')
+        if not fields:
+            lines.append("    pass")
+        else:
+            for k, v in fields.items():
+                default = "0.0" if v == "float" else ("0" if v == "int" else ("None" if v == "Optional[Any]" else "None"))
+                if v == "dict": default = "field(default_factory=dict)"
+                if v == "list": default = "field(default_factory=list)"
+                lines.append(f"    {k}: {v} = {default}")
+        return "\n".join(lines)
+
+
