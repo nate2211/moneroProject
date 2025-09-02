@@ -1,16 +1,19 @@
 import ctypes
 import ipaddress
+import os
 import socket
 import struct
 import time
 from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
 import sys
-from typing import Optional
+from typing import Optional, List
 
 import psutil
-from scapy.arch import get_if_hwaddr
+from scapy.arch import get_if_hwaddr, get_windows_if_list
+from scapy.config import conf
 from scapy.contrib.geneve import GENEVE
-from scapy.fields import IntField
+from scapy.fields import IntField, XShortField, LELongField, LEIntField, LESignedIntField, StrLenField
+from scapy.interfaces import get_if_list
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNS
 from scapy.layers.eap import EAPOL, EAP
@@ -22,18 +25,21 @@ from scapy.layers.ppp import PPP
 from scapy.layers.rip import RIP
 from scapy.layers.rtp import RTP
 from scapy.main import load_contrib
+from scapy.all import send as scapy_send, sr1 as scapy_sr1
+from scapy.sendrecv import sr1, send
 
 # Import all functionalities from the Scapy library to parse packets.
 try:
     from scapy.all import ShortField, ByteField, IP6Field, Packet, load_layer, TCPSession
     from scapy.contrib.igmp import IGMP
-    from scapy.layers.inet import TCP, UDP, IP
+    from scapy.layers.inet import TCP, UDP, IP, ICMP
     from scapy.layers.inet6 import (
         ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA,
-        ICMPv6ND_RA, ICMPv6ND_RS, IPv6
-    )
-    from scapy.layers.l2 import Ether, ARP, GRE
-    from scapy.packet import bind_layers, Raw
+        ICMPv6ND_RA, ICMPv6ND_RS, IPv6, ICMPv6Unknown, ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
+        IPv6ExtHdrHopByHop, ICMPv6NDOptSrcLLAddr, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment
+)
+    from scapy.layers.l2 import Ether, ARP, GRE, Loopback
+    from scapy.packet import bind_layers, Raw, NoPayload
 except ImportError:
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
     sys.exit(1)
@@ -88,7 +94,7 @@ DLT_LINUX_SLL2 = 276
 # Optional capture direction (if supported by lib)
 PCAP_D_IN = 1  # inbound only
 
-# --- Scapy helper layers ---
+
 
 class MLDQuery(Packet):
     name = "ICMPv6 MLD Query"
@@ -114,27 +120,7 @@ class MLDDone(Packet):
         IP6Field("mcaddr", "::")
     ]
 
-class ICMPv6(Packet):
-    name = "ICMPv6"
-    fields_desc = [
-        ByteField("type", 128),
-        ByteField("code", 0),
-        ShortField("cksum", None),
-    ]
-
-    def post_build(self, p, pay):
-        # Scapy will compute checksums normally; keeping your custom routine guarded
-        try:
-            if self.cksum is None and self.underlayer and isinstance(self.underlayer, IPv6):
-                ip = self.underlayer
-                psd_hdr = ip.src.encode() + ip.dst.encode() + len(p).to_bytes(4, 'big') + b'\x00\x00\x00' + ip.nh.to_bytes(1, 'big')
-                from scapy.layers.inet import in4_chksum
-                cksum = in4_chksum(psd_hdr + p + pay)
-                p = p[:2] + cksum.to_bytes(2, 'big') + p[4:]
-        except Exception:
-            pass
-        return p + pay
-
+# --- ICMPv6 Base and Common Types ---
 class ISKEMP(Packet):
     name = "ISKEMP"
     fields_desc = [
@@ -143,12 +129,62 @@ class ISKEMP(Packet):
         IntField("session_id", 0),
     ]
 
+
+class ICMPv6(Packet):
+    """
+    Custom ICMPv6 base layer based on RFC 4443.
+    This layer defines the common header and handles checksum calculation.
+    """
+    name = "ICMPv6 - Internet Control Message Protocol v6"
+    fields_desc = [
+        ByteField("type", 0),  # ICMPv6 Message Type
+        ByteField("code", 0),  # ICMPv6 Message Code
+        XShortField("cksum", None)  # Checksum. 'None' tells Scapy to compute it.
+    ]
+
+    def post_build(self, p, pay):
+        """
+        Calculates the checksum after the packet is built.
+        This is crucial because the checksum includes a pseudo-header
+        derived from the parent IPv6 layer.
+        """
+        # If a checksum is already provided, do nothing.
+        if self.cksum is None and self.underlayer and isinstance(self.underlayer, IPv6):
+            # The 'p' variable contains the built ICMPv6 header (type, code, checksum)
+            # The 'pay' variable is the payload that follows
+            ip = self.underlayer
+
+            # Construct the IPv6 pseudo-header
+            # Format: Src IP (16B), Dst IP (16B), Upper-Layer Pkt Len (4B), Zeroes (3B), Next Hdr (1B)
+            psd_hdr = struct.pack(
+                "!16s16sI3xB",
+                socket.inet_pton(socket.AF_INET6, ip.src),
+                socket.inet_pton(socket.AF_INET6, ip.dst),
+                len(p) + len(pay),
+                58  # Protocol number for ICMPv6
+            )
+
+            # The checksum is calculated over the pseudo-header + the ICMPv6 packet
+            # Scapy's in6_chksum handles this correctly
+            from scapy.layers.inet6 import in6_chksum
+            cksum = in6_chksum(58, ip, p + pay)
+
+            # Place the calculated checksum back into the packet bytes
+            p = p[:2] + struct.pack("!H", cksum) + p[4:]
+
+        return p + pay
+
 class SnifferSoftware:
     """
     A class to manage sniffing and sending of Layer 2 and Layer 3 packets
     using direct libpcap/wpcap calls via ctypes.
     """
-
+    ICMPV6_TYPES = (
+        ICMPv6EchoRequest, ICMPv6EchoReply,
+        ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RA, ICMPv6ND_RS,
+        ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
+        ICMPv6Unknown, ICMP
+    )
     def __init__(self, arp_manager, rip_manager, notification_manager=None, logger=None):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
@@ -163,6 +199,9 @@ class SnifferSoftware:
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
 
+    def iface_is_l2_capable(self, iface_name: str) -> bool:
+        kind = (self._interfaces_config.get(iface_name, {}) or {}).get("driver", "").lower()
+        return not ("windivert" in kind or "rawip" in kind or "winfw" in kind)
     def is_interface_connected(self, iface: str) -> bool:
         for nic, addrs in psutil.net_if_addrs().items():
             if iface in nic:
@@ -192,20 +231,37 @@ class SnifferSoftware:
             return False
 
     def setup_scapy_bindings(self):
+        # Standard L2 -> L3 Bindings
         bind_layers(Ether, IPv6, type=0x86DD)
-        bind_layers(IPv6, ICMPv6, nh=58)
+        bind_layers(Ether, ARP, type=0x0806)
+        bind_layers(Ether, EAPOL, type=0x888E)
+
+        # --- FIX: Add Bindings for IPv6 Hop-by-Hop Extension Header ---
+        # The Hop-by-Hop header is indicated by a Next Header value of 0 in the main IPv6 header.
+        bind_layers(IPv6, IPv6ExtHdrHopByHop, nh=0)
+
+        # Now, tell Scapy what can come *after* the Hop-by-Hop header.
+        # The `nh` field within the Hop-by-Hop header itself points to the next layer.
+        bind_layers(IPv6ExtHdrHopByHop, TCP, nh=6)
+        bind_layers(IPv6ExtHdrHopByHop, UDP, nh=17)
+        bind_layers(IPv6ExtHdrHopByHop, ICMPv6, nh=58)
+        bind_layers(IPv6ExtHdrHopByHop, NoPayload, nh=59)  # No Next Header
+        # -----------------------------------------------------------
+
+        # Standard IPv6 -> L4 Bindings
         bind_layers(IPv6, TCP, nh=6)
         bind_layers(IPv6, UDP, nh=17)
-        bind_layers(IPv6, Raw)
-        bind_layers(ICMPv6, ICMPv6EchoRequest, type=128)
-        bind_layers(ICMPv6, ICMPv6EchoReply, type=129)
+        bind_layers(IPv6, ICMPv6, nh=58)
+        bind_layers(IPv6, AH, nh=51)
         bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
         bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
-        bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
-        bind_layers(ICMPv6, ICMPv6ND_RS, type=133)  # fixed
-        bind_layers(ICMPv6, MLDQuery, type=130)
-        bind_layers(ICMPv6, MLDReport, type=131)
-        bind_layers(ICMPv6, MLDDone, type=132)
+        bind_layers(ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr, type=1)
+        bind_layers(ICMPv6Unknown, MLDQuery, type=130)
+        bind_layers(ICMPv6Unknown, MLDReport, type=131)
+        bind_layers(ICMPv6Unknown, MLDDone, type=132)
+        bind_layers(ICMPv6Unknown, MLDQuery, type=130)  # Query
+        bind_layers(ICMPv6Unknown, MLDReport, type=131)  # Report
+        bind_layers(ICMPv6Unknown, MLDDone, type=132)  # Done
         bind_layers(IP, IGMP, proto=2)
         bind_layers(Ether, ARP, type=0x0806)
         bind_layers(UDP, ISKEMP, dport=9999)
@@ -310,6 +366,101 @@ class SnifferSoftware:
         except Exception:
             pass  # Not present on very old builds
 
+    def _find_transport_layer(self, pkt: Packet) -> Optional[Packet]:
+        """
+        Finds the transport layer (TCP, UDP, ICMP/ICMPv6) for IPv4 or IPv6 packets.
+        - Walks IPv6 extension headers (Hop-by-Hop, Routing, DestOpt, Fragment).
+        - Steps through AH; returns None on ESP (encrypted).
+        - Handles IP-in-IP and v4<->v6 tunnels (one level or more).
+        - For IPv4, returns None on non-first fragments (no transport header).
+        """
+        if IPv6 in pkt:
+            tl = self._walk_ipv6(pkt[IPv6])
+            if tl is not None:
+                return tl
+
+        if IP in pkt:
+            return self._walk_ipv4(pkt[IP])
+
+        return None
+
+    def _walk_ipv6(self, ip6: IPv6) -> Optional[Packet]:
+        layer: Packet = ip6.payload
+        max_hops = 32  # guard against loops
+
+        while layer is not None and max_hops > 0:
+            max_hops -= 1
+
+            # Skip IPv6 extension headers
+            if isinstance(layer, (IPv6ExtHdrHopByHop, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment)):
+                layer = layer.payload
+                continue
+
+            # IPsec over v6
+            if isinstance(layer, (AH, ESP)):
+                if isinstance(layer, AH):
+                    layer = layer.payload
+                    continue
+                return None  # ESP hides upper layer
+
+            # Transport protocols
+            if isinstance(layer, (TCP, UDP)):
+                return layer
+            if (ICMPv6 and isinstance(layer, ICMPv6)) or layer.__class__.__name__.startswith("ICMPv6"):
+                return layer
+
+            # Tunnels: v6-in-v6 or v6-in-v4 (rare but possible with Scapy stacking)
+            if isinstance(layer, IPv6):
+                # Recurse into inner IPv6
+                inner = self._walk_ipv6(layer)
+                return inner
+            if isinstance(layer, IP):
+                # Reuse v4 walker for inner IPv4
+                return self._walk_ipv4(layer)
+
+            # Unknown next header type
+            return None
+
+        return None
+
+    def _walk_ipv4(self, ip4: IP) -> Optional[Packet]:
+        # If this is a non-first fragment, transport header isn't present
+        # (Scapy: ip4.frag > 0 means not the first fragment; first may have MF flag set)
+        if getattr(ip4, "frag", 0) > 0:
+            return None
+
+        layer: Packet = ip4.payload
+        max_hops = 16
+
+        while layer is not None and max_hops > 0:
+            max_hops -= 1
+
+            # IPsec over v4
+            if isinstance(layer, (AH, ESP)):
+                if isinstance(layer, AH):
+                    layer = layer.payload
+                    continue
+                return None  # ESP hides upper layer
+
+            # Transport protocols
+            if isinstance(layer, (TCP, UDP, ICMP)):
+                return layer
+
+            # Tunnels: IP-in-IP or IPv4 carrying IPv6
+            if isinstance(layer, IP):
+                # Step into inner IPv4
+                ip4 = layer
+                if getattr(ip4, "frag", 0) > 0:
+                    return None
+                layer = ip4.payload
+                continue
+            if isinstance(layer, IPv6):
+                return self._walk_ipv6(layer)
+
+            # Unknown/unsupported payload
+            return None
+
+        return None
     def _decode_by_dlt(self, raw: bytes, dlt: int):
         """
         Return a Scapy packet that matches the capture's datalink type.
@@ -361,6 +512,270 @@ class SnifferSoftware:
         if dlt == DLT_RAW:
             return "RAW"
         return f"DLT({dlt})"
+
+    # --- NEW: Windows-aware helpers ---
+    def _send_l3_loopback(
+            self,
+            packet: Packet,
+            timeout: float = 2.0,
+            expect_reply: bool = False
+    ) -> Optional[Packet]:
+        """
+        Send an L3 packet over loopback, optionally await a single reply.
+        Logs detailed metadata about what was attempted.
+        """
+        try:
+            # --- 1) Strip any Ethernet header (force L3) ---
+            if packet.haslayer(Ether):
+                packet = packet[Ether].payload
+
+            # --- 2) Ensure IP/IPv6 is present ---
+            ip = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if ip is None:
+                raise ValueError("packet has no IP/IPv6 layer")
+
+            # --- 3) Resolve loopback iface robustly ---
+            iface = getattr(conf, "loopback_interface", None) or getattr(conf, "loopback_name", None)
+            if not iface:
+                candidates = ["lo", "lo0", "Npcap Loopback Adapter"]
+                ifaces = set(get_if_list())
+                iface = next((c for c in candidates if c in ifaces), conf.iface)
+
+            # --- 4) Build summary for logging ---
+            pkt_summary = packet.summary()
+            layer_info = ip.__class__.__name__
+            src = getattr(ip, "src", "?")
+            dst = getattr(ip, "dst", "?")
+
+            # --- 5) Emit log before send ---
+            self.logger.log_message(
+                f"[Sniffer] Loopback L3 send | iface={iface} | "
+                f"layer={layer_info} | src={src} -> dst={dst} | "
+                f"expect_reply={expect_reply} | packet={pkt_summary}"
+            )
+
+            # --- 6) Send (and maybe receive) ---
+            if expect_reply:
+                reply = sr1(packet, timeout=float(timeout),iface=iface,verbose=0)
+                if reply:
+                    self.logger.log_message(
+                        f"[Sniffer] Loopback L3 reply received | iface={iface} | "
+                        f"src={reply[IP].src if reply.haslayer(IP) else '?'} -> "
+                        f"dst={reply[IP].dst if reply.haslayer(IP) else '?'} | "
+                        f"packet={reply.summary()}"
+                    )
+                else:
+                    self.logger.log_message(
+                        f"[Sniffer] Loopback L3 no reply (timeout={timeout}s) | iface={iface}"
+                    )
+                return reply
+            else:
+                send(packet, verbose=0)
+                return None
+
+        except Exception as e:
+            self.logger.log_message(
+                f"[Sniffer] Loopback L3 send error for packet '{packet.summary()}': {e}"
+            )
+            return None
+    def _normalize_pcap_name(self, name: str) -> str:
+        # collapse backslashes and trim whitespace
+        n = (name or "").strip().replace("\\\\", "\\")
+        return n
+
+    def _is_npf_loopback(self, iface_name: str) -> bool:
+        n = self._normalize_pcap_name(iface_name).lower()
+        # handles "\Device\NPF_Loopback", "NPF_Loopback", with/without trailing space
+        return n.endswith("\\device\\npf_loopback") or n == "npf_loopback"
+    def _pick_pcap_iface_for_dst(self, dst_ip: str) -> str | None:
+        """
+        Choose the correct Npcap device for reaching dst_ip on Windows.
+        We find the local IPv4 that the OS would use for dst_ip, then map it to a pcap device.
+        """
+        local_ip = None
+        try:
+            # UDP connect trick to learn the chosen egress local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((dst_ip, 53))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+        if not local_ip:
+            return None
+
+        # Map local_ip → pcap_name using scapy's interface list
+        for itf in get_windows_if_list():
+            ips = (itf.get("ips") or []) + ([itf.get("ip")] if itf.get("ip") else [])
+            for ip in ips:
+                if not ip or "." not in ip:
+                    continue
+                if ip == local_ip:
+                    return itf.get("pcap_name")
+        return None
+
+    def _dst_is_private_or_local(self, ip: str) -> bool:
+        try:
+            x = ipaddress.ip_address(ip)
+            return x.is_loopback or x.is_link_local or x.is_private
+        except Exception:
+            return False
+
+    def _ensure_egress_iface_for_dst(self, iface_in: str | None, dst_ip: str) -> str | None:
+        """
+        If iface_in is NPF Loopback and dst is not local, pick the real egress
+        pcap device that Windows would use for dst_ip.
+        """
+        iface = iface_in
+        if os.name == "nt" and iface and iface.lower().startswith("\\device\\npf_"):
+            # If loopback and not local/private, remap
+            if self._is_npf_loopback(iface) and not self._dst_is_private_or_local(dst_ip):
+                # Use UDP connect trick to learn OS-chosen local IPv4 for this dst
+                local_ip = None
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect((dst_ip, 53))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    pass
+                if not local_ip or not get_windows_if_list:
+                    return None
+                # Map local_ip → pcap_name
+                for itf in get_windows_if_list():
+                    ips = (itf.get("ips") or []) + ([itf.get("ip")] if itf.get("ip") else [])
+                    for ip in ips:
+                        if ip and "." in ip and ip == local_ip:
+                            new_iface = itf.get("pcap_name")
+                            if new_iface and not self._is_npf_loopback(new_iface):
+                                self.logger.log_message(
+                                    f"[Sniffer] 🔁 Replacing loopback with egress NIC: {iface} → {new_iface}"
+                                )
+                                return new_iface
+                return None
+        return iface
+
+    def _ipv4_cidr_for_iface(self, iface_name: str) -> str | None:
+        """
+        Return 'A.B.C.D/pfx' for the interface.
+        Supports Windows Npcap names ('\\Device\\NPF_{GUID}') and friendly names.
+        Returns None for Npcap loopback or if no IPv4 is configured.
+        """
+        if not iface_name:
+            return None
+        iface_name = self._normalize_pcap_name(iface_name)
+        # Windows pcap device path?
+        if os.name == "nt" and iface_name.lower().startswith("\\device\\npf_"):
+            if self._is_npf_loopback(iface_name):
+                return None
+
+            # Prefer Scapy's Windows inventory
+            try:
+                if 'get_windows_if_list' in globals() and get_windows_if_list:
+                    for itf in get_windows_if_list():
+                        if itf.get("pcap_name") == iface_name:
+                            # Try vector form first
+                            ips = (itf.get("ips") or [])
+                            masks = (itf.get("netmasks") or [])
+                            for ip, m in zip(ips, masks):
+                                if ip and m and "." in ip:
+                                    pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
+                                    return f"{ip}/{pref}"
+                            # Fallback to scalar ip/netmask keys
+                            ip, m = itf.get("ip"), itf.get("netmask")
+                            if ip and m and "." in ip:
+                                pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
+                                return f"{ip}/{pref}"
+            except Exception:
+                pass
+
+            # Last resort: match the device MAC to a psutil NIC and read its IPv4
+            return self._ipv4_cidr_via_mac_match(iface_name)
+
+        # Non-Windows or friendly (human) name: use psutil inventory
+        addr, mask = self._ipv4_addr_netmask_for_iface(iface_name)
+        if not addr or not mask:
+            return None
+        try:
+            pref = ipaddress.IPv4Network((addr, mask), strict=False).prefixlen
+            return f"{addr}/{pref}"
+        except Exception:
+            return None
+
+    def _ipv4_cidr_for_pcap_name(self, pcap_name: str) -> str | None:
+        """
+        Use scapy's Windows interface inventory to resolve a Npcap device to IPv4+mask.
+        """
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            for itf in get_windows_if_list():
+                # scapy exposes 'pcap_name' exactly like '\\Device\\NPF_{GUID}'
+                if itf.get("pcap_name") == pcap_name:
+                    ips = itf.get("ips", []) or []
+                    masks = itf.get("netmasks", []) or []
+                    for ip, m in zip(ips, masks):
+                        if ip and m and "." in ip:
+                            pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
+                            return f"{ip}/{pref}"
+                    # some builds expose only one IPv4/mask as 'ip'/'netmask'
+                    ip = itf.get("ip")
+                    m = itf.get("netmask")
+                    if ip and m and "." in ip:
+                        pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
+                        return f"{ip}/{pref}"
+            return None
+        except Exception:
+            return None
+
+    def _ipv4_cidr_via_mac_match(self, pcap_name: str) -> str | None:
+        """
+        Fallback: get MAC for the Npcap device, find the psutil NIC with same MAC,
+        then compute IPv4/prefix from that NIC.
+        """
+        try:
+            # scapy gets the L2 addr even for Npcap device names
+            mac = get_if_hwaddr(pcap_name)
+        except Exception:
+            mac = None
+
+        if not mac:
+            return None
+
+        mac_norm = mac.replace("-", ":").lower()
+        for nic, addrs in psutil.net_if_addrs().items():
+            nic_mac = None
+            for a in addrs:
+                if getattr(a, "family", None) == psutil.AF_LINK:
+                    nic_mac = (a.address or "").replace("-", ":").lower()
+                    break
+            if nic_mac and nic_mac == mac_norm:
+                # get IPv4 and netmask
+                for a in addrs:
+                    if a.family == socket.AF_INET and a.address and a.netmask:
+                        try:
+                            pref = ipaddress.IPv4Network((a.address, a.netmask), strict=False).prefixlen
+                            return f"{a.address}/{pref}"
+                        except Exception:
+                            pass
+        return None
+
+    def _ipv4_addr_netmask_for_iface(self, iface_name: str):
+        """
+        Existing helper (kept) – returns (addr, netmask) for friendly name;
+        tries exact match then partial.
+        """
+        addrs = psutil.net_if_addrs().get(iface_name)
+        if addrs is None:
+            for nic, lst in psutil.net_if_addrs().items():
+                if iface_name.lower() in nic.lower():
+                    addrs = lst
+                    break
+        if not addrs:
+            return None, None
+        for a in addrs:
+            if a.family == socket.AF_INET and a.address and a.netmask:
+                return a.address, a.netmask
+        return None, None
 
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
@@ -569,17 +984,35 @@ class SnifferSoftware:
                     self.logger.log_message(f"[Sniffer] Error: No route found for destination {packet.dst}")
                     return
 
-            iface_out = route_info['interface']
+            iface_out = self._normalize_pcap_name(iface or route_info['interface'])
             gw_ip = route_info['next_hop'] if route_info['next_hop'] != '0.0.0.0' else packet.dst
 
-            if self.is_loopback(gw_ip):
-                self.logger.log_message(f"[Sniffer] Skipping MAC resolution for loopback destination {gw_ip}")
-                dst_mac = None
-            else:
-                dst_mac = self.arp_manager.resolve(gw_ip, iface=iface_out)
-                if not dst_mac:
-                    self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                    return None
+            # If loopback and dst is local/private → use OS stack at L3, skip pcap/L2 entirely
+            if self._is_npf_loopback(iface_out) and self._dst_is_private_or_local(str(packet.dst)):
+                self.logger.log_message("[Sniffer] Using OS stack for loopback destination; skipping pcap/L2.")
+                self._send_l3_loopback(packet, expect_reply=False)
+                return
+
+            # For remote dst: remap loopback to real NIC first
+            iface_out = self._ensure_egress_iface_for_dst(iface_out, str(packet.dst))
+            if not iface_out:
+                self.logger.log_message(f"[Sniffer] Error: cannot map loopback to a real NIC for {packet.dst}")
+                return None
+
+            iface_cidr = self._ipv4_cidr_for_iface(iface_out)
+            if not iface_cidr:
+                self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
+                return None
+
+            # Resolve next hop MAC (only if not loopback gw)
+            if not dst_mac:
+                if self.is_loopback(gw_ip):
+                    dst_mac = None
+                else:
+                    dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
+                    if not dst_mac:
+                        self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                        return None
 
             if not src_mac:
                 src_mac = get_if_hwaddr(iface_out)
@@ -614,15 +1047,23 @@ class SnifferSoftware:
                 if not route_info:
                     self.logger.log_message(f"[Sniffer] Error: No route found for destination {packet.dst}")
                     return None
-
             iface_out = iface or route_info['interface']
+            iface_out = self._normalize_pcap_name(iface_out)  # normalize
             gw_ip = route_info['next_hop'] if route_info['next_hop'] != '0.0.0.0' else packet.dst
 
+
+            iface_cidr = self._ipv4_cidr_for_iface(iface_out)  # now safe
+            if not iface_cidr:
+                self.logger.log_message(f"[Sniffer] SR1 Error: could not derive IPv4 CIDR for iface '{iface_out}'")
+                return None
             if not dst_mac:
-                dst_mac = self.arp_manager.resolve(gw_ip, iface=iface_out)
-                if not dst_mac:
-                    self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                    return None
+                if self.is_loopback(gw_ip):
+                    dst_mac = None
+                else:
+                    dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
+                    if not dst_mac:
+                        self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                        return None
 
             if not src_mac:
                 src_mac = get_if_hwaddr(iface_out)
@@ -843,3 +1284,99 @@ class SnifferSoftware:
         finally:
             if handle:
                 self.libpcap.pcap_close(handle)
+
+    def _iter_layers(self, pkt: Packet):
+        """Yield each layer from outermost to innermost."""
+        l = pkt
+        while isinstance(l, Packet) and not isinstance(l.payload, NoPayload):
+            yield l
+            l = l.payload
+        if isinstance(l, Packet):
+            yield l
+
+    def _match_layer(self, l: Packet, query: str) -> bool:
+        """Case-insensitive match on class name or scapy 'name'."""
+        q = (query or "").lower()
+        return l.__class__.__name__.lower() == q or getattr(l, "name", "").lower() == q
+
+    def _layer_to_string(self, layer: Packet, fmt: str = "show") -> str:
+        """Render a single layer to string."""
+        fmt = (fmt or "show").lower()
+        if fmt == "summary":
+            return layer.summary()
+        if fmt == "fields":
+            # key=value pairs for all declared fields
+            parts = []
+            for f in getattr(layer, "fields_desc", []):
+                fname = getattr(f, "name", None)
+                if not fname:
+                    continue
+                try:
+                    val = getattr(layer, fname, None)
+                except Exception:
+                    val = None
+                parts.append(f"{fname}={val!r}")
+            return f"{layer.__class__.__name__}(" + ", ".join(parts) + ")"
+        # default: full verbose dump
+        try:
+            return layer.show(dump=True)
+        except Exception:
+            return str(layer)
+
+    def get_layer_as_string(self,
+            pkt: Packet,
+            layer: str | type[Packet] | int,
+            *,
+            fmt: str = "show",
+            default: str = ""
+    ) -> str:
+        """
+        Return the specified layer rendered as a string.
+
+        layer:
+          • class    -> e.g., IPv6, UDP, DNS
+          • name str -> e.g., "IPv6", "ICMPv6ND_NS", "DNS", "Raw"
+          • index    -> 0=outermost (Ether/RadioTap), 1=next, etc.
+
+        fmt: "show" (verbose), "summary", or "fields".
+        default: string to return if not found.
+        """
+        if pkt is None:
+            return default
+
+        # layer by index
+        if isinstance(layer, int):
+            for i, l in enumerate(self._iter_layers(pkt)):
+                if i == layer:
+                    return self._layer_to_string(l, fmt=fmt)
+            return default
+
+        # layer by class
+        if isinstance(layer, type) and issubclass(layer, Packet):
+            found = pkt.getlayer(layer)
+            return self._layer_to_string(found, fmt=fmt) if found else default
+
+        # layer by name (string)
+        if isinstance(layer, str):
+            # try exact by walking the actual stack (most reliable)
+            for l in self._iter_layers(pkt):
+                if self._match_layer(l, layer):
+                    return self._layer_to_string(l, fmt=fmt)
+            # as a fallback, try scapy's dynamic resolver if it exists
+            try:
+                # sometimes scapy exposes layer classes in globals of loaded modules
+                import scapy.layers.inet as _inet
+                import scapy.layers.inet6 as _inet6
+                import scapy.layers.l2 as _l2
+                import scapy.layers.dns as _dns
+                _spaces = [globals(), vars(_inet), vars(_inet6), vars(_l2), vars(_dns)]
+                for space in _spaces:
+                    cls = space.get(layer)
+                    if isinstance(cls, type) and issubclass(cls, Packet):
+                        found = pkt.getlayer(cls)
+                        if found:
+                            return self._layer_to_string(found, fmt=fmt)
+            except Exception:
+                pass
+
+        return default

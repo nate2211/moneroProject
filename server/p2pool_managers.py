@@ -28,10 +28,11 @@ from scapy.all import send, sr1
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP
-from scapy.layers.dhcp6 import DHCP6
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew
 from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, ICMP
-from scapy.layers.inet6 import IPv6
+from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6DestUnreach, \
+    ICMPv6TimeExceeded, ICMPv6ParamProblem
 from scapy.layers.ipsec import ESP, AH
 from scapy.layers.l2 import Ether, GRE, ARP
 from scapy.layers.tls.handshake import TLSClientHello, TLSFinished, TLSServerHello
@@ -41,7 +42,7 @@ from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict
 import xml.etree.ElementTree as ET
 from scapy.sessions import TCPSession
-from p2pool_sniffer import SnifferSoftware
+from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager
@@ -123,7 +124,7 @@ class PythonRouterManager:
         self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
         self.packet_signer = PacketSigningManager(router_logger)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
-        self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer)
+        self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer, self.arp_manager)
         self.dns_manager = DNSManager(router_logger, self.packet_writer)
         self.mdns_manager = mDNSManager(router_logger, self.packet_writer, self._interfaces_config)
         self.rip_manager = RIPManager(router_logger, self.function_call_tracker)
@@ -132,7 +133,7 @@ class PythonRouterManager:
         self.packet_catcher = PacketCatcherManager(router_logger, self._interfaces_config)
         self.handshake_manager = None
         self.igmp_manager = IGMPManager(router_logger, self.packet_writer)
-        self.icmp_manager = ICMPManager(router_logger, self.packet_writer, self.sendback_manager, self._interfaces_config)
+        self.icmp_manager = None
         self.dhcp_server_in = None
         self.dhcp_server_out = None
         self.firewall_manager = FirewallManager(router_logger)
@@ -142,7 +143,7 @@ class PythonRouterManager:
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
 
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
-        self.transport_manager = TransportManager(router_logger, self.packet_signer)
+        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager)
         self.isakmp_manager = None
         self.esp_manager = ESPManager(router_logger, self.packet_writer)
         self.stratum_manager = StratumManager(self.code_output_manager, router_logger)
@@ -159,6 +160,7 @@ class PythonRouterManager:
         self.windivert_manager = WinDivertManager(self, self.code_output_manager)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.parallel_python.inject_into(self.transport_manager)
+        self.parallel_python.inject_into(self.transport_manager.transport_rtp)
         self.parallel_python.inject_into(self.transport_manager.transport_dns, "log")
         self.parallel_python.inject_into(self.transport_manager.transport_ssdp, "log")
         self.parallel_python.inject_into(self.transport_manager.transport_dhcp)
@@ -167,7 +169,16 @@ class PythonRouterManager:
         self.parallel_python.inject_into(self.transport_manager.transport_ssh)
         self.parallel_python.inject_into(self.transport_manager.transport_ftp)
         self.parallel_python.inject_into(self.transport_manager.transport_rdp)
-        self.parallel_python.inject_into(self.packet_catcher)
+        self.parallel_python.inject_into(self.transport_manager.transport_ssh)
+        self.parallel_python.inject_into(self.transport_manager.transport_monero)
+        self.parallel_python.inject_into(self.transport_manager.transport_kerberos, 'log')
+        self.parallel_python.inject_into(self.transport_manager.transport_ipv6, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_overlay)
+        self.parallel_python.inject_into(self.transport_manager.transport_tcp_ephemeral, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_udp_ephemeral, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_steam, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_tcp_high_Level, "log")
+        self.parallel_python.inject_into(self.transport_manager.transport_https)
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1073,10 +1084,12 @@ class PythonRouterManager:
         vs. transit traffic.
         """
         try:
+            iface_short = inbound_iface.split('_')[-1]
 
+            # [0] Self-MAC guard (avoid loops)
             if packet.haslayer(Ether):
-                src_mac = packet[Ether].src
-                if src_mac and src_mac.lower() in self.router_macs:
+                src_mac = (packet[Ether].src or "").lower()
+                if src_mac and src_mac in self.router_macs:
                     self.function_call_tracker.track(
                         identifier='DroppedMacLog',
                         threshold=20,
@@ -1085,33 +1098,61 @@ class PythonRouterManager:
                     )
                     return
 
-            # 2) Get “ether type” for downstream routing decisions
+            # [1] Ether-type sanity
             eth_type = self._eth_type_or_none(packet)
             if eth_type is None:
-                # Rate-limit this if it’s noisy
+                # Avoid log spam (keep as warning, but single-line)
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
-            # Step 1: [Layer 2] Handle non-IP packets first (e.g., ARP, L2 frames).
-            # The L2 manager returns True if the packet is handled and should not be processed further.
+
+            # [2] L2 handling first (ARP, STP, LLDP, etc). If handled, stop here.
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
-            # Step 2: [Layer 3 Check] Get the IP layer. If none exists, drop the packet.
+
+            # [3] IP layer is mandatory for the rest
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
                 self.router_logger.log_message(
-                    f"[Router] ⚠️ Dropping non-IP packet that bypassed L2 handler: {packet.summary()}")
+                    f"[Router] ⚠️ Dropping non-IP packet that bypassed L2 handler: {packet.summary()}"
+                )
                 return
+
+            # [4] ARP inspection (only when ARP present)
             if packet.haslayer(ARP):
                 if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
                     self.router_logger.log_message(
-                        f"[Router] 🚫 Dropped ARP on {inbound_iface.split('_')[-1]} (failed inspection)."
+                        f"[Router] 🚫 Dropped ARP on {iface_short} (failed inspection)."
                     )
                     return  # stop processing, do not forward/learn this ARP
-            dst_ip = ip_layer.dst
-            iface_short = inbound_iface.split('_')[-1]
-            if not ip_layer:
-                return
 
+            # [5] Fast protocol/port helpers
+            is_tcp = packet.haslayer(TCP)
+            is_udp = packet.haslayer(UDP)
+            sport = (packet[TCP].sport if is_tcp else packet[UDP].sport if is_udp else 0) or 0
+            dport = (packet[TCP].dport if is_tcp else packet[UDP].dport if is_udp else 0) or 0
+            dst_ip = ip_layer.dst
+            if packet.haslayer(ARP):
+                if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
+                    self.router_logger.log_message(
+                        f"[ARP] 🚫 Dropped ARP on {inbound_iface.split('_')[-1]} (failed inspection)."
+                    )
+                    return  # stop processing, do not forward/learn this ARP
+            # [6] Stratum: FIXED — detect via TCP/UDP port list, not ip_layer.sport
+            #     Use your StratumManager’s robust extractor/buffer; we also tag component.
+
+            if (sport in self.stratum_manager.STRATUM_PORTS) or (dport in self.stratum_manager.STRATUM_PORTS):
+                # must have Raw payload and look like JSON
+                from scapy.packet import Raw
+                if packet.haslayer(Raw):
+                    raw = packet[Raw].load or b""
+                    if raw.lstrip()[:1] in (b"{", b"["):
+                        # hand off to the *connection* manager, not the raw StratumManager
+                        if self.stratum_connection_manager.handle_packet(packet, inbound_iface=iface_short):
+                            return
+
+
+
+            # [7] ESP/AH/GRE/NAT-T fast-paths (keep your original branching + hyperv)
             if IP in packet:
                 if packet.haslayer(ESP):
                     if self.hyperv_enabled:
@@ -1120,14 +1161,18 @@ class PythonRouterManager:
                             self.rip_manager.find_route
                         )
                         if handled:
-                            self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                                   phase="handled", component="esp-manager")
+                            self.code_output_manager.submit_packet(
+                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
+                            )
                             return
                         else:
-                            self.router_logger.log_message(f"[ESP] Sending ESP packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
+                            self.router_logger.log_message(
+                                f"[ESP] Sending ESP packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
+                            )
                             self.hyperv_manager.send_packet(packet)
-                            self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                                   phase="handled", component="esp-c++")
+                            self.code_output_manager.submit_packet(
+                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-c++"
+                            )
                             return
                     else:
                         handled = self.esp_manager.handle_packet(
@@ -1135,25 +1180,24 @@ class PythonRouterManager:
                             self.rip_manager.find_route
                         )
                         if handled:
-                            self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                                   phase="handled", component="esp-manager")
+                            self.code_output_manager.submit_packet(
+                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
+                            )
                             return
+
                 if packet.haslayer(AH):
                     if self.hyperv_enabled:
-                        self.router_logger.log_message(f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
+                        self.router_logger.log_message(
+                            f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
+                        )
                         self.hyperv_manager.send_packet(packet)
                         return True
 
                 if packet.haslayer(GRE):
                     if self.hyperv_enabled:
-                        self.router_logger.log_message(f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe")
-                        self.hyperv_manager.send_packet(packet)
-                        return True
-                if UDP in packet and (packet[UDP].sport == 4500 or packet[UDP].dport == 4500):
-                    self.router_logger.log_message(f"[VPN] 🔄 Handling NAT-T (UDP 4500) from {packet[IP].src}")
-                    self.packet_writer.forward_l2(packet, inbound_iface=inbound_iface,
-                                                  egress_iface=self.interface_out_friendly_name, allow_local_dest=True)
-                    return
+                        self.router_logger.log_message(
+                            f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst}")
+                            
             if self.isakmp_manager.handle_packet(packet, inbound_iface):
                 return
 
@@ -1175,14 +1219,14 @@ class PythonRouterManager:
                         return
 
                 if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
-                    self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short}")
+                    self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
                     if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
                                                                                  self.rip_manager.find_route):
                         self.code_output_manager.submit_packet(
                             packet,
                             inbound_iface=inbound_iface,
                             phase="handled",
-                            component="dhcp-in",
+                            component="dhcp-in-router",
                         )
                         return
                     if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
@@ -1191,20 +1235,31 @@ class PythonRouterManager:
                             packet,
                             inbound_iface=inbound_iface,
                             phase="handled",
-                            component="dhcp-out",
+                            component="dhcp-out-router",
                         )
                         return
-
-            if packet.haslayer(ICMP):  # Echo Request
-                self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short}")
-                if self.icmp_manager.handle_packet(packet, inbound_iface):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
+                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router")
+                if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
+                                                                               self.rip_manager.find_route):
                     self.code_output_manager.submit_packet(
                         packet,
                         inbound_iface=inbound_iface,
                         phase="handled",
-                        component="icmp",
+                        component="dhcp-out",
                     )
                     return
+            if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
+                self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short}")
+                handled = self.icmp_manager.handle_packet(packet, inbound_iface)
+                self.code_output_manager.submit_packet(
+                    packet, inbound_iface=inbound_iface,
+                    phase="handled" if handled else "observed",
+                    component="icmp" if packet.haslayer(ICMP) else "icmpv6"
+                )
+                if handled:
+                    return
+
             if packet.haslayer(IGMP):  # Echo Request
                 self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short}")
                 if self.igmp_manager.handle_packet(packet, inbound_iface):
@@ -1213,8 +1268,8 @@ class PythonRouterManager:
                         inbound_iface=inbound_iface,
                         phase="handled",
                         component="igmp",
-                    )
-                    return
+                )
+                return
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.
             if not self.firewall_manager.process_packet(packet):
@@ -1234,7 +1289,7 @@ class PythonRouterManager:
 
 
             if packet.haslayer(DNS) and packet[DNS].qr == 1:
-                if self.dns_manager.handle_response(packet, self._interfaces_config):
+                if self.dns_manager.handle_response(packet, inbound_iface, self._interfaces_config):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns")
                     return
@@ -1248,10 +1303,10 @@ class PythonRouterManager:
                                                  self.arp_manager.resolve,
                                                  self.rip_manager.find_route):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="transport")
+                                                           phase="handled", component="dns-query")
                     return
             if self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface,
-                                                  return_type="void", queue_name="transport"):
+                                                  return_type="all", count_to_call=10, queue_name="transport"):
                 self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                        phase="handled", component="transport")
                 return
@@ -1285,9 +1340,9 @@ class PythonRouterManager:
                 return
             if dst_ip in self._get_all_local_ips():
                 self.function_call_tracker.track(
-                    identifier='DroppedDstIPSame',
+                    identifier="DroppedDstIPSame",
                     threshold=20,
-                    final_message=f"[Router] 🚫 Skipping self-forwarded packet to {dst_ip} (router's own IP).=. Count: {{}}.",
+                    final_message=f"[Router] 🚫 Skipping self-forwarded packet to {dst_ip} (router's own IP). Count: {{}}.",
                     count_message=None,
                 )
 
@@ -1306,9 +1361,9 @@ class PythonRouterManager:
                 phase="forwarding",
                 component="forward",
             )
-            yield_no_gil(0.5)
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
+            yield_no_gil(0.02)
         except Exception:
             self.router_logger.log_message(
                 f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
@@ -1325,57 +1380,79 @@ class PythonRouterManager:
             return
         route = self.rip_manager.get_forwarding_route(dst_ip)
         # --- Multicast Handling (IPv4 and IPv6) ---
+
         if ipaddress.ip_address(dst_ip).is_multicast:
-            self.router_logger.log_message(f"[Router] 🚧 Multicast packet detected for {dst_ip}.")
+            # Compute L2 multicast destination (only needed when we actually send L2)
+            mcast_dst_mac = None
+            ip_bytes = ipaddress.ip_address(dst_ip).packed
 
-            target_mac = None
-
-            if isinstance(ip_layer, IP):
-                # IPv4 Multicast MAC: 01:00:5e: + last 23 bits of multicast IP
-                ip_bytes = ipaddress.ip_address(dst_ip).packed
-                target_mac = "01:00:5e:%02x:%02x:%02x" % (
-                    ip_bytes[1] & 0x7F,  # Mask to get last 7 bits
-                    ip_bytes[2],
-                    ip_bytes[3]
-                )
-            elif isinstance(ip_layer, IPv6):
-                # IPv6 Multicast MAC: 33:33: + last 32 bits of multicast IP
-                ip_bytes = ipaddress.ip_address(dst_ip).packed
-                target_mac = "33:33:%02x:%02x:%02x:%02x" % (
-                    ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]
-                )
-            if target_mac:
-                if packet.haslayer(Ether):
-                    packet[Ether].dst = target_mac
-                else:
-                    next_hop_mac = self.arp_manager.resolve(dst_ip, iface=route["interface"])
-                    # HARDENING: Packet is missing the Ether layer. We'll build one.
-                    self.router_logger.log_message(
-                        f"[Router] 🛠️ Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer."
-                    )
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="hardening",
-                        component="internet",
-                    )
-                    src_mac = self.get_interface_mac(route["interface"])
-                    # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
-                    packet = Ether(src=src_mac, dst=next_hop_mac) / packet
-                packet[Ether].dst = target_mac
-                self.router_logger.log_message(f"[Router] 📢 Forwarding multicast packet to MAC: {target_mac}")
-                self.ethernet_manager.handle_frame(packet, inbound_iface)
-                self.code_output_manager.submit_packet(
-                    packet,
-                    inbound_iface=inbound_iface,
-                    phase="handled",
-                    component="forwarding-multicast",
-                )
-
+            is_v4 = isinstance(ip_layer, IP)
+            if is_v4:
+                # 01:00:5e:0x:xx:xx (lower 23 bits of IPv4)
+                mcast_dst_mac = "01:00:5e:%02x:%02x:%02x" % (ip_bytes[1] & 0x7F, ip_bytes[2], ip_bytes[3])
             else:
-                self.router_logger.log_message(f"[Router] ❌ Could not determine multicast MAC for {dst_ip}. Dropping.")
-            return
+                # 33:33:xx:xx:xx:xx (lower 32 bits of IPv6)
+                mcast_dst_mac = "33:33:%02x:%02x:%02x:%02x" % (ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15])
 
+            # Choose egress (keep your own policy; here we mirror inbound)
+            egress_iface = inbound_iface
+            kind = (self._interfaces_config.get(egress_iface, {}) or {}).get("driver", "").lower()
+
+            # Use L2 path only when the driver is NOT one of WinDivert/rawip/winfw
+            use_l2 = not any(x in kind for x in ("windivert", "rawip", "winfw"))
+
+            if use_l2:
+                # L2 path (Npcap): we must set Ether dst and have a valid src MAC
+                src_mac = self.get_interface_mac(egress_iface)
+                if not src_mac:
+                    self.router_logger.log_message(
+                        f"[Router] ⚠️ {egress_iface} has no MAC (likely misconfigured L2 dev). "
+                        f"Falling back to L3 multicast send."
+                    )
+                else:
+                    # Ensure Ether exists and forward via Ethernet manager
+                    if not packet.haslayer(Ether):
+                        packet = Ether(src=src_mac, dst=mcast_dst_mac) / packet
+                    else:
+                        packet[Ether].src = src_mac
+                        packet[Ether].dst = mcast_dst_mac
+
+                    self.router_logger.log_message(f"[Router] 📢 L2 multicast → {mcast_dst_mac} on {egress_iface}")
+                    self.ethernet_manager.handle_frame(packet, inbound_iface)
+                    # (leave your code_output_manager call if you still want it)
+                    # self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+                    #                                       phase="handled", component="forwarding-multicast-l2")
+                    return
+
+            # ---- L3 path (no WinDivert): inject using Scapy's send() ----
+            # Strip Ether if present (could be from capture side)
+            if packet.haslayer(Ether):
+                packet = packet.payload  # drop L2
+
+            # Optional: ensure TTL/Hop-Limit sane for multicast forwarding
+            try:
+                if is_v4 and hasattr(packet, 'ttl'):
+                    packet.ttl = max(1, int(packet.ttl or 1))
+                elif not is_v4 and hasattr(packet, 'hlim'):
+                    packet.hlim = max(1, int(packet.hlim or 1))
+            except Exception:
+                pass
+
+            try:
+                # Scapy will craft/link-layer under the hood via Npcap/WinPcap
+                send(packet, iface=egress_iface, verbose=False)
+                self.router_logger.log_message(
+                    f"[Router] 📡 L3 multicast inject to {dst_ip} on {egress_iface} (Scapy send)"
+                )
+            except Exception as e:
+                self.router_logger.log_message(
+                    f"[Router] ❌ L3 multicast inject failed on {egress_iface} via Scapy: {e}"
+                )
+
+            # (leave your code_output_manager call if you still want it)
+            # self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+            #                                       phase="handled", component="forwarding-multicast-l3")
+            return
         src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
         sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(
@@ -1404,7 +1481,7 @@ class PythonRouterManager:
 
         if ipaddress.ip_address(dst_ip).is_global:
             selected_iface = None
-            if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
+            if initial_outbound_iface in self._pick_lag_member(packet, inbound_iface, "MyLANAggregation"):
                 selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
                 self.code_output_manager.submit_packet(
                     packet,
@@ -1418,42 +1495,17 @@ class PythonRouterManager:
                 self.router_logger.log_message("[Router] ❌ No outbound interface. Dropping packet.")
                 return
 
-            # Attempt normal ARP resolution
-            next_hop_mac = self.arp_manager.resolve(dst_ip, iface=selected_iface)
 
-            # Retry with custom ARP request if no MAC
-            if not next_hop_mac:
-                self.router_logger.log_message(f"[ARP] 💤 Retrying with direct ARP for {dst_ip}")
-                next_hop_mac = self.arp_manager.send_custom_arp_request(dst_ip, iface=selected_iface)
+            next_hop_mac = self.arp_manager.resolve(next_hop_ip, iface=selected_iface)
 
-                if not next_hop_mac:
-                    self.router_logger.log_message(f"[ARP] 🧲 Attempting fallback ping to populate OS ARP for {dst_ip}")
-                    self.trigger_arp_via_ping(dst_ip)
-                    next_hop_mac = self.arp_manager.fallback_mac_from_os_cache(dst_ip)
-                    if not next_hop_mac:
-                        self.router_logger.log_message(f"[ARP] 🚫 MAC for {dst_ip} not found. Dropping.")
-                        if self.arp_manager.notification_manager:
-                            event_data = {
-                                "event": "MAC Resolution Failure",
-                                "message": f"Unable to resolve MAC address for {dst_ip} on {selected_iface.split('_')[-1]}",
-                                "iface": selected_iface,
-                                "timestamp": time.time(),
-                                "emojis": ["🚫", "🧲", "📡"]
-                            }
-                            self.notification_manager.send_notification(event_data)
-                        return
+
+
             # Check for Keep-Alive requests first
             if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
                 self.nat_manager.handle_keep_alive(packet)
                 return
 
             self.nat_manager.translate_outbound(packet)
-
-            # Gratuitous ARP for the translated public IP (only once per IP/interface ideally)
-            translated_ip = self.nat_manager.public_ip
-            translated_mac = self.get_interface_mac(selected_iface)
-            if translated_ip and translated_mac:
-                self.arp_manager.send_gratuitous_arp(translated_ip, translated_mac, selected_iface)
 
             # Rewrite MACs
             if packet.haslayer(Ether):
@@ -1480,7 +1532,7 @@ class PythonRouterManager:
             self.router_logger.log_message(
                 RouterRandomMessages(
                     name="Router",
-                    message=f"Internet-bound packet {dst_ip} to {selected_iface.split('_')[-1]}",
+                    message=f"Internet-bound packet {dst_ip} to {selected_iface.split('_')[-1]}. IP for gateway: {next_hop_ip}",
                     emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗"]
                 )
             )
@@ -1645,6 +1697,7 @@ class PythonRouterManager:
         if packet.haslayer(TCP): del packet[TCP].chksum
         if packet.haslayer(UDP): del packet[UDP].chksum
 
+
         # --- [12] Send Packet ---
         self.packet_writer.queue_packet(packet, initial_outbound_iface)
         deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
@@ -1681,11 +1734,12 @@ class PythonRouterManager:
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
 
+            self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
             self._enable_nat_forwarding()
+            self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
             self.nat_manager.set_router_internal_ip("192.168.1.1")
-
             self.notification_manager = NotificationManager(
                 self.router_logger,
                 self.NOTIFICATION_TARGET_IP,
@@ -1693,6 +1747,8 @@ class PythonRouterManager:
                 self.interface_in_full_name
             )
             self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
+            self._inject_dependencies()
+
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
             self.parallel_python.inject_into(self.transport_manager.transport_dhcp._active)
 
@@ -1724,6 +1780,7 @@ class PythonRouterManager:
 
 
             self.syn_scanner = SYNScanner(
+                sniffer=self.sniffer,
                 router_logger=self.router_logger,
                 packet_writer=self.packet_writer,
                 interfaces_config=self._interfaces_config,
@@ -1733,7 +1790,7 @@ class PythonRouterManager:
                     ("8.8.8.8", [53, 80]),
                     ("1.1.1.1", [443]),
                 ],scan_interval=300)
-            self._inject_dependencies()
+
 
             self.syn_scanner.start()
             self.rip_manager.start()
@@ -1779,7 +1836,7 @@ class PythonRouterManager:
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            start_cpu_boost(threads=len(pcores), target_util=0.50, cores=pcores, pin_per_thread=True, unhinge=True)
+            start_cpu_boost(threads=len(pcores), target_util=0.25, cores=pcores, pin_per_thread=True, unhinge=True)
             if use_hyperv:
                 self.hyperv_manager.start()
                 self.windivert_manager.start()
@@ -1844,6 +1901,28 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
+    def _pick_lag_member(self, packet, inbound_iface, candidate_iface: str) -> str:
+        try:
+            groups = self.lag_manager.get_lag_members() or {}  # may be None/empty
+        except Exception as e:
+            self.router_logger.log_message(f"[LAG] ⚠️ get_lag_members() error: {e}")
+            return candidate_iface
+
+        # groups: {group_name: [ifaceA, ifaceB, ...]}
+        for group_name, members in (groups.items() if isinstance(groups, dict) else []):
+            members_set = set(members or [])
+            if candidate_iface in members_set:
+                try:
+                    chosen = self.lag_manager.get_member_interface(group_name, packet)
+                    if chosen:
+                        self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+                                                               phase="interface", component="lag")
+                        return chosen
+                except Exception as e:
+                    self.router_logger.log_message(f"[LAG] ⚠️ get_member_interface({group_name}) error: {e}")
+                # If selection fails, fall back to candidate
+                break
+        return candidate_iface
 
     def _eth_type_or_none(self, pkt):
         if pkt.haslayer(Ether):
