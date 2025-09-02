@@ -24,7 +24,6 @@ import requests
 from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from scapy.all import send, sr1
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.igmp import IGMP
 from scapy.layers.dhcp import DHCP
@@ -41,6 +40,8 @@ from scapy.packet import Packet
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict
 import xml.etree.ElementTree as ET
+
+from scapy.sendrecv import sr1, send
 from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
@@ -159,26 +160,6 @@ class PythonRouterManager:
         self.broadcast_manager = BroadcastManager(self.router_logger)
         self.windivert_manager = WinDivertManager(self, self.code_output_manager)
         self.parallel_python = ParallelPythonTool(router_logger)
-        self.parallel_python.inject_into(self.transport_manager)
-        self.parallel_python.inject_into(self.transport_manager.transport_rtp)
-        self.parallel_python.inject_into(self.transport_manager.transport_dns, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_ssdp, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_dhcp)
-        self.parallel_python.inject_into(self.transport_manager.transport_quic)
-        self.parallel_python.inject_into(self.transport_manager.transport_http)
-        self.parallel_python.inject_into(self.transport_manager.transport_ssh)
-        self.parallel_python.inject_into(self.transport_manager.transport_ftp)
-        self.parallel_python.inject_into(self.transport_manager.transport_rdp)
-        self.parallel_python.inject_into(self.transport_manager.transport_ssh)
-        self.parallel_python.inject_into(self.transport_manager.transport_monero)
-        self.parallel_python.inject_into(self.transport_manager.transport_kerberos, 'log')
-        self.parallel_python.inject_into(self.transport_manager.transport_ipv6, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_overlay)
-        self.parallel_python.inject_into(self.transport_manager.transport_tcp_ephemeral, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_udp_ephemeral, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_steam, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_tcp_high_Level, "log")
-        self.parallel_python.inject_into(self.transport_manager.transport_https)
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1305,8 +1286,7 @@ class PythonRouterManager:
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns-query")
                     return
-            if self.parallel_python.run_parallel(self.transport_manager.handle_packet, packet, inbound_iface,
-                                                  return_type="all", count_to_call=10, queue_name="transport"):
+            if self.transport_manager.handle_packet(packet, inbound_iface):
                 self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                        phase="handled", component="transport")
                 return
@@ -1396,62 +1376,52 @@ class PythonRouterManager:
 
             # Choose egress (keep your own policy; here we mirror inbound)
             egress_iface = inbound_iface
-            kind = (self._interfaces_config.get(egress_iface, {}) or {}).get("driver", "").lower()
+            driver_kind = str((self._interfaces_config.get(egress_iface, {}) or {}).get("driver", "")).lower()
 
-            # Use L2 path only when the driver is NOT one of WinDivert/rawip/winfw
-            use_l2 = not any(x in kind for x in ("windivert", "rawip", "winfw"))
+            # L2 is only OK when the driver is NOT windivert/rawip/winfw AND we have a MAC
+            l2_driver_ok = not any(x in driver_kind for x in ("windivert", "rawip", "winfw"))
+            src_mac = self.get_interface_mac(egress_iface) if l2_driver_ok else None
+            use_l2 = bool(l2_driver_ok and src_mac)
 
             if use_l2:
-                # L2 path (Npcap): we must set Ether dst and have a valid src MAC
-                src_mac = self.get_interface_mac(egress_iface)
-                if not src_mac:
-                    self.router_logger.log_message(
-                        f"[Router] ⚠️ {egress_iface} has no MAC (likely misconfigured L2 dev). "
-                        f"Falling back to L3 multicast send."
-                    )
+                # L2 path (Npcap): set Ether dst and ensure a valid src MAC
+                if not packet.haslayer(Ether):
+                    packet = Ether(src=src_mac, dst=mcast_dst_mac) / packet
                 else:
-                    # Ensure Ether exists and forward via Ethernet manager
-                    if not packet.haslayer(Ether):
-                        packet = Ether(src=src_mac, dst=mcast_dst_mac) / packet
-                    else:
-                        packet[Ether].src = src_mac
-                        packet[Ether].dst = mcast_dst_mac
+                    packet[Ether].src = src_mac
+                    packet[Ether].dst = mcast_dst_mac
 
-                    self.router_logger.log_message(f"[Router] 📢 L2 multicast → {mcast_dst_mac} on {egress_iface}")
-                    self.ethernet_manager.handle_frame(packet, inbound_iface)
-                    # (leave your code_output_manager call if you still want it)
-                    # self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                    #                                       phase="handled", component="forwarding-multicast-l2")
-                    return
+                self.router_logger.log_message(f"[Router] 📢 L2 multicast → {mcast_dst_mac} on {egress_iface}")
+                self.ethernet_manager.handle_frame(packet, inbound_iface)
+                return
 
-            # ---- L3 path (no WinDivert): inject using Scapy's send() ----
+            # ---- L3 path (WinDivert/rawip/winfw/unknown-MAC): inject IP packet ----
             # Strip Ether if present (could be from capture side)
             if packet.haslayer(Ether):
                 packet = packet.payload  # drop L2
 
-            # Optional: ensure TTL/Hop-Limit sane for multicast forwarding
+            # Ensure TTL/Hop-Limit is sane for multicast forwarding
             try:
-                if is_v4 and hasattr(packet, 'ttl'):
-                    packet.ttl = max(1, int(packet.ttl or 1))
-                elif not is_v4 and hasattr(packet, 'hlim'):
-                    packet.hlim = max(1, int(packet.hlim or 1))
+                if is_v4 and IP in packet:
+                    packet[IP].ttl = max(1, int(getattr(packet[IP], "ttl", 1) or 1))
+                elif not is_v4 and IPv6 in packet:
+                    packet[IPv6].hlim = max(1, int(getattr(packet[IPv6], "hlim", 1) or 1))
             except Exception:
                 pass
 
             try:
-                # Scapy will craft/link-layer under the hood via Npcap/WinPcap
-                send(packet, iface=egress_iface, verbose=False)
+                egress_iface = self.outbound_load_balancer.get_best_interface()
+                # Scapy will send the L3 packet out the given iface. For WinDivert, this
+                # remains L3-only (no MAC), which is exactly what we want here.
+                self.sniffer.send(packet, iface=egress_iface, verbose=False)
                 self.router_logger.log_message(
-                    f"[Router] 📡 L3 multicast inject to {dst_ip} on {egress_iface} (Scapy send)"
+                    f"[Router] 📡 L3 multicast inject to {dst_ip} on {egress_iface} "
+                    f"(driver={driver_kind or 'unknown'})"
                 )
             except Exception as e:
                 self.router_logger.log_message(
-                    f"[Router] ❌ L3 multicast inject failed on {egress_iface} via Scapy: {e}"
+                    f"[Router] ❌ L3 multicast inject failed on {egress_iface} (driver={driver_kind or 'unknown'}): {e}"
                 )
-
-            # (leave your code_output_manager call if you still want it)
-            # self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-            #                                       phase="handled", component="forwarding-multicast-l3")
             return
         src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
@@ -1746,7 +1716,7 @@ class PythonRouterManager:
                 self.NOTIFICATION_TARGET_PORT,
                 self.interface_in_full_name
             )
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self.router_logger)
+            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self._interfaces_config, self.router_logger)
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
@@ -1832,11 +1802,11 @@ class PythonRouterManager:
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
 
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
-            self.parallel_python.increase_ram_usage(2400)
+            self.parallel_python.increase_ram_usage(3000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
-            start_cpu_boost(threads=len(pcores), target_util=0.25, cores=pcores, pin_per_thread=True, unhinge=True)
+            start_cpu_boost(threads=len(pcores), target_util=0.75, cores=pcores, pin_per_thread=True, unhinge=True)
             if use_hyperv:
                 self.hyperv_manager.start()
                 self.windivert_manager.start()
@@ -2574,25 +2544,65 @@ class PythonRouterManager:
             for config in self._interfaces_config.values()
             if "ip_addr" in config
         }
-    def get_interface_mac(self, iface_full_name: str) -> str | None:
+
+    def get_interface_mac(self, iface_full_name: str) -> str:
         """
-        Returns the MAC address of a given interface using Scapy's get_if_hwaddr().
-        Args:
-            iface_full_name (str): The full Scapy name of the interface.
-        Returns:
-            str | None: The MAC address if found, else None.
+        Always returns a usable MAC address for the given interface.
+        - Prefers Scapy's get_if_hwaddr()
+        - Falls back to OS interface lists (Windows / netifaces)
+        - Final fallback: generates a deterministic synthetic MAC
+          (locally administered, unicast, stable per interface name)
         """
+        mac = None
+
+        # --- Try Scapy ---
         try:
+            from scapy.all import get_if_hwaddr
             mac = get_if_hwaddr(iface_full_name)
             if mac and mac.lower() != "00:00:00:00:00:00":
-                return mac
-            else:
-                self.router_logger.log_message(
-                    f"[Router] ⚠️ MAC address for '{iface_full_name}' appears invalid: {mac}")
-                return None
-        except Exception as e:
-            self.router_logger.log_message(f"[Router] ❌ Failed to get MAC for '{iface_full_name}': {e}")
-            return None
+                return mac.lower()
+        except Exception:
+            pass
+
+        # --- Try Windows API ---
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            for iface in get_windows_if_list():
+                if iface_full_name in (
+                        iface.get("name"), iface.get("win_name"), iface.get("friendlyname"),
+                        iface.get("description"), iface.get("guid")
+                ):
+                    mac = (iface.get("mac") or "").lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac
+        except Exception:
+            pass
+
+        # --- Try netifaces ---
+        try:
+            import netifaces as ni
+            if iface_full_name in ni.interfaces():
+                addrs = ni.ifaddresses(iface_full_name).get(ni.AF_LINK, [{}])
+                if addrs and "addr" in addrs[0]:
+                    mac = addrs[0]["addr"].lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac
+        except Exception:
+            pass
+
+        # --- Last resort: generate a synthetic MAC ---
+        h = abs(hash(iface_full_name)) & 0xFFFFFFFFFFFF
+        fake_mac = "02:%02x:%02x:%02x:%02x:%02x" % (
+            (h >> 32) & 0xFF,
+            (h >> 24) & 0xFF,
+            (h >> 16) & 0xFF,
+            (h >> 8) & 0xFF,
+            h & 0xFF,
+        )
+        self.router_logger.log_message(
+            f"[Router] ⚠️ Synthesized MAC {fake_mac} for iface '{iface_full_name}'"
+        )
+        return fake_mac
     def create_l2_bridge(self, bridge_name: str, member_iface_full_names: List[str]) -> bool:
         """
         Public method to create a Layer 2 bridge.
@@ -2769,7 +2779,7 @@ class PacketManager:
             if src_ip: packet.src = src_ip
             packet /= ICMP()
 
-            response = sr1(packet, timeout=timeout, verbose=0)
+            response = self.sniffer.sr1(packet, timeout=timeout, verbose=0)
 
             if response is None: return 'TIMEOUT', None
             if response.haslayer(ICMP) and response.getlayer(ICMP).type == 0: return 'REPLY', response

@@ -6112,7 +6112,7 @@ class ARPManager:
         ans = None
         for _ in range(self.arp_probe_retries):
             try:
-                ans = srp1(req, iface=iface, timeout=self.arp_probe_timeout, verbose=0)
+                ans = srp1(req, timeout=self.arp_probe_timeout, verbose=0)
             except Exception:
                 ans = None
             if ans and ans.haslayer(ARP):

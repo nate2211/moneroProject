@@ -25,7 +25,8 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6EchoRequest, ICMPv6TimeExceeded, \
     ICMPv6ParamProblem, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6Unknown, ICMPv6PacketTooBig, IPv6ExtHdrHopByHop, ICMPv6ND_RA, \
-    ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo, ICMPv6ND_RS, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment
+    ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo, ICMPv6ND_RS, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment, \
+    getmacbyip6
 from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
 from scapy.libs.rfc3961 import Key
 from scapy.packet import Packet, Raw, NoPayload
@@ -6508,49 +6509,25 @@ class TransportManager:
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles Monero P2P traffic on port 18080."""
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-monero"
-        )
 
     def _handle_high_server_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_tcp_high_Level.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_tcp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Steam TCP (CM/content/friends; 27014–27050). Observation only."""
         self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="steam-tcp"
-        )
     def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_http.handle(packet, src_ip, dst_ip, sport, dport)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-http"
-        )
     def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_https.handle(packet, inbound_iface)
         self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-https"
-        )
     def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-ssh"
-        )
     def _handle_ftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-ftp"
-        )
     def _handle_rdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-rdp"
-        )
     def _handle_tcp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_tcp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="tcp-ephemeral"
-        )
     # --------------------- Main packet handler ------------------------
     def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
         """
@@ -6661,32 +6638,20 @@ class TransportManager:
         Observation only.
         """
         self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=iface_short, phase="handled", component="steam-udp"
-        )
     def _handle_udp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_udp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-ephermeral"
-        )
     def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DNS packets."""
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-dns"
-        )
+
     def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DHCP packets."""
         self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-dhcp"
-        )
+
     def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for QUIC packets."""
         self.transport_quic.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-quic"
-        )
+
     def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for NTP packets."""
         raw_data = bytes(packet[Raw].load)
@@ -6766,30 +6731,20 @@ class TransportManager:
     def _handle_overlay_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for ZeroTier-like packets on UDP port 9993."""
         self.transport_overlay.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-overlay"
-        )
     def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for SSDP/UPnP packets on UDP port 1900."""
         self.transport_ssdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-ssdp"
-        )
+
     def _handle_ws_discovery_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
         self.logger.log_message(
             f"[Transport][🚀 UDP][🔍 WS-Discovery] WS-Discovery packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
             "Likely for dynamic device discovery."
         )
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-ephermeral"
-        )
+
     def _handle_kerberos_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
         self.transport_kerberos.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        self.code_output_manager.submit_packet(
-            packet, inbound_iface=inbound_iface, phase="handled", component="udp-kerberos"
-        )
 
     def _feed_to_tls_manager(self, packet, src_ip, dst_ip, sport, dport, *, reason: str = "auto", log: bool = True):
         from scapy.packet import Raw
@@ -8042,9 +7997,9 @@ class PacketWriter:
             self.logger.log_message("[PacketWriter] ⚠️ Error: Interface name is not specified.")
             return
         if not packet.haslayer(Ether):
-            self.logger.log_message(
-                f"[PacketWriter] 🚫 Dropped packet: Missing Ethernet layer. Summary: {packet.summary()}")
-            return
+            packet = self._ensure_l2_with_arp_manager(packet, interface)
+            if packet is None:
+                return
 
         # Final guard: fix/validate Ether src/dst before send
         try:
@@ -8201,6 +8156,83 @@ class PacketWriter:
 
         self.packet_queue.put((packet, final_iface))
 
+    def _is_ipv4_multicast(self,ip: str) -> bool:
+        try:
+            first = int(ip.split(".")[0])
+            return 224 <= first <= 239
+        except Exception:
+            return False
+
+    def _ensure_l2_with_arp_manager(self, packet, final_iface: str):
+        """
+        If the packet has no Ether layer, create one:
+          - src = interface MAC
+          - dst = resolved via ARPManager for IPv4, or mapped for broadcast/multicast
+          - IPv6: map multicast, try NDP (if available), else drop (safe)
+        Returns the (possibly wrapped) packet, or None if we can’t safely send.
+        """
+        if packet.haslayer(Ether):
+            return packet
+
+        # interface MAC for source
+        try:
+            src_mac = self._normalize_mac(get_if_hwaddr(final_iface))
+        except Exception:
+            src_mac = None
+        if not src_mac:
+            self.logger.log_message(f"[PacketWriter] ❌ No interface MAC for '{final_iface}' to synthesize L2.")
+            return None
+
+        dst_mac = None
+
+        # IPv4 path
+        if IP in packet:
+            dip = packet[IP].dst
+
+            # broadcast
+            if dip == "255.255.255.255":
+                dst_mac = "ff:ff:ff:ff:ff:ff"
+            # multicast
+            elif self._is_ipv4_multicast(dip):
+                dst_mac = self._ipv4_mcast_mac(dip)
+            else:
+                # unicast: pick next-hop, resolve via ARPManager
+                nh_ip, _af = self._infer_next_hop(final_iface, packet)  # already in your class
+                nh_ip = nh_ip or dip
+                if self.arp_manager:
+                    mac = self.arp_manager.resolve(nh_ip, final_iface)
+                else:
+                    mac = None
+                dst_mac = self._normalize_mac(mac) if mac else None
+                if not dst_mac:
+                    self.logger.log_message(f"[PacketWriter] 🚫 ARP unresolved for {nh_ip} on {final_iface}.")
+                    return None
+
+        # IPv6 path
+        elif IPv6 in packet:
+            dip6 = packet[IPv6].dst
+            if dip6.lower().startswith("ff"):  # multicast
+                dst_mac = self._ipv6_mcast_mac(dip6)
+            else:
+                # Try scapy NDP helper if present. Otherwise, we avoid guessing.
+                mac6 = None
+                if getmacbyip6:
+                    try:
+                        mac6 = getmacbyip6(dip6, iface=final_iface)
+                    except Exception:
+                        mac6 = None
+                if mac6:
+                    dst_mac = self._normalize_mac(mac6)
+                else:
+                    self.logger.log_message(
+                        f"[PacketWriter] 🚫 No IPv6 NDP resolver available for {dip6} on {final_iface}.")
+                    return None
+        else:
+            self.logger.log_message("[PacketWriter] 🚫 No IP/IPv6 layer; cannot synthesize L2.")
+            return None
+
+        ether = Ether(src=src_mac, dst=dst_mac)
+        return ether / packet
 class ForwardingManager:
     """
     Tracks recently forwarded flows and considers them duplicates only after

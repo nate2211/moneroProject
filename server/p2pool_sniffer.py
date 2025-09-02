@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import ipaddress
 import os
@@ -24,11 +25,7 @@ from scapy.layers.mobileip import MobileIP
 from scapy.layers.ppp import PPP
 from scapy.layers.rip import RIP
 from scapy.layers.rtp import RTP
-from scapy.main import load_contrib
-from scapy.all import send as scapy_send, sr1 as scapy_sr1
-from scapy.sendrecv import sr1, send
 
-# Import all functionalities from the Scapy library to parse packets.
 try:
     from scapy.all import ShortField, ByteField, IP6Field, Packet, load_layer, TCPSession
     from scapy.contrib.igmp import IGMP
@@ -185,9 +182,10 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
-    def __init__(self, arp_manager, rip_manager, notification_manager=None, logger=None):
+    def __init__(self, arp_manager, rip_manager, notification_manager=None, _interfaces_config = None, logger=None, ):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
+        self._interfaces_config = _interfaces_config
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
@@ -514,69 +512,108 @@ class SnifferSoftware:
         return f"DLT({dlt})"
 
     # --- NEW: Windows-aware helpers ---
-    def _send_l3_loopback(
-            self,
-            packet: Packet,
-            timeout: float = 2.0,
-            expect_reply: bool = False
-    ) -> Optional[Packet]:
+    def _send_l3_loopback(self, packet, *, expect_reply: bool = False, timeout: float = 2.0,
+                         iface: Optional[str] = None, logger=None):
         """
-        Send an L3 packet over loopback, optionally await a single reply.
-        Logs detailed metadata about what was attempted.
-        """
-        try:
-            # --- 1) Strip any Ethernet header (force L3) ---
-            if packet.haslayer(Ether):
-                packet = packet[Ether].payload
+        Send an L3 (IP/IPv6) packet via the OS loopback and optionally wait for one reply.
 
-            # --- 2) Ensure IP/IPv6 is present ---
-            ip = packet.getlayer(IP) or packet.getlayer(IPv6)
+        Args:
+            packet: A Scapy Packet. If it has an Ether layer, it will be stripped.
+            expect_reply: If True, waits for a single reply and returns it; otherwise returns None.
+            timeout: sr1() timeout in seconds when expect_reply=True.
+            iface: Loopback interface name to use. If None, auto-detects (lo/lo0/Npcap Loopback Adapter/conf.iface).
+            logger: Optional object with .log_message(str). If not provided, falls back to print().
+
+        Returns:
+            The reply Packet (when expect_reply=True and a reply is received), or None.
+        """
+
+
+        # --- import scapy locally to keep function self-contained --
+
+        try:
+            pkt = packet
+
+            # 1) Strip any L2 header so we always send at L3.
+            if pkt.haslayer(Ether):
+                pkt = pkt[Ether].payload
+
+            # 2) Ensure we have IP or IPv6.
+            ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
             if ip is None:
                 raise ValueError("packet has no IP/IPv6 layer")
 
-            # --- 3) Resolve loopback iface robustly ---
-            iface = getattr(conf, "loopback_interface", None) or getattr(conf, "loopback_name", None)
-            if not iface:
-                candidates = ["lo", "lo0", "Npcap Loopback Adapter"]
-                ifaces = set(get_if_list())
-                iface = next((c for c in candidates if c in ifaces), conf.iface)
+            # 3) Pick a loopback interface robustly.
+            loop_iface = iface
+            if not loop_iface:
+                loop_iface = getattr(conf, "loopback_interface", None) or getattr(conf, "loopback_name", None)
 
-            # --- 4) Build summary for logging ---
-            pkt_summary = packet.summary()
-            layer_info = ip.__class__.__name__
-            src = getattr(ip, "src", "?")
-            dst = getattr(ip, "dst", "?")
+            if not loop_iface:
+                candidates = ("lo", "lo0", "Npcap Loopback Adapter")
+                with contextlib.suppress(Exception):
+                    ifaces = set(get_if_list())
+                    for cand in candidates:
+                        if cand in ifaces:
+                            loop_iface = cand
+                            break
+                # last resort: whatever Scapy is using
+                if not loop_iface:
+                    loop_iface = conf.iface
 
-            # --- 5) Emit log before send ---
+            # 4) Normalize src/dst to loopback addresses if missing/unspecified, and build a tight BPF.
+            if ip.version == 4:
+                if getattr(ip, "src", "0.0.0.0") in ("0.0.0.0", "", None):
+                    pkt[IP].src = "127.0.0.1"
+                if getattr(ip, "dst", "0.0.0.0") in ("0.0.0.0", "", None):
+                    pkt[IP].dst = "127.0.0.1"
+                loop_host = "127.0.0.1"
+                bpf = f"host {loop_host} and (icmp or tcp or udp)"
+                layer_name = "IP"
+                src = pkt[IP].src
+                dst = pkt[IP].dst
+            else:
+                if getattr(ip, "src", "::") in ("::", "", None):
+                    pkt[IPv6].src = "::1"
+                if getattr(ip, "dst", "::") in ("::", "", None):
+                    pkt[IPv6].dst = "::1"
+                loop_host = "::1"
+                bpf = f"host {loop_host} and (icmp6 or tcp or udp)"
+                layer_name = "IPv6"
+                src = pkt[IPv6].src
+                dst = pkt[IPv6].dst
+
+            # 5) Log what we’re about to do.
             self.logger.log_message(
-                f"[Sniffer] Loopback L3 send | iface={iface} | "
-                f"layer={layer_info} | src={src} -> dst={dst} | "
-                f"expect_reply={expect_reply} | packet={pkt_summary}"
+                f"[Loopback] L3 send | iface={loop_iface} | layer={layer_name} | "
+                f"{src} → {dst} | expect_reply={expect_reply} | pkt={pkt.summary()}"
             )
 
-            # --- 6) Send (and maybe receive) ---
+            # 6) Send (and maybe receive) on loopback.
             if expect_reply:
-                reply = sr1(packet, timeout=float(timeout),iface=iface,verbose=0)
+                # Use a tight BPF so we don’t pick up unrelated traffic.
+                try:
+                    reply = self.sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0, filter=bpf)
+                except TypeError:
+                    # Some builds don’t support 'filter' kw; fall back without it.
+                    reply = self.sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0)
+
                 if reply:
+                    rep_ip = reply.getlayer(IP) or reply.getlayer(IPv6)
                     self.logger.log_message(
-                        f"[Sniffer] Loopback L3 reply received | iface={iface} | "
-                        f"src={reply[IP].src if reply.haslayer(IP) else '?'} -> "
-                        f"dst={reply[IP].dst if reply.haslayer(IP) else '?'} | "
-                        f"packet={reply.summary()}"
-                    )
+                        f"[Loopback] Reply | iface={loop_iface} | {getattr(rep_ip, 'src', '?')} → {getattr(rep_ip, 'dst', '?')} | {reply.summary()}")
                 else:
-                    self.logger.log_message(
-                        f"[Sniffer] Loopback L3 no reply (timeout={timeout}s) | iface={iface}"
-                    )
+                    self.logger.log_message(f"[Loopback] No reply (timeout={timeout}s) | iface={loop_iface}")
                 return reply
             else:
-                send(packet, verbose=0)
+                self.send(pkt, verbose=0, iface=loop_iface)
                 return None
 
         except Exception as e:
-            self.logger.log_message(
-                f"[Sniffer] Loopback L3 send error for packet '{packet.summary()}': {e}"
-            )
+            # Best-effort summary without assuming Ether is present.
+            with contextlib.suppress(Exception):
+                self.logger.log_message(f"[Loopback] ❌ Error for packet '{pkt.summary()}': {e}")
+            if 'pkt' not in locals():
+                self.logger.log_message(f"[Loopback] ❌ Error before build: {e}")
             return None
     def _normalize_pcap_name(self, name: str) -> str:
         # collapse backslashes and trim whitespace
