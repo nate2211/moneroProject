@@ -11,7 +11,7 @@ import struct
 import traceback
 from collections import defaultdict, deque
 from collections.abc import Set
-from typing import Optional, List, Any, Callable, Union
+from typing import Optional, List, Any, Callable, Union, OrderedDict
 import ipaddress
 import threading
 import json
@@ -2107,6 +2107,680 @@ class TransportInspectionManager:
         for k in stale:
             self._cooldown_until.pop(k, None)
         self._last_gc = now
+class TransportScraperManager:
+    """
+    Budgeted, packet-wide scraper (TCP/UDP) for extracting useful, small facts.
+    - Fast hot-path, zero blocking work
+    - Global token bucket + per-flow cooldown to avoid log floods
+    - Tiny per-flow reassembly (c2s/s2c) with hard caps
+    - Cheap, best-effort extractors for HTTP, TLS(CH SNI/ALPN/JA3-lite), DNS, QUIC, SSH/RDP banners, etc.
+    - Emits structured records via an exporter callback (or single-line logs if none)
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+        snapshot_metrics() -> dict
+
+    Integration:
+        In TransportManager._handle_tcp_packet / _handle_udp_packet, call:
+            self.transport_scraper.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
+    """
+
+    # ---------- Tunables ----------
+    LOG_RPS            = 0.2         # avg records/second globally
+    LOG_BURST          = 5          # global burst
+    FLOW_COOLDOWN_S    = 60.0         # min seconds between emits per 5-tuple dir
+    FLOW_TTL_S         = 15 * 60      # idle flow eviction
+    FLOW_SOFT_MAX      = 80_000       # soft cap on flows
+    GC_PERIOD_S        = 30.0
+
+    TCP_REASM_CAP      = 8 * 1024     # per-direction reassembly cap
+    TCP_HEAD_CAP       = 4096         # cap for header scanning per emit
+    TLS_REC_LEN_MAX    = 18432
+    BYTES_PREVIEW      = 48           # small ascii hex preview for logging
+
+    # Fast guesses
+    TLS_SERV_PORTS     = {443, 8443, 9443, 853, 993, 995, 465, 8883, 10443, 2083, 2087, 2096}
+    QUIC_SERV_PORTS    = {443, 853, 784, 8530, 8443}
+    DNS_PORTS          = {53}
+    WS_DISC_PORT       = 3702
+    SSDP_PORT          = 1900
+    NTP_PORT           = 123
+    NBNS_PORT = 137
+    KERBEROS_PORT = 88
+    ZT_PORT = 9993
+    _HTTP_START_RE = re.compile(
+        rb"^(OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/\d\.\d\r?\n",
+        re.I
+    )
+
+    class _TokenBucket:
+        __slots__ = ("cap", "rate", "tokens", "last")
+        def __init__(self, cap: int, rate: float):
+            self.cap = int(max(1, cap))
+            self.rate = float(max(0.1, rate))
+            self.tokens = float(self.cap)
+            self.last = time.time()
+
+        def _refill(self):
+            now = time.time(); dt = now - self.last
+            if dt > 0:
+                self.tokens = min(self.cap, int(self.tokens + dt * self.rate))
+                self.last = now
+        def take(self, cost=1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def __init__(self, router_logger, exporter=None):
+        """
+        exporter: Optional[Callable[[dict], None]]
+          Receives a small structured dict per emission. If None, falls back to logger lines.
+        """
+        self.log = router_logger
+        self._tb = self._TokenBucket(self.LOG_BURST, self.LOG_RPS)
+        self._cooldown_until: dict[tuple, float] = {}
+        self._flows: dict[tuple, dict] = {}
+        self._last_gc = time.time()
+        self._exporter = exporter
+        self._metrics = {
+            "emits": 0, "suppressed_tokens": 0, "flows": 0,
+            "gc_evicted": 0, "errors": 0,
+            "hits_http": 0, "hits_tls": 0, "hits_dns": 0, "hits_quic": 0,
+            "hits_ssh": 0, "hits_rdp": 0, "hits_other": 0
+        }
+
+        try:
+            self.log.log_message("[Transport][🧲 Scraper] Manager ready.")
+        except Exception:
+            pass
+
+    # ---------- Public ----------
+    def handle(self, packet: "Packet", src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if not ip_layer:
+                return False
+
+            proto = None
+            if packet.haslayer(TCP):
+                proto = "tcp"
+            elif packet.haslayer(UDP):
+                proto = "udp"
+            else:
+                return False
+
+            key = self._flow_key(src_ip, sport, dst_ip, dport, inbound_iface)
+            flow = self._flows.get(key)
+            if not flow:
+                flow = self._new_flow(src_ip, sport, dst_ip, dport, inbound_iface, proto)
+                self._flows[key] = flow
+                self._metrics["flows"] = len(self._flows)
+
+            flow["last_seen"] = time.time()
+            flow["pkts"] += 1
+
+            if proto == "tcp":
+                self._scrape_tcp(packet, flow)
+            else:
+                self._scrape_udp(packet, flow)
+
+            self._maybe_gc()
+            return True
+        except Exception:
+            self._metrics["errors"] += 1
+            return False
+
+    def snapshot_metrics(self) -> dict:
+        return dict(self._metrics)
+
+    # ---------- TCP ----------
+    def _scrape_tcp(self, pkt, f: dict):
+        tcp = pkt[TCP]
+        flags = tcp.sprintf("%TCP.flags%")
+        payload = self._get_payload(pkt)
+        f["last_flags"] = flags
+        f["bytes"] += len(payload)
+        direction = self._dir_from_pkt(f, tcp)
+
+        # (existing reassembly / extractors...)
+
+        # NEW: emit a tiny header-only summary when there is no payload
+        if not payload and flags:
+            interesting = any(ch in flags for ch in ("S", "F", "R", "P"))
+            if interesting:
+                rec = self._base_rec(f, direction, kind="tcp_hdr")
+                rec.update({"flags": flags})
+                self._maybe_emit(f, direction, "tcp_hdr", rec, cost=0.25)
+
+        # Try cheap extractors with tiny budgets
+        emitted = False
+        if payload:
+            # HTTP
+            if self._looks_http(f, direction):
+                rec = self._scrape_http(f, direction)
+                if rec:
+                    emitted |= self._maybe_emit(f, direction, "http", rec)
+                    self._metrics["hits_http"] += 1
+            # TLS (ClientHello)
+            if not emitted and self._likely_tls(f, direction):
+                rec = self._scrape_tls_clienthello(f, direction)
+                if rec:
+                    emitted |= self._maybe_emit(f, direction, "tls", rec)
+                    self._metrics["hits_tls"] += 1
+            # SSH banner
+            if not emitted and self._looks_ssh_banner(f, direction):
+                rec = self._scrape_ssh_banner(f, direction)
+                if rec:
+                    emitted |= self._maybe_emit(f, direction, "ssh", rec)
+                    self._metrics["hits_ssh"] += 1
+            # RDP cookie
+            if not emitted and self._looks_rdp(f, direction):
+                rec = self._scrape_rdp_cookie(f, direction)
+                if rec:
+                    emitted |= self._maybe_emit(f, direction, "rdp", rec)
+                    self._metrics["hits_rdp"] += 1
+
+        if not emitted and (flags and ('R' in flags or 'F' in flags)):
+            # Emit a tiny close summary (rate-limited)
+            rec = self._base_rec(f, direction, kind="tcp_close")
+            rec.update({"flags": flags, "bytes": f["bytes"], "pkts": f["pkts"]})
+            self._maybe_emit(f, direction, "tcp_close", rec, cost=0.5)
+
+    # ---------- UDP ----------
+    def _scrape_udp(self, pkt, f: dict):
+        udp = pkt[UDP]
+        sport = int(udp.sport); dport = int(udp.dport)
+        payload = self._get_payload(pkt)
+        f["bytes"] += len(payload)
+        direction = "c2s" if self._is_service_port(dport) else "s2c" if self._is_service_port(sport) else ("c2s" if sport <= dport else "s2c")
+
+        # DNS
+        if sport in self.DNS_PORTS or dport in self.DNS_PORTS:
+            rec = self._scrape_dns(pkt, f, direction)
+            if rec:
+                self._metrics["hits_dns"] += 1
+                self._maybe_emit(f, direction, "dns", rec)
+            return
+
+        # QUIC (very light)
+        if sport in self.QUIC_SERV_PORTS or dport in self.QUIC_SERV_PORTS:
+            rec = self._scrape_quic(payload, f, direction)
+            if rec:
+                self._metrics["hits_quic"] += 1
+                self._maybe_emit(f, direction, "quic", rec)
+            return
+
+        # WS-Discovery, SSDP, NTP (quick peeks)
+        if sport == self.WS_DISC_PORT or dport == self.WS_DISC_PORT:
+            if payload:
+                self._maybe_emit(f, direction, "ws-discovery", {
+                    **self._base_rec(f, direction, kind="wsd"),
+                    "size": len(payload)
+                }, cost=0.5)
+            return
+
+        if sport == self.SSDP_PORT or dport == self.SSDP_PORT:
+            host, st = self._peek_ssdp(payload)
+            self._maybe_emit(f, direction, "ssdp", {
+                **self._base_rec(f, direction, kind="ssdp"),
+                "host": host or "-", "st": st or "-"
+            }, cost=0.5)
+            return
+
+        if sport == self.NTP_PORT or dport == self.NTP_PORT:
+            vn, mode, stratum = self._peek_ntp(payload)
+            self._maybe_emit(f, direction, "ntp", {
+                **self._base_rec(f, direction, kind="ntp"),
+                "ver": vn, "mode": mode, "stratum": stratum
+            }, cost=0.5)
+            return
+        if sport == self.NBNS_PORT or dport == self.NBNS_PORT:
+            self._maybe_emit(f, direction, "nbns", {
+                **self._base_rec(f, direction, kind="nbns"),
+                "size": len(payload) if payload else 0
+            }, cost=0.5)
+            return
+
+        if sport == self.KERBEROS_PORT or dport == self.KERBEROS_PORT:
+            self._maybe_emit(f, direction, "kerberos", {
+                **self._base_rec(f, direction, kind="krb"),
+                "size": len(payload) if payload else 0
+            }, cost=0.5)
+            return
+        if sport == self.ZT_PORT or dport == self.ZT_PORT:
+            self._maybe_emit(f, direction, "overlay", {
+                **self._base_rec(f, direction, kind="overlay"),
+                "size": len(payload) if payload else 0
+            }, cost=0.5)
+            return
+        # Fallback small emit for unknown UDP
+        if payload:
+            self._maybe_emit(f, direction, "udp", {
+                **self._base_rec(f, direction, kind="udp"),
+                "size": len(payload),
+                "sha8": hashlib.sha256(payload[:64]).hexdigest()[:8],
+                "preview": self._preview(payload)
+            }, cost=0.5)
+        else:
+            self._metrics["hits_other"] += 1
+
+
+    # ---------- Extractors (cheap) ----------
+    def _scrape_http(self, f: dict, direction: str):
+        buf = f["c2s_buf"] if direction == "c2s" else f["s2c_buf"]
+        head = bytes(buf[: self.TCP_HEAD_CAP])
+        # headers end: CRLFCRLF or LFLF
+        h_end = head.find(b"\r\n\r\n")
+        delim = 4
+        if h_end < 0:
+            h_end = head.find(b"\n\n"); delim = 2
+        if h_end < 0:
+            return None
+        hdrs = head[:h_end]
+        lines = hdrs.split(b"\r\n")
+        if len(lines) <= 0:
+            lines = hdrs.split(b"\n")
+        start = (lines[0] if lines else b"").decode("utf-8", "ignore")
+        # pull a couple of headers
+        def get(hname):
+            hname_b = hname.lower().encode()
+            for ln in lines[1:]:
+                p = ln.split(b":", 1)
+                if len(p) == 2 and p[0].strip().lower() == hname_b:
+                    return p[1].strip().decode("utf-8", "ignore")
+            return None
+        if direction == "c2s":  # request
+            m = self._HTTP_START_RE.match(head)
+            if not m:
+                return None
+            method = m.group(1).decode("ascii", "ignore")
+            path = m.group(2).decode("utf-8", "ignore")
+            host = get("host")
+            ua = get("user-agent")
+            return {
+                **self._base_rec(f, direction, kind="http_req"),
+                "method": method, "host": host or "-", "path": path,
+                "ua": (ua[:64] if ua else None)
+            }
+        else:  # response
+            if not start.startswith("HTTP/"):
+                return None
+            parts = start.split()
+            status = parts[1] if len(parts) > 1 else "?"
+            ctype = get("content-type")
+            return {
+                **self._base_rec(f, direction, kind="http_rsp"),
+                "status": status, "ctype": (ctype[:64] if ctype else None)
+            }
+
+    def _scrape_tls_clienthello(self, f: dict, direction: str):
+        # Only meaningful from client to service port
+        a, b = f["a"], f["b"]
+        if not ((a[1] in self.TLS_SERV_PORTS and direction == "s2c") or
+                (b[1] in self.TLS_SERV_PORTS and direction == "c2s")):
+            # Expect CH going toward service port
+            pass
+        buf = f["c2s_buf"] if direction == "c2s" else f["s2c_buf"]
+        mv = memoryview(buf)
+        if len(mv) < 6 or mv[0] != 0x16:
+            return None
+        # TLS record header
+        ver = (mv[1] << 8) | mv[2]
+        if ver not in (0x0301, 0x0302, 0x0303, 0x0304):
+            return None
+        rlen = (mv[3] << 8) | mv[4]
+        if rlen <= 0 or rlen > self.TLS_REC_LEN_MAX or len(mv) < 5 + rlen:
+            return None
+        # Handshake type
+        if mv[5] != 0x01:
+            return None
+        p = 5 + 1 + 3  # type + len
+        if len(mv) < p + 2:
+            return None
+        # client_version
+        vmaj, vmin = mv[p], mv[p+1]; p += 2
+        # random
+        p += 32
+        if len(mv) < p + 1: return None
+        # session id
+        sid_len = mv[p]; p += 1 + sid_len
+        if len(mv) < p + 2: return None
+        # cipher suites
+        cs_len = (mv[p] << 8) | mv[p+1]; p += 2 + cs_len
+        if len(mv) < p + 1: return None
+        # comp
+        comp_len = mv[p]; p += 1 + comp_len
+        if len(mv) < p + 2: return None
+        # extensions
+        ext_total = (mv[p] << 8) | mv[p+1]; p += 2
+        end_ext = min(len(mv), p + ext_total)
+
+        sni = None; alpn = []
+        while p + 4 <= end_ext:
+            et = (mv[p] << 8) | mv[p+1]
+            el = (mv[p+2] << 8) | mv[p+3]
+            p += 4
+            if p + el > end_ext: break
+            ed = mv[p:p+el]
+            if et == 0x0000 and el >= 5:  # SNI
+                if len(ed) >= 2:
+                    snl = (ed[0] << 8) | ed[1]
+                    q = 2; limit = min(2 + snl, len(ed))
+                    while q + 3 <= limit:
+                        ntyp = ed[q]; nlen = (ed[q+1] << 8) | ed[q+2]; q += 3
+                        if q + nlen > limit: break
+                        if ntyp == 0:
+                            try: sni = bytes(ed[q:q+nlen]).decode("idna", "ignore")
+                            except Exception: sni = None
+                            break
+                        q += nlen
+            elif et == 0x0010 and el >= 2:  # ALPN
+                if len(ed) >= 2:
+                    ll = (ed[0] << 8) | ed[1]; q = 2; limit = min(2 + ll, len(ed))
+                    while q < limit:
+                        n = ed[q]; q += 1
+                        if q + n > limit: break
+                        try: alpn.append(bytes(ed[q:q+n]).decode("ascii", "ignore"))
+                        except Exception: pass
+                        q += n
+            p += el
+
+        if not sni and not alpn:
+            return None
+        return {
+            **self._base_rec(f, direction, kind="tls_ch"),
+            "sni": sni or "-", "alpn": ",".join(alpn) if alpn else "-"
+        }
+
+    # quick banners
+    def _scrape_ssh_banner(self, f: dict, direction: str):
+        buf = f["s2c_buf"] if direction == "s2c" else f["c2s_buf"]
+        if b"SSH-" in buf[:64]:
+            line = buf[:128].split(b"\n", 1)[0].decode("utf-8", "ignore").strip()
+            return {**self._base_rec(f, direction, kind="ssh_banner"), "banner": line[:80]}
+        return None
+
+    def _scrape_rdp_cookie(self, f: dict, direction: str):
+        # Very rough: look for "Cookie: mstshash=" in early bytes (old RDP, TCP/3389)
+        a, b = f["a"], f["b"]
+        if 3389 not in (a[1], b[1]):
+            return None
+        buf = f["c2s_buf"][: self.TCP_HEAD_CAP]
+        k = b"Cookie: mstshash="
+        i = buf.find(k)
+        if i >= 0:
+            val = buf[i+len(k): i+len(k)+48].split(b"\r\n", 1)[0].decode("utf-8", "ignore")
+            return {**self._base_rec(f, direction, kind="rdp_cookie"), "mstshash": val}
+        return None
+
+    # DNS via scapy if available, else quick parse of QNAME
+    def _scrape_dns(self, pkt, f: dict, direction: str):
+        try:
+            if pkt.haslayer(DNS):
+                dns = pkt[DNS]
+                q = dns.qd.qname.decode("utf-8", "ignore") if dns.qd and getattr(dns.qd, "qname", None) else None
+                an = None
+                if dns.an and getattr(dns.an, "rdata", None):
+                    try:
+                        an = str(dns.an.rdata)
+                    except Exception:
+                        an = None
+                return {
+                    **self._base_rec(f, direction, kind=("dns_rsp" if dns.qr == 1 else "dns_req")),
+                    "qname": (q[:-1] if q and q.endswith(".") else q) or "-",
+                    "answer": an
+                }
+        except Exception:
+            pass
+        # fallback: parse first qname from raw
+        raw = self._get_payload(pkt)
+        qname = self._dns_qname_from_raw(raw)
+        if qname:
+            return {**self._base_rec(f, direction, kind="dns_req"), "qname": qname}
+        return None
+
+    def _scrape_quic(self, payload: bytes, f: dict, direction: str):
+        if not payload or len(payload) < 6:
+            return None
+        b0 = payload[0]
+        if (b0 & 0x80):  # long header
+            version = struct.unpack_from("!I", payload, 1)[0]
+            dcid_len = payload[5]
+            return {**self._base_rec(f, direction, kind="quic_long"),
+                    "ver": f"0x{version:08x}", "dcid_len": int(dcid_len)}
+        else:  # short header
+            # Very minimal: spin bit/packet number length signals live here
+            return {**self._base_rec(f, direction, kind="quic_short"),
+                    "b0": f"0x{b0:02x}", "size": len(payload)}
+    # ---------- Emits ----------
+    def _maybe_emit(self, f: dict, direction: str, topic: str, rec: dict, *, cost: float = 1.0) -> bool:
+        now = time.time()
+        fkey = f["key"] + (direction,)
+        last = self._cooldown_until.get(fkey, 0.0)
+        if now < last:
+            return False
+        if not self._tb.take(cost=cost):
+            self._metrics["suppressed_tokens"] += 1
+            return False
+        self._cooldown_until[fkey] = now + self.FLOW_COOLDOWN_S
+
+        self._emit_record(topic, rec)
+        self._metrics["emits"] += 1
+        return True
+
+    def _emit_record(self, topic: str, rec: dict):
+        rec_out = dict(rec)
+        rec_out["topic"] = topic
+        if callable(self._exporter):
+            try:
+                self._exporter(rec_out)
+                return
+            except Exception:
+                pass
+        # fallback: concise one-liner
+        a, b = rec_out.get("a"), rec_out.get("b")
+        flow = f"{a[0]}:{a[1]} ⇄ {b[0]}:{b[1]}"
+        preview = rec_out.get("preview")
+        extra = {k: v for k, v in rec_out.items() if k not in {"a","b","dir","kind","topic","preview"}}
+        kv = " ".join(f"{k}={v}" for k, v in extra.items() if v is not None)
+        line = f"[Transport][🧲 Scraper][{rec_out.get('kind','-')}] {flow} [{rec_out.get('dir','?')}] {kv}"
+        if preview:
+            line += f" preview='{preview}'"
+        try:
+            self.log.log_message(line)
+        except Exception:
+            pass
+
+    # ---------- Flow / utils ----------
+    def _new_flow(self, src, sport, dst, dport, iface, proto):
+        a = (str(src), int(sport)); b = (str(dst), int(dport))
+        first, second = (a, b) if a <= b else (b, a)
+        return {
+            "key": (first + second + (str(iface),)),
+            "a": first, "b": second,
+            "iface": str(iface).split("_")[-1],
+            "proto": proto,
+            "created": time.time(),
+            "last_seen": time.time(),
+            "pkts": 0, "bytes": 0,
+            "c2s_buf": bytearray(),
+            "s2c_buf": bytearray(),
+            "last_flags": ""
+        }
+
+    def _flow_key(self, src, sport, dst, dport, iface):
+        a = (str(src), int(sport)); b = (str(dst), int(dport))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second + (str(iface),)
+
+    def _dir_from_pkt(self, f: dict, tcp) -> str:
+        sa, da = int(tcp.sport), int(tcp.dport)
+        # If one side is a “service” port, classify direction around it
+        if self._is_service_port(da) and not self._is_service_port(sa):
+            return "c2s"
+        if self._is_service_port(sa) and not self._is_service_port(da):
+            return "s2c"
+        # fall back: lower port ~ server
+        if sa < da:
+            return "c2s"
+        if da < sa:
+            return "s2c"
+        # tie-breaker: SYN without ACK is c2s
+        try:
+            flags = tcp.sprintf("%TCP.flags%")
+            return "c2s" if ("S" in flags and "A" not in flags) else "s2c"
+        except Exception:
+            return "c2s"
+
+    def _is_service_port(self, port: int) -> bool:
+        return (port in self.TLS_SERV_PORTS or
+                port in self.DNS_PORTS or
+                port in self.QUIC_SERV_PORTS or
+                port in {80, 22, 21, 25, 110, 143, 3389})
+
+    def _get_payload(self, pkt) -> bytes:
+        try:
+            if Raw is not None and pkt.haslayer(Raw) and pkt[Raw].load:
+                return bytes(pkt[Raw].load)
+            # fall back to bytes(payload)
+            if pkt.haslayer(TCP):
+                return bytes(getattr(pkt[TCP], "payload", b"") or b"")
+            if pkt.haslayer(UDP):
+                return bytes(getattr(pkt[UDP], "payload", b"") or b"")
+        except Exception:
+            pass
+        return b""
+
+    def _looks_http(self, f: dict, direction: str) -> bool:
+        buf = f["c2s_buf"] if direction == "c2s" else f["s2c_buf"]
+        if not buf:
+            return False
+        head = bytes(buf[: min(len(buf), 16)])
+        return head.startswith(b"HTTP/") or bool(self._HTTP_START_RE.match(head + b"\r\n"))
+
+    def _likely_tls(self, f: dict, direction: str) -> bool:
+        buf = f["c2s_buf"] if direction == "c2s" else f["s2c_buf"]
+        if len(buf) < 6:
+            return False
+        if buf[0] != 0x16:
+            return False
+        ver = (buf[1] << 8) | buf[2]
+        return ver in (0x0301, 0x0302, 0x0303, 0x0304)
+
+    def _looks_ssh_banner(self, f: dict, direction: str) -> bool:
+        buf = f["s2c_buf"] if direction == "s2c" else f["c2s_buf"]
+        return b"SSH-" in buf[:64]
+
+    def _looks_rdp(self, f: dict, direction: str) -> bool:
+        a, b = f["a"], f["b"]
+        return (3389 in (a[1], b[1]))
+
+    def _dns_qname_from_raw(self, raw: bytes) -> Optional[str]:
+        try:
+            if len(raw) < 12:
+                return None
+            qdcount = (raw[4] << 8) | raw[5]
+            if qdcount < 1:
+                return None
+            i = 12
+            labels = []
+            for _ in range(10):  # up to 10 labels
+                if i >= len(raw):
+                    return None
+                ln = raw[i]; i += 1
+                if ln == 0:
+                    break
+                if (i + ln) > len(raw):
+                    return None
+                labels.append(raw[i:i+ln].decode("utf-8", "ignore"))
+                i += ln
+            qname = ".".join(labels)
+            return qname or None
+        except Exception:
+            return None
+
+    def _peek_ssdp(self, raw: bytes) -> tuple[Optional[str], Optional[str]]:
+        try:
+            head = raw[:512]
+            host = st = None
+            for line in head.split(b"\r\n"):
+                if b":" not in line:
+                    continue
+                k, v = line.split(b":", 1)
+                k = k.strip().lower(); v = v.strip()
+                if k == b"host": host = v.decode("utf-8","ignore")
+                if k == b"st" or k == b"nt": st = v.decode("utf-8","ignore")
+            return host, st
+        except Exception:
+            return None, None
+
+    def _peek_ntp(self, raw: bytes) -> tuple[int, str, int]:
+        try:
+            if len(raw) < 48:
+                return 0, "?", 0
+            b0 = raw[0]
+            vn = (b0 >> 3) & 0x07
+            mode_num = b0 & 0x07
+            mode = {1: "sym-act", 2: "sym-pass", 3: "client", 4: "server", 5: "bcast"}.get(mode_num, "?")
+            stratum = raw[1]
+            return vn, mode, stratum
+        except Exception:
+            return 0, "?", 0
+
+    # ---------- Housekeeping ----------
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < self.GC_PERIOD_S:
+            return
+        # evict idle flows
+        dead = [k for k, f in self._flows.items() if now - f.get("last_seen", now) > self.FLOW_TTL_S]
+        for k in dead:
+            self._flows.pop(k, None)
+        # soft cap
+        if len(self._flows) > self.FLOW_SOFT_MAX:
+            excess = len(self._flows) - self.FLOW_SOFT_MAX
+            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last_seen", 0.0))[:excess]
+            for k, _ in victims:
+                self._flows.pop(k, None)
+        # trim cooldown map
+        stale = [k for k, until in self._cooldown_until.items() if until < now - (2*self.FLOW_COOLDOWN_S)]
+        for k in stale:
+            self._cooldown_until.pop(k, None)
+        self._last_gc = now
+
+    def _base_rec(self, f: dict, direction: str, *, kind: str = "generic") -> dict:
+        """
+        Build a small base record compatible with the rest of TransportScraperManager.
+        direction: 'c2s' or 's2c'
+        """
+        a = f.get("a", ("?", 0))
+        b = f.get("b", ("?", 0))
+        src = a if direction == "c2s" else b
+        dst = b if direction == "c2s" else a
+
+        return {
+            "ts": time.time(),
+            "kind": kind,
+            "dir": direction,  # <- scraper uses 'dir'
+            "a": a,  # keep endpoints for the pretty flow line
+            "b": b,
+            "src": str(src[0]),
+            "sport": int(src[1]),
+            "dst": str(dst[0]),
+            "dport": int(dst[1]),
+            "bytes": f.get("bytes", 0),
+            "pkts": f.get("pkts", 0),
+        }
+
+    def _preview(self, b: bytes) -> str:
+        try:
+            s = b[:self.BYTES_PREVIEW]
+            asciiish = "".join(chr(c) if 32 <= c < 127 else "." for c in s)
+            return asciiish
+        except Exception:
+            return ""
 
 
 class TransportHTTPSManager:
@@ -2627,7 +3301,6 @@ class TransportHTTPSManager:
             return {"flags": flags, "win": win, "wscale": wscale, "mss": mss, "sack_perm": sack_perm}
         except Exception:
             return None
-
 
 
 class TransportMoneroManager:
@@ -4018,7 +4691,7 @@ class TransportQUICManager:
     FLOW_TTL_SEC = 120
     RL_INTERVAL_SEC = 1.0
     STREAM_TTL_SEC = 300
-    BYTES_BUDGET = 256            # how many payload bytes we ever scan
+    BYTES_BUDGET = 1024            # how many payload bytes we ever scan
     FRAMES_BUDGET = 8             # max frames to parse/emit per packet
     GC_PERIOD_SEC = 60
     SHORT_DCID_LEN = 8            # common heuristic for short header DCID bytes
@@ -6425,149 +7098,267 @@ class TransportOverlayManager:
     Public API:
         handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
 
-    Behavior:
-      • Targets UDP/9993 by default but is protocol-agnostic (can be reused for other overlay ports)
-      • Emits a single concise log line per packet (distinct emoji identity 🛰️)
-      • Fingerprints payloads and heuristically classifies control vs data vs keepalive
-      • Tracks peers (src,dst) with a small time-based cache + GC
+    Design goals:
+      • Hot path stays branchy but O(1) with tiny, bounded structures
+      • Zero-copy reads via memoryview for classification
+      • Aggressive but cheap GC by wall-clock
+      • Token-bucket + per-flow cooldown to avoid log storms
     """
+
+    # -------- Tunables (kept small to avoid cache thrash) --------
+    OVERLAY_PORTS          = {9993}      # ZeroTier by default; extend if needed
+    PEER_TTL_S             = 600.0       # age-out for peer_seen entries
+    GC_PERIOD_S            = 60.0        # housekeeping cadence
+    HELLO_FP_TTL_S         = 300.0       # hash "hello-ish" payloads TTL
+    HELLO_FP_MAX           = 1024        # max distinct "hello" fingerprints kept
+    HELLO_FP_PREFIX_BYTES  = 32          # prefix to hash for hello/data FP
+    MIN_KEEPALIVE_BYTES    = 8           # under this is considered keepalive
+    SMALL_CTRL_MAX_BYTES   = 160         # small control packets likely <~160B
+
+    # logging governors
+    LOG_RPS                = 2.0         # avg logs/sec globally
+    LOG_BURST              = 40          # burst
+    FLOW_COOLDOWN_S        = 15.0        # per 5-tuple min seconds between logs
+    FLOW_TRACK_MAX         = 20000       # soft cap for cooldown map
 
     def __init__(self, router_logger, peer_timeout: int = 600):
         self.logger = router_logger
-        self.PEER_TIMEOUT = peer_timeout
-        self._last_gc = time.time()
-        # peer_seen[(a_ip,b_ip)] = last_ts (direction-agnostic order)
+        self.PEER_TTL_S = float(peer_timeout) if peer_timeout else self.PEER_TTL_S
+
+        # Peer last-seen (direction-agnostic)
         self._peer_seen: Dict[Tuple[str, str], float] = {}
-        # tiny cache of small “hello-ish” payload hashes to reduce log spam
-        self._hello_fp: Dict[str, float] = {}
+
+        # Hello fingerprint cache: fp -> last_ts (Ordered LRU with TTL)
+        self._hello_fp = OrderedDict()
+
+        # Token bucket + cooldown
+        self._tokens = float(self.LOG_BURST)
+        self._last_refill = time.time()
+        self._cooldown_until: Dict[Tuple[str, int, str, int, str], float] = {}
+
+        # Overlay/ZeroTier peer table (thread-safe; used by optional helpers)
         self._zt_peers_lock = threading.RLock()
-        self._zt_peers: dict = {}  # peer_id -> {"ips": set[str], "meta": {...}, "last_seen": float}
-        self._zt_ip_index: set[str] = set()  # flat set of all peer IPs for O(1) membership checks
-        self._zt_ttl: float = 60.0  # default seconds
+        self._zt_peers: Dict[str, Dict[str, Union[set, dict, float]]] = {}  # peer_id -> {ips,set; meta,dict; last_seen,float}
+        self._zt_ip_index: set[str] = set()
+        self._zt_ttl: float = 60.0
+
+        self._last_gc = self._last_refill
         self.logger.log_message("[Transport][🛰️ Overlay] Manager ready.")
 
     # -------------------- Public entry point --------------------
     def handle(
         self,
-        packet: Packet,
+        packet: "Packet",
         src_ip: str,
         dst_ip: str,
         sport: int,
         dport: int,
         inbound_iface: Optional[str] = None,
     ) -> bool:
-        """
-        Returns True if we consider this overlay traffic (and logged it), else False.
-        """
+        """Returns True if considered overlay traffic (and possibly logged), else False."""
         if not self._is_overlay_port(sport, dport):
             return False
 
-        if Raw is None or not packet.haslayer(Raw):
-            self.logger.log_message(
-                "[Transport][🚀 UDP][🛰️ Overlay] UDP on port 9993 detected, but no Raw payload."
-            )
+        # Fast path: raw payload?
+        has_raw = (Raw is not None) and packet.haslayer(Raw)
+        raw_data = packet[Raw].load if has_raw else b""
+        payload_len = len(raw_data) if raw_data else 0
+
+        # Build 5-tuple key once (include iface suffix for locality)
+        iface = self._iface_suffix(inbound_iface)
+        fkey = (str(src_ip), int(sport), str(dst_ip), int(dport), iface)
+
+        # Summarize classification cheaply (zero-copy)
+        kind, fp8 = self._classify_payload(raw_data) if payload_len else ("NoPayload", None)
+
+        # Track peer (direction-agnostic)
+        self._note_peer(src_ip, dst_ip)
+
+        # Decide logging (skip ack/no-payload spam unless first time in a while)
+        if not self._should_log(fkey, payload_len, kind):
+            self._maybe_gc()
             return True
 
-        raw_data = bytes(packet[Raw].load) or b""
-        if not raw_data:
-            return True
-
-        # Summarize in one line
-        parts = [f"[Transport][🚀 UDP][🛰️ Overlay] {src_ip}:{sport} → {dst_ip}:{dport}"]
-
-        # Classify payload
-        kind = self._classify_payload(raw_data)
-        if kind:
-            parts.append(f"| Kind: {kind}")
-
-        # Track peer
-        s = str(src_ip)
-        d = str(dst_ip)
-
-        # order deterministically without producing a variadic tuple
-        if s <= d:
-            peer_key: tuple[str, str] = (s, d)
-        else:
-            peer_key = (d, s)
-
-        self._peer_seen[peer_key] = time.time()
-
+        # Emit concise one-liner
+        parts = [f"[Transport][🚀 UDP][🛰️ Overlay] {src_ip}:{sport} → {dst_ip}:{dport} if={iface}"]
+        parts.append(f"| Kind={kind}")
+        if fp8:
+            parts.append(f"fp={fp8}")
+        if payload_len:
+            parts.append(f"len={payload_len}")
         self.logger.log_message(" ".join(parts))
+
         self._maybe_gc()
         return True
 
+    # -------------------- Helpers & classifiers --------------------
+    def _is_overlay_port(self, sport: int, dport: int) -> bool:
+        # Branchless membership checks are cheap; keep set small
+        return (sport in self.OVERLAY_PORTS) or (dport in self.OVERLAY_PORTS)
+
+    def _iface_suffix(self, inbound_iface: Optional[str]) -> str:
+        try:
+            return (inbound_iface or "").split("_")[-1]
+        except Exception:
+            return inbound_iface or ""
+
+    def _note_peer(self, a_ip: str, b_ip: str) -> None:
+        # Order deterministically; avoid tuple churn in hot path
+        s, d = (str(a_ip), str(b_ip))
+        key = (s, d) if s <= d else (d, s)
+        self._peer_seen[key] = time.time()
+
+    def _classify_payload(self, raw: bytes) -> Tuple[str, Optional[str]]:
+        """
+        Heuristic classification:
+          • len < MIN_KEEPALIVE_BYTES -> Keepalive
+          • small, repeating prefixes -> Control/Hello (fingerprinted)
+          • else -> Data or Control (size-based)
+        Returns (kind, fp8_or_None).
+        """
+        try:
+            mv = memoryview(raw)
+            n = len(mv)
+            if n < self.MIN_KEEPALIVE_BYTES:
+                return ("Keepalive", None)
+
+            # Compute a tiny prefix hash (first 32B) for stable identity
+            pref = mv[:self.HELLO_FP_PREFIX_BYTES]
+            fp8 = hashlib.sha1(pref).hexdigest()[:8]
+
+            now = time.time()
+            # Small controls are often highly repetitive; LRU/TTL them
+            if n <= self.SMALL_CTRL_MAX_BYTES:
+                self._hello_fp[fp8] = now
+                self._hello_fp.move_to_end(fp8, last=True)
+                # trim if beyond max
+                if len(self._hello_fp) > self.HELLO_FP_MAX:
+                    self._hello_fp.popitem(last=False)
+                return ("Control/Hello", fp8)
+
+            # Larger than "small control"
+            # Some overlays encrypt control after bootstrap; still useful to tag Data/Control-ish
+            # If we have seen the same fp recently, call it Control (encrypted/control)
+            last = self._hello_fp.get(fp8)
+            if last and (now - last) <= self.HELLO_FP_TTL_S:
+                return ("Control", fp8)
+            return ("Data", fp8)
+        except Exception:
+            return ("Unknown", None)
+
+    # -------------------- Log throttling --------------------
+    def _should_log(self, fkey: Tuple[str, int, str, int, str], payload_len: int, kind: str) -> bool:
+        """
+        Global token-bucket + per-flow cooldown.
+        Priority bump for Control/Hello or bigger payloads (informative).
+        """
+        now = time.time()
+
+        # Per-flow cooldown
+        until = self._cooldown_until.get(fkey, 0.0)
+        if now < until:
+            return False
+
+        # Refill global tokens
+        dt = max(0.0, now - self._last_refill)
+        if dt:
+            self._tokens = min(self.LOG_BURST, int(self._tokens + dt * self.LOG_RPS))
+            self._last_refill = now
+
+        # Base cost
+        base_cost = 1.0
+
+        # Importance bump
+        important = (kind != "NoPayload") and (kind.startswith("Control") or payload_len >= self.SMALL_CTRL_MAX_BYTES)
+        cost = 0.5 if important else 1.0  # cheaper for important so they fit more often
+
+        if self._tokens >= cost:
+            self._tokens -= cost
+            # Set cooldown (shorter for important, longer for noise)
+            cd = self.FLOW_COOLDOWN_S * (0.5 if important else 1.0)
+            self._cooldown_until[fkey] = now + cd
+            # Soft-cap map
+            if len(self._cooldown_until) > self.FLOW_TRACK_MAX:
+                # Drop ~1% oldest
+                # (avoid O(n log n): scan linear and remove earliest few)
+                threshold = now - self.FLOW_COOLDOWN_S
+                removed = 0
+                for k, t in list(self._cooldown_until.items()):
+                    if t < threshold:
+                        self._cooldown_until.pop(k, None)
+                        removed += 1
+                        if removed >= max(1, self.FLOW_TRACK_MAX // 100):
+                            break
+            return True
+
+        # No tokens—skip
+        return False
+
+    # -------------------- Housekeeping --------------------
+    def _maybe_gc(self) -> None:
+        now = time.time()
+        if now - self._last_gc < self.GC_PERIOD_S:
+            return
+
+        # Peer TTL
+        cutoff = now - self.PEER_TTL_S
+        for k, ts in list(self._peer_seen.items()):
+            if ts < cutoff:
+                self._peer_seen.pop(k, None)
+
+        # Hello FP TTL
+        fp_cut = now - self.HELLO_FP_TTL_S
+        for fp, ts in list(self._hello_fp.items()):
+            if ts < fp_cut:
+                self._hello_fp.pop(fp, None)
+
+        self._last_gc = now
+
+    # -------------------- Optional ZeroTier helpers (fixed & safe) --------------------
     @property
     def zt_ttl(self) -> float:
         return self._zt_ttl
 
-    def set_zt_ttl(self, seconds: int | float) -> None:
+    def set_zt_ttl(self, seconds: Union[int, float]) -> None:
         self._zt_ttl = max(1.0, float(seconds))
-        self.logger.log_message(f"[Overlay] TTL set to {self._zt_ttl:.0f}s")
-    # -------------------- Helpers --------------------
-    def _is_overlay_port(self, sport: int, dport: int) -> bool:
-        return sport == 9993 or dport == 9993
-
-    def _classify_payload(self, raw: bytes) -> str:
-        if len(raw) < 8:
-            return "Keepalive"
-        h = hashlib.sha1(raw[:32]).hexdigest()[:8]
-        if h not in self._hello_fp:
-            self._hello_fp[h] = time.time()
-            return f"Control/Hello fp={h}"
-        return "Control"
-
-    def _maybe_gc(self) -> None:
-        now = time.time()
-        if now - self._last_gc < 60:
-            return
-        expired = [k for k, ts in self._peer_seen.items() if now - ts > self.PEER_TIMEOUT]
-        for k in expired:
-            self._peer_seen.pop(k, None)
-        if expired:
-            self.logger.log_message(f"[Transport][🛰️ Overlay] 🧹 GC pruned {len(expired)} peer entries")
-        self._last_gc = now
-    def _zt_note_peer(self, ip, port):
-        e = self._zt_peers.setdefault(ip, {"ports": set(), "ts": 0})
-        e["ports"].add(int(port))
-        e: dict[str, Union[int, set, float]] = {}
-        e["ts"] = time.time()  # OK now
-
-    def _zt_is_peer(self, ip):
-        # GC stale
-        now = time.time()
-        for k,v in list(self._zt_peers.items()):
-            if now - v["ts"] > self._zt_ttl:
-                self._zt_peers.pop(k, None)
-        return ip in self._zt_peers
-
-    # --- When you already detect ZeroTier on 9993 (your existing handler) ---
-    def _handle_overlay_packet(self, pkt, src, dst, sport, dport, iface):
-        # existing Hello/Control parsing...
-        # after you accept it's ZeroTier:
-        self._zt_note_peer(src, sport)
-        self._zt_note_peer(dst, dport)
-        self.logger.log_message(f"[Transport][🚀 UDP][🛰️ Overlay] {src}:{sport} → {dst}:{dport} | Control/Hello")
+        self.logger.log_message(f"[Transport][🛰️ Overlay] TTL set to {self._zt_ttl:.0f}s")
 
     def _zt__ensure_state(self):
-        """Create overlay containers if missing (defensive for hot-reloads/old pickles)."""
-        if not hasattr(self, "_zt_peers_lock"):
+        """Create/repair overlay containers (safe across interpreters/hot-reloads)."""
+        # Figure out the concrete RLock instance type on this interpreter
+        try:
+            _RLOCK_TYPE = type(threading.RLock())
+        except Exception:
+            _RLOCK_TYPE = None  # fall back to duck-typing
+
+        # Ensure lock
+        lk = getattr(self, "_zt_peers_lock", None)
+        if not (lk and hasattr(lk, "acquire") and hasattr(lk, "release")):
             self._zt_peers_lock = threading.RLock()
-        if not hasattr(self, "_zt_peers"):
+
+        # Ensure peer tables
+        if not hasattr(self, "_zt_peers") or not isinstance(self._zt_peers, dict):
             self._zt_peers = {}
-        if not hasattr(self, "_zt_ip_index"):
+
+        if not hasattr(self, "_zt_ip_index") or not isinstance(self._zt_ip_index, set):
             self._zt_ip_index = set()
 
-    def _zt_set_peers(self, peers: dict[str, dict] | None):
+        # Optional: TTL default
+        if not hasattr(self, "_zt_ttl"):
+            self._zt_ttl = 60.0
+
+    def _zt_set_peers(self, peers: Optional[Dict[str, dict]]) -> None:
         """
-        Replace the overlay peer table.
-        Expected shape: {peer_id: {"ips": iterable[str], ...}, ...}
+        Replace the overlay peer table safely.
+        Expected: {peer_id: {"ips": iterable[str], ...}, ...}
         """
         self._zt__ensure_state()
         with self._zt_peers_lock:
-            self._zt_peers = {}
-            self._zt_ip_index = set()
+            self._zt_peers.clear()
+            self._zt_ip_index.clear()
             if not peers:
                 return
+            now = time.time()
             for pid, rec in peers.items():
                 ips = set()
                 if isinstance(rec, dict):
@@ -6578,10 +7369,10 @@ class TransportOverlayManager:
                                 ips.add(str(ipaddress.ip_address(str(ip).strip())))
                             except Exception:
                                 continue
-                self._zt_peers[pid] = {"ips": ips, "meta": rec, "last_seen": time.time()}
+                self._zt_peers[pid] = {"ips": ips, "meta": rec, "last_seen": now}
                 self._zt_ip_index.update(ips)
 
-    def _zt_add_peer(self, peer_id: str, ips: list[str] | set[str] | tuple[str, ...]):
+    def _zt_add_peer(self, peer_id: str, ips: Union[list, set, tuple]) -> None:
         self._zt__ensure_state()
         with self._zt_peers_lock:
             rec = self._zt_peers.get(peer_id) or {"ips": set(), "meta": {}, "last_seen": 0.0}
@@ -6595,18 +7386,342 @@ class TransportOverlayManager:
             rec["last_seen"] = time.time()
             self._zt_peers[peer_id] = rec
 
-    def _zt_remove_peer(self, peer_id: str):
+    def _zt_remove_peer(self, peer_id: str) -> None:
         self._zt__ensure_state()
         with self._zt_peers_lock:
             rec = self._zt_peers.pop(peer_id, None)
-            if rec and isinstance(rec, dict):
-                ips = rec.get("ips") or set()
-                # rebuild index minus removed ips
-                for ip in ips:
-                    # only drop if no other peer still advertises it
-                    still = any(ip in (r.get("ips") or set()) for r in self._zt_peers.values())
-                    if not still and ip in self._zt_ip_index:
-                        self._zt_ip_index.remove(ip)
+            if not rec:
+                return
+            ips = rec.get("ips") or set()
+            # Remove IPs that aren't referenced by any other peer
+            still_used = set()
+            for r in self._zt_peers.values():
+                still_used.update(r.get("ips") or set())
+            for ip in ips:
+                if ip not in still_used and ip in self._zt_ip_index:
+                    self._zt_ip_index.remove(ip)
+
+    # --- Convenience: path for recognized overlay types (e.g., ZeroTier hello) ---
+    def _handle_overlay_packet(self, pkt, src, dst, sport, dport, iface):
+        """If your higher-level detector says 'this is ZeroTier', call this."""
+        self._zt_note_peer(src, sport)
+        self._zt_note_peer(dst, dport)
+        self.logger.log_message(f"[Transport][🚀 UDP][🛰️ Overlay] {src}:{sport} → {dst}:{dport} | Control/Hello")
+
+    def _zt_note_peer(self, ip: str, port: int) -> None:
+        self._zt__ensure_state()
+        ip = str(ip)
+        port = int(port)
+        with self._zt_peers_lock:
+            e = self._zt_peers.get(ip)
+            if not e:
+                e = {"ports": set(), "ts": 0.0}
+                self._zt_peers[ip] = e
+            e["ports"].add(port)
+            e["ts"] = time.time()
+
+    def _zt_is_peer(self, ip: str) -> bool:
+        self._zt__ensure_state()
+        now = time.time()
+        with self._zt_peers_lock:
+            for k, v in list(self._zt_peers.items()):
+                if now - v.get("ts", 0.0) > self._zt_ttl:
+                    self._zt_peers.pop(k, None)
+            return ip in self._zt_peers
+
+class TransportWSDiscoveryManager:
+    """
+    WS-Discovery (UDP/3702) handler with low-latency parsing and concise logging.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+    """
+
+    # -------- Tunables (kept conservative for low overhead) --------
+    WSD_PORTS = {3702}
+    BYTES_BUDGET = 4096  # scan at most this many bytes from payload
+    FP_PREFIX_BYTES = 48  # for tiny content fingerprint
+    LOG_RPS = 2.0  # average logs per second allowed globally
+    LOG_BURST = 30  # global burst capacity
+    FLOW_COOLDOWN_S = 10.0  # min seconds between logs for the same 5-tuple
+    FLOW_TRACK_MAX = 20000  # soft cap for cooldown map
+    GC_PERIOD_S = 60.0  # housekeeping cadence
+    PEER_TTL_S = 600.0  # track who talked to whom (light telemetry)
+
+    # Known action suffixes (we look for these inside <wsa:Action>)
+    _KNOWN_ACTIONS = (
+        b"Probe",
+        b"ProbeMatches",
+        b"Hello",
+        b"Bye",
+        b"Resolve",
+        b"ResolveMatches",
+    )
+
+    def __init__(self, router_logger):
+        self.logger = router_logger
+
+        # Token bucket state
+        self._tokens = float(self.LOG_BURST)
+        self._last_refill = time.time()
+
+        # Per-flow cooldown: (src, sport, dst, dport, iface_suffix) -> next_allowed_ts
+        self._cooldown_until: Dict[Tuple[str, int, str, int, str], float] = {}
+
+        # Lightweight peer graph (direction-agnostic)
+        self._peer_seen: Dict[Tuple[str, str], float] = {}
+
+        self._last_gc = self._last_refill
+        self.logger.log_message("[Transport][🔍 WS-Discovery] Manager ready.")
+
+    # -------------------- Public entry point --------------------
+    def handle(
+            self,
+            packet: "Packet",
+            src_ip: str,
+            dst_ip: str,
+            sport: int,
+            dport: int,
+            inbound_iface: Optional[str] = None,
+    ) -> bool:
+        """Return True if handled/logged as WS-Discovery; else False."""
+        if not self._is_wsd_port(sport, dport):
+            return False
+
+        # Must be UDP with a payload to be interesting
+        if Raw is None or not packet.haslayer(Raw):
+            return True  # it's WS-D UDP but no payload; nothing to parse
+
+        raw = packet[Raw].load or b""
+        if not raw:
+            return True
+
+        # Build flow key and cheap classification (zero-copy)
+        iface = self._iface_suffix(inbound_iface)
+        fkey = (str(src_ip), int(sport), str(dst_ip), int(dport), iface)
+
+        # Parse a few key fields from the SOAP envelope using budgeted scanning
+        kind, action, epr, mid = self._parse_wsd_envelope(raw)
+
+        # Decide if we should log (global + per-flow throttle)
+        if not self._should_log(fkey, important=(kind != "Unknown")):
+            self._note_peer(src_ip, dst_ip)
+            self._maybe_gc()
+            return True
+
+        # Produce a concise, stable one-liner
+        parts = [
+            f"[Transport][🚀 UDP][🔍 WS-Discovery] {src_ip}:{sport} → {dst_ip}:{dport} if={iface}",
+            f"| Kind={kind}"
+        ]
+        if action:
+            parts.append(f"Action={action}")
+        if epr:
+            parts.append(f"EPR={epr}")
+        if mid:
+            parts.append(f"MsgID={mid}")
+
+        # Optional tiny fingerprint (helps collapse near-duplicates)
+        fp8 = self._fp8(raw)
+        if fp8:
+            parts.append(f"fp={fp8}")
+
+        self.logger.log_message(" ".join(parts))
+
+        self._note_peer(src_ip, dst_ip)
+        self._maybe_gc()
+        return True
+
+    # -------------------- Classifiers / parsers (budgeted) --------------------
+    def _parse_wsd_envelope(self, raw: bytes) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+        """
+        Budgeted, zero-copy-ish WS-Discovery SOAP dig:
+          - Determine Kind (Hello/Bye/Probe/ProbeMatches/Resolve/ResolveMatches/Unknown)
+          - Extract Action (string tail, e.g. 'Probe')
+          - Extract EPR Address (wsa:Address)
+          - Extract MessageID (wsa:MessageID)
+        No full XML parse; we just search in a bounded prefix.
+        """
+        try:
+            mv = memoryview(raw)
+            cap = min(len(mv), self.BYTES_BUDGET)
+            if cap < 16:
+                return ("Unknown", None, None, None)
+
+            # Common WS-* elements appear as ASCII/UTF-8 text; be tolerant to whitespace.
+            # We scan for <wsa:Action> or <Action ...> first.
+            action_text = self._find_tag_text(mv, b"wsa:Action", cap) \
+                          or self._find_tag_text(mv, b"Action", cap)
+
+            # Normalize action kind from the tail token (e.g., .../Probe)
+            kind = "Unknown"
+            action_name = None
+            if action_text:
+                # Take the last path segment or the QName tail
+                tail = action_text.rsplit("/", 1)[-1]
+                tail_b = tail.encode("utf-8", "ignore")
+                for k in self._KNOWN_ACTIONS:
+                    if tail_b.endswith(k):
+                        action_name = k.decode("ascii", "ignore")
+                        kind = action_name
+                        break
+
+            # EndpointReference (Address) and MessageID are handy
+            epr = self._find_tag_text(mv, b"wsa:Address", cap) \
+                  or self._find_tag_text(mv, b"Address", cap)
+            mid = self._find_tag_text(mv, b"wsa:MessageID", cap) \
+                  or self._find_tag_text(mv, b"MessageID", cap)
+
+            # If we didn’t find Action but we see typical WS-D namespaces, infer rough kind
+            if kind == "Unknown":
+                # Look for Probe-like terms in Types/Scopes (best-effort)
+                if self._memfind(mv, b":Probe", cap) != -1:
+                    kind = "Probe"
+                elif self._memfind(mv, b":Hello", cap) != -1:
+                    kind = "Hello"
+                elif self._memfind(mv, b":Bye", cap) != -1:
+                    kind = "Bye"
+
+            return (kind, action_name, epr, mid)
+        except Exception:
+            return ("Unknown", None, None, None)
+
+    def _find_tag_text(self, mv: memoryview, tag: bytes, cap: int) -> Optional[str]:
+        """
+        Find <tag> ... </tag> inside the first `cap` bytes (case-insensitive),
+        skipping attributes. Returns stripped inner text or None.
+        """
+        # Lowercase search window (no copy: compare lowercased bytes via casefold-ish trick)
+        # We’ll just do case-sensitive search on expected casing first (fast path).
+        open_pat = b"<" + tag
+        i = self._memfind(mv, open_pat, cap)
+        if i == -1:
+            # fallback to uppercase WSA (some stacks)
+            open_pat2 = b"<" + tag.capitalize()
+            i = self._memfind(mv, open_pat2, cap)
+            if i == -1:
+                return None
+
+        # Move to '>' (end of start tag)
+        j = self._memfind(mv, b">", cap, start=i)
+        if j == -1 or j + 1 >= cap:
+            return None
+
+        # Find closing tag
+        close_pat = b"</" + tag + b">"
+        k = self._memfind(mv, close_pat, cap, start=j + 1)
+        if k == -1:
+            # Try capitalized close
+            close_pat2 = b"</" + tag.capitalize() + b">"
+            k = self._memfind(mv, close_pat2, cap, start=j + 1)
+            if k == -1:
+                return None
+
+        # Slice inner text safely
+        inner = mv[j + 1:min(k, cap)]
+        try:
+            txt = bytes(inner).decode("utf-8", "ignore").strip()
+            # Collapse whitespace
+            return " ".join(txt.split()) if txt else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _memfind(mv: memoryview, sub: bytes, cap: int, start: int = 0) -> int:
+        """Like bytes.find but bounded to `cap` without copying."""
+        # Convert only the small window to bytes once (bounded)
+        # Cap & start guards
+        start = max(0, start)
+        end = min(len(mv), cap)
+        if start >= end:
+            return -1
+        try:
+            return bytes(mv[start:end]).find(sub) + (start if sub in mv[start:end] else 0)
+        except Exception:
+            # Very defensive fallback
+            blk = bytes(mv[:end])
+            pos = blk.find(sub, start)
+            return pos
+
+    def _fp8(self, raw: bytes) -> Optional[str]:
+        """Tiny 8-hex fingerprint of the first FP_PREFIX_BYTES (cheap uniqueness)."""
+        try:
+            pref = memoryview(raw)[:self.FP_PREFIX_BYTES]
+            return hashlib.sha1(pref).hexdigest()[:8]
+        except Exception:
+            return None
+
+    # -------------------- Throttling & housekeeping --------------------
+    def _should_log(self, fkey: Tuple[str, int, str, int, str], important: bool) -> bool:
+        """Global token-bucket + per-flow cooldown. 'important' spends fewer tokens."""
+        now = time.time()
+
+        # Per-flow cooldown
+        until = self._cooldown_until.get(fkey, 0.0)
+        if now < until:
+            return False
+
+        # Refill tokens
+        dt = max(0.0, now - self._last_refill)
+        if dt:
+            self._tokens = min(self.LOG_BURST, int(self._tokens + dt * self.LOG_RPS))
+            self._last_refill = now
+
+        # Spend tokens (important logs are cheaper)
+        cost = 0.5 if important else 1.0
+        if self._tokens >= cost:
+            self._tokens -= cost
+            # Shorter cooldown for important items to keep visibility
+            cd = self.FLOW_COOLDOWN_S * (0.5 if important else 1.0)
+            self._cooldown_until[fkey] = now + cd
+
+            # Soft-cap cooldown map
+            if len(self._cooldown_until) > self.FLOW_TRACK_MAX:
+                # Drop ~1% oldest by timestamp
+                threshold = now - self.FLOW_COOLDOWN_S
+                dropped = 0
+                for k, t in list(self._cooldown_until.items()):
+                    if t < threshold:
+                        self._cooldown_until.pop(k, None)
+                        dropped += 1
+                        if dropped >= max(1, self.FLOW_TRACK_MAX // 100):
+                            break
+            return True
+
+        return False
+
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < self.GC_PERIOD_S:
+            return
+
+        # Expire peers
+        cutoff = now - self.PEER_TTL_S
+        for k, ts in list(self._peer_seen.items()):
+            if ts < cutoff:
+                self._peer_seen.pop(k, None)
+
+        # Expire ancient cooldowns
+        stale = [k for k, until in self._cooldown_until.items() if until < now - (2 * self.FLOW_COOLDOWN_S)]
+        for k in stale:
+            self._cooldown_until.pop(k, None)
+
+        self._last_gc = now
+
+    # -------------------- Tiny utilities --------------------
+    def _is_wsd_port(self, sport: int, dport: int) -> bool:
+        return (sport in self.WSD_PORTS) or (dport in self.WSD_PORTS)
+
+    def _iface_suffix(self, inbound_iface: Optional[str]) -> str:
+        try:
+            return (inbound_iface or "").split("_")[-1]
+        except Exception:
+            return inbound_iface or ""
+
+    def _note_peer(self, a_ip: str, b_ip: str) -> None:
+        s, d = (str(a_ip), str(b_ip))
+        key = (s, d) if s <= d else (d, s)
+        self._peer_seen[key] = time.time()
 class TransportEphemeralTCPManager:
     """
     Non-blocking high-port↔high-port TCP observer.
@@ -7292,7 +8407,9 @@ class TransportManager:
         self.transport_steam = TransportSteamManager(self.logger)
         self.transport_tcp_high_Level = TransportHighServerTCPManager
         self.transport_https = TransportHTTPSManager(self.logger)
+        self.transport_ws_discovery = TransportWSDiscoveryManager(self.logger)
         self.transport_inspect = TransportInspectionManager(self.logger)
+        self.transport_scraper = TransportScraperManager(self.logger)
         self._MONERO_P2P_PORTS = [
             # Standard P2P
             18080,
@@ -7638,18 +8755,31 @@ class TransportManager:
         )
 
         if isinstance(transport_layer, TCP):
+            yield_no_gil(0.2)
             self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
                                       return_type="void", queue_name="transport_tcp_packets")
-            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip, transport_layer.sport,
+            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
+                                              transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20, queue_name="transport_inspect_tdp_packets")
+                                              return_type="all", count_to_call=20,
+                                              queue_name="transport_inspect_tcp_packets")
+            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip, transport_layer.sport,
+                                              transport_layer.dport, iface_short,
+                                              return_type="all", count_to_call=20, queue_name="transport_scrape_tcp_packets")
             return True
         elif isinstance(transport_layer, UDP):
+            yield_no_gil(0.2)
             self.parallel_python.run_parallel(self._handle_udp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
                                       return_type="void", queue_name="transport_udp_packets")
-            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip, transport_layer.sport,
+            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
+                                              transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20, queue_name="transport_inspect_udp_packets")
+                                              return_type="all", count_to_call=20,
+                                              queue_name="transport_inspect_udp_packets")
+            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip, transport_layer.sport,
+                                              transport_layer.dport, iface_short,
+                                              return_type="all", count_to_call=20, queue_name="transport_scrape_udp_packets")
+
             return True
 
         # Handle packets with extension headers that were permitted by the firewall
@@ -7659,7 +8789,6 @@ class TransportManager:
                 packet, inbound_iface=inbound_iface, phase="handled", component="transport-ipv6"
             )
             return True
-        yield_no_gil(0.02)
         return False
 
     def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
@@ -7836,10 +8965,7 @@ class TransportManager:
 
     def _handle_ws_discovery_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
-        self.logger.log_message(
-            f"[Transport][🚀 UDP][🔍 WS-Discovery] WS-Discovery packet detected from {src_ip}:{sport} to {dst_ip}:{dport}. "
-            "Likely for dynamic device discovery."
-        )
+        self.transport_ws_discovery.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_kerberos_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for WS-Discovery packets on UDP port 3702."""
