@@ -17,6 +17,7 @@ import threading
 import json
 import time
 import numpy as np
+import zmq
 from scapy.arch import get_if_hwaddr
 from scapy.contrib.ikev2 import IKEv2
 from scapy.fields import StrLenField
@@ -37,7 +38,7 @@ from scapy.layers.kerberos import (
     EncryptedData
 )
 
-from p2pool_router_managers_2 import TLSRecordManager, TLSRecord
+from p2pool_router_managers_2 import TLSRecordManager, TLSRecord,ZMQReader
 from p2pool_sniffer import MLDQuery, MLDReport, MLDDone, ICMPv6
 from server.p2pool_tools import RandomXLoader
 from tools.pythontools import yield_no_gil
@@ -2146,6 +2147,7 @@ class TransportScraperManager:
     SSDP_PORT          = 1900
     NTP_PORT           = 123
     NBNS_PORT = 137
+    NBDS_PORT = 138
     KERBEROS_PORT = 88
     ZT_PORT = 9993
     _HTTP_START_RE = re.compile(
@@ -2235,6 +2237,34 @@ class TransportScraperManager:
     def snapshot_metrics(self) -> dict:
         return dict(self._metrics)
 
+    def _scrape_nbds(self, raw: bytes) -> tuple[str, dict]:
+        """
+        Very cheap NBDS detector:
+          - identifies common mailslot messages (\\MAILSLOT\\BROWSE, \\MAILSLOT\\LANMAN)
+          - emits size + short ascii preview
+        """
+        ms = None
+        up = raw.upper()
+        if b"\\MAILSLOT\\BROWSE" in up:
+            ms = "BROWSE"
+        elif b"\\MAILSLOT\\LANMAN" in up:
+            ms = "LANMAN"
+
+        preview = None
+        try:
+            # keep it tiny, printable
+            txt = raw[:96].decode("utf-8", errors="ignore")
+            preview = txt.replace("\r", " ").replace("\n", " ")[:80]
+        except Exception:
+            pass
+
+        rec = {
+            "size": len(raw),
+            "sha8": hashlib.sha256(raw[:64]).hexdigest()[:8],
+        }
+        if ms:       rec["mailslot"] = ms
+        if preview:  rec["preview"] = preview
+        return ("nbds", rec)
     # ---------- TCP ----------
     def _scrape_tcp(self, pkt, f: dict):
         tcp = pkt[TCP]
@@ -2353,6 +2383,13 @@ class TransportScraperManager:
             self._maybe_emit(f, direction, "overlay", {
                 **self._base_rec(f, direction, kind="overlay"),
                 "size": len(payload) if payload else 0
+            }, cost=0.5)
+            return
+        if sport == self.NBDS_PORT or dport == self.NBDS_PORT:
+            topic, info = self._scrape_nbds(payload)
+            self._maybe_emit(f, direction, topic, {
+                **self._base_rec(f, direction, kind=topic),
+                **info
             }, cost=0.5)
             return
         # Fallback small emit for unknown UDP
@@ -3302,10 +3339,9 @@ class TransportHTTPSManager:
         except Exception:
             return None
 
-
 class TransportMoneroManager:
     """
-    Unified Monero transport observer + policy engine (low overhead) + optional RandomX verifier.
+    Unified Monero transport observer + policy engine (low overhead).
 
     Public API:
       handle(pkt, src, dst, sport, dport, inbound_iface) -> 'allow' | 'deny'
@@ -3314,6 +3350,7 @@ class TransportMoneroManager:
     _HTTP_EOL = b"\r\n"
     _HDR_DELIM_1 = b"\r\n\r\n"
     _HDR_DELIM_2 = b"\n\n"  # tolerate LF-only peers
+
     # -------- Ports --------
     DEFAULT_P2P_PORTS = {18080, 28080, 38080}
     DEFAULT_RPC_PORTS = {18081, 28081, 38081}
@@ -3329,11 +3366,6 @@ class TransportMoneroManager:
     PROGRESS_PKT_STEP   = 50             # progress log every N pkts
     PROGRESS_BYTES_SET  = {1024, 4096, 16384, 65536, 262144}
     LEVIN_LOG_BURST_MAX = 8              # max frames to log per feed
-
-    # --- RandomX budgets (microseconds) ---
-    RX_BUDGET_US_PER_CALL = 500          # ~0.5ms slice per handle()
-    RX_QUEUE_MAX          = 64           # bounded task queue
-    RX_INIT_COOLDOWN_SEC  = 5.0          # avoid repeated heavy init thrash
 
     # -------- Levin constants --------
     _LEVIN_SIG   = 0x0101010101010101
@@ -3427,12 +3459,7 @@ class TransportMoneroManager:
         flow_idle_timeout: int = FLOW_TTL_SEC,
         msg_rate_window: float = RL_WINDOW_SEC,
         p2p_auto_reply_ping: bool = True,
-        tx_cb: Optional[Callable[[dict, bytes, str], bool]] = None,
-        # ---- RandomX integration ----
-        randomx_loader: Optional[object] = None,  # pass an instance of RandomXLoader
-        rx_enable: bool = True,
-        rx_budget_us: int = RX_BUDGET_US_PER_CALL,
-        rx_queue_max: int = RX_QUEUE_MAX,
+        tx_cb: Optional[callable] = None,
     ):
         self.logger = logger
         self.max_payload_sample = int(max_payload_sample)
@@ -3454,20 +3481,6 @@ class TransportMoneroManager:
 
         self._last_gc = time.time()
 
-        # ---- RandomX wiring ----
-        self._rx: Optional[RandomXLoader] = randomx_loader if rx_enable else None
-        self._rx_enabled = bool(rx_enable and randomx_loader is not None)
-        self._rx_budget_us = int(rx_budget_us)
-        self._rx_queue: "deque[tuple]" = deque(maxlen=int(rx_queue_max))
-        self._rx_last_init_try_ts = 0.0
-        seed = bytes.fromhex("00" * 32)
-        blob = b"test blob"
-        self._rx.ensure_started(seed, use_dataset=False)
-        assert self._rx.is_ready(), "RandomX failed to init"
-        h = self._rx.calculate_hash(blob)
-        # tiny counters
-        self._rx_metrics = {"scheduled": 0, "done": 0, "errors": 0, "init": 0}
-
         self.logger.log_message("[Transport][🪙 Monero] Manager ready.")
 
     # ========== Public entrypoint ==========
@@ -3487,8 +3500,7 @@ class TransportMoneroManager:
                     payload = self._get_payload_bytes(pkt)
                     ftype = self._dynamic_classify_from_payload(payload)
                 if not ftype:
-                    # still process a tiny RX slice (non-blocking)
-                    self._rx_drain_budget()
+                    self._cleanup_idle(now)
                     return 'allow'
                 flow = self._new_flow(src, sport, dst, dport, inbound_iface, now, ftype)
                 self._flows[key] = flow
@@ -3498,7 +3510,6 @@ class TransportMoneroManager:
             # Fast path after first classification
             if flow.get("noinspect", False):
                 self._maybe_progress_log(flow)
-                self._rx_drain_budget()
                 self._cleanup_idle(now)
                 return 'allow'
 
@@ -3517,14 +3528,9 @@ class TransportMoneroManager:
                     f"{src}:{sport} -> {dst}:{dport} | {reason}"
                 )
 
-            # Drain a small RX budget slice every packet (bounded)
-            self._rx_drain_budget()
-
             self._cleanup_idle(now)
             return decision
         except Exception:
-            # best effort
-            self._rx_drain_budget()
             return 'allow'
 
     # ========== Policy ==========
@@ -3534,7 +3540,6 @@ class TransportMoneroManager:
             if flow.get('state') == 'ESTABLISHED' and not flow.get('synack_seen') and payload_len > 0:
                 return 'deny', "P2P data before handshake completion"
         if flow['type'] == 'rpc':
-            # Opportunistic light parse to tag mining-ish calls (already parsed in _rpc_parse_and_log)
             if flow.get('rpc_last_method') == 'get_block_template':
                 self._rl_log("[Transport][🪙 Monero][POLICY] ℹ️ Mining activity detected on flow.")
         return 'allow', "default"
@@ -3707,7 +3712,7 @@ class TransportMoneroManager:
             f"bytes={total} pkts={pkts} rate~{rate_str} roll8={roll8}"
         )
 
-    # ---- RPC: budgeted split + JSON hints + RandomX task scheduling ----
+    # ---- RPC: budgeted split + JSON hints (no RandomX hooks) ----
     def _rpc_parse_and_log(self, f, pkt, iface_or_tag: str):
         (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
         payload = self._get_payload_bytes(pkt)
@@ -3745,92 +3750,6 @@ class TransportMoneroManager:
                 self._rl_log(
                     f"[Transport][🧵 TCP][🪙 Monero][RPC] ◀RSP status={status or '?'} body={len(body)}B type={jhint}"
                 )
-                # ---- RandomX: schedule verification if this looks like get_block_template ----
-                if self._rx_enabled and jhint == "json":
-                    self._rx_maybe_schedule_from_template_json(body, f, iface_or_tag)
-
-    # ========== RandomX integration ==========
-    def _rx_maybe_schedule_from_template_json(self, body: bytes, flow: dict, iface: str):
-        try:
-            payload = body[: self.RPC_JSON_MAX]
-            j = json.loads(payload.decode("utf-8", errors="replace"))
-            if not isinstance(j, dict): return
-            res = j.get("result") or {}
-            # Monero daemon get_block_template common fields
-            blob_hex = res.get("blocktemplate_blob") or res.get("blockhashing_blob")
-            seed_hex = res.get("seed_hash") or res.get("seed")  # seed_hash is typical for RandomX
-            diff     = res.get("difficulty")
-            if not (blob_hex and seed_hex and diff):
-                return
-
-            blob = self._hex_to_bytes(blob_hex)
-            seed = self._hex_to_bytes(seed_hex)
-            if not (blob and seed):
-                return
-
-            # Start (rate-limited) RX VM if needed
-            self._rx_try_start(seed)
-
-            # Enqueue a tiny verification task
-            if self._rx_enabled and self._rx:
-                # include known nonce offset for visibility (no modification here)
-                task = ("template_check", time.time(), flow.get("endpoints"), blob, seed, int(diff))
-                if len(self._rx_queue) < self._rx_queue.maxlen:
-                    self._rx_queue.append(task)
-                    self._rx_metrics["scheduled"] += 1
-                    self._rl_log(
-                        "[Transport][🧵 TCP][🪙 Monero][RX] 🧪 queued template-check "
-                        f"host={flow.get('rpc_last_host') or '-'} diff={diff} blob_len={len(blob)}"
-                    )
-        except Exception:
-            # swallow — never block hot path
-            pass
-
-    def _rx_try_start(self, seed: bytes):
-        if not self._rx_enabled or not self._rx:
-            return
-        now = time.time()
-        if getattr(self._rx, "is_ready", None) and self._rx.is_ready():
-            return
-        if now - self._rx_last_init_try_ts < self.RX_INIT_COOLDOWN_SEC:
-            return
-        self._rx_last_init_try_ts = now
-        try:
-            # ensure_started may be heavy — do not loop on failure
-            self._rx.ensure_started(seed, use_dataset=False)
-            self._rx_metrics["init"] += 1
-            self._rl_log("[Transport][🧵 TCP][🪙 Monero][RX] ✅ RandomX VM ready")
-        except Exception:
-            self._rx_metrics["errors"] += 1
-            self._rl_log("[Transport][🧵 TCP][🪙 Monero][RX] ⚠️ RandomX init failed (suppressed)")
-
-    def _rx_drain_budget(self):
-        """Process a few RX tasks within a strict microsecond budget."""
-        if not self._rx_enabled or not self._rx or not self._rx_queue:
-            return
-        start = time.perf_counter()
-        budget = self._rx_budget_us / 1_000_000.0
-        while self._rx_queue and (time.perf_counter() - start) < budget:
-            kind, ts, endpoints, blob, seed, diff = self._rx_queue.popleft()
-            try:
-                if not (getattr(self._rx, "is_ready", None) and self._rx.is_ready()):
-                    # best-effort lazy init (rate-limited)
-                    self._rx_try_start(seed)
-                    if not self._rx.is_ready():
-                        continue
-                # compute one 32-byte hash (no nonce search; just sanity proof)
-                h = self._rx.calculate_hash(blob)
-                target = self._target_from_difficulty_int(diff)
-                ok = (h <= target)
-                a, b = endpoints or (("?", "?"), ("?", "?"))
-                self._rl_log(
-                    f"[Transport][🧵 TCP][🪙 Monero][RX] chk {'OK' if ok else 'FAIL'} "
-                    f"hash=0x{h:064x} target=0x{target:064x} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]}"
-                )
-                self._rx_metrics["done"] += 1
-            except Exception:
-                self._rx_metrics["errors"] += 1
-                # keep quiet; logs are rate-limited elsewhere
 
     # ---- P2P (Levin) ----
     def _p2p_feed_and_log(self, f: dict, payload: bytes, iface: str, direction: Optional[str]) -> None:
@@ -4034,23 +3953,23 @@ class TransportMoneroManager:
         def is_http_head(b: bytes) -> bool:
             head = b[:8].upper()
             return (
-                    head.startswith(b"GET ")
-                    or head.startswith(b"POST ")
-                    or head.startswith(b"PUT ")
-                    or head.startswith(b"HEAD ")
-                    or head.startswith(b"HTTP/")
-                    or head.startswith(b"OPTI")  # OPTIONS
-                    or head.startswith(b"DELET")  # DELETE
-                    or head.startswith(b"PATCH ")
+                head.startswith(b"GET ")
+                or head.startswith(b"POST ")
+                or head.startswith(b"PUT ")
+                or head.startswith(b"HEAD ")
+                or head.startswith(b"HTTP/")
+                or head.startswith(b"OPTI")   # OPTIONS
+                or head.startswith(b"DELET")  # DELETE
+                or head.startswith(b"PATCH ")
             )
 
         def is_tls_record(b: bytes) -> bool:
             # TLS ContentType (0x14..0x17), Version = 0x03 0x0x
             return (
-                    len(b) >= 3
-                    and b[0] in (0x14, 0x15, 0x16, 0x17)
-                    and b[1] == 0x03
-                    and 0x00 <= b[2] <= 0x05
+                len(b) >= 3
+                and b[0] in (0x14, 0x15, 0x16, 0x17)
+                and b[1] == 0x03
+                and 0x00 <= b[2] <= 0x05
             )
 
         hints = []
@@ -4095,10 +4014,8 @@ class TransportMoneroManager:
                 return b"", 0
             if sz == 0:
                 # optional trailer section: read CRLF
-                # we need at least final CRLF
                 if len(mv) < pos + 2:
                     return b"", 0
-                # try to consume one or two CRLFs (tolerant)
                 if mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
                     pos += 2
                 if len(mv) >= pos + 2 and mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
@@ -4115,7 +4032,7 @@ class TransportMoneroManager:
             pos += 2
 
     def _parse_headers(self, raw_headers: bytes) -> dict:
-        headers = {}
+        headers = {":start": raw_headers.split(self._HTTP_EOL, 1)[0].decode("utf-8", "replace")}
         for line in raw_headers.split(self._HTTP_EOL):
             if not line:
                 continue
@@ -4123,18 +4040,18 @@ class TransportMoneroManager:
                 # start-line (REQUEST/STATUS) or malformed; skip here
                 continue
             k, v = line.split(b":", 1)
-            headers[k.strip().lower()] = v.strip()
+            headers[k.strip().lower().decode("utf-8", "replace")] = v.strip().decode("utf-8", "replace")
         return headers
 
-    def _split_http_messages(self, buf: bytearray) -> Tuple[List[bytes], bytearray]:
+    def _split_http_messages(self, buf: bytearray) -> Tuple[List[Tuple[dict, bytes, bytes]], bytearray]:
         """
         Splits a TCP reassembly buffer into complete HTTP messages.
         Supports:
           • Content-Length framing
           • Transfer-Encoding: chunked (minimal)
-        Returns: (messages, remaining_buf)
+        Returns: ([(headers_dict, body_bytes, raw_bytes), ...], remaining_buf)
         """
-        msgs: List[bytes] = []
+        msgs: List[Tuple[dict, bytes, bytes]] = []
         mv = memoryview(buf)
         start = 0
         total = len(mv)
@@ -4144,58 +4061,62 @@ class TransportMoneroManager:
                 break  # not enough for headers
 
             # Find header delimiter (tolerate CRLFCRLF or LFLF)
-            h_end = mv[start:].tobytes().find(self._HDR_DELIM_1)
+            head_slice = mv[start:].tobytes()
+            h_end_rel = head_slice.find(self._HDR_DELIM_1)
             delim_len = 4
-            if h_end < 0:
-                h_end = mv[start:].tobytes().find(self._HDR_DELIM_2)
-                if h_end < 0:
+            if h_end_rel < 0:
+                h_end_rel = head_slice.find(self._HDR_DELIM_2)
+                if h_end_rel < 0:
                     break  # no full headers yet
                 delim_len = 2
-            h_end_abs = start + h_end
+            h_end_abs = start + h_end_rel
             headers_blob = mv[start:h_end_abs].tobytes()
             headers = self._parse_headers(headers_blob)
 
             # Determine body framing
-            cl = headers.get(b"content-length")
-            te = headers.get(b"transfer-encoding")
-
             body_start = h_end_abs + delim_len
+            cl = headers.get("content-length")
+            te = headers.get("transfer-encoding")
+
             if cl is not None:
-                want = self._parse_int_safe(cl, -1)
+                want = self._parse_int_safe(cl.encode(), -1)
                 if want < 0:
-                    break  # malformed; wait for more or drop upstream
+                    break  # malformed; wait for more
                 end = body_start + want
                 if total < end:
                     break  # incomplete body
-                msgs.append(mv[start:end].tobytes())
+                raw = mv[start:end].tobytes()
+                body = mv[body_start:end].tobytes()
+                msgs.append((headers, body, raw))
                 start = end
                 continue
 
-            if te and b"chunked" in te.lower():
+            if te and ("chunked" in te.lower()):
                 decoded, consumed = self._decode_chunked(mv[body_start:])
                 if consumed == 0:
                     break  # incomplete
                 end = body_start + consumed
-                msgs.append(mv[start:end].tobytes())
+                raw = mv[start:end].tobytes()
+                body = decoded
+                msgs.append((headers, body, raw))
                 start = end
                 continue
 
-            # No body (e.g., GET without payload) — treat as headers-only
-            # or methods/status codes where a body is optional. We’ll emit headers only.
-            msgs.append(mv[start:body_start].tobytes())
+            # No body (headers only)
+            raw = mv[start:body_start].tobytes()
+            msgs.append((headers, b"", raw))
             start = body_start
 
-        # Carry over remainder
         remaining = bytearray(mv[start:].tobytes())
         return msgs, remaining
 
     @staticmethod
     def _parse_int_safe(s: bytes, default: int = -1) -> int:
-        """Safe int parser for Content-Length headers."""
         try:
             return int(s.strip())
         except Exception:
             return default
+
     @staticmethod
     def _short_hex(b: bytes, max_len: int) -> str:
         if not b:
@@ -4231,20 +4152,6 @@ class TransportMoneroManager:
             return "-"
 
     @staticmethod
-    def _find_double_crlf(view: memoryview, start: int, hdr_cap: int) -> int:
-        limit = min(len(view), start + hdr_cap)
-        data = view[start:limit].tobytes()
-        idx = data.find(b"\r\n\r\n")
-        return -1 if idx < 0 else start + idx
-
-    @staticmethod
-    def _find_crlf(view: memoryview, start: int, cap: int) -> int:
-        limit = min(len(view), start + cap)
-        data = view[start:limit].tobytes()
-        idx = data.find(b"\r\n")
-        return -1 if idx < 0 else start + idx
-
-    @staticmethod
     def _looks_like_json(b: bytes) -> bool:
         bb = b.strip()
         return (bb.startswith(b"{") and bb.endswith(b"}")) or (bb.startswith(b"[") and bb.endswith(b"]"))
@@ -4274,24 +4181,6 @@ class TransportMoneroManager:
             if len(parts) >= 2 and parts[0].startswith("HTTP/"):
                 return parts[1]
             return None
-        except Exception:
-            return None
-
-    # ---- Difficulty/target helpers (no import from RandomXLoader needed) ----
-    @staticmethod
-    def _target_from_difficulty_int(difficulty: int) -> int:
-        D = max(1, int(difficulty))
-        return (1 << 256) // D
-
-    @staticmethod
-    def _hex_to_bytes(h: str) -> Optional[bytes]:
-        try:
-            h = h.strip().lower()
-            if h.startswith("0x"):
-                h = h[2:]
-            if any(c not in "0123456789abcdef" for c in h):
-                return None
-            return bytes.fromhex(h)
         except Exception:
             return None
 
@@ -5923,7 +5812,747 @@ class TransportDNSManager:
         if dead:
             self.log.log_message(f"[Transport][🔎 DNS] 🧹 GC expired {len(dead)} pending query slots")
         self._last_gc = now
+class TransportMDNSManager:
+    """
+    mDNS (Multicast DNS) helper (UDP/5353, 224.0.0.251 / ff02::fb)
 
+    Emits concise summaries:
+      • Queries: names/types (+EDNS if present, though rare in mDNS)
+      • Responses: PTR→(SRV/TXT)+A/AAAA previews
+      • Dedup + cooldown to avoid floods
+    """
+
+    MDNS_PORT_V4 = 5353
+    MDNS_MCAST_V4 = "224.0.0.251"
+    MDNS_MCAST_V6 = "ff02::fb"
+
+    # Common qtype strings
+    _QT = {
+        1:  "A", 28: "AAAA", 12: "PTR", 33: "SRV", 16: "TXT",
+        5:  "CNAME", 6: "SOA", 2: "NS"
+    }
+
+    # ---------- Tunables ----------
+    LOG_RPS         = 0.5       # ~1 line / 2s globally
+    LOG_BURST       = 10
+    FLOW_COOLDOWN_S = 10.0      # per (sig) cooldown
+    DEDUP_TTL_S     = 120.0     # suppress identical response sets briefly
+    PREVIEW_MAX     = 5
+
+    class _TokenBucket:
+        __slots__ = ("cap","rate","tokens","last")
+        def __init__(self, cap: int, rate: float):
+            self.cap = max(1, int(cap)); self.rate = max(0.1, float(rate))
+            self.tokens = float(self.cap); self.last = time.time()
+        def _refill(self):
+            now = time.time(); dt = now - self.last
+            if dt > 0:
+                self.tokens = min(self.cap, int(self.tokens + dt * self.rate)); self.last = now
+        def take(self, cost=1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost; return True
+            return False
+
+    def __init__(self, router_logger, exporter=None):
+        self.log = router_logger
+        self._exporter = exporter
+        self._tb = self._TokenBucket(self.LOG_BURST, self.LOG_RPS)
+        # cache: signature -> next_ok_ts
+        self._cooldown_until: Dict[Tuple, float] = {}
+        # dedup of response sets (hash) -> expire_ts
+        self._seen_resp: Dict[str, float] = {}
+        self._last_gc = time.time()
+        try:
+            self.log.log_message("[Transport][📡 mDNS] Manager ready.")
+        except Exception:
+            pass
+
+    # ---------- Public ----------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        if DNS is None or not packet.haslayer(DNS):
+            return False
+        # mDNS must be UDP/5353 (scoped to link-local mcast, but we won't over-assume)
+        if UDP is None or not packet.haslayer(UDP):
+            return False
+        if int(sport) != self.MDNS_PORT_V4 and int(dport) != self.MDNS_PORT_V4:
+            return False
+
+        dns = packet[DNS]
+        qr = int(getattr(dns, "qr", 0))   # 0=query, 1=response
+        iface = str(inbound_iface).split("_")[-1]
+        txid  = int(getattr(dns, "id", 0))
+        # scapy: qdcount/ancount/nscount/arcount
+        try:
+            if qr == 0:
+                names, types = self._extract_questions(dns)
+                if not names:
+                    return True
+                # Per-(name,type) cooldown to limit floods
+                head = names[0]; qtype0 = types[0]
+                sig = ("q", head, qtype0, iface)
+                if not self._should_emit(sig):
+                    return True
+                line = (f"[Transport][📡 mDNS][🔎 Query] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                        f"name={head} type={qtype0}" +
+                        (f" +{len(names)-1} more" if len(names) > 1 else ""))
+                self._emit(line)
+            else:
+                # Response: build compact preview; dedup on RR hash
+                an, ns, ar = int(getattr(dns, "ancount", 0)), int(getattr(dns, "nscount", 0)), int(getattr(dns, "arcount", 0))
+                preview, resp_hash = self._preview_answers(dns, an, ns, ar)
+                if not preview:
+                    return True
+                if not self._should_emit(("r", resp_hash, iface), dedup_hash=resp_hash):
+                    return True
+                head = preview[0]
+                more = f" … +{len(preview)-1}" if len(preview) > 1 else ""
+                line = (f"[Transport][📡 mDNS][📦 Response] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                        f"{head}{more}")
+                self._emit(line)
+        finally:
+            self._maybe_gc()
+            return True
+
+    # ---------- Internals ----------
+    def _should_emit(self, sig: Tuple, *, dedup_hash: Optional[str]=None) -> bool:
+        now = time.time()
+        # Per-signature cooldown
+        nxt = self._cooldown_until.get(sig, 0.0)
+        if now < nxt:
+            return False
+        # Global budget
+        if not self._tb.take(1.0):
+            return False
+        # Dedup identical response sets for a bit
+        if dedup_hash:
+            exp = self._seen_resp.get(dedup_hash, 0.0)
+            if now < exp:
+                return False
+            self._seen_resp[dedup_hash] = now + self.DEDUP_TTL_S
+        self._cooldown_until[sig] = now + self.FLOW_COOLDOWN_S
+        return True
+
+    def _emit(self, line: str):
+        if callable(self._exporter):
+            try:
+                self._exporter({"topic": "mdns", "line": line})
+                return
+            except Exception:
+                pass
+        try:
+            self.log.log_message(line)
+        except Exception:
+            pass
+
+    def _extract_questions(self, dns) -> Tuple[List[str], List[str]]:
+        names, types = [], []
+        try:
+            qdcount = int(getattr(dns, "qdcount", 0))
+            qd = getattr(dns, "qd", None)
+            cur = qd; n = 0
+            while cur is not None and n < qdcount:
+                nm = self._safe_name(getattr(cur, "qname", b""))
+                qt = self._QT.get(int(getattr(cur, "qtype", 0)), str(int(getattr(cur, "qtype", 0))))
+                names.append(nm); types.append(qt)
+                nxt = getattr(cur, "payload", None)
+                if nxt is cur or not isinstance(nxt, DNSQR): break
+                cur = nxt; n += 1
+        except Exception:
+            pass
+        return names, types
+
+    def _preview_answers(self, dns, an, ns, ar) -> Tuple[List[str], str]:
+        items: List[str] = []
+
+        def iter_rr(rr, count):
+            cur = rr; n = 0
+            while cur is not None and n < count:
+                yield cur
+                nxt = getattr(cur, "payload", None)
+                if nxt is cur or not isinstance(nxt, DNSRR): break
+                cur = nxt; n += 1
+
+        # PTR/SRV/TXT plus A/AAAA previews, capped
+        def fmt_rr(rr) -> str:
+            try:
+                t = self._QT.get(int(getattr(rr, "type", 0)), str(int(getattr(rr, "type", 0))))
+                name = self._safe_name(getattr(rr, "rrname", b""))
+                ttl = int(getattr(rr, "ttl", 0))
+                if t == "PTR":
+                    tgt = self._safe_name(getattr(rr, "rdata", b""))
+                    return f"PTR {name} → {tgt} (ttl={ttl})"
+                if t == "SRV":
+                    port = getattr(rr, "port", "?")
+                    tgt  = self._safe_name(getattr(rr, "target", b""))
+                    return f"SRV {name} → {tgt}:{port} (ttl={ttl})"
+                if t == "TXT":
+                    r = getattr(rr, "rdata", b"")
+                    txt = self._fmt_txt(r)
+                    return f"TXT {name} {txt} (ttl={ttl})"
+                if t in ("A","AAAA"):
+                    v = getattr(rr, "rdata", "?")
+                    return f"{t} {name} {v} (ttl={ttl})"
+                # fallback terse
+                v = getattr(rr, "rdata", b"")
+                if isinstance(v, bytes): v = self._safe(v)
+                return f"{t} {name} {v} (ttl={ttl})"
+            except Exception:
+                return "RR ?"
+
+        for rr in iter_rr(getattr(dns, "an", None), an):
+            items.append(fmt_rr(rr))
+            if len(items) >= self.PREVIEW_MAX: break
+        if len(items) < self.PREVIEW_MAX:
+            for rr in iter_rr(getattr(dns, "ar", None), ar):
+                # additional often carries SRV target A/AAAA or NSEC/TXT
+                items.append(fmt_rr(rr))
+                if len(items) >= self.PREVIEW_MAX: break
+
+        # Build a stable hash to dedup repeated multicasts
+        h = hashlib.sha1()
+        try:
+            h.update(bytes(getattr(dns, "an", b"") or b""))
+            h.update(bytes(getattr(dns, "ar", b"") or b""))
+        except Exception:
+            # as a fallback, hash the joined strings
+            h.update("|".join(items).encode("utf-8", "ignore"))
+        resp_hash = h.hexdigest()[:16]
+        return items, resp_hash
+
+    def _fmt_txt(self, rdata: Any) -> str:
+        try:
+            if isinstance(rdata, (bytes, bytearray)):
+                s = self._safe(rdata)
+                return f"\"{s}\"" if s else "\"\""
+            if isinstance(rdata, list):
+                parts = [self._safe(x) for x in rdata[:3]]
+                more = f" +{len(rdata)-3}" if len(rdata) > 3 else ""
+                return "[" + ", ".join(f"\"{p}\"" for p in parts) + "]" + more
+        except Exception:
+            pass
+        return "\"?\""
+
+    def _safe_name(self, v: Any) -> str:
+        if isinstance(v, (bytes, bytearray)):
+            return v.decode("utf-8", "ignore").rstrip(".") or "."
+        if isinstance(v, str):
+            return v.rstrip(".")
+        return str(v)
+
+    def _safe(self, b: Any) -> str:
+        try:
+            if isinstance(b, (bytes, bytearray)):
+                s = b.decode("utf-8", "ignore")
+                return s if len(s) <= 80 else s[:77] + "…"
+            return str(b)
+        except Exception:
+            return "?"
+
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < 15.0:
+            return
+        # purge old response hashes
+        stale = [k for k,v in self._seen_resp.items() if v < now]
+        for k in stale: self._seen_resp.pop(k, None)
+        # trim cooldowns that are long past
+        stale2 = [k for k,t in self._cooldown_until.items() if t < now - 2*self.FLOW_COOLDOWN_S]
+        for k in stale2: self._cooldown_until.pop(k, None)
+        self._last_gc = now
+class TransportNBNSManager:
+    """
+    Minimal NetBIOS Name Service (NBNS, UDP/137) parser & logger.
+    Avoids 'Undecoded' and surfaces who is asking/answering for which name.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+    """
+
+    # NBNS opcodes (top 4 bits of flags)
+    _OPC = {0: "QUERY", 5: "REG", 6: "RELEASE", 7: "WACK", 8: "REFRESH"}
+    # NBNS RCODEs (low 4 bits)
+    _RC  = {0: "NOERROR", 1: "FMTERR", 2: "SRVFAIL", 3: "NXDOMAIN", 6: "REFUSED"}
+
+    # QTYPE/QCLASS (common)
+    _QT = {0x0020: "NB", 0x0021: "NBSTAT"}
+    _QC = {0x0001: "IN"}
+
+    def __init__(self, router_logger, *, pending_ttl_sec=10, gc_interval_sec=5):
+        self.log = router_logger
+        self._pending_ttl = int(pending_ttl_sec)
+        self._gc_interval = int(gc_interval_sec)
+        # key = (client_ip, client_port, dst_ip, txid) → ts
+        self._pending = {}
+        self._last_gc = time.time()
+        self._recent = {}  # msg hash → last ts (simple dedup)
+        self._recent_window = 2.0
+        try:
+            self.log.log_message("[Transport][📣 NBNS] Manager ready.")
+        except Exception:
+            pass
+
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        if UDP is None:
+            return False
+        if not packet.haslayer(UDP):
+            return False
+        if not (sport == 137 or dport == 137):
+            return False
+
+        iface = inbound_iface.split("_")[-1]
+        payload = b""
+        try:
+            if Raw is not None and packet.haslayer(Raw) and packet[Raw].load:
+                payload = bytes(packet[Raw].load)
+        except Exception:
+            pass
+
+        if len(payload) < 12:  # DNS-like header size
+            self._log_rate(f"[Transport][📣 NBNS] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} (short)")
+            return True
+
+        txid = int.from_bytes(payload[0:2], "big")
+        flags = int.from_bytes(payload[2:4], "big")
+        qd, an, ns, ar = (int.from_bytes(payload[4:6], "big"),
+                          int.from_bytes(payload[6:8], "big"),
+                          int.from_bytes(payload[8:10], "big"),
+                          int.from_bytes(payload[10:12], "big"))
+        qr = (flags >> 15) & 1
+        opcode = (flags >> 11) & 0xF
+        aa = bool((flags >> 10) & 1)
+        tc = bool((flags >> 9) & 1)
+        rd = bool((flags >> 8) & 1)
+        ra = bool((flags >> 7) & 1)
+        bcast = bool((flags >> 4) & 1)
+        rcode = flags & 0xF
+
+        p = 12
+        name, qtype, qclass, p2 = self._parse_question(payload, p) if qd else ("-", None, None, p)
+
+        # direction & latency tracking
+        proto = "udp"
+        if qr == 0:  # query
+            self._pending[(src_ip, sport, dst_ip, txid)] = time.time()
+            self._log_rate(
+                f"[Transport][📣 NBNS][🧭 Query] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                f"txid=0x{txid:04x} op={self._OPC.get(opcode,'OP'+str(opcode))} "
+                f"name={name} type={self._QT.get(qtype,qtype)} "
+                f"flags={'BCAST|' if bcast else ''}{'RD|' if rd else ''}{'RA|' if ra else ''}{'AA' if aa else '-'}{(' TC' if tc else '')}"
+            )
+        else:        # response
+            lat = None
+            pend_key = (dst_ip, dport, src_ip, txid)  # reverse to original client
+            ts0 = self._pending.pop(pend_key, None)
+            if ts0:
+                lat = int((time.time() - ts0) * 1000)
+
+            hdr = (f"[Transport][📣 NBNS][📦 Response] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                   f"txid=0x{txid:04x} rcode={self._RC.get(rcode, rcode)} "
+                   f"an={an} ns={ns} ar={ar}{' '+str(lat)+'ms' if lat is not None else ''} "
+                   f"flags={'BCAST|' if bcast else ''}{'RA|' if ra else ''}{'AA' if aa else '-'}{(' TC' if tc else '')}")
+            self._log_rate(hdr)
+
+            # Show a couple of answers
+            try:
+                p = p2  # after first question
+                shown = 0
+                for _ in range(an):
+                    rr, p = self._parse_rr(payload, p)
+                    if not rr:
+                        break
+                    if shown < 4:
+                        self._log_rate(f"[Transport][📣 NBNS][📜 Answer] {rr}")
+                        shown += 1
+                # (We could emit NS/AR similarly if you want)
+            except Exception:
+                pass
+
+        self._maybe_gc()
+        return True
+
+    # ---------- parsing helpers ----------
+
+    def _parse_question(self, buf: bytes, p: int):
+        name, p = self._read_nbns_name(buf, p)
+        if p + 4 > len(buf):
+            return name, None, None, p
+        qtype = int.from_bytes(buf[p:p+2], "big"); p += 2
+        qclass = int.from_bytes(buf[p:p+2], "big"); p += 2
+        return name, qtype, qclass, p
+
+    def _parse_rr(self, buf: bytes, p: int):
+        name, p = self._read_nbns_name(buf, p)
+        if p + 10 > len(buf):
+            return None, p
+        rtype = int.from_bytes(buf[p:p+2],"big"); p += 2
+        rclass = int.from_bytes(buf[p:p+2],"big"); p += 2
+        ttl   = int.from_bytes(buf[p:p+4],"big"); p += 4
+        rdlen = int.from_bytes(buf[p:p+2],"big"); p += 2
+        rdata = buf[p:p+rdlen]; p += rdlen
+
+        tstr = self._QT.get(rtype, f"TYPE{rtype}")
+        if rtype == 0x0020:  # NB → <num addrs, flags, ip(s)>
+            # NB resource data: 2B flags + 4B IPv4 (may repeat by rdlen)
+            vals = []
+            q = 0
+            while q + 6 <= len(rdata):
+                flags = int.from_bytes(rdata[q:q+2], "big"); q += 2
+                ip = ".".join(str(b) for b in rdata[q:q+4]); q += 4
+                g = "GROUP" if (flags & 0x8000) else "UNIQ"
+                vals.append(f"{ip} ({g})")
+            val = ", ".join(vals) if vals else "?"
+        elif rtype == 0x0021:  # NBSTAT
+            # First byte is number of names; then 18B per entry; tail may include stats
+            val = self._summarize_nbstat(rdata)
+        else:
+            val = (rdata.hex()[:40] + "…") if len(rdata) > 24 else rdata.hex()
+
+        return f"🧾 {name} {tstr} {val} (ttl={ttl})", p
+
+    def _summarize_nbstat(self, rdata: bytes) -> str:
+        try:
+            if not rdata:
+                return "NBSTAT ?"
+            n = rdata[0]
+            offs = 1
+            names = []
+            for _ in range(min(n, 5)):
+                if offs + 18 > len(rdata):
+                    break
+                raw = rdata[offs:offs+15]; flags = rdata[offs+15]; offs += 18
+                nm = raw.rstrip(b"\x00").decode("ascii", "ignore")
+                names.append(f"{nm}<{flags:02x}>")
+            more = f" …+{n-5}" if n > 5 else ""
+            # optional: trailing unit ID (6B MAC) at end
+            if len(rdata) >= 6:
+                mac = ":".join(f"{b:02x}" for b in rdata[-6:])
+                return f"[{', '.join(names)}]{more} mac={mac}"
+            return "[" + ", ".join(names) + "]" + more
+        except Exception:
+            return "NBSTAT ?"
+
+    def _read_nbns_name(self, buf: bytes, p: int):
+        """
+        NBNS compresses names like DNS, but the *encoded* label for a NetBIOS
+        name is a single 32-byte 'first-level encoding'. We handle:
+          - 0x20 length then 32B encoded name + 0x00
+          - DNS-style pointers (0xC0xx)
+        """
+        if p >= len(buf):
+            return "?", p
+        l = buf[p]
+        if l == 0x00:
+            return ".", p + 1
+        if (l & 0xC0) == 0xC0 and p + 1 < len(buf):
+            # pointer
+            off = ((l & 0x3F) << 8) | buf[p+1]
+            name, _ = self._read_nbns_name(buf, off)
+            return name, p + 2
+        if l == 0x20 and p + 1 + 32 <= len(buf):
+            enc = buf[p+1:p+33]; p2 = p + 33
+            name = self._decode_nb_name(enc)
+            # next should be 0x00 label terminator
+            if p2 < len(buf) and buf[p2] == 0x00:
+                p2 += 1
+            return name, p2
+        # Fallback: try DNS-like labels
+        return self._read_dns_like_name(buf, p)
+
+    def _decode_nb_name(self, enc: bytes) -> str:
+        # RFC 1002 first-level encoding: 16-byte NetBIOS name → 32 ASCII (A–P)
+        if len(enc) != 32:
+            return "?"
+        out = bytearray()
+        for i in range(0, 32, 2):
+            c1, c2 = enc[i]-0x41, enc[i+1]-0x41
+            out.append((c1 << 4) | (c2 & 0x0F))
+        raw = bytes(out).rstrip(b" ")
+        try:
+            base = raw[:-1].decode("ascii", "ignore")
+            suffix = raw[-1]
+            return f"{base}<{suffix:02x}>"
+        except Exception:
+            return raw.hex()
+
+    def _read_dns_like_name(self, buf: bytes, p: int):
+        labels = []
+        start = p
+        for _ in range(10):
+            if p >= len(buf):
+                break
+            l = buf[p]; p += 1
+            if l == 0:
+                break
+            if (l & 0xC0) == 0xC0 and p < len(buf):
+                off = ((l & 0x3F) << 8) | buf[p]; p += 1
+                tail, _ = self._read_dns_like_name(buf, off)
+                labels.append(tail)
+                break
+            if p + l > len(buf):
+                break
+            labels.append(buf[p:p+l].decode("utf-8", "ignore"))
+            p += l
+        name = ".".join(x for x in labels if x) or "?"
+        return name, p
+
+    # ---------- housekeeping ----------
+
+    def _log_rate(self, msg: str):
+        t = time.time()
+        h = hash(msg)
+        if t - self._recent.get(h, 0.0) >= self._recent_window:
+            self._recent[h] = t
+            self.log.log_message(msg)
+
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < self._gc_interval:
+            return
+        dead = [k for k, ts in self._pending.items() if now - ts > self._pending_ttl]
+        for k in dead:
+            self._pending.pop(k, None)
+        self._last_gc = now
+class TransportNBDSManager:
+    """
+    UDP/138 NetBIOS Datagram Service (NBDS) parser & logger.
+
+    What it extracts quickly (no heavy reassembly):
+      • NBDS header peek: msg_type, flags, dgm_id (best-effort)
+      • SMB Trans/Trans2 mailslot path (e.g. \\MAILSLOT\\BROWSE)
+      • Browser Service opcodes inside \\MAILSLOT\\BROWSE payloads
+      • Short previews, rate-limited to avoid floods
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+    """
+
+    # Browser Service opcodes (subset of the classics)
+    _BROWSER_OPCODES = {
+        0x01: "HostAnnouncement",
+        0x02: "AnnouncementRequest",
+        0x08: "DomainAnnouncement",
+        0x09: "MasterAnnouncement",
+        0x0B: "LocalMasterAnnouncement",
+        0x0C: "Election",
+        0x0D: "GetBackupListReq",
+        0x0E: "GetBackupListResp",
+        0x0F: "BecomeBackup",
+        0x10: "DomainMasterAnnouncement",
+        0x1D: "ResetBrowserState",
+    }
+
+    # Simple rate-limit for repeated lines
+    _RL_WINDOW_S = 2.0
+
+    def __init__(self, router_logger):
+        self.log = router_logger
+        self._recent = {}
+        try:
+            self.log.log_message("[Transport][📦 NBDS] Manager ready.")
+        except Exception:
+            pass
+
+    # --------------- Public entry ---------------
+
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        """
+        Recognize UDP/138 and emit compact, helpful lines.
+        Always returns True when ports match, even if parsing is partial.
+        """
+        try:
+            from scapy.all import UDP, Raw  # type: ignore
+        except Exception:
+            UDP = Raw = None  # scapy not available
+
+        if sport != 138 and dport != 138:
+            return False
+        # Must be UDP to be NBDS
+        if UDP is not None and not packet.haslayer(UDP):
+            return False
+
+        iface = str(inbound_iface).split("_")[-1]
+
+        payload = b""
+        if Raw is not None and packet.haslayer(Raw) and packet[Raw].load:
+            payload = bytes(packet[Raw].load or b"")
+
+        # Quick NBDS header peek (best-effort)
+        msg_type, flags, dgm_id = self._peek_nbds_header(payload)
+
+        # Hunt for mailslot path (SMB Trans/Trans2 over NBT Datagram)
+        mailslot = self._find_mailslot_path(payload)
+
+        # Browser Service decode if BROWSE mailslot
+        br = None
+        if mailslot and mailslot.upper().endswith("\\BROWSE"):
+            br = self._parse_browser_message(payload)
+
+        # Compose log
+        extra = []
+        if msg_type is not None:
+            extra.append(f"msg={msg_type}")
+        if flags is not None:
+            extra.append(f"flags=0x{flags:02x}")
+        if dgm_id is not None:
+            extra.append(f"id=0x{dgm_id:04x}")
+        if mailslot:
+            extra.append(f"mailslot={mailslot}")
+        if br:
+            op, host, dom = br.get("op"), br.get("host"), br.get("domain")
+            opn = self._BROWSER_OPCODES.get(op, f"0x{op:02x}") if isinstance(op, int) else str(op)
+            details = f"op={opn}"
+            if host:
+                details += f" host={host}"
+            if dom:
+                details += f" domain={dom}"
+            extra.append(f"browser[{details}]")
+
+        size = len(payload)
+        line = (f"[Transport][📦 NBDS] if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                f"size={size}B " + (" ".join(extra) if extra else "-"))
+
+        self._rate_log(line)
+
+        # If nothing was recognized but we know it's 138/UDP, still claim it
+        return True
+
+    # --------------- Parsers / heuristics ---------------
+
+    def _peek_nbds_header(self, data: bytes):
+        """
+        RFC 1002 NetBIOS Datagram header (simplified):
+          0: MSG_TYPE (1B)
+          1: FLAGS (1B)
+          2-3: DGM_ID (2B)
+          ... (we skip lengths/names for speed)
+        Returns (msg_type, flags, dgm_id) or (None, None, None) if too short.
+        """
+        if len(data) < 4:
+            return None, None, None
+        msg_type = data[0]
+        flags = data[1]
+        dgm_id = (data[2] << 8) | data[3]
+        return msg_type, flags, dgm_id
+
+    def _find_mailslot_path(self, data: bytes) -> str | None:
+        """
+        Look for SMB mailslot name inside NBDS payload.
+        We scan for ASCII '\\MAILSLOT\\...' up to a terminator (NUL or non-printable run).
+        """
+        # Try both single & double backslash encodings
+        needles = (b"\\MAILSLOT\\", b"\\\\MAILSLOT\\\\")
+        idx = -1
+        needle = None
+        for n in needles:
+            idx = data.find(n)
+            if idx >= 0:
+                needle = n
+                break
+        if idx < 0:
+            return None
+
+        # Read until NUL or newline or non-ASCII
+        j = idx + len(needle)
+        while j < len(data):
+            b = data[j]
+            if b == 0 or b in (10, 13) or b < 0x20:
+                break
+            # stop at a space after the path
+            if b == 0x20:
+                break
+            j += 1
+
+        raw = data[idx:j]
+        try:
+            s = raw.decode("utf-8", "ignore")
+        except Exception:
+            s = "\\MAILSLOT\\?"
+        # Normalize double slashes
+        s = s.replace("\\\\", "\\")
+        return s
+
+    def _parse_browser_message(self, data: bytes) -> dict | None:
+        """
+        Very light Browser Service decoder inside \\MAILSLOT\\BROWSE payloads.
+        SMB Trans mailslot payload layout varies; we heuristically locate:
+          [opcode (1B)] [minor_ver (1B)] [major_ver (1B)] [...] then ASCII strings.
+        We try to extract opcode, host name, and domain/workgroup name.
+        """
+        # Find start of mailslot content: right after the mailslot path string
+        mi = data.find(b"\\MAILSLOT\\BROWSE")
+        if mi < 0:
+            mi = data.find(b"\\\\MAILSLOT\\\\BROWSE")
+        if mi < 0:
+            return None
+
+        # Skip path bytes + a small safety window to jump into payload
+        # Often you see: path\0 then payload
+        start = data.find(b"\x00", mi)
+        if start < 0:
+            start = mi + len("\\MAILSLOT\\BROWSE")
+        else:
+            start += 1
+
+        # We’ll scan forward a bit to find a plausible opcode
+        view = memoryview(data[start:start+256])
+        if len(view) < 1:
+            return None
+
+        op = view[0]  # heuristic: many messages place opcode immediately
+        # Try to pull ASCII tokens that look like NetBIOS names
+        tail = bytes(view[1:])
+        toks = self._pick_ascii_tokens(tail, max_tokens=6)
+
+        host = None
+        domain = None
+        # Common patterns: host and domain appear early
+        for t in toks:
+            tU = t.upper()
+            if not host and t and tU not in ("BROWSE", "ELECTION", "DOMAIN", "WORKGROUP"):
+                host = t
+                continue
+            if not domain and (t.endswith("$") or t.isupper()):
+                domain = t
+                break
+
+        return {"op": op, "host": host, "domain": domain}
+
+    # --------------- Helpers ---------------
+
+    def _pick_ascii_tokens(self, b: bytes, max_tokens: int = 6) -> list[str]:
+        """
+        Extract a few printable tokens (A..Z, a..z, 0..9, _-. $) separated by NULs or control chars.
+        """
+        out = []
+        cur = []
+        for ch in b:
+            if 32 <= ch <= 126:
+                cur.append(chr(ch))
+            else:
+                if cur:
+                    out.append("".join(cur))
+                    cur = []
+                    if len(out) >= max_tokens:
+                        break
+        if cur and len(out) < max_tokens:
+            out.append("".join(cur))
+        return out
+
+    def _rate_log(self, line: str):
+        try:
+            now = time.time()
+            h = hash(line)
+            last = self._recent.get(h, 0.0)
+            if now - last >= self._RL_WINDOW_S:
+                self._recent[h] = now
+                self.log.log_message(line)
+        except Exception:
+            # Fall back to best effort
+            try:
+                self.log.log_message(line)
+            except Exception:
+                pass
 class TransportDHCPActiveAgent:
     """
     Small DHCP active helper:
@@ -6606,62 +7235,32 @@ class TransportKerberosManager:
 
     # -------------------- Public entry --------------------
 
-    def handle(
-        self,
-        packet: Packet,
-        src_ip: str,
-        dst_ip: str,
-        sport: int,
-        dport: int,
-        inbound_iface: str,
-    ) -> bool:
-        """Returns True if treated as Kerberos (UDP/88) and logged, else False."""
-        if UDP is None or Raw is None:
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        if Raw is None:
             return False
-        if not packet.haslayer(UDP):
+        is_udp = UDP is not None and packet.haslayer(UDP)
+        is_tcp = TCP is not None and packet.haslayer(TCP)
+        if not (is_udp or is_tcp):
             return False
         if not (sport == 88 or dport == 88):
             return False
+
+        iface = inbound_iface.split("_")[-1]
+        direction = "REQ" if dport == 88 else "RSP"
+
         if not packet.haslayer(Raw):
-            # Nothing to parse but we claim it to avoid 'Undecoded'
-            self._rate_log(f"[Transport][🚀 UDP][🔑 Kerberos] if={inbound_iface.split('_')[-1]} "
+            self._rate_log(f"[Transport][🚀 UDP][🔑 Kerberos] {direction} if={iface} "
                            f"{src_ip}:{sport} → {dst_ip}:{dport} (no payload)")
             return True
 
         payload = bytes(packet[Raw].load or b"")
-        iface = inbound_iface.split("_")[-1]
-        direction = "REQ" if dport == 88 else "RSP"
 
-        kind = self._classify_top_level(payload) or "-"
-        realm = self._guess_realm(payload) or "-"
-        spn = self._guess_spn(payload) or "-"
-
-        # Pending tracking for latency (only for requests heading to :88)
-        latency = None
-        key = (src_ip, sport, dst_ip)
-        if direction == "REQ":
-            self._pending[key] = {"ts": time.time(), "kind": kind}
-        else:
-            # response path: swap to find original requester
-            rev_key = (dst_ip, dport, src_ip)
-            pend = self._pending.pop(rev_key, None)
-            if pend:
-                latency = int((time.time() - pend["ts"]) * 1000)
-
-        lat_str = f" {latency}ms" if latency is not None else ""
-        self._rate_log(
-            f"[Transport][🚀 UDP][🔑 Kerberos] {direction} if={iface} "
-            f"{src_ip}:{sport} → {dst_ip}:{dport} | {kind} size={len(payload)}B realm={realm} spn={spn}{lat_str}"
-        )
-
-        # Extra hint for KRB-ERROR: try to surface an ASCII message (best-effort)
-        if kind == "KRB-ERROR":
-            emsg = self._extract_readable_tail(payload)
-            if emsg:
-                self._rate_log(f"[Transport][🔑 Kerberos][⚠️ KRB-ERROR] {emsg}")
-
-        self._maybe_gc()
-        return True
+        # TCP: strip the 4-byte length (RFC 4120 §7.2.2)
+        if is_tcp:
+            if len(payload) < 4:
+                return True
+            frag_len = int.from_bytes(payload[:4], "big", signed=False)
+            payload = payload[4:4 + frag_len] if frag_len and 4 + frag_len <= len(payload) else payload[4:]
 
     # -------------------- Classifiers / heuristics --------------------
 
@@ -6679,53 +7278,51 @@ class TransportKerberosManager:
         return None
 
     def _guess_realm(self, data: bytes) -> Optional[str]:
-        """
-        Grab a plausible Kerberos REALM (ALLCAPS.DOTS) from ASCII zones.
-        """
-        # Limit scanning to first ~512 bytes for speed
-        sample = data[:512]
-        # Prefer ALL CAPS with dot(s)
+        sample = data[:800]
         for m in self._REALM_RE.finditer(sample):
-            token = m.group(0)
-            if b"." in token and token.isupper():
-                try:
-                    return token.decode("ascii", "ignore")
-                except Exception:
-                    pass
-        # Fallback: return first upper-ish token with dot
-        for m in self._REALM_RE.finditer(sample):
-            token = m.group(0)
-            if b"." in token:
-                try:
-                    return token.decode("ascii", "ignore")
-                except Exception:
-                    pass
+            tok = m.group(0)
+            if b"." not in tok:  # must have at least one dot
+                continue
+            if tok.count(b".") > 5:  # avoid huge dotted noise
+                continue
+            if tok.startswith(b".") or tok.endswith(b"."):
+                continue
+            # avoid obvious IPs like 1.2.3.4
+            if all(part.isdigit() and 0 <= int(part) <= 255 for part in tok.split(b".") if part.isdigit()):
+                continue
+            try:
+                s = tok.decode("ascii", "ignore")
+                if s.isupper():
+                    return s
+            except Exception:
+                pass
         return None
 
     def _guess_spn(self, data: bytes) -> Optional[str]:
-        """
-        Fish out common SPN patterns like 'krbtgt/REALM@REALM', 'HTTP/host@REALM', etc.
-        """
-        sample = data[:800]
-        best = None
+        sample = data[:1200].lower()
         for hint in self._SPN_HINTS:
-            idx = sample.lower().find(hint.lower())
-            if idx >= 0:
-                # read until delimiter (NUL, quote, newline, or non-printable)
-                end = idx
-                while end < len(sample) and 32 <= sample[end] <= 126:
-                    end += 1
-                cand = sample[idx:end]
-                # minor cleanup: stop before spaces or trailing commas
-                cand = cand.rstrip(b",; ")
-                if cand:
-                    best = cand
-                    break
-        if best:
-            try:
-                return best.decode("utf-8", "ignore")
-            except Exception:
-                pass
+            i = sample.find(hint)
+            if i < 0:
+                continue
+            j = i
+            # read printable run
+            while j < len(sample) and 32 <= sample[j] <= 126:
+                j += 1
+            cand = data[i:j].decode("utf-8", "ignore").strip(",; ")
+            # quick cleanups
+            cand = cand.replace("\\", "/")
+            if len(cand) >= 6 and "/" in cand:
+                return cand
+        # fallback: look for '@REALM'
+        at = sample.find(b"@")
+        if at > 0:
+            # back up a bit for the service/host
+            start = max(0, at - 64)
+            seg = data[start: min(len(data), at + 80)].decode("utf-8", "ignore")
+            # pick last token containing '@'
+            for token in seg.split():
+                if "@" in token and "/" in token and len(token) >= 6:
+                    return token.strip(",;")
         return None
 
     def _extract_readable_tail(self, data: bytes) -> Optional[str]:
@@ -6769,14 +7366,19 @@ class TransportIPv6Manager:
     """
 
     # Tunables
-    FLOW_TTL_SEC      = 10 * 60    # per-5tuple cache TTL
-    FLOW_SOFT_MAX     = 50000      # soft cap on flows (LRU evict past this)
-    RL_INTERVAL_SEC   = 1.0        # per-flow log rate-limit
-    EH_DEPTH_LIMIT    = 16         # max extension headers walked
-    HBH_OPT_BUDGET    = 8          # max HBH options summarized
-    DEST_OPT_BUDGET   = 8          # max DestOpt options summarized
-    TAIL_PREVIEW_LEN  = 8          # hex preview bytes for opaque tails
+    FLOW_TTL_SEC      = 10 * 60
+    FLOW_SOFT_MAX     = 50000
+    RL_INTERVAL_SEC   = 1.0
+    EH_DEPTH_LIMIT    = 16
+    HBH_OPT_BUDGET    = 8
+    DEST_OPT_BUDGET   = 8
+    TAIL_PREVIEW_LEN  = 8
     GC_PERIOD_SEC     = 60
+
+    # NEW: light telemetry toggles (cheap fields only)
+    SHOW_TC_DSCP      = True     # IPv6 traffic class / DSCP
+    SHOW_PLEN         = True     # IPv6 payload length
+    SHOW_ADDR_SCOPE   = True     # LL/ULA/GUA flags
 
     def __init__(self, router_logger, early_claim_hop_by_hop: bool = True, ext_depth_limit: int = EH_DEPTH_LIMIT):
         self.log = router_logger
@@ -6803,10 +7405,12 @@ class TransportIPv6Manager:
             dst_ip = getattr(ip6, "dst", "?")
             hlim   = getattr(ip6, "hlim", None)
             flow   = getattr(ip6, "fl", None)
+            nh     = getattr(ip6, "nh", None)
+            tc     = getattr(ip6, "tc", None)
+            plen   = getattr(ip6, "plen", None)
             iface_short = (inbound_iface or "").split("_")[-1] if inbound_iface else "?"
 
             # Compute flow key cheaply (includes NH & iface to keep logs tidy)
-            nh = getattr(ip6, "nh", None)
             fkey = (src_ip, dst_ip, str(nh), str(hlim), iface_short)
             now = time.time()
             st = self._flows.get(fkey)
@@ -6819,8 +7423,14 @@ class TransportIPv6Manager:
             # Fast-path: if flow already marked noinspect, emit minimal periodic line and bail
             if st.get("noinspect", False):
                 if self._should_log_flow(st, now):
-                    msg = (f"[Transport][🌍 IPv6] {src_ip} → {dst_ip} on {iface_short} | "
-                           f"NH={self._nh_name(nh)} hlim={hlim} fl={self._fmt_flow(flow)}")
+                    extras = [f"NH={self._nh_name(nh)}", f"hlim={hlim}", f"fl={self._fmt_flow(flow)}"]
+                    if self.SHOW_TC_DSCP and tc is not None:
+                        extras.append(self._fmt_tc(tc))
+                    if self.SHOW_PLEN and plen is not None:
+                        extras.append(f"plen={int(plen)}")
+                    if self.SHOW_ADDR_SCOPE:
+                        extras.append(self._fmt_scope(src_ip, dst_ip))
+                    msg = f"[Transport][🌍 IPv6] {src_ip} → {dst_ip} on {iface_short} | " + " ".join(extras)
                     self._safe_log(msg)
                 self._maybe_gc(now)
                 return True
@@ -6829,13 +7439,26 @@ class TransportIPv6Manager:
             chain, l4 = self._walk_ipv6_chain(ip6, self.ext_depth_limit)
 
             # Compose concise line
-            parts: List[str] = [f"[Transport][🌍 IPv6] {src_ip} → {dst_ip} on {iface_short}"]
+            head = [f"[Transport][🌍 IPv6] {src_ip} → {dst_ip} on {iface_short}"]
+
+            # Small, cheap header extras (won't allocate big buffers)
+            hdrbits: List[str] = []
+            hdrbits.append(f"NH={self._nh_name(nh)}")
+            if self.SHOW_TC_DSCP and tc is not None:
+                hdrbits.append(self._fmt_tc(tc))
+            if self.SHOW_PLEN and plen is not None:
+                hdrbits.append(f"plen={int(plen)}")
+            hdrbits.append(f"hlim={hlim}")
+            hdrbits.append(f"fl={self._fmt_flow(flow)}")
+            if self.SHOW_ADDR_SCOPE:
+                hdrbits.append(self._fmt_scope(src_ip, dst_ip))
+            head.append(" | " + " ".join(hdrbits))
 
             if chain:
-                parts.append(" | EH: " + ", ".join(self._summarize_eh(h) for h in chain))
+                head.append(" | EH: " + ", ".join(self._summarize_eh(h) for h in chain))
 
             if l4 is not None:
-                parts.append(" | L4: " + self._summarize_l4(l4))
+                head.append(" | L4: " + self._summarize_l4(l4))
             else:
                 # No recognized L4 — quick opaque tail hint (no bytes rebuild)
                 tail = self._get_tail_bytes(ip6)
@@ -6848,25 +7471,22 @@ class TransportIPv6Manager:
                         extras.append(f"hex={hex_preview}{'…' if tail_len > self.TAIL_PREVIEW_LEN else ''}")
                     except Exception:
                         pass
-                parts.append(f" | NH={self._nh_name(nh)} hlim={hlim} fl={self._fmt_flow(flow)} "
-                             f"| tail={tail_kind}={tail_len}B" + (f" ({', '.join(extras)})" if extras else ""))
+                head.append(f" | tail={tail_kind}={tail_len}B" + (f" ({', '.join(extras)})" if extras else ""))
 
             # Emit (rate-limited per flow)
             if self._should_log_flow(st, now):
-                self._safe_log("".join(parts))
+                self._safe_log("".join(head))
 
             # Early-claim/fast-path when HBH present (and optionally after any EH parse)
             if self.early_claim_hbh and any(self._isinstance_safe(h, IPv6ExtHdrHopByHop) for h in chain):
                 st["noinspect"] = True
             elif chain:
-                # After a first successful EH parse, we can move this flow to noinspect to be extra cheap
                 st["noinspect"] = True
 
             self._maybe_gc(now)
             return True
 
         except Exception as e:
-            # Never destabilize capture threads
             self._rl_log(f"[Transport][🌍 IPv6] error: {e}", interval=3.0)
             return False
 
@@ -6911,9 +7531,6 @@ class TransportIPv6Manager:
 
     # -------------------- Helpers: chain walking --------------------
     def _walk_ipv6_chain(self, ip6: Packet, depth_limit: int) -> Tuple[List[Packet], Optional[Packet]]:
-        """
-        Returns (ext_chain, l4_or_None). Safe: no bytes() on layers.
-        """
         chain: List[Packet] = []
         layer = getattr(ip6, "payload", None)
         hops = max(1, int(depth_limit))
@@ -6926,7 +7543,6 @@ class TransportIPv6Manager:
                 layer = getattr(layer, "payload", None)
                 continue
 
-            # Terminal L4 we care about
             if (TCP and self._isinstance_safe(layer, TCP)) or \
                (UDP and self._isinstance_safe(layer, UDP)) or \
                (ICMPv6 and self._isinstance_safe(layer, ICMPv6)):
@@ -6944,7 +7560,6 @@ class TransportIPv6Manager:
             if self._isinstance_safe(h, IPv6ExtHdrRouting):
                 segs_left = getattr(h, "segleft", None)
                 rtype = getattr(h, "type", None)
-                # For SRv6, a quick hint: list size if present (avoid heavy parsing)
                 lst = getattr(h, "addresses", None)
                 naddr = 0
                 if lst:
@@ -6979,7 +7594,6 @@ class TransportIPv6Manager:
                     names.append("…")
                     break
                 name = getattr(o, "name", None) or o.__class__.__name__
-                # Common fast-paths
                 if "RouterAlert" in name or "Router Alert" in name:
                     val = getattr(o, "value", None)
                     names.append(f"RouterAlert{'' if val is None else f'={val}'}")
@@ -6990,12 +7604,8 @@ class TransportIPv6Manager:
                     plen = getattr(o, "optlen", None) or getattr(o, "len", None)
                     names.append(f"Pad{'' if plen is None else f'={plen}'}")
                 else:
-                    # Option type code if available (avoid heavy introspection)
                     typ = getattr(o, "otype", None)
-                    if typ is None:
-                        names.append(name)
-                    else:
-                        names.append(f"{name}(t={typ})")
+                    names.append(name if typ is None else f"{name}(t={typ})")
                 count += 1
             if names:
                 items.append("[" + ",".join(names) + "]")
@@ -7020,27 +7630,59 @@ class TransportIPv6Manager:
                     names.append(f"Pad{'' if plen is None else f'={plen}'}")
                 else:
                     typ = getattr(o, "otype", None)
-                    names.append(f"{name}" if typ is None else f"{name}(t={typ})")
+                    names.append(name if typ is None else f"{name}(t={typ})")
                 count += 1
             return "DestOpt[" + ",".join(names) + "]"
         except Exception:
             return "DestOpt"
 
+    # ---- L4 summary (richer, but still cheap) ---------------------------------
     def _summarize_l4(self, l4: Packet) -> str:
         try:
+            # TCP
             if TCP and self._isinstance_safe(l4, TCP):
                 flags = getattr(l4, "flags", 0)
-                sport = getattr(l4, "sport", "?")
-                dport = getattr(l4, "dport", "?")
-                return f"TCP {sport}→{dport} flags={flags}"
+                sport = getattr(l4, "sport", "?"); dport = getattr(l4, "dport", "?")
+                fstr = self._tcp_flags_str(flags)
+                # Try to expose light extras without bytes() building
+                win = getattr(l4, "window", None)
+                opt_cnt = 0
+                try:
+                    opts = getattr(l4, "options", None)
+                    if isinstance(opts, list):
+                        opt_cnt = len(opts)
+                except Exception:
+                    pass
+                extras = [f"flags={fstr or flags}"]
+                if win is not None:
+                    extras.append(f"win={win}")
+                if opt_cnt:
+                    extras.append(f"opts={opt_cnt}")
+                return f"TCP {sport}→{dport} " + " ".join(extras)
+
+            # UDP
             if UDP and self._isinstance_safe(l4, UDP):
-                sport = getattr(l4, "sport", "?")
-                dport = getattr(l4, "dport", "?")
-                return f"UDP {sport}→{dport}"
+                sport = getattr(l4, "sport", "?"); dport = getattr(l4, "dport", "?")
+                tag = self._udp_tag(int(sport) if isinstance(sport, int) else sport,
+                                    int(dport) if isinstance(dport, int) else dport,
+                                    l4)
+                return f"UDP {sport}→{dport}{(' ' + tag) if tag else ''}"
+
+            # ICMPv6
             if ICMPv6 and self._isinstance_safe(l4, ICMPv6):
-                t = getattr(l4, "type", "?")
-                c = getattr(l4, "code", "?")
-                return f"ICMPv6 type={t} code={c}"
+                t = getattr(l4, "type", "?"); c = getattr(l4, "code", "?")
+                name = self._icmp6_name(int(t) if isinstance(t, int) else None, int(c) if isinstance(c, int) else None)
+                # Neighbor Discovery tiny hint (options count)
+                nd_hint = ""
+                try:
+                    # Scapy models ND as specific ICMPv6 subclasses; we only show count if cheaply available
+                    opts = getattr(l4, "options", None)
+                    if isinstance(opts, list) and opts:
+                        nd_hint = f" opts={len(opts)}"
+                except Exception:
+                    pass
+                return f"ICMPv6 type={t} code={c} {name}{nd_hint}".rstrip()
+
             return l4.__class__.__name__
         except Exception:
             return "L4"
@@ -7069,6 +7711,101 @@ class TransportIPv6Manager:
         except Exception:
             return "0x-----"
 
+    def _fmt_tc(self, tc_val: int) -> str:
+        try:
+            v = int(tc_val) & 0xFF
+            dscp = (v >> 2) & 0x3F
+            ecn  = v & 0x03
+            return f"tc=0x{v:02x} dscp={dscp} ecn={ecn}"
+        except Exception:
+            return "tc=?"
+
+    def _fmt_scope(self, src: str, dst: str) -> str:
+        try:
+            def _scope(ip: str) -> str:
+                s = ip.lower()
+                if s.startswith("fe80:"): return "LL"   # link-local
+                if s.startswith("fc") or s.startswith("fd"): return "ULA"
+                return "GUA"
+            return f"scope={_scope(src)}→{_scope(dst)}"
+        except Exception:
+            return "scope=?"
+
+    def _tcp_flags_str(self, flags: int) -> str:
+        # scapy may give int; map to letters: CWR/ECE/URG/ACK/PSH/RST/SYN/FIN
+        try:
+            f = int(flags)
+            bits = [
+                ("CWR","C"), ("ECE","E"), ("URG","U"), ("ACK","A"),
+                ("PSH","P"), ("RST","R"), ("SYN","S"), ("FIN","F"),
+            ]
+            # scapy packs as bits; we test by numeric mask if available, else fall back
+            # Standard order: C E U A P R S F = 0x80..0x01
+            masks = [0x80,0x40,0x20,0x10,0x08,0x04,0x02,0x01]
+            out = []
+            for (name, letter), m in zip(bits, masks):
+                if f & m:
+                    out.append(letter)
+            return "".join(out)
+        except Exception:
+            return ""
+
+    def _udp_tag(self, sport, dport, l4: Packet) -> str:
+        """
+        Very cheap recognizer for common UDP apps (no parsing). Also tries QUIC? sniff.
+        """
+        try:
+            s = int(sport) if isinstance(sport, int) or str(sport).isdigit() else -1
+            d = int(dport) if isinstance(dport, int) or str(dport).isdigit() else -1
+        except Exception:
+            s, d = -1, -1
+
+        well = {
+            53:  "DNS",
+            5353:"mDNS",
+            546: "DHCPv6-Client",
+            547: "DHCPv6-Server",
+            123: "NTP",
+            1900:"SSDP",
+            500: "IKE",
+            4500:"IPsec-NAT-T",
+            443: "HTTPS/QUIC?",
+        }
+        label = ""
+        for p in (s, d):
+            if p in well:
+                label = well[p]
+                break
+
+        # Tiny QUIC sniff: if UDP:443 and first byte present, print 1-byte preview & '?' tag.
+        if (s == 443 or d == 443):
+            try:
+                raw = getattr(l4, "payload", None)
+                lb = getattr(raw, "load", None)
+                if isinstance(lb, (bytes, bytearray)) and len(lb) >= 1:
+                    # do not parse—just show 1 byte to help triage
+                    label = (label or "QUIC?") + f" b0=0x{lb[0]:02x}"
+            except Exception:
+                pass
+
+        return f"[{label}]" if label else ""
+
+    def _icmp6_name(self, t: Optional[int], c: Optional[int]) -> str:
+        if t is None:
+            return ""
+        names = {
+            128: "EchoReq", 129: "EchoReply",
+            133: "RS", 134: "RA", 135: "NS", 136: "NA",
+            130: "MLDv1-Query", 131: "MLDv1-Report", 132: "MLDv1-Done",
+            143: "MLDv2-Report",
+            1:   "DstUnreach", 2: "PktTooBig", 3: "TimeExceed", 4: "ParmProb",
+        }
+        base = names.get(t, "")
+        if t in (1, 3, 4) and c is not None:
+            # add a tiny code hint for classic errors
+            base = f"{base}(code={c})"
+        return base
+
     def _get_tail_bytes(self, ip6: Packet) -> bytes:
         """
         Extract trailing bytes *without* forcing a full build.
@@ -7078,7 +7815,6 @@ class TransportIPv6Manager:
             tail = getattr(ip6, "payload", None)
             if tail is None or isinstance(tail, NoPayload):
                 return b""
-            # Avoid bytes(tail) which can trigger building
             orig = getattr(tail, "original", None)
             if isinstance(orig, (bytes, bytearray, memoryview)):
                 return bytes(orig)
@@ -7158,7 +7894,10 @@ class TransportOverlayManager:
         """Returns True if considered overlay traffic (and possibly logged), else False."""
         if not self._is_overlay_port(sport, dport):
             return False
-
+        if self._zt_is_peer(src_ip) or self._zt_is_peer(dst_ip):
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🛰️ Overlay] P2P data {src_ip}:{sport} → {dst_ip}:{dport}"
+            )
         # Fast path: raw payload?
         has_raw = (Raw is not None) and packet.haslayer(Raw)
         raw_data = packet[Raw].load if has_raw else b""
@@ -7428,7 +8167,186 @@ class TransportOverlayManager:
                 if now - v.get("ts", 0.0) > self._zt_ttl:
                     self._zt_peers.pop(k, None)
             return ip in self._zt_peers
+class TransportWireGuardManager:
+    """
+    Passive WireGuard observer. Detects WG v1 messages on UDP:
+      • Type 1: Handshake Initiation
+      • Type 2: Handshake Response
+      • Type 3: Cookie Reply
+      • Type 4: Transport Data (incl. keepalives)
 
+    Notes:
+      - WG can run on ANY UDP port (not just 51820).
+      - We don't decrypt; we only parse public header fields.
+      - Purely observational: never blocks or mutates packets.
+    """
+
+    # Typical lengths (not strict; vendors differ slightly):
+    #   Initiation: ~148 bytes
+    #   Response:   ~92 bytes
+    #   Cookie:     ~64 bytes
+    #   Data:       >= 32 bytes (header 16 + encrypted payload)
+    #
+    # We'll be tolerant—only header fields are required for detection.
+    RL_WINDOW_SEC = 2.0  # rate-limit identical messages
+    FLOW_TTL_SEC  = 300
+
+    def __init__(self, router_logger):
+        self.log = router_logger
+        self._flows = {}  # key -> {last_seen, pkts, bytes}
+        self._recent = defaultdict(float)
+        self.log.log_message("[Transport][🔐 WireGuard] Manager ready.")
+
+    # -------- public API --------
+    def handle(self, pkt, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
+        """
+        Returns True if this packet was recognized/logged as WireGuard.
+        """
+        raw = self._payload(pkt)
+        if not raw:
+            return False
+
+        mtype = self._peek_type(raw)
+        if mtype is None:
+            return False  # not WG
+
+        # keep minimal per-flow stats
+        key = self._key(src_ip, sport, dst_ip, dport)
+        f = self._flows.get(key)
+        now = time.time()
+        if not f:
+            f = self._flows[key] = {"last_seen": now, "pkts": 0, "bytes": 0}
+        f["last_seen"] = now
+        f["pkts"] += 1
+        f["bytes"] += len(raw)
+
+        # parse & log
+        if mtype == 1:
+            info = self._parse_initiation(raw)
+            self._rl_log(
+                f"[Transport][🚀 UDP][🔐 WireGuard] Handshake Initiation "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} | sender_idx={info.get('sender_idx','?')} "
+                f"len={len(raw)} on {inbound_iface or '-'}"
+            )
+            handled = True
+        elif mtype == 2:
+            info = self._parse_response(raw)
+            self._rl_log(
+                f"[Transport][🚀 UDP][🔐 WireGuard] Handshake Response "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} | sender_idx={info.get('sender_idx','?')} "
+                f"receiver_idx={info.get('receiver_idx','?')} len={len(raw)} on {inbound_iface or '-'}"
+            )
+            handled = True
+        elif mtype == 3:
+            info = self._parse_cookie(raw)
+            self._rl_log(
+                f"[Transport][🚀 UDP][🔐 WireGuard] Cookie Reply "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} | receiver_idx={info.get('receiver_idx','?')} "
+                f"len={len(raw)} on {inbound_iface or '-'}"
+            )
+            handled = True
+        elif mtype == 4:
+            info = self._parse_data(raw)
+            # keepalives are type=4 with zero-length encrypted payload (header-only)
+            keepalive = " keepalive" if info.get("is_keepalive") else ""
+            self._rl_log(
+                f"[Transport][🚀 UDP][🔐 WireGuard] Data{keepalive} "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} | receiver_idx={info.get('receiver_idx','?')} "
+                f"counter={info.get('counter','?')} len={len(raw)} on {inbound_iface or '-'}"
+            )
+            handled = True
+        else:
+            handled = False
+
+        self._gc()
+        return handled
+
+    # -------- detection & parsing --------
+    @staticmethod
+    def _payload(pkt):
+        try:
+            from scapy.packet import Raw
+            if pkt.haslayer(Raw):
+                return bytes(pkt[Raw].load or b"")
+        except Exception:
+            pass
+        return b""
+
+    @staticmethod
+    def _peek_type(b: bytes):
+        # WG v1 messages start with 1 byte type (1..4) then 3 reserved bytes (zeros).
+        if len(b) < 4:
+            return None
+        mtype = b[0]
+        if mtype not in (1, 2, 3, 4):
+            return None
+        # reserved must be zero most of the time; be tolerant but check common case
+        if b[1] == 0 and b[2] == 0 and b[3] == 0:
+            return mtype
+        # Some implementations preserve zeros; if not zero, treat as not WG to avoid FPs
+        return None
+
+    @staticmethod
+    def _u32(b, off):
+        try:
+            return struct.unpack_from("<I", b, off)[0]
+        except struct.error:
+            return None
+
+    @staticmethod
+    def _u64(b, off):
+        try:
+            return struct.unpack_from("<Q", b, off)[0]
+        except struct.error:
+            return None
+
+    def _parse_initiation(self, b: bytes) -> dict:
+        # layout: type(1) + rsv(3) + sender_idx(4) + ... (rest opaque)
+        return {"sender_idx": self._u32(b, 4)}
+
+    def _parse_response(self, b: bytes) -> dict:
+        # layout: type(1)+rsv(3)+sender_idx(4)+receiver_idx(4)+...
+        return {
+            "sender_idx":   self._u32(b, 4),
+            "receiver_idx": self._u32(b, 8),
+        }
+
+    def _parse_cookie(self, b: bytes) -> dict:
+        # layout: type(1)+rsv(3)+receiver_idx(4)+nonce(24)+cookie(16)+...
+        return {"receiver_idx": self._u32(b, 4)}
+
+    def _parse_data(self, b: bytes) -> dict:
+        # layout: type(1)+rsv(3)+receiver_idx(4)+counter(8)+encrypted...
+        info = {
+            "receiver_idx": self._u32(b, 4),
+            "counter":      self._u64(b, 8),
+            "is_keepalive": False
+        }
+        # minimal header is 16 bytes; keepalive often has exactly header and zero payload
+        info["is_keepalive"] = (len(b) == 16)
+        return info
+
+    # -------- utils --------
+    @staticmethod
+    def _key(a_ip, a_p, b_ip, b_p):
+        A, B = (a_ip, int(a_p)), (b_ip, int(b_p))
+        return (A, B) if A <= B else (B, A)
+
+    def _rl_log(self, msg: str):
+        t = time.time()
+        last = self._recent.get(msg, 0.0)
+        if (t - last) >= self.RL_WINDOW_SEC:
+            self._recent[msg] = t
+            try:
+                self.log.log_message(msg)
+            except Exception:
+                pass
+
+    def _gc(self):
+        now = time.time()
+        for k, f in list(self._flows.items()):
+            if (now - f.get("last_seen", now)) > self.FLOW_TTL_SEC:
+                self._flows.pop(k, None)
 class TransportWSDiscoveryManager:
     """
     WS-Discovery (UDP/3702) handler with low-latency parsing and concise logging.
@@ -8392,6 +9310,9 @@ class TransportManager:
         }
         self.transport_dhcp = TransportDHCPManager(self.logger)
         self.transport_dns = TransportDNSManager(self.logger)
+        self.transport_mdns = TransportMDNSManager(self.logger)
+        self.transport_nbns = TransportNBNSManager(self.logger)
+        self.transport_nbds = TransportNBDSManager(self.logger)
         self.transport_ssdp = TransportSSDPManager(self.logger)
         self.transport_quic = TransportQUICManager(self.logger)
         self.transport_http = TransportHTTPManager(self.logger)
@@ -8402,6 +9323,7 @@ class TransportManager:
         self.transport_kerberos = TransportKerberosManager(self.logger)
         self.transport_ipv6 = TransportIPv6Manager(self.logger)
         self.transport_overlay = TransportOverlayManager(self.logger)
+        self.transport_wireguard = TransportWireGuardManager(self.logger)
         self.transport_tcp_ephemeral = TransportEphemeralTCPManager(self.logger)
         self.transport_udp_ephemeral = TransportEphemeralUDPManager(self.logger)
         self.transport_steam = TransportSteamManager(self.logger)
@@ -8427,76 +9349,10 @@ class TransportManager:
             # ZMQ RPC
             18088
         ]
-
-        class RandomXPrefixedLogger:
-            """
-            Wraps any logger and prepends a prefix to all log calls.
-            Works with .log_message(), and also .info/.debug/.warning/.error if present.
-            """
-
-            def __init__(self, base_logger=None, prefix="[Transport][🪙 Monero][RX] ",
-                         rate_limit_s: float | None = None):
-                self._base = base_logger
-                self._prefix = str(prefix)
-                self._rl = float(rate_limit_s) if rate_limit_s else None
-                self._last: dict[str, float] = {}
-                self._lock = threading.Lock()
-
-            # ---- public logging API
-            def log_message(self, msg: str):
-                self._emit("log_message", msg)
-
-            def info(self, msg: str):
-                self._emit("info", msg)
-
-            def debug(self, msg: str):
-                self._emit("debug", msg)
-
-            def warning(self, msg: str):
-                self._emit("warning", msg)
-
-            def error(self, msg: str):
-                self._emit("error", msg)
-
-            # ---- internal
-            def _emit(self, method_name: str, msg: str):
-                txt = f"{self._prefix}{msg}" if not str(msg).startswith(self._prefix) else str(msg)
-
-                if self._rl is not None:
-                    with self._lock:
-                        now = time.time()
-                        last = self._last.get(txt, 0.0)
-                        if (now - last) < self._rl:
-                            return
-                        self._last[txt] = now
-
-                # Prefer same method on base logger; fall back gracefully.
-                if self._base is not None:
-                    try:
-                        if hasattr(self._base, method_name):
-                            getattr(self._base, method_name)(txt)
-                            return
-                        if hasattr(self._base, "log_message"):
-                            self._base.log_message(txt)
-                            return
-                    except Exception:
-                        pass
-                print(txt)
-
-            # Proxy anything else to the base logger (optional convenience)
-            def __getattr__(self, name):
-                if self._base is None:
-                    raise AttributeError(name)
-                return getattr(self._base, name)
-        def make_randomx_logger(base_logger, prefix="[Transport][🪙 Monero][RX] ", rate_limit_s=None):
-            return RandomXPrefixedLogger(base_logger, prefix=prefix, rate_limit_s=rate_limit_s)
-        rx_logger = make_randomx_logger(router_logger, prefix="[Transport][🪙 Monero][RX] ")
-        rx = RandomXLoader(dll_rel_path="tools/randomx.dll", logger=rx_logger)
         self.transport_monero = TransportMoneroManager(
             self.logger,
             extra_p2p_ports=self._MONERO_P2P_PORTS,
             extra_rpc_ports=self._MONERO_RPC_PORTS,
-            randomx_loader=rx
         )
     def _on_tls_policy_decision(self, key, rec, decision):
         """
@@ -8711,7 +9567,6 @@ class TransportManager:
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles Monero P2P traffic on port 18080."""
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-
     def _handle_high_server_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_tcp_high_Level.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_tcp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
@@ -8798,6 +9653,9 @@ class TransportManager:
         # A "range" is a (lo, hi) tuple, inclusive.
         rules = [
             ([53], self._handle_dns_packet),
+            ([5353], self._handle_mdns_packet),
+            ([137], self._handle_nbns_packet),
+            ([138], self._handle_nbds_packet),
             ([67, 68], self._handle_dhcp_packet),
             ([443], self._handle_quic_packet),
             ([123], self._handle_ntp_packet),
@@ -8805,6 +9663,7 @@ class TransportManager:
             ([88], self._handle_kerberos_packet),
             ([5060], self._handle_sip_packet),
             ([9993, 19300], self._handle_overlay_packet),
+            ([51820, 88], self._handle_wireguard_packet),
             ([1900], self._handle_ssdp_packet),
             ([3702], self._handle_ws_discovery_packet),
             ([19337], self._handle_rtp_packet),
@@ -8844,13 +9703,6 @@ class TransportManager:
         self.code_output_manager.submit_packet(
             packet, inbound_iface=iface_short, phase="unhandled", component="udp"
         )
-        if self.transport_overlay._zt_is_peer(src_ip) or self.transport_overlay._zt_is_peer(dst_ip):
-            self.logger.log_message(
-                f"[Transport][🚀 UDP][🛰️ Overlay] P2P data {src_ip}:{sport} → {dst_ip}:{dport}"
-            )
-            self.code_output_manager.submit_packet(packet, inbound_iface=iface_short,
-                                                   phase="handled", component="overlay-data")
-            return
         self.logger.log_message(
             f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {sport} → {dport}."
         )
@@ -8872,6 +9724,16 @@ class TransportManager:
         """Handles and logs details for DNS packets."""
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    def _handle_mdns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
+        self.transport_mdns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_nbns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
+        self.transport_nbns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+    def _handle_nbds_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
+        self.transport_nbds.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DHCP packets."""
         self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
@@ -8959,6 +9821,8 @@ class TransportManager:
     def _handle_overlay_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for ZeroTier-like packets on UDP port 9993."""
         self.transport_overlay.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+    def _handle_wireguard_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        self.transport_wireguard.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
     def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for SSDP/UPnP packets on UDP port 1900."""
         self.transport_ssdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

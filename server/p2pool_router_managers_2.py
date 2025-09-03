@@ -195,16 +195,57 @@ class MoneroDaemonManager:
     # ----- ZMQ -----
 
     def _handle_zmq_message(self, raw_message: bytes):
+        """
+        Handle monerod ZMQ pub messages. We expect "topic<space>payload".
+        Known topics:
+          - block / json-full-chain-main / json-minimal-block  -> new block
+          - txpool_add / json-minimal-txpool_add / json-full-txpool_add -> tx appeared
+        """
         try:
-            topic = raw_message.split(b" ", 1)[0]
-            if topic in (b"block", b"json-full-chain-main"):
-                self.logger.log_message("[Daemon] ZMQ new block → fetching template...")
-                threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
-            elif topic == b"txpool_add":
-                # Optional: refresh template to include new txs
-                pass
-        except Exception:
-            self.logger.log_message("[Daemon] ⚠️ Malformed ZMQ message received.")
+            # Split "topic payload" (tolerate missing payload)
+            if b" " in raw_message:
+                topic, payload = raw_message.split(b" ", 1)
+            else:
+                topic, payload = raw_message, b""
+
+            t = topic.strip()
+
+            block_topics = {b"block", b"json-full-chain-main", b"json-minimal-block"}
+            tx_topics = {b"txpool_add", b"json-minimal-txpool_add", b"json-full-txpool_add"}
+
+            def _debounced_refresh(label: str, min_interval: float = 0.5):
+                now = time.time()
+                last = getattr(self, "_last_template_refresh", 0.0)
+                if now - last >= min_interval:
+                    setattr(self, "_last_template_refresh", now)
+                    self.logger.log_message(f"[Daemon] ZMQ {label} → fetching template...")
+                    threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
+
+            if t in block_topics:
+                _debounced_refresh("new block")
+                return
+
+            if t in tx_topics:
+                # Optional: refresh so new txs get into the template quickly
+                _debounced_refresh("txpool_add")
+                return
+
+            # Unknown topic: keep noise low but give a hint (best-effort JSON peek)
+            if payload:
+                try:
+                    if payload.lstrip()[:1] in (b"{", b"["):
+                        j = json.loads(payload.decode("utf-8", "ignore"))
+                        k = list(j) if isinstance(j, dict) else (["list"] if isinstance(j, list) else [])
+                        self.logger.log_message(f"[Daemon] ZMQ {t!r} (json keys={k[:4]})")
+                    else:
+                        self.logger.log_message(f"[Daemon] ZMQ {t!r} ({len(payload)}B non-json payload)")
+                except Exception:
+                    self.logger.log_message(f"[Daemon] ZMQ {t!r} ({len(payload)}B payload)")
+            else:
+                self.logger.log_message(f"[Daemon] ZMQ {t!r} (no payload)")
+
+        except Exception as e:
+            self.logger.log_message(f"[Daemon] ⚠️ Malformed ZMQ message received: {e}")
 
     # ----- RPC -----
 
@@ -367,6 +408,7 @@ class MoneroDaemonManager:
             self._templates_by_job_id.pop(oldest, None)
             self._difficulty_by_job_id.pop(oldest, None)
             self.logger.log_message("[Daemon] Cleaning up old block template cache.")
+
 
 
 class StratumConnectionManager:
@@ -1128,7 +1170,7 @@ class StratumManager:
         self.session_buffers: Dict[str, bytes] = {}
         self.STRATUM_PORTS = {3333, 4444, 5555, 7777, 18081}
         self.code_output_manager = code_output_manager
-
+        self._stop_events: Dict[str, threading.Event] = {}
         self.logger.log_message("[Stratum] Streamlined Manager initialized.")
 
     # ----- lifecycle -----
@@ -1465,30 +1507,57 @@ class StratumManager:
 
     def register_session(self, session_id: str) -> None:
         with self._lock:
-            if session_id in self.sessions:
+            t = self._workers.get(session_id)
+            if session_id in self.sessions and t is not None and t.is_alive():
                 return
-            self.sessions[session_id] = {}
+
+            self.sessions[session_id] = {"job_ver": 0}
+            self._stop_events[session_id] = threading.Event()
 
             jq = queue.Queue(maxsize=1)
             self._job_queues[session_id] = jq
 
-            t = threading.Thread(target=self._share_worker, args=(session_id, jq), daemon=True, name=f"rx-{session_id}")
+            t = threading.Thread(target=self._share_worker,
+                                 args=(session_id, jq),
+                                 daemon=True, name=f"rx-{session_id}")
             self._workers[session_id] = t
             t.start()
         self.logger.log_message(f"[Stratum] ✅ Session registered and worker started for: {session_id}")
 
     def deregister_session(self, session_id: str) -> None:
         self.logger.log_message(f"[Stratum] 🛑 Deregistering session: {session_id}")
+
+        stop_evt = None
+        q = None
+        t = None
         with self._lock:
-            if session_id in self._job_queues:
-                self._job_queues[session_id].put(None)
-            w = self._workers.get(session_id)
-            if w and w.is_alive():
-                w.join(timeout=2.0)
+            # signal stop + force version bump so inner loop breaks ASAP
+            s = self.sessions.get(session_id)
+            if isinstance(s, dict):
+                s["job_ver"] = int(s.get("job_ver", 0)) + 1  # 🔸 preempt current job
+
+            stop_evt = self._stop_events.get(session_id)
+            if stop_evt:
+                stop_evt.set()
+
+            q = self._job_queues.get(session_id)
+            t = self._workers.get(session_id)
+
+        if q:
+            try:
+                q.put_nowait(None)  # unblock outer job_q.get()
+            except Exception:
+                pass
+
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+
+        with self._lock:
             self.sessions.pop(session_id, None)
             self._workers.pop(session_id, None)
             self._job_queues.pop(session_id, None)
             self._submitters.pop(session_id, None)
+            self._stop_events.pop(session_id, None)
 
     def process_messages(self, session_id: str, messages: list[dict]) -> None:
         if session_id not in self.sessions:
@@ -1540,6 +1609,11 @@ class StratumManager:
 
     def _handle_job(self, session_id: str, job: Dict[str, Any]):
         self._maybe_reinit_randomx(job.get("seed_hash"))
+        # bump per-session job version so workers can preempt immediately
+        with self._lock:
+            s = self.sessions.setdefault(session_id, {})
+            s["job_ver"] = int(s.get("job_ver", 0)) + 1
+            cur_ver = s["job_ver"]
         if session_id in self._job_queues:
             jq = self._job_queues[session_id]
             try:
@@ -1547,12 +1621,16 @@ class StratumManager:
             except queue.Empty:
                 pass
             jq.put(job)
-            self.code_output_manager.submit_packet(
-                job,
-                inbound_iface="stratum",
-                phase="handled",
-                component="stratum-job"
-            )
+            # (optional) visibility
+            try:
+                self.code_output_manager.submit_packet(
+                    {**job, "_job_ver": cur_ver},
+                    inbound_iface="stratum",
+                    phase="handled",
+                    component="stratum-job"
+                )
+            except Exception:
+                pass
 
     def _track_submit(self, session_id: str, params: dict):
         with self._lock:
@@ -1575,10 +1653,6 @@ class StratumManager:
     # ----- worker -----
 
     def _share_worker(self, session_id: str, job_q: queue.Queue):
-        """
-        Throughput-focused worker with optional 3-stage pipeline.
-        Emits SHARE and BLOCK candidates via attached submitter.
-        """
         from time import perf_counter
         import time
         import random
@@ -1586,62 +1660,43 @@ class StratumManager:
         logger = self.logger
         submitter = self._submitters.get(session_id)
 
-        # Tuning
         BATCH = 4
-        PREEMPT_EVERY = 0x3FFF  # check occasionally; won't starve hashing
         LOG_INTERVAL = 2.0
         max_backoff = 0.5
 
-        # Odd stride per-session so threads don't collide
         stride_seed = abs(hash(session_id)) or 1
         stride = ((stride_seed & 0xFFFF) | 1)
 
-        # --- helpers -------------------------------------------------------------
         def _u256_le(x) -> int:
-            """Normalize a 32-byte digest (bytes or int) to a Python int as little-endian 256."""
-            if isinstance(x, int):
-                return x
+            if isinstance(x, int): return x
             if isinstance(x, (bytes, bytearray)):
-                if len(x) != 32:
-                    # Some backends return bytearray of 32. Enforce exact size.
-                    raise ValueError(f"digest length != 32 (got {len(x)})")
+                if len(x) != 32: raise ValueError(f"digest length != 32 (got {len(x)})")
                 return int.from_bytes(x, "little")
             raise TypeError(f"Unsupported digest type: {type(x)}")
 
         def _target_u256_from_hex_le(hex_str: str | None) -> int | None:
-            if not hex_str:
-                return None
-            b = bytes.fromhex(hex_str)
-            # P2Pool/Monero targets are provided as LE. 32 bytes is full 256-bit target.
-            if len(b) == 32:
-                return int.from_bytes(b, "little")
-            elif len(b) == 8:
-                # 64-bit target: compare against low 64 bits of hash (LE).
-                # We lift to 256 space by zero-extending—equivalent to checking h_low64 <= T64.
-                return int.from_bytes(b, "little")
-            else:
-                # Be permissive: interpret as LE integer anyway.
-                return int.from_bytes(b, "little")
-
-        def _meets_target(d_u256: int, T: int, T_len_bytes: int) -> bool:
-            """Compare respecting width: if target was 8 bytes, compare low 64 bits only."""
-            if T_len_bytes == 8:
-                return (d_u256 & ((1 << 64) - 1)) <= T
-            # 32 bytes or other: full 256-bit compare
-            return d_u256 <= T
+            if not hex_str: return None
+            return int.from_bytes(bytes.fromhex(hex_str), "little")
 
         def _target_len_bytes(hex_str: str | None) -> int:
-            if not hex_str:
-                return 0
-            return len(hex_str) // 2
+            return len(hex_str) // 2 if hex_str else 0
 
-        # ------------------------------------------------------------------------
-
+        def _meets_target(d_u256: int, T: int, T_len_bytes: int) -> bool:
+            if T_len_bytes == 8:
+                return (d_u256 & ((1 << 64) - 1)) <= T
+            return d_u256 <= T
+        stop_evt = self._stop_events.get(session_id)
         while True:
             job = job_q.get()
             if job is None:
                 logger.log_message(f"[Stratum] 🛑 Worker received stop signal for session={session_id}")
                 break
+            if stop_evt.is_set():
+                self.logger.log_message(f"[Stratum] 🛑 Worker received stop signal for session={session_id}")
+                break
+            # Snapshot the job version *after* this job was enqueued
+            with self._lock:
+                my_ver = int(self.sessions.get(session_id, {}).get("job_ver", 0))
 
             job_id = job.get("id") or job.get("job_id")
             blob_hex = job.get("blob")
@@ -1660,10 +1715,8 @@ class StratumManager:
             rx = self.rx
 
             try:
-                # Targets as LE integers + remember original width for correct compare
                 share_T = _target_u256_from_hex_le(share_hex)
                 share_T_len = _target_len_bytes(share_hex)
-
                 if block_hex:
                     block_T = _target_u256_from_hex_le(block_hex)
                     block_T_len = _target_len_bytes(block_hex)
@@ -1671,16 +1724,13 @@ class StratumManager:
                     block_T = None
                     block_T_len = 0
                     if diff_val:
-                        # Use your existing difficulty->target converter (LE, 256-bit int)
                         block_T = RandomXLoader.target_from_difficulty_int(int(diff_val))
                         block_T_len = 32
-
                 buf, off = self._prepare_blob_template(blob_hex)
             except Exception as e:
                 logger.log_message(f"[Stratum] ❌ Job setup failed for {job_id}: {e}")
                 continue
 
-            # Backend capabilities
             has_pipe = all(
                 hasattr(rx, m) for m in ("calculate_hash_first", "calculate_hash_next", "calculate_hash_last"))
             calc_hash = getattr(rx, "calculate_hash", None)
@@ -1691,30 +1741,34 @@ class StratumManager:
             nonce = random.getrandbits(32)
             tries, ema_rate, last_log, error_streak = 0, None, perf_counter(), 0
             submitted_nonces: set[str] = set()
-
-            # Diagnostics: track best observed hashes to sanity-check targets
             min_h64 = (1 << 64) - 1
             min_h256 = (1 << 256) - 1
 
             logger.log_message(f"[Stratum] ▶️ Working job {job_id} (stride={stride}, batch={BATCH if has_pipe else 1})")
 
             while True:
-                # preemption: check occasionally for a newer job
-                if (tries & PREEMPT_EVERY) == 0 and tries != 0:
-                    try:
-                        newj = job_q.get_nowait()
-                        job_q.put(newj)
-                        if (newj.get("id") or newj.get("job_id")) != job_id:
-                            logger.log_message(f"[Stratum] 🔄 New job arrived, switching from {job_id}.")
-                            break
-                    except queue.Empty:
-                        pass
+                if stop_evt and stop_evt.is_set():
+                    logger.log_message(f"[Stratum] ⛔ Stop requested; leaving job {job_id} on {session_id}.")
+                    break
+
+                with self._lock:
+                    sess = self.sessions.get(session_id)
+                    if sess is None:
+                        logger.log_message(f"[Stratum] ⛔ Session removed; leaving job {job_id} on {session_id}.")
+                        break
+                    cur_ver = int(sess.get("job_ver", my_ver))
+
+                # ---- instant preemption: switch as soon as a newer job arrives ----
+                with self._lock:
+                    cur_ver = int(self.sessions.get(session_id, {}).get("job_ver", my_ver))
+                if cur_ver != my_ver:
+                    logger.log_message(
+                        f"[Stratum] 🔄 New job detected for {session_id} (ver {cur_ver} > {my_ver}); switching.")
+                    break
 
                 try:
                     if has_pipe and BATCH >= 2:
                         nonces, digests_u256 = [], []
-
-                        # first
                         self._write_nonce_le_inplace(buf, off, nonce)
                         nonces.append(nonce)
                         rx.calculate_hash_first(bytes(buf))
@@ -1731,24 +1785,12 @@ class StratumManager:
                         d_last = rx.calculate_hash_last()
                         digests_u256.append(_u256_le(d_last))
 
-                        # Optional occasional pipeline self-check (cheap & rare)
-                        if (tries & 0xFFFF) == 0:
-                            tn = nonces[-1]
-                            self._write_nonce_le_inplace(buf, off, tn)
-                            d_single = _u256_le(calc_hash(bytes(buf)))
-                            if d_single != digests_u256[-1]:
-                                logger.log_message("[Stratum] ❌ Pipeline mismatch vs single-hash path")
-                                # fallback to single path if you prefer:
-                                # has_pipe = False
-
-                        # decisions
                         for n_val, d_u256 in zip(nonces, digests_u256):
-                            # diagnostics
                             h64 = d_u256 & ((1 << 64) - 1)
                             if h64 < min_h64: min_h64 = h64
                             if d_u256 < min_h256: min_h256 = d_u256
 
-                            if _meets_target(d_u256, share_T, share_T_len):
+                            if share_T is not None and _meets_target(d_u256, share_T, share_T_len):
                                 n_hex = n_val.to_bytes(4, "little").hex()
                                 if n_hex not in submitted_nonces:
                                     submitted_nonces.add(n_hex)
@@ -1759,8 +1801,6 @@ class StratumManager:
                                         except Exception as e:
                                             logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
                                     logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
-
-
                                     if block_T and _meets_target(d_u256, block_T, block_T_len):
                                         logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
 
@@ -1768,16 +1808,13 @@ class StratumManager:
                         nonce = (nonces[-1] + stride) & 0xFFFFFFFF
 
                     else:
-                        # Single-shot path (no pipeline)
                         self._write_nonce_le_inplace(buf, off, nonce)
                         d_single = _u256_le(calc_hash(bytes(buf)))
-
-                        # diagnostics
                         h64 = d_single & ((1 << 64) - 1)
                         if h64 < min_h64: min_h64 = h64
                         if d_single < min_h256: min_h256 = d_single
 
-                        if _meets_target(d_single, share_T, share_T_len):
+                        if share_T is not None and _meets_target(d_single, share_T, share_T_len):
                             n_hex = nonce.to_bytes(4, "little").hex()
                             if n_hex not in submitted_nonces:
                                 submitted_nonces.add(n_hex)
@@ -1788,7 +1825,6 @@ class StratumManager:
                                     except Exception as e:
                                         logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
                                 logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
-
                                 if block_T and _meets_target(d_single, block_T, block_T_len):
                                     logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
 
@@ -1799,17 +1835,16 @@ class StratumManager:
                     if (now - last_log) >= LOG_INTERVAL:
                         rate = tries / (now - last_log) if now > last_log else 0.0
                         ema_rate = (0.2 * rate + 0.8 * (ema_rate or rate))
-                        # Show min-hash vs target to catch width/endianness mistakes immediately
+                        try:
+                            self.code_output_manager.submit_packet(
+                                {"job_id": job_id, "hashrate": ema_rate},
+                                inbound_iface="stratum",
+                                phase="handled",
+                                component="work"
+                            )
+                        except Exception:
+                            pass
                         msg = f"[Stratum] ⏱️ {session_id} job {job_id}: {ema_rate:.0f} H/s"
-                        self.code_output_manager.submit_packet(
-                            {
-                                "job_id": job_id,
-                                "hashrate": ema_rate
-                            },
-                            inbound_iface="stratum",
-                            phase="handled",
-                            component="work"
-                        )
                         try:
                             sh_bytes = bytes.fromhex(share_hex)
                             if len(sh_bytes) == 8:

@@ -143,11 +143,6 @@ class PythonRouterManager:
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
         self.forwarding_manager = ForwardingManager(self.function_call_tracker, router_logger=self.router_logger,)
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
-
-        self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
-        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python)
-        self.isakmp_manager = None
-        self.esp_manager = ESPManager(router_logger, self.packet_writer)
         self.stratum_manager = StratumManager(self.code_output_manager, router_logger)
         self.stratum_connection_manager = StratumConnectionManager(
             self.code_output_manager,
@@ -156,6 +151,10 @@ class PythonRouterManager:
             self.process_packet  # Callback for reinjection
         )
         self.daemon_manager = None
+        self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
+        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python)
+        self.isakmp_manager = None
+        self.esp_manager = ESPManager(router_logger, self.packet_writer)
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
@@ -1726,6 +1725,7 @@ class PythonRouterManager:
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
+
             self.parallel_python.inject_into(self.transport_manager.transport_dhcp._active)
 
             self.isakmp_manager = ISAKMPManager(self.router_logger, self.packet_writer, self.notification_manager, self._interfaces_config)
