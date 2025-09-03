@@ -5867,6 +5867,7 @@ class ARPManager:
         self.outbound_load_balancer = outbound_load_balancer
         self._static_arp_entries = {}  # {IP: MAC}
         self.interfaces_config = None
+        self.router_ip_out = None
         self.default_gateway_ip = None
         self.arp_probe_offlink = True
         self.lease_cooldown = 30
@@ -5888,8 +5889,19 @@ class ARPManager:
         self.dai_conflict_threshold = 1  # 1 conflicting claim is enough to block
         self._dai_recent_claims = {}  # { "ip": { "mac": last_seen_ts, ... } }
         self._known_gateway_macs = {}  # { "gw_ip": "aa:bb:..." }  (learned)
+        self.eset_compat_mode = True  # enable the guardrails
+        self.quiet_start_s = 5.0  # first minute = quiet
+        self._boot_ts = time.time()
+        self.garp_enabled = True  # hard off at boot (flip True if you really need it)
+        self.garp_only_for_owned = True  # even when enabled, only for our own IPs
 
     # ---------- NEW: helpers to recognize gateways so we never lease them ----------
+
+    def _in_quiet_start(self) -> bool:
+        try:
+            return self.eset_compat_mode and (time.time() - self._boot_ts) < float(self.quiet_start_s)
+        except Exception:
+            return False
     def perform_arp_dai(self, pkt: Packet, inbound_iface: str) -> bool:
         """
         Return True = permit, False = block. Blocks ARP that would poison caches:
@@ -5901,6 +5913,8 @@ class ARPManager:
         if not self.dai_enable or not pkt.haslayer(ARP):
             return True
 
+        if self._in_quiet_start():
+            return True
         iface_name = inbound_iface.split("_")[-1]
         if self.dai_enforce_on_untrusted_only and inbound_iface in self._trusted_ports:
             return True
@@ -6336,6 +6350,18 @@ class ARPManager:
 
     def send_gratuitous_arp(self, ip_address: str, mac_address: str, iface: str):
         """Sends a gratuitous ARP (announcement)."""
+        if not getattr(self, "garp_enabled", True):
+            self.router_logger.log_message(
+                f"[ARP][ESET] 🔇 GARP disabled; skipping {ip_address} on {iface.split('_')[-1]}")
+            return False
+
+        if self._in_quiet_start():
+            return True
+        if getattr(self, "garp_only_for_owned", True) and not self._owns_ip(ip_address):
+            self.router_logger.log_message(
+                f"[ARP][ESET] 🚫 not-owned: suppressing GARP for {ip_address} on {iface.split('_')[-1]}")
+            return False
+
         self.router_logger.log_message(f"[ARP] Sending Gratuitous ARP for {ip_address} ({mac_address}) on {iface.split('_')[-1]}")
         grat_arp = Ether(src=mac_address, dst="ff:ff:ff:ff:ff:ff") / ARP(op="who-has", psrc=ip_address, pdst=ip_address, hwsrc=mac_address)
         try:
@@ -6347,6 +6373,8 @@ class ARPManager:
     def send_custom_arp_request(self, target_ip: str, iface: str = None, timeout: int = 2) -> str | None:
         """Resolve a MAC for target_ip; ARP direct if on-link else ARP the gateway."""
         try:
+            if self._in_quiet_start():
+                return None
             ip_obj = ipaddress.ip_address(str(target_ip).strip())
             if not isinstance(ip_obj, ipaddress.IPv4Address) or self.is_special_ip(str(ip_obj)):
                 self.router_logger.log_message(f"[ARP] ⚠️ Skipping ARP for special/non-IPv4 IP: {target_ip}")
@@ -6506,7 +6534,7 @@ class ARPManager:
                 )
                 # SAFE: do NOT lease gateways or our own IPs
                 ip_obj = ipaddress.ip_address(str(ip).strip())
-                if (not ip_obj.is_link_local) and (not self._is_gateway_ip(ip)) and (not self._owns_ip(ip)):
+                if (not ip_obj.is_link_local) and (not self._is_gateway_ip(ip)) and (not self._owns_ip(ip)) and not self.router_ip_out:
                     self.allow_temp_arp_lease(ip, self.lease_duration, self.lease_cooldown)
 
             self._arp_cache[ip] = (mac, now)
@@ -6547,6 +6575,7 @@ class ARPManager:
         Reply to ARP who-has iff policy allows. Never auto-lease gateways.
         """
         try:
+
             if not request_pkt.haslayer(ARP):
                 return
             arp = request_pkt[ARP]
@@ -6572,6 +6601,20 @@ class ARPManager:
                 try: self.learn_arp_response(request_pkt)
                 except Exception: pass
 
+            if self._in_quiet_start():
+                if self._owns_ip(target_ip):
+                    our_mac = _own_mac_or_none()
+                    if our_mac:
+                        reply = Ether(dst=requester_mac, src=our_mac) / ARP(op=2, hwsrc=our_mac, psrc=target_ip,
+                                                                            hwdst=requester_mac, pdst=requester_ip)
+                        self.sniffer.sendp(reply, iface=iface, verbose=False)
+                        self.router_logger.log_message(
+                            f"[ARP][ESET] 📢 (quiet) Replied for own {target_ip} on {iface_name}")
+                else:
+                    self.router_logger.log_message(
+                        f"[ARP][ESET] 🤫 quiet-start: not replying for non-owned {target_ip} on {iface_name}")
+                _learn_requester()
+                return
             if self.is_special_ip(target_ip, iface_network=str(iface_net) if iface_net else None):
                 if requester_ip == "0.0.0.0":
                     if self._owns_ip(target_ip) and getattr(self, "arp_defend_on_probe", True) and self._can_defend_now(target_ip):
@@ -6661,10 +6704,14 @@ class ARPManager:
         Grants a temporary ARP lease for an IP (so we may respond to ARP for it).
         SAFE: will NOT lease a gateway IP.
         """
+        if self._in_quiet_start():
+            self.router_logger.log_message(
+                f"[ARP][LEASE][ESET] 🤫 quiet-start: refusing temporary lease for {ip_address}")
+            return False
         ip_address = str(ip_address).strip()
 
         # --- SAFETY: never lease gateways ---
-        if self._is_gateway_ip(ip_address):
+        if self._is_gateway_ip(ip_address) or ip_address == self.router_ip_out:
             self.router_logger.log_message(f"[ARP][LEASE] 🚫 Refusing temporary lease for gateway IP {ip_address}.")
             return False
 

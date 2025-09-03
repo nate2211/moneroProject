@@ -95,6 +95,122 @@ class ParallelPythonTool:
             "memory_usage_mb": memory_info.rss / (1024 * 1024)
         }
 
+    def _burn_worker(self, stop_evt: threading.Event, busy_fraction: float, period_sec: float) -> None:
+        """
+        One worker that uses a fixed duty cycle:
+        - busy for (busy_fraction * period_sec)
+        - sleep for the remainder
+        """
+        busy_time = max(0.0, min(1.0, busy_fraction)) * period_sec
+        idle_time = max(0.0, period_sec - busy_time)
+
+        # A tight spin that avoids function call overhead inside the loop
+        while not stop_evt.is_set():
+            start = time.perf_counter()
+            # Busy phase
+            while (time.perf_counter() - start) < busy_time and not stop_evt.is_set():
+                pass
+            # Idle phase
+            if idle_time > 0:
+                stop_evt.wait(idle_time)
+
+    def _burn_cpu_in_this_process(self, target_percent: float,
+                                  duration_sec: Optional[float],
+                                  workers: Optional[int],
+                                  period_ms: int = 100) -> None:
+        """
+        Create N threads that collectively approximate the requested CPU utilization.
+        - target_percent: 0..100 (per *process*, across all logical cores)
+        - duration_sec: None = run until stop_evt is set externally (not exposed here);
+                        otherwise run for given seconds and stop automatically
+        - workers: number of worker threads; default = os.cpu_count() or 1
+        - period_ms: control loop period (smaller -> smoother but more overhead)
+        """
+        logical_cores = os.cpu_count() or 1
+        workers = workers or logical_cores
+        workers = max(1, workers)
+
+        # Normalize the total busy fraction across workers.
+        # Example: on 8 cores, 400% target means roughly 4 full-busy threads.
+        # Clamp to a sane range.
+        total_core_percent = max(0.0, min(100.0, float(target_percent))) * logical_cores / 100.0
+        per_worker_busy = max(0.0, min(1.0, total_core_percent / workers))
+
+        stop_evt = threading.Event()
+        threads = []
+        for _ in range(workers):
+            t = threading.Thread(
+                target=self._burn_worker,
+                args=(stop_evt, per_worker_busy, period_ms / 1000.0),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
+
+        try:
+            if duration_sec is None:
+                # Run until externally stopped (not exposed by this simple helper)
+                while True:
+                    time.sleep(1)
+            else:
+                time.sleep(max(0.0, float(duration_sec)))
+        finally:
+            stop_evt.set()
+            for t in threads:
+                t.join(timeout=1.0)
+
+    def raise_cpu_usage_for_process_name(self, process_name: str = "Nate's Server",
+                                         target_percent: float = 300.0,
+                                         duration_sec: float = 10.0,
+                                         workers: Optional[int] = None,
+                                         logger=None) -> bool:
+        """
+        If the CURRENT process's executable name matches `process_name`,
+        spin up worker threads to increase CPU usage for `duration_sec`.
+
+        Returns True if load was applied; False if names didn't match.
+
+        Notes:
+          • This does NOT inject into other processes. It only burns CPU in *this*
+            process when its name matches `process_name`. That keeps it safe and
+            transparent.
+          • `target_percent` is across all cores (e.g., 300 on an 8-core box is ~3 fully-busy cores).
+          • If you're running from python.exe during development, this will only run
+            automatically when your frozen/bundled exe is actually named
+            'Nate's Server' (or whatever you pass in). While developing, either:
+              - rename the check to match "python.exe", or
+              - explicitly call `_burn_cpu_in_this_process(...)` instead.
+        """
+        try:
+            me = psutil.Process(os.getpid())
+            # Try both friendly name and basename of the exe path
+            current_name = (me.name() or "").strip()
+            exe_basename = (me.exe() or "").split(os.sep)[-1]
+
+            matches = {current_name.lower(), exe_basename.lower()}
+            want = process_name.lower()
+
+            if want in matches:
+                if logger:
+                    logger.log_message(f"[CPU] Attaching to current process '{current_name}' (PID {me.pid}) "
+                                       f"to raise CPU for {duration_sec}s at ~{target_percent}%...")
+                self._burn_cpu_in_this_process(target_percent, duration_sec, workers)
+                if logger:
+                    logger.log_message("[CPU] Done raising CPU usage.")
+                return True
+            else:
+                if logger:
+                    logger.log_message(
+                        f"[CPU] Skipped: current process is '{current_name}' (exe='{exe_basename}'), "
+                        f"not '{process_name}'."
+                    )
+                return False
+        except Exception as e:
+            if logger:
+                logger.log_message(f"[CPU] Error while attempting to raise CPU: {e}")
+            else:
+                print(f"[CPU] Error: {e}")
+            return False
     # --------------------------- NEW RAM USAGE METHODS ---------------------------
     def increase_ram_usage(self, megabytes: int):
         """

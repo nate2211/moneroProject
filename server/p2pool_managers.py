@@ -91,6 +91,9 @@ class PythonRouterManager:
 
         self.router_logger = router_logger
         self.code_output_manager = CodeOutputManager(self.router_logger)
+        self.parallel_python = ParallelPythonTool(router_logger)
+        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
+        self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
         self._interfaces_config = {}  # Stores config for all physical interfaces
         self.interface_in_full_name = None
         self.interface_in_friendly_name = None
@@ -120,9 +123,7 @@ class PythonRouterManager:
         # Instantiate all specialized managers
 
 
-        self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
         self.lag_manager = LinkAggregationManager(router_logger)
-        self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
         self.packet_signer = PacketSigningManager(router_logger)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
         self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer, self.arp_manager)
@@ -144,7 +145,7 @@ class PythonRouterManager:
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
 
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
-        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager)
+        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python)
         self.isakmp_manager = None
         self.esp_manager = ESPManager(router_logger, self.packet_writer)
         self.stratum_manager = StratumManager(self.code_output_manager, router_logger)
@@ -159,7 +160,6 @@ class PythonRouterManager:
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
         self.windivert_manager = WinDivertManager(self, self.code_output_manager)
-        self.parallel_python = ParallelPythonTool(router_logger)
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1343,7 +1343,13 @@ class PythonRouterManager:
             )
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
-            yield_no_gil(0.02)
+            yield_no_gil(0.2)
+            self.parallel_python.raise_cpu_usage_for_process_name(
+                process_name="Nate's Server.exe",  # or "python.exe" while testing
+                target_percent=1000.0,              # ≈ 3 cores at 100% on a multi-core CPU
+                duration_sec=60.0,                 # run for 10 seconds
+                workers=None                       # default = os.cpu_count()
+            )
         except Exception:
             self.router_logger.log_message(
                 f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
@@ -1703,11 +1709,11 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
-
+            self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
             self._enable_nat_forwarding()
-            self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
+            self.arp_manager.router_ip_out = self.router_ip_out
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
             self.nat_manager.set_router_internal_ip("192.168.1.1")
             self.notification_manager = NotificationManager(
