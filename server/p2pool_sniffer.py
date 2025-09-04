@@ -35,7 +35,7 @@ try:
         ICMPv6ND_RA, ICMPv6ND_RS, IPv6, ICMPv6Unknown, ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         IPv6ExtHdrHopByHop, ICMPv6NDOptSrcLLAddr, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment
 )
-    from scapy.layers.l2 import Ether, ARP, GRE, Loopback
+    from scapy.layers.l2 import Ether, ARP, GRE, Loopback, Dot1Q
     from scapy.packet import bind_layers, Raw, NoPayload
 except ImportError:
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
@@ -814,6 +814,58 @@ class SnifferSoftware:
                 return a.address, a.netmask
         return None, None
 
+    def _coerce_to_l3(self, pkt):
+        """
+        Best-effort: return an IP/IPv6 layer from various inputs or (None, reason).
+        Accepts Ether(with VLAN/SNAP), raw bytes, or already-formed IP/IPv6.
+        """
+
+        # Already L3?
+        if isinstance(pkt, (IP, IPv6)):
+            return pkt, None
+
+        # Full Ethernet frame?
+        if isinstance(pkt, Ether):
+            # Handle optional VLAN tag(s)
+            p = pkt
+            # peel Dot1Q stack if present
+            while p.payload and isinstance(p.payload, Dot1Q):
+                p = p.payload
+            # now p.payload is after the last Dot1Q
+            inner = p.payload
+            if isinstance(inner, (IP, IPv6)):
+                return inner, None
+            return None, f"Ethernet payload is not IP/IPv6 (got {type(inner).__name__})."
+
+        # Any Scapy packet—try to find an IP/IPv6 layer
+        try:
+            if hasattr(pkt, "haslayer"):
+                if pkt.haslayer(IP):
+                    return pkt[IP], None
+                if pkt.haslayer(IPv6):
+                    return pkt[IPv6], None
+        except Exception:
+            pass
+
+        # Raw bytes? Try to guess by version nibble
+        if isinstance(pkt, (bytes, bytearray)):
+            b0 = pkt[0] if pkt else 0
+            ver = (b0 >> 4) & 0xF
+            try:
+                if ver == 4:
+                    from scapy.layers.inet import IP as _IP
+                    return _IP(pkt), None
+                if ver == 6:
+                    from scapy.layers.inet6 import IPv6 as _IPv6
+                    return _IPv6(pkt), None
+            except Exception as e:
+                return None, f"Failed to parse raw bytes as IPv{ver}: {e}"
+
+            return None, "Raw bytes do not look like an IPv4/IPv6 header."
+
+        # Unknown shape
+        tname = type(pkt).__name__
+        return None, f"Unsupported packet type for sr1: {tname}. Expected IP/IPv6, Ether, or raw bytes."
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -1011,8 +1063,10 @@ class SnifferSoftware:
         Sends a Layer 3 packet (IP/IPv6) by wrapping in Ether().
         """
         if not (isinstance(packet, IP) or isinstance(packet, IPv6)):
-            self.logger.log_message("[Sniffer] Error: Requires a Layer 3 packet (IP or IPv6).")
-            return
+            packet, _why = self._coerce_to_l3(packet)
+            if packet is None:
+                self.logger.log_message(f"[Sniffer] sr1: could not obtain a Layer 3 packet. Hint: {_why}")
+                return None
 
         try:
             if not route_info:
@@ -1026,7 +1080,6 @@ class SnifferSoftware:
 
             # If loopback and dst is local/private → use OS stack at L3, skip pcap/L2 entirely
             if self._is_npf_loopback(iface_out) and self._dst_is_private_or_local(str(packet.dst)):
-                self.logger.log_message("[Sniffer] Using OS stack for loopback destination; skipping pcap/L2.")
                 self._send_l3_loopback(packet, expect_reply=False)
                 return
 
@@ -1075,8 +1128,10 @@ class SnifferSoftware:
             packet = packet[IP] if IP in packet else packet[IPv6]
 
         if not (isinstance(packet, IP) or isinstance(packet, IPv6)):
-            self.logger.log_message("[Sniffer] Error: sr1 requires a Layer 3 packet (IP or IPv6).")
-            return None
+            packet, _why = self._coerce_to_l3(packet)
+            if packet is None:
+                self.logger.log_message(f"[Sniffer] sr1: could not obtain a Layer 3 packet. Hint: {_why}")
+                return None
 
         try:
             if not route_info:

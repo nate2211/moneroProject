@@ -206,8 +206,8 @@ class ISAKMPManager:
         self.fragment_cache = {}
 
         # --- NEW: Rate-limiting configuration ---
-        self.RATE_LIMIT_HZ = 1  # Max 10 packets per second per source IP
-        self.BURST_LIMIT = 2  # How many packets to track for rate calculation
+        self.RATE_LIMIT_HZ = 5  # Max 10 packets per second per source IP
+        self.BURST_LIMIT = 6  # How many packets to track for rate calculation
         self.source_tracker = defaultdict(lambda: {
             "timestamps": deque(maxlen=self.BURST_LIMIT),
             "is_throttling": False

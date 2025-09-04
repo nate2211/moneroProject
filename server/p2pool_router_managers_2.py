@@ -95,26 +95,40 @@ class ZMQReader:
     def _run_loop(self):
         context = zmq.Context()
         socket = context.socket(zmq.SUB)
-        socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-txpool_add")
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-full-txpool_add")
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-block")
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-full-block")
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-miner_data")
+        socket.setsockopt(zmq.SUBSCRIBE, b"json-full-miner_data")
+        socket.RCVTIMEO = 500  # ms (so we can check stop flag regularly)
 
         try:
             socket.connect(self.zmq_address)
             while not self._stop_event.is_set():
                 try:
-                    # Non-blocking receive with a timeout
-                    raw_message = socket.recv(flags=zmq.NOBLOCK)
-                    self.message_handler(raw_message)
+                    # Try multipart first (topic, payload)
+                    frames = socket.recv_multipart(flags=0)  # blocks up to RCVTIMEO
+                    if not frames:
+                        continue
+
+                    if len(frames) >= 2:
+                        # Normalize to "topic payload" so existing handler keeps working
+                        topic = frames[0]
+                        payload = b" ".join(frames[1:])  # in case of >2 frames
+                        self.message_handler(topic + b" " + payload)
+                    else:
+                        # Single-frame: could be "topic:payload" or just "topic"
+                        self.message_handler(frames[0])
+
                 except zmq.Again:
-                    # No message received, check stop event
-                    self._stop_event.wait(0.5)
+                    continue
                 except Exception as e:
                     self.logger.log_message(f"[ZMQ] ❌ Error receiving message: {e}")
-                    self._stop_event.wait(1)
-
         except zmq.ZMQError as e:
             self.logger.log_message(f"[ZMQ] ❌ Failed to connect to ZMQ socket: {e}")
         finally:
-            socket.close()
+            socket.close(0)
             context.term()
 
 
@@ -149,7 +163,7 @@ class MoneroDaemonManager:
         self.zmq_reader = ZMQReader(self.zmq_address, self._handle_zmq_message, self.logger)
         self._templates_by_job_id: Dict[str, str] = {}
         self._difficulty_by_job_id: Dict[str, int] = {}
-
+        self._last_distributed_fingerprint = None
         # IMPORTANT: attach submitter for the daemon session specifically
         self.stratum_conn_manager.stratum_manager.attach_submitter(
             self._DAEMON_SESSION_ID, self.submit_block_to_daemon
@@ -196,22 +210,26 @@ class MoneroDaemonManager:
 
     def _handle_zmq_message(self, raw_message: bytes):
         """
-        Handle monerod ZMQ pub messages. We expect "topic<space>payload".
-        Known topics:
-          - block / json-full-chain-main / json-minimal-block  -> new block
-          - txpool_add / json-minimal-txpool_add / json-full-txpool_add -> tx appeared
+        Handles monerod ZMQ publications for:
+          - block/json-full-chain_main/json-minimal-block
+          - txpool_add/json-*-txpool_add
+          - miner_data/json-*-miner_data
+        Accepts both multipart (normalized by ZMQReader) and single-frame "topic:payload".
         """
         try:
-            # Split "topic payload" (tolerate missing payload)
-            if b" " in raw_message:
-                topic, payload = raw_message.split(b" ", 1)
-            else:
-                topic, payload = raw_message, b""
+            topic, payload = self._split_topic_payload(raw_message)
+            nt = self._norm_topic(topic)
 
-            t = topic.strip()
-
-            block_topics = {b"block", b"json-full-chain-main", b"json-minimal-block"}
-            tx_topics = {b"txpool_add", b"json-minimal-txpool_add", b"json-full-txpool_add"}
+            # Topic families (normalized with underscores)
+            block_topics = {
+                b"block",
+                b"json_full_chain_main",
+                b"json_minimal_chain_main",
+                b"json_full_block",
+                b"json_minimal_block",
+            }
+            tx_topics = {b"txpool_add", b"json_full_txpool_add", b"json_minimal_txpool_add"}
+            miner_topics = {b"miner_data", b"json_full_miner_data", b"json_minimal_miner_data"}
 
             def _debounced_refresh(label: str, min_interval: float = 0.5):
                 now = time.time()
@@ -221,32 +239,234 @@ class MoneroDaemonManager:
                     self.logger.log_message(f"[Daemon] ZMQ {label} → fetching template...")
                     threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
 
-            if t in block_topics:
-                _debounced_refresh("new block")
-                return
-
-            if t in tx_topics:
-                # Optional: refresh so new txs get into the template quickly
-                _debounced_refresh("txpool_add")
-                return
-
-            # Unknown topic: keep noise low but give a hint (best-effort JSON peek)
-            if payload:
+            # ---------- Decode JSON if present ----------
+            j = None
+            if payload and payload.lstrip()[:1] in (b"{", b"["):
                 try:
-                    if payload.lstrip()[:1] in (b"{", b"["):
-                        j = json.loads(payload.decode("utf-8", "ignore"))
-                        k = list(j) if isinstance(j, dict) else (["list"] if isinstance(j, list) else [])
-                        self.logger.log_message(f"[Daemon] ZMQ {t!r} (json keys={k[:4]})")
-                    else:
-                        self.logger.log_message(f"[Daemon] ZMQ {t!r} ({len(payload)}B non-json payload)")
+                    j = json.loads(payload.decode("utf-8", "ignore"))
                 except Exception:
-                    self.logger.log_message(f"[Daemon] ZMQ {t!r} ({len(payload)}B payload)")
+                    j = None
+
+            # ---------- Miner data ----------
+            if nt in miner_topics:
+                # Example keys: height, seed_hash, difficulty (hex), median_weight, tx_backlog[...]
+                height = None
+                seed_hash = None
+                diff_int = None
+                backlog_n = None
+                try:
+                    if isinstance(j, dict):
+                        height = j.get("height")
+                        seed_hash = j.get("seed_hash")
+                        diff_raw = j.get("difficulty")
+                        if isinstance(diff_raw, str):
+                            diff_int = int(diff_raw, 16) if diff_raw.startswith(("0x", "0X")) else int(diff_raw)
+                        backlog = j.get("tx_backlog")
+                        backlog_n = len(backlog) if isinstance(backlog, list) else None
+                except Exception:
+                    pass
+
+                # Optional: refresh template—miner_data changes (seed/diff) imply new job economics
+                _debounced_refresh("miner_data", min_interval=1.0)
+
+                # Surface for UI/metrics
+                try:
+                    self.code_output_manager.submit_packet(
+                        {
+                            "topic": topic.decode("utf-8", "ignore"),
+                            "height": height,
+                            "seed_hash": seed_hash,
+                            "difficulty": diff_int,
+                            "tx_backlog_len": backlog_n,
+                        },
+                        inbound_iface="daemon",
+                        phase="handled",
+                        component="daemon-miner-data",
+                    )
+                except Exception:
+                    pass
+
+                self.logger.log_message(
+                    f"[Daemon] ZMQ miner_data h={height} diff={diff_int} backlog={backlog_n}"
+                )
+                return
+
+            # ---------- Block / chain_main ----------
+            if nt in block_topics:
+                _debounced_refresh("new block")
+
+                height = None
+                block_hash = None
+                reward = None
+                ts = int(time.time())
+                tx_count = None
+
+                if isinstance(j, dict):
+                    height = self._peek(j, "height", ("block_header", "height"))
+                    block_hash = self._peek(j, "hash", ("block_header", "hash"))
+                    reward = self._peek(j, "reward", ("block_header", "reward"), "block_reward")
+                    ts = self._peek(j, "timestamp", ("block_header", "timestamp"), default=ts)
+                    txs_hashes = self._peek(j, "tx_hashes")
+                    txs_full = self._peek(j, "txs")
+                    if isinstance(txs_hashes, list):
+                        tx_count = len(txs_hashes)
+                    elif isinstance(txs_full, list):
+                        tx_count = len(txs_full)
+
+                elif isinstance(j, list) and j:
+                    # json-full-chain_main sometimes emits a one-element array
+                    elem = j[0] if isinstance(j[0], dict) else None
+                    if elem:
+                        height = self._peek(elem, "height", ("block_header", "height"))
+                        block_hash = self._peek(elem, "hash", ("block_header", "hash"))
+                        reward = self._peek(elem, "reward", ("block_header", "reward"), "block_reward")
+                        ts = self._peek(elem, "timestamp", ("block_header", "timestamp"), default=ts)
+                        txs_hashes = self._peek(elem, "tx_hashes")
+                        txs_full = self._peek(elem, "txs")
+                        if isinstance(txs_hashes, list):
+                            tx_count = len(txs_hashes)
+                        elif isinstance(txs_full, list):
+                            tx_count = len(txs_full)
+
+                # Update local chain snapshot for stale analytics
+                try:
+                    if height is not None:
+                        self._last_block_height = int(height)
+                    self._last_block_ts = float(ts) if ts is not None else time.time()
+                except Exception:
+                    pass
+
+                # Optional UI packet
+                try:
+                    self.code_output_manager.submit_packet(
+                        {
+                            "topic": topic.decode("utf-8", "ignore"),
+                            "height": height,
+                            "hash": block_hash,
+                            "reward": reward,
+                            "tx_count": tx_count,
+                            "timestamp": ts,
+                        },
+                        inbound_iface="daemon",
+                        phase="handled",
+                        component="daemon-block",
+                    )
+                except Exception:
+                    pass
+
+                h_disp = f"h={height}" if height is not None else "h=?"
+                tx_disp = f", txs={tx_count}" if tx_count is not None else ""
+                rw_disp = f", reward={reward}" if reward is not None else ""
+                self.logger.log_message(f"[Daemon] ZMQ block {h_disp}{tx_disp}{rw_disp}")
+                return
+
+            # ---------- Tx pool add ----------
+            if nt in tx_topics:
+                _debounced_refresh("txpool_add")
+                tx_hash = fee = size = receive_time = None
+
+                if isinstance(j, dict):
+                    tx_hash = self._peek(j, "tx_hash", "hash")
+                    fee = self._peek(j, "fee", ("tx", "rct_signatures", "fee"))
+                    size = self._peek(j, "size", ("tx", "size"))
+                    receive_time = self._peek(j, "receive_time", "timestamp")
+                else:
+                    # Fallback for bare "txpool_add" (non-JSON): payload is often raw 32-byte txid
+                    try:
+                        # our ZMQReader joined extra frames already; if you change it to keep frames,
+                        # handle the second frame explicitly here
+                        if payload and len(payload) in (32, 64):  # 32 bytes or 64 hex chars
+                            tx_hash = payload.hex() if len(payload) == 32 else payload.decode("ascii", "ignore")
+                        elif payload and all(c in b"0123456789abcdef" for c in payload.strip().lower()) and len(
+                                payload.strip()) in (64, 66):
+                            tx_hash = payload.strip().decode("ascii", "ignore").lstrip("0x")
+                    except Exception:
+                        pass
+
+                h = (tx_hash[:10] + "…") if isinstance(tx_hash, str) and len(tx_hash) > 10 else (tx_hash or "?")
+                self.logger.log_message(f"[Daemon] ZMQ txpool_add tx={h} fee={fee} size={size}")
+                return
+
+            # ---------- Unknown topic ----------
+            if payload:
+                if payload.lstrip()[:1] in (b"{", b"["):
+                    try:
+                        jj = json.loads(payload.decode("utf-8", "ignore"))
+                        k = list(jj) if isinstance(jj, dict) else (["list"] if isinstance(jj, list) else [])
+                        self.logger.log_message(f"[Daemon] ZMQ {topic!r} (json keys={k[:4]})")
+                    except Exception:
+                        self.logger.log_message(f"[Daemon] ZMQ {topic!r} ({len(payload)}B json-like payload)")
+                else:
+                    self.logger.log_message(f"[Daemon] ZMQ {topic!r} ({len(payload)}B non-json payload)")
             else:
-                self.logger.log_message(f"[Daemon] ZMQ {t!r} (no payload)")
+                self.logger.log_message(f"[Daemon] ZMQ {topic!r} (no payload)")
 
         except Exception as e:
             self.logger.log_message(f"[Daemon] ⚠️ Malformed ZMQ message received: {e}")
 
+    @staticmethod
+    def _norm_topic(t: bytes) -> bytes:
+        # Lowercase and unify separators so json-full-chain_main == json-full-chain-main
+        return t.strip().lower().replace(b"-", b"_")
+
+    @staticmethod
+    def _split_topic_payload(raw: bytes) -> tuple[bytes, bytes]:
+        """
+        Accepts:
+          • "topic payload"
+          • "topic:payload"
+          • "topic" (no payload)
+        Returns (topic, payload)
+        """
+        raw = (raw or b"").strip()
+        if not raw:
+            return b"", b""
+
+        # Prefer space once (older code path)
+        if b" " in raw:
+            t, p = raw.split(b" ", 1)
+            return t.strip(), p
+
+        # Fallback: colon form (as seen in your logs)
+        i = raw.find(b":")
+        if i != -1:
+            t, p = raw[:i], raw[i + 1:]
+            return t.strip(), p
+
+        # Topic only
+        return raw, b""
+    @staticmethod
+    def _peek(d: dict, *keys, default=None):
+        """Try multiple paths; returns first found non-None value."""
+        for k in keys:
+            try:
+                # support nested "a.b.c" or tuple path
+                if isinstance(k, (tuple, list)):
+                    cur = d
+                    ok = True
+                    for part in k:
+                        if not isinstance(cur, dict) or part not in cur:
+                            ok = False
+                            break
+                        cur = cur[part]
+                    if ok and cur is not None:
+                        return cur
+                elif isinstance(k, str) and "." in k:
+                    cur = d
+                    ok = True
+                    for part in k.split("."):
+                        if not isinstance(cur, dict) or part not in cur:
+                            ok = False
+                            break
+                        cur = cur[part]
+                    if ok and cur is not None:
+                        return cur
+                else:
+                    if isinstance(d, dict) and k in d and d[k] is not None:
+                        return d[k]
+            except Exception:
+                pass
+        return default
     # ----- RPC -----
 
     def _rpc_call(self, method: str, params: Optional[Any] = None) -> Dict[str, Any]:
@@ -263,7 +483,17 @@ class MoneroDaemonManager:
         return data
 
     # ----- Template fetch / distribution -----
+    def _tpl_fingerprint(self, *, height: int, prev_hash: str, seed_hash: str | None,
+                         target_hex: str, blob_hex: str) -> tuple:
+        # short, stable de-dup key
+        try:
+            import hashlib
+            h8 = hashlib.blake2b(bytes.fromhex(blob_hex), digest_size=8).hexdigest()
+        except Exception:
+            h8 = hex(len(blob_hex) // 2)[2:]
+        return (int(height), (prev_hash or "")[:16], (seed_hash or "")[:16], target_hex[:16], h8)
 
+    # --- replace _fetch_and_distribute_job with this version (or merge diffs) ---
     def _fetch_and_distribute_job(self) -> None:
         wa = (self.stratum_conn_manager.wallet_address or "").strip()
         if not wa:
@@ -271,7 +501,7 @@ class MoneroDaemonManager:
             return
 
         reserve = int(self.reserve_size)
-        if reserve < 0 or reserve > 127:  # keep safe
+        if reserve < 0 or reserve > 127:
             self.logger.log_message(f"[Daemon] ⚠️ reserve_size {reserve} out of range; clamping to 60.")
             reserve = 60
 
@@ -279,10 +509,9 @@ class MoneroDaemonManager:
 
         try:
             resp = self._rpc_call("get_block_template", params)
-            res = resp.get("result")
-
+            res = resp.get("result") or {}
             needed = ("blocktemplate_blob", "height")
-            if not res or not all(k in res for k in needed):
+            if not all(k in res for k in needed):
                 self.logger.log_message("[Daemon] ⚠️ Template missing required fields (daemon syncing or wrong net?).")
                 return
 
@@ -291,41 +520,87 @@ class MoneroDaemonManager:
                 self.logger.log_message("[Daemon] ⚠️ Invalid blocktemplate_blob from daemon.")
                 return
 
-            # Difficulty (prefer 128-bit wide_difficulty)
+            # Difficulty (prefer wide_difficulty, accept hex or decimal)
+            D = None
             wide = res.get("wide_difficulty")
-            if isinstance(wide, str) and wide.strip():
-                D = int(wide, 16)
-            else:
+            if isinstance(wide, (str, int)) and str(wide).strip():
+                ws = str(wide).strip()
+                try:
+                    D = int(ws, 16) if ws.lower().startswith("0x") else int(ws)
+                except Exception:
+                    D = None
+            if D is None:
                 low = int(res.get("difficulty", 0))
                 high = int(res.get("difficulty_top64", 0))
                 D = (high << 64) | low
-                if D <= 0:
-                    self.logger.log_message("[Daemon] ⚠️ Difficulty missing/invalid.")
-                    return
+            if not isinstance(D, int) or D <= 0:
+                self.logger.log_message("[Daemon] ⚠️ Difficulty missing/invalid.")
+                return
 
             height = int(res["height"])
             seed_hash = RandomXLoader.norm_hex(res.get("seed_hash"))
+            seed_height = res.get("seed_height")
             prev_hash = RandomXLoader.norm_hex(res.get("prev_hash")) or ""
+            reserved_offset = int(res.get("reserved_offset", 0))
+
+            # Compute target from difficulty (LE hex, 32 bytes)
             target_hex = RandomXLoader.target_hex_from_difficulty(D)
+            if not isinstance(target_hex, str) or len(target_hex) not in (16, 64):
+                self.logger.log_message("[Daemon] ⚠️ Computed target has unexpected length.")
+                return
 
-            # Synthesize a stable local job_id
-            job_id = f"daemon-{height}-{prev_hash[:16]}-{int(time.time()*1000)%1_000_000:06d}"
+            # Sanity: Nonce position and reserve bounds
+            blob_len_bytes = len(tpl) // 2
+            nonce_off = self.NONCE_BYTE_OFFSET
+            if blob_len_bytes < (nonce_off + 4):
+                self.logger.log_message("[Daemon] ⚠️ Blob too short to contain nonce at expected offset.")
+                return
 
+            # Validate reserve window
+            reserve_size = int(self.reserve_size)
+            if reserve_size < 0: reserve_size = 0
+            if reserved_offset <= 0:
+                # Older/alt nodes may omit; fall back to end of blob
+                reserved_offset = blob_len_bytes  # no reserved region in coinbase extra
+            if reserved_offset + reserve_size > blob_len_bytes:
+                new_size = max(0, blob_len_bytes - reserved_offset)
+                self.logger.log_message(
+                    f"[Daemon] ⚠️ reserve window {reserved_offset}+{reserve_size} > {blob_len_bytes}; clamping to {new_size}."
+                )
+                reserve_size = new_size
+
+            # De-dup identical templates (height/prev/seed/target/blob hash)
+            fp = self._tpl_fingerprint(height=height, prev_hash=prev_hash, seed_hash=seed_hash,
+                                       target_hex=target_hex, blob_hex=tpl)
+            if fp == getattr(self, "_last_distributed_fingerprint", None):
+                self.logger.log_message("[Daemon] ⏸️ Template unchanged; not redistributing job.")
+                return
+            self._last_distributed_fingerprint = fp
+
+            # Synthesize job_id
+            job_id = f"daemon-{height}-{prev_hash[:16]}-{int(time.time() * 1000) % 1_000_000:06d}"
+
+            # Stratum job payload (carry useful extras)
             stratum_job = {
                 "id": job_id,
                 "blob": tpl,
                 "target": target_hex,
                 "height": height,
                 "difficulty": D,
+                "seed_hash": seed_hash,
+                "seed_height": seed_height,
+                "prev_hash": prev_hash,
+                "reserved_offset": reserved_offset,
+                "reserve_size": reserve_size,
+                # Optional: some pools like to see where the nonce is (debug/metrics)
+                "nonce_byte_offset": self.NONCE_BYTE_OFFSET,
             }
-            if seed_hash:
-                stratum_job["seed_hash"] = seed_hash
 
+            # Cache + distribute
             self._templates_by_job_id[job_id] = tpl
             self._difficulty_by_job_id[job_id] = D
             self._cleanup_templates()
 
-            # Distribute to the daemon session
             self.stratum_conn_manager.distribute_job_from_daemon(stratum_job)
             self.code_output_manager.submit_packet(
                 {
@@ -333,18 +608,23 @@ class MoneroDaemonManager:
                     "height": height,
                     "difficulty": D,
                     "target": target_hex,
+                    "seed_hash": seed_hash,
+                    "prev_hash": prev_hash,
+                    "reserved_offset": reserved_offset,
+                    "reserve_size": reserve_size,
                 },
                 inbound_iface="daemon",
                 phase="handled",
-                component="daemon-job"
+                component="daemon-job",
             )
-            self.logger.log_message(f"[Daemon] ✅ Distributed new job {job_id} (h={height}, diff={D}).")
+            self.logger.log_message(
+                f"[Daemon] ✅ Distributed new job {job_id} (h={height}, diff={D}, seed={str(seed_hash)[:12]}…)."
+            )
 
         except requests.exceptions.RequestException as e:
             self.logger.log_message(f"[Daemon] ❌ Network error fetching template: {e}")
         except Exception as e:
             self.logger.log_message(f"[Daemon] ❌ Error preparing job: {type(e).__name__}: {e}")
-
     # ----- Submission -----
 
     def submit_block_to_daemon(self, job_id: str, nonce: str, result_hash: str) -> None:
@@ -5885,6 +6165,7 @@ class ARPManager:
             router_logger: The logger instance for logging messages.
             cache_timeout_seconds (int): How long a cache entry is valid.
         """
+
         self.dhcp_server_out = None
         self.dhcp_server_in = None
         self.notification_manager = None
@@ -5927,6 +6208,8 @@ class ARPManager:
         self.eset_compat_mode = True  # enable the guardrails
         self.quiet_start_s = 5.0  # first minute = quiet
         self._boot_ts = time.time()
+        self.arp_probe_offlink = False
+        self._offlink_nogw_suppress: dict[str, float] = {}
         self.garp_enabled = True  # hard off at boot (flip True if you really need it)
         self.garp_only_for_owned = True  # even when enabled, only for our own IPs
 
@@ -6458,10 +6741,20 @@ class ARPManager:
                     self.router_logger.log_message(f"[ARP][LL] ⛔ {ip_obj} is link-local; iface not 169.254/16. Not ARPing.")
                     return None
 
-            if net_obj and gw_obj and _is_on_link(gw_obj, net_obj):
-                self.router_logger.log_message(f"[ARP] 🌐 Target {ip_obj} is off-link. Resolving gateway {gw_obj} on {use_iface.split('_')[-1]}.")
-                mac = self._arp_resolve_ipv4(use_iface, str(gw_obj))
-                return mac
+            if isinstance(net_obj, ipaddress.IPv4Network) and isinstance(gw_obj, ipaddress.IPv4Address):
+                if _is_on_link(gw_obj, net_obj):
+                    self.router_logger.log_message(
+                        f"[ARP] 🌐 {ip_obj} is off-link; resolving GW {gw_obj} on {use_iface.split('_')[-1]}")
+                    return self._arp_resolve_ipv4(use_iface, str(gw_obj))
+                else:
+                    # gateway defined but not on this L2 → cannot ARP at all
+                    if self._suppress_offlink_nogw(str(ip_obj)):
+                        self.router_logger.log_message(
+                            f"[ARP] 🔕 {ip_obj} off-link; GW {gw_obj} not on-link for {net_obj} (suppressed)")
+                        return None
+                    self.router_logger.log_message(
+                        f"[ARP] ⛔ {ip_obj} off-link; GW {gw_obj} not on-link for {net_obj}; not ARPing")
+                    return None
 
             if self.arp_probe_offlink and self.sniffer.iface_is_l2_capable(use_iface):
                 self.router_logger.log_message(f"[ARP] 🧪 {ip_obj} appears off-link by route, probing L2 anyway on {use_iface.split('_')[-1]}.")
@@ -6480,6 +6773,13 @@ class ARPManager:
             self.router_logger.log_message(f"[ARP] ❌ Unhandled exception in send_custom_arp_request for {target_ip}: {e}")
             return None
 
+    def _suppress_offlink_nogw(self, ip: str, ttl: float = 120.0) -> bool:
+        now = time.time()
+        until = self._offlink_nogw_suppress.get(ip, 0.0)
+        if now < until:
+            return True
+        self._offlink_nogw_suppress[ip] = now + ttl
+        return False
     def _owns_ip(self, ip: str) -> bool:
         return ip in {cfg.get("ip_addr") for cfg in getattr(self, "_interfaces_config", {}).values() if cfg}
 
