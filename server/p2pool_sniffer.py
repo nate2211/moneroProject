@@ -13,8 +13,10 @@ import psutil
 from scapy.arch import get_if_hwaddr, get_windows_if_list
 from scapy.config import conf
 from scapy.contrib.geneve import GENEVE
+from scapy.contrib.mpls import MPLS
 from scapy.fields import IntField, XShortField, LELongField, LEIntField, LESignedIntField, StrLenField
 from scapy.interfaces import get_if_list
+from scapy.layers.dhcp import BOOTP, DHCP
 from scapy.layers.dhcp6 import DHCP6
 from scapy.layers.dns import DNS
 from scapy.layers.eap import EAPOL, EAP
@@ -22,7 +24,7 @@ from scapy.layers.ipsec import ESP, AH
 from scapy.layers.kerberos import Kerberos
 from scapy.layers.l2tp import L2TP
 from scapy.layers.mobileip import MobileIP
-from scapy.layers.ppp import PPP
+from scapy.layers.ppp import PPP, PPPoED, PPPoE
 from scapy.layers.rip import RIP
 from scapy.layers.rtp import RTP
 
@@ -35,7 +37,7 @@ try:
         ICMPv6ND_RA, ICMPv6ND_RS, IPv6, ICMPv6Unknown, ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         IPv6ExtHdrHopByHop, ICMPv6NDOptSrcLLAddr, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment
 )
-    from scapy.layers.l2 import Ether, ARP, GRE, Loopback, Dot1Q
+    from scapy.layers.l2 import Ether, ARP, GRE, Loopback, Dot1Q, getmacbyip
     from scapy.packet import bind_layers, Raw, NoPayload
 except ImportError:
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
@@ -87,7 +89,15 @@ DLT_IEEE802_11 = 105
 DLT_LINUX_SLL = 113
 DLT_IEEE802_11_RADIO = 127
 DLT_LINUX_SLL2 = 276
-
+DLT_LOOP            = 12
+DLT_PPP             = 9
+DLT_PPP_SERIAL      = 50
+DLT_C_HDLC          = 104   # Cisco HDLC
+DLT_PPP_WITH_DIR    = 204
+DLT_PPP_BSDOS       = 16
+DLT_PFLOG           = 48
+DLT_PPI             = 192   # Per-Packet Info (often used for 802.11)
+DLT_IEEE802_3       = 2     # Raw 802.3 (LLC/SNAP)
 # Optional capture direction (if supported by lib)
 PCAP_D_IN = 1  # inbound only
 
@@ -189,13 +199,23 @@ class SnifferSoftware:
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
-        self.supported_ethertypes = {0x0800, 0x86DD, 0x0806, 0x8100}  # IPv4, IPv6, ARP, VLAN
+        self.supported_ethertypes = {
+            0x0800,  # IPv4
+            0x86DD,  # IPv6
+            0x0806,  # ARP
+            0x8100,  # VLAN (802.1Q)
+            0x88A8,  # QinQ / 802.1ad
+            0x8864,  # PPPoE Session (you unwrap PPP->IP later)
+            0x8863,  # PPPoE Discovery (to avoid false "unsupported" spam)
+            0x8847,  # MPLS unicast
+            0x8848,}
         self.unsupported_ethertypes = {0x8006}
         self.local_ips = self._get_local_ips()
         self.banned_packets = []
         self._load_pcap_library()
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
+        self.logged_packets = []
 
     def iface_is_l2_capable(self, iface_name: str) -> bool:
         kind = (self._interfaces_config.get(iface_name, {}) or {}).get("driver", "").lower()
@@ -270,6 +290,14 @@ class SnifferSoftware:
         bind_layers(IP, AH, proto=51)
         bind_layers(IPv6, AH, nh=51)
         bind_layers(IP, GRE, proto=47)
+        # DHCPv4 over IPv4/UDP
+        bind_layers(UDP, BOOTP, sport=67)  # server -> client
+        bind_layers(UDP, BOOTP, dport=67)  # client -> server
+        bind_layers(UDP, BOOTP, sport=68)  # some NICs/drivers expose reverse ordering
+        bind_layers(UDP, BOOTP, dport=68)
+
+        # BOOTP payload carries the DHCP options layer
+        bind_layers(BOOTP, DHCP)
         # Extra protocols
         bind_layers(UDP, DHCP6, sport=547)
         bind_layers(UDP, DHCP6, dport=546)
@@ -288,6 +316,27 @@ class SnifferSoftware:
         bind_layers(TCP, Kerberos, sport=88)
         bind_layers(TCP, Kerberos, dport=88)
         bind_layers(Ether, EAPOL, type=0x888E)
+        #
+        #special
+        bind_layers(IPv6, IPv6ExtHdrRouting, nh=43)
+        bind_layers(IPv6, IPv6ExtHdrDestOpt, nh=60)
+        bind_layers(IPv6, IPv6ExtHdrFragment, nh=44)
+        bind_layers(PPP, IP, proto=0x0021)  # IPv4 over PPP
+        bind_layers(PPP, IPv6, proto=0x0057)  # IPv6 over PPP
+
+        bind_layers(Ether, PPPoED, type=0x8863)
+        bind_layers(Ether, PPPoE, type=0x8864)
+        bind_layers(PPPoE, PPP)  # then PPP will carry IPCP/IP/IPv6CP
+
+        bind_layers(Ether, MPLS, type=0x8847)
+        bind_layers(Ether, MPLS, type=0x8848)
+
+        bind_layers(Dot1Q, Dot1Q, type=0x8100)  # nested VLANs (common)
+        bind_layers(Dot1Q, Ether, type=0x0800)  # IPv4 behind VLAN
+        bind_layers(Dot1Q, Ether, type=0x86DD)  # IPv6 behind VLAN
+        bind_layers(Dot1Q, Ether, type=0x0806)  # ARP behind VLAN
+        bind_layers(Dot1Q, Ether, type=0x88A8)  # QinQ continuation
+
         #
         load_layer("vxlan")
         load_layer("dhcp")
@@ -364,66 +413,264 @@ class SnifferSoftware:
         except Exception:
             pass  # Not present on very old builds
 
+    # --- NEW: generic tunnel/L2 unwrap helpers --------------------------------
+    def _unwrap_vlan(self, p):
+        # peel stacked Dot1Q to next payload (often Ether or L3)
+        while isinstance(p, Dot1Q):
+            p = p.payload
+        return p
+
+    def _unwrap_pppoe(self, p):
+        # PPPoE -> PPP -> IP/IPv6
+        if isinstance(p, PPPoE):
+            p = p.payload
+        if isinstance(p, PPP):
+            p = p.payload
+        return p
+
+    def _unwrap_mpls(self, p):
+        # MPLS may stack; walk until Bottom-of-Stack (s=1)
+        cur = p
+        last = None
+        while isinstance(cur, MPLS):
+            last = cur
+            cur = cur.payload
+        # Some captures leave inner Ether unparsed; Scapy usually handles it,
+        # but we just return the payload after the last MPLS label.
+        return cur if last else p
+
+    def _unwrap_udp_tunnels(self, l4):
+        """
+        VXLAN/GENEVE/L2TP-over-UDP → return inner payload (often Ether → IP).
+        """
+        try:
+            # VXLAN (default UDP 4789). scapy's VXLAN returns inner Ether as payload.
+            if hasattr(l4, "dport") and int(l4.dport) in (4789,):  # VXLAN
+                vx = getattr(l4, "payload", None)
+                # VXLAN layer name can vary by scapy build; rely on presence of .payload that is Ether
+                if vx and hasattr(vx, "payload"):
+                    return vx.payload  # inner Ether
+
+            # GENEVE (UDP 6081): scapy.contrib.geneve.GENEVE
+            if hasattr(l4, "dport") and int(l4.dport) in (6081,):
+                ge = getattr(l4, "payload", None)
+                if isinstance(ge, GENEVE) and ge.payload is not None:
+                    return ge.payload  # usually Ether
+
+            # L2TP (UDP 1701) typically carries PPP (and then IP)
+            if hasattr(l4, "dport") and int(l4.dport) in (1701,):
+                l2tp = getattr(l4, "payload", None)
+                if isinstance(l2tp, L2TP) and l2tp.payload is not None:
+                    return l2tp.payload  # often PPP/HDLC/Ether
+        except Exception:
+            pass
+        return None
+
+    def _unwrap_gre(self, layer):
+        """
+        GRE payload can be Ether or IP; return the useful inner layer.
+        """
+        try:
+            if isinstance(layer, GRE):
+                inner = layer.payload
+                # If inner is Ether, go one deeper to IP/IPv6 if present
+                if isinstance(inner, Ether):
+                    ethp = inner.payload
+                    return ethp if isinstance(ethp, (IP, IPv6, MPLS, PPP, PPPoE, Dot1Q)) else inner
+                return inner
+        except Exception:
+            pass
+        return None
+
+    def _descend_to_ip(self, p, max_depth=8):
+        """
+        From any layer (Ether/VLAN/PPPoE/PPP/MPLS/Ether), descend until IP/IPv6 or give up.
+        """
+        depth = 0
+        cur = p
+        while depth < max_depth and cur is not None:
+            depth += 1
+            # If already at L3, stop
+            if isinstance(cur, (IP, IPv6)):
+                return cur
+
+            # Ether → handle VLANs and get inner
+            if isinstance(cur, Ether):
+                pay = cur.payload
+                # unwrap nested VLANs first
+                if isinstance(pay, Dot1Q):
+                    pay = self._unwrap_vlan(pay)
+                # PPPoE?
+                if isinstance(pay, PPPoE) or isinstance(pay, PPP):
+                    pay = self._unwrap_pppoe(pay)
+                # MPLS?
+                if isinstance(pay, MPLS):
+                    pay = self._unwrap_mpls(pay)
+                # If still Ether-like (some drivers), step once
+                if isinstance(pay, Ether):
+                    cur = pay
+                    continue
+                cur = pay
+                continue
+
+            # Direct VLAN
+            if isinstance(cur, Dot1Q):
+                cur = self._unwrap_vlan(cur)
+                continue
+
+            # PPPoE/PPP
+            if isinstance(cur, (PPPoE, PPP)):
+                cur = self._unwrap_pppoe(cur)
+                continue
+
+            # MPLS
+            if isinstance(cur, MPLS):
+                cur = self._unwrap_mpls(cur)
+                continue
+
+            # GRE anywhere in path
+            if isinstance(cur, GRE):
+                cur = self._unwrap_gre(cur)
+                continue
+
+            # Some tunnels deliver an inner Ether frame as 'payload'
+            pay = getattr(cur, "payload", None)
+            if isinstance(pay, Ether):
+                cur = pay
+                continue
+
+            # Nothing we recognize further
+            break
+        return cur if isinstance(cur, (IP, IPv6)) else None
+
+    # --- UPDATED: transport finder w/ tunnel awareness -------------------------
     def _find_transport_layer(self, pkt: Packet) -> Optional[Packet]:
         """
-        Finds the transport layer (TCP, UDP, ICMP/ICMPv6) for IPv4 or IPv6 packets.
-        - Walks IPv6 extension headers (Hop-by-Hop, Routing, DestOpt, Fragment).
-        - Steps through AH; returns None on ESP (encrypted).
-        - Handles IP-in-IP and v4<->v6 tunnels (one level or more).
-        - For IPv4, returns None on non-first fragments (no transport header).
+        Return the **inner-most** transport layer (TCP/UDP/ICMP/ICMPv6) if discoverable.
+        Unwraps common tunnels (VLAN, PPPoE/PPP, MPLS, GRE, VXLAN/GENEVE/L2TP over UDP).
+        Handles IPv6 fragments: only offset 0 is examined; non-first returns None.
         """
-        if IPv6 in pkt:
-            tl = self._walk_ipv6(pkt[IPv6])
-            if tl is not None:
-                return tl
+        # 1) Descend to an inner IP/IPv6 first (works from Ether or other L2)
+        ip = None
+        try:
+            if pkt.haslayer(IP) or pkt.haslayer(IPv6):
+                ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
+            else:
+                # Try to walk L2/tunnels to reach L3
+                top = pkt
+                if isinstance(top, Ether):
+                    ip = self._descend_to_ip(top)
+                else:
+                    # for RAW/RadioTap/Dot11 captures, Scapy usually provides IP directly if present
+                    ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        except Exception:
+            ip = None
+        if ip is None:
+            return None
 
-        if IP in pkt:
-            return self._walk_ipv4(pkt[IP])
+        # 2) Once we have IP, walk to L4 (supporting tunnels nested at/after L4 as needed)
+        if isinstance(ip, IPv6):
+            tl = self._walk_ipv6(ip)
+        else:
+            tl = self._walk_ipv4(ip)
+        if tl is not None:
+            return tl
+
+        # 3) If L4 was UDP and carried an L2-over-UDP tunnel, unwrap and try inner IP again
+        try:
+            # Find the closest UDP if present on this path
+            udp = pkt.getlayer(UDP)
+            if udp:
+                inner = self._unwrap_udp_tunnels(udp)
+                if inner:
+                    ip2 = self._descend_to_ip(inner)
+                    if isinstance(ip2, IPv6):
+                        return self._walk_ipv6(ip2)
+                    elif isinstance(ip2, IP):
+                        return self._walk_ipv4(ip2)
+        except Exception:
+            pass
+
+        # 4) GRE may be present below/inside IP (already handled), but try once from the packet root
+        try:
+            gre = pkt.getlayer(GRE)
+            if gre:
+                inner = self._unwrap_gre(gre)
+                ip3 = self._descend_to_ip(inner)
+                if isinstance(ip3, IPv6):
+                    return self._walk_ipv6(ip3)
+                elif isinstance(ip3, IP):
+                    return self._walk_ipv4(ip3)
+        except Exception:
+            pass
 
         return None
 
+    # --- UPDATED: IPv6 walker with fragment-0 handling -------------------------
     def _walk_ipv6(self, ip6: IPv6) -> Optional[Packet]:
         layer: Packet = ip6.payload
-        max_hops = 32  # guard against loops
+        max_hops = 32
 
         while layer is not None and max_hops > 0:
             max_hops -= 1
 
-            # Skip IPv6 extension headers
-            if isinstance(layer, (IPv6ExtHdrHopByHop, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment)):
+            # IPv6 extension headers
+            if isinstance(layer, (IPv6ExtHdrHopByHop, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt)):
                 layer = layer.payload
                 continue
 
-            # IPsec over v6
-            if isinstance(layer, (AH, ESP)):
-                if isinstance(layer, AH):
+            if isinstance(layer, IPv6ExtHdrFragment):
+                # Only inspect first fragment (offset==0); otherwise we don't have L4 header
+                try:
+                    off = int(getattr(layer, "offset", 0))
+                except Exception:
+                    off = 0
+                if off == 0:
                     layer = layer.payload
+                    # continue walking into first fragment payload
                     continue
-                return None  # ESP hides upper layer
+                return None
 
-            # Transport protocols
+            # IPsec
+            if isinstance(layer, ESP):
+                return None
+            if isinstance(layer, AH):
+                layer = layer.payload
+                continue
+
+            # Transport
             if isinstance(layer, (TCP, UDP)):
                 return layer
-            if (ICMPv6 and isinstance(layer, ICMPv6)) or layer.__class__.__name__.startswith("ICMPv6"):
+            if isinstance(layer, ICMPv6) or layer.__class__.__name__.startswith("ICMPv6"):
                 return layer
 
-            # Tunnels: v6-in-v6 or v6-in-v4 (rare but possible with Scapy stacking)
+            # Tunnels (nested IP)
             if isinstance(layer, IPv6):
-                # Recurse into inner IPv6
-                inner = self._walk_ipv6(layer)
-                return inner
+                return self._walk_ipv6(layer)
             if isinstance(layer, IP):
-                # Reuse v4 walker for inner IPv4
                 return self._walk_ipv4(layer)
 
-            # Unknown next header type
-            return None
+            # GRE below v6?
+            if isinstance(layer, GRE):
+                inner = self._unwrap_gre(layer)
+                if isinstance(inner, IPv6):
+                    return self._walk_ipv6(inner)
+                if isinstance(inner, IP):
+                    return self._walk_ipv4(inner)
+                # inner Ether → descend to IP
+                ip_inner = self._descend_to_ip(inner)
+                if isinstance(ip_inner, IPv6):
+                    return self._walk_ipv6(ip_inner)
+                if isinstance(ip_inner, IP):
+                    return self._walk_ipv4(ip_inner)
+                return None
 
+            return None
         return None
 
+    # --- UPDATED: IPv4 walker with more tunnels -------------------------------
     def _walk_ipv4(self, ip4: IP) -> Optional[Packet]:
-        # If this is a non-first fragment, transport header isn't present
-        # (Scapy: ip4.frag > 0 means not the first fragment; first may have MF flag set)
+        # Non-first fragment (frag>0) lacks L4 header
         if getattr(ip4, "frag", 0) > 0:
             return None
 
@@ -433,63 +680,111 @@ class SnifferSoftware:
         while layer is not None and max_hops > 0:
             max_hops -= 1
 
-            # IPsec over v4
-            if isinstance(layer, (AH, ESP)):
-                if isinstance(layer, AH):
-                    layer = layer.payload
-                    continue
-                return None  # ESP hides upper layer
+            # IPsec
+            if isinstance(layer, ESP):
+                return None
+            if isinstance(layer, AH):
+                layer = layer.payload
+                continue
 
-            # Transport protocols
+            # Transport
             if isinstance(layer, (TCP, UDP, ICMP)):
                 return layer
 
-            # Tunnels: IP-in-IP or IPv4 carrying IPv6
+            # Tunnels
             if isinstance(layer, IP):
-                # Step into inner IPv4
-                ip4 = layer
-                if getattr(ip4, "frag", 0) > 0:
+                # IP-in-IP
+                if getattr(layer, "frag", 0) > 0:
                     return None
-                layer = ip4.payload
+                layer = layer.payload
                 continue
             if isinstance(layer, IPv6):
                 return self._walk_ipv6(layer)
 
-            # Unknown/unsupported payload
+            if isinstance(layer, GRE):
+                inner = self._unwrap_gre(layer)
+                if isinstance(inner, IPv6):
+                    return self._walk_ipv6(inner)
+                if isinstance(inner, IP):
+                    return self._walk_ipv4(inner)
+                ip_inner = self._descend_to_ip(inner)
+                if isinstance(ip_inner, IPv6):
+                    return self._walk_ipv6(ip_inner)
+                if isinstance(ip_inner, IP):
+                    return self._walk_ipv4(ip_inner)
+                return None
+
+            # If the payload is an Ether frame (after some tunnel), descend
+            pay = getattr(layer, "payload", None)
+            if isinstance(pay, Ether):
+                ip_inner = self._descend_to_ip(pay)
+                if isinstance(ip_inner, IPv6):
+                    return self._walk_ipv6(ip_inner)
+                if isinstance(ip_inner, IP):
+                    # Restart walk from inner IP
+                    return self._walk_ipv4(ip_inner)
+                return None
+
             return None
 
         return None
+
+
     def _decode_by_dlt(self, raw: bytes, dlt: int):
-        """
-        Return a Scapy packet that matches the capture's datalink type.
-        Falls back to Raw on failure.
-        """
         try:
             if dlt == DLT_EN10MB:
                 return Ether(raw)
+
             if dlt == DLT_IEEE802_11_RADIO:
                 from scapy.layers.dot11 import RadioTap
                 return RadioTap(raw)
+
+            if dlt == DLT_PPI:
+                # PPI sometimes precedes 802.11 frames
+                from scapy.layers.dot11 import RadioTap
+                from scapy.layers.ppi import PPI
+                pkt = PPI(raw)
+                # Many drivers embed 802.11 after PPI payload; scapy can figure it out
+                return pkt
+
             if dlt == DLT_IEEE802_11:
                 from scapy.layers.dot11 import Dot11
                 return Dot11(raw)
+
             if dlt in (DLT_LINUX_SLL, DLT_LINUX_SLL2):
                 from scapy.layers.l2 import CookedLinux
                 return CookedLinux(raw)
+
+            if dlt == DLT_PFLOG:
+                from scapy.layers.pflog import PFLog
+                return PFLog(raw)
+
+            if dlt in (DLT_PPP, DLT_PPP_SERIAL, DLT_PPP_WITH_DIR, DLT_PPP_BSDOS):
+                from scapy.layers.ppp import PPP
+                return PPP(raw)
+
+            if dlt == DLT_C_HDLC:
+                from scapy.layers.l2 import CHDLC
+                return CHDLC(raw)
+
+            if dlt == DLT_IEEE802_3:
+                # 802.3 length field + LLC/SNAP
+                from scapy.layers.l2 import LLC
+                return LLC(raw)
+
             if dlt == DLT_RAW:
                 try:
                     return IP(raw)
                 except Exception:
                     return IPv6(raw)
-            if dlt == DLT_NULL:
-                # 4-byte host-endian AF then payload
+
+            if dlt == DLT_NULL or dlt == DLT_LOOP:
                 af = struct.unpack("@I", raw[:4])[0]
                 payload = raw[4:]
-                if af == socket.AF_INET:
-                    return IP(payload)
-                if af == socket.AF_INET6:
-                    return IPv6(payload)
+                if af == socket.AF_INET:  return IP(payload)
+                if af == socket.AF_INET6: return IPv6(payload)
                 return Raw(payload)
+
             return Raw(raw)
         except Exception:
             return Raw(raw)
@@ -582,11 +877,6 @@ class SnifferSoftware:
                 src = pkt[IPv6].src
                 dst = pkt[IPv6].dst
 
-            # 5) Log what we’re about to do.
-            self.logger.log_message(
-                f"[Loopback] L3 send | iface={loop_iface} | layer={layer_name} | "
-                f"{src} → {dst} | expect_reply={expect_reply} | pkt={pkt.summary()}"
-            )
 
             # 6) Send (and maybe receive) on loopback.
             if expect_reply:
@@ -658,6 +948,7 @@ class SnifferSoftware:
         except Exception:
             return False
 
+
     def _ensure_egress_iface_for_dst(self, iface_in: str | None, dst_ip: str) -> str | None:
         """
         If iface_in is NPF Loopback and dst is not local, pick the real egress
@@ -700,6 +991,8 @@ class SnifferSoftware:
         """
         if not iface_name:
             return None
+        if os.name == "nt" and self._is_npf_loopback(iface_name):
+            return "127.0.0.1/8"  # synthetic; ensures downstream code doesn't crash
         iface_name = self._normalize_pcap_name(iface_name)
         # Windows pcap device path?
         if os.name == "nt" and iface_name.lower().startswith("\\device\\npf_"):
@@ -866,6 +1159,15 @@ class SnifferSoftware:
         # Unknown shape
         tname = type(pkt).__name__
         return None, f"Unsupported packet type for sr1: {tname}. Expected IP/IPv6, Ether, or raw bytes."
+
+    def _multicast_mac_for(self, ip_str: str) -> str:
+        """IPv4: 01:00:5e:0x:xx:xx (lower 23 bits). IPv6: 33:33:xx:xx:xx:xx (lower 32 bits)."""
+        x = ipaddress.ip_address(ip_str)
+        b = x.packed
+        if x.version == 4:
+            return "01:00:5e:%02x:%02x:%02x" % (b[1] & 0x7F, b[2], b[3])
+        else:
+            return "33:33:%02x:%02x:%02x:%02x" % (b[12], b[13], b[14], b[15])
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -906,6 +1208,8 @@ class SnifferSoftware:
 
         try:
             while True:
+                if stop_filter and stop_filter(None): # Pass None since we don't have a packet yet
+                    break
                 ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
 
                 if ret == 0:
@@ -935,6 +1239,12 @@ class SnifferSoftware:
                         packet = self._decode_by_dlt(raw_packet, dlt)
                     except Exception:
                         continue  # malformed frame
+                    try:
+                        if packet.summary() not in self.logged_packets:
+                            self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | {packet.summary()}")
+                            self.logged_packets.append(packet.summary())
+                    except Exception:
+                        self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | <decode error>")
 
                     try:
                         if stop_filter and stop_filter(packet):
@@ -1154,8 +1464,10 @@ class SnifferSoftware:
                 else:
                     dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
                     if not dst_mac:
-                        self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                        return None
+                        dst_mac = getmacbyip(gw_ip)
+                        if not dst_mac:
+                            self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                            return None
 
             if not src_mac:
                 src_mac = get_if_hwaddr(iface_out)
@@ -1189,9 +1501,11 @@ class SnifferSoftware:
             # Compile BPF filter for the reply (REVERSED flow)
             # We expect: src=remote (packet.dst), dst=local (packet.src)
             if TCP in packet:
-                inner = f"tcp and src host {packet.dst} and dst host {packet.src} and src port {packet.dport} and dst port {packet.sport}"
+                inner = (f"tcp and src host {packet.dst} and dst host {packet.src} and "
+                         f"src port {packet.dport} and dst port {packet.sport}")
             elif UDP in packet:
-                inner = f"udp and src host {packet.dst} and dst host {packet.src} and src port {packet.dport} and dst port {packet.sport}"
+                inner = (f"udp and src host {packet.dst} and dst host {packet.src} and "
+                         f"src port {packet.dport} and dst port {packet.sport}")
             else:
                 # ICMP/ICMPv6 or other L4-less traffic
                 if IPv6 in packet:
@@ -1199,19 +1513,52 @@ class SnifferSoftware:
                 else:
                     inner = f"ip and src host {packet.dst} and dst host {packet.src} and (icmp or (tcp or udp))"
 
-            # VLAN-safe: match inner payload whether or not a 802.1Q tag is present
-            bpf_filter_str = f"({inner}) or (vlan and {inner})"
+            # Decide whether the linktype can use 'vlan'
+            dlt = self.libpcap.pcap_datalink(handle)
+            # Loopback/raw types do NOT support 'vlan'
+            DLT_NULL = 0
+            DLT_LOOP = 12
+            DLT_RAW = 101
+            supports_vlan = dlt not in (DLT_NULL, DLT_LOOP, DLT_RAW)
+
+            # Try filters in order of preference
+            candidates = [f"({inner}) or (vlan and {inner})", inner] if supports_vlan else [inner]
+
             bpf = bpf_program()
-            if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), bpf_filter_str.encode("utf-8"), 1, 0) != 0:
-                error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                self.logger.log_message(f"[Sniffer] Error compiling BPF filter: {error_msg}")
+            compiled = False
+            last_err = ""
+            for expr in candidates:
+                if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), expr.encode("utf-8"), 1, 0) == 0:
+                    if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
+                        compiled = True
+                        break
+                    else:
+                        last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
+                        # free and try next candidate
+                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                        continue
+                else:
+                    last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
+                    # If error mentions VLAN on a weird DLT, fall back to inner only once
+                    if "vlan" in last_err.lower() and expr != inner:
+                        # free current bpf before retry
+                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                        # attempt compile/set with inner only
+                        if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), inner.encode("utf-8"), 1, 0) == 0:
+                            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
+                                compiled = True
+                                break
+                            else:
+                                last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
+                        # free and continue to next candidate (though there isn't one)
+                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                    else:
+                        # free and try next candidate
+                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
+
+            if not compiled:
+                self.logger.log_message(f"[Sniffer] Error compiling/setting BPF filter (DLT={dlt}): {last_err}")
                 return None
-            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) != 0:
-                error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                self.logger.log_message(f"[Sniffer] Error setting BPF filter: {error_msg}")
-                self.libpcap.pcap_freecode(ctypes.byref(bpf))
-                return None
-            self.libpcap.pcap_freecode(ctypes.byref(bpf))
 
             # Send the packet
             packet_bytes = bytes(l2_packet)

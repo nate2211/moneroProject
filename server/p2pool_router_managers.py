@@ -5833,8 +5833,8 @@ class TransportMDNSManager:
     }
 
     # ---------- Tunables ----------
-    LOG_RPS         = 0.5       # ~1 line / 2s globally
-    LOG_BURST       = 10
+    LOG_RPS         = .15      # ~1 line / 2s globally
+    LOG_BURST       = 3
     FLOW_COOLDOWN_S = 10.0      # per (sig) cooldown
     DEDUP_TTL_S     = 120.0     # suppress identical response sets briefly
     PREVIEW_MAX     = 5
@@ -9608,7 +9608,7 @@ class TransportManager:
             duration_sec=5.0,  # run for 10 seconds
             workers=None  # default = os.cpu_count()
         )
-
+        # Handle packets with extension headers that were permitted by the firewall
         if isinstance(transport_layer, TCP):
             yield_no_gil(0.2)
             self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
@@ -9618,9 +9618,11 @@ class TransportManager:
                                               transport_layer.dport, iface_short,
                                               return_type="all", count_to_call=20,
                                               queue_name="transport_inspect_tcp_packets")
-            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip, transport_layer.sport,
+            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
+                                              transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20, queue_name="transport_scrape_tcp_packets")
+                                              return_type="all", count_to_call=20,
+                                              queue_name="transport_scrape_tcp_packets")
             return True
         elif isinstance(transport_layer, UDP):
             yield_no_gil(0.2)
@@ -9631,13 +9633,13 @@ class TransportManager:
                                               transport_layer.dport, iface_short,
                                               return_type="all", count_to_call=20,
                                               queue_name="transport_inspect_udp_packets")
-            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip, transport_layer.sport,
+            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
+                                              transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20, queue_name="transport_scrape_udp_packets")
-
+                                              return_type="all", count_to_call=20,
+                                              queue_name="transport_scrape_udp_packets")
             return True
 
-        # Handle packets with extension headers that were permitted by the firewall
         handled = self.transport_ipv6.handle(packet, inbound_iface)
         if handled:
             self.code_output_manager.submit_packet(
@@ -11294,8 +11296,10 @@ class PacketWriter:
                     mac = None
                 dst_mac = self._normalize_mac(mac) if mac else None
                 if not dst_mac:
-                    self.logger.log_message(f"[PacketWriter] 🚫 ARP unresolved for {nh_ip} on {final_iface}.")
-                    return None
+                    dst_mac = getmacbyip(nh_ip)
+                    if not dst_mac:
+                        self.logger.log_message(f"[PacketWriter] 🚫 ARP unresolved for {nh_ip} on {final_iface}.")
+                        return None
 
         # IPv6 path
         elif IPv6 in packet:
@@ -11443,7 +11447,7 @@ class EthernetBridgeManager:
         # MAC address table: { mac_address: (interface_full_name, expiry_timestamp) }
         self._mac_table: Dict[str, Tuple[str, float]] = {}
         self._mac_table_lock = threading.Lock()
-
+        self.sniffer = None
         self._stop_event = threading.Event()
         self._cleanup_thread = None
         self.logger.log_message("[Bridge] Manager initialized.")
@@ -11543,7 +11547,7 @@ class EthernetBridgeManager:
             # Forward the frame to the specific target interface.
             self.logger.log_message(
                 f"[Bridge] ➡️ Forwarding L2 Frame {src_mac} -> {dst_mac} to port {target_iface.split('_')[-1]}")
-            self.packet_writer.queue_packet(frame, target_iface)
+            self.sniffer.send(frame, target_iface)
 
         # Case 2: Destination is unknown, a broadcast, or a multicast (Flooding)
         else:
@@ -11557,7 +11561,7 @@ class EthernetBridgeManager:
             for iface in interfaces_in_bridge:
                 # Don't send the frame back out the port it came in on.
                 if iface != inbound_iface:
-                    self.packet_writer.queue_packet(frame.copy(), iface)
+                    self.sniffer.send(frame.copy(), iface)
                     flood_targets.append(iface.split('_')[-1])
 
             if not flood_targets:

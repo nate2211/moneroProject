@@ -438,6 +438,7 @@ class PythonRouterManager:
                     setattr(manager, 'sniffer', self.sniffer)
                     self.router_logger.log_message(f"[Sniffer] -> Injected sniffer into {manager.__class__.__name__}")
 
+
     def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
                                    router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
                                    router_netmask_out: str = "255.255.255.0"):
@@ -1041,6 +1042,7 @@ class PythonRouterManager:
                 self._interfaces_config,
                 enforce_same_subnet=False
             )
+            self.dhcp_server_in.sniffer = self.sniffer
             self.dhcp_server_out = DHCPServer(
                 self.router_logger,
                 self.packet_writer,
@@ -1050,6 +1052,7 @@ class PythonRouterManager:
                 self._interfaces_config,
                 enforce_same_subnet=False
             )
+            self.dhcp_server_out.sniffer = self.sniffer
             self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in, self.dhcp_server_out)
         else:
             self.router_logger.log_message("[DHCP] DHCP Server not initialized: Router IN network not configured.")
@@ -1084,6 +1087,9 @@ class PythonRouterManager:
                 # Avoid log spam (keep as warning, but single-line)
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
+            if self.transport_manager.handle_packet(packet, inbound_iface):
+                self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+                                                       phase="processing", component="transport")
 
             # [2] L2 handling first (ARP, STP, LLDP, etc). If handled, stop here.
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
@@ -1265,9 +1271,6 @@ class PythonRouterManager:
                         component="handshake",
                     )
                     return
-
-
-
             if packet.haslayer(DNS) and packet[DNS].qr == 1:
                 if self.dns_manager.handle_response(packet, inbound_iface, self._interfaces_config):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
@@ -1278,29 +1281,12 @@ class PythonRouterManager:
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="mdns")
                     return
-            if packet.haslayer(UDP) and packet[UDP]:
+            if packet.haslayer(UDP) and packet[UDP].dport == 53:
                 if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
                                                  self.arp_manager.resolve,
                                                  self.rip_manager.find_route):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns-query")
-                    return
-            if self.transport_manager.handle_packet(packet, inbound_iface):
-                self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                       phase="handled", component="transport")
-                return
-
-
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
-                if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
-                                                                             self.rip_manager.find_route):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="dhcp")
-                    return
-                if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
-                                                                               self.rip_manager.find_route):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="dhcp")
                     return
             if (
                     packet.haslayer("Kerberos")
@@ -1358,11 +1344,11 @@ class PythonRouterManager:
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
 
         iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6) or packet.getlayer(Ether)
-        dst_ip = ip_layer.dst
+        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         if not ip_layer:
-            self.router_logger.log_message(f"[Router] ❗ No IP layer found in packet. Dropping.")
+            self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
             return
+        dst_ip = ip_layer.dst
         route = self.rip_manager.get_forwarding_route(dst_ip)
         # --- Multicast Handling (IPv4 and IPv6) ---
 
@@ -1456,7 +1442,7 @@ class PythonRouterManager:
 
         if ipaddress.ip_address(dst_ip).is_global:
             selected_iface = None
-            if initial_outbound_iface in self._pick_lag_member(packet, inbound_iface, "MyLANAggregation"):
+            if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
                 selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
                 self.code_output_manager.submit_packet(
                     packet,
@@ -1517,7 +1503,7 @@ class PythonRouterManager:
                 phase="handled",
                 component="internet",
             )
-            self.packet_writer.queue_packet(packet, selected_iface)
+            self.sniffer.send(packet, selected_iface)
             return
 
         is_from_internal_bridge = self.ethernet_manager.is_bridge_member(inbound_iface)
@@ -1528,6 +1514,7 @@ class PythonRouterManager:
 
 
 
+        selected_iface = self.outbound_load_balancer.get_next_interface(packet)
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)
         inbound_network = inbound_config.get("network") if inbound_config else None
@@ -1536,8 +1523,7 @@ class PythonRouterManager:
                 ipaddress.ip_address(dst_ip) in inbound_network and
                 dst_ip != inbound_config.get("ip_addr")
         )
-
-        if inbound_iface == initial_outbound_iface:
+        if inbound_iface == selected_iface:
             if not is_intra_lan:
                 alternate_route = self.rip_manager.find_alternate_route(dst_ip, exclude_iface=inbound_iface)
 
@@ -1747,6 +1733,7 @@ class PythonRouterManager:
 
             self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager,
                                                       self.rip_manager, self.packet_writer)
+            self.handshake_manager.sniffer = self.sniffer
             self.handshake_manager._tls_mgr.policy.ciphers.set_requirements(
                 require_pfs=True,
                 require_aead=True

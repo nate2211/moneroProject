@@ -12,6 +12,7 @@ from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set, Ite
 import ipaddress
 import time
 
+import psutil
 import requests
 import zmq
 from scapy.arch import get_windows_if_list
@@ -2411,7 +2412,7 @@ class mDNSManager:
         self._query_log_lock = threading.Lock()
         self._cleanup_thread = None
         self._stop_event = threading.Event()
-
+        self.sniffer = None
         self.logger.log_message("[mDNS] Manager initialized. Query forwarding cooldown is active.")
 
     def start(self):
@@ -2588,40 +2589,116 @@ class mDNSManager:
                           UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
                           DNS(id=original_packet[DNS].id, qr=1, aa=1, qd=original_packet[DNS].qd, an=dns_rr)
 
-        self.packet_writer.queue_packet(response_packet, inbound_iface)
+        self.sniffer.send(response_packet, inbound_iface)
         self.logger.log_message(f"[mDNS] ✅ Sent mDNS response for '{qname}' (Type: {qtype}) on {inbound_iface.split('_')[-1]}")
 
     def _forward_mdns_query(self, original_packet: Packet):
-        """Forwards an mDNS query to all other interfaces."""
-        inbound_iface = original_packet.sniffed_on
+        """
+        Re-emit an mDNS query to all *other* non-loopback interfaces.
+        - If the egress iface is L2-capable and has a MAC -> send L2 (Ether dst = mcast MAC)
+        - Otherwise -> send L3 (no Ether) with TTL/HopLimit=255
+        - Never try to forward *from* loopback *to* loopback (that would stay local)
+        """
+        inbound_iface = getattr(original_packet, "sniffed_on", None)
+
+        # Extract DNS qname (best-effort)
         try:
-            qname = original_packet[DNS].qd.qname.decode()
-        except (IndexError, AttributeError):
-            self.logger.log_message("[mDNS] ⚠️ Cannot forward: Malformed query packet.")
+            qname = (original_packet[DNS].qd.qname or b"").decode(errors="ignore")
+        except Exception:
+            qname = "?"
+
+        is_v6_in = IPv6 in original_packet
+        MDNS_IPv4 = "224.0.0.251"
+        MDNS_IPv6 = "ff02::fb"
+        MDNS_PORT = 5353
+
+        # mDNS multicast destination + L2 multicast MACs
+        dst_ip_mcast = MDNS_IPv6 if is_v6_in else MDNS_IPv4
+        dst_mac_mcast = "33:33:00:00:00:fb" if is_v6_in else "01:00:5e:00:00:fb"
+
+        # Pull the DNS payload to reuse as-is
+        try:
+            dns_layer = original_packet[DNS].copy()
+            dns_layer.qr = 0  # ensure it's a QUERY when re-emitting
+        except Exception:
+            self.logger.log_message("[mDNS] ⚠️ Cannot forward: malformed DNS layer.")
             return
 
-        is_ipv6 = original_packet.haslayer(IPv6)
-        dst_mac = "33:33:00:00:00:fb" if is_ipv6 else "01:00:5e:00:00:fb"
-        dst_ip = self.MDNS_IPV6_ADDR if is_ipv6 else self.MDNS_IPV4_ADDR
-
-        for iface_name, config in self.interfaces_config.items():
+        for iface_name, cfg in (self.interfaces_config or {}).items():
+            # Skip the inbound iface and any obvious loopback device
             if iface_name == inbound_iface:
                 continue
-
-            src_ip_out = config.get("ipv6_addr") if is_ipv6 else config.get("ip_addr")
-            src_mac_out = config.get("mac")
-
-            if not src_ip_out or not src_mac_out:
+            if "\\npf_loopback" in iface_name.lower() or iface_name.lower() in ("lo", "lo0", "loopback"):
                 continue
 
-            l3 = IPv6(src=src_ip_out, dst=dst_ip) if is_ipv6 else IP(src=src_ip_out, dst=dst_ip)
-            forwarded_packet = Ether(src=src_mac_out, dst=dst_mac) / \
-                               l3 / \
-                               UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
-                               original_packet[DNS]
+            # Pick source IP and MAC for this egress
+            src_ip = (cfg.get("ipv6_ll") or cfg.get("ipv6_addr")) if is_v6_in else cfg.get("ip_addr")
+            src_mac = cfg.get("mac")
+            if not src_ip:
+                # If we have no IP for this family, skip this iface
+                continue
 
-            self.packet_writer.queue_packet(forwarded_packet, iface_name)
-            self.logger.log_message(f"[mDNS] 🔁 Forwarded mDNS query for '{qname}' to {iface_name.split('_')[-1]}")
+            # Build L3 header with TTL/HopLimit=255 (required by mDNS)
+            if is_v6_in:
+                l3 = IPv6(src=src_ip, dst=MDNS_IPv6, hlim=255)
+            else:
+                l3 = IP(src=src_ip, dst=MDNS_IPv4, ttl=255)
+
+            l4 = UDP(sport=MDNS_PORT, dport=MDNS_PORT)
+            l3pkt = l3 / l4 / dns_layer
+
+            # Decide if we can send L2 on this iface
+            driver_kind = str((self.interfaces_config.get(iface_name, {}) or {}).get("driver", "")).lower()
+            l2_capable = not any(x in driver_kind for x in ("windivert", "rawip", "winfw"))
+
+            # If L2-capable *and* we have a MAC, prefer proper Ethernet multicast
+            if l2_capable and src_mac:
+                ether = Ether(src=src_mac, dst=dst_mac_mcast)
+                try:
+                    self.sniffer.sendp(ether / l3pkt, iface=iface_name, verbose=0)
+                    self.logger.log_message(
+                        f"[mDNS] 📢 L2 fwd '{qname}' → {iface_name.split('_')[-1]} "
+                        f"({src_ip} → {dst_ip_mcast}, {src_mac}→{dst_mac_mcast})"
+                    )
+                    continue
+                except Exception as e:
+                    self.logger.log_message(f"[mDNS] ⚠️ L2 send failed on {iface_name}: {e}. Falling back to L3.")
+
+            # L3 path (no Ether): handle WinDivert/rawip/loopback-adjacent safely
+            try:
+                # Use sniffer.send() with explicit iface; it will remap loopback and synthesize mcast MAC when needed
+                self.sniffer.send(l3pkt, iface=iface_name, verbose=0)
+                self.logger.log_message(
+                    f"[mDNS] 🌐 L3 fwd '{qname}' → {iface_name.split('_')[-1]} "
+                    f"({src_ip} → {dst_ip_mcast}, driver={driver_kind or 'unknown'})"
+                )
+            except Exception as e:
+                # Final fallback: try best-effort multicast egress selection inline
+                try:
+                    chosen = None
+                    # Choose the first UP NIC with IPv4 (for v4) / any IP (for v6) and a MAC
+                    stats = psutil.net_if_stats()
+                    addrs = psutil.net_if_addrs()
+                    for nic, lst in addrs.items():
+                        if not stats.get(nic) or not stats[nic].isup:
+                            continue
+                        has_mac = any(getattr(a, "family", None) == psutil.AF_LINK and a.address for a in lst)
+                        if is_v6_in:
+                            ok_ip = any(a.family == socket.AF_INET6 for a in lst)
+                        else:
+                            ok_ip = any(a.family == socket.AF_INET for a in lst)
+                        if has_mac and ok_ip and "loopback" not in nic.lower():
+                            chosen = nic
+                            break
+                    if chosen:
+                        self.sniffer.send(l3pkt, iface=chosen, verbose=0)
+                        self.logger.log_message(
+                            f"[mDNS] 🔁 L3 fallback '{qname}' via {chosen} (from {iface_name})"
+                        )
+                    else:
+                        self.logger.log_message(f"[mDNS] ❌ No eligible NIC to forward '{qname}' from {iface_name}.")
+                except Exception as ee:
+                    self.logger.log_message(f"[mDNS] ❌ Forward failed for '{qname}' on {iface_name}: {ee}")
 
 HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
 
@@ -3548,7 +3625,7 @@ class HandshakeManager:
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop,
                                                 daemon=True, name="HandshakeCleanup")
         self._cleanup_thread.start()
-
+        self.sniffer = None
         self.logger.log_message("[Handshake] Manager initialized (TLS wired to TLSRecordManager).")
 
     def _canon_key(self, ip1: str, pt1: int, ip2: str, pt2: int):
@@ -3945,7 +4022,7 @@ class HandshakeManager:
             out = base_eth / ip_layer / tcp_seg / Raw(load=rec.payload)
 
             # Send via your writer (add iface if your writer requires it)
-            self.packet_writer.queue_packet(out)
+            self.sniffer.send(out)
             self.logger.log_message(
                 f"[TLS] 🔁 Forwarded AppData {len(rec.payload)}B {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
             )
@@ -5749,6 +5826,7 @@ class DNSManager:
         self.DNS_CACHE_MAX_ENTRIES = 1000
         self._conditional_forwarders = {}  # allow "ip" or "ip:port"
         self._dns_blacklist = set()
+        self.sniffer = None
         self.router_logger.log_message("[DNS] Manager initialized.")
 
     # --- NEW: easy way to pick a local stub like 127.0.0.1:8888
@@ -5873,7 +5951,7 @@ class DNSManager:
             if UDP in resp and hasattr(resp[UDP], "chksum"):
                 del resp[UDP].chksum
 
-            self.packet_writer.queue_packet(resp, inbound_iface)
+            self.sniffer.send(resp, inbound_iface)
             return True
 
         # ---------- choose upstream target + path ----------
@@ -5962,7 +6040,7 @@ class DNSManager:
             f"[DNS] ➡️ {ip_layer.src}:{udp_layer.sport} {qname} -> "
             f"{target_ip}:{target_port} via {outbound_iface_name.split('_')[-1]}"
         )
-        self.packet_writer.queue_packet(fwd, outbound_iface_name)
+        self.sniffer.send(fwd, outbound_iface_name)
         return True
 
     def handle_response(self, packet, inbound_iface: str, router_interfaces: dict) -> bool:
@@ -6063,7 +6141,7 @@ class DNSManager:
         )
 
         # Send back to the original client on the original inbound iface
-        self.packet_writer.queue_packet(resp, client_iface)
+        self.sniffer.send(resp, client_iface)
         return True
 
 class ARPManager:
@@ -7114,7 +7192,9 @@ class ARPManager:
         if mac:
             self.router_logger.log_message(f"[ARP][GW] 🧭 Cache after ping: {v.gw} → {mac}")
             return mac
-
+        if not mac:
+            mac = getmacbyip(v.gw)
+            return mac
         self.router_logger.log_message(f"[ARP][GW] ⛔ Could not resolve MAC for gateway {v.gw} on {iface}")
         return None
 
@@ -7329,7 +7409,7 @@ class DHCPServer:
 
         self._stop_event = threading.Event()
         self._cleanup_thread = None
-
+        self.sniffer = None
         self.logger.log_message(
             f"[DHCP] Server initialized. v4Relay={self.dhcp_relay_target_ip or 'None'} "
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
@@ -7645,7 +7725,7 @@ class DHCPServer:
                     DHCP(options=dhcp_layer.options)
                 )
                 relay_packet[BOOTP].giaddr = router_in_ip
-                self.packet_writer.queue_packet(relay_packet, inbound_iface)
+                self.sniffer.send(relay_packet, inbound_iface)
                 return True
 
             requested_ip = self._get_requested_ip_opt50(dhcp_layer)
@@ -7676,7 +7756,7 @@ class DHCPServer:
                                   siaddr=router_in_ip, chaddr=bootp_layer.chaddr) /
                             DHCP(options=opts))
                 reply = (Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / offer_l3) if not is_loopback_request else offer_l3
-                self.packet_writer.queue_packet(reply, inbound_iface)
+                self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(f"[DHCP] 📝 Offer {assigned_ip} → {client_mac} (iface={inbound_iface})")
                 return True
 
@@ -7695,7 +7775,7 @@ class DHCPServer:
                                             ("message", "Use this DHCP server"),
                                             "end"]))
                     reply = (Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / nak_l3) if not is_loopback_request else nak_l3
-                    self.packet_writer.queue_packet(reply, inbound_iface)
+                    self.sniffer.send(reply, inbound_iface)
                     self.logger.log_message(
                         f"[DHCP] 🚫 Authoritative NAK to {client_mac}: client named server_id={opt54}, ours={router_in_ip}."
                     )
@@ -7709,7 +7789,7 @@ class DHCPServer:
                               BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr) /
                               DHCP(options=[("message-type", "nak"), ("server_id", router_in_ip), "end"]))
                     reply = (Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / nak_l3) if not is_loopback_request else nak_l3
-                    self.packet_writer.queue_packet(reply, inbound_iface)
+                    self.sniffer.send(reply, inbound_iface)
                     self.logger.log_message(f"[DHCP] 🚫 NAK to {client_mac} (no IP) (iface={inbound_iface}).")
                     return True
 
@@ -7726,7 +7806,7 @@ class DHCPServer:
                                 siaddr=router_in_ip, chaddr=bootp_layer.chaddr) /
                           DHCP(options=opts))
                 reply = (Ether(src=router_in_mac, dst=pkt[Ether].src) / ack_l3) if not is_loopback_request else ack_l3
-                self.packet_writer.queue_packet(reply, inbound_iface)
+                self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(f"[DHCP] 🛰️ ACK {assigned_ip} → {client_mac} (iface={inbound_iface})")
                 return True
 
@@ -7743,7 +7823,7 @@ class DHCPServer:
                                 siaddr=router_in_ip, chaddr=bootp_layer.chaddr) /
                           DHCP(options=opts))
                 reply = (Ether(src=router_in_mac, dst="ff:ff:ff:ff:ff:ff") / ack_l3) if not is_loopback_request else ack_l3
-                self.packet_writer.queue_packet(reply, inbound_iface)
+                self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(f"[DHCP] ℹ️ INFORM ACK → {client_mac} (iface={inbound_iface})")
                 return True
 
@@ -7794,7 +7874,7 @@ class DHCPServer:
                 relay = DHCP6_RelayForward(linkaddr=router_in_ipv6,
                                            peeraddr=pkt[IP].src if pkt.haslayer(IP) else None,
                                            msg=pkt[DHCP6])
-                self.packet_writer.queue_packet(relay, inbound_iface)
+                self.sniffer.send(relay, inbound_iface)
                 return True
 
             if not router_in_ipv6:
@@ -7813,7 +7893,7 @@ class DHCPServer:
                 advertise = (IP(src=str(router_in_ipv6), dst="ff02::1:2") /
                              UDP(sport=547, dport=546) /
                              DHCP6_Advertise(trid=dhcp6.trid, options=opts))
-                self.packet_writer.queue_packet(advertise, inbound_iface)
+                self.sniffer.send(advertise, inbound_iface)
                 self.logger.log_message(f"[DHCP] v6 ADVERTISE → DUID {getattr(client_duid, 'hex', lambda: b'')()} (iface={inbound_iface})")
                 return True
 
@@ -7825,7 +7905,7 @@ class DHCPServer:
                 reply = (IP(src=str(router_in_ipv6), dst="ff02::1:2") /
                          UDP(sport=547, dport=546) /
                          DHCP6_Reply(trid=dhcp6.trid, options=opts))
-                self.packet_writer.queue_packet(reply, inbound_iface)
+                self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(f"[DHCP] v6 REPLY → DUID {getattr(client_duid, 'hex', lambda: b'')()} (iface={inbound_iface})")
                 return True
 

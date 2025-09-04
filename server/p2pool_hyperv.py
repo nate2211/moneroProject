@@ -553,7 +553,6 @@ class WinDivertManager:
                                     pkt, inbound_iface="win-divert",
                                     phase="process-ipv4", component="win-divert-manager"
                                 )
-                                self.logger.log_message("[WinDivert] Processing IPv4 Packet")
 
                         elif ver == 6:
                             ok, usable_len, is_runt = self._ipv6_sane(pkt)
@@ -613,7 +612,7 @@ class WinDivertManager:
                                     pkt, inbound_iface="win-divert",
                                     phase="process-ipv6", component="win-divert-manager"
                                 )
-                                self.logger.log_message("[WinDivert] Processing IPv6 Packet")
+
 
                         else:
                             # Unknown/unsupported L3 — count and skip quietly
