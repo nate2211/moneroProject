@@ -1674,7 +1674,7 @@ class PythonRouterManager:
 
 
         # --- [12] Send Packet ---
-        self.packet_writer.queue_packet(packet, initial_outbound_iface)
+        self.sniffer.send(packet, iface=initial_outbound_iface)
         deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
         sampling_rate = self.packet_catcher_heuristic_rates.get(proto, self.packet_catcher_heuristic_rates['DEFAULT'])
         if deterministic_value < sampling_rate:
@@ -1687,7 +1687,7 @@ class PythonRouterManager:
                 component="packet-catch",
             )
         self.router_logger.log_message(
-            f"[Router] 📤 Packet queued to {initial_outbound_iface.split('_')[-1]}"
+            f"[Router] 📤 Packet sent to {initial_outbound_iface.split('_')[-1]}"
         )
         self.code_output_manager.submit_packet(
             packet,
