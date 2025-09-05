@@ -1731,6 +1731,301 @@ class TransportHTTPManager:
             return None
         s = b.decode("latin-1", "ignore")
         return s if len(s) <= maxlen else (s[:maxlen] + "…")
+class TransportSCADAManager:
+    """
+    Observes common ICS/SCADA protocols with cheap signature peeks.
+
+    Protocols/ports:
+      • Modbus/TCP           : 502/tcp
+      • DNP3                 : 20000/tcp, 20000/udp
+      • IEC 60870-5-104      : 2404/tcp
+      • Siemens S7 (S7comm)  : 102/tcp
+      • OPC UA (binary)      : 4840/tcp
+      • BACnet/IP            : 47808/udp
+
+    Public API:
+      - handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+      - handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+      - snapshot_metrics() -> dict
+    """
+
+    # ---- Tunables (baked in) ----
+    FLOW_TTL_SEC        = 10 * 60
+    FLOW_SOFT_MAX       = 20_000
+    RL_INTERVAL_SEC     = 1.0
+    BYTES_BUDGET        = 256
+
+    # Ports
+    PORT_MODBUS         = 502
+    PORT_DNP3           = 20000
+    PORT_IEC104         = 2404
+    PORT_S7COMM         = 102
+    PORT_OPCUA          = 4840
+    PORT_BACNET_UDP     = 47808
+
+    def __init__(self, logger):
+        self.logger = logger
+        self._peek_cap = self.BYTES_BUDGET
+        self.logging_enabled = True
+        self.flow_cache_ttl = self.FLOW_TTL_SEC
+        self.flow_cache_max = self.FLOW_SOFT_MAX
+
+        # flow_key -> {first,last,last_log, proto, extras}
+        self._flows: Dict[Tuple[str,str,str,str], Dict[str, Any]] = {}
+
+        self._metrics = {
+            "seen": 0,
+            "modbus": 0,
+            "dnp3": 0,
+            "iec104": 0,
+            "s7": 0,
+            "opcua": 0,
+            "bacnet": 0,
+            "errors": 0,
+            "flow_cache_evictions": 0,
+        }
+
+        self._safe_log("[Transport][🏭 SCADA] Manager ready")
+
+    # ---------------------------
+    # Public entrypoints
+    # ---------------------------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        """TCP observer."""
+        try:
+            if not self._pre_checks(packet, want_udp=False):
+                return False
+
+            proto, info = self._classify_tcp(packet, sport, dport)
+            if not proto:
+                return False
+
+            now = time.time()
+            key = self._flow_key(src_ip, sport, dst_ip, dport)
+            st = self._flows.get(key)
+            if st is None:
+                st = {"first": now, "last": now, "last_log": 0.0, "proto": proto, "extras": info}
+                self._flows[key] = st
+            else:
+                st["last"] = now
+                st["proto"] = st.get("proto") or proto
+                if info: st["extras"] = info
+
+            if self._should_log(st, now):
+                self._log_tcp(proto, src_ip, sport, dst_ip, dport, inbound_iface, info)
+
+            self._metrics["seen"] += 1
+            self._clean_if_needed(now)
+            return True
+
+        except Exception:
+            self._metrics["errors"] += 1
+            return False
+
+    def handle_udp(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        """UDP observer (DNP3/BACnet)."""
+        try:
+            if not self._pre_checks(packet, want_udp=True):
+                return False
+
+            proto, info = self._classify_udp(packet, sport, dport)
+            if not proto:
+                return False
+
+            now = time.time()
+            key = self._flow_key(src_ip, sport, dst_ip, dport)
+            st = self._flows.get(key)
+            if st is None:
+                st = {"first": now, "last": now, "last_log": 0.0, "proto": proto, "extras": info}
+                self._flows[key] = st
+            else:
+                st["last"] = now
+                st["proto"] = st.get("proto") or proto
+                if info: st["extras"] = info
+
+            if self._should_log(st, now):
+                self._log_udp(proto, src_ip, sport, dst_ip, dport, inbound_iface, info)
+
+            self._metrics["seen"] += 1
+            self._clean_if_needed(now)
+            return True
+
+        except Exception:
+            self._metrics["errors"] += 1
+            return False
+
+    def snapshot_metrics(self) -> dict:
+        return dict(self._metrics)
+
+    # ---------------------------
+    # Classifiers (cheap peeks)
+    # ---------------------------
+    def _classify_tcp(self, pkt, sport, dport) -> Tuple[Optional[str], Dict[str, Any]]:
+        raw = self._raw(pkt)
+        ports = (sport, dport)
+
+        # Modbus/TCP (502): MBAP header 7 bytes, then func code
+        if self._port_hit(self.PORT_MODBUS, ports) and len(raw) >= 8:
+            # MBAP: trans(2) proto(2=0) len(2) unit(1) + PDU
+            p_proto = int.from_bytes(raw[2:4], "big", signed=False)
+            if p_proto == 0:
+                func = raw[7]
+                self._metrics["modbus"] += 1
+                return "Modbus/TCP", {"fc": func}
+
+        # DNP3 over TCP (20000): start 0x05 0x64, then length/control/addr (little-endian CRCs follow later)
+        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 2:
+            if raw[0] == 0x05 and raw[1] == 0x64:
+                self._metrics["dnp3"] += 1
+                return "DNP3/TCP", {}
+
+        # IEC-104 (2404): start 0x68, length field next, then 4 control bytes
+        if self._port_hit(self.PORT_IEC104, ports) and len(raw) >= 6:
+            if raw[0] == 0x68:
+                apdu_len = raw[1]
+                self._metrics["iec104"] += 1
+                return "IEC-104", {"len": apdu_len}
+
+        # S7comm (102): often starts with COTP (0x03 0x00 ...), then S7 header (0x32)
+        if self._port_hit(self.PORT_S7COMM, ports) and len(raw) >= 7:
+            # Quick/loose: look for COTP TPDU (0x03 0x00) and later 0x32
+            if raw[0] == 0x03 and raw[1] == 0x00:
+                # seek 0x32 within first 32 bytes
+                if 0x32 in raw[:32]:
+                    self._metrics["s7"] += 1
+                    return "S7comm", {}
+
+        # OPC UA (4840): hello/ack with ASCII "HEL"/"ACK" in UA binary header; also often contains "opc.tcp://"
+        if self._port_hit(self.PORT_OPCUA, ports) and len(raw) >= 8:
+            head = raw[:8]
+            if b"opc.tcp" in raw or head[:3] in (b"HEL", b"ACK"):
+                self._metrics["opcua"] += 1
+                return "OPC-UA", {}
+
+        return None, {}
+
+    def _classify_udp(self, pkt, sport, dport) -> Tuple[Optional[str], Dict[str, Any]]:
+        raw = self._raw(pkt)
+        ports = (sport, dport)
+
+        # DNP3/UDP (same framing)
+        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 2:
+            if raw[0] == 0x05 and raw[1] == 0x64:
+                self._metrics["dnp3"] += 1
+                return "DNP3/UDP", {}
+
+        # BACnet/IP (47808/udp): BVLC type=0x81 then function
+        if self._port_hit(self.PORT_BACNET_UDP, ports) and len(raw) >= 4:
+            if raw[0] == 0x81:
+                func = raw[1]
+                self._metrics["bacnet"] += 1
+                return "BACnet/IP", {"fn": func}
+
+        return None, {}
+
+    # ---------------------------
+    # Logging
+    # ---------------------------
+    def _log_tcp(self, proto, sip, sport, dip, dport, iface, info):
+        extras = self._fmt_info(proto, info)
+        self._safe_log(
+            f"[Transport][🧵 TCP][🏭 SCADA] {proto} {sip}:{sport} → {dip}:{dport} on {self._iface_suffix(iface)}{extras}"
+        )
+
+    def _log_udp(self, proto, sip, sport, dip, dport, iface, info):
+        extras = self._fmt_info(proto, info)
+        self._safe_log(
+            f"[Transport][🚀 UDP][🏭 SCADA] {proto} {sip}:{sport} → {dip}:{dport} on {self._iface_suffix(iface)}{extras}"
+        )
+
+    def _fmt_info(self, proto: str, info: Dict[str, Any]) -> str:
+        if not info:
+            return ""
+        try:
+            if proto.startswith("Modbus") and "fc" in info:
+                return f" fc={info['fc']}"
+            if proto.startswith("IEC-104") and "len" in info:
+                return f" apdu_len={info['len']}"
+            if proto.startswith("BACnet") and "fn" in info:
+                return f" fn={info['fn']}"
+        except Exception:
+            pass
+        # generic
+        try:
+            kv = ",".join(f"{k}={v}" for k, v in info.items())
+            return f" {kv}" if kv else ""
+        except Exception:
+            return ""
+
+    # ---------------------------
+    # Utilities
+    # ---------------------------
+    def _pre_checks(self, pkt, *, want_udp: bool) -> bool:
+        if (TCP is None) or (UDP is None):
+            return False
+        if not pkt:
+            return False
+        if not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
+            return False
+        if want_udp:
+            return pkt.haslayer(UDP)
+        return pkt.haslayer(TCP)
+
+    def _raw(self, pkt) -> bytes:
+        if Raw is None or not pkt.haslayer(Raw):
+            return b""
+        try:
+            return bytes(pkt[Raw].load)[: self._peek_cap] or b""
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _port_hit(port: int, ports: Tuple[int, int]) -> bool:
+        s, d = ports
+        return (s == port) or (d == port)
+
+    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int):
+        a = (str(src_ip), str(int(sport)))
+        b = (str(dst_ip), str(int(dport)))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second
+
+    def _should_log(self, st: Dict[str, Any], now: float) -> bool:
+        last = st.get("last_log", 0.0)
+        if (now - last) >= self.RL_INTERVAL_SEC:
+            st["last_log"] = now
+            return True
+        return False
+
+    def _iface_suffix(self, inbound_iface: str) -> str:
+        try:
+            return inbound_iface.split("_")[-1]
+        except Exception:
+            return inbound_iface or ""
+
+    def _safe_log(self, msg: str):
+        if not self.logging_enabled:
+            return
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _clean_if_needed(self, now_ts: float):
+        # TTL cleanup (every ~2k events)
+        if self._metrics["seen"] % 2048 == 0:
+            ttl = self.flow_cache_ttl
+            if ttl > 0:
+                stale = [k for k, v in self._flows.items() if now_ts - v.get("last", now_ts) > ttl]
+                for k in stale:
+                    self._flows.pop(k, None)
+        # Soft cap cleanup
+        if len(self._flows) > self.flow_cache_max:
+            excess = len(self._flows) - self.flow_cache_max
+            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:excess]
+            for k, _ in victims:
+                self._flows.pop(k, None)
+            self._metrics["flow_cache_evictions"] += excess
 
 class TransportSSHManager:
     def __init__(self, logger): self.logger = logger
@@ -7826,7 +8121,231 @@ class TransportIPv6Manager:
             pass
         return b""
 
+class TransportFileManager:
+    """
+    File/Device transport observer (low-overhead, best-effort parsing).
 
+    Recognizes:
+      • SMB2/3 over TCP/445 (microsoft_ds) and TCP/139 (NetBIOS Session Service)
+      • SMB1 signature (legacy)
+      • NetBIOS Session Service framing (NBSS) in front of SMB
+      • Apple Lockdown / usbmuxd (TCP/62078) — metadata only
+
+    Public API:
+      - handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+      - snapshot_metrics() -> dict
+    """
+
+    # ---- Tunables ----
+    FLOW_TTL_SEC        = 10 * 60
+    FLOW_SOFT_MAX       = 40_000
+    RL_INTERVAL_SEC     = 1.0
+    BYTES_BUDGET        = 512
+    SMB2_HDR_SIZE       = 64          # canonical SMB2 header size
+    NBSS_HDR_SIZE       = 4           # 1 type + 3 length
+    LOG_APPLE_LOCKDOWN  = True
+
+    # Known ports
+    PORT_SMB            = 445
+    PORT_NETBIOS_SSN    = 139
+    PORT_APPLE_LOCKDOWN = 62078
+
+    # Minimal SMB2 command map
+    _SMB2_CMD = {
+        0: "NEGOTIATE", 1: "SESSION_SETUP", 2: "LOGOFF", 3: "TREE_CONNECT",
+        4: "TREE_DISCONNECT", 5: "CREATE", 6: "CLOSE", 7: "FLUSH",
+        8: "READ", 9: "WRITE", 10: "LOCK", 11: "IOCTL", 12: "CANCEL",
+        13: "ECHO", 14: "QUERY_DIR", 15: "CHANGE_NOTIFY", 16: "QUERY_INFO",
+        17: "SET_INFO", 18: "OPLOCK_BREAK"
+    }
+
+    def __init__(
+        self,
+        logger,
+        *,
+        max_bytes_to_peek: int = BYTES_BUDGET,
+        logging_enabled: bool = True,
+        flow_cache_ttl: int = FLOW_TTL_SEC,
+        flow_cache_max: int = FLOW_SOFT_MAX,
+        log_lockdown: bool = LOG_APPLE_LOCKDOWN,
+    ):
+        self.logger = logger
+        self._peek_cap = int(max_bytes_to_peek)
+        self.logging_enabled = bool(logging_enabled)
+        self.flow_cache_ttl = int(flow_cache_ttl)
+        self.flow_cache_max = int(flow_cache_max)
+        self.log_lockdown = bool(log_lockdown)
+
+        # flow_key -> {first,last,last_log, proto:'SMB2'|'SMB1'|'LOCKDOWN', extras:dict}
+        self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+        self._metrics = {
+            "smb_seen": 0,
+            "smb1_seen": 0,
+            "smb2_seen": 0,
+            "smb_cmd_count": 0,
+            "lockdown_seen": 0,
+            "fast_path_hits": 0,
+            "errors": 0,
+            "flow_cache_evictions": 0,
+        }
+
+        self._safe_log("[Transport][📁 File] Manager ready")
+
+    def snapshot_metrics(self) -> dict:
+        return dict(self._metrics)
+
+    # ---------------------------
+    # Public entrypoint
+    # ---------------------------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface: str) -> bool:
+        try:
+            if not self._pre_checks(packet):
+                return False
+
+            now = time.time()
+            fkey = self._flow_key(src_ip, sport, dst_ip, dport)
+            st = self._flows.get(fkey)
+            if st is None:
+                st = {"first": now, "last": now, "last_log": 0.0, "proto": None, "extras": {}}
+                self._flows[fkey] = st
+            else:
+                st["last"] = now
+
+            # ---- Apple Lockdown (62078): light classification + logging
+            if self._is_lockdown(sport, dport):
+                st["proto"] = "LOCKDOWN"
+                self._metrics["lockdown_seen"] += 1
+                if self.log_lockdown and self._should_log_flow(st, now):
+                    self._safe_log(self._fmt_basic("🔌 Lockdown", src_ip, sport, dst_ip, dport, inbound_iface))
+                self._clean_if_needed(now)
+                return True
+
+            # ---- SMB / NetBIOS (139/445)
+            if not self._is_smbish_port(sport, dport):
+                return False
+
+            raw = self._get_raw_bytes(packet)
+            if not raw:
+                st["proto"] = st.get("proto") or "SMB?"
+                if self._should_log_flow(st, now):
+                    self._safe_log(self._fmt_basic("📁 SMB", src_ip, sport, dst_ip, dport, inbound_iface))
+                self._metrics["smb_seen"] += 1
+                self._clean_if_needed(now)
+                return True
+
+            mv = memoryview(raw)
+            # Strip NBSS header if present
+            offset = 0
+            if len(mv) >= 4 and mv[0] in (0x00, 0x81, 0x82, 0x83):
+                offset = self.NBSS_HDR_SIZE
+
+            # SMB2 magic
+            if len(mv) >= offset + 4 and mv[offset] == 0xFE and mv[offset+1:offset+4].tobytes() == b"SMB":
+                st["proto"] = "SMB2"
+                self._metrics["smb2_seen"] += 1
+                cmd = self._peek_smb2_command(mv, offset)
+                if cmd is not None:
+                    st["extras"]["cmd"] = cmd
+                    self._metrics["smb_cmd_count"] += 1
+
+                if self._should_log_flow(st, now):
+                    cmd_name = self._SMB2_CMD.get(cmd, str(cmd)) if cmd is not None else "-"
+                    self._safe_log(
+                        self._fmt_basic("📁 SMB2", src_ip, sport, dst_ip, dport, inbound_iface) +
+                        f" cmd={cmd_name}"
+                    )
+                self._metrics["smb_seen"] += 1
+                self._clean_if_needed(now)
+                return True
+
+            # SMB1 signature
+            if len(mv) >= offset + 4 and mv[offset] == 0xFF and mv[offset+1:offset+4].tobytes() == b"SMB":
+                st["proto"] = "SMB1"
+                self._metrics["smb1_seen"] += 1
+                if self._should_log_flow(st, now):
+                    self._safe_log(self._fmt_basic("📁 SMB1", src_ip, sport, dst_ip, dport, inbound_iface))
+                self._metrics["smb_seen"] += 1
+                self._clean_if_needed(now)
+                return True
+
+            return False
+
+        except Exception:
+            self._metrics["errors"] += 1
+            return False
+
+    # ---------------------------
+    # Internals
+    # ---------------------------
+    def _peek_smb2_command(self, mv: memoryview, base: int) -> Optional[int]:
+        # Command at +12 (2 bytes, LE)
+        if len(mv) < base + 16:
+            return None
+        return int(mv[base + 12] | (mv[base + 13] << 8))
+
+    def _is_smbish_port(self, sport: int, dport: int) -> bool:
+        return (sport in (self.PORT_SMB, self.PORT_NETBIOS_SSN) or
+                dport in (self.PORT_SMB, self.PORT_NETBIOS_SSN))
+
+    def _is_lockdown(self, sport: int, dport: int) -> bool:
+        return (sport == self.PORT_APPLE_LOCKDOWN) or (dport == self.PORT_APPLE_LOCKDOWN)
+
+    # Utilities (mirror style of your managers)
+    def _pre_checks(self, pkt) -> bool:
+        if TCP is None:
+            return False
+        return bool(pkt and pkt.haslayer(TCP) and (pkt.haslayer(IP) or pkt.haslayer(IPv6)))
+
+    def _get_raw_bytes(self, pkt) -> bytes:
+        if Raw is None or not pkt.haslayer(Raw):
+            return b""
+        try:
+            return bytes(pkt[Raw].load)[: self._peek_cap] or b""
+        except Exception:
+            return b""
+
+    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int):
+        a = (str(src_ip), str(int(sport)))
+        b = (str(dst_ip), str(int(dport)))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second
+
+    def _should_log_flow(self, st: Dict[str, Any], now: float) -> bool:
+        last = st.get("last_log", 0.0)
+        if (now - last) >= self.RL_INTERVAL_SEC:
+            st["last_log"] = now
+            return True
+        return False
+
+    def _fmt_basic(self, tag: str, src_ip, sport, dst_ip, dport, inbound_iface) -> str:
+        return (f"[Transport][🧵 TCP][{tag}] "
+                f"{src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)}")
+
+    def _iface_suffix(self, inbound_iface: str) -> str:
+        try:    return inbound_iface.split("_")[-1]
+        except: return inbound_iface or ""
+
+    def _safe_log(self, msg: str):
+        if not self.logging_enabled:
+            return
+        try:    self.logger.log_message(msg)
+        except: pass
+
+    def _clean_if_needed(self, now_ts: float):
+        total = self._metrics["smb_seen"] + self._metrics["lockdown_seen"]
+        if total % 2048 == 0:
+            ttl = self.flow_cache_ttl
+            if ttl > 0:
+                stale = [k for k, v in self._flows.items() if now_ts - v.get("last", now_ts) > ttl]
+                for k in stale:
+                    self._flows.pop(k, None)
+        if len(self._flows) > self.flow_cache_max:
+            excess = len(self._flows) - self.flow_cache_max
+            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:excess]
+            for k, _ in victims:
+                self._flows.pop(k, None)
+            self._metrics["flow_cache_evictions"] += excess
 class TransportOverlayManager:
     """
     Overlay / virtual-network control traffic (e.g., mesh/overlay controllers).
@@ -9328,6 +9847,7 @@ class TransportManager:
         self.transport_udp_ephemeral = TransportEphemeralUDPManager(self.logger)
         self.transport_steam = TransportSteamManager(self.logger)
         self.transport_tcp_high_Level = TransportHighServerTCPManager
+        self.transport_files = TransportFileManager(self.logger)
         self.transport_https = TransportHTTPSManager(self.logger)
         self.transport_ws_discovery = TransportWSDiscoveryManager(self.logger)
         self.transport_inspect = TransportInspectionManager(self.logger)
@@ -9354,6 +9874,7 @@ class TransportManager:
             extra_p2p_ports=self._MONERO_P2P_PORTS,
             extra_rpc_ports=self._MONERO_RPC_PORTS,
         )
+        self.transport_scada = TransportSCADAManager(self.logger)
     def _on_tls_policy_decision(self, key, rec, decision):
         """
         Called on EVERY TLS record after the policy engine evaluates it.
@@ -9526,6 +10047,7 @@ class TransportManager:
         # --- NEW: unified rules (single ports + ranges) ---
         rules = [
             # (ports, handler)
+            ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
             ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
             ([22], self._handle_ssh_packet),
@@ -9536,6 +10058,7 @@ class TransportManager:
             ([(27014, 27050)], self._handle_tcp_steam_packet),
             ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),  # range example
             ([(1024, 65535)], self._handle_high_server_packet),  # high server port observer
+            ([445, 139, 62078], self._handle_files_packet),
         ]
 
         handler = None
@@ -9567,11 +10090,23 @@ class TransportManager:
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles Monero P2P traffic on port 18080."""
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_files_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """
+        SMB/NetBIOS (445/139) and Apple Lockdown (62078).
+        Uses low-overhead peeks; logs command names for SMB2 when possible.
+        Also feeds TLS analyzer *only if* a TLS-looking record is present (rare on these ports).
+        """
+        self.transport_files.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_high_server_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_tcp_high_Level.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_tcp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Steam TCP (CM/content/friends; 27014–27050). Observation only."""
         self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_scada_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_scada.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_http.handle(packet, src_ip, dst_ip, sport, dport)
     def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
@@ -9669,6 +10204,7 @@ class TransportManager:
             ([1900], self._handle_ssdp_packet),
             ([3702], self._handle_ws_discovery_packet),
             ([19337], self._handle_rtp_packet),
+            ([20000, 47808], self._handle_scada_udp_packet),
             ([(27000, 27100), 4380, 27036, 27037], self._handle_udp_steam_packet),
             ([(49152, 65535), 3478, 5349], self._handle_udp_ephemeral_packet),
         ]
@@ -9722,6 +10258,9 @@ class TransportManager:
         self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
     def _handle_udp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_udp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_scada_udp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_scada.handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DNS packets."""
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
