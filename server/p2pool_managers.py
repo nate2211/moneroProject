@@ -1657,7 +1657,7 @@ class PythonRouterManager:
                 RouterRandomMessages(
                     name="Router",
                     message=f"Broadcast forwarding to {target_mac}",
-                    emoticons=["️📺", "📼", "📽️", "☎️", "🖨️", "🎥"]
+                    emoticons=["️📺", "📼", "📽️", "🖨️", "🎥"]
                 )
             )
         else:
