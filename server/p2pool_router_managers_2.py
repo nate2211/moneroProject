@@ -3102,9 +3102,15 @@ class TLSRecordManager:
 
     @staticmethod
     def _looks_like_tls_header(buf: bytes) -> bool:
-        if len(buf) < 5: return False
-        ct, vmaj, vmin = buf[0], buf[1], buf[2]
-        return ct in (20, 21, 22, 23) and vmaj == 3
+        if len(buf) < 5:
+            return False
+        ct, ver = buf[0], (buf[1] << 8) | buf[2]
+        if ct not in (0x14, 0x15, 0x16, 0x17):  # CCS, Alert, Handshake, AppData
+            return False
+        if ver not in (0x0301, 0x0302, 0x0303, 0x0304):  # TLS1.0 .. TLS1.3
+            return False
+        rlen = (buf[3] << 8) | buf[4]
+        return 0 < rlen <= 18432
 
     def _emit_event(self, key, kind: str, payload: Dict):
         evt = {"ts": time.time(), "flow": key, "kind": kind, "data": payload}
@@ -3916,7 +3922,7 @@ class HandshakeManager:
                     ts=time.time()
                 )
 
-            return False
+            return True
 
         return False
 
@@ -4474,7 +4480,6 @@ class RIPManager:
         self.authentication_key = None  # For RIP authentication
         self.interface_loopback_full_name = None
         self.function_call_tracker = function_call_tracker
-
     def set_authentication_key(self, key: str):
         """Sets a shared secret for RIP authentication (plaintext for simplicity)."""
         self.authentication_key = key
@@ -5223,48 +5228,111 @@ class RIPManager:
         # This would then trigger RIP updates.
         # For now, it's just logs. Actual implementation would involve adding to _routing_table with type "redistributed_rip" or similar.
 
-    def find_alternate_route(self, dest_ip_str: str, exclude_iface: str) -> Dict[str, Any] | None:
+    def _canon_iface_name(self, name: str) -> str:
+        """Normalize iface names so comparisons are apples-to-apples."""
+        if not name:
+            return ""
+        # Strip Windows device wrapper and keep the GUID-ish bit
+        # e.g. "\Device\NPF_{GUID}" -> "{GUID}"
+        out = name.strip()
+        if "\\Device\\NPF_" in out:
+            out = out.split("\\Device\\NPF_")[-1]
+        # Common pattern in your code: take suffix after underscore
+        # but only if it gives us a GUID-like token
+        if "_" in out:
+            tail = out.split("_")[-1]
+            if tail.startswith("{") and tail.endswith("}"):
+                out = tail
+        return out
+
+    def find_alternate_route(
+            self,
+            dest_ip_str: str,
+            exclude_iface: str,
+            *,
+            max_cost: int = 15,  # RIP infinity - 1
+            allow_default_as_alt: bool = False  # keep False if your caller already tries default
+    ) -> Dict[str, Any] | None:
         """
         Finds the best alternate route for a destination IP, avoiding the specified interface.
-        Used for rerouting in routing loop scenarios.
+        - Skips special/broadcast/multicast addresses
+        - Normalizes iface names before comparing
+        - Optional: consider default route as an alternate (if not on excluded iface)
         """
         try:
-            dest_ip_obj = ipaddress.ip_address(dest_ip_str)
-            best_match = None
-            best_prefix = -1
-
-            with self._rt_lock:
-                for net, rt_details in self._routing_table.items():
-                    iface = rt_details.get("interface")
-                    if iface == exclude_iface:
-                        continue  # Skip the looping interface
-
-                    # Prioritize direct loopback if applicable
-                    if dest_ip_obj.is_loopback and rt_details["type"] == "direct" and \
-                            iface == self.interface_loopback_full_name:
-                        return rt_details
-
-                    if dest_ip_obj in net:
-                        current_match_is_better = False
-
-                        if best_match is None:
-                            current_match_is_better = True
-                        elif net.prefixlen > best_prefix:
-                            current_match_is_better = True
-                        elif net.prefixlen == best_prefix:
-                            if rt_details["cost"] < best_match["cost"]:
-                                current_match_is_better = True
-                            elif rt_details["cost"] == best_match["cost"]:
-                                if rt_details["type"] == "static" and best_match["type"] != "static":
-                                    current_match_is_better = True
-
-                        if current_match_is_better and rt_details["cost"] < 16:
-                            best_prefix = net.prefixlen
-                            best_match = rt_details
-
-            return best_match
+            dest_ip = ipaddress.ip_address(dest_ip_str)
         except ValueError:
             return None
+
+        # 0) Special addresses: don't even try
+        if dest_ip.is_multicast or dest_ip.is_unspecified or dest_ip.is_reserved:
+            return None
+        # Limited broadcast (v4)
+        if isinstance(dest_ip, ipaddress.IPv4Address) and dest_ip == ipaddress.IPv4Address("255.255.255.255"):
+            return None
+
+        best_match = None
+        best_prefix = -1
+
+        # Normalize excluded iface to match your table
+        excluded = self._canon_iface_name(exclude_iface)
+
+        default_v4 = ipaddress.ip_network("0.0.0.0/0")
+        default_v6 = ipaddress.ip_network("::/0")
+        default_candidate = None
+
+        with self._rt_lock:
+            for net, rt in self._routing_table.items():
+                iface = self._canon_iface_name(rt.get("interface", ""))
+
+                # Respect exclusion (avoid the bouncing interface)
+                if iface == excluded:
+                    continue
+
+                # Cache default for later if allowed
+                if allow_default_as_alt and (net == default_v4 or net == default_v6):
+                    # only accept if cost OK
+                    if rt.get("cost", 16) <= max_cost:
+                        default_candidate = rt
+
+                # Match only proper prefixes
+                try:
+                    if dest_ip not in net:
+                        continue
+                except Exception:
+                    continue
+
+                cost = int(rt.get("cost", 16))
+                if cost > max_cost:
+                    continue
+
+                # Prefer loopback direct only if target is loopback and iface is loopback
+                if dest_ip.is_loopback and rt.get("type") == "direct" and iface == self._canon_iface_name(
+                        self.interface_loopback_full_name):
+                    return rt
+
+                # LPM, then lower cost, then static over dynamic
+                better = False
+                if best_match is None:
+                    better = True
+                elif net.prefixlen > best_prefix:
+                    better = True
+                elif net.prefixlen == best_prefix:
+                    if cost < best_match.get("cost", 16):
+                        better = True
+                    elif cost == best_match.get("cost", 16):
+                        if rt.get("type") == "static" and best_match.get("type") != "static":
+                            better = True
+
+                if better:
+                    best_prefix = net.prefixlen
+                    best_match = rt
+
+        # If no prefix match, optionally return default (not on excluded iface)
+        if best_match is None and allow_default_as_alt and default_candidate is not None:
+            return default_candidate
+
+        return best_match
 
 class NATManager:
     """

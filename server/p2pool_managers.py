@@ -43,7 +43,7 @@ import xml.etree.ElementTree as ET
 
 from scapy.sendrecv import sr1, send
 from scapy.sessions import TCPSession
-from p2pool_sniffer import SnifferSoftware, ICMPv6
+from p2pool_sniffer import SnifferSoftware, ICMPv6, ISAKEMP
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager
@@ -1090,7 +1090,33 @@ class PythonRouterManager:
             if self.transport_manager.handle_packet(packet, inbound_iface):
                 self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                        phase="processing", component="transport")
+            if packet.haslayer(UDP):
+                try:
+                    _udp = packet[UDP]
+                    _sp = int(getattr(_udp, "sport", 0) or 0)
+                    _dp = int(getattr(_udp, "dport", 0) or 0)
+                except Exception:
+                    _sp = _dp = 0
 
+                if (_sp in (137, 138)) or (_dp in (137, 138)):  # 137=NBNS, 138=NetBIOS-DGM
+                    # only drop when this packet is NOT meant for the router itself (transit only)
+                    try:
+                        dst_ip = (packet.getlayer(IP) or packet.getlayer(IPv6)).dst
+                    except Exception:
+                        dst_ip = None
+                    try:
+                        is_for_router = bool(dst_ip and (dst_ip in self._get_all_local_ips()))
+                    except Exception:
+                        is_for_router = False
+
+                    if not is_for_router:
+                        self.function_call_tracker.track(
+                            identifier="DroppedNBNSAnyTransit",
+                            threshold=50,
+                            final_message=f"[Router] 🧹 Dropped transit NBNS/NetBIOS (UDP/137,138). Count: {{}}.",
+                            count_message=None,
+                        )
+                        return
             # [2] L2 handling first (ARP, STP, LLDP, etc). If handled, stop here.
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
@@ -1183,9 +1209,10 @@ class PythonRouterManager:
                     if self.hyperv_enabled:
                         self.router_logger.log_message(
                             f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst}")
-                            
-            if self.isakmp_manager.handle_packet(packet, inbound_iface):
-                return
+
+            if packet.haslayer(ISAKEMP):
+                if self.isakmp_manager.handle_packet(packet, inbound_iface):
+                    return
 
             is_for_router = dst_ip in self._get_all_local_ips()
 
@@ -1261,8 +1288,8 @@ class PythonRouterManager:
             if not self.firewall_manager.process_packet(packet):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
-
-            if packet.haslayer(TCP) or packet.haslayer(TLS):
+            transport_layer = self.sniffer._find_transport_layer(packet)
+            if isinstance(transport_layer, TCP) or packet.haslayer(TLS) :
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet,
@@ -1271,17 +1298,17 @@ class PythonRouterManager:
                         component="handshake",
                     )
                     return
-            if packet.haslayer(DNS) and packet[DNS].qr == 1:
+            if isinstance(transport_layer, DNS) and packet[DNS].qr == 1:
                 if self.dns_manager.handle_response(packet, inbound_iface, self._interfaces_config):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns")
                     return
-            if packet.haslayer(UDP) and packet[UDP].dport == 5353:
+            if isinstance(transport_layer, UDP) and packet[UDP].dport == 5353:
                 if self.mdns_manager.handle_packet(packet):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="mdns")
                     return
-            if packet.haslayer(UDP) and packet[UDP].dport == 53:
+            if isinstance(transport_layer, UDP) and packet[UDP].dport == 53:
                 if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
                                                  self.arp_manager.resolve,
                                                  self.rip_manager.find_route):
@@ -1317,7 +1344,7 @@ class PythonRouterManager:
                 RouterRandomMessages(
                     name="Router",
                     message=f"Forwarding: {packet.summary()} | In:{iface_short}",
-                    emoticons=["🚚", "🚛", "🛻", "�", "🚐", "🚙", "🚎", "🚕"]
+                    emoticons=["🚚", "🚛","🚄", "🛻", "🚈", "🚐", "🚙", "🚎", "🚕", "🚑", "🚓", "⛵", "🛶", "🚤", "🛳️", "⛴️", "🛥️", "🚢", "🛩️", "🌁", "🌃", "🏙️", "🌄", "🌅", "🏝️"]
                 )
             )
             self.code_output_manager.submit_packet(
@@ -1381,8 +1408,13 @@ class PythonRouterManager:
                 else:
                     packet[Ether].src = src_mac
                     packet[Ether].dst = mcast_dst_mac
-
-                self.router_logger.log_message(f"[Router] 📢 L2 multicast → {mcast_dst_mac} on {egress_iface}")
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"L2 multicast → {mcast_dst_mac} on {egress_iface}",
+                        emoticons=["📢️", "🗂️", "🗳️", "🗃️", "➰", "📚", "🗄️"]
+                    )
+                )
                 self.ethernet_manager.handle_frame(packet, inbound_iface)
                 return
 
@@ -1476,7 +1508,11 @@ class PythonRouterManager:
             else:
                 # HARDENING: Packet is missing the Ether layer. We'll build one.
                 self.router_logger.log_message(
-                    f"[Router] 🛠️ Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer."
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer.",
+                        emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
+                    )
                 )
                 src_mac = self.get_interface_mac(selected_iface)
                 # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
@@ -1494,7 +1530,7 @@ class PythonRouterManager:
                 RouterRandomMessages(
                     name="Router",
                     message=f"Internet-bound packet {dst_ip} to {selected_iface.split('_')[-1]}. IP for gateway: {next_hop_ip}",
-                    emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗"]
+                    emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗", "🌑"]
                 )
             )
             self.code_output_manager.submit_packet(
@@ -1512,9 +1548,10 @@ class PythonRouterManager:
             self.nat_manager.translate_outbound(packet)
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
 
-
-
-        selected_iface = self.outbound_load_balancer.get_next_interface(packet)
+        if initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces():
+            selected_iface = self.outbound_load_balancer.get_next_interface(packet)
+        else:
+            selected_iface = route["interface"]
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)
         inbound_network = inbound_config.get("network") if inbound_config else None
@@ -1523,10 +1560,10 @@ class PythonRouterManager:
                 ipaddress.ip_address(dst_ip) in inbound_network and
                 dst_ip != inbound_config.get("ip_addr")
         )
+
         if inbound_iface == selected_iface:
             if not is_intra_lan:
                 alternate_route = self.rip_manager.find_alternate_route(dst_ip, exclude_iface=inbound_iface)
-
                 if alternate_route:  # ✅ Ensure alternate_route is valid first
                     actual_outbound_iface = alternate_route["interface"]
                     if actual_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
@@ -1539,12 +1576,15 @@ class PythonRouterManager:
 
                         initial_outbound_iface = actual_outbound_iface
                 else:
-                    # Try default route (0.0.0.0/0)
                     default_route = self.rip_manager.find_route("0.0.0.0")
                     if default_route:
                         actual_outbound_iface = default_route["interface"]
                         self.router_logger.log_message(
-                            f"[Router] 🚵 No alternate route to {dst_ip}. Using default route via {actual_outbound_iface.split('_')[-1]}"
+                            RouterRandomMessages(
+                                name="Router",
+                                message=f"No alternate route to {dst_ip}. Using default route via {actual_outbound_iface.split('_')[-1]}",
+                                emoticons=["🚵", "👣", "🥾"]
+                            )
                         )
                         self.code_output_manager.submit_packet(
                             packet,
@@ -1560,7 +1600,11 @@ class PythonRouterManager:
                         return
             else:
                 self.router_logger.log_message(
-                    f"[Router] 🏠 Intra-LAN forwarding: {packet.summary()} | In:{iface_short} -> Out:{iface_short}"
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Intra-LAN forwarding: {packet.summary()} | In:{iface_short} -> Out:{iface_short}",
+                        emoticons=["🏠", "🏡", "🏘️"]
+                    )
                 )
                 self.code_output_manager.submit_packet(
                     packet,
@@ -1595,7 +1639,11 @@ class PythonRouterManager:
             else:
                 # HARDENING: The packet is missing an Ether layer. We will build one.
                 self.router_logger.log_message(
-                    f"[Router] 🛠️ Hardening packet for {dst_ip}: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}."
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Hardening packet for {dst_ip}: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}.",
+                        emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
+                    )
                 )
                 # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
                 packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
@@ -1605,7 +1653,13 @@ class PythonRouterManager:
             )
         elif ipaddress.ip_address(dst_ip) == outbound_network.broadcast_address:
             target_mac = "ff:ff:ff:ff:ff:ff"
-            self.router_logger.log_message(f"[Router] 📢 Broadcast forwarding to {target_mac}")
+            self.router_logger.log_message(
+                RouterRandomMessages(
+                    name="Router",
+                    message=f"Broadcast forwarding to {target_mac}",
+                    emoticons=["️📺", "📼", "📽️", "☎️", "🖨️", "🎥"]
+                )
+            )
         else:
             target_mac = self.arp_manager.resolve(next_hop_ip, initial_outbound_iface)
 
@@ -1631,7 +1685,13 @@ class PythonRouterManager:
                 return
 
             if ttl_or_hlim <= 1:
-                self.router_logger.log_message(f"[Router] ⌛ TTL/Hop Limit expired for {dst_ip}. Dropping.")
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"TTL/Hop Limit expired for {dst_ip}. Dropping.",
+                        emoticons=["️⌛", "⏱️", "⌚", "🕰️", "⏰", "⏲️"]
+                    )
+                )
                 return
             if hasattr(ip_layer, "ttl"):
                 packet[IP].ttl -= 1
@@ -1646,9 +1706,14 @@ class PythonRouterManager:
             packet[Ether].src = outbound_config["mac"]
             packet[Ether].dst = target_mac
         else:
-            # HARDENING: Packet is missing the Ether layer. We will build one.
+            # HARDENING: Packet is missing the Ether layer. We will build one
+            # .
             self.router_logger.log_message(
-                f"[Router] 🛠️ Hardening packet: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}."
+                RouterRandomMessages(
+                    name="Router",
+                    message=f"Hardening packet: Reconstructing missing Ether layer for egress on {initial_outbound_iface.split('_')[-1]}.",
+                    emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
+                )
             )
             # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
             packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
@@ -1672,8 +1737,13 @@ class PythonRouterManager:
                 phase="handled",
                 component="packet-catch",
             )
+        proto_str = self._proto_summary(packet)
         self.router_logger.log_message(
-            f"[Router] 📤 Packet sent to {initial_outbound_iface.split('_')[-1]}"
+            RouterRandomMessages(
+                name="Router",
+                message=f"Packet sent to {initial_outbound_iface.split('_')[-1]} {proto_str}",
+                emoticons=["🏢", "🚕", "🗽", "🏞️", "🎢", "🎡", "🦖", "📰", "🖼️", "⛲"]
+            )
         )
         self.code_output_manager.submit_packet(
             packet,
@@ -1864,6 +1934,85 @@ class PythonRouterManager:
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
+
+    def _proto_summary(self, pkt):
+        """
+        Inspect the packet structure only:
+          - L3: IPv4/IPv6 addresses
+          - L4: first non-Raw/non-Padding layer under IP/IPv6
+          - Ports if that layer exposes sport/dport
+          - App: first meaningful layer after L4 (if decoded), e.g., TLS/DNS
+        """
+        try:
+            # ---- L3 (addresses) ----
+            v6 = False
+            if pkt.haslayer(IP):
+                ip = pkt[IP]
+                src, dst = ip.src, ip.dst
+            elif pkt.haslayer(IPv6):
+                ip = pkt[IPv6]
+                src, dst = ip.src, ip.dst
+                v6 = True
+            else:
+                # L2 or unknown
+                if pkt.haslayer(Ether):
+                    e = pkt[Ether]
+                    return f"Ether {e.src} → {e.dst} type=0x{int(getattr(e, 'type', 0) or 0):04x}"
+                return pkt.summary()
+
+            def addr(a):
+                return f"[{a}]" if v6 else a
+
+            # ---- Walk down from IP/IPv6 payload ----
+            lay = ip.payload
+            IGNORE = {"Raw", "Padding", "NoPayload"}
+            l4_name = None
+            app_name = None
+            sport = dport = None
+            depth = 0
+
+            while getattr(lay, "name", "NoPayload") != "NoPayload":
+                lname = getattr(lay, "name", lay.__class__.__name__) or lay.__class__.__name__
+
+                if lname not in IGNORE:
+                    if l4_name is None:
+                        # First meaningful layer under IP/IPv6 = transport protocol
+                        l4_name = lname
+                        if hasattr(lay, "sport"):
+                            try:
+                                sport = int(getattr(lay, "sport") or 0)
+                            except Exception:
+                                sport = None
+                        if hasattr(lay, "dport"):
+                            try:
+                                dport = int(getattr(lay, "dport") or 0)
+                            except Exception:
+                                dport = None
+                    elif app_name is None:
+                        # First meaningful layer after L4 = application protocol (if decoded)
+                        app_name = lname
+                        break
+
+                lay = getattr(lay, "payload", None)
+                if lay is None:
+                    break
+                depth += 1
+                if depth > 16:  # safety
+                    break
+
+            # ---- Compose line ----
+            if l4_name:
+                name = f"{l4_name}/{app_name}" if app_name else l4_name
+                if sport and dport:
+                    return f"{name} {addr(src)}:{sport} → {addr(dst)}:{dport}"
+                else:
+                    return f"{name} {addr(src)} → {addr(dst)}"
+
+            # Fallback: just L3
+            return f"{'IPv6' if v6 else 'IPv4'} {addr(src)} → {addr(dst)}"
+        except Exception:
+            return "IP"
+
     def _pick_lag_member(self, packet, inbound_iface, candidate_iface: str) -> str:
         try:
             groups = self.lag_manager.get_lag_members() or {}  # may be None/empty
@@ -2593,7 +2742,11 @@ class PythonRouterManager:
             h & 0xFF,
         )
         self.router_logger.log_message(
-            f"[Router] ⚠️ Synthesized MAC {fake_mac} for iface '{iface_full_name}'"
+            RouterRandomMessages(
+                name="Router",
+                message=f"Synthesized MAC {fake_mac} for iface '{iface_full_name}",
+                emoticons=["️⚠️️️", "🧪", "🧨", "🧧", "🌡️", "⚗️"]
+            )
         )
         return fake_mac
     def create_l2_bridge(self, bridge_name: str, member_iface_full_names: List[str]) -> bool:

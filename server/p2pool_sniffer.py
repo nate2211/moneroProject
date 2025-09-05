@@ -128,7 +128,7 @@ class MLDDone(Packet):
     ]
 
 # --- ICMPv6 Base and Common Types ---
-class ISKEMP(Packet):
+class ISAKEMP(Packet):
     name = "ISKEMP"
     fields_desc = [
         ByteField("version", 1),
@@ -282,8 +282,8 @@ class SnifferSoftware:
         bind_layers(ICMPv6Unknown, MLDDone, type=132)  # Done
         bind_layers(IP, IGMP, proto=2)
         bind_layers(Ether, ARP, type=0x0806)
-        bind_layers(UDP, ISKEMP, dport=9999)
-        bind_layers(UDP, ISKEMP, sport=9999)
+        bind_layers(UDP, ISAKEMP, dport=9999)
+        bind_layers(UDP, ISAKEMP, sport=9999)
         bind_layers(UDP, DNS, dport=53)
         bind_layers(UDP, DNS, sport=53)
         bind_layers(IP, ESP, proto=50)
@@ -1411,8 +1411,10 @@ class SnifferSoftware:
                 else:
                     dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
                     if not dst_mac:
-                        self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                        return None
+                        dst_mac = getmacbyip(gw_ip)
+                        if not dst_mac:
+                            self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                            return None
 
             if not src_mac:
                 src_mac = get_if_hwaddr(iface_out)
