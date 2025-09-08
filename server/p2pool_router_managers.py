@@ -28,6 +28,7 @@ from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6E
     ICMPv6ParamProblem, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6Unknown, ICMPv6PacketTooBig, IPv6ExtHdrHopByHop, ICMPv6ND_RA, \
     ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo, ICMPv6ND_RS, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment, \
     getmacbyip6, ICMPv6NDOptUnknown
+from scapy.layers.isakmp import ISAKMP
 from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
 from scapy.libs.rfc3961 import Key
 from scapy.packet import Packet, Raw, NoPayload
@@ -230,6 +231,85 @@ class ISAKMPManager:
             self.notification_manager.send_notification(event_data, cooldown_seconds=10,
                                                         cooldown_key="isakmpmalformed")
 
+    def get_field_name(self, field):
+        try:
+            return field.name
+        except AttributeError:
+            return str(field)
+
+    def _log_ikev2_details(self, packet: Packet):
+        """
+        Parses an IKEv2 packet and logs rich details from its payloads.
+        Now includes validation to reject malformed packets.
+        """
+        ike_layer = packet.getlayer(IKEv2)
+        src_ip = packet[IP].src
+
+        declared_length = ike_layer.length
+        actual_length = len(packet[UDP].payload)
+        # --- END NEW ---
+        # --- NEW: Upfront validation for IKEv2 header ---
+        # 1. Check version. High nibble must be 2.
+        if ike_layer.version >> 4 != 2:
+            self.log.log_message(f"[IKEv2] REJECT: Invalid IKEv2 version {hex(ike_layer.version)} from {src_ip}.")
+            return
+
+        # 2. Check length. Must match the actual UDP payload length.
+        declared_length = ike_layer.length
+        actual_length = len(packet[UDP].payload)
+        if declared_length != actual_length:
+            self.log.log_message(
+                f"[IKEv2] REJECT: Length mismatch from {src_ip}. Declared: {declared_length}, Actual: {actual_length}.")
+            return
+        log_details = {
+            # FIX: Use helper to prevent AttributeError on unknown enum values
+            "exchange_type": self.get_field_name(ike_layer.exch_type),
+            "message_id": ike_layer.id,
+            "is_initiator": "I" in self.get_field_name(ike_layer.flags),
+            "proposals": [],
+            "notifications": [],
+            "traffic_selectors": [],
+            "identity": "N/A",
+            "auth_method": "N/A"
+        }
+
+        current_payload = ike_layer.payload
+        while not isinstance(current_payload, NoPayload):
+            payload_name = self.get_field_name(current_payload)
+
+            if payload_name == "IKEv2 Security Association":
+                if hasattr(current_payload, 'proposals'):
+                    for proposal in current_payload.proposals:
+                        prop_text = []
+                        if hasattr(proposal, 'transforms'):
+                            for transform in proposal.transforms:
+                                # FIX: Use helper for all .name accesses
+                                transform_type = self.get_field_name(transform.type)
+                                transform_id = self.get_field_name(transform.ID)
+                                prop_text.append(f"{transform_type}={transform_id}")
+                        log_details["proposals"].append(" | ".join(prop_text))
+
+            elif payload_name == "IKEv2 Identification Initiator":
+                log_details[
+                    "identity"] = f"{self.get_field_name(current_payload.id_type)}: {current_payload.id.decode(errors='ignore')}"
+
+            elif payload_name == "IKEv2 Authentication":
+                log_details["auth_method"] = self.get_field_name(current_payload.auth_method)
+
+            elif payload_name in ["IKEv2 Traffic Selector Initiator", "IKEv2 Traffic Selector Responder"]:
+                if hasattr(current_payload, 'traffic_selectors'):
+                    for ts in current_payload.traffic_selectors:
+                        log_details["traffic_selectors"].append(
+                            f"Proto:{ts.proto} Start:{ts.start_addr}/{ts.start_port} End:{ts.end_addr}/{ts.end_port}"
+                        )
+
+            elif payload_name == "IKEv2 Notify":
+                log_details["notifications"].append(
+                    f"{self.get_field_name(current_payload.type)} (Proto:{self.get_field_name(current_payload.proto_id)})")
+
+            current_payload = current_payload.payload
+
+        self.log.log_message(f"[IKEv2] From {src_ip}: {log_details}")
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
         """
         Handles incoming packets. Now includes rate-limiting to prevent spam.
@@ -267,9 +347,15 @@ class ISAKMPManager:
         # --- END NEW ---
 
         # If the packet was not dropped by the rate-limiter, proceed as normal
-        self.log.log_message(f"[ISAKMP] 📨 Packet from {src_ip} on {inbound_iface}")
+
 
         final_packet = pkt
+        if final_packet.haslayer(IKEv2):
+            self.log.log_message(f"[IKEv2] 📨 Packet from {src_ip} on {inbound_iface}")
+            self._log_ikev2_details(final_packet)
+        if final_packet.haslayer(ISAKMP):
+            self.log.log_message(f"[ISAKMP] 📨 Packet from {src_ip} on {inbound_iface}")
+
         if pkt.haslayer(IP) and (pkt[IP].flags == 'MF' or pkt[IP].frag != 0):
             frag_key = (pkt[IP].src, pkt[IP].dst, pkt[IP].id)
             self.fragment_cache.setdefault(frag_key, []).append(pkt[IP])
@@ -7855,6 +7941,7 @@ class TransportDHCPManager:
                     )
                 elif msg_name == "ACK":
                     self._active.on_ack(xid=xid, yiaddr=yiaddr, lease_time=lease_time)
+                    return True
 
             # Server reactions
             if self._server_mode:
@@ -7882,7 +7969,7 @@ class TransportDHCPManager:
                                  server=server_id or siaddr, host=host, lease_time=lease_time)
         self._maybe_update_lease(msg_name, mac, yiaddr, lease_time, server_id or siaddr)
         self._maybe_gc()
-        return True
+        return False
 
     # ---------- Existing helpers from your class (unchanged) ----------
     def _fmt_prl(self, prl: list) -> str:
@@ -10860,19 +10947,17 @@ class TransportManager:
             return self.parallel_python.run_parallel(self._handle_udp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
                                       return_type="bool", queue_name="transport_udp_packets")
 
-        handled = self.transport_ipv6.handle(packet, inbound_iface)
-        if handled:
-            self.code_output_manager.submit_packet(
-                packet, inbound_iface=inbound_iface, phase="handled", component="transport-ipv6"
-            )
-            return False
+        self.transport_ipv6.handle(packet, inbound_iface)
         return False
 
     def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """Dispatches UDP packets to the correct handler based on port (supports singles + ranges)."""
 
+
         # Rules: list of (ports_or_ranges, handler)
         # A "range" is a (lo, hi) tuple, inclusive.
+        if sport == 500 or dport == 500:
+            return False
         rules = [
             ([53], self._handle_dns_packet),
             ([5353], self._handle_mdns_packet),
@@ -10912,15 +10997,21 @@ class TransportManager:
                 break
 
         if handler:
-            if handler == self._handle_ws_discovery_packet:
+            if handler == self._handle_dhcp_packet:
+                return handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+            elif handler == self._handle_dns_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
+            elif handler == self._handle_mdns_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
+            elif handler == self._handle_ws_discovery_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
-
                 return True
             elif handler == self._handle_ssdp_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
-
                 return True
             else:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
@@ -10976,7 +11067,7 @@ class TransportManager:
         self.transport_nbds.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DHCP packets."""
-        self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        return self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for QUIC packets."""
@@ -11252,94 +11343,95 @@ class TransportManager:
         except Exception:
             return False
 
-class _ReqBody(bytes):
-    """Bytes with a parsed-JSON view (dot-access for keys)."""
-    def __new__(cls, data: bytes, parsed: Optional[Dict[str, Any]] = None):
-        obj = super().__new__(cls, data)
-        obj._parsed = parsed or {}
-        return obj
-
-    # Nice-to-have helpers
-    def json(self) -> Dict[str, Any]:
-        return dict(self._parsed)
-
-    def get(self, key: str, default=None):
-        return self._parsed.get(key, default)
-
-    # Dot-access for common fields (helps static analyzers)
-    @property
-    def realm(self):
-        return self._parsed.get("realm")
-
-    # Generic dot-access fallback
-    def __getattr__(self, name: str):
-        try:
-            return self._parsed[name]
-        except KeyError:
-            raise AttributeError(f"'_ReqBody' has no attribute '{name}'")
-
-class _MsgTypeShim:
-    def __init__(self, val: int):
-        self.val = val
-
-class _RootShim:
-    def __init__(
-        self,
-        msgtype_val: int,
-        req_body: Optional[Union[bytes, bytearray, memoryview, str, dict, list]] = None,
-    ):
-        self.msgType = _MsgTypeShim(msgtype_val)
-        self._req_body = self._make_reqbody(req_body)
-
-    @staticmethod
-    def _to_bytes(x) -> bytes:
-        if x is None:
-            return b""
-        if isinstance(x, (bytes, bytearray, memoryview)):
-            return bytes(x)
-        if isinstance(x, str):
-            return x.encode("utf-8", "ignore")
-        # dict/list -> JSON bytes
-        try:
-            return json.dumps(x, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        except Exception:
-            return b""
-
-    @classmethod
-    def _make_reqbody(cls, x) -> bytes:
-        b = cls._to_bytes(x)
-        parsed = {}
-        if b:
-            try:
-                j = json.loads(b.decode("utf-8", "ignore"))
-                if isinstance(j, dict):
-                    parsed = j
-            except Exception:
-                parsed = {}
-        return _ReqBody(b, parsed)
-
-    # CamelCase + lowercase aliases expected by callers
-    @property
-    def reqBody(self) -> bytes:
-        return self._req_body
-
-    @reqBody.setter
-    def reqBody(self, v):
-        self._req_body = self._make_reqbody(v)
-
-    @property
-    def reqbody(self) -> bytes:
-        return self._req_body
-
-    @reqbody.setter
-    def reqbody(self, v):
-        self._req_body = self._make_reqbody(v)
 class KerberosManager:
     """
     Manages Kerberos protocol traffic within the router.
     Can be used for passive analysis, logging, or active intervention/proxying.
     """
 
+    class _ReqBody(bytes):
+        """Bytes with a parsed-JSON view (dot-access for keys)."""
+
+        def __new__(cls, data: bytes, parsed: Optional[Dict[str, Any]] = None):
+            obj = super().__new__(cls, data)
+            obj._parsed = parsed or {}
+            return obj
+
+        # Nice-to-have helpers
+        def json(self) -> Dict[str, Any]:
+            return dict(self._parsed)
+
+        def get(self, key: str, default=None):
+            return self._parsed.get(key, default)
+
+        # Dot-access for common fields (helps static analyzers)
+        @property
+        def realm(self):
+            return self._parsed.get("realm")
+
+        # Generic dot-access fallback
+        def __getattr__(self, name: str):
+            try:
+                return self._parsed[name]
+            except KeyError:
+                raise AttributeError(f"'_ReqBody' has no attribute '{name}'")
+
+    class _MsgTypeShim:
+        def __init__(self, val: int):
+            self.val = val
+
+    class _RootShim:
+        def __init__(
+                self,
+                msgtype_val: int,
+                req_body: Optional[Union[bytes, bytearray, memoryview, str, dict, list]] = None,
+        ):
+            self.msgType = KerberosManager._MsgTypeShim(msgtype_val)
+            self._req_body = self._make_reqbody(req_body)
+
+        @staticmethod
+        def _to_bytes(x) -> bytes:
+            if x is None:
+                return b""
+            if isinstance(x, (bytes, bytearray, memoryview)):
+                return bytes(x)
+            if isinstance(x, str):
+                return x.encode("utf-8", "ignore")
+            # dict/list -> JSON bytes
+            try:
+                return json.dumps(x, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            except Exception:
+                return b""
+
+        @classmethod
+        def _make_reqbody(cls, x) -> bytes:
+            b = cls._to_bytes(x)
+            parsed = {}
+            if b:
+                try:
+                    j = json.loads(b.decode("utf-8", "ignore"))
+                    if isinstance(j, dict):
+                        parsed = j
+                except Exception:
+                    parsed = {}
+            return KerberosManager._ReqBody(b, parsed)
+
+        # CamelCase + lowercase aliases expected by callers
+        @property
+        def reqBody(self) -> bytes:
+            return self._req_body
+
+        @reqBody.setter
+        def reqBody(self, v):
+            self._req_body = self._make_reqbody(v)
+
+        @property
+        def reqbody(self) -> bytes:
+            return self._req_body
+
+        @reqbody.setter
+        def reqbody(self, v):
+            self._req_body = self._make_reqbody(v)
     class KerberosOpaque(Packet):
         name = "KerberosOpaque"
         fields_desc = [StrLenField("blob", b"", length_from=lambda pkt: len(pkt.blob))]
@@ -11485,7 +11577,7 @@ class KerberosManager:
         @property
         def root(self):
             mt = self._classify_msgtype()
-            return _RootShim(mt if mt is not None else -1)
+            return KerberosManager._RootShim(mt if mt is not None else -1)
 
         def msgtype_name(self) -> str:
             mt = self._classify_msgtype()
@@ -13002,6 +13094,7 @@ class EthernetBridgeManager:
 
             if not flood_targets:
                 self.logger.log_message("[Bridge] 🚫 No other active interfaces in bridge to flood to.")
+
 
     def _cleanup_mac_table_loop(self):
         """Periodically removes stale entries from the MAC address table."""

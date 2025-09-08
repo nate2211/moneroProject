@@ -28,7 +28,7 @@ from scapy.layers.mobileip import MobileIP
 from scapy.layers.ppp import PPP, PPPoED, PPPoE
 from scapy.layers.rip import RIP
 from scapy.layers.rtp import RTP
-
+from scapy.layers.isakmp import ISAKMP
 try:
     from scapy.all import ShortField, ByteField, IP6Field, Packet, load_layer, TCPSession
     from scapy.contrib.igmp import IGMP
@@ -128,14 +128,6 @@ class MLDDone(Packet):
         IP6Field("mcaddr", "::")
     ]
 
-# --- ICMPv6 Base and Common Types ---
-class ISAKEMP(Packet):
-    name = "ISKEMP"
-    fields_desc = [
-        ByteField("version", 1),
-        ShortField("opcode", 0),
-        IntField("session_id", 0),
-    ]
 
 
 class ICMPv6(Packet):
@@ -233,6 +225,7 @@ class SnifferSoftware:
         self._define_pcap_prototypes()
         self.logged_packets = []
         self.hyperv_manager = hyperv_manager
+        self.banned_ips = ["89.222.103.1"]
 
     def iface_is_l2_capable(self, iface_name: str) -> bool:
         kind = (self._interfaces_config.get(iface_name, {}) or {}).get("driver", "").lower()
@@ -299,8 +292,8 @@ class SnifferSoftware:
         bind_layers(ICMPv6Unknown, MLDDone, type=132)  # Done
         bind_layers(IP, IGMP, proto=2)
         bind_layers(Ether, ARP, type=0x0806)
-        bind_layers(UDP, ISAKEMP, dport=9999)
-        bind_layers(UDP, ISAKEMP, sport=9999)
+        bind_layers(UDP, ISAKMP, dport=9999)
+        bind_layers(UDP, ISAKMP, sport=9999)
         bind_layers(UDP, DNS, dport=53)
         bind_layers(UDP, DNS, sport=53)
         bind_layers(IP, ESP, proto=50)
@@ -1331,8 +1324,25 @@ class SnifferSoftware:
                     if not (packet.haslayer(IP) or packet.haslayer(IPv6) or packet.haslayer(ARP)):
                         # Likely 802.11 mgmt/ctrl etc.
                         continue
+                    src_ip, dst_ip = None, None
+                    if packet.haslayer(IP):
+                        src_ip = packet[IP].src
+                        dst_ip = packet[IP].dst
+                    elif packet.haslayer(IPv6):
+                        src_ip = packet[IPv6].src
+                        dst_ip = packet[IPv6].dst
 
-                    # RIP handling
+                    if src_ip and (src_ip in self.banned_ips or dst_ip in self.banned_ips):
+                        banned_ip = src_ip if src_ip in self.banned_ips else dst_ip
+                        if self.notification_manager:
+                            self.notification_manager.send_notification({
+                                "event": "Sniffer Banned IP Detected",
+                                "message": f"Packet on sniffer from {src_ip} to {dst_ip} dropped due to banned IP: {banned_ip}",
+                                "iface": iface,
+                                "timestamp": time.time(),
+                                "emojis": ["🚫", "🧱", "🛑"]
+                            }, cooldown_seconds=10, cooldown_key=f"banned_ip_{banned_ip}")
+                        continue
                     if packet.haslayer(RIP) and packet.haslayer(IP) and packet.haslayer(UDP):
                         try:
                             original_ip = packet.getlayer(IP)
@@ -1422,7 +1432,6 @@ class SnifferSoftware:
                 verbose = 1
                 iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
                 iface_cidr = self._ipv4_cidr_for_iface(iface_out)
-                self.logger.log_message(f"[Sniffer] Selecting from lan aggregation for send.")
                 if not iface_cidr:
                     self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
                     return None
@@ -1445,8 +1454,7 @@ class SnifferSoftware:
             l2_packet = Ether(src=src_mac, dst=dst_mac) / packet
 
             if verbose >= 1:
-                self.logger.log_message(f"[+] Resolved route: {packet.dst} -> via {gw_ip} on {iface_out}")
-                self.logger.log_message(f"[+] L2 Frame: {src_mac} -> {dst_mac}")
+                self.logger.log_message(f"[Sniffer] Resolved route: {packet.dst} -> via {gw_ip} on {iface_out} [+] L2 Frame: {src_mac} -> {dst_mac}")
 
             self.sendp(l2_packet, iface=iface_out, verbose=verbose)
 

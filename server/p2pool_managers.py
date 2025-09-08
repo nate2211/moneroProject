@@ -30,6 +30,7 @@ from scapy.arch import get_if_hwaddr
 from scapy.config import conf
 from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3
+from scapy.contrib.ikev2 import IKEv2
 from scapy.layers.dhcp import DHCP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit
 from scapy.layers.dns import DNSQR, DNS
@@ -37,6 +38,7 @@ from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6DestUnreach, \
     ICMPv6TimeExceeded, ICMPv6ParamProblem, IPv6ExtHdrHopByHop
 from scapy.layers.ipsec import ESP, AH
+from scapy.layers.isakmp import ISAKMP
 from scapy.layers.l2 import Ether, GRE, ARP
 from scapy.layers.tls.handshake import TLSClientHello, TLSFinished, TLSServerHello
 from scapy.layers.tls.record import TLS
@@ -47,7 +49,7 @@ import xml.etree.ElementTree as ET
 
 from scapy.sendrecv import sr1, send
 from scapy.sessions import TCPSession
-from p2pool_sniffer import SnifferSoftware, ICMPv6, ISAKEMP
+from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager
@@ -1172,35 +1174,6 @@ class PythonRouterManager:
         yield_no_gil(0.1)
         try:
             iface_short = inbound_iface.split('_')[-1]
-            if iface_short == "WireShark":
-                is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
-
-                if is_handled_by_transport:
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="processing",
-                        component="wireshark-transport"
-                    )
-                    return
-                self.router_logger.log_message(
-                    RouterRandomMessages(
-                        name="Router",
-                        message=f"Forwarding: {packet.summary()} | In:{iface_short}",
-                        emoticons=["🚚", "🚛", "🚄", "🛻", "🚈", "🚐", "🚙", "🚎", "🚕", "🚑", "🚓", "⛵", "🛶", "🚤", "🛳️", "⛴️",
-                                   "🛥️", "🚢", "🛩️", "🌁", "🌃", "🏙️", "🌄", "🌅", "🏝️"]
-                    )
-                )
-                self.parallel_python.run_parallel(
-                    self._forward_general_ip_packet,
-                    packet,
-                    inbound_iface,
-                    return_type="void",
-                    queue_name="forward_packets"
-                )
-
-                # Step 3: Stop all further processing for this packet.
-                return
             if isinstance(packet, bytes):
                 try:
                     # Check for an empty payload to prevent index errors
@@ -1217,9 +1190,44 @@ class PythonRouterManager:
 
                 except Exception as e:
                     return
+
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
                 self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
+                return
+            src_ip=None
+            dst_ip=None
+            if packet.haslayer(IP):
+                src_ip = packet[IP].src
+                dst_ip = packet[IP].dst
+            elif packet.haslayer(IPv6):
+                src_ip = packet[IPv6].src
+                dst_ip = packet[IPv6].dst
+
+            if src_ip and (src_ip in self.sniffer.banned_ips or dst_ip in self.sniffer.banned_ips):
+                banned_ip = src_ip if src_ip in self.sniffer.banned_ips else dst_ip
+                if self.notification_manager:
+                    self.notification_manager.send_notification({
+                        "event": "Router Banned IP Detected",
+                        "message": f"Packet on router from {src_ip} to {dst_ip} dropped due to banned IP: {banned_ip} on {inbound_iface}",
+                        "iface": inbound_iface,
+                        "timestamp": time.time(),
+                        "emojis": ["🚫", "🧱", "🛑"]
+                    }, cooldown_seconds=10, cooldown_key=f"banned_ip_{banned_ip}")
+                return
+            if packet.haslayer(IPv6):
+                self.ndp_manager.learn_from_packet(packet, inbound_iface)
+            if packet.haslayer(IP):
+                self.arp_manager.learn_from_packet(packet, inbound_iface)
+            is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
+
+            if is_handled_by_transport:
+                self.code_output_manager.submit_packet(
+                    packet,
+                    inbound_iface=inbound_iface,
+                    phase="processing",
+                    component="transport"
+                )
                 return
             dst_ip = ip_layer.dst
 
@@ -1232,19 +1240,7 @@ class PythonRouterManager:
                     count_message=None,
                 )
                 return # Stop processing immediately
-            # [0] Self-MAC guard (avoid loops)
-            if packet.haslayer(Ether):
-                src_mac = (packet[Ether].src or "").lower()
-                if src_mac and src_mac in self.router_macs:
-                    self.function_call_tracker.track(
-                        identifier='DroppedMacLog',
-                        threshold=20,
-                        final_message=f"[Router] 👻 Dropping packet from our own MAC ({src_mac}). Count: {{}}.",
-                        count_message=None,
-                    )
-                    return
 
-            # [1] Ether-type sanity
             eth_type = self._eth_type_or_none(packet)
             if eth_type is None:
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
@@ -1276,12 +1272,11 @@ class PythonRouterManager:
                             count_message=None,
                         )
                         return
-            # [2] L2 handling first (ARP, STP, LLDP, etc). If handled, stop here.
+
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
 
-            # --- Step 3: SANITIZE IPV6 HOP-BY-HOP HEADER ---
-            # This is the correct place and method for the sanitization logic.
+
             if ip_layer.version == 6 and ip_layer.nh == 0:
                 original_summary = packet.summary()
                 p = packet.copy()
@@ -1296,42 +1291,16 @@ class PythonRouterManager:
 
                 if stripped_count > 0:
                     new_ip_layer.plen = len(new_ip_layer.payload)
-                    packet = p  # Overwrite with the sanitized version
-                    ip_layer = new_ip_layer  # Update our reference to the clean IP layer
+                    packet = p
+                    ip_layer = new_ip_layer
 
-            if not ip_layer:
-                self.router_logger.log_message(
-                    f"[Router] ⚠️ Dropping non-IP packet that bypassed L2 handler: {packet.summary()}"
-                )
-                return
-            # [4] ARP inspection (only when ARP present)
             if packet.haslayer(ARP):
                 if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
                     self.router_logger.log_message(
                         f"[Router] 🚫 Dropped ARP on {iface_short} (failed inspection)."
                     )
-                    return  # stop processing, do not forward/learn this ARP
+                    return
 
-            # [5] Fast protocol/port helpers
-            is_tcp = packet.haslayer(TCP)
-            is_udp = packet.haslayer(UDP)
-            sport = (packet[TCP].sport if is_tcp else packet[UDP].sport if is_udp else 0) or 0
-            dport = (packet[TCP].dport if is_tcp else packet[UDP].dport if is_udp else 0) or 0
-            # [6] Stratum: FIXED — detect via TCP/UDP port list, not ip_layer.sport
-            #     Use your StratumManager’s robust extractor/buffer; we also tag component.
-            if (sport in self.stratum_manager.STRATUM_PORTS) or (dport in self.stratum_manager.STRATUM_PORTS):
-                # must have Raw payload and look like JSON
-                from scapy.packet import Raw
-                if packet.haslayer(Raw):
-                    raw = packet[Raw].load or b""
-                    if raw.lstrip()[:1] in (b"{", b"["):
-                        # hand off to the *connection* manager, not the raw StratumManager
-                        if self.stratum_connection_manager.handle_packet(packet, inbound_iface=iface_short):
-                            return
-
-
-
-            # [7] ESP/AH/GRE/NAT-T fast-paths (keep your original branching + hyperv)
             if IP in packet:
                 if packet.haslayer(ESP):
                     if self.hyperv_enabled:
@@ -1375,15 +1344,15 @@ class PythonRouterManager:
                     if self.hyperv_enabled:
                         self.router_logger.log_message(
                             f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst}")
-
-            if packet.haslayer(ISAKEMP):
+                        self.hyperv_manager.send_packet(packet)
+                        return True
+            if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
                 if self.isakmp_manager.handle_packet(packet, inbound_iface):
                     return
             if packet.haslayer(ICMPv6ND_NA):
                 self.ndp_manager.learn_neighbor_advertisement(packet)
                 return
-            if packet.haslayer(IPv6):
-                self.ndp_manager.learn_from_packet(packet, inbound_iface)
+
             is_for_router = dst_ip in self._get_all_local_ips()
 
             if is_for_router:
@@ -1498,8 +1467,16 @@ class PythonRouterManager:
             proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
             sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(UDP) else 0
             dport = packet[TCP].dport if packet.haslayer(TCP) else packet[UDP].dport if packet.haslayer(UDP) else 0
+
             if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
                 return
+            if (sport in self.stratum_manager.STRATUM_PORTS) or (dport in self.stratum_manager.STRATUM_PORTS):
+                from scapy.packet import Raw
+                if packet.haslayer(Raw):
+                    raw = packet[Raw].load or b""
+                    if raw.lstrip()[:1] in (b"{", b"["):
+                        if self.stratum_connection_manager.handle_packet(packet, inbound_iface=iface_short):
+                            return
             if dst_ip in self._get_all_local_ips():
                 self.function_call_tracker.track(
                     identifier="DroppedDstIPSame",
@@ -1509,11 +1486,6 @@ class PythonRouterManager:
                 )
 
                 return
-            if iface_short != "Wireshark":
-                if self.transport_manager.handle_packet(packet, inbound_iface):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="processing", component="transport")
-                    return
             # Final forwarding logic
             self.router_logger.log_message(
                 RouterRandomMessages(
@@ -1628,9 +1600,6 @@ class PythonRouterManager:
         dport = packet[TCP].dport if packet.haslayer(TCP) else packet[UDP].dport if packet.haslayer(
             UDP) else 0
 
-        if self.forwarding_manager.is_duplicate(src_ip, dst_ip, sport, dport, proto):
-            return
-
         if not route:
             self.router_logger.log_message(f"[Router] 🗺️ No specific route for {dst_ip}, checking for default route...")
 
@@ -1709,11 +1678,13 @@ class PythonRouterManager:
                             emoticons=["🛰️", "📡", "🛸", "⚓", "🛟"]
                         )
                     )
+
             if not is_ipv6:
                 if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
                     self.nat_manager.handle_keep_alive(packet)
                     return
-                self.nat_manager.translate_outbound(packet)
+                if packet.haslayer(Ether) and (packet[Ether].src or "").lower() in self.router_macs:
+                    self.nat_manager.translate_outbound(packet)
 
             if is_ipv6:
                 if IPv6 in packet and hasattr(packet[IPv6], "plen"):
@@ -1876,7 +1847,7 @@ class PythonRouterManager:
                     RouterRandomMessages(
                         name="Router",
                         message=f"Performing ARP lookup for {next_hop_ip}...",
-                        emoticons=["️🕵️", "👨‍🏭", "👨‍✈️", "👨‍🎓", "👨‍🍳", "👨‍💻", "👩‍⚕️", "👩‍🏫", "🧑‍🔬", "👷‍♀️", "💂", ""]
+                        emoticons=["️🕵️", "👨‍🏭", "👨‍✈️", "👨‍🎓", "👨‍🍳", "👨‍💻", "👩‍⚕️", "👩‍🏫", "🧑‍🔬", "👷‍♀️", "💂"]
                     )
                 )
                 target_mac = self.arp_manager.resolve(next_hop_ip, initial_outbound_iface)
@@ -3488,6 +3459,9 @@ class WiresharkManager:
                 "not port 5357",
                 "not port 889",
                 f"not (udp[8:4] = {STR_BCAST_PART1} and udp[12:4] = {STR_BCAST_PART2})",
+
+                #Banned IPS
+                "not host 89.222.103.1"
             ]
             parts.append(f"not (src host {self.router_manager.router_ip_out} and dst host {self.router_manager.router_ip_out})")
             parts.append("not (ip broadcast and udp and dst port 22222)")

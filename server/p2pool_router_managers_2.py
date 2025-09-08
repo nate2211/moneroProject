@@ -4469,7 +4469,8 @@ class RIPManager:
         # All static routes are now added here in a single, consolidated block.
         self.add_static_route(network_str="0.0.0.0/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
-
+        self.add_static_route(network_str="0.0.0.0/0", next_hop=router_gateway_out_ip,
+                              interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="8.8.8.8/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
 
@@ -6416,6 +6417,9 @@ class ARPManager:
         self.garp_enabled = True  # hard off at boot (flip True if you really need it)
         self.garp_only_for_owned = True  # even when enabled, only for our own IPs
 
+        self.ARP_PASSIVE_TTL = 20 * 60  # expire entries after 20 minutes (tune)
+        self.ARP_MAX_ENTRIES = 10  # soft cap; oldest entries are trimmed
+        self._last_passive_gc = 0.0  # last cleanup timestamp
     # ---------- NEW: helpers to recognize gateways so we never lease them ----------
 
     def _in_quiet_start(self) -> bool:
@@ -6686,7 +6690,7 @@ class ARPManager:
         with self._arp_cache_lock:
             entry = self._arp_cache.get(ip_str)
         if entry:
-            mac_cached, ts = entry
+            mac_cached, ts = entry[:2]
             if now - ts < self.CACHE_TIMEOUT:
                 self.router_logger.log_message(f"[ARP] ⚡ resolve: cache {ip_str} → {mac_cached}")
                 return mac_cached
@@ -6797,7 +6801,7 @@ class ARPManager:
                 with self._arp_cache_lock:
                     entry = self._arp_cache.get(ip)
                 if entry:
-                    mac, ts = entry
+                    mac, ts = entry[:2]
                     age = now - ts
                     if age < self.CACHE_TIMEOUT:
                         hits = self._cache_hit_table[ip]
@@ -7061,7 +7065,7 @@ class ARPManager:
         with self._arp_cache_lock:
             existing_entry = self._arp_cache.get(ip)
             if existing_entry:
-                old_mac, _ = existing_entry
+                old_mac, _ = existing_entry[:2]
                 if old_mac.lower() != mac.lower():
                     self.router_logger.log_message(
                         f"[ARP] ⚠️ MAC change detected for {ip}: {old_mac} → {mac} on {iface.split('_')[-1]}"
@@ -7272,6 +7276,128 @@ class ARPManager:
             f"[ARP][LEASE] ✅ Temporary ARP lease granted for {ip_address} for {lease_duration}s (cooldown: {cooldown}s)."
         )
         return True
+
+    def learn_from_packet(self, pkt: "Packet", inbound_iface: str):
+        """
+        Passively learn IPv4 IP→MAC mappings from observed traffic.
+        - Learns from ARP (requests, replies, gratuitous)
+        - Opportunistically learns from any IPv4 L3 packet’s source (L2 src → L3 src)
+        """
+        if not pkt.haslayer(Ether):
+            return
+        now = time.time()
+        eth = pkt[Ether]
+        src_mac = (eth.src or "").lower()
+        if not self._is_unicast_mac(src_mac):
+            return
+        if pkt.haslayer(ARP):
+            a = pkt[ARP]
+            try:
+                op = int(a.op)  # 1=request, 2=reply
+            except Exception:
+                op = 0
+
+            psrc = (a.psrc or "").strip()
+            hwsrc = (a.hwsrc or "").lower().strip()
+
+            if psrc and hwsrc and self._ipv4_ok_to_learn(psrc):
+                self._update_arp_cache(psrc, hwsrc, now, "IPv4-arp", inbound_iface)
+
+        if pkt.haslayer(IP):
+            ip4 = pkt[IP]
+            sip = getattr(ip4, "src", None)
+            if sip and self._ipv4_ok_to_learn(sip):
+                self._update_arp_cache(sip, src_mac, now, "IPv4-passive", inbound_iface)
+
+        if (self._last_passive_gc or 0.0) + 30.0 <= now:
+            cutoff = now - float(self.ARP_PASSIVE_TTL)
+
+            with self._arp_cache_lock:
+                # TTL prune: ONLY learned entries (len(tuple) >= 3)
+                to_delete = []
+                for ip, val in self._arp_cache.items():
+                    if isinstance(val, tuple) and len(val) >= 3:
+                        ts = val[1] if len(val) >= 2 else 0
+                        if ts < cutoff:
+                            to_delete.append(ip)
+                for ip in to_delete:
+                    self._arp_cache.pop(ip, None)
+
+                # Size cap: trim ONLY learned entries, oldest first
+                if self.ARP_MAX_ENTRIES and len(self._arp_cache) > int(self.ARP_MAX_ENTRIES):
+                    learned = [
+                        (ip, val[1])
+                        for ip, val in self._arp_cache.items()
+                        if isinstance(val, tuple) and len(val) >= 3
+                    ]
+                    self.router_logger.log_message(f"[ARP] 🧠 Learned {len(learned)}")
+                    overflow = len(self._arp_cache) - int(self.ARP_MAX_ENTRIES)
+                    removed = 0
+                    if learned and overflow > 0:
+                        learned.sort(key=lambda kv: kv[1])  # oldest ts first
+                        for ip, mac in learned:
+                            if removed >= overflow:
+                                break
+                            if ip in self._arp_cache:
+                                self._arp_cache.pop(ip, None)
+                                removed += 1
+                    if removed:
+                        self.router_logger.log_message(
+                            f"[ARP] 🧹 ARP cache cleaned: removed {removed} learned entrie(s)."
+                        )
+
+            self._last_passive_gc = now
+    def _update_arp_cache(self, ip: str, mac: str, now: float, reason: str, iface: str):
+        with self._arp_cache_lock:
+            cur = self._arp_cache.get(ip)
+            if not cur or cur[0].lower() != mac.lower():
+                self._arp_cache[ip] = (mac, now, "Learned")
+                #self.router_logger.log_message(f"[ARP] 🧠 {reason}: {ip} is-at {mac} on {iface.split('_')[-1]}")
+
+
+    def _is_unicast_mac(self, mac: str) -> bool:
+        try:
+            m = mac.replace("-", ":").lower()
+            if m == "00:00:00:00:00:00":
+                return False
+            first_octet = int(m.split(":")[0], 16)
+            return (first_octet & 1) == 0  # LSB=0 => unicast
+        except Exception:
+            return False
+
+    def _ipv4_ok_to_learn(self, ip: str) -> bool:
+        """
+        Decide if we should attempt to learn/update an IPv4→MAC mapping for `ip`.
+
+        Rules:
+          • Reject special/bad IPv4 (unspecified, broadcast, loopback, multicast).
+          • Do NOT learn for our own IPs or gateway IPs.
+          • If cache has a protected entry (1- or 2-tuple), do NOT learn over it.
+          • If cache has a 'Learned' entry (3-tuple), allow updates/refresh.
+
+        Note: We don't have the candidate MAC here, so this only gates learning.
+              The actual overwrite/flip policies should still be enforced in
+              the caller (e.g., _maybe_commit_learn / _update_arp_cache).
+        """
+        try:
+            ip4 = ipaddress.IPv4Address(ip)
+        except Exception:
+            return False
+        if ip4.is_unspecified or ip4 == ipaddress.IPv4Address("255.255.255.255"):
+            return False
+        if ip4.is_multicast or ip4.is_loopback:
+            return False
+
+        with self._arp_cache_lock:
+            entry = self._arp_cache.get(str(ip4))
+
+        if entry is None:
+            return True
+
+        is_learned = isinstance(entry, tuple) and len(entry) >= 3
+        if is_learned:
+            return True
+        return False
 
     def resolve_gateway_mac(self, gw_ip: str, iface: str, iface_cidr: str,
                             timeout: float = 2.0, retries: int = 2) -> str | None:
