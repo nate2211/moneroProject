@@ -358,7 +358,7 @@ class P2PoolGUI(QMainWindow):
     def start_wireshark(self):
         self.wireshark_logger.log_message("[GUI] Requesting to start Wireshark capture...")
         if self.helper.wireshark_manager:
-            if self.helper.wireshark_manager.start_capture(main_interface_name='Wi-Fi'):
+            if self.helper.wireshark_manager.start_capture(main_interface_name='Wi-Fi', router_manager=self.helper.router_manager):
                 self.wireshark_tab.start_wireshark_button.setEnabled(False)
                 self.wireshark_tab.stop_wireshark_button.setEnabled(True)
             else:

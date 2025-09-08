@@ -7,18 +7,19 @@ import struct
 import time
 from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
 import sys
-from typing import Optional, List
+from typing import Optional, List, Union
 
 import psutil
 from scapy.arch import get_if_hwaddr, get_windows_if_list
 from scapy.config import conf
 from scapy.contrib.geneve import GENEVE
 from scapy.contrib.mpls import MPLS
-from scapy.fields import IntField, XShortField, LELongField, LEIntField, LESignedIntField, StrLenField
+from scapy.fields import IntField, XShortField, LELongField, LEIntField, LESignedIntField, StrLenField, EnumField, \
+    FieldLenField, IPField
 from scapy.interfaces import get_if_list
 from scapy.layers.dhcp import BOOTP, DHCP
 from scapy.layers.dhcp6 import DHCP6
-from scapy.layers.dns import DNS
+from scapy.layers.dns import DNS, DNSStrField, DNSRR
 from scapy.layers.eap import EAPOL, EAP
 from scapy.layers.ipsec import ESP, AH
 from scapy.layers.kerberos import Kerberos
@@ -180,7 +181,21 @@ class ICMPv6(Packet):
             p = p[:2] + struct.pack("!H", cksum) + p[4:]
 
         return p + pay
+class DNSRR_AAAA(DNSRR):
+    name = "DNSRR_AAAA"
+    fields_desc = [
+        DNSStrField("rrname", None),
+        EnumField("type", 28, {1: "A", 28: "AAAA"}),
+        EnumField("rclass", 1, {1: "IN"}),
+        IntField("ttl", 0),
+        FieldLenField("rdlen", None, length_of="rdata", fmt="!H"),
+        IP6Field("rdata", "::")  # The IPv6 address itself
+    ]
 
+    def __init__(self, *args, **kwargs):
+        super(DNSRR_AAAA, self).__init__(*args, **kwargs)
+        # Force the type field to be AAAA (28)
+        self.type = 28
 class SnifferSoftware:
     """
     A class to manage sniffing and sending of Layer 2 and Layer 3 packets
@@ -192,9 +207,10 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
-    def __init__(self, arp_manager, rip_manager, notification_manager=None, _interfaces_config = None, logger=None, ):
+    def __init__(self, arp_manager, rip_manager, lag_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
+        self.lag_manager = lag_manager
         self._interfaces_config = _interfaces_config
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
@@ -216,6 +232,7 @@ class SnifferSoftware:
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
         self.logged_packets = []
+        self.hyperv_manager = hyperv_manager
 
     def iface_is_l2_capable(self, iface_name: str) -> bool:
         kind = (self._interfaces_config.get(iface_name, {}) or {}).get("driver", "").lower()
@@ -1168,6 +1185,7 @@ class SnifferSoftware:
             return "01:00:5e:%02x:%02x:%02x" % (b[1] & 0x7F, b[2], b[3])
         else:
             return "33:33:%02x:%02x:%02x:%02x" % (b[12], b[13], b[14], b[15])
+
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -1401,8 +1419,13 @@ class SnifferSoftware:
 
             iface_cidr = self._ipv4_cidr_for_iface(iface_out)
             if not iface_cidr:
-                self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
-                return None
+                verbose = 1
+                iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+                iface_cidr = self._ipv4_cidr_for_iface(iface_out)
+                self.logger.log_message(f"[Sniffer] Selecting from lan aggregation for send.")
+                if not iface_cidr:
+                    self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
+                    return None
 
             # Resolve next hop MAC (only if not loopback gw)
             if not dst_mac:
@@ -1574,9 +1597,11 @@ class SnifferSoftware:
                 error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
                 if "device attached" in error_msg.lower() or "not functioning" in error_msg.lower():
                     self.logger.log_message(
-                        f"[Sniffer] ⛔ sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31).")
+                        f"[Sniffer] 🪈 sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31) sending down PYPIPE.")
+                    self.hyperv_manager.send_packet(bytes(packet))
                 else:
-                    self.logger.log_message(f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}")
+                    self.hyperv_manager.send_packet(bytes(packet))
+                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out} sending down PYPIPE")
                 return None
 
             if verbose >= 1:
@@ -1675,14 +1700,14 @@ class SnifferSoftware:
             )
 
             if result != 0:
-                # --- END OF CORRECTION ---
                 error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
                 if "device attached" in error_msg.lower() or "not functioning" in error_msg.lower():
                     self.logger.log_message(
-                        f"[Sniffer] ⛔ sr2 send failed on {iface_out}: Device not functioning (likely Win32 error 31)."
-                    )
+                        f"[Sniffer] 🪈 sr2 send failed on {iface_out}: Device not functioning (likely Win32 error 31) sending down PYPIPE.")
+                    self.hyperv_manager.send_packet(bytes(packet))
                 else:
-                    self.logger.log_message(f"[Sniffer] ❌ sr2 send failed on {iface_out}: {error_msg}")
+                    self.hyperv_manager.send_packet(bytes(packet))
+                    self.logger.log_message(f"[Sniffer] 🪈 sr2 send failed on {iface_out} sending down PYPIPE")
                 return None
 
             if verbose >= 1:
@@ -1821,3 +1846,43 @@ class SnifferSoftware:
                 pass
 
         return default
+
+    def get_ipv6_layer(self, pkt: Packet, layer_spec: Union[type[Packet], str, int]) -> Optional[Packet]:
+        """
+        Finds and returns a specific layer object from within a Scapy packet.
+
+        This is a versatile helper that can find a layer by its Scapy class,
+        its name as a string, or its numerical index in the layer stack.
+
+        Args:
+            pkt: The Scapy Packet object to search within.
+            layer_spec: The layer to find, specified as:
+                - A Scapy class (e.g., IPv6, TCP, ICMPv6ND_RA)
+                - A string name (e.g., "IPv6", "Raw")
+                - An integer index (e.g., 0 for the outermost layer)
+
+        Returns:
+            The found Scapy layer object, or None if not found.
+        """
+        if not isinstance(pkt, Packet):
+            return None
+
+        # --- Find by Index ---
+        if isinstance(layer_spec, int):
+            for i, l in enumerate(self._iter_layers(pkt)):
+                if i == layer_spec:
+                    return l
+            return None  # Index out of bounds
+
+        # --- Find by Class ---
+        if isinstance(layer_spec, type) and issubclass(layer_spec, Packet):
+            return pkt.getlayer(layer_spec)
+
+        # --- Find by Name ---
+        if isinstance(layer_spec, str):
+            for l in self._iter_layers(pkt):
+                if self._match_layer(l, layer_spec):
+                    return l
+
+        return None  # Not found or unsupported spec type
+

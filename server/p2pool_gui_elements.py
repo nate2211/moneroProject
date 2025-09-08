@@ -1607,7 +1607,7 @@ class RouterTab(QWidget):
 
         self.presets = {
             "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS/mDNS",
-                     "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/Bridge", "Firewall", "Packet"],
+                     "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/NDP/Bridge", "Firewall", "Packet"],
             "Minimal": ["General"],
         }
         self._hot_prefix_to_pane = {

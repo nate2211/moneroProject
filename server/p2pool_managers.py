@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import ctypes
+import logging
 import os
 import platform
 import socket
 import string
 import traceback
 import uuid
+import warnings
 from pathlib import Path
 from typing import Optional, List, Any
 import geoip2.database
@@ -25,18 +27,20 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.arch import get_if_hwaddr
+from scapy.config import conf
 from scapy.contrib.igmp import IGMP
+from scapy.contrib.igmpv3 import IGMPv3
 from scapy.layers.dhcp import DHCP
-from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit
 from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6DestUnreach, \
-    ICMPv6TimeExceeded, ICMPv6ParamProblem
+    ICMPv6TimeExceeded, ICMPv6ParamProblem, IPv6ExtHdrHopByHop
 from scapy.layers.ipsec import ESP, AH
 from scapy.layers.l2 import Ether, GRE, ARP
 from scapy.layers.tls.handshake import TLSClientHello, TLSFinished, TLSServerHello
 from scapy.layers.tls.record import TLS
-from scapy.packet import Packet
+from scapy.packet import Packet, Raw
 from scapy.layers.inet import IP, UDP
 from typing import Tuple, Dict
 import xml.etree.ElementTree as ET
@@ -46,7 +50,7 @@ from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware, ICMPv6, ISAKEMP
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
-    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager
+    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -94,6 +98,7 @@ class PythonRouterManager:
         self.parallel_python = ParallelPythonTool(router_logger)
         self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
         self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
+        self.ndp_manager = NDPManager(router_logger)
         self._interfaces_config = {}  # Stores config for all physical interfaces
         self.interface_in_full_name = None
         self.interface_in_friendly_name = None
@@ -108,6 +113,8 @@ class PythonRouterManager:
         self.interface_lac_2_friendly_name = None
         self.router_ip_in = None
         self.router_ip_out = None
+        self.router_ipv6_out = None
+        self.router_ipv6_link_local_out = None
         self.router_gateway_out_ip = None
         self.router_macs = None
         self._sniff_threads = {}
@@ -126,7 +133,7 @@ class PythonRouterManager:
         self.lag_manager = LinkAggregationManager(router_logger)
         self.packet_signer = PacketSigningManager(router_logger)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
-        self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer, self.arp_manager)
+        self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer, self.arp_manager, self.ndp_manager)
         self.dns_manager = DNSManager(router_logger, self.packet_writer)
         self.mdns_manager = mDNSManager(router_logger, self.packet_writer, self._interfaces_config)
         self.rip_manager = RIPManager(router_logger, self.function_call_tracker)
@@ -152,7 +159,7 @@ class PythonRouterManager:
         )
         self.daemon_manager = None
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
-        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python)
+        self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python, self.packet_writer)
         self.isakmp_manager = None
         self.esp_manager = ESPManager(router_logger, self.packet_writer)
         self.hyperv_manager = HyperVManager(self.router_logger)
@@ -164,6 +171,7 @@ class PythonRouterManager:
             'UDP': 0.60,
             'DEFAULT': 0.60,
         }
+        self.started = False
 
 
 
@@ -437,7 +445,6 @@ class PythonRouterManager:
                     # Use setattr to assign the sniffer instance
                     setattr(manager, 'sniffer', self.sniffer)
                     self.router_logger.log_message(f"[Sniffer] -> Injected sniffer into {manager.__class__.__name__}")
-
 
     def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
                                    router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
@@ -956,6 +963,7 @@ class PythonRouterManager:
         self.mac_in = get_if_hwaddr(self.interface_in_full_name)
         self.mac_out = get_if_hwaddr(self.interface_out_full_name)
         self.create_link_aggregation_group("MyLANAggregation", link_group)
+        self._set_ipv6_link_local()
         self.router_macs = {cfg.get('mac') for cfg in self._interfaces_config.values() if 'mac' in cfg}
         self.router_logger.log_message(f"\n--- Python Router Configuration Summary ---")
         self.router_logger.log_message(
@@ -969,6 +977,97 @@ class PythonRouterManager:
         self.router_logger.log_message(f"----------------------------------------------------------------")
         return True
 
+    def _synthesize_link_local_ipv6(self, mac_address: str) -> Optional[str]:
+        """
+        Creates an IPv6 link-local address from a MAC address using the EUI-64 standard.
+        """
+        try:
+            # 1. Remove delimiters and split the MAC into two halves
+            mac_parts = mac_address.replace(":", "").replace("-", "")
+            if len(mac_parts) != 12: return None
+
+            part1 = mac_parts[:6]
+            part2 = mac_parts[6:]
+
+            # 2. Insert 'fffe' in the middle
+            eui64 = f"{part1}fffe{part2}"
+
+            # 3. Invert the 7th bit (the "U/L" bit) of the first byte
+            first_byte = int(eui64[:2], 16)
+            inverted_byte = first_byte ^ 2
+
+            # 4. Reconstruct the host part
+            host_part = f"{inverted_byte:02x}{eui64[2:]}"
+
+            # 5. Format into a standard IPv6 address with the link-local prefix
+            addr_parts = [host_part[i:i + 4] for i in range(0, len(host_part), 4)]
+            final_addr = f"fe80::{':'.join(addr_parts)}"
+
+            return str(ipaddress.IPv6Address(final_addr))  # Return a compressed, valid address
+        except Exception as e:
+            self.router_logger.log_message(f"[Router] ❌ Failed to synthesize EUI-64 address: {e}")
+            return None
+
+    def _set_ipv6_link_local(self):
+        # 1. Run ipconfig and capture the output
+        self.router_logger.log_message(
+            f"[Router] 🔎 Discovering link-local IPv6 address for {self.interface_out_friendly_name}..."
+        )
+
+        found_address = None
+        result = subprocess.check_output("ipconfig", text=True, stderr=subprocess.DEVNULL)
+
+        in_correct_adapter_section = False
+        for line in result.splitlines():
+            # [FIX] This is a more robust way to track which adapter section we are in.
+            # A new section starts with a line containing "adapter" and ending with a colon.
+            if "adapter" in line.lower() and line.strip().endswith(':'):
+                # Check if this new section is the one we are looking for.
+                if self.interface_out_friendly_name.lower() in line.lower():
+                    in_correct_adapter_section = True
+                else:
+                    # It's a different adapter, so we are no longer in the correct section.
+                    in_correct_adapter_section = False
+
+            # If we are in the correct section, look for the address line.
+            if in_correct_adapter_section:
+                clean_line = line.strip()
+                if clean_line.startswith("Link-local IPv6 Address"):
+                    address_part = clean_line.split(":", 1)[1].strip()
+                    # Clean up the '(Preferred)' suffix and any other trailing text
+                    cleaned_address = address_part.split("(")[0].strip()
+                    found_address = cleaned_address
+                    break  # We found the address, no need to parse further.
+
+        if found_address:
+            self.router_ipv6_link_local_out = found_address
+            conf.route6.add(
+                dst="::/0",  # For any destination
+                gw=self.router_ipv6_link_local_out,
+                dev=self.interface_out_full_name
+            )
+            self.router_logger.log_message(
+                f"[Router] ✅ Discovered OS link-local address: {self.router_ipv6_link_local_out}"
+            )
+            logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+        else:
+            self.router_logger.log_message(
+                f"[Router] ⚠️ No link-local IPv6 address found on {self.interface_out_friendly_name}. Synthesizing one..."
+            )
+            # Get the MAC address of the outbound interface
+            out_mac = self.get_interface_mac(self.interface_out_full_name)
+            if out_mac:
+                synthesized_ll = self._synthesize_link_local_ipv6(out_mac)
+                if synthesized_ll:
+                    self.router_ipv6_link_local_out = synthesized_ll
+                    conf.route6.add(
+                        dst="::/0",  # For any destination
+                        gw=self.router_ipv6_link_local_out,
+                        dev=self.interface_out_full_name
+                    )
+                    self.router_logger.log_message(
+                        f"[Router] ✅ Synthesized EUI-64 link-local address: {self.router_ipv6_link_local_out}")
+            self.ndp_manager.router_ipv6_link_local_out = self.router_ipv6_link_local_out
     def _start_single_sniffer(self, iface_name: str):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
@@ -1028,7 +1127,7 @@ class PythonRouterManager:
             # Get the router-assigned IPs (already set during interface setup)
             in_iface_ip = self._interfaces_config.get(self.interface_in_full_name, {}).get("ip_addr")
             out_iface_ip = self._interfaces_config.get(self.interface_out_full_name, {}).get("ip_addr")
-
+            in_mac = self._interfaces_config.get(self.interface_in_full_name, {}).get("mac")
             # Use full dynamic ranges (excluding router's own IP)
             dhcp_pool_in = generate_full_pool(self.router_network_in, in_iface_ip)
             dhcp_pool_out = generate_full_pool(self.router_network_out, out_iface_ip)
@@ -1040,9 +1139,11 @@ class PythonRouterManager:
                 dhcp_pool_in[0],
                 dhcp_pool_in[-1],
                 self._interfaces_config,
+                in_mac=in_mac,
                 enforce_same_subnet=False
             )
             self.dhcp_server_in.sniffer = self.sniffer
+            self.dhcp_server_in.router_ipv6_link_local_out = self.router_ipv6_link_local_out
             self.dhcp_server_out = DHCPServer(
                 self.router_logger,
                 self.packet_writer,
@@ -1050,9 +1151,11 @@ class PythonRouterManager:
                 dhcp_pool_out[0],
                 dhcp_pool_out[-1],
                 self._interfaces_config,
+                in_mac=in_mac,
                 enforce_same_subnet=False
             )
             self.dhcp_server_out.sniffer = self.sniffer
+            self.dhcp_server_out.router_ipv6_link_local_out = self.router_ipv6_link_local_out
             self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in, self.dhcp_server_out)
         else:
             self.router_logger.log_message("[DHCP] DHCP Server not initialized: Router IN network not configured.")
@@ -1066,9 +1169,69 @@ class PythonRouterManager:
         Main packet processing pipeline with a clear separation for router-destined
         vs. transit traffic.
         """
+        yield_no_gil(0.1)
         try:
             iface_short = inbound_iface.split('_')[-1]
+            if iface_short == "WireShark":
+                is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
+                if is_handled_by_transport:
+                    self.code_output_manager.submit_packet(
+                        packet,
+                        inbound_iface=inbound_iface,
+                        phase="processing",
+                        component="wireshark-transport"
+                    )
+                    return
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Forwarding: {packet.summary()} | In:{iface_short}",
+                        emoticons=["🚚", "🚛", "🚄", "🛻", "🚈", "🚐", "🚙", "🚎", "🚕", "🚑", "🚓", "⛵", "🛶", "🚤", "🛳️", "⛴️",
+                                   "🛥️", "🚢", "🛩️", "🌁", "🌃", "🏙️", "🌄", "🌅", "🏝️"]
+                    )
+                )
+                self.parallel_python.run_parallel(
+                    self._forward_general_ip_packet,
+                    packet,
+                    inbound_iface,
+                    return_type="void",
+                    queue_name="forward_packets"
+                )
+
+                # Step 3: Stop all further processing for this packet.
+                return
+            if isinstance(packet, bytes):
+                try:
+                    # Check for an empty payload to prevent index errors
+                    if not packet: return
+
+                    version = packet[0] >> 4
+                    if version == 6:
+                        packet = IPv6(packet)
+                    elif version == 4:
+                        packet = IP(packet)
+                    else:
+                        # This is a non-IP packet, drop it.
+                        return
+
+                except Exception as e:
+                    return
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if not ip_layer:
+                self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
+                return
+            dst_ip = ip_layer.dst
+
+            link_local_ip_bare = self.router_ipv6_link_local_out.split('%')[0]
+            if dst_ip == link_local_ip_bare or ip_layer.src== link_local_ip_bare:
+                self.function_call_tracker.track(
+                    identifier="DroppedLinkLocal",
+                    threshold=100,
+                    final_message=f"[Router] 💧 Dropping packet to our own link-local address: {dst_ip} Count: {{}}.",
+                    count_message=None,
+                )
+                return # Stop processing immediately
             # [0] Self-MAC guard (avoid loops)
             if packet.haslayer(Ether):
                 src_mac = (packet[Ether].src or "").lower()
@@ -1084,12 +1247,8 @@ class PythonRouterManager:
             # [1] Ether-type sanity
             eth_type = self._eth_type_or_none(packet)
             if eth_type is None:
-                # Avoid log spam (keep as warning, but single-line)
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
-            if self.transport_manager.handle_packet(packet, inbound_iface):
-                self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                       phase="processing", component="transport")
             if packet.haslayer(UDP):
                 try:
                     _udp = packet[UDP]
@@ -1121,14 +1280,30 @@ class PythonRouterManager:
             if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
                 return
 
-            # [3] IP layer is mandatory for the rest
-            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            # --- Step 3: SANITIZE IPV6 HOP-BY-HOP HEADER ---
+            # This is the correct place and method for the sanitization logic.
+            if ip_layer.version == 6 and ip_layer.nh == 0:
+                original_summary = packet.summary()
+                p = packet.copy()
+                new_ip_layer = p.getlayer(IPv6)
+
+                stripped_count = 0
+                while new_ip_layer and new_ip_layer.nh == 0 and hasattr(new_ip_layer.payload, 'nh'):
+                    hbh_header = new_ip_layer.payload
+                    new_ip_layer.nh = hbh_header.nh
+                    new_ip_layer.payload = hbh_header.payload
+                    stripped_count += 1
+
+                if stripped_count > 0:
+                    new_ip_layer.plen = len(new_ip_layer.payload)
+                    packet = p  # Overwrite with the sanitized version
+                    ip_layer = new_ip_layer  # Update our reference to the clean IP layer
+
             if not ip_layer:
                 self.router_logger.log_message(
                     f"[Router] ⚠️ Dropping non-IP packet that bypassed L2 handler: {packet.summary()}"
                 )
                 return
-
             # [4] ARP inspection (only when ARP present)
             if packet.haslayer(ARP):
                 if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
@@ -1142,16 +1317,8 @@ class PythonRouterManager:
             is_udp = packet.haslayer(UDP)
             sport = (packet[TCP].sport if is_tcp else packet[UDP].sport if is_udp else 0) or 0
             dport = (packet[TCP].dport if is_tcp else packet[UDP].dport if is_udp else 0) or 0
-            dst_ip = ip_layer.dst
-            if packet.haslayer(ARP):
-                if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
-                    self.router_logger.log_message(
-                        f"[ARP] 🚫 Dropped ARP on {inbound_iface.split('_')[-1]} (failed inspection)."
-                    )
-                    return  # stop processing, do not forward/learn this ARP
             # [6] Stratum: FIXED — detect via TCP/UDP port list, not ip_layer.sport
             #     Use your StratumManager’s robust extractor/buffer; we also tag component.
-
             if (sport in self.stratum_manager.STRATUM_PORTS) or (dport in self.stratum_manager.STRATUM_PORTS):
                 # must have Raw payload and look like JSON
                 from scapy.packet import Raw
@@ -1204,7 +1371,6 @@ class PythonRouterManager:
                         )
                         self.hyperv_manager.send_packet(packet)
                         return True
-
                 if packet.haslayer(GRE):
                     if self.hyperv_enabled:
                         self.router_logger.log_message(
@@ -1213,23 +1379,29 @@ class PythonRouterManager:
             if packet.haslayer(ISAKEMP):
                 if self.isakmp_manager.handle_packet(packet, inbound_iface):
                     return
-
+            if packet.haslayer(ICMPv6ND_NA):
+                self.ndp_manager.learn_neighbor_advertisement(packet)
+                return
+            if packet.haslayer(IPv6):
+                self.ndp_manager.learn_from_packet(packet, inbound_iface)
             is_for_router = dst_ip in self._get_all_local_ips()
 
             if is_for_router:
 
                 if packet.haslayer(DNS):
-                    self.router_logger.log_message(f"[DNS] 🗺️ Intercepting DNS query on {iface_short}")
-                    if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
-                                                     self.arp_manager.resolve,
-                                                     self.rip_manager.find_route):
-                        self.code_output_manager.submit_packet(
-                            packet,
-                            inbound_iface=inbound_iface,
-                            phase="handled",
-                            component="dns",
-                        )
-                        return
+                    dns = packet[DNS]
+
+                    # qr=0 means it's a query from a client
+                    if dns.qr == 0:
+                        self.router_logger.log_message("[DNS] 🗺️ Intercepting DNS query for router.")
+                        if self.dns_manager.handle_query(packet, inbound_iface):
+                            return  # Packet was handled (forwarded upstream or served from cache)
+
+                    # qr=1 means it's a response from an upstream server
+                    else:
+                        self.router_logger.log_message("[DNS] ⬅️ Processing DNS response for router.")
+                        if self.dns_manager.handle_response(packet):
+                            return  # Packet was handled (forwarded back to client)
 
                 if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
                     self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
@@ -1251,7 +1423,7 @@ class PythonRouterManager:
                             component="dhcp-out-router",
                         )
                         return
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6_Solicit):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router")
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
@@ -1262,18 +1434,17 @@ class PythonRouterManager:
                         component="dhcp-out",
                     )
                     return
-            if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
+            if packet.haslayer(ICMP) or packet.haslayer(DHCP6_Solicit):
                 self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short}")
-                handled = self.icmp_manager.handle_packet(packet, inbound_iface)
-                self.code_output_manager.submit_packet(
-                    packet, inbound_iface=inbound_iface,
-                    phase="handled" if handled else "observed",
-                    component="icmp" if packet.haslayer(ICMP) else "icmpv6"
-                )
-                if handled:
+                if self.icmp_manager.handle_packet(packet, inbound_iface):
+                    self.code_output_manager.submit_packet(
+                        packet, inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="icmp"
+                    )
                     return
 
-            if packet.haslayer(IGMP):  # Echo Request
+            if packet.haslayer(IGMP) or packet.haslayer(IGMPv3):  # Echo Request
                 self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short}")
                 if self.igmp_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
@@ -1299,7 +1470,7 @@ class PythonRouterManager:
                     )
                     return
             if isinstance(transport_layer, DNS) and packet[DNS].qr == 1:
-                if self.dns_manager.handle_response(packet, inbound_iface, self._interfaces_config):
+                if self.dns_manager.handle_response(packet):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns")
                     return
@@ -1309,9 +1480,8 @@ class PythonRouterManager:
                                                            phase="handled", component="mdns")
                     return
             if isinstance(transport_layer, UDP) and packet[UDP].dport == 53:
-                if self.dns_manager.handle_query(packet, inbound_iface, self._interfaces_config,
-                                                 self.arp_manager.resolve,
-                                                 self.rip_manager.find_route):
+
+                if self.dns_manager.handle_query(packet, inbound_iface):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
                                                            phase="handled", component="dns-query")
                     return
@@ -1339,6 +1509,11 @@ class PythonRouterManager:
                 )
 
                 return
+            if iface_short != "Wireshark":
+                if self.transport_manager.handle_packet(packet, inbound_iface):
+                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
+                                                           phase="processing", component="transport")
+                    return
             # Final forwarding logic
             self.router_logger.log_message(
                 RouterRandomMessages(
@@ -1375,10 +1550,10 @@ class PythonRouterManager:
         if not ip_layer:
             self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
             return
+        l2_driver_ok = inbound_iface not in ("WinDivertBridge", "WireShark")
         dst_ip = ip_layer.dst
         route = self.rip_manager.get_forwarding_route(dst_ip)
         # --- Multicast Handling (IPv4 and IPv6) ---
-
         if ipaddress.ip_address(dst_ip).is_multicast:
             # Compute L2 multicast destination (only needed when we actually send L2)
             mcast_dst_mac = None
@@ -1394,10 +1569,7 @@ class PythonRouterManager:
 
             # Choose egress (keep your own policy; here we mirror inbound)
             egress_iface = inbound_iface
-            driver_kind = str((self._interfaces_config.get(egress_iface, {}) or {}).get("driver", "")).lower()
-
             # L2 is only OK when the driver is NOT windivert/rawip/winfw AND we have a MAC
-            l2_driver_ok = not any(x in driver_kind for x in ("windivert", "rawip", "winfw"))
             src_mac = self.get_interface_mac(egress_iface) if l2_driver_ok else None
             use_l2 = bool(l2_driver_ok and src_mac)
 
@@ -1436,14 +1608,17 @@ class PythonRouterManager:
                 egress_iface = self.outbound_load_balancer.get_best_interface()
                 # Scapy will send the L3 packet out the given iface. For WinDivert, this
                 # remains L3-only (no MAC), which is exactly what we want here.
-                self.sniffer.send(packet, iface=egress_iface, verbose=False)
+                self.sniffer.send(packet, iface=egress_iface, verbose=0)
                 self.router_logger.log_message(
-                    f"[Router] 📡 L3 multicast inject to {dst_ip} on {egress_iface} "
-                    f"(driver={driver_kind or 'unknown'})"
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"L3 multicast inject to {dst_ip} on {egress_iface}.",
+                        emoticons=["🪂️", "🚆", "🚃", "🕍", "⛩️", "🕋", "🏗"]
+                    )
                 )
             except Exception as e:
                 self.router_logger.log_message(
-                    f"[Router] ❌ L3 multicast inject failed on {egress_iface} (driver={driver_kind or 'unknown'}): {e}"
+                    f"[Router] ❌ L3 multicast inject failed on {egress_iface} using inbound {inbound_iface}: {e}"
                 )
             return
         src_ip = ip_layer.src
@@ -1457,22 +1632,30 @@ class PythonRouterManager:
             return
 
         if not route:
-            self.function_call_tracker.track(
-                identifier='DroppedRoute',
-                threshold=20,
-                final_message=f"[Router] 🛑 No route to {dst_ip}. Dropping. Count: {{}}.",
-                count_message=None)
-            self.code_output_manager.submit_packet(
-                packet,
-                inbound_iface=inbound_iface,
-                phase="drop",
-                component="drop-route",
-            )
-            return
+            self.router_logger.log_message(f"[Router] 🗺️ No specific route for {dst_ip}, checking for default route...")
+
+            default_route = self.rip_manager.get_forwarding_route("0.0.0.0")
+
+            if default_route:
+                route = default_route
+            else:
+                self.function_call_tracker.track(
+                    identifier='DroppedRoute',
+                    threshold=20,
+                    final_message=f"[Router] 🛑 No route to {dst_ip}. Dropping. Count: {{}}.",
+                    count_message=None)
+                self.code_output_manager.submit_packet(
+                    packet,
+                    inbound_iface=inbound_iface,
+                    phase="drop",
+                    component="drop-route",
+                )
+                return
         initial_outbound_iface = route["interface"]
-        next_hop_ip = route["next_hop"] if route["next_hop"] != "0.0.0.0" else dst_ip
+        next_hop_ip = dst_ip if route["next_hop"] in ("0.0.0.0", "::") else route["next_hop"]
 
         if ipaddress.ip_address(dst_ip).is_global:
+
             selected_iface = None
             if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
                 selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
@@ -1487,50 +1670,64 @@ class PythonRouterManager:
             if not selected_iface:
                 self.router_logger.log_message("[Router] ❌ No outbound interface. Dropping packet.")
                 return
+            is_ipv6 = (ip_layer.version == 6)
+            if l2_driver_ok:
+                if is_ipv6:
+                    next_hop_mac = self.ndp_manager.resolve(next_hop_ip, initial_outbound_iface)
+                else:
+                    next_hop_mac = self.arp_manager.resolve(next_hop_ip, iface=selected_iface)
 
-
-            next_hop_mac = self.arp_manager.resolve(next_hop_ip, iface=selected_iface)
-
-
-
-            # Check for Keep-Alive requests first
-            if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
-                self.nat_manager.handle_keep_alive(packet)
-                return
-
-            self.nat_manager.translate_outbound(packet)
-
-            # Rewrite MACs
-            if packet.haslayer(Ether):
-                # Standard case: The packet has an L2 frame, so we just modify it.
-                packet[Ether].src = self.get_interface_mac(selected_iface)
-                packet[Ether].dst = next_hop_mac
-            else:
-                # HARDENING: Packet is missing the Ether layer. We'll build one.
-                self.router_logger.log_message(
-                    RouterRandomMessages(
-                        name="Router",
-                        message=f"Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer.",
-                        emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
+                if not next_hop_mac:
+                    self.router_logger.log_message(
+                        f"[Router] 🕵️ No MAC for next hop {next_hop_ip} on {selected_iface.split('_')[-1]}. Dropping packet."
                     )
-                )
-                src_mac = self.get_interface_mac(selected_iface)
-                # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
-                packet = Ether(src=src_mac, dst=next_hop_mac) / packet
+                    return
+                # Rewrite MACs
+                if packet.haslayer(Ether):
+                    # Standard case: The packet has an L2 frame, so we just modify it.
+                    packet[Ether].src = self.get_interface_mac(selected_iface)
+                    packet[Ether].dst = next_hop_mac
+                else:
+                    # HARDENING: Packet is missing the Ether layer. We'll build one.
+                    self.router_logger.log_message(
+                        RouterRandomMessages(
+                            name="Router",
+                            message=f"Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer.",
+                            emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
+                        )
+                    )
+                    src_mac = self.get_interface_mac(selected_iface)
+                    # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
+                    packet = Ether(src=src_mac, dst=next_hop_mac) / packet
+            else:
+                if packet.haslayer(Ether):
+                    packet = packet.payload  # strip L2 if present
+                    self.router_logger.log_message(
+                        RouterRandomMessages(
+                            name="Router",
+                            message=f"Hardening internet-bound packet for {dst_ip} on {inbound_iface} stripping Ether for L3-only egress.",
+                            emoticons=["🛰️", "📡", "🛸", "⚓", "🛟"]
+                        )
+                    )
+            if not is_ipv6:
+                if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
+                    self.nat_manager.handle_keep_alive(packet)
+                    return
+                self.nat_manager.translate_outbound(packet)
 
-            packet[IP].src = self.nat_manager.public_ip
-            del packet[IP].chksum
-            if packet.haslayer(TCP):
-                del packet[TCP].chksum
-            elif packet.haslayer(UDP):
-                del packet[UDP].chksum
+            if is_ipv6:
+                if IPv6 in packet and hasattr(packet[IPv6], "plen"):
+                    del packet[IPv6].plen
+            else:
+                if IP in packet and hasattr(packet[IP], "chksum"):
+                    del packet[IP].chksum
 
             # Log and send
             self.router_logger.log_message(
                 RouterRandomMessages(
                     name="Router",
-                    message=f"Internet-bound packet {dst_ip} to {selected_iface.split('_')[-1]}. IP for gateway: {next_hop_ip}",
-                    emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗", "🌑"]
+                    message=f"Internet-bound packet {self._proto_summary(packet)} to {selected_iface.split('_')[-1]}.",
+                    emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗", "🌑", "🌈", "🎇", "🔮"]
                 )
             )
             self.code_output_manager.submit_packet(
@@ -1539,14 +1736,15 @@ class PythonRouterManager:
                 phase="handled",
                 component="internet",
             )
-            self.sniffer.send(packet, selected_iface)
+            self.sniffer.send(packet, selected_iface, verbose=0)
             return
 
         is_from_internal_bridge = self.ethernet_manager.is_bridge_member(inbound_iface)
         is_to_external_wan = initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces()
         if is_from_internal_bridge and is_to_external_wan:
-            self.nat_manager.translate_outbound(packet)
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if not ip_layer.version == 6:
+                self.nat_manager.translate_outbound(packet)
 
         if initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces():
             selected_iface = self.outbound_load_balancer.get_next_interface(packet)
@@ -1651,6 +1849,8 @@ class PythonRouterManager:
             self.router_logger.log_message(
                 f"[Router] 🌀 Loopback forwarding for {dst_ip}. No ARP needed."
             )
+            self.packet_writer._send_raw_packet(packet, interface=inbound_iface)
+            return
         elif ipaddress.ip_address(dst_ip) == outbound_network.broadcast_address:
             target_mac = "ff:ff:ff:ff:ff:ff"
             self.router_logger.log_message(
@@ -1661,11 +1861,29 @@ class PythonRouterManager:
                 )
             )
         else:
-            target_mac = self.arp_manager.resolve(next_hop_ip, initial_outbound_iface)
+            is_ipv6 = (ip_layer.version == 6)
+            if is_ipv6:
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Performing NDP lookup for {next_hop_ip}...",
+                        emoticons=["️🕵️", "👨‍🏭", "👨‍✈️", "👨‍🎓", "👨‍🍳", "👨‍💻", "👩‍⚕️", "👩‍🏫", "🧑‍🔬", "👷‍♀️"]
+                    )
+                )
+                target_mac = self.ndp_manager.resolve(next_hop_ip, initial_outbound_iface)
+            else:
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        name="Router",
+                        message=f"Performing ARP lookup for {next_hop_ip}...",
+                        emoticons=["️🕵️", "👨‍🏭", "👨‍✈️", "👨‍🎓", "👨‍🍳", "👨‍💻", "👩‍⚕️", "👩‍🏫", "🧑‍🔬", "👷‍♀️", "💂", ""]
+                    )
+                )
+                target_mac = self.arp_manager.resolve(next_hop_ip, initial_outbound_iface)
 
         if not target_mac:
             self.router_logger.log_message(
-                f"[Router] 🕵️ ARP failed for {next_hop_ip} on {initial_outbound_iface.split('_')[-1]}. Dropping."
+                f"[Router] 🕵️ No target mac for {next_hop_ip} on {initial_outbound_iface.split('_')[-1]}. Dropping."
             )
             return
 
@@ -1692,6 +1910,7 @@ class PythonRouterManager:
                         emoticons=["️⌛", "⏱️", "⌚", "🕰️", "⏰", "⏲️"]
                     )
                 )
+                self.packet_writer.send_icmp_time_exceeded(original_packet=packet, inbound_iface=inbound_iface)
                 return
             if hasattr(ip_layer, "ttl"):
                 packet[IP].ttl -= 1
@@ -1719,13 +1938,22 @@ class PythonRouterManager:
             packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
 
         # --- [11] Fix Checksums ---
-        del ip_layer.chksum
-        if packet.haslayer(TCP): del packet[TCP].chksum
-        if packet.haslayer(UDP): del packet[UDP].chksum
+        # --- 7. Fix Checksums (IP-Version Aware) ---
+        if not packet.haslayer(IPv6):
+            del packet[IP].chksum
 
+        if TCP in packet and hasattr(packet[TCP], "chksum"): del packet[TCP].chksum
+        if UDP in packet and hasattr(packet[UDP], "chksum"): del packet[UDP].chksum
 
-        # --- [12] Send Packet ---
         self.sniffer.send(packet, iface=initial_outbound_iface)
+        proto_str = self._proto_summary(packet)
+        self.router_logger.log_message(
+            RouterRandomMessages(
+                name="Router",
+                message=f"Packet sent to {initial_outbound_iface.split('_')[-1]} {proto_str}",
+                emoticons=["🏢", "🚕", "🗽", "🏞️", "🎢", "🎡", "🦖", "📰", "🖼️", "⛲"]
+            )
+        )
         deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
         sampling_rate = self.packet_catcher_heuristic_rates.get(proto, self.packet_catcher_heuristic_rates['DEFAULT'])
         if deterministic_value < sampling_rate:
@@ -1737,14 +1965,6 @@ class PythonRouterManager:
                 phase="handled",
                 component="packet-catch",
             )
-        proto_str = self._proto_summary(packet)
-        self.router_logger.log_message(
-            RouterRandomMessages(
-                name="Router",
-                message=f"Packet sent to {initial_outbound_iface.split('_')[-1]} {proto_str}",
-                emoticons=["🏢", "🚕", "🗽", "🏞️", "🎢", "🎡", "🦖", "📰", "🖼️", "⛲"]
-            )
-        )
         self.code_output_manager.submit_packet(
             packet,
             inbound_iface=inbound_iface,
@@ -1777,7 +1997,7 @@ class PythonRouterManager:
                 self.NOTIFICATION_TARGET_PORT,
                 self.interface_in_full_name
             )
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.notification_manager, self._interfaces_config, self.router_logger)
+            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
@@ -1798,9 +2018,7 @@ class PythonRouterManager:
                 interface_out_full_name=self.interface_out_full_name,
                 interface_in_full_name=self.interface_in_full_name
             )
-
-
-
+            self.dns_manager.start()
             self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager,
                                                       self.rip_manager, self.packet_writer)
             self.handshake_manager.sniffer = self.sniffer
@@ -1827,6 +2045,7 @@ class PythonRouterManager:
 
             self.syn_scanner.start()
             self.rip_manager.start()
+            self.packet_writer.sniffer = self.sniffer
             self.packet_writer.start()
             self.handshake_manager.start()
             self.igmp_manager.set_interfaces_config(self._interfaces_config)
@@ -1876,6 +2095,7 @@ class PythonRouterManager:
                 self.hyperv_enabled = True
             else:
                 self.hyperv_enabled = False
+            self.started = True
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
@@ -1904,6 +2124,7 @@ class PythonRouterManager:
             self._disable_nat_forwarding()
             if self.nat_manager:
                 self.nat_manager.stop()
+            self.dns_manager.stop()
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")
@@ -1930,7 +2151,7 @@ class PythonRouterManager:
                 self.windivert_manager.stop()
                 self.hyperv_manager.teardown()
                 self.hyperv_enabled = False
-
+            self.started = False
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
@@ -2680,12 +2901,18 @@ class PythonRouterManager:
             return False
 
     def _get_all_local_ips(self) -> set[str]:
-        """Returns a set of all IPs assigned to the router’s interfaces."""
-        return {
-            config["ip_addr"]
-            for config in self._interfaces_config.values()
-            if "ip_addr" in config
-        }
+        """
+        Returns a comprehensive set of all IPv4 and IPv6 addresses assigned
+        to the router's interfaces.
+        """
+        local_ips = set()
+        for config in self._interfaces_config.values():
+            # Add the IPv4 address if it exists
+            if config.get("ip_addr"):
+                local_ips.add(config["ip_addr"])
+
+        local_ips.add(self.router_ipv6_link_local_out)
+        return local_ips
 
     def get_interface_mac(self, iface_full_name: str) -> str:
         """
@@ -3020,6 +3247,7 @@ class WiresharkManager:
         self.loopback_interface_id = None
         self.vpn_interface_id = None
         self.min_packet_len = 60
+        self.router_manager = None
 
 
     def _initialize_geoip(self):
@@ -3166,8 +3394,9 @@ class WiresharkManager:
             self.logger.log_message(f"[Wireshark] An error occurred while listing interfaces: {e}")
         return interfaces
 
-    def start_capture(self, main_interface_name: str = 'Wi-Fi', promiscuous=True):
+    def start_capture(self, main_interface_name: str = 'Wi-Fi', router_manager = None, promiscuous=True):
         self._initialize_geoip()
+        self.router_manager = router_manager
         tshark_path = self._get_tshark_path()
         if not tshark_path: return False
         if self.tshark_procs:
@@ -3231,32 +3460,103 @@ class WiresharkManager:
 
         self.stop_event.clear()
 
+        def _bpf_addr(a: str | None) -> str | None:
+            # strip IPv6 zone index, e.g. 'fe80::1%Ethernet'
+            return a.split("%", 1)[0] if isinstance(a, str) else None
+
+        def build_capture_filter() -> str:
+            # A list of BPF parts that will be joined with 'and'
+            STR_BCAST_PART1 = 0x5354525f  # Represents "STR_"
+            STR_BCAST_PART2 = 0x42434153  # Represents "BCAS"4
+            parts = [
+                # 1. Basic IP traffic only
+                "(ip or ip6)",
+                "not arp",
+
+                # 2. Filter Multicast and common Discovery/Chatter protocols
+                "not (ip multicast or ip6 multicast)",
+                "not (udp port 5353 or udp port 1900 or udp port 3702 or udp port 5355)",
+                "not (port 67 or port 68 or port 546 or port 547)",
+
+                # 3. Filter local loopback traffic (IPv4 and IPv6)
+                "not host 127.0.0.1",
+                "not host ::1",
+                "not host 10.2.0.2",
+                # 4. Filter NetBIOS Name Service noise on the APIPA/link-local network
+                "not (udp port 137 and net 169.254.0.0/16)",
+
+                "not port 5357",
+                "not port 889",
+                f"not (udp[8:4] = {STR_BCAST_PART1} and udp[12:4] = {STR_BCAST_PART2})",
+            ]
+            parts.append(f"not (src host {self.router_manager.router_ip_out} and dst host {self.router_manager.router_ip_out})")
+            parts.append("not (ip broadcast and udp and dst port 22222)")
+            # Exclude very small frames
+            min_len = int(getattr(self, "min_packet_len", 0) or 0)
+            if min_len > 0:
+                parts.append(f"greater {max(0, min_len - 1)}")
+
+            return "(" + " and ".join(parts) + ")"
+        if self.router_manager.started:
+            capture_filter = build_capture_filter()
+        else:
+            capture_filter = ""
         base_command = [
-            tshark_path, '-l',
-            '-T', 'json',
-            '-V',
-            '-o', 'tcp.desegment_tcp_streams:TRUE'
+            tshark_path, "-l", "-T", "json", "-V",
+            "-o", "tcp.desegment_tcp_streams:TRUE",
+            "-f", capture_filter
         ]
         if not promiscuous:
             base_command.append('-p')
-        started_count = 0
-        for iface_id in interfaces_to_capture:
-            self.logger.log_message(f"[Wireshark] Starting capture on interface {iface_id}...")
-            command = base_command + ['-i', str(iface_id)]
-            try:
-                proc = subprocess.Popen(
-                    command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                self.tshark_procs[iface_id] = proc
-                thread = threading.Thread(target=self._redirect_output, args=(proc, iface_id), daemon=True)
-                self.redirect_threads[iface_id] = thread
-                thread.start()
-                self.logger.log_message(f"[Wireshark] Capture started on interface {iface_id} with PID: {proc.pid}")
-                started_count += 1
-            except Exception as e:
-                self.logger.log_message(f"[Wireshark] Failed to start capture on interface {iface_id}: {e}")
-        return started_count > 0
+        def start_capture():
+            started_count = 0
+            for iface_id in interfaces_to_capture:
+                self.logger.log_message(f"[Wireshark] Starting capture on interface {iface_id}...")
+                command = base_command + ['-i', str(iface_id)]
+                try:
+                    proc = subprocess.Popen(
+                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    self.tshark_procs[iface_id] = proc
+                    thread = threading.Thread(target=self._redirect_output, args=(proc, iface_id), daemon=True)
+                    self.redirect_threads[iface_id] = thread
+                    thread.start()
+                    self.logger.log_message(f"[Wireshark] Capture started on interface {iface_id} with PID: {proc.pid}")
+                    started_count += 1
+                except Exception as e:
+                    self.logger.log_message(f"[Wireshark] Failed to start capture on interface {iface_id}: {e}")
+            return started_count > 0
+
+        if self.router_manager.started:
+            self.logger.log_message(f"[Wireshark] Parallel Capture started")
+            funcs = []
+            def capture_helper(iface_id):
+                self.logger.log_message(f"[Wireshark] Starting capture on interface {iface_id}...")
+                command = base_command + ['-i', str(iface_id)]
+                try:
+                    proc = subprocess.Popen(
+                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    self.tshark_procs[iface_id] = proc
+                    thread = threading.Thread(target=self._redirect_output, args=(proc, iface_id), daemon=True)
+                    self.redirect_threads[iface_id] = thread
+                    thread.start()
+                    self.logger.log_message(
+                        f"[Wireshark] Capture started on interface {iface_id} with PID: {proc.pid}")
+                except Exception as e:
+                    self.logger.log_message(f"[Wireshark] Failed to start capture on interface {iface_id}: {e}")
+            started_count = 0
+            for iface_id in interfaces_to_capture:
+                funcs.append((capture_helper, (iface_id,)))
+                started_count +=1
+            self.router_manager.parallel_python.increase_ram_usage(5000)
+            self.router_manager.parallel_python.run_all_parallel(funcs,
+                                                             return_type="void")
+            return started_count
+        else:
+            return start_capture()
 
     def stop_capture(self):
         if not self.tshark_procs:
@@ -3286,10 +3586,168 @@ class WiresharkManager:
         self.tshark_procs.clear()
         self.redirect_threads.clear()
 
+    def _as_int(self, x: Any, default: Optional[int] = None) -> Optional[int]:
+        try:
+            return int(str(x))
+        except Exception:
+            return default
+
+    def _hexdump_to_bytes(self, hex_like: str) -> Optional[bytes]:
+        """
+        tshark often gives hex with colons 'xx:xx:...', or sometimes plain hex.
+        This cleans and converts to bytes.
+        """
+        if not hex_like:
+            return None
+        try:
+            s = "".join(ch for ch in hex_like if ch in "0123456789abcdefABCDEF")
+            if len(s) % 2 != 0:
+                # pad if odd
+                s = s[:-1]
+            return bytes.fromhex(s)
+        except Exception:
+            return None
+
+    def _get_ip_pair(self, layers: Dict[str, Any]) -> tuple[str, str, str]:
+        """
+        Returns (version, src, dst) where version is 'ipv4', 'ipv6', or 'none'
+        """
+        if "ip" in layers:
+            ip_l = layers["ip"]
+            return "ipv4", ip_l.get("ip.src", "N/A"), ip_l.get("ip.dst", "N/A")
+        if "ipv6" in layers:
+            v6 = layers["ipv6"]
+            return "ipv6", v6.get("ipv6.src", "N/A"), v6.get("ipv6.dst", "N/A")
+        return "none", "N/A", "N/A"
+
+    def _build_scapy_from_tshark(self, layers: Dict[str, Any]) -> Optional[Packet]:
+        """
+        Best-effort Scapy reconstruction from tshark JSON.
+        Supports: Ether (if present), IPv4/IPv6 + TCP/UDP, ICMPv6 echo, and Raw payloads.
+        """
+        eth = layers.get("eth", {})
+        eth_src = eth.get("eth.src")
+        eth_dst = eth.get("eth.dst")
+
+        ipver, src_ip, dst_ip = self._get_ip_pair(layers)
+
+        # Decide payload (Raw) source: prefer L4 payload keys, else generic data/data-text-lines
+        raw_bytes = None
+        # TCP payload as hex
+        if "tcp" in layers and "tcp.payload" in layers["tcp"]:
+            raw_bytes = self._hexdump_to_bytes(layers["tcp"]["tcp.payload"])
+        # UDP payload as hex
+        if raw_bytes is None and "udp" in layers and "udp.payload" in layers["udp"]:
+            raw_bytes = self._hexdump_to_bytes(layers["udp"]["udp.payload"])
+        # tshark generic data
+        if raw_bytes is None and "data" in layers and isinstance(layers["data"].get("data.data"), str):
+            raw_bytes = self._hexdump_to_bytes(layers["data"]["data.data"])
+        # data-text-lines (strings → bytes)
+        if raw_bytes is None and "data-text-lines" in layers:
+            dtl = layers["data-text-lines"]
+            if isinstance(dtl, list):
+                dtl = "\n".join(dtl)
+            if isinstance(dtl, str):
+                try:
+                    raw_bytes = dtl.encode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+        l4_layer = None
+
+        # Transport build
+        if "tcp" in layers:
+            tcp = layers["tcp"]
+            sport = self._as_int(tcp.get("tcp.srcport"), 0) or 0
+            dport = self._as_int(tcp.get("tcp.dstport"), 0) or 0
+            l4_layer = TCP(sport=sport, dport=dport)
+            if raw_bytes:
+                l4_layer = l4_layer / Raw(load=raw_bytes)
+
+        elif "udp" in layers:
+            udp = layers["udp"]
+            sport = self._as_int(udp.get("udp.srcport"), 0) or 0
+            dport = self._as_int(udp.get("udp.dstport"), 0) or 0
+            l4_layer = UDP(sport=sport, dport=dport)
+            if raw_bytes:
+                l4_layer = l4_layer / Raw(load=raw_bytes)
+
+        elif "icmpv6" in layers:
+            ic6 = layers["icmpv6"]
+            t = self._as_int(ic6.get("icmpv6.type"), -1)
+            # Echo req/rep most common
+            if t == 128:  # Echo Request
+                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
+                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
+                l4_layer = ICMPv6EchoRequest(id=ident, seq=seq)
+            elif t == 129:  # Echo Reply
+                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
+                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
+                l4_layer = ICMPv6EchoReply(id=ident, seq=seq)
+            else:
+                if raw_bytes:
+                    l4_layer = Raw(load=raw_bytes)
+
+        else:
+            # No recognizable L4; still attach any raw bytes
+            if raw_bytes:
+                l4_layer = Raw(load=raw_bytes)
+
+        # Build IP/IPv6
+        net = None
+        if ipver == "ipv4":
+            net = IP(src=src_ip, dst=dst_ip)
+        elif ipver == "ipv6":
+            net = IPv6(src=src_ip, dst=dst_ip)
+
+        # Final assembly
+        out = None
+        if eth_src and eth_dst:
+            out = Ether(src=str(eth_src), dst=str(eth_dst))
+            if net is not None:
+                out = out / net
+        else:
+            # No Ether, start from network layer if present
+            out = net if net is not None else None
+
+        if out is None:
+            # Nothing we can confidently build
+            return None
+
+        if l4_layer is not None:
+            out = out / l4_layer
+
+        return out
+
+    def _is_ipv4_broadcast(self, addr: str) -> bool:
+        try:
+            return ipaddress.ip_address(addr) == ipaddress.IPv4Address("255.255.255.255")
+        except Exception:
+            return False
+
+    def _is_multicast_or_llm(self, addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+            if ip.version == 4:
+                # 224.0.0.0/24 and 239.255.255.0/24 are particularly noisy
+                if ip in ipaddress.IPv4Network('224.0.0.0/24'):
+                    return True
+                if ip in ipaddress.IPv4Network('239.255.255.0/24'):
+                    return True
+                if str(ip) == "239.255.255.250":  # SSDP
+                    return True
+                return ip.is_multicast
+            else:
+                # IPv6 link-local multicast
+                return ip.is_multicast and ip.is_link_local
+        except Exception:
+            return False
+
     def _process_packet(self, packet_data: dict | str, interface_id: str) -> None:
-        """Parse a JSON packet dict, enrich it, and push to logger / callback."""
+        """Parse tshark JSON, log/filter like before, THEN wrap into Scapy and pass to router_manager with iface='WireShark'."""
+        yield_no_gil(0.1)
         if not isinstance(packet_data, dict):
-            return  # ignore non‑JSON / malformed
+            return  # ignore non-JSON / malformed
 
         try:
             layers = packet_data.get("_source", {}).get("layers", {})
@@ -3320,60 +3778,92 @@ class WiresharkManager:
             # ----------------------------------------------------------
             #                  Filtering for idle/senseless traffic
             # ----------------------------------------------------------
-            # This filtering logic is now always active within _process_packet.
+            # IPv4 broadcast?
+            if self._is_ipv4_broadcast(dst_ip):
+                self.logger.log_message(
+                    f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}.")
+                return
 
-            # Check for IPv4 multicast/broadcast or IPv6 multicast
+            # Multicast/Link-local multicast/Discovery?
+            dst_is_mcast = self._is_multicast_or_llm(dst_ip)
+            if dst_is_mcast:
+                self.logger.log_message(
+                    f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}.")
+                return
+
+            def _nz(ip: str) -> str:
+                return ip.split("%", 1)[0] if isinstance(ip, str) else ip
+
             try:
-                dst_ip_obj = ipaddress.ip_address(dst_ip)
-
-                # Check for IPv4 broadcast address (255.255.255.255)
-                if isinstance(dst_ip_obj, ipaddress.IPv4Address) and dst_ip_obj == ipaddress.IPv4Address(
-                        '255.255.255.255'):
-                    self.logger.log_message(
-                        f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}.")
-                    return  # Filter this packet
-
-                # Filter common multicast addresses and general link-local multicast/broadcast.
-                if dst_ip_obj.is_multicast:
-                    # Specific common multicast ranges/addresses for discovery protocols (MDNS, SSDP, etc.)
-                    if (isinstance(dst_ip_obj, ipaddress.IPv4Address) and (
-                            dst_ip_obj in ipaddress.IPv4Network('224.0.0.0/24') or  # Link-local multicast, MDNS
-                            dst_ip_obj in ipaddress.IPv4Network('239.255.255.0/24')  # Some SSDP/UPnP
-                    )) or \
-                            (isinstance(dst_ip_obj, ipaddress.IPv6Address) and (
-                                    dst_ip_obj in ipaddress.IPv6Network('ff02::/16')  # Link-local multicast IPv6
-                            )) or \
-                            dst_ip == "239.255.255.250":  # SSDP specific IPv4 multicast
-                        self.logger.log_message(
-                            f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}.")
-                        return  # Filter this packet
+                dst_obj = ipaddress.ip_address(_nz(dst_ip))
             except ValueError:
-                pass  # Not a valid IP, so can't check for multicast/broadcast
+                dst_obj = None
 
-            # Check for common discovery/idle protocol ports (UDP/TCP)
-            # Expanded list of common noisy ports
-            common_noisy_ports = [
-                "5353",  # MDNS
-                "1900",  # SSDP
-                "137",  # NetBIOS Name Service (UDP)
-                "138",  # NetBIOS Datagram Service (UDP)
-                "139",  # NetBIOS Session Service (TCP)
-                "445",  # SMB over TCP (can be noisy on local networks)
-                "520",  # RIP (Routing Information Protocol)
-                "161",  # SNMP (Simple Network Management Protocol)
-                "162",  # SNMP Trap
-                "67",  # DHCP Server (BOOTP Server)
-                "68",  # DHCP Client (BOOTP Client)
-                "546",  # DHCPv6 Client
-                "547",  # DHCPv6 Server
-                "5678",  # UPnP (some implementations)
-                "5679",  # UPnP (some implementations)
-                "3702",  # WS-Discovery (Web Services Dynamic Discovery)
-                "5355"  # LLMNR (Link-Local Multicast Name Resolution)
-            ]
+            def _is_loopback_addr(ip: str) -> bool:
+                import ipaddress
+                try:
+                    return ipaddress.ip_address(_nz(ip)).is_loopback
+                except Exception:
+                    return False
+            # Drop MLD/ND noise: ff02::/16 multicast and solicited-node ff02::1:ff00:0/104
+            if "icmpv6" in layers and dst_obj and dst_obj.is_multicast:
+                # Common ICMPv6 types to suppress: 130-143 (MLD), 133-137 (ND/RA/RS/NS/NA)
+                self.logger.log_message(
+                    f"[Wireshark Filter] Filtering ICMPv6 multicast to {dst_ip} on interface {interface_id}."
+                )
+                return
+            if _is_loopback_addr(src_ip) and _is_loopback_addr(dst_ip):
+                # optional: lightweight log or counter
+                self.logger.log_message(f"[Wireshark] Skipping local loopback packet {src_ip} -> {dst_ip}")
+                return  # 🚫 do not forward or “send via Scapy”
 
-            # Convert ports to integers for direct comparison if needed, but tshark output is string
-            # So keep as strings for comparison with dictionary values.
+            if self.router_manager.started and src_ip == dst_ip:
+                # 💡 This packet is addressed to itself. We need to check if it's a case
+                # that requires processing (like private/link-local traffic).
+                is_legitimate_loopback = False
+                try:
+                    ip_obj = ipaddress.ip_address(src_ip)
+
+                    # This is the check: is the address private, link-local, or standard loopback?
+                    if ip_obj.is_private or ip_obj.is_link_local or ip_obj.is_loopback:
+                        is_legitimate_loopback = True
+
+                except ValueError:
+                    # If it's not a valid IP address, we'll treat it as not legitimate.
+                    is_legitimate_loopback = False
+
+                if is_legitimate_loopback:
+                    self.logger.log_message(
+                        f"[Wireshark] 💧 Dropping loopback public IP packet: {src_ip} -> {dst_ip}"
+                    )
+                    return
+                else:
+                    # 🚫 This is a self-addressed packet using a public IP. Drop it.
+                    self.logger.log_message(
+                        f"[Wireshark] 💧 Dropping suspicious self-addressed public IP packet: {src_ip} -> {dst_ip}"
+                    )
+                    return  # Stop processing immediately
+            if self.router_manager.started:
+                link_local_ip_bare = self.router_manager.router_ipv6_link_local_out.split('%')[0]
+                if dst_ip == link_local_ip_bare or src_ip == link_local_ip_bare:
+                    self.logger.log_message(
+                        f"[Wireshark] 💧 Dropping packet to our own link-local address: {dst_ip}"
+                    )
+                    return # Stop processing immediately
+            # 0) Fast path: skip non-IP frames entirely (prevents N/A logs)
+            has_ip4 = "ip" in layers
+            has_ip6 = "ipv6" in layers
+            if not (has_ip4 or has_ip6):
+                return
+
+            # from here on, it is safe to assume we have IPv4 or IPv6
+            ip_layer = layers.get("ip") or layers.get("ipv6")
+            src_ip = ip_layer.get("ip.src", ip_layer.get("ipv6.src", "N/A"))
+            # Common noisy ports
+            common_noisy_ports = {
+                "5353", "1900", "137", "138", "139", "445", "520", "161", "162",
+                "67", "68", "546", "547", "5678", "5679", "3702", "5355","22222"
+            }
 
             if "udp" in layers:
                 udp_layer = layers["udp"]
@@ -3382,7 +3872,7 @@ class WiresharkManager:
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
                     self.logger.log_message(
                         f"[Wireshark Filter] Filtering Discovery/Idle UDP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}.")
-                    return  # Filter this packet
+                    return
 
             if "tcp" in layers:
                 tcp_layer = layers["tcp"]
@@ -3391,7 +3881,7 @@ class WiresharkManager:
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
                     self.logger.log_message(
                         f"[Wireshark Filter] Filtering Discovery/Idle TCP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}.")
-                    return  # Filter this packet
+                    return
 
             # ----------------------------------------------------------
             #                  Contextual / VPN tagging
@@ -3410,7 +3900,7 @@ class WiresharkManager:
                     self.vpn_interface_id is not None and
                     not _is_private(dst_ip)
             ):
-                context_tags.append("via‑VPN‑out")
+                context_tags.append("via-VPN-out")
 
             # 2) Traffic already on VPN adapter
             if interface_id == self.vpn_interface_id:
@@ -3419,7 +3909,7 @@ class WiresharkManager:
                 elif not _is_private(src_ip) and _is_private(dst_ip):
                     context_tags.append("WAN→VPN")  # ingress before decryption
                 else:
-                    context_tags.append("VPN‑internal")
+                    context_tags.append("VPN-internal")
 
             # ----------------------------------------------------------
             #               Transport & service lookup
@@ -3454,7 +3944,7 @@ class WiresharkManager:
             )
 
             # ----------------------------------------------------------
-            #              Application‑layer quick peeks
+            #              Application-layer quick peeks
             # ----------------------------------------------------------
             if "http" in layers:
                 http = layers["http"]
@@ -3484,37 +3974,32 @@ class WiresharkManager:
                     f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}")
 
             # ----------------------------------------------------------
-            #           Optional reassembled payload preview (TCP)
+            #           Optional reassembled payload preview (TCP/UDP)
             # ----------------------------------------------------------
             raw_payload_hex_str = None
             if tcp_layer and tcp_layer.get("tcp.payload"):
                 raw_payload_hex_str = tcp_layer["tcp.payload"].replace(":", "")
+            elif "udp" in layers and layers["udp"].get("udp.payload"):
+                raw_payload_hex_str = layers["udp"]["udp.payload"].replace(":", "")
             elif "data-text-lines" in layers:
-                # TShark sometimes puts reassembled data here, might not be hex string
                 reassembled = layers["data-text-lines"]
-                if isinstance(reassembled, list): # data-text-lines can be an array of lines
+                if isinstance(reassembled, list):
                     reassembled = "\n".join(reassembled)
-
-                # Attempt to convert to bytes if it's not already binary and get hex
                 try:
                     raw_payload_hex_str = reassembled.encode('utf-8', errors='ignore').hex()
                 except Exception:
-                    raw_payload_hex_str = None # Couldn't convert to hex from this source
+                    raw_payload_hex_str = None
 
             if raw_payload_hex_str:
-                # Truncate raw hex for logging
                 truncated_hex_display = raw_payload_hex_str[:128] + ("..." if len(raw_payload_hex_str) > 128 else "")
                 self.logger.log_message(f"[Payload-Wireshark] 📦 Raw payload (hex): {truncated_hex_display}...")
 
-                # Attempt to decode to human-readable string
                 try:
-                    # Convert hex string to bytes, then decode
                     payload_bytes = bytes.fromhex(raw_payload_hex_str)
                     decoded_payload = payload_bytes.decode('utf-8', errors='replace')
 
-                    # Heuristic for human-readability (same as in TransportLayerManager)
                     replacement_char_count = decoded_payload.count('\ufffd')
-                    printable_char_count = sum(1 for char in decoded_payload if char in string.printable)
+                    printable_char_count = sum(1 for ch in decoded_payload if ch in string.printable)
 
                     is_human_readable = True
                     if len(decoded_payload) > 0:
@@ -3522,20 +4007,67 @@ class WiresharkManager:
                             is_human_readable = False
                         elif printable_char_count / len(decoded_payload) < 0.50:
                             is_human_readable = False
-                    elif len(payload_bytes) > 0: # If decoded_payload is empty but payload has content, it's not readable
+                    elif len(payload_bytes) > 0:
                         is_human_readable = False
 
                     if is_human_readable and len(decoded_payload.strip()) > 0:
                         self.logger.log_message(f"[Payload-Wireshark] 📝 Decoded payload: {decoded_payload}")
                     else:
                         self.logger.log_message("[Payload-Wireshark] ⚠️ Decoded payload not considered human-readable.")
-
-                except UnicodeDecodeError: # Less likely with errors='replace', but good to catch
+                except UnicodeDecodeError:
                     self.logger.log_message("[Payload-Wireshark] ⚠️ Could not decode payload as UTF-8.")
                 except Exception as e:
                     self.logger.log_message(f"[Payload-Wireshark] ❌ Error processing/decoding payload: {e}")
             else:
                 self.logger.log_message(f"[Payload-Wireshark] 📦 No reassembled payload data found.")
+
+            # ----------------------------------------------------------
+            #                 NEW: build Scapy & dispatch
+            # ----------------------------------------------------------
+            try:
+                if self.router_manager.started:
+                    scapy_pkt = self._build_scapy_from_tshark(layers)
+                    if scapy_pkt is None:
+                        # Nothing we could reconstruct; still bail gracefully
+                        self.logger.log_message("[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON.")
+                        return
+
+                    # Hand off to your router with inbound iface set to "WireShark"
+                    try:
+                        if self.router_manager.started and (
+                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
+                                    src_ip)) or
+                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(dst_ip))
+                        ):
+                            if self.router_manager.router_ip_out in str(
+                                    src_ip) and self.router_manager.router_ip_out in str(dst_ip):
+                                self.logger.log_message(
+                                    "[Wireshark-Process] Skipping Routers self forward")
+                                return
+                            try:
+                                if self.router_manager.router_ip_out in str(dst_ip):
+                                    self.logger.log_message(
+                                        "[Wireshark-Process] 🪈 Sending Routers own packet via Scapy through PYPIPE")
+                                    # Prefer (pkt, iface) signature if your router supports it
+                                    self.router_manager.hyperv_manager.send_packet(bytes(scapy_pkt))
+                                else:
+                                    self.logger.log_message(
+                                        "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark.")
+                                    # Prefer (pkt, iface) signature if your router supports it
+                                    self.router_manager.process_packet(scapy_pkt, "WireShark")
+                            except TypeError:
+                                # Fallback to single-arg call if that’s your router’s API
+                                self.router_manager.hyperv_manager.send_packet(bytes(scapy_pkt))
+                            return
+                        self.logger.log_message(
+                            "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark.")
+                        # Prefer (pkt, iface) signature if your router supports it
+                        self.router_manager.process_packet(scapy_pkt, "WireShark")
+                    except TypeError:
+                        # Fallback to single-arg call if that’s your router’s API
+                        self.router_manager.process_packet(scapy_pkt)
+            except Exception as e:
+                self.logger.log_message(f"[Wireshark-Process] ❌ Scapy build/dispatch error: {e}")
 
         except Exception as e:
             self.logger.log_message(

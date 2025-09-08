@@ -27,7 +27,7 @@ from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6EchoRequest, ICMPv6TimeExceeded, \
     ICMPv6ParamProblem, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6Unknown, ICMPv6PacketTooBig, IPv6ExtHdrHopByHop, ICMPv6ND_RA, \
     ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo, ICMPv6ND_RS, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment, \
-    getmacbyip6
+    getmacbyip6, ICMPv6NDOptUnknown
 from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
 from scapy.libs.rfc3961 import Key
 from scapy.packet import Packet, Raw, NoPayload
@@ -1303,7 +1303,7 @@ class ESPManager:
 
         # (We do NOT change IP src/dst; checksums not touched)
         self.log.log_message(f"{note} {self._five_tuple_str(fwd)} via {egress.split('_')[-1]}")
-        self.pw.queue_packet(fwd, egress)
+        self.pw._send_raw_packet(fwd, egress, allow_dst_ours=True)
         return True
 
     def _deliver_to_lan(self, pkt, entry: dict, router_ifaces: dict, note: str) -> bool:
@@ -1321,7 +1321,7 @@ class ESPManager:
                 out[Ether].dst = lan_mac
         # (Keep IP headers unchanged)
         self.log.log_message(f"{note} {self._five_tuple_str(out)} via {lan_if.split('_')[-1]}")
-        self.pw.queue_packet(out, lan_if)
+        self.pw._send_raw_packet(out, lan_if, allow_dst_ours=True)
         return True
 
     # -------------------------
@@ -3400,7 +3400,7 @@ class TransportHTTPSManager:
         flow_cache_ttl: int = FLOW_TTL_SEC,
         flow_cache_max: int = FLOW_SOFT_MAX,
         log_packet_prefix: bool = True,        # NEW: scapy-like prefix
-        detect_quic_udp443: bool = True        # NEW: QUIC over UDP
+        detect_quic_udp443: bool = True,        # NEW: QUIC over UDP
     ):
         self.logger = logger
         self.detect_non443_tls = bool(detect_non443_tls)
@@ -3439,7 +3439,6 @@ class TransportHTTPSManager:
             "sslv2_seen": 0,              # NEW
             "sslv2_handshake_labeled": 0, # NEW
         }
-
         self._peek_tcp_meta_cached = None  # per-handle cache
         self._safe_log("[Transport][🔒 HTTPS] Manager ready")
 
@@ -4377,7 +4376,6 @@ class TransportMoneroManager:
                     f"[Transport][🪙 Monero] ⛔ DENY {flow['type'].upper()} "
                     f"{src}:{sport} -> {dst}:{dport} | {reason}"
                 )
-
             self._cleanup_idle(now)
             return decision
         except Exception:
@@ -5802,7 +5800,7 @@ class TransportSSDPManager:
     _XML_FETCH_TIMEOUT = 2.0              # seconds
     _XML_FETCH_MAX = 200_000              # bytes
     _ENRICH_THREADS = 2                   # small/quiet
-    _PER_SRC_RATE = (10.0, 20)            # 10 logs/sec, burst 20
+    _PER_SRC_RATE = (0.5, 0.5)            # 10 logs/sec, burst 20
     _PER_USN_RATE = (2.0, 4)              # 2 logs/sec per USN, burst 4
     _RELOG_DEBOUNCE = 15.0                # don't re-log same USN too often
 
@@ -6325,6 +6323,10 @@ class TransportDNSManager:
         self._pending: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
 
         self._last_gc = time.time()
+        self._tcp_buf: Dict[Tuple[str, int, str, int], Dict[str, Any]] = {}
+        self._tcp_buf_ttl_sec = 60  # flush idle TCP streams after 60s
+        self._tcp_buf_hard_cap = 1 << 20  # 1 MiB safety cap per-flow
+        self._last_tcp_gc = time.time()
         self.log.log_message("[Transport][🔎 DNS] Manager ready.")
 
     # ---------- Public entry point ----------
@@ -6481,23 +6483,94 @@ class TransportDNSManager:
                 self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] {self._fmt_rr(rr)}")
                 shown += 1
 
-    # ---------- Utilities ----------
+    def handle_tcp_segment(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        """
+        DNS over TCP reassembler. Consumes Raw TCP bytes, peels 2-byte length-prefixed DNS
+        messages, and logs via existing query/response paths. Returns True if any DNS message handled.
+        """
+        if TCP is None or DNS is None or Raw is None:
+            return False
+        if not packet.haslayer(TCP) or not packet.haslayer(Raw):
+            return False
+        if sport != 53 and dport != 53:
+            return False
 
-    def _extract_questions(self, dns: Any) -> Tuple[List[str], List[str]]:
-        names: List[str] = []
-        types: List[str] = []
-        try:
-            qdcount = int(getattr(dns, "qdcount", 0))
-            qd = getattr(dns, "qd", None)
-            # scapy represents multiple questions as a chained/stacked DNSQR list
-            for i, qr in enumerate(self._iter_qr(qd, qdcount)):
-                name = self._safe_name(getattr(qr, "qname", b""))
-                qtype = int(getattr(qr, "qtype", 0))
-                names.append(name)
-                types.append(self._QT.get(qtype, str(qtype)))
-        except Exception:
-            pass
-        return names, types
+        seg = bytes(packet[Raw].load or b"")
+        if not seg:
+            return False
+
+        key = (src_ip, sport, dst_ip, dport)
+        entry = self._tcp_buf.get(key)
+        if entry is None:
+            entry = {"buf": bytearray(), "ts": time.time()}
+            self._tcp_buf[key] = entry
+
+        buf = entry["buf"]
+        buf.extend(seg)
+        entry["ts"] = time.time()
+
+        # Hard cap per flow to avoid unbounded memory in pathological cases
+        if len(buf) > self._tcp_buf_hard_cap:
+            # Drop the flow buffer; log once and move on
+            self._tcp_buf.pop(key, None)
+            self.log.log_message("[Transport][🧵 TCP][🔎 DNS]F buffer overflow; dropping flow state")
+            return False
+
+        handled_any = False
+
+        # Peel off as many complete messages as present
+        while True:
+            if len(buf) < 2:
+                break
+            msg_len = (buf[0] << 8) | buf[1]
+            if msg_len <= 0:
+                # Defensive: discard length header and continue
+                del buf[:2]
+                continue
+            if len(buf) < 2 + msg_len:
+                break
+
+            payload = bytes(buf[2:2 + msg_len])
+            del buf[:2 + msg_len]
+
+            # Parse one DNS message
+            try:
+                dns = DNS(payload)
+            except Exception:
+                # Skip silently if not valid DNS
+                continue
+
+            handled_any = True
+
+            # Direction/proto info
+            proto = "tcp"
+            iface = inbound_iface.split("_")[-1]
+            txid = int(getattr(dns, "id", 0))
+            qr = int(getattr(dns, "qr", 0))  # 0=query, 1=response
+
+            if qr == 0:
+                # ---- QUERY ----
+                qnames, qtypes = self._extract_questions(dns)
+                self._log_query(iface, src_ip, sport, dst_ip, dport, txid, proto, dns, qnames, qtypes)
+                if qnames:
+                    pend_key = (src_ip, sport, txid, proto)
+                    self._pending[pend_key] = {
+                        "ts": time.time(),
+                        "names": qnames,
+                        "types": qtypes,
+                        "server": dst_ip,
+                    }
+            else:
+                # ---- RESPONSE ---- (reverse key to match original client tuple)
+                pend_key = (dst_ip, dport, txid, proto)
+                pend = self._pending.pop(pend_key, None)
+                latency_ms = int((time.time() - pend["ts"]) * 1000) if pend else None
+                self._log_response(iface, src_ip, sport, dst_ip, dport, txid, proto, dns, latency_ms)
+
+        # Periodic GC of old flow buffers
+        self._tcp_buf_gc()
+
+        return handled_any
 
     def _preview_qname(self, dns: Any) -> str:
         try:
@@ -6510,6 +6583,58 @@ class TransportDNSManager:
             pass
         return "-"
 
+    def _tcp_buf_gc(self):
+        now = time.time()
+        if now - self._last_tcp_gc < 10:  # run every ~10s
+            return
+        expired = []
+        for k, v in self._tcp_buf.items():
+            if now - v.get("ts", 0) > self._tcp_buf_ttl_sec:
+                expired.append(k)
+        for k in expired:
+            self._tcp_buf.pop(k, None)
+        if expired:
+            self.log.log_message(f"[Transport][🧵 TCP][🔎 DNS] 🧹 GC expired {len(expired)} stream buffers")
+        self._last_tcp_gc = now
+
+    def _extract_questions(self, dns: Any) -> Tuple[List[str], List[str]]:
+        """
+        Extract all question names and qtypes from a DNS packet.
+        Returns (names, types) where both are lists of strings.
+        """
+        names: List[str] = []
+        types: List[str] = []
+        try:
+            qdcount = int(getattr(dns, "qdcount", 0))
+            qd = getattr(dns, "qd", None)
+
+            # scapy represents multiple questions as a chain of DNSQR payloads
+            cur = qd
+            seen = 0
+            while cur is not None and seen < qdcount:
+                # Name
+                qname = getattr(cur, "qname", b"")
+                if isinstance(qname, (bytes, bytearray)):
+                    name = qname.decode("utf-8", errors="ignore").rstrip(".")
+                else:
+                    name = str(qname).rstrip(".")
+                names.append(name or ".")
+
+                # QTYPE
+                qtype = int(getattr(cur, "qtype", 0))
+                types.append(self._QT.get(qtype, str(qtype)))
+
+                # Advance
+                cur = getattr(cur, "payload", None)
+                if cur is qd:  # defensive guard against cycles
+                    break
+                if not isinstance(cur, DNSQR):
+                    break
+                seen += 1
+        except Exception:
+            # swallow parse errors, return what we got
+            pass
+        return names, types
     def _extract_edns(self, dns: Any) -> Optional[Dict[str, Any]]:
         """
         Look for OPT (type 41) in additional; return {'size': int, 'do': bool} if present.
@@ -9331,7 +9456,6 @@ class TransportWireGuardManager:
             handled = True
         else:
             handled = False
-
         self._gc()
         return handled
 
@@ -9433,8 +9557,8 @@ class TransportWSDiscoveryManager:
     WSD_PORTS = {3702}
     BYTES_BUDGET = 4096  # scan at most this many bytes from payload
     FP_PREFIX_BYTES = 48  # for tiny content fingerprint
-    LOG_RPS = 2.0  # average logs per second allowed globally
-    LOG_BURST = 30  # global burst capacity
+    LOG_RPS = 0.1  # average logs per second allowed globally
+    LOG_BURST = 1  # global burst capacity
     FLOW_COOLDOWN_S = 10.0  # min seconds between logs for the same 5-tuple
     FLOW_TRACK_MAX = 20000  # soft cap for cooldown map
     GC_PERIOD_S = 60.0  # housekeeping cadence
@@ -10347,7 +10471,7 @@ class TransportManager:
     TLS dissection is performed passively by TLSRecordManager using TCP Raw bytes.
     """
 
-    def __init__(self, router_logger, packet_signer, code_output_manager, parallel_python):
+    def __init__(self, router_logger, packet_signer, code_output_manager, parallel_python, packet_writer):
         """
         Initializes the TransportManager with a logger and a packet signer.
         """
@@ -10382,6 +10506,7 @@ class TransportManager:
             51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
             80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
         }
+        self.packet_writer = packet_writer
         self.transport_dhcp = TransportDHCPManager(self.logger)
         self.transport_dns = TransportDNSManager(self.logger)
         self.transport_mdns = TransportMDNSManager(self.logger)
@@ -10605,6 +10730,7 @@ class TransportManager:
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
             ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
+            ([53], self._handle_dns_tcp_packet),
             ([22], self._handle_ssh_packet),
             ([21], self._handle_ftp_packet),
             ([88], self._handle_kerberos_packet),
@@ -10633,6 +10759,8 @@ class TransportManager:
 
         if handler:
             handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+            self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
+            return True
         else:
             self.code_output_manager.submit_packet(
                 packet, inbound_iface=iface_short, phase="tls-feed", component="tcp"
@@ -10641,11 +10769,15 @@ class TransportManager:
                 self.logger.log_message(
                     f"[Transport][🧵 TCP][❔ Undecoded] Unknown TCP protocol on ports {sport} → {dport}."
                 )
+                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
+            return True
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles Monero P2P traffic on port 18080."""
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    def _handle_dns_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, iface_short)
     def _handle_files_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """
         SMB/NetBIOS (445/139) and Apple Lockdown (62078).
@@ -10701,41 +10833,39 @@ class TransportManager:
         # Handle packets with extension headers that were permitted by the firewall
         if isinstance(transport_layer, TCP):
             yield_no_gil(0.2)
-            self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
-                                      return_type="void", queue_name="transport_tcp_packets")
             self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20,
+                                              return_type="void",
                                               queue_name="transport_inspect_tcp_packets")
             self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20,
+                                              return_type="void",
                                               queue_name="transport_scrape_tcp_packets")
-            return True
+            return self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
+                                      return_type="bool", queue_name="transport_tcp_packets")
         elif isinstance(transport_layer, UDP):
             yield_no_gil(0.2)
-            self.parallel_python.run_parallel(self._handle_udp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
-                                      return_type="void", queue_name="transport_udp_packets")
             self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20,
+                                              return_type="void",
                                               queue_name="transport_inspect_udp_packets")
             self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
-                                              return_type="all", count_to_call=20,
+                                              return_type="void",
                                               queue_name="transport_scrape_udp_packets")
-            return True
+            return self.parallel_python.run_parallel(self._handle_udp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
+                                      return_type="bool", queue_name="transport_udp_packets")
 
         handled = self.transport_ipv6.handle(packet, inbound_iface)
         if handled:
             self.code_output_manager.submit_packet(
                 packet, inbound_iface=inbound_iface, phase="handled", component="transport-ipv6"
             )
-            return True
+            return False
         return False
 
     def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
@@ -10749,16 +10879,16 @@ class TransportManager:
             ([137], self._handle_nbns_packet),
             ([138], self._handle_nbds_packet),
             ([67, 68], self._handle_dhcp_packet),
+            ([51820, 88, 59385], self._handle_wireguard_packet),
             ([443], self._handle_quic_packet),
             ([123], self._handle_ntp_packet),
             ([69], self._handle_tftp_packet),
             ([88], self._handle_kerberos_packet),
             ([5060], self._handle_sip_packet),
             ([9993, 19300], self._handle_overlay_packet),
-            ([51820, 88], self._handle_wireguard_packet),
             ([1900], self._handle_ssdp_packet),
             ([3702], self._handle_ws_discovery_packet),
-            ([19337], self._handle_rtp_packet),
+            ([19337, 19307], self._handle_rtp_packet),
             ([20000, 47808], self._handle_scada_udp_packet),
             ([(27000, 27100), 4380, 27036, 27037], self._handle_udp_steam_packet),
             ([(49152, 65535), 3478, 5349], self._handle_udp_ephemeral_packet),
@@ -10782,14 +10912,26 @@ class TransportManager:
                 break
 
         if handler:
-            handler(packet, src_ip, dst_ip, sport, dport, iface_short)
-            return
+            if handler == self._handle_ws_discovery_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
+
+                return True
+            elif handler == self._handle_ssdp_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
+
+                return True
+            else:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
+                return True
 
         # RTP/VoIP dynamic range as a fallback
         try:
             if sport in self.voip_port_range or dport in self.voip_port_range:
                 self._handle_rtp_packet(packet, src_ip, dst_ip, sport, dport, iface_short)
-                return
+                return True
         except Exception:
             # If voip_port_range isn’t iterable (e.g., misconfigured), just skip
             pass
@@ -10799,6 +10941,8 @@ class TransportManager:
         self.logger.log_message(
             f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {sport} → {dport}."
         )
+        self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
+        return True
 
     # ---------------------- UDP protocol handlers ---------------------
     def _bytes_to_str(self, data: bytes) -> str:
@@ -11942,10 +12086,46 @@ class PacketWriter:
     A self-contained class that sends Layer 2 network packets on a dedicated
     thread using a queue.
     """
-
+    TOKEN_BUCKET_CAPACITY = 4  # Allows bursts of up to 20 packets
+    TOKEN_REFILL_RATE_HZ = 6  # Sustainable rate of 100 packets per second
     # --- MAC normalization helpers ---
     _HEX = "0123456789abcdef"
 
+    class TokenBucketManager:
+        """Manages token buckets for rate limiting on a per-key basis (e.g., per IP)."""
+
+        def __init__(self, capacity: int, refill_rate: float, logger):
+            self.capacity = capacity  # Max tokens in a bucket
+            self.refill_rate = refill_rate  # Tokens added per second
+            self.buckets = {}  # key -> {"tokens": float, "last_refill": float}
+            self.lock = threading.Lock()
+            self.logger = logger
+
+        def consume(self, key: str) -> bool:
+            """
+            Attempts to consume one token for a given key. Returns True if successful,
+            False if the bucket is empty (rate limit exceeded).
+            """
+            with self.lock:
+                now = time.time()
+                bucket = self.buckets.setdefault(key, {
+                    "tokens": self.capacity,
+                    "last_refill": now
+                })
+
+                # Refill tokens based on elapsed time
+                elapsed = now - bucket["last_refill"]
+                refill_amount = elapsed * self.refill_rate
+                bucket["tokens"] = min(self.capacity, int(bucket["tokens"] + refill_amount))
+                bucket["last_refill"] = now
+
+                # Check if there are enough tokens to consume
+                if bucket["tokens"] >= 1.0:
+                    bucket["tokens"] -= 1.0
+                    return True
+                else:
+                    # Not enough tokens, rate limit is active
+                    return False
     @staticmethod
     def _normalize_mac(mac) -> Optional[str]:
         """
@@ -12109,11 +12289,14 @@ class PacketWriter:
 
         # If dst was something else invalid, fail
         return False
-    def __init__(self, logger, interfaces_config, packet_signer, outbound_load_balancer, arp_manager= None):
+
+
+    def __init__(self, logger, interfaces_config, packet_signer, outbound_load_balancer, arp_manager= None,ndp_manager= None):
         """
         Initializes the PacketWriter.
         The interface map is now populated by calling the update_interfaces method.
         """
+
         self.logger = logger
         self.packet_signer = packet_signer
         self.sniffer = None
@@ -12125,13 +12308,18 @@ class PacketWriter:
         self.arp_manager = arp_manager
         # This map will be populated by the new update_interfaces method
         self.iface_map = {}
-
+        self.ndp_manager = ndp_manager
         # Destination throttling
         self.packet_writing_table = defaultdict(lambda: {
             "timestamps": deque(maxlen=10),
             "last_sent": 0,
             "count": 0
         })
+        self.rate_limiter = self.TokenBucketManager(
+            capacity=self.TOKEN_BUCKET_CAPACITY,
+            refill_rate=self.TOKEN_REFILL_RATE_HZ,
+            logger=self.logger
+        )
         self.SEND_RATE_LIMIT_HZ = 10
         self.logger.log_message("[PacketWriter] Initialized.")
 
@@ -12147,7 +12335,6 @@ class PacketWriter:
 
         # Clear the old map
         self.iface_map.clear()
-
         # Rebuild the map from the new configuration
         for system_name, config_dict in self._interfaces_config.items():
             friendly_name = config_dict.get('friendly_name')
@@ -12173,13 +12360,16 @@ class PacketWriter:
                 continue
         self.logger.log_message("[PacketWriter] Worker thread has stopped.")
 
-    def _send_raw_packet(self, packet, interface: str):
+    def _send_raw_packet(self, packet, interface: str, allow_dst_ours: bool = False, no_consume: bool = False):
         """
         Uses the sniffer's sendp to send a Layer 2 packet. The 'interface' string
         is now the correct system name, thanks to translation in queue_packet.
         """
+        chosen = False
         if not interface:
-            self.logger.log_message("[PacketWriter] ⚠️ Error: Interface name is not specified.")
+            interface = self.outbound_load_balancer.get_next_interface(packet)
+            self.logger.log_message(f"[PacketWriter] 📤 Choosing early!")
+            chosen = True
             return
         if not packet.haslayer(Ether):
             packet = self._ensure_l2_with_arp_manager(packet, interface)
@@ -12219,14 +12409,29 @@ class PacketWriter:
         dst_ip = packet[IP].dst if IP in packet else packet[IPv6].dst if IPv6 in packet else None
 
         allow_local_dest = bool(getattr(packet, "_pw_allow_local_dest", False))
-        if dst_ip in router_ips and not allow_local_dest:
+        if dst_ip in router_ips and not (allow_local_dest or allow_dst_ours):
             self.logger.log_message(
                 f"[PacketWriter] 🚫 Dropped packet: Destination IP ({dst_ip}) is our own. Summary: {packet.summary()}")
             return
+        if not no_consume:
+            if not self.rate_limiter.consume(dst_ip):
+                self.logger.log_message(f"[PacketWriter] 🚫 Rate limit exceeded for {dst_ip}. Dropping packet.")
+                return
 
         try:
+            if chosen:
+                egress_iface = interface
+            else:
+                egress_iface = self.outbound_load_balancer.get_next_interface(packet)
+            self.logger.log_message(
+                RouterRandomMessages(
+                    name="PacketWriter",
+                    message=f"Sending packet on '{egress_iface}': {packet.summary()}",
+                    emoticons=["📫", "📪", "📬", "📭"]
+                )
+            )
             self.packet_signer.sign_packet(packet)
-            self.sniffer.sendp(packet, iface=interface, verbose=0)
+            self.sniffer.sendp(packet, iface=egress_iface, verbose=0)
         except Exception as e:
             self.logger.log_message(f"[PacketWriter] ❌ Failed to send packet on '{interface}': {e}")
 
@@ -12292,7 +12497,85 @@ class PacketWriter:
         if final_allow_broadcast:
             setattr(out_frame, "_pw_allow_broadcast", True)
 
-        self.queue_packet(out_frame, interface=egress_iface)
+        self._send_raw_packet(out_frame, egress_iface)
+
+    def send_icmp_time_exceeded(self, original_packet, inbound_iface: str):
+        """
+        Constructs and sends an ICMP 'Time Exceeded' message back to the sender.
+
+        This function implements RFC 792 requirements for when a packet's
+        Time-To-Live (TTL) expires. It sends an ICMP Type 11, Code 0 message
+        to the original packet's source.
+
+        Args:
+            original_packet: The full Scapy packet that was discarded due to an
+                             expired TTL.
+            inbound_iface: The friendly or system name of the interface on which
+                           the original_packet was received.
+        """
+        # 1. Validate the original packet to ensure it's eligible for an ICMP error message.
+        if not IP in original_packet:
+            self.logger.log_message(
+                "[PacketWriter] ⚠️ Cannot send ICMP Time Exceeded: Original packet has no IP layer.")
+            return
+
+        if ICMP in original_packet:
+            if original_packet[ICMP].type in [3, 4, 5, 11, 12]:
+                self.logger.log_message(
+                    "[PacketWriter] 🚫 Suppressing ICMP Time Exceeded for an existing ICMP error packet.")
+                return
+
+        original_src_ip = original_packet[IP].src
+        if ipaddress.ip_address(original_src_ip).is_multicast or original_src_ip == "255.255.255.255":
+            self.logger.log_message(f"[PacketWriter] 🚫 Suppressing ICMP Time Exceeded for broadcast/multicast source.")
+            return
+        if ipaddress.ip_address(original_src_ip).is_loopback or original_src_ip == "0.0.0.0":
+            self.logger.log_message(
+                f"[PacketWriter] 🚫 Suppressing ICMP Time Exceeded for invalid source IP {original_src_ip}.")
+            return
+
+        # 2. Determine the source IP for the ICMP reply.
+        # First, try to use the IP of the interface on which the packet arrived (the ideal case).
+        system_inbound_iface = self.iface_map.get(inbound_iface, inbound_iface)
+        iface_config = self._interfaces_config.get(system_inbound_iface)
+        router_src_ip = iface_config.get("ip_addr") if iface_config else None
+
+        # If the inbound interface is not in the config OR it has no IP, synthesize a source IP.
+        if not router_src_ip:
+            log_reason = "is not in the configuration or has no assigned IP"
+            self.logger.log_message(
+                f"[PacketWriter] ⚠️ Inbound iface '{inbound_iface}' {log_reason}. Synthesizing source IP from egress route.")
+
+            # Determine the egress interface for the reply packet by checking the route back.
+            temp_packet_for_routing = IP(dst=original_src_ip)
+            egress_iface_name = self.outbound_load_balancer.get_next_interface(temp_packet_for_routing)
+
+            if not egress_iface_name:
+                self.logger.log_message(
+                    f"[PacketWriter] ❌ Cannot determine egress route to {original_src_ip}. Cannot send ICMP reply.")
+                return
+
+            # Get the IP of that egress interface to use as the source.
+            system_egress_iface = self.iface_map.get(egress_iface_name, egress_iface_name)
+            egress_config = self._interfaces_config.get(system_egress_iface)
+            router_src_ip = egress_config.get("ip_addr") if egress_config else None
+
+            if not router_src_ip:
+                self.logger.log_message(
+                    f"[PacketWriter] ❌ Egress interface '{egress_iface_name}' has no IP. Cannot send ICMP reply.")
+                return
+
+            self.logger.log_message(
+                f"[PacketWriter] ✅ Synthesized source IP {router_src_ip} from egress interface '{egress_iface_name}'.")
+
+        # 3. Construct the ICMP Time Exceeded packet.
+        icmp_payload = original_packet[IP]
+        reply_packet = IP(src=router_src_ip, dst=original_src_ip, ttl=64) / ICMP(type=11, code=0) / icmp_payload
+
+        self.logger.log_message(f"[PacketWriter] ⌛ Sending ICMP Time Exceeded to {original_src_ip} from {router_src_ip}.")
+
+        # 4. Send the packet using the main method that handles routing and L2 framing.
+        self._send_raw_packet(reply_packet,system_inbound_iface )
 
     def start(self):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -12348,6 +12631,61 @@ class PacketWriter:
         except Exception:
             return False
 
+    def get_interface_mac(self, iface_full_name: str) -> str:
+        """
+        Always returns a usable MAC address for the given interface.
+        - Prefers Scapy's get_if_hwaddr()
+        - Falls back to OS interface lists (Windows / netifaces)
+        - Final fallback: generates a deterministic synthetic MAC
+          (locally administered, unicast, stable per interface name)
+        """
+        mac = None
+
+        # --- Try Scapy ---
+        try:
+            from scapy.all import get_if_hwaddr
+            mac = get_if_hwaddr(iface_full_name)
+            if mac and mac.lower() != "00:00:00:00:00:00":
+                return mac.lower()
+        except Exception:
+            pass
+
+        # --- Try Windows API ---
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            for iface in get_windows_if_list():
+                if iface_full_name in (
+                        iface.get("name"), iface.get("win_name"), iface.get("friendlyname"),
+                        iface.get("description"), iface.get("guid")
+                ):
+                    mac = (iface.get("mac") or "").lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac
+        except Exception:
+            pass
+
+        # --- Try netifaces ---
+        try:
+            import netifaces as ni
+            if iface_full_name in ni.interfaces():
+                addrs = ni.ifaddresses(iface_full_name).get(ni.AF_LINK, [{}])
+                if addrs and "addr" in addrs[0]:
+                    mac = addrs[0]["addr"].lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac
+        except Exception:
+            pass
+
+        # --- Last resort: generate a synthetic MAC ---
+        h = abs(hash(iface_full_name)) & 0xFFFFFFFFFFFF
+        fake_mac = "02:%02x:%02x:%02x:%02x:%02x" % (
+            (h >> 32) & 0xFF,
+            (h >> 24) & 0xFF,
+            (h >> 16) & 0xFF,
+            (h >> 8) & 0xFF,
+            h & 0xFF,
+        )
+        return fake_mac
     def _ensure_l2_with_arp_manager(self, packet, final_iface: str):
         """
         If the packet has no Ether layer, create one:
@@ -12365,8 +12703,10 @@ class PacketWriter:
         except Exception:
             src_mac = None
         if not src_mac:
-            self.logger.log_message(f"[PacketWriter] ❌ No interface MAC for '{final_iface}' to synthesize L2.")
-            return None
+            src_mac = self.get_interface_mac(final_iface)
+            if not src_mac:
+                self.logger.log_message(f"[PacketWriter] ❌ No interface MAC for '{final_iface}' to synthesize L2.")
+                return None
 
         dst_mac = None
 
@@ -12411,9 +12751,11 @@ class PacketWriter:
                 if mac6:
                     dst_mac = self._normalize_mac(mac6)
                 else:
-                    self.logger.log_message(
-                        f"[PacketWriter] 🚫 No IPv6 NDP resolver available for {dip6} on {final_iface}.")
-                    return None
+                    dst_mac = self.ndp_manager.resolve(dip6, iface=final_iface)
+                    if dst_mac is None:
+                        self.logger.log_message(
+                            f"[PacketWriter] 🚫 No IPv6 resolver available for {dip6} on {final_iface}.")
+                        return None
         else:
             self.logger.log_message("[PacketWriter] 🚫 No IP/IPv6 layer; cannot synthesize L2.")
             return None
@@ -12426,7 +12768,7 @@ class ForwardingManager:
     a certain threshold has been reached within a timeout period.
     """
 
-    def __init__(self, function_call_tracker, router_logger=None,timeout: int = 5, max_entries: int = 10000, duplicate_threshold: int = 5):
+    def __init__(self, function_call_tracker, router_logger=None,timeout: int = 5, max_entries: int = 10000, duplicate_threshold: int = 20):
         self.logger = router_logger or (lambda x: None)
         self.timeout = timeout
         self.duplicate_threshold = duplicate_threshold  # NEW: Configurable threshold
@@ -12435,7 +12777,7 @@ class ForwardingManager:
         # CHANGED: from a set to a dictionary to store (count, timestamp)
         self._flow_counts: Dict[Tuple, Tuple[int, float]] = {}
         self.ban_duration = 60  # seconds
-        self.max_consecutive_rate = 20  # e.g., more than 10 packets/sec = ban
+        self.max_consecutive_rate = 100  # e.g., more than 10 packets/sec = ban
         self._banned_flows: Dict[Tuple, float] = {}  # flow → ban_expiry_time
         self._lock = threading.Lock()
 
@@ -13110,79 +13452,84 @@ class SYNScanner:
 
 class ICMPManager:
     """
-    Self-contained ICMP/ND/MLD manager.
+    Manages ICMP, Neighbor Discovery (ND), and Multicast Listener Discovery (MLD).
+
+    This self-contained class handles essential control plane protocols for both
+    IPv4 and IPv6, making a router responsive to network diagnostics and state
+    discovery.
 
     Features:
-      • ICMPv4 Echo, common error logging, IPv4 reassembly of router-destined frags,
-        and IPv4 reply fragmentation to fit MTU.
-      • ICMPv6 Echo, DestUnreach, TimeExceeded, ParamProblem, PacketTooBig generation on oversize reply.
-      • IPv6 Neighbor Discovery: learn SLLA/TLLA (even via Unknown TLV), answer NS with NA,
-        answer RS with a minimal RA (if iface config has prefix).
-      • MLDv1 (Query/Report/Done) & MLDv2 (Report type 143) membership tracking with timeout purge.
+      • **ICMPv4**: Echo (ping) reply, common error logging, and robust handling of
+        fragmentation (reassembly of inbound fragments, fragmentation of outbound replies).
+      • **ICMPv6**: Echo reply, generation of essential error messages (Destination
+        Unreachable, Time Exceeded, Packet Too Big), and detailed error logging.
+      • **Neighbor Discovery (IPv6)**: Learns neighbor MAC addresses from Neighbor
+        and Router Solicitations, and responds to solicitations for its own addresses.
+        It can also send basic Router Advertisements.
+      • **MLD (IPv6)**: Tracks multicast group memberships (v1 and v2) based on
+        listener reports, with automatic timeout and purging of stale entries.
 
-    Expected external contracts:
-      - router_logger: has log_message(str) -> None
-      - packet_writer: has queue_packet(Packet, outbound_iface: str) -> None
-      - interfaces_config: dict keyed by interface name -> {
-            "mac": "...",
-            "ip_addr": "v4addr",
-            "ipv6_addr" or "ipv6"/"ip6"/"ip_addr6": "v6addr",
-            "ipv6_prefix": "2001:db8:1::",  # (optional) for RA
-            "mtu": 1500
-        }
+    External Contracts:
+      - `router_logger`: An object with a `log_message(str) -> None` method.
+      - `packet_writer`: An object with a `queue_packet(Packet, outbound_iface: str) -> None` method.
+      - `interfaces_config`: A dictionary mapping interface names to their configuration,
+        including MAC, IP addresses, and MTU.
     """
 
-    # Tunables
-    MLD_MEMBERSHIP_TIMEOUT = 260
-    PURGE_INTERVAL_SEC = 60
-    REASM_TIMEOUT_SEC = 5.0
-    _EIGHT = 8
+    # --- Tunable Constants ---
+    MLD_MEMBERSHIP_TIMEOUT = 260  # Seconds before a multicast group membership expires.
+    PURGE_INTERVAL_SEC = 60  # How often to run the cleanup task.
+    REASM_TIMEOUT_SEC = 5.0  # Seconds before abandoning IPv4 reassembly.
+    _EIGHT = 8  # Constant for IPv4 fragment offset calculation.
 
     def __init__(self, router_logger, packet_writer, interfaces_config: dict, rate_limit_pps: int = 5):
         self.log = router_logger
         self.pw = packet_writer
         self.ifaces = interfaces_config or {}
-
-        # Rate limit Echo-Reply per (src,dst)
         self.rate_limit_pps = rate_limit_pps
+
+        # --- State Management ---
+        # Rate limiting for echo replies, keyed by (src_ip, dst_ip)
         self._last_reply_time = defaultdict(float)
         self._rate_limit_lock = threading.Lock()
 
-        # IPv4 reassembly state
-        # key: (src,dst,proto,id) -> {"first_hdr": IP, "parts": {offset_bytes: bytes}, "total": int|None, "t0": ts, "iface": str}
+        # IPv4 reassembly buffer: key -> {state}
         self._reasm: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
         self._reasm_lock = threading.Lock()
 
-        # IPv6 ND + MLD state
-        # ND neighbor cache: v6 -> { "mac": str, "seen": ts }
+        # IPv6 Neighbor Discovery cache: ipv6_addr -> {"mac": str, "seen": timestamp}
         self.nd_cache: Dict[str, Dict[str, Any]] = {}
-        # MLD membership: (group, iface) -> {"last_report": ts, "mode": "include"/"exclude", "sources": set()}
+
+        # MLD membership table: (group_addr, iface_name) -> {state}
         self._mld_groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._mld_lock = threading.Lock()
 
-        # Purge thread
-        self._stop = threading.Event()
-        self._purger = threading.Thread(target=self._purge_loop, daemon=True, name="ICMPPurger")
-        self._purger.start()
+        # --- Background Purge Thread ---
+        self._stop_event = threading.Event()
+        self._purge_thread = threading.Thread(target=self._purge_loop, daemon=True, name="ICMPPurger")
+        self._purge_thread.start()
 
-        self.log.log_message("[ICMP] Manager initialized (IPv4 reasm/frag + ICMPv6 + ND + MLD).")
+        self._mld_querier: Dict[str, Dict[str, Any]] = {}
 
-    # -------------------------------------------------------------------------
+        self.log.log_message("[ICMP] Manager initialized (IPv4/IPv6 ICMP, ND, MLD).")
+
+    # --------------------------------------------------------------------------
     # Lifecycle
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     def stop(self):
-        """Stops background purge thread."""
-        self._stop.set()
-        if self._purger.is_alive():
-            self._purger.join(timeout=2)
+        """Signals the background purge thread to stop."""
+        self._stop_event.set()
+        if self._purge_thread.is_alive():
+            self._purge_thread.join(timeout=2)
 
-    # -------------------------------------------------------------------------
-    # Entry point
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Main Entry Point
+    # --------------------------------------------------------------------------
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
         """
-        Dispatch based on IP version.
-        Return True when fully handled (consumed).
+        Main packet handler; dispatches to IPv4 or IPv6 specific handlers.
+
+        Returns True if the packet was fully handled (consumed), False otherwise.
         """
         try:
             if pkt.haslayer(IPv6):
@@ -13193,13 +13540,12 @@ class ICMPManager:
             self.log.log_message(f"[ICMP] ❗ ERROR in handle_packet: {e}\n{traceback.format_exc()}")
         return False
 
-    # -------------------------------------------------------------------------
-    # IPv6 path
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # IPv6 Path
+    # --------------------------------------------------------------------------
     def _handle_ipv6(self, pkt: Packet, iface: str) -> bool:
-        v6 = pkt[IPv6]
-
-        # ND first (NS/NA/RS)
+        """Handles all incoming IPv6 packets for ICMPv6, ND, and MLD."""
+        # --- Neighbor Discovery ---
         if pkt.haslayer(ICMPv6ND_NS):
             self._handle_ns(pkt, iface)
             return True
@@ -13210,28 +13556,28 @@ class ICMPManager:
             self._handle_rs(pkt, iface)
             return True
 
-        # MLD
+        # --- Multicast Listener Discovery ---
         if self._handle_mld(pkt, iface):
             return True
 
-        # Echo Request (only if addressed to us)
-        if pkt.haslayer(ICMPv6EchoRequest) and self._is_for_router_v6(v6.dst):
+        # --- ICMPv6 Echo Request (Ping) ---
+        if pkt.haslayer(ICMPv6EchoRequest) and self._is_for_router_v6(pkt[IPv6].dst):
             self._handle_echo_request_v6(pkt, iface)
             return True
 
-        # Common ICMPv6 errors -> log (and optional sendback hook site if you add one)
+        # --- ICMPv6 Error Message Logging ---
         if self._handle_icmpv6_errors(pkt, iface):
             return True
 
         return False
 
-    # ----- ICMPv6 echo -----
     def _handle_echo_request_v6(self, pkt: Packet, iface: str) -> None:
+        """Responds to an ICMPv6 Echo Request."""
         v6 = pkt[IPv6]
         req = pkt[ICMPv6EchoRequest]
         src_ip, dst_ip = v6.src, v6.dst
 
-        self.log.log_message(f"[ICMP] 📨 Echo-Request v6 {src_ip} → {dst_ip} on {iface.split('_')[-1]} (len={len(bytes(pkt))})")
+        self.log.log_message(f"[ICMP] 📨 Echo-Request v6 {src_ip} → {dst_ip} on {self._iface_suffix(iface)}")
         if self._is_rate_limited(src_ip, dst_ip):
             return
 
@@ -13239,159 +13585,82 @@ class ICMPManager:
         l2dst = pkt[Ether].src if pkt.haslayer(Ether) and not self._is_loopback_name(iface) else None
 
         base = IPv6(src=dst_ip, dst=src_ip)
-        echo = ICMPv6EchoReply(id=int(req.id), seq=int(req.seq)) / req.payload
+        echo_reply = ICMPv6EchoReply(id=req.id, seq=req.seq) / req.payload
+        reply = (Ether(src=l2src, dst=l2dst) / base / echo_reply) if l2dst else (base / echo_reply)
 
-        reply = (Ether(src=l2src, dst=l2dst) / base / echo) if l2dst else (base / echo)
-
-        # IPv6: cannot fragment in-source. If it doesn't fit MTU, emit PTB.
+        # In IPv6, routers don't fragment. If the reply is too big, send a PTB error instead.
         self._maybe_queue_v6_or_too_big(reply, pkt, iface)
-        self.log.log_message(f"[ICMP] ✅ Echo-Reply v6 queued on {iface.split('_')[-1]} for {src_ip}")
+        self.log.log_message(f"[ICMP] ✅ Echo-Reply v6 queued on {self._iface_suffix(iface)} for {src_ip}")
 
-    # ----- ICMPv6 errors -----
     def _handle_icmpv6_errors(self, pkt: Packet, iface: str) -> bool:
+        """Logs common incoming ICMPv6 error messages."""
         if pkt.haslayer(ICMPv6DestUnreach):
             du = pkt[ICMPv6DestUnreach]
-            self.log.log_message(f"[ICMP] 🔌 v6 DestUnreach code={int(du.code)} on {iface.split('_')[-1]}; {pkt.summary()}")
-            if int(du.code) == 1:  # admin prohibited
+            code = int(getattr(du, 'code', -1))
+            self.log.log_message(f"[ICMP] 🔌 v6 DestUnreach code={code} on {self._iface_suffix(iface)}; {pkt.summary()}")
+            if code in (1, 5, 6):  # Admin Prohibited, Policy Fail, Reject Route
                 self._log_admin_block_v6(pkt, iface)
             return True
 
         if pkt.haslayer(ICMPv6TimeExceeded):
-            te = pkt[ICMPv6TimeExceeded]
-            self.log.log_message(f"[ICMP] ⏳ v6 TimeExceeded code={int(te.code)} on {iface.split('_')[-1]}; {pkt.summary()}")
+            self.log.log_message(f"[ICMP] ⏳ v6 TimeExceeded on {self._iface_suffix(iface)}; {pkt.summary()}")
             return True
 
         if pkt.haslayer(ICMPv6ParamProblem):
-            pp = pkt[ICMPv6ParamProblem]
-            self.log.log_message(f"[ICMP] 🧩 v6 ParamProblem code={int(pp.code)} on {iface.split('_')[-1]}; {pkt.summary()}")
+            self.log.log_message(f"[ICMP] 🧩 v6 ParamProblem on {self._iface_suffix(iface)}; {pkt.summary()}")
             return True
 
         return False
 
-    def _log_admin_block_v6(self, pkt, inbound_iface: Optional[str]) -> None:
-        """
-        ICMPv6 Destination Unreachable (Type=1) with admin-prohibited-like codes.
-        Codes of interest (RFC 4443):
-          1 = Communication with destination administratively prohibited
-          5 = Source address failed ingress/egress policy
-          6 = Reject route to destination
-        """
+    def _log_admin_block_v6(self, pkt: Packet, inbound_iface: str) -> None:
+        """Logs detailed information for ICMPv6 'administratively prohibited' errors."""
         try:
-            if ICMPv6DestUnreach is None or not pkt.haslayer(ICMPv6DestUnreach):
-                return
             ic = pkt[ICMPv6DestUnreach]
             code = int(getattr(ic, "code", -1))
-
-            # Map a few common codes to short labels
-            code_name = {
-                1: "admin-prohibited",
-                5: "src-policy-fail",
-                6: "reject-route",
-            }.get(code, f"code={code}")
+            code_name = {1: "admin-prohibited", 5: "src-policy-fail", 6: "reject-route"}.get(code, f"code={code}")
 
             src, dst = self._v6_endpoints(pkt)
             inner = self._extract_inner_5tuple_v6(ic)
 
-            msg = (
-                f"[Transport][🛰 ICMPv6] 🚫 {code_name} "
-                f"{src} → {dst} on {self._iface_suffix(inbound_iface)}"
-            )
+            msg = f"[ICMP] 🚫 v6 {code_name} {src} → {dst} on {self._iface_suffix(inbound_iface)}"
             if inner:
-                msg += (
-                    f" | inner={inner['proto']} "
-                    f"{inner['src']}:{inner['sport']} → {inner['dst']}:{inner['dport']}"
-                )
+                msg += f" | inner={inner['proto']} {inner['src']}:{inner['sport']} → {inner['dst']}:{inner['dport']}"
             self.log.log_message(msg)
         except Exception:
-            # never let logging throw
-            pass
+            pass  # Logging should never crash
 
-        # ---- tiny helpers (robust, no-throw) ----
+    # --- Neighbor Discovery Methods ---
 
-    def _v6_endpoints(self, pkt):
-        try:
-            if IPv6 is not None and pkt.haslayer(IPv6):
-                ip6 = pkt[IPv6]
-                return str(getattr(ip6, "src", "::")), str(getattr(ip6, "dst", "::"))
-        except Exception:
-            pass
-        return "::", "::"
-
-    def _extract_inner_5tuple_v6(self, ic_layer) -> Optional[dict]:
-        """
-        Try to recover the offending inner packet 5-tuple from the ICMPv6 payload.
-        Returns dict with src/dst/sport/dport/proto or None.
-        """
-        try:
-            # The ICMPv6 error should carry the invoking (truncated) packet as payload.
-            inner = getattr(ic_layer, "payload", None)
-            if not inner or not hasattr(inner, "haslayer"):
-                return None
-
-            # Some stacks nest IPv6 directly; others have multiple wraps—walk one step.
-            ip6 = inner[IPv6] if (IPv6 is not None and inner.haslayer(IPv6)) else None
-            if not ip6:
-                return None
-
-            src = str(getattr(ip6, "src", "::"))
-            dst = str(getattr(ip6, "dst", "::"))
-
-            if TCP is not None and inner.haslayer(TCP):
-                l4 = inner[TCP]
-                return {
-                    "proto": "TCP",
-                    "src": src,
-                    "dst": dst,
-                    "sport": int(getattr(l4, "sport", 0) or 0),
-                    "dport": int(getattr(l4, "dport", 0) or 0),
-                }
-            if UDP is not None and inner.haslayer(UDP):
-                l4 = inner[UDP]
-                return {
-                    "proto": "UDP",
-                    "src": src,
-                    "dst": dst,
-                    "sport": int(getattr(l4, "sport", 0) or 0),
-                    "dport": int(getattr(l4, "dport", 0) or 0),
-                }
-
-            # No TCP/UDP — fall back to proto number only
-            return {"proto": f"nh={getattr(ip6, 'nh', '-')}", "src": src, "dst": dst, "sport": 0, "dport": 0}
-        except Exception:
-            return None
-
-    def _iface_suffix(self, inbound_iface: Optional[str]) -> str:
-        try:
-            return (inbound_iface or "").split("_")[-1] or "-"
-        except Exception:
-            return "-"
-    # ----- Neighbor Discovery -----
     def _handle_ns(self, pkt: Packet, iface: str) -> None:
+        """Handles a Neighbor Solicitation."""
         ns, v6 = pkt[ICMPv6ND_NS], pkt[IPv6]
         target_ip = getattr(ns, "tgt", None)
 
-        # Learn SLLA (even through Unknown TLV)
-        mac = self._nd_peer_mac_from_pkt(pkt) or (pkt[Ether].src if pkt.haslayer(Ether) else None)
+        # Learn the sender's MAC address from the Source Link-Layer Address option.
+        mac = self._nd_peer_mac_from_pkt(pkt) or (pkt.getlayer(Ether).src if pkt.haslayer(Ether) else None)
         if mac:
             self._nd_learn_mac(v6.src, mac)
 
-        # If NS targets one of our IPs, send NA
+        # If the NS is asking for one of our own addresses, send a Neighbor Advertisement.
         if target_ip and self._is_for_router_v6(target_ip):
             self._send_neighbor_advertisement(pkt, target_ip, iface)
 
     def _handle_na(self, pkt: Packet) -> None:
+        """Handles a Neighbor Advertisement to learn a neighbor's MAC."""
         na, v6 = pkt[ICMPv6ND_NA], pkt[IPv6]
         who = getattr(na, "tgt", v6.src)
-        mac = self._nd_peer_mac_from_pkt(pkt) or (pkt[Ether].src if pkt.haslayer(Ether) else None)
+        mac = self._nd_peer_mac_from_pkt(pkt) or (pkt.getlayer(Ether).src if pkt.haslayer(Ether) else None)
         if mac:
             self._nd_learn_mac(who, mac)
-        self.log.log_message(f"[ICMP][ND] 📒 Learned neighbor {who} -> {mac or '??'}")
+            self.log.log_message(f"[ICMP][ND] 📒 Learned neighbor {who} -> {mac}")
 
     def _handle_rs(self, pkt: Packet, iface: str) -> None:
-        self.log.log_message(f"[ICMP][ND] 📨 Router Solicitation from {pkt[IPv6].src} on {iface.split('_')[-1]}")
+        """Handles a Router Solicitation by sending a Router Advertisement."""
+        self.log.log_message(f"[ICMP][ND] 📨 Router Solicitation from {pkt[IPv6].src} on {self._iface_suffix(iface)}")
         self._send_router_advertisement(iface, destination_ip=pkt[IPv6].src)
 
     def _send_neighbor_advertisement(self, solicitation_pkt: Packet, target_ip: str, iface: str) -> None:
+        """Constructs and sends a Neighbor Advertisement (NA)."""
         my_mac = self._iface_mac_by_v6(target_ip)
         if not my_mac:
             self.log.log_message(f"[ICMP][ND] ⚠️ Cannot find MAC for our IP {target_ip} to send NA.")
@@ -13399,21 +13668,24 @@ class ICMPManager:
 
         v6s = solicitation_pkt[IPv6]
         dst_ip = v6s.src
-        dst_mac = solicitation_pkt[Ether].src if solicitation_pkt.haslayer(Ether) else self._solicited_node_mac_for_target(dst_ip)
+        dst_mac = solicitation_pkt[Ether].src if solicitation_pkt.haslayer(
+            Ether) else self._solicited_node_mac_for_target(dst_ip)
 
-        # Build NA with TLLA option (manually packed to avoid parser variance)
-        tlla = self._pack_nd_lladdr_opt(opt_type=2, mac_str=my_mac)
-        na = (Ether(src=my_mac, dst=dst_mac) /
-              IPv6(src=target_ip, dst=dst_ip, hlim=255) /
-              ICMPv6ND_NA(R=1, S=1, O=1, tgt=target_ip) /
-              Raw(load=tlla))
-        self.pw.queue_packet(na, iface)
-        self.log.log_message(f"[ICMP][ND] ✅ NA sent for {target_ip} → {dst_ip} on {iface.split('_')[-1]} (R,S,O=1)")
+        tlla = self._pack_nd_lladdr_opt(opt_type=2, mac_str=my_mac)  # Type 2 = Target Link-Layer Address
+        na = (
+                Ether(src=my_mac, dst=dst_mac) /
+                IPv6(src=target_ip, dst=dst_ip, hlim=255) /
+                ICMPv6ND_NA(R=1, S=1, O=1, tgt=target_ip) /
+                Raw(load=tlla)
+        )
+        self.pw._send_raw_packet(na, iface, allow_dst_ours=True)
+        self.log.log_message(f"[ICMP][ND] ✅ NA sent for {target_ip} → {dst_ip} on {self._iface_suffix(iface)}")
 
     def _send_router_advertisement(self, iface: str, destination_ip: str) -> None:
+        """Constructs and sends a Router Advertisement (RA)."""
         cfg = self.ifaces.get(iface, {})
         my_mac = cfg.get("mac")
-        my_ll = cfg.get("ipv6_addr") or cfg.get("ipv6") or cfg.get("ip6") or cfg.get("ip_addr6")
+        my_ll = self._get_iface_ipv6(iface)
         prefix = cfg.get("ipv6_prefix")
         if not (my_mac and my_ll):
             return
@@ -13421,591 +13693,559 @@ class ICMPManager:
         dst_ip = destination_ip if destination_ip and destination_ip != "::" else "ff02::1"
         dst_mac = self.nd_cache.get(self._norm_v6(dst_ip), {}).get("mac") or "33:33:00:00:00:01"
 
-        ra = (Ether(src=my_mac, dst=dst_mac) /
-              IPv6(src=my_ll, dst=dst_ip, hlim=255) /
-              ICMPv6ND_RA(M=0, O=0, routerlifetime=1800) /
-              ICMPv6NDOptSrcLLAddr(lladdr=my_mac))
-
+        ra = (
+                Ether(src=my_mac, dst=dst_mac) /
+                IPv6(src=my_ll, dst=dst_ip, hlim=255) /
+                ICMPv6ND_RA(M=0, O=0, routerlifetime=1800) /
+                ICMPv6NDOptSrcLLAddr(lladdr=my_mac)
+        )
         if prefix:
-            ra = ra / ICMPv6NDOptPrefixInfo(prefix=prefix, prefixlen=64, L=1, A=1,
-                                            validlifetime=7200, preferredlifetime=1800)
+            ra /= ICMPv6NDOptPrefixInfo(prefix=prefix, prefixlen=64, L=1, A=1, validlifetime=7200,
+                                        preferredlifetime=1800)
 
-        self.pw.queue_packet(ra, iface)
-        self.log.log_message(f"[ICMP][ND] ✅ RA sent to {dst_ip} on {iface.split('_')[-1]}")
+        self.pw._send_raw_packet(ra, iface,allow_dst_ours=True)
+        self.log.log_message(f"[ICMP][ND] ✅ RA sent to {dst_ip} on {self._iface_suffix(iface)}")
 
-    # -------------------------------------------------------------------------
-    # MLD (v1/v2) membership handling
-    # -------------------------------------------------------------------------
-    def _handle_mld(self, pkt: Packet, inbound_iface: str) -> bool:
-        if not pkt.haslayer(IPv6):
-            return False
+    # --- MLD (Multicast) Methods ---
 
-        v6 = pkt[IPv6]
-        src_ip6 = v6.src
-        iface_short = inbound_iface.split("_")[-1]
+    def _handle_mld(self, pkt: Packet, iface: str) -> bool:
+        """Dispatches MLDv1 and MLDv2 packets to appropriate handlers."""
+        src_ip6 = pkt[IPv6].src
+        iface_short = self._iface_suffix(iface)
 
-        # v1: 130 Query / 131 Report / 132 Done
-        if pkt.haslayer(MLDReport) or pkt.haslayer(MLDDone) or pkt.haslayer(MLDQuery):
-            group_ip = self._get_mld_v1_group(pkt)
-            kind = "Report" if pkt.haslayer(MLDReport) else "Done" if pkt.haslayer(MLDDone) else "Query"
-            self.log.log_message(f"[ICMP][MLD] v1 {kind} from {src_ip6} on {iface_short} gaddr={group_ip}")
-            if pkt.haslayer(MLDReport):
-                self._mld_join(group_ip, inbound_iface, mode="include", sources=None, who=src_ip6)
-            elif pkt.haslayer(MLDDone):
-                self._mld_leave(group_ip, inbound_iface, who=src_ip6)
+        # ---- MLDv1 Query (type 130) ----
+        if (pkt.haslayer("MLDQuery") or
+                (pkt.haslayer(ICMPv6) and int(pkt[ICMPv6].type) == 130)):
+            # Be robust to Scapy variants
+            q = pkt.getlayer("MLDQuery")
+            group_ip = str(getattr(q, "mcaddr", "::")) if q else "::"  # "::" == general query
+            kind = "general" if group_ip in ("::", "0::") else f"group={group_ip}"
+            hlim = int(getattr(pkt[IPv6], "hlim", -1))
+            self._mld_querier[iface] = {"src": src_ip6, "last_seen": time.time(), "group": group_ip}
+            self.log.log_message(f"[ICMP][MLD] v1 Query ({kind}) from {src_ip6} on {iface_short} (hlim={hlim})")
+            # Optional: if your router has memberships, you could proactively send reports here.
+            self._send_mldv1_reports_for_iface(iface, specific_group=group_ip if group_ip != '::' else None)
             return True
 
-        # v2 Report (type 143) – names vary across Scapy builds
+        # ---- MLDv1 Report / Done ----
+        if pkt.haslayer(MLDReport) or pkt.haslayer(MLDDone):
+            group_ip = self._get_mld_v1_group(pkt)
+            if pkt.haslayer(MLDReport):
+                self.log.log_message(f"[ICMP][MLD] v1 Report from {src_ip6} on {iface_short} gaddr={group_ip}")
+                self._mld_join(group_ip, iface, mode="include", sources=None, who=src_ip6)
+            else:
+                self.log.log_message(f"[ICMP][MLD] v1 Done from {src_ip6} on {iface_short} gaddr={group_ip}")
+                self._mld_leave(group_ip, iface, who=src_ip6)
+            return True
+
+        # ---- MLDv2 Report (type 143) ----
         if self._looks_like_mldv2_report(pkt):
             rep = pkt.getlayer("MLDv2report") or pkt.getlayer("MLDv2Report") or pkt.getlayer("ICMPv6MLReport2")
-            records = getattr(rep, "records", None) or getattr(rep, "grps", None)
-            if not records:
-                self.log.log_message("[ICMP][MLD] v2 report without records (parser mismatch).")
-                return True
-
+            records = getattr(rep, "records", []) or getattr(rep, "grps", [])
             for rec in records:
                 rtype = int(getattr(rec, "rtype", getattr(rec, "type", 0)))
                 group = str(getattr(rec, "mcaddr", getattr(rec, "maddr", "::")))
-                srcs  = [str(s) for s in (getattr(rec, "srcaddrs", []) or getattr(rec, "sources", []))]
-                if rtype in (1, 3):  # INCLUDE
-                    self._mld_join(group, inbound_iface, mode="include", sources=set(srcs) if srcs else set(), who=src_ip6)
-                elif rtype in (2, 4):  # EXCLUDE
-                    self._mld_join(group, inbound_iface, mode="exclude", sources=set(srcs) if srcs else set(), who=src_ip6)
-                elif rtype == 5:      # ALLOW_NEW_SOURCES
-                    self._mld_join(group, inbound_iface, mode="include", sources=set(srcs), who=src_ip6)
-                elif rtype == 6:      # BLOCK_OLD_SOURCES
-                    with self._mld_lock:
-                        key = (group, inbound_iface)
-                        ent = self._mld_groups.get(key)
-                        if ent:
-                            ent["last_report"] = time.time()
-                    self.log.log_message(f"[ICMP][MLD] v2 BLOCK_OLD_SOURCES group={group} srcs={srcs} on {iface_short}")
-                else:
-                    self.log.log_message(f"[ICMP][MLD] v2 UNKNOWN({rtype}) group={group} srcs={srcs} on {iface_short} (noop)")
+                srcs = {str(s) for s in (getattr(rec, "srcaddrs", []) or getattr(rec, "sources", []))}
+                if rtype in (1, 3, 5):  # INCLUDE-ish
+                    self._mld_join(group, iface, mode="include", sources=srcs, who=src_ip6)
+                elif rtype in (2, 4):  # EXCLUDE-ish
+                    self._mld_join(group, iface, mode="exclude", sources=srcs, who=src_ip6)
+                elif rtype == 6:  # BLOCK_OLD_SOURCES
+                    self._mld_block_sources(group, iface, sources=srcs, who=src_ip6)
             return True
 
         return False
 
+    def _send_mldv1_reports_for_iface(self, iface: str, specific_group: Optional[str] = None) -> None:
+        """
+        Emit basic MLDv1 Reports for any groups we track on this iface.
+        This is minimal (no Router-Alert HBH option); good enough for visibility/testing.
+        """
+        cfg = self.ifaces.get(iface, {})
+        src_ll = self._get_iface_ipv6(iface)
+        src_mac = cfg.get("mac")
+        if not (src_ll and src_mac):
+            return
+
+        now = time.time()
+        with self._mld_lock:
+            groups = [g for (g, ifn) in self._mld_groups.keys()
+                      if ifn == iface and (specific_group is None or g == specific_group)]
+        for g in groups:
+            # MLDv1 reports are sent to the multicast group itself, HLIM=1
+            dst_mac = self._solicited_node_mac_for_target(g) if g.startswith("ff") else "33:33:00:00:00:01"
+            report = (Ether(src=src_mac, dst=dst_mac) /
+                      IPv6(src=src_ll, dst=g, hlim=1) /
+                      MLDReport(mcaddr=g))
+            self.pw._send_raw_packet(report, iface, allow_dst_ours=True)
+            self.log.log_message(f"[ICMP][MLD] 📣 Sent MLDv1 Report for {g} on {self._iface_suffix(iface)}")
+    def _mld_join(self, group_ip: str, ifname: str, *, mode: str, sources: Optional[Set[str]], who: str) -> None:
+        """Updates or creates a multicast group membership."""
+        with self._mld_lock:
+            key = (group_ip, ifname)
+            entry = self._mld_groups.get(key, {"mode": "include", "sources": set()})
+            entry["mode"] = mode
+            if sources:
+                entry["sources"].update(sources)
+            entry["last_report"] = time.time()
+            self._mld_groups[key] = entry
+        src_txt = f" sources={sorted(list(sources))}" if sources else ""
+        self.log.log_message(f"[ICMP][MLD] ✅ {who} joined {group_ip} on {self._iface_suffix(ifname)} ({mode}{src_txt})")
+
+    def _mld_leave(self, group_ip: str, ifname: str, *, who: str) -> None:
+        """Removes a multicast group membership."""
+        with self._mld_lock:
+            key = (group_ip, ifname)
+            if key in self._mld_groups:
+                del self._mld_groups[key]
+                self.log.log_message(f"[ICMP][MLD] 🗑️ {who} left {group_ip} on {self._iface_suffix(ifname)}.")
+
+    def _mld_block_sources(self, group_ip: str, ifname: str, *, sources: Set[str], who: str):
+        """Handles MLDv2 BLOCK_OLD_SOURCES records."""
+        with self._mld_lock:
+            entry = self._mld_groups.get((group_ip, ifname))
+            if entry and entry["mode"] == "include":
+                entry["sources"].difference_update(sources)
+                entry["last_report"] = time.time()
+                self.log.log_message(
+                    f"[ICMP][MLD] 🔄 {who} blocked sources for {group_ip} on {self._iface_suffix(ifname)}")
+
+    def get_mld_memberships(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Returns a copy of the current MLD membership state."""
+        with self._mld_lock:
+            return {
+                key: {
+                    "last_report": val["last_report"],
+                    "mode": val["mode"],
+                    "sources": sorted(list(val["sources"]))
+                } for key, val in self._mld_groups.items()
+            }
+
+    # --------------------------------------------------------------------------
+    # IPv4 Path
+    # --------------------------------------------------------------------------
+    def _handle_ipv4(self, pkt: Packet, iface: str) -> bool:
+        """Handles all incoming IPv4 packets for ICMP and reassembly."""
+        ip = pkt[IP]
+
+        # Check if the packet is for the router.
+        is_for_router, router_mac, router_ip = self._match_router_ip_v4(ip.dst)
+        if not is_for_router:
+            return False
+
+        # If it's a fragment destined for us, try to reassemble it.
+        if self._is_ipv4_fragment(ip):
+            assembled_pkt = self._reassemble_ipv4(pkt, iface)
+            if assembled_pkt is None:
+                return True  # Fragment buffered, packet handled.
+            pkt = assembled_pkt  # Continue processing the reassembled packet.
+
+        if not pkt.haslayer(ICMP):
+            return False
+
+        icmp = pkt[ICMP]
+        # --- ICMPv4 Echo Request (Ping) ---
+        if icmp.type == 8:
+            self._handle_echo_request_v4(pkt, iface, router_mac, router_ip)
+            return True
+
+        # --- ICMPv4 Error Message Logging ---
+        if self._handle_icmpv4_errors(pkt, iface):
+            return True
+
+        return False
+
+    def _handle_echo_request_v4(self, pkt: Packet, iface: str, router_mac: str, router_ip: str) -> None:
+        """Responds to an ICMPv4 Echo Request."""
+        ip, icmp = pkt[IP], pkt[ICMP]
+        self.log.log_message(f"[ICMP] 📨 Echo-Request v4 {ip.src} → {ip.dst} on {self._iface_suffix(iface)}")
+        if self._is_rate_limited(ip.src, ip.dst):
+            return
+
+        # Build reply packet
+        if pkt.haslayer(Ether) and not self._is_loopback_name(iface):
+            reply = (Ether(src=router_mac, dst=pkt[Ether].src) /
+                     IP(src=router_ip, dst=ip.src) /
+                     ICMP(type=0, id=icmp.id, seq=icmp.seq) /
+                     icmp.payload)
+        else:
+            reply = (IP(src=router_ip, dst=ip.src) /
+                     ICMP(type=0, id=icmp.id, seq=icmp.seq) /
+                     icmp.payload)
+
+        # Fragment the reply if it's larger than the outbound MTU.
+        self._maybe_fragment_and_queue_v4(reply, iface)
+        self.log.log_message(f"[ICMP] ✅ Echo-Reply v4 queued on {self._iface_suffix(iface)} for {ip.src}")
+
+    def _handle_icmpv4_errors(self, pkt: Packet, iface: str) -> bool:
+        """Logs common incoming ICMPv4 error messages."""
+        icmp = pkt[ICMP]
+        t, c = int(icmp.type), int(getattr(icmp, "code", 0))
+
+        if t == 3:  # Destination Unreachable
+            if c == 4:  # Frag needed and DF set
+                mtu_hint = getattr(icmp, "unused", 0) or getattr(icmp, "nexthopmtu", 0)
+                self.log.log_message(
+                    f"[ICMP] 📦 v4 Frag-needed(DF) from {pkt[IP].src} on {self._iface_suffix(iface)} (mtu={mtu_hint})")
+            elif c == 13:  # Admin Prohibited
+                self._log_admin_block(pkt, iface)
+            else:
+                self.log.log_message(f"[ICMP] 🔌 v4 DestUnreach code={c} on {self._iface_suffix(iface)}")
+            return True
+
+        if t == 11:  # Time Exceeded
+            self.log.log_message(f"[ICMP] ⏳ v4 TimeExceeded on {self._iface_suffix(iface)}")
+            return True
+
+        return False
+
+    def _log_admin_block(self, pkt: Packet, inbound_iface: str) -> None:
+        """Logs detailed information for ICMPv4 'administratively prohibited' errors."""
+        inner_ip = self._extract_inner_ipv4(pkt)
+        if inner_ip:
+            l4 = inner_ip.payload
+            sport = getattr(l4, "sport", "-")
+            dport = getattr(l4, "dport", "-")
+            proto = self._proto_name_v4(getattr(inner_ip, "proto", 0))
+            self.log.log_message(
+                f"[ICMP] 🔒 Admin-prohibited v4 on {self._iface_suffix(inbound_iface)}: "
+                f"{inner_ip.src}:{sport} → {inner_ip.dst}:{dport} proto={proto}"
+            )
+        else:
+            self.log.log_message(
+                f"[ICMP] 🔒 Admin-prohibited v4 (no parsable inner IP) on {self._iface_suffix(inbound_iface)}")
+
+    # --------------------------------------------------------------------------
+    # IPv4 Fragmentation & Reassembly
+    # --------------------------------------------------------------------------
+    def _is_ipv4_fragment(self, ip: IP) -> bool:
+        """Checks if an IPv4 packet is a fragment."""
+        mf_flag = bool(int(ip.flags) & 0x1)  # More Fragments flag
+        return mf_flag or (int(ip.frag) > 0)
+
+    def _reassemble_ipv4(self, pkt: Packet, iface: str) -> Optional[Packet]:
+        """Buffers IPv4 fragments and reassembles them when complete."""
+        ip = pkt[IP]
+        key = (ip.src, ip.dst, int(ip.proto), int(ip.id))
+        now = time.time()
+
+        offset_bytes = int(ip.frag) * self._EIGHT
+        is_last_frag = not (int(ip.flags) & 0x1)
+        frag_payload = bytes(ip.payload)
+
+        with self._reasm_lock:
+            state = self._reasm.setdefault(key, {
+                "first_hdr": ip, "parts": {}, "total": None, "t0": now, "iface": iface
+            })
+            state["parts"][offset_bytes] = frag_payload
+            state["t0"] = now
+            if is_last_frag:
+                state["total"] = offset_bytes + len(frag_payload)
+
+            if state["total"] is None:
+                return None  # Not all fragments received yet.
+
+            # Check for completeness
+            offsets = sorted(state["parts"].keys())
+            current_offset = 0
+            for off in offsets:
+                if off != current_offset:
+                    return None  # Gap detected.
+                current_offset += len(state["parts"][off])
+
+            if current_offset < state["total"]:
+                return None  # Not all data is here.
+
+            # Assemble the packet
+            full_payload = b"".join(state["parts"][off] for off in offsets)
+            base = state["first_hdr"]
+            base.flags = 0
+            base.frag = 0
+
+            # Re-parse to correctly build the full packet structure
+            full_pkt = IP(bytes(base) / full_payload)
+            del self._reasm[key]
+
+        self.log.log_message(f"[ICMP] 🔧 Reassembled IPv4 packet {ip.src}→{ip.dst} (len={len(bytes(full_pkt))})")
+        return full_pkt
+
+    def _maybe_fragment_and_queue_v4(self, reply_pkt: Packet, outbound_iface: str) -> None:
+        """Fragments an IPv4 packet if it exceeds the interface MTU, then queues it."""
+        mtu = self._get_iface_mtu(outbound_iface)
+        if len(bytes(reply_pkt)) <= mtu:
+            self.pw._send_raw_packet(reply_pkt, outbound_iface, allow_dst_ours=True)
+            return
+
+        l2_overhead = 14 if reply_pkt.haslayer(Ether) else 0
+        ip_mtu = mtu - l2_overhead
+
+        try:
+            ip_frags = self._ipv4_fragment_datagram(reply_pkt[IP], ip_mtu)
+            if reply_pkt.haslayer(Ether):
+                eth = reply_pkt[Ether]
+                for frag in ip_frags:
+                    self.pw._send_raw_packet(Ether(src=eth.src, dst=eth.dst) / frag, outbound_iface, allow_dst_ours=True)
+            else:
+                for frag in ip_frags:
+                    self.pw._send_raw_packet(frag, outbound_iface, allow_dst_ours=True)
+            self.log.log_message(f"[ICMP] ✂ Fragmented Echo-Reply v4 into {len(ip_frags)} parts for {outbound_iface}.")
+        except Exception as e:
+            self.log.log_message(f"[ICMP] ❌ IPv4 fragmentation failed: {e}. Sending oversized packet.")
+            self.pw._send_raw_packet(reply_pkt, outbound_iface)
+
+    def _ipv4_fragment_datagram(self, ip_pkt: IP, ip_mtu: int) -> List[IP]:
+        """Helper to split an IP datagram into fragments."""
+        ihl_bytes = ip_pkt.ihl * 4
+        max_payload = (ip_mtu - ihl_bytes) // 8 * 8
+        payload = bytes(ip_pkt.payload)
+        frags, offset = [], 0
+
+        while offset < len(payload):
+            chunk = payload[offset: offset + max_payload]
+            is_more = (offset + len(chunk)) < len(payload)
+
+            frag = ip_pkt.copy()
+            frag.flags = "MF" if is_more else 0
+            frag.frag = offset // 8
+            del frag.payload
+            del frag.chksum
+            del frag.len
+            frags.append(frag / chunk)
+            offset += len(chunk)
+
+        return frags
+
+    # --------------------------------------------------------------------------
+    # General & Helper Methods
+    # --------------------------------------------------------------------------
+    def _maybe_queue_v6_or_too_big(self, reply_pkt: Packet, original_pkt: Packet, iface: str) -> None:
+        """Queues an IPv6 packet or sends a 'Packet Too Big' error if it exceeds MTU."""
+        mtu = self._get_iface_mtu(iface)
+        if len(bytes(reply_pkt)) <= mtu:
+            self.pw._send_raw_packet(reply_pkt, iface, allow_dst_ours=True)
+            return
+
+        # Build and send ICMPv6 Packet Too Big (Type 2)
+        v6_orig = original_pkt[IPv6]
+        v6_reply = reply_pkt[IPv6]
+        ptb = IPv6(src=v6_reply.src, dst=v6_orig.src) / ICMPv6PacketTooBig(mtu=mtu) / bytes(v6_orig)[:1232]
+
+        if reply_pkt.haslayer(Ether):
+            eth = reply_pkt[Ether]
+            ptb_pkt = Ether(src=eth.src, dst=eth.dst) / ptb
+        else:
+            ptb_pkt = ptb
+
+        self.pw._send_raw_packet(ptb_pkt, iface, allow_dst_ours=True)
+        self.log.log_message(f"[ICMP] 📦 Sent ICMPv6 Packet-Too-Big (mtu={mtu}) on {self._iface_suffix(iface)}")
+
+    def _is_rate_limited(self, src_ip: str, dst_ip: str) -> bool:
+        """Checks if an echo reply should be rate-limited."""
+        with self._rate_limit_lock:
+            now = time.time()
+            key = (src_ip, dst_ip)
+            if (now - self._last_reply_time[key]) < (1.0 / self.rate_limit_pps):
+                self.log.log_message(f"[ICMP] 🚫 Rate-limiting Echo-Reply to {src_ip}.")
+                return True
+            self._last_reply_time[key] = now
+            return False
+
+    def _purge_loop(self):
+        """Background thread loop to purge expired state (MLD memberships, reassembly buffers)."""
+        self.log.log_message("[ICMP] Purge thread started.")
+        while not self._stop_event.is_set():
+            now = time.time()
+            self._purge_mld_memberships(now)
+            self._cleanup_reasm(now)
+            self._stop_event.wait(self.PURGE_INTERVAL_SEC)
+        self.log.log_message("[ICMP] Purge thread exited.")
+
+    def _purge_mld_memberships(self, now: float) -> None:
+        """Removes expired MLD group memberships."""
+        with self._mld_lock:
+            expired_keys = [
+                key for key, val in self._mld_groups.items()
+                if (now - val.get("last_report", 0)) > self.MLD_MEMBERSHIP_TIMEOUT
+            ]
+            for key in expired_keys:
+                g, ifn = key
+                del self._mld_groups[key]
+                self.log.log_message(f"[ICMP][MLD] 🧹 Timed out membership for {g} on {self._iface_suffix(ifn)}.")
+
+    def _cleanup_reasm(self, now: float) -> None:
+        """Removes expired IPv4 reassembly buffers."""
+        with self._reasm_lock:
+            expired_keys = [
+                key for key, state in self._reasm.items()
+                if (now - state.get("t0", 0)) > self.REASM_TIMEOUT_SEC
+            ]
+            for key in expired_keys:
+                src, dst, proto, _ = key
+                self.log.log_message(f"[ICMP] ⏳ Reassembly timeout v4 for {src}→{dst} proto={proto}")
+                del self._reasm[key]
+
+    # --- Tiny No-Throw Helpers ---
+
+    def _iface_suffix(self, iface_name: Optional[str]) -> str:
+        return (iface_name or "").split("_")[-1] or "-"
+
+    def _norm_v6(self, addr: Any) -> Optional[str]:
+        if not addr: return None
+        try:
+            return str(ipaddress.IPv6Address(addr))
+        except Exception:
+            return str(addr)
+
+    def _get_iface_mtu(self, name: str) -> int:
+        return self.ifaces.get(name, {}).get("mtu", 1500)
+
+    def _is_loopback_name(self, name: str) -> bool:
+        return "loopback" in (name or "").lower() or (name or "").lower() == "lo"
+
+    def _get_iface_ipv6(self, iface: str) -> Optional[str]:
+        cfg = self.ifaces.get(iface, {})
+        for key in ("ipv6_addr", "ipv6", "ip6", "ip_addr6"):
+            if key in cfg:
+                return cfg[key]
+        return None
+
+    def _iface_v6_set(self) -> set[str]:
+        addrs: set[str] = set()
+        for iface_name in self.ifaces:
+            addr = self._norm_v6(self._get_iface_ipv6(iface_name))
+            if addr:
+                addrs.add(addr)
+        return addrs
+
+    def _is_for_router_v6(self, dst_ip: str) -> bool:
+        return self._norm_v6(dst_ip) in self._iface_v6_set()
+
+    def _iface_mac_by_v6(self, ip6: str) -> Optional[str]:
+        norm_ip6 = self._norm_v6(ip6)
+        for cfg in self.ifaces.values():
+            for key in ("ipv6_addr", "ipv6", "ip6", "ip_addr6"):
+                if self._norm_v6(cfg.get(key)) == norm_ip6:
+                    return cfg.get("mac")
+        return None
+
+    def _match_router_ip_v4(self, dst_ip: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        for cfg in self.ifaces.values():
+            if cfg.get("ip_addr") == dst_ip:
+                return True, cfg.get("mac"), cfg.get("ip_addr")
+        return False, None, None
+
+    def _nd_peer_mac_from_pkt(self, pkt: Packet) -> Optional[str]:
+        """Extracts MAC address from ND SLLA/TLLA options, including Unknown TLV."""
+        # First, try Scapy's parsed layers
+        if pkt.haslayer(ICMPv6NDOptSrcLLAddr) and pkt[ICMPv6NDOptSrcLLAddr].lladdr:
+            return pkt[ICMPv6NDOptSrcLLAddr].lladdr
+        # Manually parse Unknown options for robustness against Scapy versions
+        opt = pkt.getlayer(ICMPv6NDOptUnknown)
+        while opt:
+            try:
+                raw, t, l = bytes(opt), opt.type, opt.len * 8
+                if t in (1, 2) and l >= 8 and len(raw) >= 8:  # SLLA or TLLA
+                    mac_bytes = raw[2:8]
+                    return ":".join(f"{b:02x}" for b in mac_bytes)
+            except Exception:
+                pass
+            opt = opt.payload.getlayer(ICMPv6NDOptUnknown) if hasattr(opt, "payload") else None
+        return None
+
+    def _pack_nd_lladdr_opt(self, opt_type: int, mac_str: str) -> bytes:
+        mac_bytes = bytes.fromhex(mac_str.replace(":", ""))
+        return bytes([opt_type & 0xFF, 1]) + mac_bytes
+
+    def _solicited_node_mac_for_target(self, target_ip6: str) -> str:
+        try:
+            last24 = int(ipaddress.IPv6Address(target_ip6)) & 0xFFFFFF
+            return f"33:33:ff:{(last24 >> 16) & 0xFF:02x}:{(last24 >> 8) & 0xFF:02x}:{last24 & 0xFF:02x}"
+        except Exception:
+            return "33:33:00:00:00:00"  # Fallback
+
     def _get_mld_v1_group(self, pkt: Packet) -> str:
-        if pkt.haslayer(MLDReport):
-            return str(pkt[MLDReport].mcaddr)
-        if pkt.haslayer(MLDDone):
-            return str(pkt[MLDDone].mcaddr)
-        if pkt.haslayer(MLDQuery):
-            layer = pkt[MLDQuery]
-            return str(getattr(layer, "mcaddr", "::"))
+        for layer_cls in (MLDReport, MLDDone, MLDQuery):
+            if pkt.haslayer(layer_cls):
+                return str(getattr(pkt[layer_cls], "mcaddr", "::"))
         return "::"
 
     def _looks_like_mldv2_report(self, pkt: Packet) -> bool:
         for name in ("MLDv2report", "MLDv2Report", "ICMPv6MLReport2"):
             if pkt.haslayer(name):
                 return True
-        ic = pkt.getlayer("ICMPv6") or pkt.getlayer(ICMPv6Unknown)
         try:
-            return int(getattr(ic, "type", 0)) == 143
+            return pkt.haslayer(ICMPv6) and pkt[ICMPv6].type == 143
         except Exception:
             return False
 
-    def _mld_join(self, group_ip: str, ifname: str, *, mode: str, sources: Optional[Set[str]], who: str) -> None:
-        with self._mld_lock:
-            key = (group_ip, ifname)
-            ent = self._mld_groups.get(key, {"mode": "include", "sources": set(), "last_report": 0})
-            if sources:
-                ent["sources"].update(sources)
-            ent["mode"] = mode
-            ent["last_report"] = time.time()
-            self._mld_groups[key] = ent
-        src_txt = f" sources={sorted(sources)}" if sources else ""
-        self.log.log_message(f"[ICMP][MLD] ✅ {who} joined {group_ip} on {ifname.split('_')[-1]} ({mode}{src_txt})")
-
-    def _mld_leave(self, group_ip: str, ifname: str, *, who: str) -> None:
-        with self._mld_lock:
-            key = (group_ip, ifname)
-            if key in self._mld_groups:
-                del self._mld_groups[key]
-                self.log.log_message(f"[ICMP][MLD] 🗑️ {who} left {group_ip} on {ifname.split('_')[-1]}.")
-            else:
-                self.log.log_message(f"[ICMP][MLD] {who} sent Done for {group_ip}, but not in table.")
-
-    def get_mld_memberships(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        with self._mld_lock:
-            out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-            for (g, iface), ent in self._mld_groups.items():
-                out[(g, iface)] = {
-                    "last_report": ent["last_report"],
-                    "mode": ent["mode"],
-                    "sources": sorted(ent["sources"]) if ent["sources"] else [],
-                }
-            return out
-
-    # -------------------------------------------------------------------------
-    # IPv6 MTU helper
-    # -------------------------------------------------------------------------
-    def _maybe_queue_v6_or_too_big(self, reply_pkt: Packet, original_pkt: Packet, outbound_iface: str) -> bool:
-        mtu = self._get_iface_mtu(outbound_iface)
-        raw_len = len(bytes(reply_pkt))
-        if raw_len <= mtu:
-            self.pw.queue_packet(reply_pkt, outbound_iface)
-            return True
-
-        # Build and send Packet Too Big (type 2), include as much of the invoking packet as reasonable.
+    def _v6_endpoints(self, pkt: Packet) -> Tuple[str, str]:
         try:
-            include = bytes(original_pkt[IPv6]) if original_pkt.haslayer(IPv6) else bytes(original_pkt)
+            if pkt.haslayer(IPv6):
+                return str(pkt[IPv6].src), str(pkt[IPv6].dst)
         except Exception:
-            include = bytes(original_pkt) if isinstance(original_pkt, (bytes, bytearray)) else b""
-        inc_slice = include[:1232]  # safe cap
+            pass
+        return "::", "::"
 
-        if reply_pkt.haslayer(Ether):
-            eth = reply_pkt[Ether]
-            ptb = Ether(src=eth.src, dst=eth.dst) / IPv6(src=reply_pkt[IPv6].src, dst=reply_pkt[IPv6].dst) / \
-                  ICMPv6PacketTooBig(mtu=mtu) / Raw(inc_slice)
-        else:
-            ptb = IPv6(src=reply_pkt[IPv6].src, dst=reply_pkt[IPv6].dst) / ICMPv6PacketTooBig(mtu=mtu) / Raw(inc_slice)
-
-        self.pw.queue_packet(ptb, outbound_iface)
-        self.log.log_message(f"[ICMP] 📦 Sent ICMPv6 Packet-Too-Big (mtu={mtu}) on {outbound_iface}")
-        return True
-
-    # -------------------------------------------------------------------------
-    # IPv4 path
-    # -------------------------------------------------------------------------
-    def _handle_ipv4(self, pkt: Packet, iface: str) -> bool:
-        ip = pkt[IP]
-
-        # Reassemble if router-destined and fragmented
-        is_for_router, router_mac, router_ip = self._match_router_ip_v4(ip.dst)
-        if self._is_ipv4_fragment(ip) and is_for_router:
-            assembled = self._reassemble_ipv4(pkt, iface)
-            if assembled is None:
-                return True  # buffered and handled
-            pkt = assembled
-            ip = pkt[IP]
-
-        if not is_for_router:
-            return False
-
-        if not pkt.haslayer(ICMP):
-            return False
-
-        icmp = pkt[ICMP]
-        if icmp.type == 8:  # Echo Request
-            self._handle_echo_request_v4(pkt, iface, router_mac, router_ip)
-            return True
-
-        # Common errors
-        if self._handle_icmpv4_errors(pkt, iface):
-            return True
-
-        return False
-
-    # ----- ICMPv4 echo -----
-    def _handle_echo_request_v4(self, pkt: Packet, iface: str, router_mac: Optional[str], router_ip: Optional[str]) -> None:
-        ip = pkt[IP]
-        icmp = pkt[ICMP]
-        self.log.log_message(f"[ICMP] 📨 Echo-Request v4 {ip.src} → {ip.dst} on {iface.split('_')[-1]} (len={len(bytes(pkt))})")
-        if self._is_rate_limited(ip.src, ip.dst):
-            return
-
-        if pkt.haslayer(Ether) and not self._is_loopback_name(iface):
-            l2dst = pkt[Ether].src
-            l2src = router_mac or "00:00:00:00:00:00"
-            reply = Ether(src=l2src, dst=l2dst) / IP(src=ip.dst, dst=ip.src) / ICMP(type=0, id=icmp.id, seq=icmp.seq) / icmp.payload
-        else:
-            reply = IP(src=ip.dst, dst=ip.src) / ICMP(type=0, id=icmp.id, seq=icmp.seq) / icmp.payload
-
-        self._maybe_fragment_and_queue_v4(reply, iface)
-        self.log.log_message(f"[ICMP] ✅ Echo-Reply v4 queued on {iface.split('_')[-1]} for {ip.src}")
-
-    # ----- ICMPv4 errors -----
-    def _handle_icmpv4_errors(self, pkt: Packet, iface: str) -> bool:
-        icmp = pkt[ICMP]
-        t, c = int(icmp.type), int(getattr(icmp, "code", 0))
-        if t == 3:  # DestUnreach
-            # c==4 is "frag needed and DF set" (Next-Hop MTU in "unused"/nexthopmtu field depending on Scapy)
-            if c == 4:
-                hinted_mtu = getattr(icmp, "unused", None) or getattr(icmp, "nexthopmtu", None)
-                self.log.log_message(f"[ICMP] 📦 v4 Frag-needed (DF) from {pkt[IP].src} on {iface.split('_')[-1]} (mtu={hinted_mtu})")
-            elif c == 13:  # admin prohibited
-                self._log_admin_block(pkt, iface)
-            else:
-                self.log.log_message(f"[ICMP] 🔌 v4 DestUnreach code={c} on {iface.split('_')[-1]}; {pkt.summary()}")
-            return True
-
-        if t == 11:  # Time Exceeded
-            self.log.log_message(f"[ICMP] ⏳ v4 TimeExceeded code={c} on {iface.split('_')[-1]}; {pkt.summary()}")
-            return True
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # IPv4 fragmentation & reassembly
-    # -------------------------------------------------------------------------
-    def _is_ipv4_fragment(self, ip: IP) -> bool:
+    def _extract_inner_5tuple_v6(self, ic_layer) -> Optional[dict]:
+        """Extracts the 5-tuple from the original packet inside an ICMPv6 error."""
         try:
-            mf = bool(int(ip.flags) & 0x1)  # MF
+            inner = ic_layer.payload
+            if not inner.haslayer(IPv6): return None
+
+            ip6 = inner[IPv6]
+            src, dst = str(ip6.src), str(ip6.dst)
+            proto_map = {58: "ICMPv6", 6: "TCP", 17: "UDP"}
+            proto = proto_map.get(ip6.nh, str(ip6.nh))
+
+            if ip6.nh == 6 and inner.haslayer("TCP"):
+                return {"proto": "TCP", "src": src, "dst": dst, "sport": inner["TCP"].sport,
+                        "dport": inner["TCP"].dport}
+            if ip6.nh == 17 and inner.haslayer("UDP"):
+                return {"proto": "UDP", "src": src, "dst": dst, "sport": inner["UDP"].sport,
+                        "dport": inner["UDP"].dport}
+            return {"proto": proto, "src": src, "dst": dst, "sport": 0, "dport": 0}
         except Exception:
-            mf = getattr(ip.flags, "MF", False)
-        return mf or (int(ip.frag) > 0)
-
-    def _reassemble_ipv4(self, pkt: Packet, inbound_iface: str) -> Optional[Packet]:
-        ip = pkt[IP]
-        key = (ip.src, ip.dst, int(ip.proto), int(ip.id))
-        now = time.time()
-
-        self._cleanup_reasm(now)
-
-        try:
-            mf = bool(int(ip.flags) & 0x1)
-        except Exception:
-            mf = getattr(ip.flags, "MF", False)
-
-        off_bytes = int(ip.frag) * self._EIGHT
-        frag_payload = bytes(ip.payload)
-
-        with self._reasm_lock:
-            st = self._reasm.get(key)
-            if not st:
-                st = self._reasm[key] = {
-                    "first_hdr": ip.copy(),
-                    "parts": {},
-                    "total": None,
-                    "t0": now,
-                    "iface": inbound_iface,
-                }
-
-            st["parts"][off_bytes] = frag_payload
-            st["t0"] = now
-
-            if not mf:
-                st["total"] = off_bytes + len(frag_payload)
-
-            total = st["total"]
-            if total is None:
-                return None
-
-            covered = 0
-            while covered in st["parts"]:
-                covered += len(st["parts"][covered])
-
-            if covered < total:
-                return None
-
-            # Assemble
-            assembled_payload = bytearray(total)
-            for off, data in st["parts"].items():
-                assembled_payload[off:off + len(data)] = data
-
-            base = st["first_hdr"].copy()
-            base.flags = 0
-            base.frag = 0
-
-            full = IP(bytes(base)) / Raw(bytes(assembled_payload))
-            try:
-                full = IP(bytes(full))  # force re-decode (pull inner ICMP, etc.)
-            except Exception:
-                pass
-
-            del self._reasm[key]
-            self.log.log_message(f"[ICMP] 🔧 Reassembled IPv4 frags {ip.src}→{ip.dst} (len={len(bytes(full))}) on {inbound_iface.split('_')[-1]}")
-            return full
-
-    def _cleanup_reasm(self, now: float) -> None:
-        with self._reasm_lock:
-            dead = []
-            for key, st in self._reasm.items():
-                if now - st.get("t0", now) > self.REASM_TIMEOUT_SEC:
-                    dead.append(key)
-            for key in dead:
-                st = self._reasm.pop(key, None)
-                if st:
-                    src, dst, proto, _ = key
-                    self.log.log_message(f"[ICMP] ⏳ Reassembly timeout v4 for {src}→{dst} proto={proto} on {st.get('iface')}.")
-
-    def _maybe_fragment_and_queue_v4(self, reply_pkt: Packet, outbound_iface: str) -> None:
-        mtu = self._get_iface_mtu(outbound_iface)
-        raw_len = len(bytes(reply_pkt))
-        if raw_len <= mtu:
-            self.pw.queue_packet(reply_pkt, outbound_iface)
-            return
-
-        l2_overhead = 14 if reply_pkt.haslayer(Ether) else 0
-        ip_mtu = max(576, mtu - l2_overhead)  # conservative lower bound
-
-        if not reply_pkt.haslayer(IP):
-            self.pw.queue_packet(reply_pkt, outbound_iface)
-            self.log.log_message(f"[ICMP] ⚠ Oversize non-IPv4 reply ({raw_len}B) > MTU {mtu} on {outbound_iface}; sent as-is.")
-            return
-
-        ip_part = reply_pkt[IP].copy()
-        try:
-            if int(ip_part.flags) & 0x2:  # DF
-                ip_part.flags = int(ip_part.flags) & ~0x2
-        except Exception:
-            ip_part.flags = 0
-
-        try:
-            ip_frags = self._ipv4_fragment_datagram(ip_part, ip_mtu)
-        except Exception as e:
-            self.log.log_message(f"[ICMP] ❌ Fragmentation v4 failed ({e}); sending unfragmented.")
-            self.pw.queue_packet(reply_pkt, outbound_iface)
-            return
-
-        if reply_pkt.haslayer(Ether):
-            eth = reply_pkt[Ether]
-            for ipf in ip_frags:
-                self.pw.queue_packet(Ether(src=eth.src, dst=eth.dst) / ipf, outbound_iface)
-        else:
-            for ipf in ip_frags:
-                self.pw.queue_packet(ipf, outbound_iface)
-
-        self.log.log_message(f"[ICMP] ✂ Fragmented Echo-Reply v4 into {len(ip_frags)} frags for {outbound_iface} (MTU={mtu}).")
-
-    def _ipv4_fragment_datagram(self, ip_pkt: IP, ip_mtu: int):
-        ihl_bytes = int(getattr(ip_pkt, "ihl", 5)) * 4
-        if ihl_bytes <= 0:
-            ihl_bytes = 20
-
-        max_payload = (max(ip_mtu - ihl_bytes, 0) // 8) * 8
-        if max_payload <= 0:
-            raise ValueError(f"ip_mtu too small ({ip_mtu}) for header size {ihl_bytes}")
-
-        full_payload = bytes(ip_pkt.payload)
-        total = len(full_payload)
-        frags = []
-        offset = 0
-
-        while offset < total:
-            chunk = full_payload[offset: offset + max_payload]
-            more = (offset + len(chunk)) < total
-
-            frag = IP(
-                version=ip_pkt.version, ihl=ip_pkt.ihl, tos=ip_pkt.tos, id=ip_pkt.id,
-                flags=0, frag=offset // 8, ttl=ip_pkt.ttl, proto=ip_pkt.proto,
-                src=ip_pkt.src, dst=ip_pkt.dst, options=getattr(ip_pkt, "options", b"") or b"",
-            ) / Raw(chunk)
-
-            if more:
-                try:
-                    frag.flags = int(frag.flags) | 0x1  # MF
-                except Exception:
-                    frag.flags = 0x1
-
-            try:
-                del frag.len, frag.chksum
-            except Exception:
-                pass
-
-            frags.append(frag)
-            offset += len(chunk)
-
-        return frags
-
-    # -------------------------------------------------------------------------
-    # ND helpers
-    # -------------------------------------------------------------------------
-    def _nd_peer_mac_from_pkt(self, pkt: Packet) -> Optional[str]:
-        # Preferred: use concrete ND option layers
-        for lname in ("ICMPv6NDOptSrcLLAddr", "ICMPv6NDOptDstLLAddr"):
-            opt = pkt.getlayer(lname)
-            if opt is not None and hasattr(opt, "lladdr"):
-                val = getattr(opt, "lladdr", None)
-                if val:
-                    return str(val)
-
-        # Some stacks send Target Link-Layer Address as an option –
-        # Scapy might parse it as Unknown. Parse Unknown TLVs manually.
-        opt = pkt.getlayer("ICMPv6NDOptUnknown")
-        seen = set()
-        while opt and id(opt) not in seen:
-            seen.add(id(opt))
-            try:
-                raw = bytes(opt)
-                if len(raw) >= 2:
-                    t = raw[0]
-                    l = raw[1] * 8
-                    if l == 0:
-                        break
-                    body = raw[2:l] if len(raw) >= l else raw[2:]
-                    if t in (1, 2) and len(body) >= 6:  # 1=SLLA, 2=TLLA
-                        mac_bytes = body[:6]
-                        return ":".join(f"{b:02x}" for b in mac_bytes)
-            except Exception:
-                pass
-            opt = opt.payload if hasattr(opt, "payload") else None
-        return None
-
-    def _pack_nd_lladdr_opt(self, opt_type: int, mac_str: str) -> bytes:
-        mac_bytes = bytes.fromhex(mac_str.replace(":", "")) if mac_str else b"\x00" * 6
-        mac_bytes = mac_bytes[:6].ljust(6, b"\x00")
-        return bytes([opt_type & 0xFF, 1]) + mac_bytes  # 8 bytes total (type, len=1, 6B MAC)
-
-    def _nd_learn_mac(self, ip6: str, mac: str) -> None:
-        try:
-            key = str(ipaddress.IPv6Address(ip6))
-        except Exception:
-            key = str(ip6)
-        self.nd_cache[key] = {"mac": mac, "seen": time.time()}
-
-    def _solicited_node_mac_for_target(self, target_ip6: str) -> str:
-        try:
-            val = int(ipaddress.IPv6Address(target_ip6))
-            last24 = val & 0xFFFFFF
-            return f"33:33:ff:{(last24 >> 16) & 0xFF:02x}:{(last24 >> 8) & 0xFF:02x}:{last24 & 0xFF:02x}"
-        except Exception:
-            return "33:33:ff:00:00:00"
-
-    # -------------------------------------------------------------------------
-    # Misc helpers
-    # -------------------------------------------------------------------------
-    def _match_router_ip_v4(self, dst_ip: str) -> Tuple[bool, Optional[str], Optional[str]]:
-        for _, cfg in (self.ifaces or {}).items():
-            if cfg.get("ip_addr") == dst_ip:
-                return True, cfg.get("mac"), cfg.get("ip_addr")
-        return False, None, None
-
-    def _iface_mac_by_v6(self, ip6: str) -> Optional[str]:
-        ip6n = self._norm_v6(ip6)
-        for _, cfg in (self.ifaces or {}).items():
-            for k in ("ipv6_addr", "ipv6", "ip6", "ip_addr6"):
-                if self._norm_v6(cfg.get(k)) == ip6n:
-                    return cfg.get("mac")
-        return None
-
-    def _is_for_router_v6(self, dst_ip: str) -> bool:
-        return self._norm_v6(dst_ip) in self._iface_v6_set()
-
-    def _get_iface_mtu(self, name: str) -> int:
-        try:
-            return int(self.ifaces.get(name, {}).get("mtu", 1500))
-        except Exception:
-            return 1500
-
-    def _is_loopback_name(self, name: str) -> bool:
-        n = (name or "").lower()
-        return "loopback" in n or n == "lo"
-
-    def _norm_v6(self, addr: Any) -> Optional[str]:
-        if not addr:
             return None
-        try:
-            return str(ipaddress.IPv6Address(addr))
-        except Exception:
-            return str(addr)
 
-    def _iface_v6_set(self) -> Set[str]:
-        keys = ("ipv6_addr", "ipv6", "ip6", "ip_addr6")
-
-        # ✅ Change 'Set[str]' to 'set[str]' for the mutable local variable
-        addrs: set[str] = set()
-
-        for _, cfg in (self.ifaces or {}).items():
-            for k in keys:
-                nv = self._norm_v6(cfg.get(k))
-                if nv:
-                    # The type checker now knows `addrs` has an .add() method
-                    addrs.add(nv)
-        return addrs
     def _extract_inner_ipv4(self, pkt: Packet) -> Optional[IP]:
-        """
-        Best-effort extraction of the original IPv4 header carried inside an ICMPv4 error.
-        Handles Scapy's IPerror/TCPerror/UDPerror layers or raw bytes fallback.
-        """
-        icmp = pkt.getlayer(ICMP)
-        if not icmp:
-            return None
-
-        # 1) Scapy sometimes builds IPerror/TCPerror/UDPerror; prefer those.
-        iperr = icmp.getlayer("IPerror") or pkt.getlayer("IPerror")
-        if iperr:
-            try:
-                # IPerror behaves like IP for our purposes
-                return IP(bytes(iperr))
-            except Exception:
-                pass
-
-        # 2) If payload is raw bytes starting at an IPv4 header, parse it directly.
+        """Extracts the original IPv4 header from inside an ICMPv4 error message."""
         try:
-            raw_inner = bytes(icmp.payload)
+            payload = bytes(pkt[ICMP].payload)
+            if len(payload) >= 20 and (payload[0] >> 4) == 4:
+                return IP(payload)
         except Exception:
-            raw_inner = b""
-
-        if len(raw_inner) >= 20:
-            # sanity: version=4, ihl between 5..15
-            vihl = raw_inner[0]
-            ver = (vihl >> 4) & 0xF
-            ihl = (vihl & 0xF)
-            if ver == 4 and 5 <= ihl <= 15:
-                try:
-                    return IP(raw_inner)
-                except Exception:
-                    pass
-
-        # 3) Nothing usable
+            pass
         return None
 
     def _proto_name_v4(self, proto_num: int) -> str:
         return {6: "TCP", 17: "UDP", 1: "ICMP"}.get(int(proto_num), str(proto_num))
 
+    def _nd_learn_mac(self, ipv6_addr: str, mac_addr: str) -> None:
+        """
+        Updates the Neighbor Discovery (ND) cache with an IPv6-to-MAC address mapping.
 
-    def _log_admin_block(self, pkt: Packet, inbound_iface: str) -> None:
-        icmp = pkt[ICMP]
-        ip2 = self._extract_inner_ipv4(pkt)
+        This method is the core of the router's ability to learn about other devices
+        on the local network. It takes an IPv6 address and a MAC address, normalizes
+        the IPv6 address to a canonical format, and stores the mapping along with a
+        timestamp.
 
-        if ip2 is not None:
-            l4 = ip2.payload
-            sport = getattr(l4, "sport", None)
-            dport = getattr(l4, "dport", None)
-            proto = self._proto_name_v4(getattr(ip2, "proto", 0))
-            self.log.log_message(
-                f"[ICMP] 🔒 Admin-prohibited v4 on {inbound_iface.split('_')[-1]}: "
-                f"{ip2.src}:{sport if sport is not None else '-'} → "
-                f"{ip2.dst}:{dport if dport is not None else '-'} proto={proto}"
-            )
-            return
-
-        # Fallback: payload too short / not captured / non-standard
+        Args:
+            ipv6_addr: The IPv6 address of the neighbor device.
+            mac_addr: The corresponding MAC (link-layer) address of the neighbor.
+        """
+        # Step 1: Normalize the IPv6 address to ensure a consistent key format.
+        # IPv6 addresses can be written in many ways (e.g., with or without "::").
+        # Normalizing prevents duplicate entries for the same address.
         try:
-            raw_inner = bytes(icmp.payload)
-        except Exception:
-            raw_inner = b""
+            normalized_key = str(ipaddress.IPv6Address(ipv6_addr))
+        except ipaddress.AddressValueError:
+            # If the address is invalid, use the raw string as a fallback.
+            normalized_key = str(ipv6_addr)
 
-        snippet = raw_inner[:32].hex(" ") if raw_inner else ""
-        self.log.log_message(
-            f"[ICMP] 🔒 Admin-prohibited v4 (no parsable inner IP) on {inbound_iface.split('_')[-1]} "
-            f"(inner_len={len(raw_inner)}B, head={snippet})"
-        )
-    # -------------------------------------------------------------------------
-    # Purge loop
-    # -------------------------------------------------------------------------
-    def _purge_loop(self):
-        self.log.log_message("[ICMP] MLD/ND purge thread started.")
-        while not self._stop.is_set():
-            self._purge_mld_memberships()
-            # (Optional) ND cache aging could be added here
-            self._stop.wait(self.PURGE_INTERVAL_SEC)
-        self.log.log_message("[ICMP] MLD/ND purge thread exited.")
+        # Step 2: Update the cache with the MAC address and the current time.
+        # The timestamp is used to age out old, potentially stale entries.
+        self.nd_cache[normalized_key] = {"mac": mac_addr, "seen": time.time()}
 
-    def _purge_mld_memberships(self) -> None:
-        now = time.time()
-        with self._mld_lock:
-            to_del = [
-                key for key, ent in self._mld_groups.items()
-                if (now - ent.get("last_report", 0)) > self.MLD_MEMBERSHIP_TIMEOUT
-            ]
-            for key in to_del:
-                g, ifn = key
-                del self._mld_groups[key]
-                self.log.log_message(f"[ICMP][MLD] 🧹 Timed out membership for {g} on {ifn.split('_')[-1]}.")
+        # (Optional) Add a log message for visibility.
+        self.log.log_message(f"[ICMP][ND] 📒 Learned neighbor mapping: {normalized_key} -> {mac_addr}")
 
-    # -------------------------------------------------------------------------
-    # Rate limit
-    # -------------------------------------------------------------------------
-    def _is_rate_limited(self, src_ip: str, dst_ip: str) -> bool:
-        with self._rate_limit_lock:
-            now = time.time()
-            key = (src_ip, dst_ip)
-            if now - self._last_reply_time[key] < (1.0 / self.rate_limit_pps):
-                self.log.log_message(f"[ICMP] 🚫 Rate-limiting Echo-Reply to {src_ip}.")
-                return True
-            self._last_reply_time[key] = now
-            return False

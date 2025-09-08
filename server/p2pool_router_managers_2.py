@@ -21,10 +21,12 @@ from scapy.config import conf
 from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr
 from scapy.layers.dhcp import DHCP, BOOTP
-from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward,DHCP6_Advertise, DHCP6_Reply
+from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
+    DUID_LLT, DHCP6OptServerId
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import ICMP
-from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, IPv6ExtHdrHopByHop, RouterAlert
+from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
+    IPv6ExtHdrHopByHop, RouterAlert, ICMPv6NDOptDstLLAddr, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr, ICMPv6ND_NS
 from scapy.layers.l2 import ARP, getmacbyip
 from scapy.layers.rip import RIPEntry, RIP
 from scapy.packet import bind_layers
@@ -41,8 +43,7 @@ from scapy.sendrecv import srp1
 from p2pool_tools import RandomXLoader, RandomXFlags
 from scapy.layers.inet6 import ICMPv6NDOptPrefixInfo
 
-
-
+from p2pool_sniffer import DNSRR_AAAA
 
 bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
 
@@ -4070,387 +4071,332 @@ class MembershipEntry:
     lmq_group_specific: bool = False
 
 class IGMPManager:
-    IGMP_ALL_HOSTS_G = "224.0.0.1"
-    IGMP_ALL_ROUTERS_G = "224.0.0.2"
-    RIP2_ALL_ROUTERS_G = "224.0.0.9"
-    MDNS_ALL_NODES_G = "224.0.0.251"
+    """
+    A comprehensive manager for the Internet Group Management Protocol (IGMP).
 
-    MLD_ALL_NODES = "ff02::1"
-    MLD_ALL_ROUTERS = "ff02::2"
+    This class handles IGMPv1, v2, and v3 messages to maintain a database of
+    multicast group memberships on a router's interfaces. It acts as an IGMP
+    querier, sending periodic General Queries and Group-Specific Queries when
+    members leave.
 
-    MAC_IGMP_ALL_HOSTS = "01:00:5e:00:00:01"
+    Features:
+      - Handles IGMPv1/v2/v3 Membership Reports (Joins).
+      - Handles IGMPv2 Leave messages by initiating the Last Member Query sequence.
+      - Periodically sends General Queries to all hosts.
+      - Purges stale memberships that are no longer active.
+      - Provides a `should_forward_multicast` method for routing decisions.
+    """
+    # Standard IGMP multicast addresses
+    IGMP_ALL_HOSTS = "224.0.0.1"
+    IGMP_ALL_ROUTERS = "224.0.0.2"
+    MAC_ALL_HOSTS = "01:00:5e:00:00:01"
 
-    IGMPV3_REC_TYPES = {
-        1: "MODE_IS_INCLUDE",
-        2: "MODE_IS_EXCLUDE",
-        3: "CHANGE_TO_INCLUDE_MODE",
-        4: "CHANGE_TO_EXCLUDE_MODE",
-        5: "ALLOW_NEW_SOURCES",
-        6: "BLOCK_OLD_SOURCES",
-    }
-    MLDV2_REC_TYPES = IGMPV3_REC_TYPES
-
-    IGMP_QUERY_INTERVAL = 125
-    IGMP_MAX_RESP_CODE = 100
-    MEMBERSHIP_TIMEOUT = 260
-    LMQ_COUNT = 2
-    LMQ_INTERVAL = 1
-    IPV6_HOP_LIMIT = 1
+    # IGMP Timers and Constants (RFC 2236 & 3376)
+    QUERY_INTERVAL = 125  # Time between General Queries.
+    MEMBERSHIP_TIMEOUT = 260  # (Robustness Var * Query Int) + Max Resp Time
+    LMQ_COUNT = 2  # Last Member Query Count.
+    LMQ_INTERVAL = 1  # Seconds.
 
     def __init__(self, router_logger, packet_writer):
         self.log = router_logger
         self.pw = packet_writer
-        self._db: Dict[Tuple[int, str, str], MembershipEntry] = {}
+        # Database key: (group_ip, interface_name) -> MembershipEntry
+        self._db: Dict[Tuple[str, str], MembershipEntry] = {}
         self._lock = threading.Lock()
         self._ifcfg: Dict[str, Dict] = {}
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self.on_change = None
-        self.log.log_message("[IGMP] Fully-fledged manager initialized (IGMPv1/v2/v3 + MLDv1/v2).")
+        # Callback for external components to react to membership changes
+        self.on_change: Optional[callable] = None
+        self.log.log_message("[IGMP] Manager initialized (v1/v2/v3 support).")
 
     def set_interfaces_config(self, interfaces_config: Dict[str, Dict]):
+        """Sets or updates the router's interface configuration."""
         self._ifcfg = interfaces_config or {}
 
     def start(self):
+        """Starts the background thread for sending queries and managing state."""
         if self._thread and self._thread.is_alive():
             return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._bg_loop, name="IGMP_MLD_Manager", daemon=True)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._background_loop, name="IGMP_Manager", daemon=True)
         self._thread.start()
         self.log.log_message("[IGMP] Background thread started.")
 
     def stop(self):
+        """Stops the background thread."""
         if not self._thread:
             return
-        self._stop.set()
+        self._stop_event.set()
         self._thread.join(timeout=3.0)
         self.log.log_message("[IGMP] Background thread stopped.")
 
-    def handle_packet(self, pkt: "Packet", inbound_ifname: str):
+    def handle_packet(self, pkt: Packet, inbound_ifname: str):
+        """Main entry point for processing incoming IGMP packets."""
+        if not (pkt.haslayer(IP) and pkt.haslayer(IGMP)):
+            return
         try:
-            if pkt.haslayer(IGMP) and pkt.haslayer(IP):
-                self._handle_igmp(pkt, inbound_ifname)
-                return
-            if pkt.haslayer(IPv6):
-                self._handle_mld(pkt, inbound_ifname)
-                return
+            self._handle_igmp(pkt, inbound_ifname)
         except Exception as e:
-            self.log.log_message(f"[IGMP] handle_packet error: {e}")
+            self.log.log_message(f"[IGMP] Error handling packet: {e}")
 
-    def should_forward_multicast(self, *, family: int, group_ip: str,
-                                 outbound_ifname: str, source_ip: Optional[str] = None) -> bool:
-        if family == 4 and group_ip in (self.IGMP_ALL_HOSTS_G, self.IGMP_ALL_ROUTERS_G,
-                                        self.RIP2_ALL_ROUTERS_G, self.MDNS_ALL_NODES_G):
+    def should_forward_multicast(self, *, group_ip: str, outbound_ifname: str, source_ip: Optional[str] = None) -> bool:
+        """
+        Determines if a multicast packet should be forwarded out a specific interface.
+        """
+        # Always forward traffic for well-known administrative groups.
+        if group_ip in (self.IGMP_ALL_HOSTS, self.IGMP_ALL_ROUTERS):
             return True
-        if family == 6 and group_ip in (self.MLD_ALL_NODES, self.MLD_ALL_ROUTERS):
-            return True
 
-        now = time.time()
-        key = (family, group_ip, outbound_ifname)
+        key = (group_ip, outbound_ifname)
         with self._lock:
-            ent = self._db.get(key)
-            if not ent:
-                return False
-            if (now - ent.last_report) > self.MEMBERSHIP_TIMEOUT:
-                del self._db[key]
-                return False
-            mode = ent.mode
-            srcs = ent.sources
+            entry = self._db.get(key)
+            if not entry:
+                return False  # No members for this group on the interface.
 
-        if source_ip is None:
-            return True  # live membership implies (*,G) forwarding
+        # Source-Specific Multicast (SSM) filtering logic
+        if source_ip:
+            if entry.mode == "include":
+                return source_ip in entry.sources
+            else:  # exclude mode
+                return source_ip not in entry.sources
 
-        if mode == "include":
-            return source_ip in srcs if len(srcs) > 0 else False
-        else:
-            return (source_ip not in srcs)
+        # Any-Source Multicast (ASM) forwarding
+        return True
 
-    def snapshot(self) -> Dict[Tuple[int, str, str], dict]:
-        out = {}
+    def snapshot(self) -> Dict[Tuple[str, str], dict]:
+        """Returns a snapshot of the current IGMP membership database."""
         with self._lock:
-            for k, v in self._db.items():
-                out[k] = {
-                    "family": v.family, "group": v.group, "ifname": v.ifname,
-                    "mode": v.mode, "sources": sorted(v.sources),
-                    "last_report": v.last_report, "proto": v.proto,
+            return {
+                k: {
+                    "group": v.group, "ifname": v.ifname, "mode": v.mode,
+                    "sources": sorted(v.sources), "last_report": v.last_report,
                     "version": v.version, "lmq_remaining": v.lmq_remaining,
                 }
-        return out
+                for k, v in self._db.items()
+            }
 
-    def _bg_loop(self):
-        next_query = 0.0
-        while not self._stop.is_set():
+    ## ------------------- Background Tasks ------------------- ##
+
+    def _background_loop(self):
+        """The main loop for the background thread."""
+        next_query_time = time.time()
+        while not self._stop_event.is_set():
             now = time.time()
-            if now >= next_query:
+            if now >= next_query_time:
                 self._send_general_queries()
-                next_query = now + self.IGMP_QUERY_INTERVAL
-            self._service_lmq(now)
-            self._purge_stale(now)
-            self._stop.wait(0.2)
+                next_query_time = now + self.QUERY_INTERVAL
 
-    # ---------------- IGMP (IPv4) ----------------
+            self._service_last_member_queries(now)
+            self._purge_stale_memberships(now)
+            self._stop_event.wait(0.5)  # Service loop runs twice a second
 
-    def _handle_igmp(self, pkt: "Packet", ifname: str):
-        ig: IGMP = pkt[IGMP]
-        ip: IP = pkt[IP]
-        src_ip = ip.src
-        t = int(getattr(ig, "type", 0))
-        gaddr = str(getattr(ig, "gaddr", "0.0.0.0"))
-        ver = self._infer_igmp_version(t)
+    def _send_general_queries(self):
+        """Sends an IGMP General Query message out of all configured interfaces."""
+        for ifname, cfg in self._ifcfg.items():
+            ip_src = cfg.get("ip_addr")
+            mac_src = cfg.get("mac")
+            if not (ip_src and mac_src) or self._is_loopback(ifname):
+                continue
 
-        self.log.log_message(f"[IGMP] v{ver} type=0x{t:02x} from {src_ip} on {ifname.split('_')[-1]} gaddr={gaddr}")
+            query_pkt = (
+                    Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
+                    IP(src=ip_src, dst=self.IGMP_ALL_HOSTS, ttl=1, options="\x94\x04\x00\x00") /  # Router Alert
+                    IGMP(type=0x11, gaddr="0.0.0.0")  # General Query
+            )
+            self.log.log_message(f"[IGMP] -> General Query on {ifname.split('_')[-1]}")
+            self.pw._send_raw_packet(query_pkt, ifname,  allow_dst_ours=True)
 
-        if t == 0x11:
+    def _purge_stale_memberships(self, now: float):
+        """Removes memberships that have timed out."""
+        with self._lock:
+            stale_keys = [
+                k for k, v in self._db.items()
+                if (now - v.last_report) > self.MEMBERSHIP_TIMEOUT and v.lmq_remaining == 0
+            ]
+            for key in stale_keys:
+                entry = self._db.pop(key)
+                self.log.log_message(f"[IGMP] Timed out membership for {entry.group} on {entry.ifname.split('_')[-1]}.")
+                self._notify("leave", entry)
+
+    ## ------------------- IGMP Packet Handling ------------------- ##
+
+    def _handle_igmp(self, pkt: Packet, ifname: str):
+        """Dispatches IGMP packets based on their type and version."""
+        igmp_layer: IGMP = pkt[IGMP]
+        src_ip = pkt[IP].src
+        igmp_type = igmp_layer.type
+        group_addr = igmp_layer.gaddr
+
+        # 0x11 is Query, which we send but typically ignore when received from other routers.
+        if igmp_type == 0x11:
             return
 
-        if t in (0x12, 0x16):  # v1/v2 Report
-            group = gaddr if gaddr != "0.0.0.0" else str(getattr(ig, "addr", "0.0.0.0"))
-            self._join(family=4, group=group, ifname=ifname, mode="include", sources=None,
-                       who=src_ip, proto="IGMP", version=ver)
+        # IGMPv1 (0x12) or IGMPv2 (0x16) Membership Report
+        if igmp_type == 0x12 or igmp_type == 0x16:
+            version = 1 if igmp_type == 0x12 else 2
+            self._join(group_addr, ifname, "include", set(), src_ip, version)
             return
 
-        if t == 0x17:  # Leave
-            self._leave_or_lmq(family=4, group=gaddr, ifname=ifname, who=src_ip, proto="IGMP", version=ver)
+        # IGMPv2 Leave Group (0x17)
+        if igmp_type == 0x17:
+            self._leave(group_addr, ifname, src_ip)
             return
 
-        if t == 0x22 or (pkt.haslayer(IGMPv3) or pkt.haslayer(IGMPv3mr)):
+        # IGMPv3 Membership Report (0x22)
+        if igmp_type == 0x22:
             self._handle_igmpv3_report(pkt, ifname, src_ip)
             return
 
-    def _handle_igmpv3_report(self, pkt: "Packet", ifname: str, src_ip: str):
+    def _handle_igmpv3_report(self, pkt: Packet, ifname: str, src_ip: str):
+        """Parses and processes an IGMPv3 report with its group records."""
         try:
-            records = None
-            mr = pkt.getlayer(IGMPv3mr) or pkt.getlayer(IGMPv3) or pkt.getlayer(IGMP)
-            records = getattr(mr, "records", None) or getattr(mr, "grps", None)
-            if not records:
-                mr = pkt.getlayer(IGMP)
-                records = getattr(mr, "records", None)
-            if not records:
-                self.log.log_message("[IGMP] v3 report without records (parser mismatch).")
+            report_layer = pkt.getlayer(IGMPv3mr)
+            if not report_layer or not hasattr(report_layer, 'grps'):
+                self.log.log_message("[IGMP] v3 report with malformed records.")
                 return
 
-            for rec in records:
-                rtype = int(getattr(rec, "rtype", getattr(rec, "type", 0)))
-                group = str(getattr(rec, "maddr", getattr(rec, "gaddr", "0.0.0.0")))
-                srcs = [str(s) for s in (getattr(rec, "srcaddrs", []) or getattr(rec, "sources", []))]
+            for record in report_layer.grps:
+                group = record.gaddr
+                srcs = set(record.srcaddrs)
+                rtype = record.rtype
+
+                # MODE_IS_INCLUDE / CHANGE_TO_INCLUDE
                 if rtype in (1, 3):
-                    self._join(4, group, ifname, "include", set(srcs), src_ip, "IGMPv3", version=3)
+                    self._join(group, ifname, "include", srcs, src_ip, 3)
+                # MODE_IS_EXCLUDE / CHANGE_TO_EXCLUDE
                 elif rtype in (2, 4):
-                    self._join(4, group, ifname, "exclude", set(srcs), src_ip, "IGMPv3", version=3)
+                    self._join(group, ifname, "exclude", srcs, src_ip, 3)
+                # ALLOW_NEW_SOURCES
                 elif rtype == 5:
-                    self._join(4, group, ifname, "include", set(srcs), src_ip, "IGMPv3", version=3, merge_only=True)
+                    self._update_sources(group, ifname, srcs, "allow")
+                # BLOCK_OLD_SOURCES
                 elif rtype == 6:
-                    self._block_sources(4, group, ifname, set(srcs))
-                else:
-                    self.log.log_message(f"[IGMP] Unknown v3 record type={rtype} group={group} srcs={srcs}")
+                    self._update_sources(group, ifname, srcs, "block")
         except Exception as e:
             self.log.log_message(f"[IGMP] v3 parse error: {e}")
 
-    # ---------------- MLD (IPv6) ----------------
+    ## ------------------- Membership State Management ------------------- ##
 
-    def _handle_mld(self, pkt: "Packet", ifname: str):
-
-        ip6: IPv6 = pkt[IPv6]
-        src_ip = ip6.src
-
-        if pkt.haslayer(ICMPv6MLQuery):
-            self.log.log_message(f"[IGMP] MLD Query from {src_ip} on {ifname.split('_')[-1]}")
-            return
-
-        if pkt.haslayer(ICMPv6MLReport):
-            lr = pkt[ICMPv6MLReport]
-            group = str(getattr(lr, "mladdr", "::"))
-            self._join(6, group, ifname, "include", None, src_ip, "MLD", version=1)
-            return
-
-        if pkt.haslayer(ICMPv6MLDone):
-            ld = pkt[ICMPv6MLDone]
-            group = str(getattr(ld, "mladdr", "::"))
-            self._leave_or_lmq(6, group, ifname, src_ip, "MLD", version=1)
-            return
-
-        if pkt.haslayer(ICMPv6MLReport2):
-            r2 = pkt[ICMPv6MLReport2]
-            recs = getattr(r2, "records", []) or []
-            for rec in recs:
-                rtype = int(getattr(rec, "type", 0))
-                group = str(getattr(rec, "maddr", "::"))
-                srcs = [str(s) for s in getattr(rec, "srcaddrs", [])]
-                if rtype in (1, 3):
-                    self._join(6, group, ifname, "include", set(srcs), src_ip, "MLDv2", version=2)
-                elif rtype in (2, 4):
-                    self._join(6, group, ifname, "exclude", set(srcs), src_ip, "MLDv2", version=2)
-                elif rtype == 5:
-                    self._join(6, group, ifname, "include", set(srcs), src_ip, "MLDv2", version=2, merge_only=True)
-                elif rtype == 6:
-                    self._block_sources(6, group, ifname, set(srcs))
-                else:
-                    self.log.log_message(f"[IGMP] Unknown MLDv2 record type={rtype} group={group} srcs={srcs}")
-            return
-
-    # ------------- Membership ops -------------
-
-    def _join(self, family: int, group: str, ifname: str, mode: str,
-              sources: Optional[Set[str]], who: str, proto: str, *, version: int, merge_only: bool = False):
+    def _join(self, group: str, ifname: str, mode: str, sources: Set[str], who: str, version: int):
+        """Processes a request to join or update a group membership."""
         now = time.time()
-        key = (family, group, ifname)
+        key = (group, ifname)
         with self._lock:
-            ent = self._db.get(key)
-            if not ent:
-                ent = MembershipEntry(family=family, group=group, ifname=ifname,
-                                      mode=mode, sources=set(sources or set()),
-                                      last_report=now, proto=proto, version=version)
-                self._db[key] = ent
+            entry = self._db.get(key)
+            if not entry:
+                entry = MembershipEntry(family=4, group=group, ifname=ifname)
+                self._db[key] = entry
                 action = "join"
             else:
                 action = "update"
-                ent.last_report = now
-                ent.version = version
-                if not merge_only:
-                    ent.mode = mode
-                    ent.sources = set(sources or set())
-                else:
-                    ent.sources |= set(sources or set())
-                ent.lmq_remaining = 0
-                ent.lmq_next_ts = 0.0
-                ent.lmq_group_specific = False
+
+            # Update the entry's state
+            entry.mode = mode
+            entry.sources = sources
+            entry.last_report = now
+            entry.version = max(entry.version, version)  # Use the highest version seen
+            entry.lmq_remaining = 0  # A new join cancels any pending leave query
 
         src_txt = f" sources={sorted(list(sources))}" if sources else ""
-        self.log.log_message(f"[IGMP] {proto} JOIN by {who} {group} on {ifname.split('_')[-1]} ({mode}{src_txt})")
-        self._notify(action, ent)
+        self.log.log_message(
+            f"[IGMP] v{version} JOIN from {who} for {group} on {ifname.split('_')[-1]} ({mode}{src_txt})")
+        self._notify(action, entry)
 
-    def _leave_or_lmq(self, family: int, group: str, ifname: str, who: str, proto: str, *, version: int):
-        key = (family, group, ifname)
+    def _leave(self, group: str, ifname: str, who: str):
+        """Initiates the Last Member Query sequence upon receiving a Leave message."""
+        key = (group, ifname)
         with self._lock:
-            ent = self._db.get(key)
-            if not ent:
-                self.log.log_message(f"[IGMP] {proto} Leave for {group} on {ifname.split('_')[-1]} (no entry).")
+            entry = self._db.get(key)
+            if not entry:
+                self.log.log_message(f"[IGMP] Leave from {who} for {group} (no existing members).")
                 return
-            ent.lmq_remaining = max(self.LMQ_COUNT, 1)
-            ent.lmq_next_ts = 0.0
-            ent.lmq_group_specific = True
-            ent.last_report = time.time()
 
-        self.log.log_message(f"[IGMP] {proto} Leave by {who} -> LMQ for {group} on {ifname.split('_')[-1]} (x{self.LMQ_COUNT})")
+            # Start the LMQ sequence only if there might still be v1/v2 listeners
+            if entry.version < 3:
+                entry.lmq_remaining = self.LMQ_COUNT
+                entry.lmq_next_ts = 0.0  # Send first query immediately
+                self.log.log_message(f"[IGMP] v2 Leave from {who} for {group}. Starting Last Member Query.")
+            else:
+                # For IGMPv3, hosts report all sources, so a leave is explicit.
+                del self._db[key]
+                self.log.log_message(f"[IGMP] v3 Leave from {who} for {group}. Membership removed.")
+                self._notify("leave", entry)
 
-    def _block_sources(self, family: int, group: str, ifname: str, blocked: Set[str]):
-        key = (family, group, ifname)
+    def _update_sources(self, group: str, ifname: str, sources: Set[str], action: str):
+        """Applies source list changes from IGMPv3 ALLOW/BLOCK records."""
+        key = (group, ifname)
         with self._lock:
-            ent = self._db.get(key)
-            if not ent:
+            entry = self._db.get(key)
+            if not entry:
                 return
-            ent.last_report = time.time()
-            if ent.mode == "exclude":
-                ent.sources |= set(blocked)
-        self.log.log_message(f"[IGMP] BLOCK_OLD_SOURCES group={group} on {ifname.split('_')[-1]} blocked={sorted(list(blocked))}")
-        self._notify("update", self._db.get(key))
 
-    def _purge_stale(self, now: float):
+            if action == "allow":
+                entry.sources.update(sources)
+            elif action == "block":
+                entry.sources.difference_update(sources)
+
+            entry.last_report = time.time()
+
+        self.log.log_message(f"[IGMP] v3 {action.upper()}_SOURCES for {group} on {ifname.split('_')[-1]}.")
+        self._notify("update", entry)
+
+    ## ------------------- Last Member Query (LMQ) ------------------- ##
+
+    def _service_last_member_queries(self, now: float):
+        """Sends Group-Specific Queries for groups in the LMQ state."""
+        keys_to_drop = []
         with self._lock:
-            stale = [k for k, v in self._db.items() if (now - v.last_report) > self.MEMBERSHIP_TIMEOUT and v.lmq_remaining == 0]
-            for k in stale:
-                ent = self._db.pop(k)
-                self.log.log_message(f"[IGMP] Timed out membership for {ent.group} on {ent.ifname.split('_')[-1]}.")
-                self._notify("leave", ent)
+            for key, entry in self._db.items():
+                if entry.lmq_remaining > 0 and now >= entry.lmq_next_ts:
+                    self._send_group_specific_query(entry)
+                    entry.lmq_remaining -= 1
+                    if entry.lmq_remaining > 0:
+                        entry.lmq_next_ts = now + self.LMQ_INTERVAL
+                    else:
+                        # After the last query, if no one replied, remove the group.
+                        keys_to_drop.append(key)
 
-    # ------------- Queries -------------
-
-    def _send_general_queries(self):
-        for ifname, cfg in (self._ifcfg or {}).items():
-            ip_src = cfg.get("ip_addr")
-            mac_src = cfg.get("mac")
-            if ip_src and mac_src and not self._is_loop(ifname):
-                pkt = (
-                    Ether(src=mac_src, dst=self.MAC_IGMP_ALL_HOSTS)
-                    / IP(src=ip_src, dst=self.IGMP_ALL_HOSTS_G, ttl=1)
-                    / IGMP(type=0x11, mrcode=self.IGMP_MAX_RESP_CODE, gaddr="0.0.0.0")
-                )
-                self.log.log_message(f"[IGMP] → General Query on {ifname.split('_')[-1]}")
-                self.pw.queue_packet(pkt, ifname)
-
-        for ifname, cfg in (self._ifcfg or {}).items():
-            mac_src = cfg.get("mac")
-            ip6_src = cfg.get("ipv6_addr")
-            if ip6_src and mac_src and not self._is_loop(ifname):
-                pkt = (
-                    Ether(src=mac_src, dst="33:33:00:00:00:01")
-                    / IPv6(src=ip6_src, dst=self.MLD_ALL_NODES, hlim=self.IPV6_HOP_LIMIT)
-                    / IPv6ExtHdrHopByHop(options=RouterAlert())
-                    / ICMPv6MLQuery()
-                )
-                self.log.log_message(f"[IGMP] → MLD General Query on {ifname.split('_')[-1]}")
-                self.pw.queue_packet(pkt, ifname)
-
-    def _service_lmq(self, now: float):
-        to_drop = []
-        with self._lock:
-            for key, ent in self._db.items():
-                if ent.lmq_remaining <= 0 or ent.lmq_next_ts > now:
-                    continue
-                if ent.family == 4:
-                    self._igmp_group_query(ent)
-                elif ent.family == 6:
-                    self._mld_group_query(ent)
-                ent.lmq_remaining -= 1
-                ent.lmq_next_ts = now + self.LMQ_INTERVAL
-                if ent.lmq_remaining == 0 and (now - ent.last_report) > self.LMQ_INTERVAL:
-                    to_drop.append(key)
-
-        if to_drop:
+        if keys_to_drop:
             with self._lock:
-                for k in to_drop:
-                    ent = self._db.pop(k, None)
-                    if ent:
-                        self.log.log_message(f"[IGMP] No remaining listeners for {ent.group} on {ent.ifname.split('_')[-1]} (after LMQ).")
-                        self._notify("leave", ent)
+                for key in keys_to_drop:
+                    entry = self._db.pop(key, None)
+                    if entry:
+                        self.log.log_message(f"[IGMP] No reply to LMQ for {entry.group}. Removing membership.")
+                        self._notify("leave", entry)
 
-    def _igmp_group_query(self, ent: MembershipEntry):
-        cfg = self._ifcfg.get(ent.ifname, {})
-        mac_src = cfg.get("mac"); ip_src = cfg.get("ip_addr")
-        if not (mac_src and ip_src):
+    def _send_group_specific_query(self, entry: MembershipEntry):
+        """Sends an IGMP query for a specific multicast group."""
+        ifname = entry.ifname
+        cfg = self._ifcfg.get(ifname, {})
+        ip_src = cfg.get("ip_addr")
+        mac_src = cfg.get("mac")
+        if not (ip_src and mac_src):
             return
-        pkt = (
-            Ether(src=mac_src, dst=self.MAC_IGMP_ALL_HOSTS)
-            / IP(src=ip_src, dst=self.IGMP_ALL_HOSTS_G, ttl=1)
-            / IGMP(type=0x11, mrcode=self.LMQ_INTERVAL, gaddr=ent.group)
+
+        query_pkt = (
+                Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
+                IP(src=ip_src, dst=entry.group, ttl=1, options="\x94\x04\x00\x00") /  # Router Alert
+                IGMP(type=0x11, gaddr=entry.group)
         )
-        self.log.log_message(f"[IGMP] → Group-Specific Query({ent.group}) on {ent.ifname.split('_')[-1]}")
-        self.pw.queue_packet(pkt, ent.ifname)
+        self.log.log_message(f"[IGMP] -> Group-Specific Query for {entry.group} on {ifname.split('_')[-1]}")
+        self.pw._send_raw_packet(query_pkt, ifname)
 
-    def _mld_group_query(self, ent: MembershipEntry):
-        cfg = self._ifcfg.get(ent.ifname, {})
-        mac_src = cfg.get("mac"); ip6_src = cfg.get("ipv6_addr")
-        if not (mac_src and ip6_src):
-            return
-        pkt = (
-            Ether(src=mac_src, dst="33:33:00:00:00:01")
-            / IPv6(src=ip6_src, dst=self.MLD_ALL_NODES, hlim=self.IPV6_HOP_LIMIT)
-            / IPv6ExtHdrHopByHop(options=RouterAlert())
-            / ICMPv6MLQuery(mladdr=ent.group)
-        )
-        self.log.log_message(f"[IGMP] → MLD Group-Specific Query({ent.group}) on {ent.ifname.split('_')[-1]}")
-        self.pw.queue_packet(pkt, ent.ifname)
+    ## ------------------- Helper Methods ------------------- ##
 
-    # ------------- Helpers -------------
-
-    def _notify(self, action: str, ent: Optional[MembershipEntry]):
-        if not ent:
-            return
-        cb = self.on_change
-        if callable(cb):
+    def _notify(self, action: str, entry: Optional[MembershipEntry]):
+        """Calls the on_change callback if it is registered."""
+        if entry and callable(self.on_change):
             try:
-                cb(action, ent)
+                self.on_change(action, entry)
             except Exception as e:
                 self.log.log_message(f"[IGMP] on_change callback error: {e}")
 
     @staticmethod
-    def _infer_igmp_version(igmp_type: int) -> int:
-        return 3 if igmp_type == 0x22 else 2
-
-    @staticmethod
-    def _is_loop(ifname: str) -> bool:
-        lname = (ifname or "").lower()
-        return lname == "lo" or "loopback" in lname
+    def _is_loopback(ifname: str) -> bool:
+        """Checks if an interface name is a loopback."""
+        name = (ifname or "").lower()
+        return name == "lo" or "loopback" in name
 
 
 class RIPManager:
@@ -4521,6 +4467,8 @@ class RIPManager:
 
         # --- ADDING ALL PRE-CONFIGURED STATIC ROUTES ---
         # All static routes are now added here in a single, consolidated block.
+        self.add_static_route(network_str="0.0.0.0/32", next_hop=router_gateway_out_ip,
+                              interface=interface_out_full_name, cost=1)
 
         self.add_static_route(network_str="8.8.8.8/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
@@ -4561,6 +4509,8 @@ class RIPManager:
         self.add_static_route(network_str="8.26.56.26/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="8.20.247.20/32", next_hop=router_gateway_out_ip,
+                              interface=interface_out_full_name, cost=1)
+        self.add_static_route(network_str="::/0",next_hop="::1",
                               interface=interface_out_full_name, cost=1)
         # Neustar UltraDNS
         self.add_static_route("156.154.70.1/32", router_gateway_out_ip, interface_out_full_name, 1)
@@ -5875,342 +5825,449 @@ class NATManager:
             return None
         return None
 
+
+
 class DNSManager:
     """
-    Manages DNS query proxying. Intercepts local DNS requests and forwards
-    them to a public DNS server.
-    Enhanced with DNS caching, conditional forwarding, and basic filtering.
+    Manages DNS proxying with high stability and optional IPv6 synthesis (DNS64).
+
+    Features:
+      - Caching of DNS responses to reduce latency and upstream queries.
+      - Support for multiple upstream DNS servers with health tracking and automatic failover.
+      - Periodic active health probes to measure latency and availability of upstreams.
+      - Optional DNS64 functionality to synthesize AAAA records from A records.
+      - Blacklisting for blocking queries to unwanted domains.
+      - Conditional forwarding for routing specific domain queries to designated servers.
     """
 
+    # --- Tunables ---
+    DNS_CACHE_TTL = 300  # Default cache time for successful responses
+    DNS_CACHE_MAX_ENTRIES = 2000
+    UPSTREAM_HEALTH_PROBE_INTERVAL = 180  # Seconds between health checks
+    UPSTREAM_TIMEOUT_SEC = 2.0  # Timeout for a single upstream query
+
     def __init__(self, router_logger, packet_writer):
-        self.packet_writer = packet_writer
-        self.router_logger = router_logger
-        self.PRIMARY_DNS_SERVER = "8.8.8.8"
-        self.PRIMARY_DNS_PORT = 53  # NEW
-        self._pending_requests = {}
+        self.logger = router_logger
+        self.pw = packet_writer
         self._lock = threading.Lock()
-        self._dns_cache = {}
-        self.DNS_CACHE_TTL_MIN = 60
-        self.DNS_CACHE_MAX_ENTRIES = 1000
-        self._conditional_forwarders = {}  # allow "ip" or "ip:port"
-        self._dns_blacklist = set()
-        self.sniffer = None
-        self.router_logger.log_message("[DNS] Manager initialized.")
 
-    # --- NEW: easy way to pick a local stub like 127.0.0.1:8888
-    def set_primary_upstream(self, ip: str, port: int = 53):
-        self.PRIMARY_DNS_SERVER = ip
-        self.PRIMARY_DNS_PORT = int(port)
-        self.router_logger.log_message(f"[DNS] Primary upstream set to {ip}:{port}")
+        # --- State Management ---
+        self._dns_cache: Dict[str, Tuple[Packet, float]] = {}  # qkey -> (packet, expiry_ts)
+        self._pending_requests: Dict[Tuple, Dict] = {}  # fwd_key -> original_client_info
 
-    # --- helper: resolve forward target (supports "ip:port" values in conditional forwarders)
-    def _get_forward_target(self, qname: str) -> tuple[str, int]:
-        q = qname.lower().strip('.')
-        for suffix, target in self._conditional_forwarders.items():
-            if q.endswith(suffix) or q == suffix:
-                if ":" in target and target.count(":") == 1:  # minimal, IPv4 "ip:port"
-                    ip, port = target.split(":", 1)
-                    return ip, int(port)
-                return target, self.PRIMARY_DNS_PORT
-        return self.PRIMARY_DNS_SERVER, self.PRIMARY_DNS_PORT
+        # --- Stability & DNS64 Configuration ---
+        self.upstreams: List[Dict] = []
+        self._dns64_enabled = False
+        self._dns64_prefix = "64:ff9b::/96"
 
-    def add_conditional_forwarder(self, domain_suffix: str, dns_server_ip: str):
-        """Adds a conditional DNS forwarder."""
-        self._conditional_forwarders[domain_suffix.lower()] = dns_server_ip
-        self.router_logger.log_message(f"[DNS] Added conditional forwarder: {domain_suffix} -> {dns_server_ip}")
+        # --- Background Health Probe Thread ---
+        self._stop_event = threading.Event()
+        self._probe_thread: Optional[threading.Thread] = None
 
-    def remove_conditional_forwarder(self, domain_suffix: str):
-        """Removes a conditional DNS forwarder."""
-        if domain_suffix.lower() in self._conditional_forwarders:
-            del self._conditional_forwarders[domain_suffix.lower()]
-            self.router_logger.log_message(f"[DNS] Removed conditional forwarder: {domain_suffix}")
+        self.logger.log_message("[DNS] 🧠 Manager initialized with stability features.")
+        self.configure_upstreams()  # Set default upstreams
 
-    def add_dns_blacklist_entry(self, domain_suffix: str):
-        """Adds a domain suffix to the DNS blacklist."""
-        self._dns_blacklist.add(domain_suffix.lower())
-        self.router_logger.log_message(f"[DNS] Added to blacklist: {domain_suffix}")
+    def configure_upstreams(
+            self,
+            servers: Optional[List[str]] = None,
+            enable_dns64: bool = True,
+            dns64_prefix: str = "64:ff9b::/96"
+    ):
+        """Configures the upstream DNS servers and DNS64 settings."""
+        if servers is None:
+            servers = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]  # Default resilient servers
 
-    def remove_dns_blacklist_entry(self, domain_suffix: str):
-        """Removes a domain suffix from the DNS blacklist."""
-        if domain_suffix.lower() in self._dns_blacklist:
-            self._dns_blacklist.remove(domain_suffix.lower())
-            self.router_logger.log_message(f"[DNS] Removed from blacklist: {domain_suffix}")
+        with self._lock:
+            self.upstreams = [
+                {"ip": ip, "latency_ms": 9999, "healthy": False, "last_probe": 0}
+                for ip in servers
+            ]
+            self._dns64_enabled = enable_dns64
+            self._dns64_prefix = dns64_prefix
 
-    def _is_blacklisted(self, qname: str) -> bool:
-        """Checks if a domain name is blacklisted."""
-        qname_lower = qname.lower().strip('.')  # Remove trailing dot
-        for bl_entry in self._dns_blacklist:
-            if qname_lower.endswith(bl_entry) or qname_lower == bl_entry:
-                return True
-        return False
+        dns64_status = f"DNS64 enabled (prefix {dns64_prefix})" if enable_dns64 else "DNS64 disabled"
+        self.logger.log_message(f"[DNS]  upstream servers configured: {servers}. {dns64_status}.")
 
-    def _get_forward_dns_server(self, qname: str) -> str:
-        """Determines the DNS server to forward the query to based on conditional forwarders."""
-        qname_lower = qname.lower().strip('.')
-        for suffix, dns_ip in self._conditional_forwarders.items():
-            if qname_lower.endswith(suffix) or qname_lower == suffix:
-                self.router_logger.log_message(f"[DNS] Using conditional forwarder for {qname}: {dns_ip}")
-                return dns_ip
-        return self.PRIMARY_DNS_SERVER
+    def start(self):
+        """Starts the background health probe thread."""
+        if self._probe_thread and self._probe_thread.is_alive(): return
+        self._stop_event.clear()
+        self._probe_thread = threading.Thread(
+            target=self._health_probe_loop,
+            daemon=True,
+            name="DNSHealthProber"
+        )
+        self._probe_thread.start()
 
-    def _add_to_cache(self, qname: str, response_packet: Packet):
-        """Adds a DNS response to the cache."""
+    def stop(self):
+        """Stops the background thread."""
+        if not self._probe_thread or not self._probe_thread.is_alive(): return
+        self._stop_event.set()
+        self._probe_thread.join(timeout=2)
+
+    def _health_probe_loop(self):
+        """Periodically sends a small DNS query to each upstream to check its health."""
+        while not self._stop_event.is_set():
+            self._run_health_probes()
+            self._stop_event.wait(self.UPSTREAM_HEALTH_PROBE_INTERVAL)
+        self.logger.log_message("[DNS] 🩺 Health probe thread stopped.")
+
+    def _run_health_probes(self):
+        """Sends a probe to all configured upstreams."""
+        for upstream in self.upstreams:
+            # In a real implementation, you would send a packet and await a response.
+            # For this simulation, we'll simulate a check.
+            # This is where you would integrate with your PacketWriter and sniffer.
+            # For now, we'll simulate a successful probe.
+            upstream["healthy"] = True
+            upstream["latency_ms"] = random.uniform(10, 50)
+            upstream["last_probe"] = time.time()
+
+        # Sort upstreams by latency to prefer the fastest one
+        with self._lock:
+            self.upstreams.sort(key=lambda u: u["latency_ms"])
+
+        best_upstream = self.upstreams[0]
+        self.logger.log_message(
+            f"[DNS] 🩺 Health probe complete. Best upstream: "
+            f"{best_upstream['ip']} ({best_upstream['latency_ms']:.2f}ms)"
+        )
+
+    def _get_best_upstream(self) -> Optional[str]:
+        """Returns the IP of the best available upstream server."""
+        with self._lock:
+            for upstream in self.upstreams:
+                if upstream["healthy"]:
+                    return upstream["ip"]
+        return None
+
+    def handle_query(self, packet: Packet, inbound_iface: str) -> bool:
+        """Handles a client's DNS query."""
+        if not (packet.haslayer(DNS) and packet[DNS].qr == 0): return False
+
+        qname = packet[DNS].qd.qname.decode().lower()
+        qtype = packet[DNS].qd.qtype
+        qkey = f"{qname}:{qtype}"
+
+        # --- 1. Check Cache ---
+        cached_response = self._get_from_cache(qkey)
+        if cached_response:
+            self._send_response_to_client(cached_response, packet)
+            return True
+
+        # --- 2. Select Upstream and Forward ---
+        target_ip = self._get_best_upstream()
+        if not target_ip:
+            self.logger.log_message("[DNS] ❌ No healthy upstream servers available. Dropping query.")
+            # Optionally, send a SERVFAIL response back to the client here.
+            return True
+
+        self.logger.log_message(f"[DNS] ➡️ Forwarding query for {qname} to {target_ip}")
+        self._forward_query(packet, target_ip, inbound_iface)
+        return True
+
+    def handle_response(self, packet: Packet) -> bool:
+        """Handles a response from an upstream server."""
+        if not (packet.haslayer(DNS) and packet[DNS].qr == 1): return False
+
+        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        udp_layer = packet.getlayer(UDP)
+        dns_layer = packet[DNS]
+
+        fwd_key = (ip_layer.dst, udp_layer.dport, dns_layer.id)
+        with self._lock:
+            original_req_info = self._pending_requests.pop(fwd_key, None)
+
+        if not original_req_info: return False  # Not a response we were waiting for
+
+        # --- DNS64 Synthesis Logic ---
+        final_response = self._apply_dns64_if_needed(packet)
+
+        # --- Cache the final response ---
+        qname = final_response[DNS].qd.qname.decode().lower()
+        qtype = final_response[DNS].qd.qtype
+        qkey = f"{qname}:{qtype}"
+        self._add_to_cache(qkey, final_response)
+
+        # --- Send response back to the original client ---
+        self._send_response_to_client(final_response, original_req_info["original_packet"])
+        return True
+
+    def _apply_dns64_if_needed(self, response_packet: Packet) -> Packet:
+        """If DNS64 is enabled and this is an A-only response, synthesize a AAAA record."""
+        if not self._dns64_enabled: return response_packet
+
+        dns = response_packet[DNS]
+        qtype = dns.qd.qtype
+
+        # Check if this was a AAAA query that resulted in no AAAA records (ancount=0)
+        # but for which an A record might exist (check authority section for SOA).
+        if qtype == 28 and dns.ancount == 0:
+            # This is a candidate for synthesis. We would need to make another
+            # internal query for the 'A' record. For simplicity here, we'll
+            # assume the A record is in the additional section or we would query for it.
+
+            # Find an A record in the response (often in 'ar' section for AAAA misses)
+            ipv4_address = None
+            for i in range(dns.arcount):
+                if dns.ar[i].type == 1:
+                    ipv4_address = dns.ar[i].rdata
+                    break
+
+            if ipv4_address:
+                # Synthesize the AAAA record
+                prefix = ipaddress.IPv6Network(self._dns64_prefix)
+                ipv4_int = int(ipaddress.IPv4Address(ipv4_address))
+                ipv6_int = int(prefix.network_address) + ipv4_int
+                synthesized_ipv6 = str(ipaddress.IPv6Address(ipv6_int))
+
+                self.logger.log_message(f"[DNS]  synthesizing AAAA record: {ipv4_address} -> {synthesized_ipv6}")
+
+                # Create and append the new AAAA record to the answer section
+                new_aaaa_record = DNSRR_AAAA(
+                    rrname=dns.qd.qname,
+                    ttl=self.DNS_CACHE_TTL,
+                    rdata=synthesized_ipv6
+                )
+                dns.ancount += 1
+                dns.an = new_aaaa_record if dns.an is None else dns.an / new_aaaa_record
+                dns.rcode = 0  # Set to NOERROR
+
+        return response_packet
+
+    # --- Caching and Packet Manipulation Helpers ---
+    def _add_to_cache(self, qkey: str, response_packet: Packet):
         with self._lock:
             if len(self._dns_cache) >= self.DNS_CACHE_MAX_ENTRIES:
                 oldest_key = next(iter(self._dns_cache))
                 del self._dns_cache[oldest_key]
 
-            min_ttl = self.DNS_CACHE_TTL_MIN
-            if response_packet.haslayer(DNSRR) and response_packet[DNSRR].ttl:
-                ttl = response_packet[DNSRR].ttl
-                cache_duration = max(ttl, min_ttl)
-            else:
-                cache_duration = min_ttl
+            expiry = time.time() + self.DNS_CACHE_TTL
+            self._dns_cache[qkey] = (response_packet, expiry)
 
-            expiry_time = time.time() + cache_duration
-            self._dns_cache[qname] = (bytes(response_packet), expiry_time)  # Store raw bytes
-            self.router_logger.log_message(f"[DNS] Added {qname} to cache, expires in {cache_duration}s.")
-
-    def _get_from_cache(self, qname: str) -> Packet | None:
-        """Retrieves a DNS response from the cache if valid."""
+    def _get_from_cache(self, qkey: str) -> Optional[Packet]:
         with self._lock:
-            cached_entry = self._dns_cache.get(qname)
-            if cached_entry:
-                response_bytes, expiry_time = cached_entry
-                if time.time() < expiry_time:
-                    self.router_logger.log_message(f"[DNS] Cache hit for {qname}.")
-                    return Ether(response_bytes)
-                else:
-                    del self._dns_cache[qname]
+            entry = self._dns_cache.get(qkey)
+            if entry and time.time() < entry[1]:
+                self.logger.log_message(f"[DNS] CACHE HIT for {qkey}")
+                return entry[0]
+            elif entry:
+                del self._dns_cache[qkey]  # Expired
         return None
 
-    def handle_query(self, packet, inbound_iface: str, router_interfaces: dict,
-                     get_mac_function, find_route_function) -> bool:
-        # Only DNS queries (qr == 0)
-        if not (packet.haslayer(DNS) and packet[DNS].qr == 0):
-            return False
+    def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str):
+        """Forwards a DNS query to an upstream server."""
+        fwd_pkt = original_packet.copy()
 
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        if ip_layer is None:
-            self.router_logger.log_message("[DNS] ❌ No IP layer in DNS query.")
-            return False
-
-        udp_layer = packet.getlayer(UDP)
-        dns_layer = packet.getlayer(DNS)
-        if not udp_layer or not dns_layer:
-            return False
-
-        qname = dns_layer.qd.qname.decode() if getattr(dns_layer, "qd", None) else "unknown"
-
-        # ---------- cache fast-path ----------
-        cached = self._get_from_cache(qname)
-        if cached:
-            resp = cached.copy()
-            # rewrite IP/UDP/ETH back to the querying client
-            if IP in resp:
-                resp[IP].dst = ip_layer.src
-                if hasattr(resp[IP], "chksum"): del resp[IP].chksum
-            elif IPv6 in resp:
-                resp[IPv6].dst = ip_layer.src  # checksum handled by kernel/stack on send
-            resp[UDP].dport = udp_layer.sport
-            resp[DNS].id = dns_layer.id
-            if resp.haslayer(Ether) and packet.haslayer(Ether):
-                resp[Ether].dst = packet[Ether].src
-            if UDP in resp and hasattr(resp[UDP], "chksum"):
-                del resp[UDP].chksum
-
-            self.sniffer.send(resp, inbound_iface)
-            return True
-
-        # ---------- choose upstream target + path ----------
-        target_ip, target_port = self._get_forward_target(qname)
-
-        is_loopback_target = False
-        try:
-            is_loopback_target = ipaddress.ip_address(target_ip).is_loopback
-        except ValueError:
-            # target_ip may be a hostname; treat as non-loopback
-            is_loopback_target = False
-
-        route: Optional[dict] = None
-        if is_loopback_target:
-            # Find a configured loopback “interface” (we only need its IP/MAC placeholder)
-            outbound_iface_name = None
-            for name, cfg in router_interfaces.items():
-                if cfg.get("ip_addr") in ("127.0.0.1", "::1"):
-                    outbound_iface_name = name
-                    break
-            if not outbound_iface_name:
-                self.router_logger.log_message("[DNS] ❌ No loopback interface configured.")
-                return False
-        else:
-            route = find_route_function(target_ip)
-            if not route or not route.get("interface"):
-                self.router_logger.log_message(f"[DNS] ❌ No route to {target_ip}.")
-                return False
-            outbound_iface_name = route["interface"]
-
-        outbound_iface_config = router_interfaces.get(outbound_iface_name)
-        if not outbound_iface_config:
-            self.router_logger.log_message(f"[DNS] ❌ Missing config for iface '{outbound_iface_name}'.")
-            return False
-
-        # Key used to match upstream response back to the requester
-        router_src_ip_used_upstream = "127.0.0.1" if is_loopback_target else outbound_iface_config["ip_addr"]
-        pending_key = (router_src_ip_used_upstream, int(udp_layer.sport), int(dns_layer.id))
+        # Store original request info to match the response later
+        fwd_key = (fwd_pkt[IP].src, fwd_pkt[UDP].sport, fwd_pkt[DNS].id)
         with self._lock:
-            self._pending_requests[pending_key] = {
-                "original_mac_src": packet[Ether].src if packet.haslayer(Ether) else None,
-                "inbound_iface": inbound_iface,
-                "client_ip": ip_layer.src,  # NEW
-                "client_port": int(udp_layer.sport),  # NEW
-                "qname": qname,  # handy for cache/logs
+            self._pending_requests[fwd_key] = {
+                "original_packet": original_packet,
+                "timestamp": time.time()
             }
 
-        # ---------- build upstream DNS request ----------
-        fwd = packet.copy()
+        # Modify the packet for forwarding
+        fwd_pkt[IP].dst = target_ip
+        # The source IP should be the router's IP on the egress interface
+        # (This requires routing logic not shown here, so we'll simplify)
+        fwd_pkt[IP].src = "192.168.1.1"  # Placeholder
 
-        if IP in fwd:
-            fwd[IP].src = router_src_ip_used_upstream
-            fwd[IP].dst = target_ip
-            if hasattr(fwd[IP], "chksum"): del fwd[IP].chksum
-        elif IPv6 in fwd:
-            # If the chosen target is not IPv6, fall back to a known v6 resolver
-            if ":" not in str(target_ip):
-                target_ip = "2001:4860:4860::8888"  # Google Public DNS v6
-            fwd[IPv6].src = outbound_iface_config["ip_addr"]
-            fwd[IPv6].dst = target_ip
 
-        fwd[UDP].dport = int(target_port)
-        if hasattr(fwd[UDP], "chksum"):
-            del fwd[UDP].chksum
+        # Recalculate checksums
+        del fwd_pkt[IP].chksum
+        del fwd_pkt[UDP].chksum
 
-        # L2 rewrite (optional/only if the packet still has an Ethernet header)
-        if fwd.haslayer(Ether):
-            fwd[Ether].src = outbound_iface_config.get("mac", fwd[Ether].src)
-            if is_loopback_target:
-                # No ARP on loopback
-                fwd[Ether].dst = "00:00:00:00:00:00"
-            else:
-                # route is guaranteed to be set in this branch
-                gw_ip = route.get("next_hop") or target_ip  # type: ignore[union-attr]
-                mac = get_mac_function(gw_ip, outbound_iface_name)
-                if not mac:
-                    # Clean pending state; upstream send aborted
-                    with self._lock:
-                        self._pending_requests.pop(pending_key, None)
-                    # We 'handled' the DNS query logic, but couldn’t resolve L2 yet
-                    return True
-                fwd[Ether].dst = mac
+        self.pw._send_raw_packet(fwd_pkt, inbound_iface)  # Placeholder for egress interface
 
-        # ---------- log + send ----------
-        self.router_logger.log_message(
-            f"[DNS] ➡️ {ip_layer.src}:{udp_layer.sport} {qname} -> "
-            f"{target_ip}:{target_port} via {outbound_iface_name.split('_')[-1]}"
-        )
-        self.sniffer.send(fwd, outbound_iface_name)
-        return True
+    def _send_response_to_client(self, response_packet: Packet, original_request: Packet):
+        """Sends a DNS response back to the original client."""
+        client_ip = original_request[IP].src
+        client_port = original_request[UDP].sport
 
-    def handle_response(self, packet, inbound_iface: str, router_interfaces: dict) -> bool:
+
+        resp = response_packet.copy()
+
+        # Rewrite headers to match the original query
+        resp[IP].dst = client_ip
+        resp[UDP].dport = client_port
+        resp[DNS].id = original_request[DNS].id
+
+
+        # Recalculate checksums
+        del resp[IP].chksum
+        del resp[UDP].chksum
+
+        self.pw._send_raw_packet(resp, original_request.sniffed_on)
+
+
+class NDPManager:
+    """
+    Manages IPv6 Neighbor Discovery Protocol (NDP) resolution, caching, and
+    related operations for the router, analogous to the ARPManager for IPv4.
+    """
+
+    def __init__(self, router_logger, cache_timeout_seconds=300):
         """
-        Handle upstream DNS *responses* and forward them back to the original client.
-        Rewrites L3/L4/L2, updates the cache, emits a single concise log line.
-        Returns True iff we handled (forwarded or dropped with a reason).
+        Initializes the NDP Manager.
+        Args:
+            router_logger: The logger instance for logging messages.
+            sniffer: The sniffer instance for sending packets.
+            cache_timeout_seconds (int): How long a cache entry is valid.
         """
-        # Must be a DNS response
-        if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
-            return False
+        self.router_logger = router_logger
+        self.sniffer = None
+        self._ndp_cache = {}  # Maps IPv6 -> (MAC, timestamp)
+        self._ndp_cache_lock = threading.Lock()
+        self.CACHE_TIMEOUT = cache_timeout_seconds
 
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        udp_layer = packet.getlayer(UDP)
-        dns_layer = packet.getlayer(DNS)
-        if ip_layer is None or udp_layer is None or dns_layer is None:
-            return False
+        self._static_ndp_entries = {}  # Manually configured {IPv6: MAC}
+        self._interfaces_config = {}
+        self._trusted_ports = set()
 
-        # Key that matches what we stored on the way out:
-        # (router_src_ip_used_upstream, client_udp_sport, dns_id)
-        router_dst_ip_used_upstream = getattr(ip_layer, "dst", None)
-        pending_key = (str(router_dst_ip_used_upstream), int(udp_layer.dport), int(dns_layer.id))
+        # NDP-specific configuration
+        self.ndp_probe_retries = 3
+        self.ndp_probe_timeout = 1.0
+        self.router_ipv6_link_local_out = None
+        # Placeholders for NDP security features
+        self.ra_guard_enabled = True  # Router Advertisement Guard
+        self.ndp_inspection_enabled = True  # Equivalent to DAI
 
-        with self._lock:
-            pend = self._pending_requests.pop(pending_key, None)
+    def add_static_ndp_entry(self, ipv6_address: str, mac_address: str):
+        """Adds a static entry to the neighbor cache."""
+        self._static_ndp_entries[ipv6_address] = mac_address.lower()
+        self.router_logger.log_message(f"[NDP] Added static entry: {ipv6_address} -> {mac_address}")
 
-        if not isinstance(pend, dict):
-            # Not ours (or already expired/handled elsewhere)
-            return False
+    # --- Core NDP Resolution Logic ---
 
-        # Safe extraction without .get() on pend
-        client_iface = inbound_iface
-        if "inbound_iface" in pend and pend["inbound_iface"]:
-            client_iface = pend["inbound_iface"]
-
-        client_mac = pend["original_mac_src"] if "original_mac_src" in pend else None
-        client_ip = pend["client_ip"] if "client_ip" in pend else None
-        client_port = pend["client_port"] if "client_port" in pend else None
-
-        # Prefer stored qname, fallback to parsing current packet
-        if "qname" in pend and pend["qname"]:
-            qname = pend["qname"]
-        else:
-            qname = dns_layer.qd.qname.decode() if getattr(dns_layer, "qd", None) else "unknown"
-
-        if not client_ip or not client_port:
-            # Should not happen if handle_query stored them; drop safely
-            self.router_logger.log_message(f"[DNS] ❌ Missing client tuple for {qname}; drop.")
-            return True
-
-        # Build the client-bound packet
-        resp = packet.copy()
-
-        # ---- L3 rewrite ----
-        if IP in resp:
-            resp[IP].dst = client_ip
-            if hasattr(resp[IP], "chksum"):
-                del resp[IP].chksum
-        elif IPv6 in resp:
-            resp[IPv6].dst = client_ip  # checksum recalculated on send
-
-        # ---- L4 rewrite ----
-        resp[UDP].dport = int(client_port)
-        if hasattr(resp[UDP], "chksum"):
-            del resp[UDP].chksum
-
-        # ---- L2 rewrite (optional, only if Ether is present) ----
-        if resp.haslayer(Ether):
-            egress_cfg = router_interfaces[client_iface] if client_iface in router_interfaces else {}
-            if "mac" in egress_cfg:
-                resp[Ether].src = egress_cfg["mac"]
-            if client_mac:
-                resp[Ether].dst = client_mac
-
-        # Cache the response using TTL (best-effort)
+    def resolve(self, ipv6_address: str, iface: str) -> Optional[str]:
+        """
+        Resolves an IPv6 address to a MAC address.
+        The resolution order is: static entries -> cache -> active probing.
+        """
         try:
-            self._add_to_cache(qname, resp)
-            cached = "cache✓"
-        except Exception:
-            cached = "cache-"
+            ip_obj = ipaddress.IPv6Address(ipv6_address)
+            if ip_obj.is_multicast or ip_obj.is_unspecified:
+                return None  # Cannot resolve these
+        except ValueError:
+            self.router_logger.log_message(f"[NDP] ⚠️ Invalid IPv6 address for resolution: {ipv6_address}")
+            return None
 
-        # rcode summary
-        rmap = {0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN"}
-        rcode_val = getattr(dns_layer, "rcode", -1)
-        rcode_name = rmap.get(rcode_val, str(rcode_val))
+        now = time.time()
+        ip_str = str(ip_obj)
 
+        # 1. Check static entries first
+        static_mac = self._static_ndp_entries.get(ip_str)
+        if static_mac:
+            self.router_logger.log_message(f"[NDP] 🧷 Static entry: {ip_str} -> {static_mac}")
+            return static_mac
 
-        # Log a single concise line
+        # 2. Check the dynamic cache
+        with self._ndp_cache_lock:
+            entry = self._ndp_cache.get(ip_str)
+            if entry:
+                mac, ts = entry
+                if now - ts < self.CACHE_TIMEOUT:
+                    self.router_logger.log_message(f"[NDP] ⚡ Cache hit: {ip_str} -> {mac}")
+                    return mac
+                else:
+                    self.router_logger.log_message(f"[NDP] 🕓 Cache stale for {ip_str}, refreshing.")
+        os_mac = self._get_mac_from_os_cache(ip_str)
+        if os_mac:
+            with self._ndp_cache_lock:
+                self._ndp_cache[ip_str] = (os_mac, now)
+            return os_mac
+    def _get_mac_from_os_cache(self, ipv6_address: str) -> Optional[str]:
+        """
+        Parses the Windows 'netsh' command to find a MAC in the OS neighbor cache.
+        """
         try:
-            up_src_ip = ip_layer.src
-            up_sport = udp_layer.sport
+            # The regex looks for a MAC address on the same line as the IP
+            mac_regex = re.compile(r"([0-9a-f]{2}[:-]){5}[0-9a-f]{2}")
+            cmd = ["netsh", "interface", "ipv6", "show", "neighbors"]
+
+            # Run the command and capture output
+            result = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+            for line in result.splitlines():
+                if ipv6_address in line:
+                    match = mac_regex.search(line)
+                    if match:
+                        mac = match.group(0).lower().replace("-", ":")
+                        self.router_logger.log_message(f"[NDP] 🧭 Found in OS cache: {ipv6_address} -> {mac}")
+                        return mac
+            return None
         except Exception:
-            up_src_ip, up_sport = "-", "-"
+            return None
 
-        self.router_logger.log_message(
-            f"[DNS] ⬅️ {up_src_ip}:{up_sport} {qname} {rcode_name} -> {client_ip}:{client_port} "
-            f"via {client_iface.split('_')[-1]} ({cached})"
-        )
+    # --- Handling Incoming NDP Packets ---
 
-        # Send back to the original client on the original inbound iface
-        self.sniffer.send(resp, client_iface)
-        return True
+    def learn_neighbor_advertisement(self, pkt: Packet):
+        """Learn MAC from an IPv6 Neighbor Advertisement and update cache."""
+        if not pkt.haslayer(ICMPv6ND_NA):
+            return
+
+        na = pkt[ICMPv6ND_NA]
+        ip = pkt[IPv6].src
+        mac = None
+
+        # Preferred: use the NA option carrying a link-layer address.
+        try:
+            opt = pkt.getlayer(ICMPv6NDOptDstLLAddr) or pkt.getlayer(ICMPv6NDOptSrcLLAddr)
+            if opt and hasattr(opt, "lladdr") and opt.lladdr:
+                mac = opt.lladdr
+        except Exception:
+            mac = None  # keep going; we'll try a fallback
+
+        # Fallback: if there’s no LL option, trust the L2 source (common on-link case)
+        if mac is None and pkt.haslayer(Ether):
+            mac = pkt[Ether].src
+
+        # Optional sanity: only learn if the NA is “solicited” or override flag is set
+        try:
+            S = int(getattr(na, "S", 0))  # Solicited
+            O = int(getattr(na, "O", 0))  # Override
+            if not (S or O):
+                # Unsolicited + no override → often a periodic announcement; you may skip
+                pass
+        except Exception:
+            pass
+
+        if ip and mac:
+            with self._ndp_cache_lock:
+                self._ndp_cache[ip] = (mac, time.time())
+            self.router_logger.log_message(f"[NDP] 🧠 Learned: {ip} is-at {mac}")
+
+    def learn_from_packet(self, pkt: Packet, iface: str):
+        """
+        Passively learns IP-to-MAC mappings from observed traffic.
+        This is called by the main router for every packet.
+        """
+        # We can only learn if the packet has both L2 and L3 IPv6 headers
+        if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
+            return
+
+        src_mac = pkt[Ether].src
+        src_ip = pkt[IPv6].src
+
+        # Basic validation: ensure we have valid addresses to learn from
+        try:
+            ip_obj = ipaddress.IPv6Address(src_ip)
+            if not src_mac or ip_obj.is_unspecified or ip_obj.is_multicast:
+                return
+        except ValueError:
+            return
+
+        now = time.time()
+        with self._ndp_cache_lock:
+            existing_entry = self._ndp_cache.get(src_ip)
+            # Add or update the cache entry
+            if not existing_entry or existing_entry[0] != src_mac:
+                self.router_logger.log_message(f"[NDP] 🧠 Passively learned: {src_ip} is-at {src_mac} on {iface.split('_')[-1]}")
+                self._ndp_cache[src_ip] = (src_mac, now)
+
+
+
 
 class ARPManager:
     """
@@ -7418,7 +7475,7 @@ class DHCPServer:
           * "nak_on_mismatch"  → when a client REQUEST names a different server_id (opt54),
                                   send NAK (authoritative) to steer it back to us.
     """
-
+    def make_duid(self, mac): return DUID_LLT(hwtype=1, timeval=int(time.time()), lladdr=mac)
     def __init__(
         self,
         router_logger,
@@ -7436,6 +7493,7 @@ class DHCPServer:
         serve_on_all_ifaces: bool = True,
         authoritative: bool = True,
         rogue_policy: str = "nak_on_mismatch",  # "log" | "nak_on_mismatch"
+        in_mac: None
     ):
         import ipaddress, threading, time
         from typing import Dict, Tuple, Set
@@ -7474,10 +7532,11 @@ class DHCPServer:
         # --- DHCPv6 ---
         self.dhcp6_prefix = ipaddress.IPv6Network(dhcp6_prefix) if dhcp6_prefix else None
         self.dhcp6_relay_target_ip = dhcp6_relay_target_ip
-
+        self.router_ipv6_link_local_out = None
         self._stop_event = threading.Event()
         self._cleanup_thread = None
         self.sniffer = None
+        self._dhcp6_srv_id = DHCP6OptServerId(duid=self.make_duid(in_mac))
         self.logger.log_message(
             f"[DHCP] Server initialized. v4Relay={self.dhcp_relay_target_ip or 'None'} "
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
@@ -7692,7 +7751,7 @@ class DHCPServer:
                 if sport == 67 and dport == 68:
                     return "v4", "server"
                 return "v4", "other"
-            if pkt.haslayer(DHCP6):
+            if pkt.haslayer(DHCP6_Solicit):
                 if dport == 547 and sport == 546:
                     return "v6", "client"
                 if sport == 547 and dport == 546:
@@ -7722,7 +7781,6 @@ class DHCPServer:
             return True
 
         router_in_ip = in_cfg.get("ip_addr")
-        router_in_ipv6 = in_cfg.get("ipv6_addr")
         router_in_mac = in_cfg.get("mac")
 
         version, direction = self._classify_dhcp(pkt)
@@ -7908,73 +7966,70 @@ class DHCPServer:
 
         # ================= DHCPv6 =================
         if version == "v6":
-            if not self.dhcp6_prefix and not self.dhcp6_relay_target_ip:
-                self.logger.log_message("[DHCP] DHCPv6 disabled; ignoring.")
+
+            # One link-local for everything
+            router_ll = self.router_ipv6_link_local_out
+            if not router_ll:
+                self.logger.log_message("[DHCP] v6: missing router IPv6 (no link-local/global); cannot serve.")
                 return True
 
+            # Eth wrapping if not loopback
+            is_loopback = not pkt.haslayer(Ether)
+            client_mac = pkt[Ether].src if pkt.haslayer(Ether) else None
+
+            v6src = pkt[IPv6].src  # client's source (usually link-local)
+            dhcp6 = pkt[DHCP6_Solicit]
+            msgtype = int(getattr(dhcp6, "msgtype", 0))
+
+            # Observe server->client only
             if direction != "client":
-                # observe but do not act for v6 server→client
                 src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "(no-ether)"
                 self.logger.log_message(f"[DHCP] v6 server→client observed from {src_mac}; skipping.")
                 return True
 
-            dhcp6 = pkt[DHCP6]
-            msgtype = int(getattr(dhcp6, "msgtype", getattr(dhcp6, "msgtype", 0)))
-
-            # extract DUID if present
-            client_duid = None
-            for opt in getattr(dhcp6, "options", []):
-                if isinstance(opt, tuple) and opt[0] == 1:
-                    client_duid = opt[1]
-                    break
-                if hasattr(opt, "otype") and opt.otype == 1:
-                    client_duid = opt.duid
-                    break
-            if not client_duid:
-                self.logger.log_message("[DHCP] v6 missing client DUID; ignoring.")
-                return True
-
+            # -------- Relay (to upstream server) ----------
             if self.dhcp6_relay_target_ip:
-                if not router_in_ipv6:
-                    self.logger.log_message("[DHCP] v6 relay enabled but missing router IPv6; skipping relay.")
-                    return True
-                self.logger.log_message(f"[DHCP] Relaying v6 to {self.dhcp6_relay_target_ip} (iface={inbound_iface}).")
-                relay = DHCP6_RelayForward(linkaddr=router_in_ipv6,
-                                           peeraddr=pkt[IP].src if pkt.haslayer(IP) else None,
-                                           msg=pkt[DHCP6])
-                self.sniffer.send(relay, inbound_iface)
+                target = self.dhcp6_relay_target_ip  # can be LL or global of the upstream
+                self.logger.log_message(f"[DHCP] Relaying v6 to {target}.")
+                relay = (IPv6(src=router_ll, dst=target, hlim=255) /
+                         UDP(sport=547, dport=547) /
+                         DHCP6_RelayForward(linkaddr=router_ll, peeraddr=v6src, msg=pkt[DHCP6]))
+                out = (Ether(src=router_in_mac, dst=client_mac) / relay) if (client_mac and not is_loopback) else relay
+                self.sniffer.send(out, inbound_iface)
                 return True
 
-            if not router_in_ipv6:
-                self.logger.log_message("[DHCP] v6 missing router IPv6; cannot serve.")
-                return True
-
+            # -------- Server replies (ADVERTISE / REPLY) ----------
             if msgtype == 1:  # SOLICIT
-                opts = [
-                    # Stateless example: advertise prefix and DNS
-                    ("iana", b""),  # placeholder if your stack expects an IA option
-                    # If using scapy classes:
-                    # DHCP6OptIAPrefix(prefix=str(self.dhcp6_prefix), plen=self.dhcp6_prefix.prefixlen, preferred_lifetime=3600),
-                    # DHCP6OptDNSServers(dnsservers=[str(router_in_ipv6)]),
-                    "end"
-                ]
-                advertise = (IP(src=str(router_in_ipv6), dst="ff02::1:2") /
-                             UDP(sport=547, dport=546) /
-                             DHCP6_Advertise(trid=dhcp6.trid, options=opts))
-                self.sniffer.send(advertise, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 ADVERTISE → DUID {getattr(client_duid, 'hex', lambda: b'')()} (iface={inbound_iface})")
-                return True
+                # Optional: mirror client's IAID and include an address only if you actually want to advertise one
+                ia_na = dhcp6.getlayer(DHCP6OptIA_NA)
+                iaid = int(getattr(ia_na, "iaid", 0)) if ia_na else 0
 
-            if msgtype == 3:  # REQUEST
+                ia_block = b""
+
+                advertise = (
+                        IPv6(src=router_ll, dst=v6src, hlim=255)
+                        / UDP(sport=547, dport=546)
+                        / DHCP6_Advertise(trid=dhcp6.trid)
+                        / self._dhcp6_srv_id
+                        / ia_block
+                )
+
+                out = (Ether(src=router_in_mac, dst=client_mac) / advertise) if (
+                            client_mac and not is_loopback) else advertise
+                self.sniffer.send(out, inbound_iface)
+                self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src} (iface={inbound_iface})")
+                return True
+            if msgtype == 3:  # REQUEST -> REPLY
                 opts = [
-                    ("iana", b""),
+                    # TODO: include IA_NA/IA_PD/DNS; mirror what you advertised/leased
                     "end"
                 ]
-                reply = (IP(src=str(router_in_ipv6), dst="ff02::1:2") /
+                reply = (IPv6(src=router_ll, dst=v6src, hlim=255) /
                          UDP(sport=547, dport=546) /
                          DHCP6_Reply(trid=dhcp6.trid, options=opts))
-                self.sniffer.send(reply, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 REPLY → DUID {getattr(client_duid, 'hex', lambda: b'')()} (iface={inbound_iface})")
+                out = (Ether(src=router_in_mac, dst=client_mac) / reply) if (client_mac and not is_loopback) else reply
+                self.sniffer.send(out, inbound_iface)
+                self.logger.log_message(f"[DHCP] v6 REPLY → {v6src} (iface={inbound_iface})")
                 return True
 
             self.logger.log_message(f"[DHCP] v6 msgtype {msgtype} not handled; ignoring.")
@@ -8106,8 +8161,7 @@ class OutboundLoadBalancer:
                 candidate_iface = self._outbound_interfaces[current_index]
 
                 if self._interface_status.get(candidate_iface, False):
-                    self.logger.log_message(
-                        f"[OutboundLB] Selected interface {candidate_iface.split('_')[-1]} for flow {ip_layer.src} -> {ip_layer.dst}.")
+                    #self.logger.log_message(f"[OutboundLB] Selected interface {candidate_iface.split('_')[-1]} for flow {ip_layer.src} -> {ip_layer.dst}.")
                     return candidate_iface
 
             self.logger.log_message("[OutboundLB] Hash-based selection failed, no 'up' interfaces found.")
