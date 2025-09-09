@@ -188,6 +188,8 @@ class DNSRR_AAAA(DNSRR):
         super(DNSRR_AAAA, self).__init__(*args, **kwargs)
         # Force the type field to be AAAA (28)
         self.type = 28
+
+
 class SnifferSoftware:
     """
     A class to manage sniffing and sending of Layer 2 and Layer 3 packets

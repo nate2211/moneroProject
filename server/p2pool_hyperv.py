@@ -1,7 +1,9 @@
 # HyperVManager.py
 import ctypes
 import gc
+import io
 import os
+import pstats
 import queue
 import sys
 import atexit
@@ -11,7 +13,7 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Optional
-
+import cProfile
 import win32con
 import win32event
 import win32file
@@ -25,6 +27,8 @@ from scapy.layers.inet import IP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import Ether
 import win32api
+from winerror import ERROR_OPERATION_ABORTED, ERROR_IO_PENDING
+
 from tools.pythontools import yield_no_gil
 
 class CppLogger(QObject):
@@ -350,7 +354,7 @@ class WinDivertManager:
     DEFAULT_PIPE_NAME = r'\\.\pipe\windivert_to_python'
 
     def __init__(self, router_manager, code_output_manager, pipe_name=DEFAULT_PIPE_NAME,
-                 idle_timeout=2.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
+                 idle_timeout=10.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
 
         # Allow deep chains of IPv6 ext headers without Scapy aborts.
         conf.max_list_count = 2048
@@ -444,7 +448,7 @@ class WinDivertManager:
         frames_this_batch = 0
         bytes_read_total = 0
         deadline = time.monotonic() + idle_timeout
-        MAX_FRAMES_PER_PASS = 256
+        MAX_FRAMES_PER_PASS = 1000
 
         def _reset_event():
             if ev:
@@ -461,14 +465,14 @@ class WinDivertManager:
                 try:
                     hr, data = win32file.ReadFile(ph, 65536, ovl)
                 except pywintypes.error as e:
-                    if e.winerror != win32con.ERROR_IO_PENDING: return False
+                    if e.winerror != ERROR_IO_PENDING: return False
                     ms = max(1, int((deadline - time.monotonic()) * 1000))
                     rc = win32event.WaitForSingleObject(ev, ms)
                     if rc == WAIT_TIMEOUT: continue
                     try:
                         hr, data = win32file.GetOverlappedResult(ph, ovl, True)
                     except pywintypes.error as ge:
-                        if ge.winerror in (win32con.ERROR_OPERATION_ABORTED, 995): return False
+                        if ge.winerror in (ERROR_OPERATION_ABORTED, 995): return False
                         return False
 
                 if not data: return False
@@ -503,13 +507,10 @@ class WinDivertManager:
 
                 self.frames_read += 1
                 parsed_this_pass += 1
-                frames_this_batch += 1
-
-                # ** THE FIX: Pass the raw bytes directly to the router. **
-                # The router's process_packet function will now be responsible
-                # for the "hardening" step we developed previously.
+                frames_this_batch += 1.
                 if packet_bytes:
                     self.router_manager.process_packet(packet_bytes, self.VIRTUAL_IFACE_NAME)
+
         return True
 
     # ---------------- reader thread ----------------
