@@ -1219,6 +1219,20 @@ class PythonRouterManager:
                 self.ndp_manager.learn_from_packet(packet, inbound_iface)
             if packet.haslayer(IP):
                 self.arp_manager.learn_from_packet(packet, inbound_iface)
+            if not self.firewall_manager.process_packet(packet):
+                self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
+                return
+            transport_layer = self.sniffer._find_transport_layer(packet)
+            if isinstance(transport_layer, TCP):
+                if self.handshake_manager.handle_packet(packet, inbound_iface):
+                    self.code_output_manager.submit_packet(
+                        packet,
+                        inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="handshake",
+                    )
+                    return
+
             is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
             if is_handled_by_transport:
@@ -1425,19 +1439,7 @@ class PythonRouterManager:
                 return
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.
-            if not self.firewall_manager.process_packet(packet):
-                self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
-                return
-            transport_layer = self.sniffer._find_transport_layer(packet)
-            if isinstance(transport_layer, TCP) or packet.haslayer(TLS) :
-                if self.handshake_manager.handle_packet(packet, inbound_iface):
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="handshake",
-                    )
-                    return
+
             if isinstance(transport_layer, DNS) and packet[DNS].qr == 1:
                 if self.dns_manager.handle_response(packet):
                     self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
