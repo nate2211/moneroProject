@@ -318,6 +318,7 @@ class HyperVManager:
                 return False
 
 
+# --- Kernel32 bindings (you already had these) ---
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 _OpenThread = _kernel32.OpenThread
@@ -331,6 +332,12 @@ _CancelSyncIo.restype = ctypes.c_int
 _CloseHandle = _kernel32.CloseHandle
 _CloseHandle.argtypes = [ctypes.c_void_p]
 _CloseHandle.restype = ctypes.c_int
+
+# Prefer pywin32 CancelIoEx; fall back to ctypes if needed
+try:
+    _pywin32_cancel_io_ex = win32file.CancelIoEx
+except AttributeError:
+    _pywin32_cancel_io_ex = None
 
 _CancelIoEx = _kernel32.CancelIoEx
 _CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]  # (HANDLE, LPOVERLAPPED)
@@ -346,15 +353,16 @@ THREAD_ALL_ACCESS = 0x1FFFFF
 class WinDivertManager:
     """
     Pipe reader for WinDivert frames that processes packets immediately (no queue).
-    - Overlapped, cancelable reads
-    - Backpressure: we only read when we're ready to process; C++ blocks naturally
+    - Overlapped, cancelable reads (true CancelIoEx on stop)
+    - Backpressure: we only read when we're ready; C++ will batch & time out safely
     - Reader thread is the sole owner/closer of handles (no double-close)
+    - Aligned with C++ server: PIPE_TYPE_BYTE (length-prefixed frames)
     """
     VIRTUAL_IFACE_NAME = "WinDivertBridge"
     DEFAULT_PIPE_NAME = r'\\.\pipe\windivert_to_python'
 
     def __init__(self, router_manager, code_output_manager, pipe_name=DEFAULT_PIPE_NAME,
-                 idle_timeout=10.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
+                 idle_timeout=2.0, max_frames_per_batch=1024, max_bytes_per_batch=(1 << 20)):
 
         # Allow deep chains of IPv6 ext headers without Scapy aborts.
         conf.max_list_count = 2048
@@ -386,13 +394,17 @@ class WinDivertManager:
         self.frames_processed = 0
         self.frames_badlen = 0
 
-        # IPv4 defrag state
+        # light telemetry
+        self._last_log_ts = 0.0
+        self._log_every = 0.5        # seconds - fine-grained beacons
+        self._quiet_log_after = 2.0  # if no frames for this long, log why
+
+        # IPv4/IPv6 defrag placeholders (kept for parity; router may use them later)
         self._frag_db = {}
         self._frag_timeout_sec = 5.0
         self._frag_max_streams = 1024
         self._frag_max_per_stream = 128
 
-        # IPv6 defrag state
         self._frag6_db = {}
         self._frag6_timeout_sec = 5.0
         self._frag6_max_streams = 1024
@@ -428,6 +440,11 @@ class WinDivertManager:
         self.logger.log_message("[WinDivert] Stopping manager...")
 
         self._stop_event.set()
+
+        # Try to cancel any pending overlapped ReadFile cleanly
+        self._cancel_pending_io()
+
+        # Also poke the event so a wait unblocks immediately
         try:
             with self._hdl_lock:
                 ev = self._ovl_event
@@ -435,6 +452,8 @@ class WinDivertManager:
                 win32event.SetEvent(ev)
         except Exception:
             pass
+
+        # If the server is waiting for a client, connect once to break WaitNamedPipe/CreateFile races
         self._unblock_pipe_wait()
 
         self._reader_thread.join(timeout=5.0)
@@ -450,6 +469,9 @@ class WinDivertManager:
         deadline = time.monotonic() + idle_timeout
         MAX_FRAMES_PER_PASS = 1000
 
+        last_progress_ts = time.monotonic()
+        last_frames_read = self.frames_read
+
         def _reset_event():
             if ev:
                 win32event.ResetEvent(ev)
@@ -459,57 +481,79 @@ class WinDivertManager:
                and bytes_read_total < max_bytes
                and time.monotonic() < deadline):
 
-            # --- This section remains the same: it reads from the pipe ---
+            # --- ISSUE OVERLAPPED READ (BYTE mode; C++ length-prefixed) ---
             try:
                 _reset_event()
                 try:
                     hr, data = win32file.ReadFile(ph, 65536, ovl)
                 except pywintypes.error as e:
-                    if e.winerror != ERROR_IO_PENDING: return False
+                    if e.winerror != ERROR_IO_PENDING:
+                        # hard failure: disconnect and reconnect outside
+                        return False
                     ms = max(1, int((deadline - time.monotonic()) * 1000))
                     rc = win32event.WaitForSingleObject(ev, ms)
-                    if rc == WAIT_TIMEOUT: continue
+                    if rc == WAIT_TIMEOUT:
+                        # keep the loop alive; micro-idle beacon if needed
+                        self._maybe_log_idle(frames_this_batch, bytes_read_total, buf_len=len(buf))
+                        continue
                     try:
                         hr, data = win32file.GetOverlappedResult(ph, ovl, True)
                     except pywintypes.error as ge:
-                        if ge.winerror in (ERROR_OPERATION_ABORTED, 995): return False
+                        # 995 = ERROR_OPERATION_ABORTED when we cancelled at stop()
+                        if ge.winerror in (ERROR_OPERATION_ABORTED, 995):
+                            return False
                         return False
 
-                if not data: return False
+                if not data:
+                    # Peer closed or end of stream
+                    return False
 
                 buf.extend(data)
                 bytes_read_total += len(data)
                 deadline = time.monotonic() + idle_timeout
+
             except Exception:
+                # Any unexpected error → force reconnect
                 return False
 
-            # --- [SIMPLIFIED LOGIC] ---
-            # This loop now ONLY extracts frames and passes the raw bytes.
-            # All complex parsing and salvaging is removed.
+            # --- FAST EXTRACT: LEN(4 LE) + PAYLOAD ---
             parsed_this_pass = 0
             while parsed_this_pass < MAX_FRAMES_PER_PASS:
-                if self._stop_event.is_set(): return False
-                if len(buf) < 4: break
+                if self._stop_event.is_set():
+                    return False
+                if len(buf) < 4:
+                    break
 
                 pkt_len = int.from_bytes(buf[0:4], "little", signed=False)
 
-                # Basic length sanity check
+                # BYTE-mode sanity: WinDivert network frames are 20..65535-ish
                 if not (14 <= pkt_len <= 65535):
-                    del buf[:4]
+                    del buf[:4]  # drop bogus length, attempt resync next iteration
                     self.frames_badlen += 1
+                    self._maybe_log_badlen_sample()
                     continue
 
-                if len(buf) < 4 + pkt_len: break
+                if len(buf) < 4 + pkt_len:
+                    break  # need more bytes
 
-                # Extract the raw bytes for one full packet
                 packet_bytes = bytes(buf[4: 4 + pkt_len])
                 del buf[:4 + pkt_len]
 
                 self.frames_read += 1
                 parsed_this_pass += 1
-                frames_this_batch += 1.
+                frames_this_batch += 1
+
+                # Progress beacon (matches C++ micro-heartbeats spirit)
+                now = time.monotonic()
+                if self.frames_read != last_frames_read:
+                    last_progress_ts = now
+                    last_frames_read = self.frames_read
+
                 if packet_bytes:
                     self.router_manager.process_packet(packet_bytes, self.VIRTUAL_IFACE_NAME)
+
+            # Lightweight periodic status (no spam)
+            self._maybe_log_progress(frames_this_batch, bytes_read_total, buf_len=len(buf), last_progress_ts=last_progress_ts)
 
         return True
 
@@ -524,13 +568,17 @@ class WinDivertManager:
         while not self._stop_event.is_set():
             ph = ev = ovl = None
             try:
+                # Reconnect loop (small wait keeps UI logs responsive)
                 try:
-                    win32pipe.WaitNamedPipe(self.pipe_name, 1000)
+                    win32pipe.WaitNamedPipe(self.pipe_name, 250)
                 except pywintypes.error as e:
+                    # 2 = ERROR_FILE_NOT_FOUND (server not up yet)
                     if e.winerror == 2:
-                        self._stop_event.wait(0.25)
+                        self._stop_event.wait(0.10)
                         continue
-                    raise
+                    # Anything else: brief backoff
+                    self._stop_event.wait(0.05)
+                    continue
 
                 if self._stop_event.is_set():
                     break
@@ -538,20 +586,24 @@ class WinDivertManager:
                 self.logger.log_message(f"[WinDivert] 🔎 Connecting to pipe: {self.pipe_name}")
                 ph = win32file.CreateFile(
                     self.pipe_name,
-                    win32file.GENERIC_READ,
+                    win32file.GENERIC_READ,  # client reads; server is PIPE_ACCESS_OUTBOUND
                     0, None,
                     win32file.OPEN_EXISTING,
                     win32con.FILE_FLAG_OVERLAPPED,
                     None
                 )
-                self.logger.log_message("[WinDivert] ✅ Pipe connected (OVERLAPPED, immediate processing).")
+                self.logger.log_message("[WinDivert] ✅ Pipe connected (OVERLAPPED, BYTE mode).")
 
+                # Server is PIPE_TYPE_BYTE; setting MESSAGE mode would fail (OK).
+                # We *could* set PIPE_READMODE_BYTE explicitly (0), but it’s already byte.
                 try:
-                    PIPE_READMODE_MESSAGE = 0x00000002
-                    win32pipe.SetNamedPipeHandleState(ph, PIPE_READMODE_MESSAGE, None, None)
+                    PIPE_READMODE_BYTE = 0x00000000
+                    win32pipe.SetNamedPipeHandleState(ph, PIPE_READMODE_BYTE, None, None)
                 except pywintypes.error:
+                    # Ignore; byte mode is enforced by server type.
                     pass
 
+                # Prepare one reusable OVERLAPPED for all reads
                 ev = win32event.CreateEvent(None, True, False, None)
                 ovl = pywintypes.OVERLAPPED()
                 ovl.hEvent = ev
@@ -601,9 +653,83 @@ class WinDivertManager:
                     ev = None
                 ovl = None
 
+    # ---------------- cancellation & logging helpers ----------------
+
+    def _cancel_pending_io(self):
+        """Cancel outstanding overlapped ReadFile cleanly (matches C++ overlapped writes)."""
+        try:
+            with self._hdl_lock:
+                h = self._pipe_handle
+                ovl = self._ovl
+                tid = self._reader_tid
+        except Exception:
+            h = ovl = tid = None
+
+        # Best: CancelIoEx on the specific overlapped
+        if h and ovl:
+            try:
+                if _pywin32_cancel_io_ex:
+                    _pywin32_cancel_io_ex(h, ovl)   # pywin32 path
+                else:
+                    # ctypes fallback
+                    _CancelIoEx(int(h), None)
+            except Exception:
+                pass
+
+        # Extra: cancel synchronous I/O if any (safety net)
+        if tid:
+            try:
+                th = _OpenThread(THREAD_QUERY_LIMITED_INFORMATION, False, tid)
+                if th:
+                    try:
+                        _CancelSyncIo(th)
+                    finally:
+                        _CloseHandle(th)
+            except Exception:
+                pass
+
+        # Wake up any waiters on the event
+        try:
+            with self._hdl_lock:
+                ev = self._ovl_event
+            if ev:
+                win32event.SetEvent(ev)
+        except Exception:
+            pass
+
+    def _maybe_log_progress(self, frames_this_batch, bytes_read_total, buf_len, last_progress_ts):
+        now = time.monotonic()
+        if now - self._last_log_ts < self._log_every:
+            return
+        self._last_log_ts = now
+
+        # If we’re actively draining, log at a low cadence
+        # If we’re stalled or idle, log a hint for visibility
+        stalled = (now - last_progress_ts) >= self._quiet_log_after
+        if stalled or buf_len > 0:
+            self.logger.log_message(
+                f"[WinDivert] Reader: frames+={frames_this_batch} bytes+={bytes_read_total} "
+                f"buf={buf_len}B {'(stalled?)' if stalled else ''}"
+            )
+
+    def _maybe_log_idle(self, frames_this_batch, bytes_read_total, buf_len):
+        # Called on read timeouts to provide a lightweight beacon
+        now = time.monotonic()
+        if now - self._last_log_ts >= self._log_every:
+            self._last_log_ts = now
+            self.logger.log_message(
+                f"[WinDivert] Reader idle: frames+={frames_this_batch} bytes+={bytes_read_total} buf={buf_len}B"
+            )
+
+    def _maybe_log_badlen_sample(self):
+        now = time.monotonic()
+        if now - self._ipv4_bad_last_log >= self._ipv4_bad_log_every:
+            self._ipv4_bad_last_log = now
+            self.logger.log_message(f"[WinDivert] ⚠️ bad length prefix count={self.frames_badlen}")
 
     # ---------------- misc ----------------
     def _unblock_pipe_wait(self):
+        # If server is waiting for a client, a quick connect/close can break WaitNamedPipe races.
         try:
             h = win32file.CreateFile(
                 self.pipe_name, win32file.GENERIC_READ, 0, None,
@@ -612,3 +738,4 @@ class WinDivertManager:
             win32file.CloseHandle(h)
         except pywintypes.error:
             pass
+

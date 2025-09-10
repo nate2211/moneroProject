@@ -22,6 +22,7 @@ from scapy.arch import get_if_hwaddr
 from scapy.contrib.ikev2 import IKEv2
 from scapy.fields import StrLenField
 from scapy.layers.dhcp import DHCP, BOOTP
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Solicit
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6EchoRequest, ICMPv6TimeExceeded, \
@@ -7898,6 +7899,13 @@ class TransportDHCPManager:
     def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
         from scapy.layers.dhcp import DHCP as _DHCP
 
+        if 546 in (sport, dport) or 547 in (sport, dport):
+            if DHCP6 is not None and (
+                packet.haslayer(DHCP6_Solicit) or
+                (packet.haslayer(DHCP6) and getattr(packet[DHCP6], "msgtype", None) == 1)
+            ):
+                self.logger.log_message("[Transport][🚀 UDP][⚙️ DHCPv6] 🛰️ SOLICIT seen;")
+                return False
         if _DHCP is None or BOOTP is None:
             return False
         if not packet.haslayer(BOOTP) or not packet.haslayer(_DHCP):
