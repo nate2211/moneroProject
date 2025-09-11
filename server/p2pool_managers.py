@@ -1419,7 +1419,7 @@ class PythonRouterManager:
                         component="dhcp-out",
                     )
                     return
-            if packet.haslayer(ICMP) or packet.haslayer(DHCP6_Solicit):
+            if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
                 self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short}")
                 if self.icmp_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
