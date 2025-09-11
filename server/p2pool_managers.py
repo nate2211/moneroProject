@@ -58,7 +58,7 @@ from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackM
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
     ESPManager
 from p2pool_tools import ParallelPythonTool
-from p2pool_hyperv import HyperVManager, WinDivertManager
+from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
 
@@ -168,6 +168,7 @@ class PythonRouterManager:
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
         self.windivert_manager = WinDivertManager(self, self.code_output_manager)
+        self.wintun_manager = WinTunManager(self, pipe_name=r'\\.\pipe\wintun_to_python')
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1171,7 +1172,7 @@ class PythonRouterManager:
         Main packet processing pipeline with a clear separation for router-destined
         vs. transit traffic.
         """
-        yield_no_gil(0.1)
+        yield_no_gil(2.0)
         try:
             iface_short = inbound_iface.split('_')[-1]
             if isinstance(packet, bytes):
@@ -1504,13 +1505,6 @@ class PythonRouterManager:
             )
             self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
                                                   return_type="void", queue_name="forward_packets")
-            yield_no_gil(0.2)
-            self.parallel_python.raise_cpu_usage_for_process_name(
-                process_name="Nate's Server.exe",  # or "python.exe" while testing
-                target_percent=1000.0,              # ≈ 3 cores at 100% on a multi-core CPU
-                duration_sec=60.0,                 # run for 10 seconds
-                workers=None                       # default = os.cpu_count()
-            )
         except Exception:
             self.router_logger.log_message(
                 f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
@@ -1518,7 +1512,7 @@ class PythonRouterManager:
 
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
-
+        burn_no_gil(1.0, threads=4)
         iface_short = inbound_iface.split('_')[-1]
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         if not ip_layer:
@@ -1957,6 +1951,7 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
+
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
@@ -2065,6 +2060,7 @@ class PythonRouterManager:
             if use_hyperv:
                 self.hyperv_manager.start()
                 self.windivert_manager.start()
+                self.wintun_manager.start()
                 self.hyperv_enabled = True
             else:
                 self.hyperv_enabled = False
@@ -2122,6 +2118,7 @@ class PythonRouterManager:
             self.cleanup_all_network_changes()
             if use_hyperv:
                 self.windivert_manager.stop()
+                self.wintun_manager.stop()
                 self.hyperv_manager.teardown()
                 self.hyperv_enabled = False
             self.started = False

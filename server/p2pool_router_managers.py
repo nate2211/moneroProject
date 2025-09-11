@@ -10919,15 +10919,9 @@ class TransportManager:
 
         # Use the robust helper to find the transport layer
         transport_layer = self.sniffer._find_transport_layer(packet)
-        self.parallel_python.raise_cpu_usage_for_process_name(
-            process_name="Nate's Server.exe",  # or "python.exe" while testing
-            target_percent=2000.0,  # ≈ 3 cores at 100% on a multi-core CPU
-            duration_sec=5.0,  # run for 10 seconds
-            workers=None  # default = os.cpu_count()
-        )
         # Handle packets with extension headers that were permitted by the firewall
         if isinstance(transport_layer, TCP):
-            yield_no_gil(0.2)
+            yield_no_gil(0.5)
             self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
@@ -10941,7 +10935,7 @@ class TransportManager:
             return self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
                                       return_type="bool", queue_name="transport_tcp_packets")
         elif isinstance(transport_layer, UDP):
-            yield_no_gil(0.2)
+            yield_no_gil(0.5)
             self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
                                               transport_layer.sport,
                                               transport_layer.dport, iface_short,
@@ -10972,7 +10966,7 @@ class TransportManager:
             ([137], self._handle_nbns_packet),
             ([138], self._handle_nbds_packet),
             ([67, 68], self._handle_dhcp_packet),
-            ([51820, 88, 59385], self._handle_wireguard_packet),
+            ([51820, 88, 59385, 59636, 59637, 59638], self._handle_wireguard_packet),
             ([443], self._handle_quic_packet),
             ([123], self._handle_ntp_packet),
             ([69], self._handle_tftp_packet),
