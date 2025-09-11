@@ -167,8 +167,8 @@ class PythonRouterManager:
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(self, self.code_output_manager)
-        self.wintun_manager = WinTunManager(self, pipe_name=r'\\.\pipe\wintun_to_python')
+        self.windivert_manager = WinDivertManager(self, self.code_output_manager, max_frames_per_batch=20000, max_bytes_per_batch=(1 << 60))
+        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python', max_frames_per_batch=20000, max_bytes_per_batch=(1 << 60))
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1409,7 +1409,7 @@ class PythonRouterManager:
                         )
                         return
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit):
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router")
+                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router Packet: {packet.summary()}")
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
                     self.code_output_manager.submit_packet(
@@ -1420,24 +1420,24 @@ class PythonRouterManager:
                     )
                     return
             if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
-                self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short}")
+                self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short} Packet: {packet.summary()}")
                 if self.icmp_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet, inbound_iface=inbound_iface,
                         phase="handled",
                         component="icmp"
                     )
-                    return
+                return
 
             if packet.haslayer(IGMP) or packet.haslayer(IGMPv3):  # Echo Request
-                self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short}")
+                self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short} Packet: {packet.summary()}")
                 if self.igmp_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet,
                         inbound_iface=inbound_iface,
                         phase="handled",
                         component="igmp",
-                )
+                    )
                 return
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.

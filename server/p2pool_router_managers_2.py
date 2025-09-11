@@ -24,7 +24,7 @@ from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
     DUID_LLT, DHCP6OptServerId
 from scapy.layers.dns import DNS, DNSRR
-from scapy.layers.inet import ICMP
+from scapy.layers.inet import ICMP, IPOption_Router_Alert
 from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
     IPv6ExtHdrHopByHop, RouterAlert, ICMPv6NDOptDstLLAddr, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr, ICMPv6ND_NS
 from scapy.layers.l2 import ARP, getmacbyip
@@ -4091,6 +4091,9 @@ class IGMPManager:
     IGMP_ALL_ROUTERS = "224.0.0.2"
     MAC_ALL_HOSTS = "01:00:5e:00:00:01"
 
+    IGMP_V3_REPORT_ADDR = "224.0.0.22"
+    MAC_IGMP_V3_REPORT = "01:00:5e:00:00:16"  # Ethernet map for 224.0.0.22
+    ADMIN_LOCAL_NET = ipaddress.IPv4Network("224.0.0.0/24")  # Link-local admin scope
     # IGMP Timers and Constants (RFC 2236 & 3376)
     QUERY_INTERVAL = 125  # Time between General Queries.
     MEMBERSHIP_TIMEOUT = 260  # (Robustness Var * Query Int) + Max Resp Time
@@ -4132,21 +4135,34 @@ class IGMPManager:
         self.log.log_message("[IGMP] Background thread stopped.")
 
     def handle_packet(self, pkt: Packet, inbound_ifname: str):
-        """Main entry point for processing incoming IGMP packets."""
-        if not (pkt.haslayer(IP) and pkt.haslayer(IGMP)):
-            return
         try:
-            self._handle_igmp(pkt, inbound_ifname)
+            if not pkt.haslayer(IP):
+                return
+            ip_dst = pkt[IP].dst
+
+            # Always consume admin-scope local multicast (224.0.0.0/24)
+            if self._is_admin_local_mcast(ip_dst):
+                self._log_ip_router_alert(pkt, inbound_ifname)
+                # Try to parse; if no IGMP-ish layer, still consume silently.
+                if pkt.haslayer(IGMP) or pkt.haslayer(IGMPv3mr):
+                    self._handle_igmp(pkt, inbound_ifname)
+                else:
+                    self.log.log_message(
+                        f"[IGMP] Consumed admin-local {ip_dst} lacking IGMP layer on {inbound_ifname.split('_')[-1]}")
+                return
+
+            # Non-admin multicast: parse if present, but don't force
+            if pkt.haslayer(IGMP) or pkt.haslayer(IGMPv3mr):
+                self._handle_igmp(pkt, inbound_ifname)
         except Exception as e:
             self.log.log_message(f"[IGMP] Error handling packet: {e}")
-
     def should_forward_multicast(self, *, group_ip: str, outbound_ifname: str, source_ip: Optional[str] = None) -> bool:
         """
         Determines if a multicast packet should be forwarded out a specific interface.
         """
-        # Always forward traffic for well-known administrative groups.
-        if group_ip in (self.IGMP_ALL_HOSTS, self.IGMP_ALL_ROUTERS):
-            return True
+        # Never route admin-scope local multicast (224.0.0.0/24). These are link-local only.
+        if self._is_admin_local_mcast(group_ip):
+            return False
 
         key = (group_ip, outbound_ifname)
         with self._lock:
@@ -4222,28 +4238,46 @@ class IGMPManager:
     ## ------------------- IGMP Packet Handling ------------------- ##
 
     def _handle_igmp(self, pkt: Packet, ifname: str):
-        """Dispatches IGMP packets based on their type and version."""
-        igmp_layer: IGMP = pkt[IGMP]
-        src_ip = pkt[IP].src
-        igmp_type = igmp_layer.type
-        group_addr = igmp_layer.gaddr
+        ip = pkt[IP]
+        src_ip = ip.src
 
-        # 0x11 is Query, which we send but typically ignore when received from other routers.
+        # Figure out IGMP type & quick path
+        igmp_type = None
+        igmp_layer = None
+
+        if pkt.haslayer(IGMP):
+            igmp_layer = pkt[IGMP]
+            igmp_type = int(getattr(igmp_layer, "type", -1))
+        elif pkt.haslayer(IGMPv3mr):
+            # Some stacks expose only IGMPv3mr; treat as type 0x22
+            igmp_layer = pkt.getlayer(IGMPv3mr)
+            igmp_type = 0x22
+        else:
+            self.log.log_message(f"[IGMP] Unrecognized IGMP variant on {ifname.split('_')[-1]}")
+            return
+
+        # Queries (0x11) from other routers: ignore or use for querier election
         if igmp_type == 0x11:
             return
 
-        # IGMPv1 (0x12) or IGMPv2 (0x16) Membership Report
-        if igmp_type == 0x12 or igmp_type == 0x16:
+        # Enforce TTL==1 best-effort on admin-scope
+        if self._is_admin_local_mcast(ip.dst) and getattr(ip, "ttl", 1) != 1:
+            self.log.log_message(f"[IGMP] ⚠️ Admin-scope IGMP with TTL={ip.ttl} on {ifname.split('_')[-1]}")
+
+        # v1/v2 Membership Reports
+        if igmp_type in (0x12, 0x16):
+            group_addr = getattr(igmp_layer, "gaddr", None) or "0.0.0.0"
             version = 1 if igmp_type == 0x12 else 2
             self._join(group_addr, ifname, "include", set(), src_ip, version)
             return
 
-        # IGMPv2 Leave Group (0x17)
+        # v2 Leave
         if igmp_type == 0x17:
+            group_addr = getattr(igmp_layer, "gaddr", None) or "0.0.0.0"
             self._leave(group_addr, ifname, src_ip)
             return
 
-        # IGMPv3 Membership Report (0x22)
+        # v3 Membership Report
         if igmp_type == 0x22:
             self._handle_igmpv3_report(pkt, ifname, src_ip)
             return
@@ -4251,27 +4285,32 @@ class IGMPManager:
     def _handle_igmpv3_report(self, pkt: Packet, ifname: str, src_ip: str):
         """Parses and processes an IGMPv3 report with its group records."""
         try:
-            report_layer = pkt.getlayer(IGMPv3mr)
-            if not report_layer or not hasattr(report_layer, 'grps'):
-                self.log.log_message("[IGMP] v3 report with malformed records.")
+            rep = pkt.getlayer(IGMPv3mr)
+            # Some builds put records under .grps; others stash in payload chains
+            records = []
+            if rep and hasattr(rep, "grps"):
+                records = list(rep.grps) or []
+            if not records and hasattr(rep, "records"):
+                records = list(rep.records) or []
+            if not records and hasattr(rep, "payload") and hasattr(rep.payload, "grps"):
+                records = list(rep.payload.grps) or []
+
+            if not records:
+                self.log.log_message("[IGMP] v3 report with no records (variant or malformed).")
                 return
 
-            for record in report_layer.grps:
-                group = record.gaddr
-                srcs = set(record.srcaddrs)
-                rtype = record.rtype
+            for rec in records:
+                group = str(getattr(rec, "gaddr", getattr(rec, "maddr", "0.0.0.0")))
+                srcs = set(getattr(rec, "srcaddrs", getattr(rec, "sources", [])) or [])
+                rtype = int(getattr(rec, "rtype", getattr(rec, "type", 0)))
 
-                # MODE_IS_INCLUDE / CHANGE_TO_INCLUDE
-                if rtype in (1, 3):
+                if rtype in (1, 3):  # MODE_IS_INCLUDE / CHANGE_TO_INCLUDE
                     self._join(group, ifname, "include", srcs, src_ip, 3)
-                # MODE_IS_EXCLUDE / CHANGE_TO_EXCLUDE
-                elif rtype in (2, 4):
+                elif rtype in (2, 4):  # MODE_IS_EXCLUDE / CHANGE_TO_EXCLUDE
                     self._join(group, ifname, "exclude", srcs, src_ip, 3)
-                # ALLOW_NEW_SOURCES
-                elif rtype == 5:
+                elif rtype == 5:  # ALLOW_NEW_SOURCES
                     self._update_sources(group, ifname, srcs, "allow")
-                # BLOCK_OLD_SOURCES
-                elif rtype == 6:
+                elif rtype == 6:  # BLOCK_OLD_SOURCES
                     self._update_sources(group, ifname, srcs, "block")
         except Exception as e:
             self.log.log_message(f"[IGMP] v3 parse error: {e}")
@@ -4383,7 +4422,27 @@ class IGMPManager:
         self.pw._send_raw_packet(query_pkt, ifname)
 
     ## ------------------- Helper Methods ------------------- ##
+    def _is_admin_local_mcast(self, addr: str) -> bool:
+        try:
+            return ipaddress.IPv4Address(addr) in self.ADMIN_LOCAL_NET
+        except Exception:
+            return False
 
+    def _log_ip_router_alert(self, pkt: Packet, ifname: str) -> None:
+        try:
+            ip = pkt[IP]
+            ttl = getattr(ip, "ttl", None)
+            has_ra = False
+            # If options are parsed, they may live in a list under ip.options (scapy >= 2.5)
+            opts = getattr(ip, "options", None)
+            if isinstance(opts, list):
+                has_ra = any(isinstance(o, IPOption_Router_Alert) for o in opts)
+            elif isinstance(opts, (bytes, bytearray)):
+                # Fallback to your sender's bytes
+                has_ra = opts.startswith(b"\x94\x04\x00\x00")
+            self.log.log_message(f"[IGMP] HBH Router-Alert={has_ra} TTL={ttl} on {ifname.split('_')[-1]}")
+        except Exception:
+            pass
     def _notify(self, action: str, entry: Optional[MembershipEntry]):
         """Calls the on_change callback if it is registered."""
         if entry and callable(self.on_change):

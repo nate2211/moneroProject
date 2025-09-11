@@ -12272,10 +12272,18 @@ class PacketWriter:
         low23 = n & 0x7FFFFF
         return "01:00:5e:%02x:%02x:%02x" % ((low23 >> 16) & 0x7f, (low23 >> 8) & 0xff, low23 & 0xff)
 
-    def _ipv6_mcast_mac(self, ip6: str) -> str:
-        # RFC 2464: 33:33:xx:xx:xx:xx (low 32 bits of IPv6 dest)
-        n = int(ipaddress.IPv6Address(ip6))
-        return "33:33:%02x:%02x:%02x:%02x" % ((n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
+    def _ipv6_mcast_mac(self, group_ip6: str) -> str:
+        try:
+            v = int(ipaddress.IPv6Address(group_ip6))
+            lo32 = v & 0xffffffff
+            return (
+                f"33:33:{(lo32 >> 24) & 0xff:02x}:"
+                f"{(lo32 >> 16) & 0xff:02x}:"
+                f"{(lo32 >> 8) & 0xff:02x}:"
+                f"{lo32 & 0xff:02x}"
+            )
+        except Exception:
+            return "33:33:00:00:00:00"
 
     def _infer_next_hop(self, final_iface: str, pkt) -> tuple[Optional[str], Optional[str]]:
         """
@@ -13639,25 +13647,44 @@ class ICMPManager:
     # IPv6 Path
     # --------------------------------------------------------------------------
     def _handle_ipv6(self, pkt: Packet, iface: str) -> bool:
-        """Handles all incoming IPv6 packets for ICMPv6, ND, and MLD."""
         # --- Neighbor Discovery ---
         if pkt.haslayer(ICMPv6ND_NS):
-            self._handle_ns(pkt, iface)
+            self._handle_ns(pkt, iface);
             return True
         if pkt.haslayer(ICMPv6ND_NA):
-            self._handle_na(pkt)
+            self._handle_na(pkt);
             return True
         if pkt.haslayer(ICMPv6ND_RS):
-            self._handle_rs(pkt, iface)
+            self._handle_rs(pkt, iface);
             return True
 
-        # --- Multicast Listener Discovery ---
-        if self._handle_mld(pkt, iface):
-            return True
+        # --- Multicast Listener Discovery (robust handling, including ff02::16) ---
+        # Fast path: if dst is ff02::16 (All MLDv2 Routers), this is an MLDv2 Report; consume here.
+        try:
+            v6 = pkt[IPv6]
+            dst_l = str(v6.dst).lower()
+            if dst_l == "ff02::16":
+                # Parse (and log) HBH Router Alert if present, then handle as MLDv2
+                self._log_hbh_router_alert(pkt, iface)
+                if self._handle_mld(pkt, iface):
+                    return True
+                # Even if parsing fails, never forward ff02::16; consume quietly
+                self.log.log_message(f"[ICMP][MLD] 🔒 Consumed packet to ff02::16 on {self._iface_suffix(iface)}")
+                return True
+
+            # If other ff02::/16 link-local multicast arrives here (after ND above), try MLD handler then swallow.
+            if dst_l.startswith("ff02:"):
+                if self._handle_mld(pkt, iface):
+                    return True
+                self.log.log_message(
+                    f"[ICMP] 🔒 Dropped unrecognized link-local multicast {v6.src}→{v6.dst} on {self._iface_suffix(iface)}")
+                return True
+        except Exception:
+            pass
 
         # --- ICMPv6 Echo Request (Ping) ---
         if pkt.haslayer(ICMPv6EchoRequest) and self._is_for_router_v6(pkt[IPv6].dst):
-            self._handle_echo_request_v6(pkt, iface)
+            self._handle_echo_request_v6(pkt, iface);
             return True
 
         # --- ICMPv6 Error Message Logging ---
@@ -13763,8 +13790,8 @@ class ICMPManager:
 
         v6s = solicitation_pkt[IPv6]
         dst_ip = v6s.src
-        dst_mac = solicitation_pkt[Ether].src if solicitation_pkt.haslayer(
-            Ether) else self._solicited_node_mac_for_target(dst_ip)
+        dst_mac = (solicitation_pkt[Ether].src if solicitation_pkt.haslayer(Ether)
+                   else self._solicited_node_mac_for_target(target_ip))
 
         tlla = self._pack_nd_lladdr_opt(opt_type=2, mac_str=my_mac)  # Type 2 = Target Link-Layer Address
         na = (
@@ -13809,16 +13836,14 @@ class ICMPManager:
         iface_short = self._iface_suffix(iface)
 
         # ---- MLDv1 Query (type 130) ----
-        if (pkt.haslayer("MLDQuery") or
-                (pkt.haslayer(ICMPv6) and int(pkt[ICMPv6].type) == 130)):
-            # Be robust to Scapy variants
+        if (pkt.haslayer("MLDQuery") or (pkt.haslayer(ICMPv6) and int(pkt[ICMPv6].type) == 130)):
             q = pkt.getlayer("MLDQuery")
-            group_ip = str(getattr(q, "mcaddr", "::")) if q else "::"  # "::" == general query
+            group_ip = str(getattr(q, "mcaddr", "::")) if q else "::"
             kind = "general" if group_ip in ("::", "0::") else f"group={group_ip}"
             hlim = int(getattr(pkt[IPv6], "hlim", -1))
-            self._mld_querier[iface] = {"src": src_ip6, "last_seen": time.time(), "group": group_ip}
+            with getattr(self, "_mldq_lock", threading.Lock()):
+                self._mld_querier[iface] = {"src": src_ip6, "last_seen": time.time(), "group": group_ip}
             self.log.log_message(f"[ICMP][MLD] v1 Query ({kind}) from {src_ip6} on {iface_short} (hlim={hlim})")
-            # Optional: if your router has memberships, you could proactively send reports here.
             self._send_mldv1_reports_for_iface(iface, specific_group=group_ip if group_ip != '::' else None)
             return True
 
@@ -13834,19 +13859,32 @@ class ICMPManager:
             return True
 
         # ---- MLDv2 Report (type 143) ----
-        if self._looks_like_mldv2_report(pkt):
-            rep = pkt.getlayer("MLDv2report") or pkt.getlayer("MLDv2Report") or pkt.getlayer("ICMPv6MLReport2")
+        # Be robust to HBH header and Scapy naming:
+        icmpv6 = pkt.getlayer(ICMPv6)
+        if icmpv6 and int(getattr(icmpv6, "type", -1)) == 143:
+            # Known Scapy variants for the MLDv2 report record container
+            rep = (pkt.getlayer("MLDv2report") or pkt.getlayer("MLDv2Report") or
+                   pkt.getlayer("ICMPv6MLReport2") or pkt.getlayer(ICMPv6))  # last resort
             records = getattr(rep, "records", []) or getattr(rep, "grps", [])
+            # Some stacks store records in payload list; try to extract fallback
+            if not records and hasattr(rep, "payload") and hasattr(rep.payload, "records"):
+                records = getattr(rep.payload, "records", [])
+
+            rec_cnt = 0
             for rec in records:
                 rtype = int(getattr(rec, "rtype", getattr(rec, "type", 0)))
                 group = str(getattr(rec, "mcaddr", getattr(rec, "maddr", "::")))
                 srcs = {str(s) for s in (getattr(rec, "srcaddrs", []) or getattr(rec, "sources", []))}
-                if rtype in (1, 3, 5):  # INCLUDE-ish
+                if rtype in (1, 3, 5):  # MODE_IS_INCLUDE / CHANGE_TO_INCLUDE / ALLOW_NEW_SOURCES
                     self._mld_join(group, iface, mode="include", sources=srcs, who=src_ip6)
-                elif rtype in (2, 4):  # EXCLUDE-ish
+                elif rtype in (2, 4):  # MODE_IS_EXCLUDE / CHANGE_TO_EXCLUDE
                     self._mld_join(group, iface, mode="exclude", sources=srcs, who=src_ip6)
                 elif rtype == 6:  # BLOCK_OLD_SOURCES
                     self._mld_block_sources(group, iface, sources=srcs, who=src_ip6)
+                rec_cnt += 1
+
+            self._log_hbh_router_alert(pkt, iface)  # best-effort HBH log
+            self.log.log_message(f"[ICMP][MLD] v2 Report from {src_ip6} on {iface_short} (records={rec_cnt})")
             return True
 
         return False
@@ -13868,7 +13906,7 @@ class ICMPManager:
                       if ifn == iface and (specific_group is None or g == specific_group)]
         for g in groups:
             # MLDv1 reports are sent to the multicast group itself, HLIM=1
-            dst_mac = self._solicited_node_mac_for_target(g) if g.startswith("ff") else "33:33:00:00:00:01"
+            dst_mac = self._ipv6_mcast_mac(g)
             report = (Ether(src=src_mac, dst=dst_mac) /
                       IPv6(src=src_ll, dst=g, hlim=1) /
                       MLDReport(mcaddr=g))
@@ -14344,3 +14382,47 @@ class ICMPManager:
         # (Optional) Add a log message for visibility.
         self.log.log_message(f"[ICMP][ND] 📒 Learned neighbor mapping: {normalized_key} -> {mac_addr}")
 
+    def _ipv6_mcast_mac(self, group_ip6: str) -> str:
+        try:
+            v = int(ipaddress.IPv6Address(group_ip6))
+            lo32 = v & 0xffffffff
+            return (
+                f"33:33:{(lo32 >> 24) & 0xff:02x}:"
+                f"{(lo32 >> 16) & 0xff:02x}:"
+                f"{(lo32 >> 8) & 0xff:02x}:"
+                f"{lo32 & 0xff:02x}"
+            )
+        except Exception:
+            return "33:33:00:00:00:00"
+
+    def _log_hbh_router_alert(self, pkt: Packet, iface: str) -> None:
+        """Best-effort parse of IPv6 Hop-by-Hop Router Alert (value 0 for MLD)."""
+        try:
+            if not pkt.haslayer("IPv6ExtHdrHopByHop"):
+                return
+            hbh = pkt.getlayer("IPv6ExtHdrHopByHop")
+            # Scapy variants: option may be named differently; try common fields
+            opts = []
+            cur = getattr(hbh, "options", None)
+            if isinstance(cur, list):
+                opts = cur
+            elif hasattr(hbh, "payload"):
+                opts = [hbh.payload]
+
+            for opt in opts:
+                # Try attributes first
+                val = getattr(opt, "value", None)
+                opt_type = getattr(opt, "otype", getattr(opt, "opt_type", None))
+                # Fallback to bytes scan if needed
+                if val is None and hasattr(opt, "payload"):
+                    raw = bytes(opt)
+                    # Router Alert option type is 0x05 per RFC 2711
+                    if raw and raw[0] == 0x05 and len(raw) >= 4:
+                        val = int.from_bytes(raw[2:4], "big")
+                        opt_type = 0x05
+                if opt_type in (0x05, 5) and val is not None:
+                    self.log.log_message(f"[ICMP][HBH] Router-Alert value={val} on {self._iface_suffix(iface)}")
+                    return
+        except Exception:
+            # Silent: HBH parsing should never break control-plane
+            pass
