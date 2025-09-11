@@ -1196,6 +1196,7 @@ class PythonRouterManager:
             if not ip_layer:
                 self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
                 return
+
             src_ip=None
             dst_ip=None
             if packet.haslayer(IP):
@@ -1387,7 +1388,7 @@ class PythonRouterManager:
                         if self.dns_manager.handle_response(packet):
                             return  # Packet was handled (forwarded back to client)
 
-                if packet.haslayer(DHCP) or packet.haslayer(DHCP6):
+                if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit):
                     self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
                     if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
                                                                                  self.rip_manager.find_route):
@@ -1407,7 +1408,7 @@ class PythonRouterManager:
                             component="dhcp-out-router",
                         )
                         return
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6_Solicit):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router")
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
@@ -1518,7 +1519,7 @@ class PythonRouterManager:
         if not ip_layer:
             self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
             return
-        l2_driver_ok = inbound_iface not in ("WinDivertBridge", "WireShark")
+        l2_driver_ok = inbound_iface not in ("WinDivertBridge", "WireShark", "Nate's Tunnel")
         dst_ip = ip_layer.dst
         route = self.rip_manager.get_forwarding_route(dst_ip)
         # --- Multicast Handling (IPv4 and IPv6) ---

@@ -10966,7 +10966,7 @@ class TransportManager:
             ([137], self._handle_nbns_packet),
             ([138], self._handle_nbds_packet),
             ([67, 68], self._handle_dhcp_packet),
-            ([51820, 88, 59385, 59636, 59637, 59638], self._handle_wireguard_packet),
+            ([51820, 88, 59385, 59636, 59637, 59638, 61138], self._handle_wireguard_packet),
             ([443], self._handle_quic_packet),
             ([123], self._handle_ntp_packet),
             ([69], self._handle_tftp_packet),
