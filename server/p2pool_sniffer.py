@@ -13,6 +13,7 @@ import psutil
 from scapy.arch import get_if_hwaddr, get_windows_if_list
 from scapy.config import conf
 from scapy.contrib.geneve import GENEVE
+from scapy.contrib.igmpv3 import IGMPv3mq, IGMPv3mr
 from scapy.contrib.mpls import MPLS
 from scapy.fields import IntField, XShortField, LELongField, LEIntField, LESignedIntField, StrLenField, EnumField, \
     FieldLenField, IPField
@@ -36,8 +37,9 @@ try:
     from scapy.layers.inet6 import (
         ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA,
         ICMPv6ND_RA, ICMPv6ND_RS, IPv6, ICMPv6Unknown, ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
-        IPv6ExtHdrHopByHop, ICMPv6NDOptSrcLLAddr, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment
-)
+        IPv6ExtHdrHopByHop, ICMPv6NDOptSrcLLAddr, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment,
+        ICMPv6ND_Redirect
+    )
     from scapy.layers.l2 import Ether, ARP, GRE, Loopback, Dot1Q, getmacbyip
     from scapy.packet import bind_layers, Raw, NoPayload
 except ImportError:
@@ -262,10 +264,9 @@ class SnifferSoftware:
 
     def setup_scapy_bindings(self):
         # Standard L2 -> L3 Bindings
-        bind_layers(Ether, IPv6, type=0x86DD)
-        bind_layers(Ether, ARP, type=0x0806)
-        bind_layers(Ether, EAPOL, type=0x888E)
-
+        bind_layers(Dot1Q, IP, type=0x0800)
+        bind_layers(Dot1Q, IPv6, type=0x86DD)
+        bind_layers(Dot1Q, ARP, type=0x0806)
         # --- FIX: Add Bindings for IPv6 Hop-by-Hop Extension Header ---
         # The Hop-by-Hop header is indicated by a Next Header value of 0 in the main IPv6 header.
         bind_layers(IPv6, IPv6ExtHdrHopByHop, nh=0)
@@ -283,16 +284,17 @@ class SnifferSoftware:
         bind_layers(IPv6, UDP, nh=17)
         bind_layers(IPv6, ICMPv6, nh=58)
         bind_layers(IPv6, AH, nh=51)
+        bind_layers(ICMPv6, ICMPv6ND_RS, type=133)
+        bind_layers(ICMPv6, ICMPv6ND_RA, type=134)
         bind_layers(ICMPv6, ICMPv6ND_NS, type=135)
         bind_layers(ICMPv6, ICMPv6ND_NA, type=136)
-        bind_layers(ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr, type=1)
-        bind_layers(ICMPv6Unknown, MLDQuery, type=130)
-        bind_layers(ICMPv6Unknown, MLDReport, type=131)
-        bind_layers(ICMPv6Unknown, MLDDone, type=132)
-        bind_layers(ICMPv6Unknown, MLDQuery, type=130)  # Query
-        bind_layers(ICMPv6Unknown, MLDReport, type=131)  # Report
-        bind_layers(ICMPv6Unknown, MLDDone, type=132)  # Done
+        bind_layers(ICMPv6, ICMPv6ND_Redirect, type=137)
+        bind_layers(ICMPv6, MLDQuery, type=130)
+        bind_layers(ICMPv6, MLDReport, type=131)
+        bind_layers(ICMPv6, MLDDone, type=132)
         bind_layers(IP, IGMP, proto=2)
+        bind_layers(IGMP, IGMPv3mq, type=0x11)
+        bind_layers(IGMP, IGMPv3mr, type=0x22)
         bind_layers(Ether, ARP, type=0x0806)
         bind_layers(UDP, ISAKMP, dport=9999)
         bind_layers(UDP, ISAKMP, sport=9999)

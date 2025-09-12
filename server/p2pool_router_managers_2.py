@@ -19,7 +19,7 @@ from scapy.arch import get_windows_if_list
 from scapy.arch import get_if_hwaddr
 from scapy.config import conf
 from scapy.contrib.igmp import IGMP
-from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr
+from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3mq
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
     DUID_LLT, DHCP6OptServerId
@@ -4079,46 +4079,61 @@ class IGMPManager:
     querier, sending periodic General Queries and Group-Specific Queries when
     members leave.
 
-    Features:
+    Features (original + added):
       - Handles IGMPv1/v2/v3 Membership Reports (Joins).
       - Handles IGMPv2 Leave messages by initiating the Last Member Query sequence.
       - Periodically sends General Queries to all hosts.
       - Purges stale memberships that are no longer active.
       - Provides a `should_forward_multicast` method for routing decisions.
+      - (NEW) Parses IGMPv3 Queries (general/group/source-specific), logs max-resp.
+      - (NEW) Querier election/back-off (other-querier present interval).
+      - (NEW) Optional source-specific query sender for v3.
+      - (NEW) Rich logs: record counts, include/exclude, source counts (truncated).
+      - (NEW) snapshot() still present; add pretty_snapshot() for human logs.
     """
-    # Standard IGMP multicast addresses
+
+    # Standard multicast & admin local
     IGMP_ALL_HOSTS = "224.0.0.1"
     IGMP_ALL_ROUTERS = "224.0.0.2"
     MAC_ALL_HOSTS = "01:00:5e:00:00:01"
 
     IGMP_V3_REPORT_ADDR = "224.0.0.22"
-    MAC_IGMP_V3_REPORT = "01:00:5e:00:00:16"  # Ethernet map for 224.0.0.22
-    ADMIN_LOCAL_NET = ipaddress.IPv4Network("224.0.0.0/24")  # Link-local admin scope
-    # IGMP Timers and Constants (RFC 2236 & 3376)
-    QUERY_INTERVAL = 125  # Time between General Queries.
-    MEMBERSHIP_TIMEOUT = 260  # (Robustness Var * Query Int) + Max Resp Time
-    LMQ_COUNT = 2  # Last Member Query Count.
-    LMQ_INTERVAL = 1  # Seconds.
+    MAC_IGMP_V3_REPORT = "01:00:5e:00:00:16"
+    ADMIN_LOCAL_NET = ipaddress.IPv4Network("224.0.0.0/24")
+
+    # Timers / RFCs
+    QUERY_INTERVAL = 125
+    MEMBERSHIP_TIMEOUT = 260
+    LMQ_COUNT = 2
+    LMQ_INTERVAL = 1
+
+    # (NEW) v3 querier election (RFC 3376 §7.6, §8.6)
+    ROBUSTNESS = 2
+    QUERY_RESPONSE_INTERVAL = 10  # seconds
+    OTHER_QUERIER_PRESENT_INTERVAL = ROBUSTNESS * QUERY_INTERVAL + QUERY_RESPONSE_INTERVAL / 2.0
 
     def __init__(self, router_logger, packet_writer):
         self.log = router_logger
         self.pw = packet_writer
-        # Database key: (group_ip, interface_name) -> MembershipEntry
         self._db: Dict[Tuple[str, str], MembershipEntry] = {}
         self._lock = threading.Lock()
         self._ifcfg: Dict[str, Dict] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Callback for external components to react to membership changes
         self.on_change: Optional[callable] = None
+
+        # (NEW) per-interface querier state
+        # ifname -> {"other_ip": str|None, "last_seen": float, "i_am_querier": bool}
+        self._querier: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "other_ip": None, "last_seen": 0.0, "i_am_querier": True  # start as querier until proven otherwise
+        })
+
         self.log.log_message("[IGMP] Manager initialized (v1/v2/v3 support).")
 
     def set_interfaces_config(self, interfaces_config: Dict[str, Dict]):
-        """Sets or updates the router's interface configuration."""
         self._ifcfg = interfaces_config or {}
 
     def start(self):
-        """Starts the background thread for sending queries and managing state."""
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -4127,13 +4142,13 @@ class IGMPManager:
         self.log.log_message("[IGMP] Background thread started.")
 
     def stop(self):
-        """Stops the background thread."""
         if not self._thread:
             return
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self.log.log_message("[IGMP] Background thread stopped.")
 
+    # --------------------------- Public API --------------------------- #
     def handle_packet(self, pkt: Packet, inbound_ifname: str):
         try:
             if not pkt.haslayer(IP):
@@ -4143,7 +4158,6 @@ class IGMPManager:
             # Always consume admin-scope local multicast (224.0.0.0/24)
             if self._is_admin_local_mcast(ip_dst):
                 self._log_ip_router_alert(pkt, inbound_ifname)
-                # Try to parse; if no IGMP-ish layer, still consume silently.
                 if pkt.haslayer(IGMP) or pkt.haslayer(IGMPv3mr):
                     self._handle_igmp(pkt, inbound_ifname)
                 else:
@@ -4151,16 +4165,14 @@ class IGMPManager:
                         f"[IGMP] Consumed admin-local {ip_dst} lacking IGMP layer on {inbound_ifname.split('_')[-1]}")
                 return
 
-            # Non-admin multicast: parse if present, but don't force
+            # Non-admin multicast: parse if present
             if pkt.haslayer(IGMP) or pkt.haslayer(IGMPv3mr):
                 self._handle_igmp(pkt, inbound_ifname)
         except Exception as e:
             self.log.log_message(f"[IGMP] Error handling packet: {e}")
+
     def should_forward_multicast(self, *, group_ip: str, outbound_ifname: str, source_ip: Optional[str] = None) -> bool:
-        """
-        Determines if a multicast packet should be forwarded out a specific interface.
-        """
-        # Never route admin-scope local multicast (224.0.0.0/24). These are link-local only.
+        # Never route admin-scope local multicast
         if self._is_admin_local_mcast(group_ip):
             return False
 
@@ -4168,20 +4180,21 @@ class IGMPManager:
         with self._lock:
             entry = self._db.get(key)
             if not entry:
-                return False  # No members for this group on the interface.
+                return False
 
-        # Source-Specific Multicast (SSM) filtering logic
+        # SSM filter (unchanged + small correctness for EXCLUDE/empty)
         if source_ip:
             if entry.mode == "include":
                 return source_ip in entry.sources
-            else:  # exclude mode
-                return source_ip not in entry.sources
-
-        # Any-Source Multicast (ASM) forwarding
-        return True
+            # EXCLUDE with empty set means "any source"
+            return not (source_ip in entry.sources)
+        else:
+            if entry.mode == "include":
+                return len(entry.sources) == 0 or True  # ASM include has no source restriction
+            else:
+                return True  # EXCLUDE(*) forwards unless specifically blocked
 
     def snapshot(self) -> Dict[Tuple[str, str], dict]:
-        """Returns a snapshot of the current IGMP membership database."""
         with self._lock:
             return {
                 k: {
@@ -4192,39 +4205,50 @@ class IGMPManager:
                 for k, v in self._db.items()
             }
 
-    ## ------------------- Background Tasks ------------------- ##
+    # (NEW) human-friendly table for logs/CLI
+    def pretty_snapshot(self) -> str:
+        snap = self.snapshot()
+        lines = ["group,iface,mode,sources,ver,last_report,LMQ"]
+        for (_, ifn), v in snap.items():
+            lines.append(f"{v['group']},{ifn},{v['mode']},{len(v['sources'])},{v['version']},{int(time.time()-v['last_report'])}s,{v['lmq_remaining']}")
+        return "\n".join(lines)
 
+    # ------------------------ Background tasks ----------------------- #
     def _background_loop(self):
-        """The main loop for the background thread."""
         next_query_time = time.time()
         while not self._stop_event.is_set():
             now = time.time()
+
+            # (NEW) update querier role per interface
+            self._refresh_querier_roles(now)
+
             if now >= next_query_time:
-                self._send_general_queries()
+                self._send_general_queries()  # respects querier role now
                 next_query_time = now + self.QUERY_INTERVAL
 
             self._service_last_member_queries(now)
             self._purge_stale_memberships(now)
-            self._stop_event.wait(0.5)  # Service loop runs twice a second
+            self._stop_event.wait(0.5)
 
     def _send_general_queries(self):
-        """Sends an IGMP General Query message out of all configured interfaces."""
         for ifname, cfg in self._ifcfg.items():
+            if not self._is_querier(ifname):
+                continue  # back off if another querier active
+
             ip_src = cfg.get("ip_addr")
             mac_src = cfg.get("mac")
             if not (ip_src and mac_src) or self._is_loopback(ifname):
                 continue
 
             query_pkt = (
-                    Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
-                    IP(src=ip_src, dst=self.IGMP_ALL_HOSTS, ttl=1, options="\x94\x04\x00\x00") /  # Router Alert
-                    IGMP(type=0x11, gaddr="0.0.0.0")  # General Query
+                Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
+                IP(src=ip_src, dst=self.IGMP_ALL_HOSTS, ttl=1, options=b"\x94\x04\x00\x00") /
+                IGMP(type=0x11, gaddr="0.0.0.0")
             )
             self.log.log_message(f"[IGMP] -> General Query on {ifname.split('_')[-1]}")
-            self.pw._send_raw_packet(query_pkt, ifname,  allow_dst_ours=True)
+            self.pw._send_raw_packet(query_pkt, ifname, allow_dst_ours=True)
 
     def _purge_stale_memberships(self, now: float):
-        """Removes memberships that have timed out."""
         with self._lock:
             stale_keys = [
                 k for k, v in self._db.items()
@@ -4235,13 +4259,12 @@ class IGMPManager:
                 self.log.log_message(f"[IGMP] Timed out membership for {entry.group} on {entry.ifname.split('_')[-1]}.")
                 self._notify("leave", entry)
 
-    ## ------------------- IGMP Packet Handling ------------------- ##
-
+    # ------------------------ Packet handling ------------------------ #
     def _handle_igmp(self, pkt: Packet, ifname: str):
         ip = pkt[IP]
         src_ip = ip.src
 
-        # Figure out IGMP type & quick path
+        # Determine IGMP kind
         igmp_type = None
         igmp_layer = None
 
@@ -4249,15 +4272,15 @@ class IGMPManager:
             igmp_layer = pkt[IGMP]
             igmp_type = int(getattr(igmp_layer, "type", -1))
         elif pkt.haslayer(IGMPv3mr):
-            # Some stacks expose only IGMPv3mr; treat as type 0x22
             igmp_layer = pkt.getlayer(IGMPv3mr)
             igmp_type = 0x22
         else:
             self.log.log_message(f"[IGMP] Unrecognized IGMP variant on {ifname.split('_')[-1]}")
             return
 
-        # Queries (0x11) from other routers: ignore or use for querier election
+        # (NEW) Handle v1/v2/v3 Queries explicitly (0x11)
         if igmp_type == 0x11:
+            self._handle_query(pkt, ifname)
             return
 
         # Enforce TTL==1 best-effort on admin-scope
@@ -4282,11 +4305,42 @@ class IGMPManager:
             self._handle_igmpv3_report(pkt, ifname, src_ip)
             return
 
+    # (NEW) IGMP Query handling + querier election
+    def _handle_query(self, pkt: Packet, ifname: str):
+        ip = pkt[IP]
+        src = ip.src
+        dst = ip.dst
+        lbl = ifname.split('_')[-1]
+
+        # mark other querier presence & election
+        self._update_querier_seen(ifname, src)
+
+        # Try IGMPv3mq first
+        q = pkt.getlayer("IGMPv3mq") or pkt.getlayer("IGMPv3mra")  # scapy variants
+        if q:
+            g = str(getattr(q, "gaddr", "0.0.0.0"))
+            srcs = list(getattr(q, "srcaddrs", []) or getattr(q, "sources", []) or [])
+            qqic = getattr(q, "qqic", None)
+            mrc = getattr(q, "mrcode", getattr(q, "mrtime", None))
+            mr_secs = self._decode_max_resp_time(mrc)
+            kind = "general" if g == "0.0.0.0" else ("g&s" if srcs else "group")
+            s_txt = f" sources={len(srcs)}" if srcs else ""
+            self.log.log_message(f"[IGMP] v3 Query ({kind}) {src}→{dst} on {lbl} g={g}{s_txt} maxresp={mr_secs:.1f}s qqic={self._decode_qqic(qqic)}s")
+            return
+
+        # Fallback: IGMP (v1/v2) Query
+        ig = pkt.getlayer(IGMP)
+        if ig and int(getattr(ig, "type", -1)) == 0x11:
+            g = str(getattr(ig, "gaddr", "0.0.0.0"))
+            mrc = getattr(ig, "mrtime", getattr(ig, "mrcode", None))
+            mr_secs = self._decode_max_resp_time(mrc)
+            kind = "general" if g == "0.0.0.0" else "group"
+            self.log.log_message(f"[IGMP] v2 Query ({kind}) {src}→{dst} on {lbl} g={g} maxresp={mr_secs:.1f}s")
+
+    # (NEW) v3 report parsing with richer logs
     def _handle_igmpv3_report(self, pkt: Packet, ifname: str, src_ip: str):
-        """Parses and processes an IGMPv3 report with its group records."""
         try:
             rep = pkt.getlayer(IGMPv3mr)
-            # Some builds put records under .grps; others stash in payload chains
             records = []
             if rep and hasattr(rep, "grps"):
                 records = list(rep.grps) or []
@@ -4299,26 +4353,36 @@ class IGMPManager:
                 self.log.log_message("[IGMP] v3 report with no records (variant or malformed).")
                 return
 
+            rec_cnt = 0
             for rec in records:
                 group = str(getattr(rec, "gaddr", getattr(rec, "maddr", "0.0.0.0")))
                 srcs = set(getattr(rec, "srcaddrs", getattr(rec, "sources", [])) or [])
                 rtype = int(getattr(rec, "rtype", getattr(rec, "type", 0)))
 
+                mode_txt = "include" if rtype in (1, 3, 5) else "exclude" if rtype in (2, 4) else "delta"
+                src_list_preview = ", ".join(sorted(list(srcs))[:4])
+                if len(srcs) > 4:
+                    src_list_preview += f", +{len(srcs)-4}..."
+
                 if rtype in (1, 3):  # MODE_IS_INCLUDE / CHANGE_TO_INCLUDE
                     self._join(group, ifname, "include", srcs, src_ip, 3)
                 elif rtype in (2, 4):  # MODE_IS_EXCLUDE / CHANGE_TO_EXCLUDE
                     self._join(group, ifname, "exclude", srcs, src_ip, 3)
-                elif rtype == 5:  # ALLOW_NEW_SOURCES
+                elif rtype == 5:      # ALLOW_NEW_SOURCES
                     self._update_sources(group, ifname, srcs, "allow")
-                elif rtype == 6:  # BLOCK_OLD_SOURCES
+                elif rtype == 6:      # BLOCK_OLD_SOURCES
                     self._update_sources(group, ifname, srcs, "block")
+
+                self.log.log_message(
+                    f"[IGMP] v3 record {src_ip} {mode_txt} {group} on {ifname.split('_')[-1]} srcs={len(srcs)} [{src_list_preview}]")
+                rec_cnt += 1
+
+            self.log.log_message(f"[IGMP] v3 Report processed with {rec_cnt} record(s) on {ifname.split('_')[-1]}")
         except Exception as e:
             self.log.log_message(f"[IGMP] v3 parse error: {e}")
 
-    ## ------------------- Membership State Management ------------------- ##
-
+    # ----------------- Membership state management ------------------ #
     def _join(self, group: str, ifname: str, mode: str, sources: Set[str], who: str, version: int):
-        """Processes a request to join or update a group membership."""
         now = time.time()
         key = (group, ifname)
         with self._lock:
@@ -4330,12 +4394,11 @@ class IGMPManager:
             else:
                 action = "update"
 
-            # Update the entry's state
             entry.mode = mode
             entry.sources = sources
             entry.last_report = now
-            entry.version = max(entry.version, version)  # Use the highest version seen
-            entry.lmq_remaining = 0  # A new join cancels any pending leave query
+            entry.version = max(entry.version, version)
+            entry.lmq_remaining = 0
 
         src_txt = f" sources={sorted(list(sources))}" if sources else ""
         self.log.log_message(
@@ -4343,7 +4406,6 @@ class IGMPManager:
         self._notify(action, entry)
 
     def _leave(self, group: str, ifname: str, who: str):
-        """Initiates the Last Member Query sequence upon receiving a Leave message."""
         key = (group, ifname)
         with self._lock:
             entry = self._db.get(key)
@@ -4351,19 +4413,16 @@ class IGMPManager:
                 self.log.log_message(f"[IGMP] Leave from {who} for {group} (no existing members).")
                 return
 
-            # Start the LMQ sequence only if there might still be v1/v2 listeners
             if entry.version < 3:
                 entry.lmq_remaining = self.LMQ_COUNT
-                entry.lmq_next_ts = 0.0  # Send first query immediately
+                entry.lmq_next_ts = 0.0
                 self.log.log_message(f"[IGMP] v2 Leave from {who} for {group}. Starting Last Member Query.")
             else:
-                # For IGMPv3, hosts report all sources, so a leave is explicit.
                 del self._db[key]
                 self.log.log_message(f"[IGMP] v3 Leave from {who} for {group}. Membership removed.")
                 self._notify("leave", entry)
 
     def _update_sources(self, group: str, ifname: str, sources: Set[str], action: str):
-        """Applies source list changes from IGMPv3 ALLOW/BLOCK records."""
         key = (group, ifname)
         with self._lock:
             entry = self._db.get(key)
@@ -4380,10 +4439,8 @@ class IGMPManager:
         self.log.log_message(f"[IGMP] v3 {action.upper()}_SOURCES for {group} on {ifname.split('_')[-1]}.")
         self._notify("update", entry)
 
-    ## ------------------- Last Member Query (LMQ) ------------------- ##
-
+    # ----------------- Last Member Query (LMQ) ---------------------- #
     def _service_last_member_queries(self, now: float):
-        """Sends Group-Specific Queries for groups in the LMQ state."""
         keys_to_drop = []
         with self._lock:
             for key, entry in self._db.items():
@@ -4393,7 +4450,6 @@ class IGMPManager:
                     if entry.lmq_remaining > 0:
                         entry.lmq_next_ts = now + self.LMQ_INTERVAL
                     else:
-                        # After the last query, if no one replied, remove the group.
                         keys_to_drop.append(key)
 
         if keys_to_drop:
@@ -4405,7 +4461,6 @@ class IGMPManager:
                         self._notify("leave", entry)
 
     def _send_group_specific_query(self, entry: MembershipEntry):
-        """Sends an IGMP query for a specific multicast group."""
         ifname = entry.ifname
         cfg = self._ifcfg.get(ifname, {})
         ip_src = cfg.get("ip_addr")
@@ -4414,14 +4469,34 @@ class IGMPManager:
             return
 
         query_pkt = (
-                Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
-                IP(src=ip_src, dst=entry.group, ttl=1, options="\x94\x04\x00\x00") /  # Router Alert
-                IGMP(type=0x11, gaddr=entry.group)
+            Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
+            IP(src=ip_src, dst=entry.group, ttl=1, options=b"\x94\x04\x00\x00") /
+            IGMP(type=0x11, gaddr=entry.group)
         )
         self.log.log_message(f"[IGMP] -> Group-Specific Query for {entry.group} on {ifname.split('_')[-1]}")
         self.pw._send_raw_packet(query_pkt, ifname)
 
-    ## ------------------- Helper Methods ------------------- ##
+    # (NEW) optional v3 source-specific query
+    def _send_source_specific_query(self, ifname: str, group: str, sources: List[str]):
+        cfg = self._ifcfg.get(ifname, {})
+        ip_src = cfg.get("ip_addr")
+        mac_src = cfg.get("mac")
+        if not (ip_src and mac_src) or not sources:
+            return
+        # Scapy IGMPv3mq accepts srcaddrs list & qqic/mrcode if desired
+        try:
+            pkt = (
+                Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) /
+                IP(src=ip_src, dst=group, ttl=1, options=b"\x94\x04\x00\x00") /
+                IGMP(type=0x11) /  # v3 query gets decoded via next layer
+                IGMPv3mq(gaddr=group, srcaddrs=sources, mrcode=100, qqic=10)
+            )
+            self.log.log_message(f"[IGMP] -> Source-Specific Query for {group} ({len(sources)} srcs) on {ifname.split('_')[-1]}")
+            self.pw._send_raw_packet(pkt, ifname, allow_dst_ours=True)
+        except Exception as e:
+            self.log.log_message(f"[IGMP] failed to build v3 SSM query: {e}")
+
+    # ------------------------- Helpers ------------------------------ #
     def _is_admin_local_mcast(self, addr: str) -> bool:
         try:
             return ipaddress.IPv4Address(addr) in self.ADMIN_LOCAL_NET
@@ -4433,29 +4508,96 @@ class IGMPManager:
             ip = pkt[IP]
             ttl = getattr(ip, "ttl", None)
             has_ra = False
-            # If options are parsed, they may live in a list under ip.options (scapy >= 2.5)
             opts = getattr(ip, "options", None)
             if isinstance(opts, list):
                 has_ra = any(isinstance(o, IPOption_Router_Alert) for o in opts)
             elif isinstance(opts, (bytes, bytearray)):
-                # Fallback to your sender's bytes
                 has_ra = opts.startswith(b"\x94\x04\x00\x00")
             self.log.log_message(f"[IGMP] HBH Router-Alert={has_ra} TTL={ttl} on {ifname.split('_')[-1]}")
         except Exception:
             pass
+
+    @staticmethod
+    def _is_loopback(ifname: str) -> bool:
+        name = (ifname or "").lower()
+        return name == "lo" or "loopback" in name
+
+    # ---------- (NEW) Querier election helpers ---------- #
+    def _refresh_querier_roles(self, now: float):
+        for ifname, state in self._querier.items():
+            other_last = state["last_seen"]
+            if (now - other_last) > self.OTHER_QUERIER_PRESENT_INTERVAL:
+                # no other seen recently: we (re)assume querier
+                if not state["i_am_querier"]:
+                    self.log.log_message(f"[IGMP] No other querier on {ifname.split('_')[-1]} — becoming querier.")
+                state["other_ip"] = None
+                state["i_am_querier"] = True
+
+    def _update_querier_seen(self, ifname: str, src_ip: str):
+        my = self._ifcfg.get(ifname, {}).get("ip_addr")
+        st = self._querier[ifname]
+        st["last_seen"] = time.time()
+        st["other_ip"] = src_ip
+
+        # lowest IP wins
+        try:
+            if my and ipaddress.IPv4Address(src_ip) < ipaddress.IPv4Address(my):
+                if st["i_am_querier"]:
+                    self.log.log_message(f"[IGMP] Other querier {src_ip} elected on {ifname.split('_')[-1]} — backing off.")
+                st["i_am_querier"] = False
+            elif my:
+                # we have the lower IP
+                if not st["i_am_querier"]:
+                    self.log.log_message(f"[IGMP] Our IP {my} < {src_ip} — resuming querier on {ifname.split('_')[-1]}.")
+                st["i_am_querier"] = True
+        except Exception:
+            # if compare fails, just back off for safety
+            st["i_am_querier"] = False
+
+    def _is_querier(self, ifname: str) -> bool:
+        return self._querier[ifname]["i_am_querier"]
+
+    # ---------- (NEW) v3 timing decode helpers ---------- #
+    def _decode_max_resp_time(self, code) -> float:
+        """
+        IGMPv2/IGMPv3 Max Resp Code -> seconds.
+        If < 128 => units of 1/10s. If >= 128 => floating format (mant/exp).
+        """
+        try:
+            if code is None:
+                return self.QUERY_RESPONSE_INTERVAL
+            val = int(code)
+            if val < 128:
+                return val / 10.0
+            exp = (val >> 4) & 0x07
+            mant = val & 0x0F
+            return ((mant | 0x10) << (exp + 3)) / 10.0
+        except Exception:
+            return self.QUERY_RESPONSE_INTERVAL
+
+    def _decode_qqic(self, code) -> float:
+        """
+        QQIC decode per RFC 3376. Same floating format rules as Max Resp Code.
+        """
+        try:
+            if code is None:
+                return self.QUERY_INTERVAL
+            val = int(code)
+            if val < 128:
+                return float(val)
+            exp = (val >> 4) & 0x07
+            mant = val & 0x0F
+            return float((mant | 0x10) << (exp + 3))
+        except Exception:
+            return float(self.QUERY_INTERVAL)
+
+    # --------------------- Notifications --------------------- #
     def _notify(self, action: str, entry: Optional[MembershipEntry]):
-        """Calls the on_change callback if it is registered."""
         if entry and callable(self.on_change):
             try:
                 self.on_change(action, entry)
             except Exception as e:
                 self.log.log_message(f"[IGMP] on_change callback error: {e}")
-
-    @staticmethod
-    def _is_loopback(ifname: str) -> bool:
-        """Checks if an interface name is a loopback."""
-        name = (ifname or "").lower()
-        return name == "lo" or "loopback" in name
 
 
 class RIPManager:
