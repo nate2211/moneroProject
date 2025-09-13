@@ -4115,9 +4115,11 @@ class IGMPManager:
     QUERIER_BACKOFF_SEC = 255
 
     # IGMPv3 query fields (RFC 3376)
-    V3_MAX_RESP_CODE = 100       # 10.0s encoded
-    V3_QRV = 2                   # Robustness
-    V3_QQIC = 125                # Query Interval Code
+    V3_MAX_RESP_CODE = 100  # encoded MRC (see RFC; 100 ~ 10s plain code)
+    V3_QRV = 2  # robustness value in query
+    V3_QQIC = 125  # query interval code (~125s)
+    V3_SUPPRESS = 0  # S bit (1=do not send reports immediately)
+
 
     # IGMPv3 Report Record Types (for readable logs)
     V3_RTYPE_MAP = {
@@ -4313,78 +4315,66 @@ class IGMPManager:
     # --------------------------------------------------------- Query emission
 
     def _send_general_queries(self, now: float):
-        """Sends General Query (IGMPv3mq preferred; fallback to IGMP v2) if we are querier."""
         for ifname, cfg in self._ifcfg.items():
             ip_src = cfg.get("ip_addr")
             mac_src = cfg.get("mac")
             if not ip_src or self._is_loopback(ifname):
                 continue
-
-            # Querier backoff
             if not self._we_are_querier(ifname, our_ip=ip_src, now=now):
                 continue
 
             ip_layer = IP(src=ip_src, dst=self.IGMP_ALL_HOSTS, ttl=1)
-            self._set_router_alert(ip_layer)
-
-            # Prefer IGMPv3mq general query
-            note = "General Query (v3mq)"
-            if IGMPv3mq is not None and IGMPv3 is not None:
-                v3 = IGMPv3(type=0x11)
-                mq = IGMPv3mq(gaddr="0.0.0.0", mrc=self.V3_MAX_RESP_CODE, qrv=self.V3_QRV,
-                              qqic=self.V3_QQIC, srcaddrs=[])
-                l3 = v3 / mq
-            else:
-                note = "General Query (v2)"
-                l3 = IGMP(type=0x11, gaddr="0.0.0.0") if IGMP else Raw(b"\x11" + b"\x00"*7)
-
-            if mac_src:
+            # Try to add Router Alert
+            try:
+                if IPOption_Router_Alert is not None:
+                    ip_layer.options = IPOption_Router_Alert()
+                else:
+                    ip_layer.options = b"\x94\x04\x00\x00"
+            except Exception:
                 try:
-                    frame = Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) / ip_layer / l3
+                    ip_layer.options = b"\x94\x04\x00\x00"
                 except Exception:
-                    frame = ip_layer / l3
-            else:
-                frame = ip_layer / l3
+                    pass
 
+            # Build v3 query safely; general query => gaddr 0.0.0.0
+            igmp_q = self._build_v3_query_pkt("0.0.0.0")
+
+            frame = (Ether(src=mac_src, dst=self.MAC_ALL_HOSTS) / ip_layer / igmp_q) if mac_src else (ip_layer / igmp_q)
             self._counters["tx_general_query"] += 1
             self.log.log_message(f"[IGMP] -> General Query on {self._iface_suffix(ifname)}")
-            self._pw_send(frame, ifname, note=note, allow_dst_ours=True)
+            self._pw_send(frame, ifname, note="General Query", allow_dst_ours=True)
 
     def _send_group_specific_query(self, entry: MembershipEntry):
-        """Sends Group-Specific Query (IGMPv3mq preferred; fallback to IGMP v2) for LMQ."""
         ifname = entry.ifname
         cfg = self._ifcfg.get(ifname, {})
-        ip_src = cfg.get("ip_addr")
+        ip_src = cfg.get("ip_addr");
         mac_src = cfg.get("mac")
         if not ip_src:
-            self.log.log_message(f"[IGMP] ⚠️ Cannot send Group-Specific Query for {entry.group}: no IP on {self._iface_suffix(ifname)}")
+            self.log.log_message(
+                f"[IGMP] ⚠️ Cannot send Group-Specific Query for {entry.group}: no IP on {self._iface_suffix(ifname)}")
             return
 
         ip_layer = IP(src=ip_src, dst=entry.group, ttl=1)
-        self._set_router_alert(ip_layer)
-
-        note = f"Group-Specific Query {entry.group} (v3mq)"
-        if IGMPv3mq is not None and IGMPv3 is not None:
-            v3 = IGMPv3(type=0x11)
-            mq = IGMPv3mq(gaddr=entry.group, mrc=self.V3_MAX_RESP_CODE, qrv=self.V3_QRV,
-                          qqic=self.V3_QQIC, srcaddrs=[])
-            l3 = v3 / mq
-        else:
-            note = f"Group-Specific Query {entry.group} (v2)"
-            l3 = IGMP(type=0x11, gaddr=entry.group) if IGMP else Raw(b"\x11" + b"\x00"*7)
-
-        if mac_src:
-            dst_mac = self._ipv4_mcast_to_mac(entry.group) or self.MAC_ALL_HOSTS
+        try:
+            if IPOption_Router_Alert is not None:
+                ip_layer.options = IPOption_Router_Alert()
+            else:
+                ip_layer.options = b"\x94\x04\x00\x00"
+        except Exception:
             try:
-                pkt = Ether(src=mac_src, dst=dst_mac) / ip_layer / l3
+                ip_layer.options = b"\x94\x04\x00\x00"
             except Exception:
-                pkt = ip_layer / l3
-        else:
-            pkt = ip_layer / l3
+                pass
+
+        # If you track pending-block sources for LMQv2/v3, pass them; otherwise leave empty
+        igmp_q = self._build_v3_query_pkt(entry.group)
+
+        dst_mac = self._ipv4_mcast_to_mac(entry.group) or self.MAC_ALL_HOSTS
+        pkt = (Ether(src=mac_src, dst=dst_mac) / ip_layer / igmp_q) if mac_src else (ip_layer / igmp_q)
 
         self._counters["tx_group_query"] += 1
         self.log.log_message(f"[IGMP] -> Group-Specific Query for {entry.group} on {self._iface_suffix(ifname)}")
-        self._pw_send(pkt, ifname, note=note, allow_dst_ours=True)
+        self._pw_send(pkt, ifname, note=f"Group-Specific Query {entry.group}", allow_dst_ours=True)
 
     # ------------------------------------------------------------- Housekeeping
 
@@ -4563,7 +4553,48 @@ class IGMPManager:
             self.log.log_message(f"[IGMP] v3 parse error: {e}")
 
     # --------------------------------------------------------- Membership state
+    def _build_v3_query_pkt(self, gaddr: str, srcs: Optional[list[str]] = None):
+        """
+        Returns a Scapy layer for an IGMPv3 Membership Query.
+        Tries IGMPv3mq first (post-assign fields), then falls back to IGMP (v2-style).
+        """
+        srcs = srcs or []
+        # Try IGMPv3mq (contrib)
+        mq = None
+        try:
+            # Import lazily in case contrib isn’t present at import time
+            from scapy.contrib.igmp import IGMPv3mq  # type: ignore
+            mq = IGMPv3mq(gaddr=gaddr)
+            # Set fields defensively: some builds name these differently or merge bits.
+            for fld, val in (
+                    ("mrc", self.V3_MAX_RESP_CODE),  # some builds
+                    ("mrd", self.V3_MAX_RESP_CODE),  # others
+                    ("mrt", self.V3_MAX_RESP_CODE),  # very old
+                    ("qqic", self.V3_QQIC),
+                    ("qrv", self.V3_QRV),
+                    ("s", int(self.V3_SUPPRESS)),
+            ):
+                try:
+                    setattr(mq, fld, val)
+                except Exception:
+                    pass
+            # number of sources (if we supply any)
+            if srcs:
+                try:
+                    mq.numsrc = len(srcs)
+                    mq.srcaddrs = srcs
+                except Exception:
+                    pass
+            return mq
+        except Exception:
+            pass
 
+        # Fallback: v2-style Query (hosts respond; v3 features not signalled)
+        try:
+            return IGMP(type=0x11, gaddr=gaddr)  # General (0.0.0.0) or Group-specific
+        except Exception:
+            # Last-resort: raw header (type=0x11)
+            return Raw(b"\x11\x00\x00\x00" + ipaddress.IPv4Address(gaddr).packed)
     def _join(self, group: str, ifname: str, mode: str, sources: Set[str], who: str, version: int):
         """Processes a request to join or update a group membership."""
         now = time.time()

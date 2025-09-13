@@ -13580,6 +13580,12 @@ class ICMPManager:
     PURGE_INTERVAL_SEC     = 60
     REASM_TIMEOUT_SEC      = 5.0
     _EIGHT                 = 8
+
+    V3_MAX_RESP_CODE = 100  # encoded MRC (see RFC; 100 ~ 10s plain code)
+    V3_QRV = 2  # robustness value in query
+    V3_QQIC = 125  # query interval code (~125s)
+    V3_SUPPRESS = 0  # S bit (1=do not send reports immediately)
+
     TRANSIT_ECHO_POLICY = "mirror"  # "reject" | "mirror" | "none"
     TRANSIT_ECHO_RATE_LIMIT_PPS = 2  # rate-limit our synthetic ICMP errors/mirrors
     def __init__(self, router_logger, packet_writer, interfaces_config: dict, rate_limit_pps: int = 5):
@@ -14543,7 +14549,7 @@ class ICMPManager:
         if not self.VERBOSE_HEX_PREVIEW or not blob: return
         preview = binascii.hexlify(blob[:self.HEX_PREVIEW_BYTES]).decode("ascii")
         more = "" if len(blob) <= self.HEX_PREVIEW_BYTES else f"...(+{len(blob)-self.HEX_PREVIEW_BYTES}B)"
-        self.log.log_message(f"[ICMP ][HEX] {label}[:{self.HEX_PREVIEW_BYTES}]={preview}{more}")
+        self.log.log_message(f"[ICMP][HEX] {label}[:{self.HEX_PREVIEW_BYTES}]={preview}{more}")
 
     # --------------------------------------------------------------------------
     # IPv4 echo + frag + reassembly
