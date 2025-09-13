@@ -13,7 +13,7 @@ class GeminiChatBot:
     Compatible with retry logic, chat history, and GUI loggers like GeminiLogger.
     """
 
-    def __init__(self, logger, model_name: str = "gemini-2.5-flash",
+    def __init__(self, logger, model_name: str = "gemini-2.5-pro",
                  initial_instruction: str = None):
 
         self.logger = logger
