@@ -6284,7 +6284,8 @@ class DNSManager:
         # --- Background Health Probe Thread ---
         self._stop_event = threading.Event()
         self._probe_thread: Optional[threading.Thread] = None
-
+        self.router_ipv4_out = None
+        self.router_ip_out = None
         self.logger.log_message("[DNS] 🧠 Manager initialized with stability features.")
         self.configure_upstreams()  # Set default upstreams
 
@@ -6388,30 +6389,61 @@ class DNSManager:
         return True
 
     def handle_response(self, packet: Packet) -> bool:
-        """Handles a response from an upstream server."""
-        if not (packet.haslayer(DNS) and packet[DNS].qr == 1): return False
+        """
+        Processes an incoming DNS response from an upstream server.
 
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        udp_layer = packet.getlayer(UDP)
-        dns_layer = packet[DNS]
+        This method matches the response to a pending client request, applies
+        DNS64 synthesis if needed, caches the result, and forwards the final
+        answer back to the original client.
 
-        fwd_key = (ip_layer.dst, udp_layer.dport, dns_layer.id)
+        Args:
+            packet: The incoming network packet.
+
+        Returns:
+            True if the packet was a DNS response that this manager handled,
+            False otherwise.
+        """
+        # 1. --- IDENTIFY ---
+        # Ensure it's a DNS response packet we can process.
+        if not (packet.haslayer(DNS) and packet[DNS].qr == 1 and packet.haslayer(UDP)):
+            return False
+
+        # 2. --- ASSOCIATE ---
+        # Reconstruct the lookup key to find the original client request.
+        # This key must match the format used when the query was forwarded. The
+        # key is based on the destination of the *incoming* response, which was
+        # the source of the *outgoing* query.
+        if IP in packet:
+            lookup_key = ("4", packet[IP].dst, int(packet[UDP].dport), int(packet[DNS].id))
+        elif IPv6 in packet:
+            lookup_key = ("6", packet[IPv6].dst, int(packet[UDP].dport), int(packet[DNS].id))
+        else:
+            return False  # Not an IPv4 or IPv6 packet
+
+        # Atomically retrieve and remove the pending request.
         with self._lock:
-            original_req_info = self._pending_requests.pop(fwd_key, None)
+            original_req_info = self._pending_requests.pop(lookup_key, None)
 
-        if not original_req_info: return False  # Not a response we were waiting for
+        # If no matching request is found, it's not a response we are waiting for.
+        if not original_req_info:
+            return False
 
-        # --- DNS64 Synthesis Logic ---
+        self.logger.log_message(f"[DNS] ✅ Matched response for {packet[DNS].qd.qname.decode()} to a pending request.")
+
+        # 3. --- PROCESS ---
+        # Apply DNS64 synthesis if enabled and applicable.
         final_response = self._apply_dns64_if_needed(packet)
 
-        # --- Cache the final response ---
+        # Add the final, potentially modified, response to our cache.
         qname = final_response[DNS].qd.qname.decode().lower()
         qtype = final_response[DNS].qd.qtype
-        qkey = f"{qname}:{qtype}"
-        self._add_to_cache(qkey, final_response)
+        self._add_to_cache(f"{qname}:{qtype}", final_response)
 
-        # --- Send response back to the original client ---
+        # 4. --- DELIVER ---
+        # Send the final packet back to the original client who made the request.
         self._send_response_to_client(final_response, original_req_info["original_packet"])
+
+        # Signal that the packet has been fully handled.
         return True
 
     def _apply_dns64_if_needed(self, response_packet: Packet) -> Packet:
@@ -6477,49 +6509,65 @@ class DNSManager:
         return None
 
     def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str):
-        """Forwards a DNS query to an upstream server."""
-        fwd_pkt = original_packet.copy()
+        fwd = original_packet.copy()
 
-        # Store original request info to match the response later
-        fwd_key = (fwd_pkt[IP].src, fwd_pkt[UDP].sport, fwd_pkt[DNS].id)
+        # Rewrite destination to upstream and source to our router IP
+        if IP in fwd:
+            fwd[IP].dst = target_ip
+            fwd[UDP].dport = 53
+            fwd[IP].src = self.router_ip_out
+            # Recalc checksums
+            if hasattr(fwd[IP], "chksum"): del fwd[IP].chksum
+            if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
+            # Key that matches the *reply* tuple: (dst=router_ip, dport=client_port) on the way back
+            fwd_key = ("4", fwd[IP].src, int(fwd[UDP].sport), int(fwd[DNS].id))
+        elif IPv6 in fwd:
+            fwd[IPv6].dst = target_ip
+            fwd[UDP].dport = 53
+            fwd[IPv6].src = self.router_ipv4_out
+            if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
+            fwd_key = ("6", fwd[IPv6].src, int(fwd[UDP].sport), int(fwd[DNS].id))
+        else:
+            # Not IP; ignore
+            return
+
+        # Store mapping to find the original request when the reply comes back
         with self._lock:
             self._pending_requests[fwd_key] = {
                 "original_packet": original_packet,
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
 
-        # Modify the packet for forwarding
-        fwd_pkt[IP].dst = target_ip
-        # The source IP should be the router's IP on the egress interface
-        # (This requires routing logic not shown here, so we'll simplify)
-        fwd_pkt[IP].src = "192.168.1.1"  # Placeholder
-
-
-        # Recalculate checksums
-        del fwd_pkt[IP].chksum
-        del fwd_pkt[UDP].chksum
-
-        self.pw._send_raw_packet(fwd_pkt, inbound_iface)  # Placeholder for egress interface
+        self.pw._send_raw_packet(fwd, inbound_iface)
 
     def _send_response_to_client(self, response_packet: Packet, original_request: Packet):
-        """Sends a DNS response back to the original client."""
-        client_ip = original_request[IP].src
-        client_port = original_request[UDP].sport
-
-
         resp = response_packet.copy()
 
-        # Rewrite headers to match the original query
-        resp[IP].dst = client_ip
-        resp[UDP].dport = client_port
-        resp[DNS].id = original_request[DNS].id
+        if IP in original_request:
+            client_ip = original_request[IP].src
+            client_port = int(original_request[UDP].sport)
+            resp[IP].dst = client_ip
+            resp[UDP].dport = client_port
+            resp[DNS].id = original_request[DNS].id
+            # source = router’s DNS address, sport = 53
+            if getattr(self, "router_ip_out", None):
+                resp[IP].src = self.router_ip_out
+            resp[UDP].sport = 53
+            if hasattr(resp[IP], "chksum"): del resp[IP].chksum
+            if hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
 
+        elif IPv6 in original_request:
+            client_ip = original_request[IPv6].src
+            client_port = int(original_request[UDP].sport)
+            resp[IPv6].dst = client_ip
+            resp[UDP].dport = client_port
+            resp[DNS].id = original_request[DNS].id
+            if getattr(self, "router_ipv6_out", None):
+                resp[IPv6].src = self.router_ipv6_out
+            resp[UDP].sport = 53
+            if hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
 
-        # Recalculate checksums
-        del resp[IP].chksum
-        del resp[UDP].chksum
-
-        self.pw._send_raw_packet(resp, original_request.sniffed_on)
+        self.pw._send_raw_packet(resp, getattr(original_request, "sniffed_on", None))
 
 
 class NDPManager:

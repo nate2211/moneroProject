@@ -1442,21 +1442,36 @@ class PythonRouterManager:
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.
 
-            if isinstance(transport_layer, DNS) and packet[DNS].qr == 1:
-                if self.dns_manager.handle_response(packet):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="dns")
-                    return
-            if isinstance(transport_layer, UDP) and packet[UDP].dport == 5353:
-                if self.mdns_manager.handle_packet(packet):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="mdns")
-                    return
-            if isinstance(transport_layer, UDP) and packet[UDP].dport == 53:
+            dns = packet.getlayer(DNS)
+            if dns:
+                # Upstream answers (consume when they are ours)
+                if dns.qr == 1:
+                    if self.dns_manager.handle_response(packet):
+                        self.code_output_manager.submit_packet(
+                            packet, inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="dns-answer"
+                        )
+                        return
+                else:
+                    # Client queries (only intercept real DNS queries to 53)
+                    if UDP in packet and int(packet[UDP].dport) == 53:
+                        if self.dns_manager.handle_query(packet, inbound_iface):
+                            self.code_output_manager.submit_packet(
+                                packet, inbound_iface=inbound_iface,
+                                phase="handled",
+                                component="dns-query"
+                            )
+                            return
 
-                if self.dns_manager.handle_query(packet, inbound_iface):
-                    self.code_output_manager.submit_packet(packet, inbound_iface=inbound_iface,
-                                                           phase="handled", component="dns-query")
+            # mDNS stays separate (5353/UDP, local-scope)
+            if UDP in packet and int(packet[UDP].dport) == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    self.code_output_manager.submit_packet(
+                        packet, inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="mdns"
+                    )
                     return
             if (
                     packet.haslayer("Kerberos")
@@ -1958,6 +1973,8 @@ class PythonRouterManager:
             self.packet_writer.update_interfaces(self._interfaces_config)
             self._enable_nat_forwarding()
             self.arp_manager.router_ip_out = self.router_ip_out
+            self.dns_manager.router_ip_out = self.router_ip_out
+            self.dns_manager.router_ipv4_out = self.router_ipv6_link_local_out
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
             self.nat_manager.set_router_internal_ip("192.168.1.1")
             self.notification_manager = NotificationManager(

@@ -11004,6 +11004,8 @@ class TransportManager:
                 return handler(packet, src_ip, dst_ip, sport, dport, iface_short)
             elif handler == self._handle_dns_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                if packet.haslayer(DNS) and packet[DNS].qr == 1:
+                    return True
                 return False
             elif handler == self._handle_mdns_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
