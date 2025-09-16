@@ -836,6 +836,11 @@ class WinTunManager:
     # ---------------- core: read & process immediately ----------------
     def _read_and_process_frames_overlapped(self, ph, ev, ovl,
                                             idle_timeout=2.0, max_frames=1024, max_bytes=(1 << 20)):
+        """
+        Overlapped pipe reader for BYTE-mode, length-prefixed frames.
+
+        Key rule: never call ReadFile again while a prior overlapped read is still pending.
+        """
         buf = bytearray()
         frames_this_batch = 0
         bytes_read_total = 0
@@ -845,51 +850,79 @@ class WinTunManager:
         last_progress_ts = time.monotonic()
         last_frames_read = self.frames_read
 
-        def _reset_event():
-            if ev:
-                win32event.ResetEvent(ev)
+        # Track whether an overlapped ReadFile is currently pending.
+        pending = False
+
+        def _issue_read():
+            """Issue a single overlapped read (no-op if one is pending)."""
+            nonlocal pending
+            if pending:
+                return True
+            # Prepare the event for a new operation only when no I/O is pending.
+            try:
+                if ev:
+                    win32event.ResetEvent(ev)
+                try:
+                    # Attempt synchronous completion fast-path
+                    hr, data = win32file.ReadFile(ph, 65536, ovl)
+                    # Completed synchronously
+                    if not data:
+                        return False  # peer closed
+                    buf.extend(data)
+                    return True
+                except pywintypes.error as e:
+                    if e.winerror == ERROR_IO_PENDING:
+                        pending = True
+                        return True
+                    # Hard error → reconnect
+                    return False
+            except Exception:
+                return False
+
+        def _await_read(ms):
+            """Wait for completion of the ONE pending read."""
+            nonlocal pending
+            if not pending:
+                return True  # nothing to wait for
+            rc = win32event.WaitForSingleObject(ev, ms)
+            if rc == WAIT_TIMEOUT:
+                return True  # keep waiting; do not issue another ReadFile
+            try:
+                # Fetch result without extra blocking; event is signaled
+                hr, data = win32file.GetOverlappedResult(ph, ovl, False)
+            except pywintypes.error as ge:
+                # ERROR_OPERATION_ABORTED happens on cancellation during stop()
+                if ge.winerror in (ERROR_OPERATION_ABORTED, 995):
+                    return False
+                return False
+            pending = False
+            if not data:
+                return False  # peer closed
+            buf.extend(data)
+            return True
 
         while (not self._stop_event.is_set()
                and frames_this_batch < max_frames
                and bytes_read_total < max_bytes
                and time.monotonic() < deadline):
 
-            # --- ISSUE OVERLAPPED READ (BYTE mode; C++ length-prefixed frames) ---
-            try:
-                _reset_event()
-                try:
-                    hr, data = win32file.ReadFile(ph, 65536, ovl)
-                except pywintypes.error as e:
-                    if e.winerror != ERROR_IO_PENDING:
-                        # hard failure: disconnect and reconnect outside
-                        return False
-                    ms = max(1, int((deadline - time.monotonic()) * 1000))
-                    rc = win32event.WaitForSingleObject(ev, ms)
-                    if rc == WAIT_TIMEOUT:
-                        # keep the loop alive; micro-idle beacon if needed
-                        self._maybe_log_idle(frames_this_batch, bytes_read_total, buf_len=len(buf))
-                        continue
-                    try:
-                        hr, data = win32file.GetOverlappedResult(ph, ovl, True)
-                    except pywintypes.error as ge:
-                        # 995 = ERROR_OPERATION_ABORTED when we cancelled at stop()
-                        if ge.winerror in (ERROR_OPERATION_ABORTED, 995):
-                            return False
-                        return False
-
-                if not data:
-                    # Peer closed or end of stream
+            # 1) Ensure exactly one outstanding read (or data already buffered)
+            if not buf:
+                if not _issue_read():
+                    return False  # reconnect
+                # Wait a bit for the pending read, but do NOT issue another ReadFile if it times out
+                ms = max(1, int((deadline - time.monotonic()) * 1000))
+                if not _await_read(ms):
                     return False
+                # If any bytes arrived, account and extend deadline
+                if buf:
+                    bytes_read_total += len(buf)
+                    deadline = time.monotonic() + idle_timeout
+                else:
+                    # Idle heartbeat; still waiting for the same pending read
+                    self._maybe_log_idle(frames_this_batch, bytes_read_total, buf_len=0)
 
-                buf.extend(data)
-                bytes_read_total += len(data)
-                deadline = time.monotonic() + idle_timeout
-
-            except Exception:
-                # Any unexpected error → force reconnect
-                return False
-
-            # --- FAST EXTRACT: LEN(4 LE) + PAYLOAD ---
+            # 2) Parse as many complete frames as available
             parsed_this_pass = 0
             while parsed_this_pass < MAX_FRAMES_PER_PASS:
                 if self._stop_event.is_set():
@@ -899,9 +932,9 @@ class WinTunManager:
 
                 pkt_len = int.from_bytes(buf[0:4], "little", signed=False)
 
-                # BYTE-mode sanity: raw L3 frames typically 20..65535
+                # Sanity for length field (Ethernet and raw IP frames)
                 if not (14 <= pkt_len <= 65535):
-                    del buf[:4]  # drop bogus length, attempt resync next iteration
+                    del buf[:4]  # drop bad length and attempt resync
                     self.frames_badlen += 1
                     self._maybe_log_badlen_sample()
                     continue
@@ -909,26 +942,33 @@ class WinTunManager:
                 if len(buf) < 4 + pkt_len:
                     break  # need more bytes
 
-                packet_bytes = bytes(buf[4: 4 + pkt_len])
+                packet_bytes = bytes(buf[4:4 + pkt_len])
                 del buf[:4 + pkt_len]
 
                 self.frames_read += 1
                 parsed_this_pass += 1
                 frames_this_batch += 1
 
-                # Progress beacon (matches C++ micro-heartbeats spirit)
+                # Progress beacon
                 now = time.monotonic()
                 if self.frames_read != last_frames_read:
                     last_progress_ts = now
                     last_frames_read = self.frames_read
 
                 if packet_bytes:
-                    # Forward straight to your pipeline
                     self.router_manager.process_packet(packet_bytes, self.VIRTUAL_IFACE_NAME)
 
-            # Lightweight periodic status (no spam)
+            # 3) Lightweight periodic status
             self._maybe_log_progress(frames_this_batch, bytes_read_total, buf_len=len(buf),
                                      last_progress_ts=last_progress_ts)
+
+            # 4) If we’ve parsed everything we currently have and the read is not pending,
+            #    issue the next overlapped read so the server can continue writing.
+            if not buf and not pending:
+                if not _issue_read():
+                    return False
+                # Short non-blocking wait to avoid tight spinning; keep the same pending op.
+                _ = _await_read(1)  # ignore result here; main loop will handle it
 
         return True
 
