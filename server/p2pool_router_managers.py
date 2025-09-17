@@ -12,7 +12,7 @@ import struct
 import traceback
 from collections import defaultdict, deque
 from collections.abc import Set
-from typing import Optional, List, Any, Callable, Union, OrderedDict
+from typing import Optional, List, Any, Callable, Union, OrderedDict, DefaultDict
 import ipaddress
 import threading
 import json
@@ -23,7 +23,8 @@ from scapy.arch import get_if_hwaddr
 from scapy.contrib.ikev2 import IKEv2
 from scapy.fields import StrLenField
 from scapy.layers.dhcp import DHCP, BOOTP
-from scapy.layers.dhcp6 import DHCP6, DHCP6_Solicit
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Solicit, DHCP6OptClientId, DHCP6OptServerId, DHCP6OptElapsedTime, \
+    DHCP6OptIA_NA, DHCP6OptIAAddress
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 from scapy.layers.inet import TCP, ICMP, defrag
 from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6EchoRequest, ICMPv6TimeExceeded, \
@@ -7616,6 +7617,218 @@ class TransportNBDSManager:
                 self.log.log_message(line)
             except Exception:
                 pass
+class TransportDHCP6Manager:
+    """
+    DHCPv6 observer (UDP/546,547)
+
+    Emits concise summaries:
+      • Message type, iface, 5-tuple
+      • Client/Server DUID preview
+      • IA_NA / IAADDR addresses (+ lifetimes)
+      • Common options (ORO, DNS, DNSSL, elapsed time)
+    Flood control:
+      • Global token bucket (LOG_RPS/LOG_BURST)
+      • Per-signature cooldown (FLOW_COOLDOWN_S)
+      • Dedup identical previews (DEDUP_TTL_S)
+    """
+
+    # ---------- Tunables ----------
+    LOG_RPS         = 0.25    # ~1 line / 4s globally
+    LOG_BURST       = 3
+    FLOW_COOLDOWN_S = 10.0    # per (sig) cooldown
+    DEDUP_TTL_S     = 60.0    # suppress identical preview sets briefly
+    PREVIEW_MAX     = 4
+
+    # ---------- Token bucket ----------
+    class _TokenBucket:
+        __slots__ = ("cap","rate","tokens","last")
+        def __init__(self, cap: int, rate: float):
+            self.cap = max(1, int(cap)); self.rate = max(0.05, float(rate))
+            self.tokens = float(self.cap); self.last = time.time()
+        def _refill(self):
+            now = time.time(); dt = now - self.last
+            if dt > 0:
+                self.tokens = min(self.cap, self.tokens + dt * self.rate); self.last = now
+        def take(self, cost=1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost; return True
+            return False
+
+    # ---------- Init ----------
+    def __init__(self, router_logger):
+        self.log = router_logger
+        self._tb = self._TokenBucket(self.LOG_BURST, self.LOG_RPS)
+        self._cooldown_until: Dict[Tuple, float] = {}
+        self._seen_hash: Dict[str, float] = {}
+        self._last_gc = time.time()
+        try:
+            self.log.log_message("[Transport][⚙️ DHCPv6] Manager ready.")
+        except Exception:
+            pass
+
+    # ---------- Public ----------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        # Must be UDP and one of the DHCPv6 ports
+        if UDP is None or DHCP6 is None or not packet.haslayer(UDP) or not packet.haslayer(DHCP6):
+            return False
+        if 546 not in (sport, dport) and 547 not in (sport, dport):
+            return False
+
+        dh = packet[DHCP6]
+        mtype = int(getattr(dh, "msgtype", getattr(dh, "msgtype", 0)) or 0)
+        mname = self._msg_name(mtype)
+        iface = str(inbound_iface).split("_")[-1]
+
+        # Build a compact preview of notable options
+        preview_items, resp_hash = self._preview(dh)
+
+        # Rate / cooldown / dedup
+        sig = (mtype, iface, sport, dport)
+        if not self._should_emit(sig, dedup_hash=resp_hash):
+            self._maybe_gc()
+            return True
+
+        head = preview_items[0] if preview_items else "-"
+        more = f" … +{len(preview_items)-1}" if len(preview_items) > 1 else ""
+        line = (f"[Transport][⚙️ DHCPv6] {mname} if={iface} {src_ip}:{sport} → {dst_ip}:{dport} "
+                f"{head}{more}")
+        self._emit(line)
+        self._maybe_gc()
+        return True
+
+    # ---------- Internals ----------
+    def _should_emit(self, sig: Tuple, *, dedup_hash: Optional[str]=None) -> bool:
+        now = time.time()
+        nxt = self._cooldown_until.get(sig, 0.0)
+        if now < nxt:
+            return False
+        if not self._tb.take(1.0):
+            return False
+        if dedup_hash:
+            exp = self._seen_hash.get(dedup_hash, 0.0)
+            if now < exp:
+                return False
+            self._seen_hash[dedup_hash] = now + self.DEDUP_TTL_S
+        self._cooldown_until[sig] = now + self.FLOW_COOLDOWN_S
+        return True
+
+    def _emit(self, line: str):
+        try:
+            self.log.log_message(line)
+        except Exception:
+            pass
+
+    def _maybe_gc(self):
+        now = time.time()
+        if now - self._last_gc < 15.0:  # cheap
+            return
+        self._seen_hash = {h: t for h, t in self._seen_hash.items() if t >= now}
+        cutoff = now - 2*self.FLOW_COOLDOWN_S
+        self._cooldown_until = {k: t for k, t in self._cooldown_until.items() if t >= cutoff}
+        self._last_gc = now
+
+    # ---------- Formatting helpers ----------
+    def _msg_name(self, m: int) -> str:
+        MAP = {
+            1:"SOLICIT", 2:"ADVERTISE", 3:"REQUEST", 4:"CONFIRM",
+            5:"RENEW", 6:"REBIND", 7:"REPLY", 8:"RELEASE", 9:"DECLINE",
+            10:"RECONFIGURE", 11:"INFORMATION-REQUEST", 12:"RELAY-FORW", 13:"RELAY-REPL"
+        }
+        return MAP.get(m, f"TYPE-{m}")
+
+    def _preview(self, dh) -> Tuple[List[str], str]:
+        items: List[str] = []
+
+        # DUID previews (Client/Server)
+        cid = self._find_opt(dh, DHCP6OptClientId)
+        sid = self._find_opt(dh, DHCP6OptServerId)
+        if cid:
+            items.append(f"CID={self._duid_preview(getattr(cid, 'duid', b''))}")
+        if sid:
+            items.append(f"SID={self._duid_preview(getattr(sid, 'duid', b''))}")
+
+        # Elapsed time
+        et = self._find_opt(dh, DHCP6OptElapsedTime)
+        if et:
+            try:
+                ticks = int(getattr(et, "elapsedtime", 0))
+                ms = ticks * 10  # per RFC3315: units of 1/100 sec
+                items.append(f"ET={ms}ms")
+            except Exception:
+                pass
+
+
+        # IA_NA / IAADDR previews (addresses + lifetimes)
+        for ia in self._iter_opts(dh, DHCP6OptIA_NA):
+            iaid = getattr(ia, "iaid", None)
+            for iaaddr in self._iter_opts(ia, DHCP6OptIAAddress):
+                ip6 = getattr(iaaddr, "addr", None)
+                vlt = getattr(iaaddr, "validlifetime", None)
+                plt = getattr(iaaddr, "preferredlifetime", None)
+                if ip6:
+                    s = f"IAADDR[{iaid if iaid is not None else '-'}]={ip6}"
+                    if vlt is not None: s += f" vlt={vlt}s"
+                    if plt is not None: s += f" plt={plt}s"
+                    items.append(s)
+
+        # cap preview length
+        if len(items) > self.PREVIEW_MAX:
+            items = items[:self.PREVIEW_MAX]
+
+        # stable hash over key fields for dedup
+        h = hashlib.sha1()
+        try:
+            # include serialized options if available; otherwise fall back to string join
+            raw = bytes(getattr(dh, "options", b"") or b"")
+            h.update(raw)
+        except Exception:
+            h.update("|".join(items).encode("utf-8", "ignore"))
+        return items or ["-"], h.hexdigest()[:16]
+
+    # ---------- Option utilities ----------
+    def _find_opt(self, layer, opt_cls):
+        if opt_cls is None or layer is None:
+            return None
+        try:
+            if layer.haslayer(opt_cls):
+                return layer[opt_cls]
+        except Exception:
+            pass
+        return None
+
+    def _iter_opts(self, layer, opt_cls):
+        if opt_cls is None or layer is None:
+            return []
+        out = []
+        try:
+            cur = getattr(layer, "options", None)
+            # Scapy nests DHCP6 options as a linked list in .payload; iterate conservatively
+            seen = 0
+            while cur is not None and seen < 64:
+                if isinstance(cur, opt_cls):
+                    out.append(cur)
+                nxt = getattr(cur, "payload", None)
+                if nxt is cur:
+                    break
+                cur = nxt
+                seen += 1
+        except Exception:
+            pass
+        return out
+
+    def _duid_preview(self, duid: Any) -> str:
+        # DUID: try to show type and tail bytes
+        try:
+            b = bytes(duid or b"")
+            if len(b) >= 2:
+                dtype = int.from_bytes(b[0:2], "big")
+                tail = b[-6:] if len(b) > 6 else b
+                hexs = ":".join(f"{x:02x}" for x in tail)
+                return f"type={dtype} …{hexs}"
+            return "(empty)"
+        except Exception:
+            return "?"
 class TransportDHCPActiveAgent:
     """
     Small DHCP active helper:
@@ -10055,14 +10268,14 @@ class TransportEphemeralTCPManager:
                 tls_hint = self._peek_tls(f["buf_c2s"]) or self._peek_tls(f["buf_s2c"])
                 label, extra = self._classify(src_ip, dst_ip, sport, dport, tls_hint, f)
                 if label is not None:
-                    self._emit(label, src_ip, sport, dst_ip, dport, extra)
+                    self._emit(label, src_ip, sport, dst_ip, dport, inbound_iface, extra)
                     f["classified"] = True
                     f["label"], f["extra"] = label, extra
                     emitted_now = True
 
             if (not f["classified"]) and f["first_payload_ts"] is not None:
                 if (f["last_seen"] - f["first_payload_ts"]) >= self.FALLBACK_EMIT_AFTER:
-                    self._emit("App-Data", src_ip, sport, dst_ip, dport, "fallback (low signal)")
+                    self._emit("App-Data", src_ip, sport, dst_ip, dport, inbound_iface, "fallback (low signal)")
                     f["classified"] = True
                     f["label"], f["extra"] = "App-Data", "fallback (low signal)"
                     emitted_now = True
@@ -10229,8 +10442,8 @@ class TransportEphemeralTCPManager:
             return True
         return False
 
-    def _emit(self, label: str, sip: str, sport: int, dip: str, dport: int, extra: Optional[str]):
-        msg = f"[Transport][🧵 TCP][📦 Ephemeral] {label} {sip}:{sport} ↔ {dip}:{dport}"
+    def _emit(self, label: str, sip: str, sport: int, dip: str, dport: int, inbound_iface, extra: Optional[str]):
+        msg = f"[Transport][🧵 TCP][📦 Ephemeral] {label} {sip}:{sport} ↔ {dip}:{dport}  on {inbound_iface}"
         if extra:
             msg += f" | {extra}"
         self.log.log_message(msg)
@@ -10309,7 +10522,7 @@ class TransportEphemeralUDPManager:
 
         if self._should_log(flow, label):
             self.log.log_message(
-                f"[Transport][🚀 UDP][📦 Ephemeral] {label} {src_ip}:{sport} ↔ {dst_ip}:{dport}"
+                f"[Transport][🚀 UDP][📦 Ephemeral] {label} {src_ip}:{sport} ↔ {dst_ip}:{dport} on {inbound_iface}"
                 + (f" | {extra}" if extra else "")
             )
         return True
@@ -10558,6 +10771,330 @@ class TransportHighServerTCPManager:
         for k, f in list(self._flows.items()):
             if now - f.get("last_seen", now) > ttl:
                 self._flows.pop(k, None)
+class TransportRIPManager:
+    """
+    Handles Routing Information Protocol:
+      - RIP v1/v2 over IPv4 on UDP/520
+      - RIPng over IPv6 on UDP/521
+
+    Logs concise route announcements and keeps a per-sender cache (TTL) to avoid spam.
+    """
+    LOG_COOLDOWN = 640
+    def __init__(self, router_logger, *, announce_ttl=30.0):
+        self.log = router_logger
+        self._last_seen: Dict[Tuple[str,int,str,int,str], float] = {}  # (sip,sport,dip,dport,route_key) -> ts
+        self._ttl = float(announce_ttl)
+        self._cooldown_until: Dict[Tuple[str,int,str,int,str,int], float] = {}
+        try:
+            # Optional: use scapy dissectors if available
+            from scapy.layers.rip import RIP, RIPng
+            self._has_scapy = True
+        except Exception:
+            self._has_scapy = False
+        self.log.log_message("[Transport][🛣️ RIP] Manager ready.")
+
+    # ---------- Public entry ----------
+    def handle(self, pkt, src_ip, dst_ip, sport, dport, inbound_iface=None):
+        try:
+            if dport == 520 or sport == 520:
+                self._handle_rip_ipv4(pkt, src_ip, dst_ip, sport, dport)
+            elif dport == 521 or sport == 521:
+                self._handle_ripng(pkt, src_ip, dst_ip, sport, dport)
+        except Exception as e:
+            self.log.log_message(f"[Transport][🛣️ RIP] parse error: {e}")
+
+    # ---------- RIP v1/v2 (UDP/520 over IPv4) ----------
+    def _handle_rip_ipv4(self, pkt, src_ip, dst_ip, sport, dport):
+        payload = self._raw(pkt)
+        if len(payload) < 4:
+            return
+        cmd = payload[0]          # 1=request, 2=response
+        ver = payload[1]          # 1=v1, 2=v2
+        # payload[2:4] are zero/reserved
+
+        entries = []
+        off = 4
+        # RIP v1/v2 entries are 20 bytes each
+        while off + 20 <= len(payload):
+            e = payload[off:off+20]
+            off += 20
+            afi = int.from_bytes(e[0:2], "big")
+            if afi == 0:  # padding
+                continue
+            # v1 layout (RFC1058): AFI(2), must be 2 for IP
+            #   IP(4) at e[4:8]; Metric(4) at e[16:20]; mask/nexthop zeros
+            # v2 layout (RFC2453): AFI(2), RouteTag(2), IP(4), Mask(4), NextHop(4), Metric(4)
+            ip     = self.ip_str(e[4:8])
+            metric = int.from_bytes(e[16:20], "big")
+
+            if ver == 2:
+                mask    = self.ip_str(e[8:12])
+                nexthop = self.ip_str(e[12:16])
+                tag     = int.from_bytes(e[2:4], "big")
+            else:
+                mask, nexthop, tag = "0.0.0.0", "0.0.0.0", 0
+
+            # Skip weird/infinite metrics (>16 per spec)
+            if not (1 <= metric <= 16):
+                continue
+
+            entries.append((ip, mask, nexthop, metric, tag))
+
+        if not entries:
+            return
+
+        # Log succinctly with dedupe
+        self._log_routes(src_ip, sport, dst_ip, dport, f"RIPv{ver}", cmd, entries)
+
+    # ---------- RIPng (UDP/521 over IPv6) ----------
+    def _handle_ripng(self, pkt, src_ip, dst_ip, sport, dport):
+        payload = self._raw(pkt)
+        if len(payload) < 4:
+            return
+        cmd = payload[0]      # 1=request, 2=response
+        ver = payload[1]      # RIPng version is 1
+        off = 4
+        entries = []
+        # RIPng RTE is 20 bytes: IPv6 prefix(16) | RouteTag(2) | PrefixLen(1) | Metric(1)
+        while off + 20 <= len(payload):
+            e = payload[off:off+20]
+            off += 20
+            metric = e[19]
+            if metric == 0xFF:
+                # "Next Hop" RTE; ignore for log (stateful forwarding could use it)
+                continue
+            if not (1 <= metric <= 16):
+                continue
+            pfx = self.inet6_str(e[0:16])
+            rtag = int.from_bytes(e[16:18], "big")
+            plen = e[18]
+            entries.append((f"{pfx}/{plen}", rtag, metric))
+
+        if not entries:
+            return
+
+        # Format entries into common tuple structure for _log_routes
+        entries_fmt = []
+        for pfx_plen, rtag, metric in entries:
+            # mask/nexthop N/A; keep fields consistent
+            entries_fmt.append((pfx_plen, "-", "-", metric, rtag))
+
+        self._log_routes(src_ip, sport, dst_ip, dport, "RIPng", cmd, entries_fmt)
+
+    # ---------- Utilities ----------
+    def _log_routes(self, sip, sport, dip, dport, proto, cmd, entries):
+        """
+        entries for RIP v1/v2: (ip, mask, nexthop, metric, tag)
+        entries for RIPng:     (prefix/len, -,   -,       metric, tag)
+        """
+        now = time.time()
+        shown = 0
+
+        # --- NEW: per-flow cooldown guard ---
+        # key includes proto and cmd so requests vs responses don't suppress each other.
+        cd_key = (sip, int(sport), dip, int(dport), str(proto), int(cmd))
+        next_ok = self._cooldown_until.get(cd_key, 0.0)
+        if now < next_ok:
+            # still cooling down; skip logging this packet entirely
+            return
+
+        for (dst, mask, nh, metric, tag) in entries:
+            key = (sip, sport, dip, dport, f"{dst}|{mask}|{nh}|{metric}|{tag}|{proto}|{cmd}")
+            last = self._last_seen.get(key, 0.0)
+            if now - last < self._ttl:
+                continue
+            self._last_seen[key] = now
+            shown += 1
+
+            cmd_str = {1: "request", 2: "response"}.get(cmd, str(cmd))
+            extra = f"metric={metric}"
+            if mask not in ("-", "0.0.0.0"):
+                extra += f" mask={mask}"
+            if nh not in ("-", "0.0.0.0"):
+                extra += f" nexthop={nh}"
+            if tag:
+                extra += f" tag={tag}"
+
+            self.log.log_message(
+                f"[Transport][🛣️ {proto}] {cmd_str} from {sip}:{sport} → {dip}:{dport} | {dst} | {extra}"
+            )
+
+        # If we emitted anything, arm the cooldown for this (flow,proto,cmd)
+        if shown:
+            self._cooldown_until[cd_key] = now + float(self.LOG_COOLDOWN)
+            self._gc()
+
+    def _gc(self):
+        now = time.time()
+        # expire per-route TTLs
+        for k, ts in list(self._last_seen.items()):
+            if now - ts > self._ttl:
+                self._last_seen.pop(k, None)
+        # NEW: trim cooldowns that are long past
+        for k, t in list(self._cooldown_until.items()):
+            if t < now - self.LOG_COOLDOWN:
+                self._cooldown_until.pop(k, None)
+
+
+    @staticmethod
+    def _raw(pkt) -> bytes:
+        try:
+            from scapy.packet import Raw
+            if pkt.haslayer(Raw):
+                return bytes(pkt[Raw].load or b"")
+        except Exception:
+            pass
+        # fallback: try generic
+        try:
+            return bytes(pkt.payload.payload.payload)
+        except Exception:
+            return b""
+
+    # ----- tiny helpers (module-level) -----
+    def ip_str(self, b4: bytes) -> str:
+        try:
+            import socket
+            return socket.inet_ntop(socket.AF_INET, b4)
+        except Exception:
+            return ".".join(str(x) for x in b4)
+
+    def inet6_str(self, b16: bytes) -> str:
+        try:
+            import socket
+            return socket.inet_ntop(socket.AF_INET6, b16)
+        except Exception:
+            # crude fallback
+            return ":".join(f"{b16[i]<<8 | b16[i+1]:x}" for i in range(0,16,2))
+class TransportESPManager:
+    """
+    Observes IPsec over UDP (NAT-T) + IKEv2 like other managers.
+
+    Recognizes on UDP/4500 and UDP/500:
+      • NAT-T keepalive (single 0xFF byte)
+      • NAT-T Non-ESP marker (0x00000000) + ESP {SPI,SEQ}
+      • ESP already dissected by scapy (ESP layer over UDP)
+      • IKEv2 header (compact hint: version/exchange/flags/len)
+
+    Returns True iff it recognized/logged the packet (so caller can decide forwarding).
+    """
+
+    NAT_T = 4500
+    IKE   = 500
+
+    def __init__(self, router_logger, log_window: float = 2.0):
+        self.log = router_logger
+        self._last_log = defaultdict(float)
+        self._log_window = float(log_window)
+        # lightweight counters per flow+SPI
+        self._stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+        self._last_summary = time.time()
+        self._summary_every = 60.0
+        self.log.log_message("[Transport][🛡 ESP] Manager ready.")
+
+    # ------------------- Public entry -------------------
+
+    def handle(self, packet: Packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface=None) -> bool:
+        if not packet.haslayer(UDP):
+            return False
+        if not (sport in (self.IKE, self.NAT_T) or dport in (self.IKE, self.NAT_T)):
+            return False
+
+        raw = self._get_raw(packet)
+        # 1) NAT-T keepalive (exactly one 0xFF)
+        if (sport == self.NAT_T or dport == self.NAT_T) and raw == b"\xff":
+            return self.log.log_message(src_ip, sport, dst_ip, dport, "keepalive",
+                                  f"[Transport][🛡 ESP] NAT-T keepalive {src_ip}:{sport} → {dst_ip}:{dport} on {inbound_iface}")
+
+        # 2) NAT-T with Non-ESP marker (0x00000000) then ESP SPI/SEQ
+        if (sport == self.NAT_T or dport == self.NAT_T):
+            # If scapy already built ESP layer over UDP, prefer that.
+            if packet.haslayer("ESP"):
+                spi, seq = self._esp_fields_from_layer(packet)
+                return self._emit_esp("NAT-T", src_ip, sport, dst_ip, dport, spi, seq, len(raw), inbound_iface)
+
+            # Otherwise parse bytes: 4B non-ESP marker + 8B {SPI,SEQ}
+            if len(raw) >= 12 and raw[:4] == b"\x00\x00\x00\x00":
+                spi = int.from_bytes(raw[4:8], "big")
+                seq = int.from_bytes(raw[8:12], "big")
+                return self._emit_esp("NAT-T", src_ip, sport, dst_ip, dport, spi, seq, len(raw) - 4, inbound_iface)
+
+        # 3) IKEv2 (500 or 4500 without non-ESP marker)
+        if len(raw) >= 28:
+            try:
+                vmaj, vmin, exch, flags, length = self._parse_ike_header(raw)
+                xname = {34: "IKE_SA_INIT", 35: "IKE_AUTH", 36: "CREATE_CHILD_SA", 37: "INFORMATIONAL"}.get(exch, f"exchange={exch}")
+                return self.log.log_message(src_ip, sport, dst_ip, dport, "ike",
+                                      f"[Transport][🔐 IKEv2] {xname} {src_ip}:{sport} → {dst_ip}:{dport} | v={vmaj}.{vmin} flags=0x{flags:02x} len={length} on {inbound_iface}")
+            except Exception:
+                # minimal hint if header parse fails
+                return self.log.log_message(src_ip, sport, dst_ip, dport, "ike-min",
+                                      f"[Transport][🔐 IKEv2] message {src_ip}:{sport} → {dst_ip}:{dport} | {len(raw)}B on {inbound_iface}")
+
+        return False
+
+    # ------------------- Internals -------------------
+
+    def _emit_esp(self, kind: str, sip: str, sport: int, dip: str, dport: int, spi: int, seq: int, plen: int, inbound_iface: str) -> bool:
+        flow = self._canon((sip, sport), (dip, dport), spi)
+        st = self._stats[flow]; st["pkts"] += 1; st["bytes"] += int(plen)
+        st = self._stats[flow]; st["pkts"] += 1; st["bytes"] += int(plen)
+        if self._should_log(sip, sport, dip, dport, f"spi={spi:08x}"):
+            self.log.log_message(
+                f"[Transport][🛡 ESP] {kind} SPI=0x{spi:08x} seq={seq} {sip}:{sport} → {dip}:{dport} on {inbound_iface} | len={plen}B"
+            )
+        self._maybe_summary()
+        return True
+
+    def _maybe_summary(self):
+        now = time.time()
+        if now - self._last_summary < self._summary_every:
+            return
+        self._last_summary = now
+        # coalesce per 2-tuple (peer A,B), independent of SPI
+        totals = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+        for ((a, b), _spi), st in list(self._stats.items()):
+            totals[(a, b)]["pkts"] += st["pkts"]; totals[(a, b)]["bytes"] += st["bytes"]
+        for (a, b), st in totals.items():
+            (sip, sp), (dip, dp) = a, b
+            self.log.log_message(f"[Transport][🛡 ESP] summary {sip}:{sp} ↔ {dip}:{dp} | pkts={st['pkts']} bytes={st['bytes']}")
+
+    # --- helpers ---
+
+    @staticmethod
+    def _get_raw(pkt: Packet) -> bytes:
+        try:
+            from scapy.packet import Raw
+            return bytes(pkt[Raw].load) if pkt.haslayer(Raw) and pkt[Raw].load else b""
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _esp_fields_from_layer(pkt: Packet):
+        esp = pkt["ESP"]
+        # scapy ESP layer keeps spi, seq attributes
+        spi = int(getattr(esp, "spi", 0)) & 0xFFFFFFFF
+        seq = int(getattr(esp, "seq", 0)) & 0xFFFFFFFF
+        return spi, seq
+
+    @staticmethod
+    def _canon(a, b, spi: int):
+        return (((a, b) if a <= b else (b, a)), int(spi))
+
+    def _should_log(self, sip, sp, dip, dp, tag="") -> bool:
+        k = f"{sip}:{sp}>{dip}:{dp}|{tag}"
+        now = time.time()
+        if now - self._last_log[k] >= self._log_window:
+            self._last_log[k] = now
+            return True
+        return False
+
+    @staticmethod
+    def _parse_ike_header(b: bytes):
+        # Initiator SPI(8) Responder SPI(8) Next(1) Ver(1) Exch(1) Flags(1) MsgID(4) Len(4)
+        version = b[17]; vmaj, vmin = (version >> 4) & 0x0F, version & 0x0F
+        exch   = b[18]; flags = b[19]
+        length = int.from_bytes(b[24:28], "big")
+        return vmaj, vmin, exch, flags, length
 class TransportManager:
     """
     Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
@@ -10604,6 +11141,7 @@ class TransportManager:
         }
         self.packet_writer = packet_writer
         self.transport_dhcp = TransportDHCPManager(self.logger)
+        self.transport_dhcp6 = TransportDHCP6Manager(self.logger)
         self.transport_dns = TransportDNSManager(self.logger)
         self.transport_mdns = TransportMDNSManager(self.logger)
         self.transport_nbns = TransportNBNSManager(self.logger)
@@ -10626,6 +11164,7 @@ class TransportManager:
         self.transport_files = TransportFileManager(self.logger)
         self.transport_https = TransportHTTPSManager(self.logger)
         self.transport_ws_discovery = TransportWSDiscoveryManager(self.logger)
+        self.transport_esp = TransportESPManager(self.logger)
         self.transport_inspect = TransportInspectionManager(self.logger)
         self.transport_scraper = TransportScraperManager(self.logger)
         self._MONERO_P2P_PORTS = [
@@ -10651,6 +11190,7 @@ class TransportManager:
             extra_rpc_ports=self._MONERO_RPC_PORTS,
         )
         self.transport_scada = TransportSCADAManager(self.logger)
+        self.transport_rip = TransportRIPManager(self.logger)
     def _on_tls_policy_decision(self, key, rec, decision):
         """
         Called on EVERY TLS record after the policy engine evaluates it.
@@ -10863,7 +11403,7 @@ class TransportManager:
             )
             if not self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport):
                 self.logger.log_message(
-                    f"[Transport][🧵 TCP][❔ Undecoded] Unknown TCP protocol on ports {sport} → {dport}."
+                    f"[Transport][🧵 TCP][❔ Undecoded] Unknown TCP protocol on ports {sport} → {dport} on {iface_short}."
                 )
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
             return True
@@ -10962,11 +11502,14 @@ class TransportManager:
         if sport == 500 or dport == 500:
             return False
         rules = [
+            ([520, 521], self._handle_rip_packet),
             ([53], self._handle_dns_packet),
             ([5353], self._handle_mdns_packet),
             ([137], self._handle_nbns_packet),
             ([138], self._handle_nbds_packet),
             ([67, 68], self._handle_dhcp_packet),
+            ([500, 4500], self._handle_esp_packet),
+            ([546, 547], self._handle_dhcp6_packet),
             ([51820, 88, 59385, 59636, 59637, 59638, 61138], self._handle_wireguard_packet),
             ([443], self._handle_quic_packet),
             ([123], self._handle_ntp_packet),
@@ -11035,7 +11578,7 @@ class TransportManager:
             packet, inbound_iface=iface_short, phase="unhandled", component="udp"
         )
         self.logger.log_message(
-            f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {sport} → {dport}."
+            f"[Transport][🚀 UDP][❔ Undecoded] Unknown UDP protocol on ports {sport} → {dport} on {iface_short}."
         )
         self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
         return True
@@ -11045,6 +11588,8 @@ class TransportManager:
         """Safely decodes bytes to a string, ignoring any decoding errors."""
         return data.decode('utf-8', errors='ignore')
 
+    def _handle_rip_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        self.transport_rip.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
     def _handle_udp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         """
         Steam/Source UDP: A2S queries (usually 27015±n), SDR (27000–27100), client (4380), discovery (27036/27037).
@@ -11059,7 +11604,9 @@ class TransportManager:
     def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for DNS packets."""
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-
+    def _handle_esp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """Handles and logs details for DNS packets."""
+        self.transport_esp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_mdns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
         self.transport_mdns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
@@ -11074,6 +11621,9 @@ class TransportManager:
         """Handles and logs details for DHCP packets."""
         return self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    def _handle_dhcp6_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """Handles and logs details for DHCP packets."""
+        return self.transport_dhcp6.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for QUIC packets."""
         self.transport_quic.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

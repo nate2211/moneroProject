@@ -467,7 +467,7 @@ class WinDivertManager:
         frames_this_batch = 0
         bytes_read_total = 0
         deadline = time.monotonic() + idle_timeout
-        MAX_FRAMES_PER_PASS = 10000
+        MAX_FRAMES_PER_PASS = 2024
 
         last_progress_ts = time.monotonic()
         last_frames_read = self.frames_read
@@ -485,7 +485,7 @@ class WinDivertManager:
             try:
                 _reset_event()
                 try:
-                    hr, data = win32file.ReadFile(ph, 65536, ovl)
+                    hr, data = win32file.ReadFile(ph, win32file.AllocateReadBuffer(65536), ovl)
                 except pywintypes.error as e:
                     if e.winerror != ERROR_IO_PENDING:
                         # hard failure: disconnect and reconnect outside
@@ -504,6 +504,14 @@ class WinDivertManager:
                             return False
                         return False
 
+                if isinstance(data, str):
+                    # rare pywin32 quirk: immediate completion returns a str
+                    # latin-1 is a 1:1 mapping 0..255 -> U+0000..U+00FF (lossless for raw bytes)
+                    data = data.encode("latin1")
+                elif isinstance(data, memoryview):
+                    data = data.tobytes()
+                elif isinstance(data, bytearray):
+                    data = bytes(data)
                 if not data:
                     # Peer closed or end of stream
                     return False
@@ -840,7 +848,7 @@ class WinTunManager:
         frames_this_batch = 0
         bytes_read_total = 0
         deadline = time.monotonic() + idle_timeout
-        MAX_FRAMES_PER_PASS = 10000
+        MAX_FRAMES_PER_PASS = 2024
 
         last_progress_ts = time.monotonic()
         last_frames_read = self.frames_read
@@ -858,7 +866,7 @@ class WinTunManager:
             try:
                 _reset_event()
                 try:
-                    hr, data = win32file.ReadFile(ph, 65536, ovl)
+                    hr, data = win32file.ReadFile(ph, win32file.AllocateReadBuffer(65536), ovl)
                 except pywintypes.error as e:
                     if e.winerror != ERROR_IO_PENDING:
                         # hard failure: disconnect and reconnect outside
@@ -876,7 +884,14 @@ class WinTunManager:
                         if ge.winerror in (ERROR_OPERATION_ABORTED, 995):
                             return False
                         return False
-
+                if isinstance(data, str):
+                    # rare pywin32 quirk: immediate completion returns a str
+                    # latin-1 is a 1:1 mapping 0..255 -> U+0000..U+00FF (lossless for raw bytes)
+                    data = data.encode("latin1")
+                elif isinstance(data, memoryview):
+                    data = data.tobytes()
+                elif isinstance(data, bytearray):
+                    data = bytes(data)
                 if not data:
                     # Peer closed or end of stream
                     return False
