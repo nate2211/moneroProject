@@ -167,8 +167,8 @@ class PythonRouterManager:
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(self, self.code_output_manager, max_frames_per_batch=20000, max_bytes_per_batch=(1 << 60))
-        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python', max_frames_per_batch=20000, max_bytes_per_batch=(1 << 60))
+        self.windivert_manager = WinDivertManager(self, self.code_output_manager, max_frames_per_batch=50000, max_bytes_per_batch=(1 << 120))
+        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python', max_frames_per_batch=50000, max_bytes_per_batch=(1 << 120))
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
