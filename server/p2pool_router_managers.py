@@ -11431,16 +11431,16 @@ class TransportManager:
     def _handle_scada_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_scada.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_http.handle(packet, src_ip, dst_ip, sport, dport)
+        self.transport_http.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_https.handle(packet, inbound_iface)
         self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
     def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport)
+        self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_ftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport)
+        self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_rdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport)
+        self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     def _handle_tcp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_tcp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
     # --------------------- Main packet handler ------------------------
@@ -11545,6 +11545,9 @@ class TransportManager:
         if handler:
             if handler == self._handle_dhcp_packet:
                 return handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+            elif handler == self._handle_dhcp6_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
             elif handler == self._handle_dns_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 if packet.haslayer(DNS) and packet[DNS].qr == 1:

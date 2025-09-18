@@ -85,22 +85,28 @@ class pcap_pkthdr(Structure):
     ]
 
 # --- DLT constants we care about ---
-DLT_NULL = 0
-DLT_EN10MB = 1
-DLT_RAW = 12
-DLT_IEEE802_11 = 105
-DLT_LINUX_SLL = 113
-DLT_IEEE802_11_RADIO = 127
-DLT_LINUX_SLL2 = 276
-DLT_LOOP            = 12
+# --- DLT constants we care about (tcpdump.org/linktypes) ---
+DLT_NULL            = 0
+DLT_EN10MB          = 1
+DLT_IEEE802_3       = 2
 DLT_PPP             = 9
-DLT_PPP_SERIAL      = 50
-DLT_C_HDLC          = 104   # Cisco HDLC
-DLT_PPP_WITH_DIR    = 204
+DLT_LOOP            = 12
 DLT_PPP_BSDOS       = 16
 DLT_PFLOG           = 48
-DLT_PPI             = 192   # Per-Packet Info (often used for 802.11)
-DLT_IEEE802_3       = 2     # Raw 802.3 (LLC/SNAP)
+DLT_PPP_SERIAL      = 50
+DLT_C_HDLC          = 104     # Cisco HDLC
+DLT_IEEE802_11      = 105
+DLT_IEEE802_11_RADIO= 127
+DLT_PPP_WITH_DIR    = 204
+DLT_PPI             = 192     # Per-Packet Info
+DLT_LINUX_SLL       = 113
+DLT_RAW             = 101
+DLT_LINUX_SLL2      = 276
+# Optional/less common but useful:
+DLT_FRELAY          = 107     # Frame Relay (payload varies; often like CHDLC)
+DLT_IPV4            = 228
+DLT_IPV6            = 229
+
 # Optional capture direction (if supported by lib)
 PCAP_D_IN = 1  # inbound only
 
@@ -743,82 +749,153 @@ class SnifferSoftware:
 
         return None
 
-
     def _decode_by_dlt(self, raw: bytes, dlt: int):
+        """
+        Best-effort decode based on pcap linktype (DLT_*).
+        Returns a Scapy Packet (Ether/IP/IPv6/LLC/PPP/CHDLC/etc.) or Raw on failure.
+        """
         try:
+            # Ethernet
             if dlt == DLT_EN10MB:
                 return Ether(raw)
 
+            # 802.11 (with or without Radiotap/PPI)
             if dlt == DLT_IEEE802_11_RADIO:
                 from scapy.layers.dot11 import RadioTap
                 return RadioTap(raw)
 
             if dlt == DLT_PPI:
-                # PPI sometimes precedes 802.11 frames
-                from scapy.layers.dot11 import RadioTap
+                # PPI often wraps 802.11; Scapy understands inner payload
                 from scapy.layers.ppi import PPI
-                pkt = PPI(raw)
-                # Many drivers embed 802.11 after PPI payload; scapy can figure it out
-                return pkt
+                return PPI(raw)
 
             if dlt == DLT_IEEE802_11:
                 from scapy.layers.dot11 import Dot11
                 return Dot11(raw)
 
-            if dlt in (DLT_LINUX_SLL, DLT_LINUX_SLL2):
+            # Linux "cooked" captures
+            if dlt == DLT_LINUX_SLL:
                 from scapy.layers.l2 import CookedLinux
                 return CookedLinux(raw)
 
+            if dlt == DLT_LINUX_SLL2:
+                # Newer cooked format; Scapy parses it as CookedLinux (SLL2 aware)
+                from scapy.layers.l2 import CookedLinux
+                return CookedLinux(raw)
+
+            # PF firewall logs
             if dlt == DLT_PFLOG:
                 from scapy.layers.pflog import PFLog
                 return PFLog(raw)
 
-            if dlt in (DLT_PPP, DLT_PPP_SERIAL, DLT_PPP_WITH_DIR, DLT_PPP_BSDOS):
+            # PPP and friends
+            if dlt == DLT_PPP:
                 from scapy.layers.ppp import PPP
                 return PPP(raw)
 
+            if dlt == DLT_PPP_SERIAL:
+                # Serial PPP is usually just PPP with HDLC flag stripped; try PPP directly
+                from scapy.layers.ppp import PPP
+                return PPP(raw)
+
+            if dlt == DLT_PPP_WITH_DIR:
+                # First byte is direction (0=sent, 1=received), then PPP frame
+                # Guard against short frames
+                from scapy.layers.ppp import PPP
+                return PPP(raw[1:]) if len(raw) > 1 else Raw(raw)
+
+            if dlt == DLT_PPP_BSDOS:
+                # BSD/OS PPP: 1-byte direction + PPP (most common); some variants 4 bytes
+                from scapy.layers.ppp import PPP
+                if len(raw) > 1 and raw[0] in (0, 1):
+                    return PPP(raw[1:])
+                # Heuristic fallback
+                return PPP(raw)
+
+            # Cisco HDLC / Frame Relay
             if dlt == DLT_C_HDLC:
                 from scapy.layers.l2 import CHDLC
                 return CHDLC(raw)
 
+            if dlt == DLT_FRELAY:
+                # Frame Relay: Scapy doesn't have a dedicated FR layer that always fits
+                # Many captures look like CHDLC framing; try CHDLC then fall back.
+                from scapy.layers.l2 import CHDLC
+                try:
+                    return CHDLC(raw)
+                except Exception:
+                    return Raw(raw)
+
+            # IEEE 802.3 length + LLC/SNAP
             if dlt == DLT_IEEE802_3:
-                # 802.3 length field + LLC/SNAP
                 from scapy.layers.l2 import LLC
                 return LLC(raw)
 
+            # RAW/LOOP/NULL/IP-only linktypes
             if dlt == DLT_RAW:
+                # raw IP (opaque to whether v4 or v6)
                 try:
                     return IP(raw)
                 except Exception:
                     return IPv6(raw)
 
-            if dlt == DLT_NULL or dlt == DLT_LOOP:
-                af = struct.unpack("@I", raw[:4])[0]
-                payload = raw[4:]
-                if af == socket.AF_INET:  return IP(payload)
-                if af == socket.AF_INET6: return IPv6(payload)
-                return Raw(payload)
+            if dlt == DLT_IPV4:
+                return IP(raw)
 
+            if dlt == DLT_IPV6:
+                return IPv6(raw)
+
+            if dlt in (DLT_NULL, DLT_LOOP):
+                # First 4 bytes are AF_* in **host** byte order; use native '@I'
+                if len(raw) >= 4:
+                    af = struct.unpack("@I", raw[:4])[0]
+                    payload = raw[4:]
+                    if af == socket.AF_INET:
+                        return IP(payload)
+                    if af == socket.AF_INET6:
+                        return IPv6(payload)
+                    # unknown family: still return Raw payload
+                    return Raw(payload)
+                return Raw(raw)
+
+            # Fallback: let Scapy try raw IP, then IPv6, then Raw
+            try:
+                return IP(raw)
+            except Exception:
+                pass
+            try:
+                return IPv6(raw)
+            except Exception:
+                pass
             return Raw(raw)
+
         except Exception:
+            # Never let a bad decode kill the loop
             return Raw(raw)
 
     def _dlt_name(self, dlt: int) -> str:
-        if dlt == DLT_EN10MB:
-            return "EN10MB"
-        if dlt == DLT_IEEE802_11_RADIO:
-            return "IEEE802_11_RADIO"
-        if dlt == DLT_IEEE802_11:
-            return "IEEE802_11"
-        if dlt == DLT_LINUX_SLL:
-            return "LINUX_SLL"
-        if dlt == DLT_LINUX_SLL2:
-            return "LINUX_SLL2"
-        if dlt == DLT_NULL:
-            return "NULL"
-        if dlt == DLT_RAW:
-            return "RAW"
-        return f"DLT({dlt})"
+        names = {
+            DLT_EN10MB: "EN10MB",
+            DLT_IEEE802_11_RADIO: "IEEE802_11_RADIO",
+            DLT_IEEE802_11: "IEEE802_11",
+            DLT_LINUX_SLL: "LINUX_SLL",
+            DLT_LINUX_SLL2: "LINUX_SLL2",
+            DLT_NULL: "NULL",
+            DLT_LOOP: "LOOP",
+            DLT_RAW: "RAW",
+            DLT_PPI: "PPI",
+            DLT_PFLOG: "PFLOG",
+            DLT_PPP: "PPP",
+            DLT_PPP_SERIAL: "PPP_SERIAL",
+            DLT_PPP_WITH_DIR: "PPP_WITH_DIR",
+            DLT_PPP_BSDOS: "PPP_BSDOS",
+            DLT_C_HDLC: "C_HDLC",
+            DLT_IEEE802_3: "IEEE802_3",
+            DLT_FRELAY: "FRELAY",
+            DLT_IPV4: "IPV4",
+            DLT_IPV6: "IPV6",
+        }
+        return names.get(dlt, f"DLT({dlt})")
 
     # --- NEW: Windows-aware helpers ---
     def _send_l3_loopback(self, packet, *, expect_reply: bool = False, timeout: float = 2.0,
@@ -1387,8 +1464,11 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, 100, errbuf)
         if not handle:
-            self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}")
-            return
+            iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+            handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, 100, errbuf)
+            if not handle:
+                self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}")
+                return
         try:
             packet_bytes = bytes(packet)
             self.libpcap.pcap_sendpacket(
@@ -1518,9 +1598,12 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
         if not handle:
-            self.logger.log_message(
-                f"[Sniffer] Error opening device {iface_out}: {errbuf.value.decode('utf-8', errors='ignore')}")
-            return None
+            iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+            handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
+            if not handle:
+                self.logger.log_message(
+                    f"[Sniffer] Error opening device {iface_out}: {errbuf.value.decode('utf-8', errors='ignore')}")
+                return None
         try:
             self.libpcap.pcap_setdirection(handle, 1)  # PCAP_D_IN
         except Exception:

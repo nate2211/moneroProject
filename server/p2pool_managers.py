@@ -32,7 +32,7 @@ from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3
 from scapy.contrib.ikev2 import IKEv2
 from scapy.layers.dhcp import DHCP
-from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit, DHCP6_InfoRequest
 from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6DestUnreach, \
@@ -1143,7 +1143,9 @@ class PythonRouterManager:
                 dhcp_pool_in[-1],
                 self._interfaces_config,
                 in_mac=in_mac,
-                enforce_same_subnet=False
+                enforce_same_subnet=False,
+                dns_v6 = ["fd00::1", "fd00::2"],  # Class default DNSv6
+                search_domains = ["lan.local"]  # Class default domains
             )
             self.dhcp_server_in.sniffer = self.sniffer
             self.dhcp_server_in.router_ipv6_link_local_out = self.router_ipv6_link_local_out
@@ -1155,7 +1157,9 @@ class PythonRouterManager:
                 dhcp_pool_out[-1],
                 self._interfaces_config,
                 in_mac=in_mac,
-                enforce_same_subnet=False
+                enforce_same_subnet=False,
+                dns_v6 = ["fd00::1", "fd00::2"],  # Class default DNSv6
+                search_domains = ["lan.local"]  # Class default domains
             )
             self.dhcp_server_out.sniffer = self.sniffer
             self.dhcp_server_out.router_ipv6_link_local_out = self.router_ipv6_link_local_out
@@ -1389,7 +1393,7 @@ class PythonRouterManager:
                         if self.dns_manager.handle_response(packet):
                             return  # Packet was handled (forwarded back to client)
 
-                if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit):
+                if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest):
                     self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
                     if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
                                                                                  self.rip_manager.find_route):
@@ -1409,7 +1413,7 @@ class PythonRouterManager:
                             component="dhcp-out-router",
                         )
                         return
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router Packet: {packet.summary()}")
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):

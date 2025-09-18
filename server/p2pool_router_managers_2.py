@@ -23,7 +23,8 @@ from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3mq
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
-    DUID_LLT, DHCP6OptServerId
+    DUID_LLT, DHCP6OptServerId, DHCP6_InfoRequest, DHCP6_Request, DHCP6OptClientId, DHCP6OptDNSServers, \
+    DHCP6OptDNSDomains, DHCP6OptInfoRefreshTime
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import ICMP, IPOption_Router_Alert
 from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
@@ -3758,7 +3759,7 @@ class HandshakeManager:
                                                      stored_original_src_ip, stored_original_src_port,
                                                      stored_original_dst_ip, stored_original_dst_port)
                     self.logger.log_message(
-                        f"[Handshake] 🔁 SYN retransmit from {original_src_ip}:{original_src_port} on {inbound_iface}"
+                        f"[Handshake] 🔁 SYN retransmit from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} on {inbound_iface}"
                     )
                 return False
 
@@ -8087,7 +8088,9 @@ class DHCPServer:
         serve_on_all_ifaces: bool = True,
         authoritative: bool = True,
         rogue_policy: str = "nak_on_mismatch",  # "log" | "nak_on_mismatch"
-        in_mac: None
+        in_mac: None,
+        dns_v6: str,
+        search_domains: str
     ):
         import ipaddress, threading, time
         from typing import Dict, Tuple, Set
@@ -8103,7 +8106,8 @@ class DHCPServer:
         self.serve_on_all_ifaces = bool(serve_on_all_ifaces)
         self.authoritative = bool(authoritative)
         self.rogue_policy = rogue_policy
-
+        self.dns_v6 = dns_v6
+        self.search_domains = search_domains
         # --- DHCPv4 ---
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
@@ -8350,7 +8354,11 @@ class DHCPServer:
                     return "v6", "client"
                 if sport == 547 and dport == 546:
                     return "v6", "server"
-                return "v6", "other"
+            if pkt.haslayer(DHCP6_InfoRequest):
+                if dport == 547 and sport == 546:
+                    return "v6", "client"
+                if sport == 547 and dport == 546:
+                    return "v6", "server"
         return None, None
 
     def _iface_cfg_for(self, inbound_iface: str) -> dict:
@@ -8567,13 +8575,24 @@ class DHCPServer:
                 self.logger.log_message("[DHCP] v6: missing router IPv6 (no link-local/global); cannot serve.")
                 return True
 
-            # Eth wrapping if not loopback
+            # --- Frame/env details ---
             is_loopback = not pkt.haslayer(Ether)
             client_mac = pkt[Ether].src if pkt.haslayer(Ether) else None
-
             v6src = pkt[IPv6].src  # client's source (usually link-local)
-            dhcp6 = pkt[DHCP6_Solicit]
-            msgtype = int(getattr(dhcp6, "msgtype", 0))
+
+            # --- Pick the exact DHCPv6 subtype first, then fall back to base DHCP6 ---
+            dhcp6 = None
+            msgtype = 0
+
+            if pkt.haslayer(DHCP6_Solicit):
+                dhcp6 = pkt[DHCP6_Solicit]
+                msgtype = 1
+            elif pkt.haslayer(DHCP6_InfoRequest):
+                dhcp6 = pkt[DHCP6_InfoRequest]
+                msgtype = 11
+            elif pkt.haslayer(DHCP6_Request):
+                dhcp6 = pkt[DHCP6_Request]
+                msgtype = 3
 
             # Observe server->client only
             if direction != "client":
@@ -8612,6 +8631,79 @@ class DHCPServer:
                             client_mac and not is_loopback) else advertise
                 self.sniffer.send(out, inbound_iface)
                 self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src} (iface={inbound_iface})")
+                return True
+
+            if msgtype == 11:  # DHCPv6 Information-Request -> Reply (RDNSS, domains, IRT)
+                # Echo Client-ID if present
+                clid_layer = pkt.getlayer(DHCP6OptClientId)
+                clid = DHCP6OptClientId(duid=clid_layer.duid) if clid_layer is not None else None
+
+                # Build DHCPv6 reply with options
+                reply = DHCP6_Reply(trid=dhcp6.trid)  # or pkt[DHCP6_InfoRequest].trid (same here)
+
+                # Always include our Server-ID
+                reply /= self._dhcp6_srv_id
+                if clid:
+                    reply /= clid
+
+                # Coerce dns_v6 and search_domains into the right types
+                def _to_list_ipv6(v):
+                    if v is None:
+                        return []
+                    if isinstance(v, (list, tuple)):
+                        return [str(x) for x in v]
+                    return [str(v)]
+
+                def _to_list_str(v):
+                    if v is None:
+                        return []
+                    if isinstance(v, (list, tuple)):
+                        return [str(x) for x in v]
+                    # Accept comma-separated "example.com, local"
+                    if isinstance(v, str) and "," in v:
+                        return [s.strip() for s in v.split(",") if s.strip()]
+                    return [str(v)]
+
+                try:
+                    dns_list = _to_list_ipv6(self.dns_v6)
+                    if dns_list:
+                        reply /= DHCP6OptDNSServers(dnsservers=dns_list)
+                except Exception:
+                    pass
+
+                try:
+                    dom_list = _to_list_str(self.search_domains)
+                    if dom_list:
+                        reply /= DHCP6OptDNSDomains(domains=dom_list)
+                except Exception:
+                    pass
+
+                try:
+                    reply /= DHCP6OptInfoRefreshTime(irtt=600)
+                except Exception:
+                    pass
+
+                # --- Always build full IPv6/UDP for DHCPv6 ---
+                # RFC 8415: server→client reply is UDP 547 -> 546; hop limit 1 on-link
+                ip6 = IPv6(src=router_ll, dst=v6src, hlim=1)
+                udp = UDP(sport=547, dport=546)
+
+                # Prefer unicast back to client MAC; fallback to ff02::1:2 multicast
+                if (not is_loopback) and client_mac:
+                    # Unicast to client MAC seen on the request
+                    l2 = Ether(src=router_in_mac, dst=client_mac)
+                    out = l2 / ip6 / udp / reply
+                elif not is_loopback:
+                    # L2 present but we didn't get client MAC → multicast
+                    l2 = Ether(src=router_in_mac, dst="33:33:00:01:00:02")
+                    out = l2 / IPv6(src=router_ll, dst="ff02::1:2", hlim=1) / udp / reply
+                else:
+                    # Pure L3 (loopback/virtual)
+                    out = ip6 / udp / reply
+
+                # send L2 or L3; your sniffer handles both
+                self.sniffer.send(out, inbound_iface)
+                self.logger.log_message(f"[DHCP] v6 INFO-REPLY → {v6src} (iface={inbound_iface})")
                 return True
             if msgtype == 3:  # REQUEST -> REPLY
                 opts = [
