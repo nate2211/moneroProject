@@ -1186,7 +1186,7 @@ class PythonRouterManager:
                     elif version == 4:
                         packet = IP(packet)
                     else:
-                        # This is a non-IP packet, drop it.
+                        packet = Ether(packet)
                         return
 
                 except Exception as e:
@@ -1221,6 +1221,9 @@ class PythonRouterManager:
                 self.ndp_manager.learn_from_packet(packet, inbound_iface)
             if packet.haslayer(IP):
                 self.arp_manager.learn_from_packet(packet, inbound_iface)
+            if packet.haslayer(ICMPv6ND_NA):
+                self.ndp_manager.learn_neighbor_advertisement(packet)
+                return
             if not self.firewall_manager.process_packet(packet):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
@@ -1365,9 +1368,7 @@ class PythonRouterManager:
             if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
                 if self.isakmp_manager.handle_packet(packet, inbound_iface):
                     return
-            if packet.haslayer(ICMPv6ND_NA):
-                self.ndp_manager.learn_neighbor_advertisement(packet)
-                return
+
 
             is_for_router = dst_ip in self._get_all_local_ips()
 
