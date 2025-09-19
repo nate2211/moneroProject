@@ -4348,7 +4348,7 @@ class IGMPManager:
     def _send_group_specific_query(self, entry: MembershipEntry):
         ifname = entry.ifname
         cfg = self._ifcfg.get(ifname, {})
-        ip_src = cfg.get("ip_addr");
+        ip_src = cfg.get("ip_addr")
         mac_src = cfg.get("mac")
         if not ip_src:
             self.log.log_message(
@@ -6268,11 +6268,12 @@ class DNSManager:
     UPSTREAM_HEALTH_PROBE_INTERVAL = 180  # Seconds between health checks
     UPSTREAM_TIMEOUT_SEC = 2.0  # Timeout for a single upstream query
 
-    def __init__(self, router_logger, packet_writer):
+    def __init__(self, router_logger, packet_writer, router_ipv6_ll):
+
         self.logger = router_logger
         self.pw = packet_writer
         self._lock = threading.Lock()
-
+        self.router_ipv6_ll = router_ipv6_ll
         # --- State Management ---
         self._dns_cache: Dict[str, Tuple[Packet, float]] = {}  # qkey -> (packet, expiry_ts)
         self._pending_requests: Dict[Tuple, Dict] = {}  # fwd_key -> original_client_info
@@ -6281,6 +6282,10 @@ class DNSManager:
         self.upstreams: List[Dict] = []
         self._dns64_enabled = False
         self._dns64_prefix = "64:ff9b::/96"
+
+        # pending request indices
+        self._pending_requests: Dict[Tuple, Dict] = {}      # primary key
+        self._pending_by_txid: Dict[Tuple, Tuple] = {}      # secondary index -> primary key
 
         # --- Background Health Probe Thread ---
         self._stop_event = threading.Event()
@@ -6391,60 +6396,88 @@ class DNSManager:
 
     def handle_response(self, packet: Packet) -> bool:
         """
-        Processes an incoming DNS response from an upstream server.
+        Process an incoming DNS response from an upstream.
 
-        This method matches the response to a pending client request, applies
-        DNS64 synthesis if needed, caches the result, and forwards the final
-        answer back to the original client.
+        Works with the new indexes set in _forward_query():
+          - primary key: ("4|6", router_src_ip, router_src_port, txid)
+          - secondary:   ("4|6", upstream_ip, txid)
 
-        Args:
-            packet: The incoming network packet.
-
-        Returns:
-            True if the packet was a DNS response that this manager handled,
-            False otherwise.
+        Returns True if consumed/forwarded, False to let other handlers see it.
         """
-        # 1. --- IDENTIFY ---
-        # Ensure it's a DNS response packet we can process.
+        # Must be DNS response over UDP
         if not (packet.haslayer(DNS) and packet[DNS].qr == 1 and packet.haslayer(UDP)):
             return False
 
-        # 2. --- ASSOCIATE ---
-        # Reconstruct the lookup key to find the original client request.
-        # This key must match the format used when the query was forwarded. The
-        # key is based on the destination of the *incoming* response, which was
-        # the source of the *outgoing* query.
+        dns_id = int(packet[DNS].id)
+
+        # Build primary and secondary lookup keys from the on-wire response
         if IP in packet:
-            lookup_key = ("4", packet[IP].dst, int(packet[UDP].dport), int(packet[DNS].id))
+            ipver = "4"
+            resp_dst_ip = packet[IP].dst  # should be our router IP (src we used when forwarding)
+            resp_src_ip = packet[IP].src  # upstream resolver
+            resp_dport = int(packet[UDP].dport)  # should match our ephemeral sport
+            primary_key = (ipver, resp_dst_ip, resp_dport, dns_id)
+            secondary_key = (ipver, resp_src_ip, dns_id)
+
         elif IPv6 in packet:
-            lookup_key = ("6", packet[IPv6].dst, int(packet[UDP].dport), int(packet[DNS].id))
+            ipver = "6"
+            resp_dst_ip = str(packet[IPv6].dst)
+            resp_src_ip = str(packet[IPv6].src)
+            resp_dport = int(packet[UDP].dport)
+            primary_key = (ipver, resp_dst_ip, resp_dport, dns_id)
+            secondary_key = (ipver, resp_src_ip, dns_id)
+
         else:
-            return False  # Not an IPv4 or IPv6 packet
-
-        # Atomically retrieve and remove the pending request.
-        with self._lock:
-            original_req_info = self._pending_requests.pop(lookup_key, None)
-
-        # If no matching request is found, it's not a response we are waiting for.
-        if not original_req_info:
             return False
 
-        self.logger.log_message(f"[DNS] ✅ Matched response for {packet[DNS].qd.qname.decode()} to a pending request.")
+        # Try primary lookup first (fast path)
+        matched_via = "primary"
+        with self._lock:
+            original_req_info = self._pending_requests.pop(primary_key, None)
 
-        # 3. --- PROCESS ---
-        # Apply DNS64 synthesis if enabled and applicable.
+            # If not found, try secondary (by upstream, txid) → map to primary
+            if original_req_info is None:
+                fwd_key = self._pending_by_txid.pop(secondary_key, None)
+                if fwd_key is not None:
+                    original_req_info = self._pending_requests.pop(fwd_key, None)
+                    matched_via = "secondary"
+
+        # No match → not ours
+        if not original_req_info:
+            self.logger.log_message(
+                f"[DNS] ⛔ Unmatched DNS response id={dns_id} from {resp_src_ip}→{resp_dst_ip}:{resp_dport} (ipver={ipver})")
+            return False
+
+        # Optional: normalize/clean checksums before any edits
+        if IP in packet and hasattr(packet[IP], "chksum"):
+            del packet[IP].chksum
+        if UDP in packet and hasattr(packet[UDP], "chksum"):
+            del packet[UDP].chksum
+
+        # Apply DNS64 (if enabled and applicable)
         final_response = self._apply_dns64_if_needed(packet)
 
-        # Add the final, potentially modified, response to our cache.
-        qname = final_response[DNS].qd.qname.decode().lower()
-        qtype = final_response[DNS].qd.qtype
-        self._add_to_cache(f"{qname}:{qtype}", final_response)
+        # Cache the answer (best-effort)
+        qname_log = "<unknown>"
+        qtype_log = "<unknown>"
+        try:
+            qname_log = final_response[DNS].qd.qname.decode().lower()
+            qtype_log = int(final_response[DNS].qd.qtype)
+            self._add_to_cache(f"{qname_log}:{qtype_log}", final_response)
+        except Exception:
+            pass
 
-        # 4. --- DELIVER ---
-        # Send the final packet back to the original client who made the request.
+        # Send back to original client
+        upstream_ip = original_req_info.get("upstream_ip", resp_src_ip)
+        sniff_iface = getattr(original_req_info.get("original_packet", None), "sniffed_on", None)
+
+        self.logger.log_message(
+            f"[DNS] ⬅️ Response matched ({matched_via}) id={dns_id} "
+            f"qname={qname_log} qtype={qtype_log} from_upstream={upstream_ip} "
+            f"to_client_iface={sniff_iface}"
+        )
+
         self._send_response_to_client(final_response, original_req_info["original_packet"])
-
-        # Signal that the packet has been fully handled.
         return True
 
     def _apply_dns64_if_needed(self, response_packet: Packet) -> Packet:
@@ -6508,67 +6541,138 @@ class DNSManager:
             elif entry:
                 del self._dns_cache[qkey]  # Expired
         return None
+    def _alloc_udp_ephemeral_port(self) -> int:
+        # 49152–65535 per IANA; keep it simple & safe
+        return random.randint(49152, 65535)
+
+    def _is_v6_ll(self, addr: str) -> bool:
+        try:
+            return ipaddress.IPv6Address(addr).is_link_local
+        except:
+            return addr.lower().startswith("fe80:")
 
     def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str):
         fwd = original_packet.copy()
 
-        # Rewrite destination to upstream and source to our router IP
-        if IP in fwd:
+        # Extract qname (best-effort for logging)
+        try:
+            qname = fwd[DNS].qd.qname.decode().rstrip(".").lower()
+        except Exception:
+            qname = "<unknown>"
+
+        # ---- IPv4 path (default) ----
+        try:
+            ipaddress.IPv4Address(target_ip)
+            use_ipv4 = True
+        except Exception:
+            use_ipv4 = False
+
+        if use_ipv4:
             fwd[IP].dst = target_ip
             fwd[UDP].dport = 53
-            fwd[IP].src = self.router_ip_out
-            # Recalc checksums
+            if self.router_ip_out:
+                fwd[IP].src = self.router_ip_out
+            fwd[UDP].sport = self._alloc_udp_ephemeral_port()
             if hasattr(fwd[IP], "chksum"): del fwd[IP].chksum
             if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
-            # Key that matches the *reply* tuple: (dst=router_ip, dport=client_port) on the way back
             fwd_key = ("4", fwd[IP].src, int(fwd[UDP].sport), int(fwd[DNS].id))
-        elif IPv6 in fwd:
-            fwd[IPv6].dst = target_ip
+            sec_key = ("4", target_ip, int(fwd[DNS].id))
+
+            self.logger.log_message(
+                f"[DNS] ➡️ TX (IPv4) q={qname} id={int(fwd[DNS].id)} "
+                f"{fwd[IP].src}:{int(fwd[UDP].sport)} → {target_ip}:53 via {inbound_iface}"
+            )
+
+        # ---- IPv6 link-local path (upstream on-link) ----
+        elif self._is_v6_ll(target_ip):
+            v6_dst = target_ip.split("%", 1)[0]
+            fwd[IPv6].dst = v6_dst
             fwd[UDP].dport = 53
-            fwd[IPv6].src = self.router_ipv4_out
+
+            ll_src = getattr(self, "router_ipv6_link_local_out", None)
+            if ll_src:
+                fwd[IPv6].src = ll_src.split("%", 1)[0]
+
+            fwd[UDP].sport = self._alloc_udp_ephemeral_port()
             if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
+
             fwd_key = ("6", fwd[IPv6].src, int(fwd[UDP].sport), int(fwd[DNS].id))
+            sec_key = ("6", v6_dst, int(fwd[DNS].id))
+
+            self.logger.log_message(
+                f"[DNS] ➡️ TX (IPv6-LL) q={qname} id={int(fwd[DNS].id)} "
+                f"{fwd[IPv6].src}:{int(fwd[UDP].sport)} → {v6_dst}%{inbound_iface if inbound_iface else ''}:53 via {inbound_iface}"
+            )
+
         else:
-            # Not IP; ignore
+            self.logger.log_message(
+                f"[DNS] ⚠️ Skipping IPv6 upstream {target_ip} for q={qname}: "
+                f"no global/ULA on WAN; use IPv4 upstreams."
+            )
             return
 
-        # Store mapping to find the original request when the reply comes back
         with self._lock:
             self._pending_requests[fwd_key] = {
                 "original_packet": original_packet,
                 "timestamp": time.time(),
+                "upstream_ip": target_ip,
             }
+            self._pending_by_txid[sec_key] = fwd_key
 
         self.pw._send_raw_packet(fwd, inbound_iface)
 
     def _send_response_to_client(self, response_packet: Packet, original_request: Packet):
+        """
+        Send the DNS reply back to the original client.
+
+        IPv4: source = router_ip_out (if set), UDP sport = 53.
+        IPv6: source = router_ipv6_ll ONLY (link-local). Scope IDs are not in headers;
+             the egress interface (sniffed_on) supplies scope.
+        """
         resp = response_packet.copy()
 
+        # --- IPv4 client reply ---
         if IP in original_request:
             client_ip = original_request[IP].src
             client_port = int(original_request[UDP].sport)
+
             resp[IP].dst = client_ip
             resp[UDP].dport = client_port
             resp[DNS].id = original_request[DNS].id
-            # source = router’s DNS address, sport = 53
+
             if getattr(self, "router_ip_out", None):
                 resp[IP].src = self.router_ip_out
-            resp[UDP].sport = 53
-            if hasattr(resp[IP], "chksum"): del resp[IP].chksum
-            if hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
 
+            resp[UDP].sport = 53
+
+            if hasattr(resp[IP], "chksum"): del resp[IP].chksum
+            if UDP in resp and hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
+
+        # --- IPv6 client reply (link-local only) ---
         elif IPv6 in original_request:
             client_ip = original_request[IPv6].src
             client_port = int(original_request[UDP].sport)
+
             resp[IPv6].dst = client_ip
             resp[UDP].dport = client_port
             resp[DNS].id = original_request[DNS].id
-            if getattr(self, "router_ipv6_out", None):
-                resp[IPv6].src = self.router_ipv6_out
-            resp[UDP].sport = 53
-            if hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
 
-        self.pw._send_raw_packet(resp, getattr(original_request, "sniffed_on", None))
+            v6_ll = self.router_ipv6_ll
+            if v6_ll:
+                # Strip any %zone from stored link-local before placing into header
+                resp[IPv6].src = str(v6_ll).split("%", 1)[0]
+
+            resp[UDP].sport = 53
+
+            # Optional: set a sane hop limit for local segment
+            # if not getattr(resp[IPv6], "hlim", None):
+            #     resp[IPv6].hlim = 64
+
+            if UDP in resp and hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
+
+        # Egress on the same iface we sniffed the request (provides LL scope)
+        out_iface = getattr(original_request, "sniffed_on", None)
+        self.pw._send_raw_packet(resp, out_iface)
 
 
 class NDPManager:
@@ -6582,7 +6686,6 @@ class NDPManager:
         Initializes the NDP Manager.
         Args:
             router_logger: The logger instance for logging messages.
-            sniffer: The sniffer instance for sending packets.
             cache_timeout_seconds (int): How long a cache entry is valid.
         """
         self.router_logger = router_logger
@@ -8650,7 +8753,6 @@ class DHCPServer:
                             client_mac and not is_loopback) else advertise
                 self.sniffer.send(out, inbound_iface)  # keep using your known egress iface
                 self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src_nz} (iface={inbound_iface})")
-                return True
                 return True
 
             if msgtype == 11:  # DHCPv6 Information-Request -> Reply (RDNSS, domains, IRT)

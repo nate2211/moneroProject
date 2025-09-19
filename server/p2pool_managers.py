@@ -136,7 +136,7 @@ class PythonRouterManager:
         self.packet_signer = PacketSigningManager(router_logger)
         self.sendback_manager = SendBackManager(router_logger, self.packet_signer, self.outbound_load_balancer)
         self.packet_writer = PacketWriter(router_logger, self._interfaces_config, self.packet_signer, self.outbound_load_balancer, self.arp_manager, self.ndp_manager)
-        self.dns_manager = DNSManager(router_logger, self.packet_writer)
+        self.dns_manager = None
         self.mdns_manager = mDNSManager(router_logger, self.packet_writer, self._interfaces_config)
         self.rip_manager = RIPManager(router_logger, self.function_call_tracker)
         self.nat_manager = None
@@ -1041,6 +1041,12 @@ class PythonRouterManager:
                     cleaned_address = address_part.split("(")[0].strip()
                     found_address = cleaned_address
                     break  # We found the address, no need to parse further.
+                if clean_line.startswith("Link-local IPv6 Address"):
+                    address_part = clean_line.split(":", 1)[1].strip()
+                    # Clean up the '(Preferred)' suffix and any other trailing text
+                    cleaned_address = address_part.split("(")[0].strip()
+                    found_address = cleaned_address
+                    break  # We found the address, no need to parse further.
 
         if found_address:
             self.router_ipv6_link_local_out = found_address
@@ -1231,6 +1237,7 @@ class PythonRouterManager:
             if not self.firewall_manager.process_packet(packet):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
+
             transport_layer = self.sniffer._find_transport_layer(packet)
             if isinstance(transport_layer, TCP):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
@@ -1451,6 +1458,7 @@ class PythonRouterManager:
             if dns:
                 # Upstream answers (consume when they are ours)
                 if dns.qr == 1:
+                    self.router_logger.log_message("[DNS] ⬅️ Processing DNS response for router.")
                     if self.dns_manager.handle_response(packet):
                         self.code_output_manager.submit_packet(
                             packet, inbound_iface=inbound_iface,
@@ -1972,7 +1980,7 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
-
+            self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
@@ -2073,7 +2081,6 @@ class PythonRouterManager:
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
-
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
             self.parallel_python.increase_ram_usage(3000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
