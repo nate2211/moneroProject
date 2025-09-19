@@ -8613,24 +8613,44 @@ class DHCPServer:
 
             # -------- Server replies (ADVERTISE / REPLY) ----------
             if msgtype == 1:  # SOLICIT
-                # Optional: mirror client's IAID and include an address only if you actually want to advertise one
-                ia_na = dhcp6.getlayer(DHCP6OptIA_NA)
-                iaid = int(getattr(ia_na, "iaid", 0)) if ia_na else 0
+                _ZONE_RE = re.compile(r'%(?:\d+|[A-Za-z0-9_.-]+)$')
 
-                ia_block = b""
+                def _rm_zone(addr: str | None) -> str | None:
+                    """Remove Windows/Linux zone id ('%12' or '%Ethernet') from IPv6 string."""
+                    if not addr or '%' not in addr:
+                        return addr
+                    # Only drop a trailing zone id, keep anything before it intact
+                    return _ZONE_RE.sub('', addr)
 
+                # ... inside handle_packet() before building the reply:
+                is_loopback = not pkt.haslayer(Ether)
+                client_mac = pkt[Ether].src if pkt.haslayer(Ether) else None
+
+                v6src_raw = pkt[IPv6].src  # client's (likely fe80::…%X)
+                router_ll_nz = _rm_zone(router_ll)  # your link-local (strip %X)
+                v6src_nz = _rm_zone(v6src_raw)
+
+                # Guard: if stripping fails for any reason, just bail gracefully
+                if not router_ll_nz or not v6src_nz:
+                    self.logger.log_message("[DHCP] v6: invalid link-local addressing; skipping reply")
+                    return False
+
+                dhcp6 = pkt.getlayer(DHCP6_Solicit) or pkt.getlayer(DHCP6_InfoRequest)
+
+                # Example for SOLICIT → ADVERTISE
                 advertise = (
-                        IPv6(src=router_ll, dst=v6src, hlim=255)
+                        IPv6(src=router_ll_nz, dst=v6src_nz, hlim=255)
                         / UDP(sport=547, dport=546)
                         / DHCP6_Advertise(trid=dhcp6.trid)
                         / self._dhcp6_srv_id
-                        / ia_block
+                    # / ia_block  # include if you actually offer an IA_NA/IA_PD
                 )
 
                 out = (Ether(src=router_in_mac, dst=client_mac) / advertise) if (
                             client_mac and not is_loopback) else advertise
-                self.sniffer.send(out, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src} (iface={inbound_iface})")
+                self.sniffer.send(out, inbound_iface)  # keep using your known egress iface
+                self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src_nz} (iface={inbound_iface})")
+                return True
                 return True
 
             if msgtype == 11:  # DHCPv6 Information-Request -> Reply (RDNSS, domains, IRT)

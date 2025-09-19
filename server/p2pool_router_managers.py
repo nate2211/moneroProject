@@ -11548,6 +11548,9 @@ class TransportManager:
             elif handler == self._handle_dhcp6_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 return False
+            elif handler == self._handle_kerberos_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
             elif handler == self._handle_dns_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 if packet.haslayer(DNS) and packet[DNS].qr == 1:
