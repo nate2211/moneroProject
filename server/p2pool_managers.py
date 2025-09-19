@@ -1384,7 +1384,15 @@ class PythonRouterManager:
             is_for_router = dst_ip in self._get_all_local_ips()
 
             if is_for_router:
-
+                # mDNS stays separate (5353/UDP, local-scope)
+                if UDP in packet and int(packet[UDP].dport) == 5353:
+                    if self.mdns_manager.handle_packet(packet):
+                        self.code_output_manager.submit_packet(
+                            packet, inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="mdns"
+                        )
+                        return
                 if packet.haslayer(DNS):
                     dns = packet[DNS]
 
@@ -1453,7 +1461,15 @@ class PythonRouterManager:
                 return
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.
-
+            # mDNS stays separate (5353/UDP, local-scope)
+            if UDP in packet and int(packet[UDP].dport) == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    self.code_output_manager.submit_packet(
+                        packet, inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="mdns"
+                    )
+                    return
             dns = packet.getlayer(DNS)
             if dns:
                 # Upstream answers (consume when they are ours)
@@ -1477,15 +1493,7 @@ class PythonRouterManager:
                             )
                             return
 
-            # mDNS stays separate (5353/UDP, local-scope)
-            if UDP in packet and int(packet[UDP].dport) == 5353:
-                if self.mdns_manager.handle_packet(packet):
-                    self.code_output_manager.submit_packet(
-                        packet, inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="mdns"
-                    )
-                    return
+
             if (
                     packet.haslayer("Kerberos")
                     or (UDP in packet and (int(packet[UDP].sport) in (88, 464) or int(packet[UDP].dport) in (88, 464)))
