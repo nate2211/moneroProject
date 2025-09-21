@@ -24,7 +24,7 @@ from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3mq
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
     DUID_LLT, DHCP6OptServerId, DHCP6_InfoRequest, DHCP6_Request, DHCP6OptClientId, DHCP6OptDNSServers, \
-    DHCP6OptDNSDomains, DHCP6OptInfoRefreshTime
+    DHCP6OptDNSDomains, DHCP6OptInfoRefreshTime, DHCP6OptIAAddress
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import ICMP, IPOption_Router_Alert
 from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
@@ -8229,7 +8229,7 @@ class DHCPServer:
 
         # Track seen Offers/Acks from any server: mac -> dict(...)
         self._seen_server_offers: Dict[str, dict] = {}
-
+        self._seen_v6_replies = {}
         # --- DHCPv6 ---
         self.dhcp6_prefix = ipaddress.IPv6Network(dhcp6_prefix) if dhcp6_prefix else None
         self.dhcp6_relay_target_ip = dhcp6_relay_target_ip
@@ -8458,6 +8458,11 @@ class DHCPServer:
                 if sport == 547 and dport == 546:
                     return "v6", "server"
             if pkt.haslayer(DHCP6_InfoRequest):
+                if dport == 547 and sport == 546:
+                    return "v6", "client"
+                if sport == 547 and dport == 546:
+                    return "v6", "server"
+            if pkt.haslayer(DHCP6_Reply):
                 if dport == 547 and sport == 546:
                     return "v6", "client"
                 if sport == 547 and dport == 546:
@@ -8696,6 +8701,73 @@ class DHCPServer:
             elif pkt.haslayer(DHCP6_Request):
                 dhcp6 = pkt[DHCP6_Request]
                 msgtype = 3
+            elif pkt.haslayer(DHCP6_Reply):
+                dhcp6 = pkt[DHCP6_Request]
+                msgtype = 7
+
+            if msgtype == 7:  # DHCPv6 Reply (server -> client)
+                src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "(no-ether)"
+                dst_ll = str(pkt[IPv6].dst) if pkt.haslayer(IPv6) else "(no-ip)"
+
+                # Notable options
+                srv_id = pkt.getlayer(DHCP6OptServerId)
+                cli_id = pkt.getlayer(DHCP6OptClientId)
+                dns_opt = pkt.getlayer(DHCP6OptDNSServers)
+                dom_opt = pkt.getlayer(DHCP6OptDNSDomains)
+
+                # IA_NA blocks & IA Address children
+                ia_blocks = pkt.getlayer(DHCP6OptIA_NA, nb=999) or []
+                if not isinstance(ia_blocks, list):
+                    ia_blocks = [ia_blocks]
+                ia_info = []
+                for ia in ia_blocks:
+                    iaid = int(getattr(ia, "iaid", 0))
+                    T1 = int(getattr(ia, "T1", 0))
+                    T2 = int(getattr(ia, "T2", 0))
+                    addrs = []
+                    for sub in getattr(ia, "ianaopts", []) or []:
+                        if isinstance(sub, DHCP6OptIAAddress):
+                            addrs.append({
+                                "addr": str(getattr(sub, "addr", "")),
+                                "pref": int(getattr(sub, "preflft", 0)),
+                                "valid": int(getattr(sub, "validlft", 0)),
+                            })
+                    ia_info.append({"iaid": iaid, "T1": T1, "T2": T2, "addrs": addrs})
+
+                # Tag as our/other by DUID (optional but handy)
+                our_duid = bytes(getattr(self._dhcp6_srv_id, "duid", b""))
+                srv_duid = bytes(getattr(srv_id, "duid", b"")) if srv_id else b""
+                cli_duid = bytes(getattr(cli_id, "duid", b"")) if cli_id else b""
+                tag = "our" if (srv_duid and our_duid and srv_duid == our_duid) else "other"
+
+                dns_list = [str(x) for x in getattr(dns_opt, "dnsservers", [])] if dns_opt else []
+                dom_list = [str(x) for x in getattr(dom_opt, "domains", [])] if dom_opt else []
+
+                # Record by client link-local
+                self._seen_v6_replies[dst_ll] = {
+                    "ts": self.time.time(),
+                    "iface": inbound_iface,
+                    "server_mac": src_mac,
+                    "server_duid_hex": srv_duid.hex() if srv_duid else "",
+                    "client_duid_hex": cli_duid.hex() if cli_duid else "",
+                    "dns": dns_list,
+                    "domains": dom_list,
+                    "ia_na": ia_info,
+                    "tag": tag,
+                }
+
+                # Log concise summary
+                ia_str = "; ".join(
+                    f"IAID={e['iaid']}[{','.join(a['addr'] for a in e['addrs'])}]"
+                    for e in ia_info
+                ) or "no-ia"
+                dns_str = ",".join(dns_list) or "no-dns"
+                dom_str = ",".join(dom_list) or "no-domains"
+                self.logger.log_message(
+                    f"[DHCP] v6 REPLY observed from {src_mac} → {dst_ll} [{tag}] "
+                    f"DNS=[{dns_str}] DOM=[{dom_str}] {ia_str}"
+                )
+                return True
 
             # Observe server->client only
             if direction != "client":

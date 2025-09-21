@@ -32,7 +32,7 @@ from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3
 from scapy.contrib.ikev2 import IKEv2
 from scapy.layers.dhcp import DHCP
-from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit, DHCP6_InfoRequest
+from scapy.layers.dhcp6 import DHCP6, DHCP6_Renew, DHCP6_Solicit, DHCP6_InfoRequest, DHCP6_Reply
 from scapy.layers.dns import DNSQR, DNS
 from scapy.layers.inet import TCP, ICMP
 from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6DestUnreach, \
@@ -1428,7 +1428,7 @@ class PythonRouterManager:
                             component="dhcp-out-router",
                         )
                         return
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest):
+            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest) or packet.haslayer(DHCP6_Reply):
                 self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router Packet: {packet.summary()}")
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
