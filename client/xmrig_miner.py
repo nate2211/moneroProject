@@ -7,7 +7,7 @@ import aiohttp
 import anyio
 import psutil
 import re
-
+import time
 from xmrig_managers import AsyncPsutilManager, AsyncTSharkManager
 
 REPORT_INTERVAL_SECONDS = 5
@@ -69,6 +69,9 @@ class PeriodicReporter:
                 # This will now catch any error, including from data gathering
                 self.logger.log_message("[!] CRITICAL ERROR IN PERIODIC REPORTER:")
                 self.logger.log_message(traceback.format_exc())
+                await self.xmrig_miner.stop_miner()
+                await asyncio.sleep(5)
+                await self.xmrig_miner.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
 
 
 class ServerPoller:
@@ -161,50 +164,111 @@ class ServerPoller:
 
             await asyncio.sleep(5)
 class OutputMonitor:
-
-    def __init__(self, xmrig_miner, xmrig_data, logger):
-
+    def __init__(self, xmrig_miner, xmrig_data, logger, *, quiet_timeout_sec: int = 60, poll_sec: int = 5):
         self.xmrig_data = xmrig_data
         self.logger = logger
         self.xmrig_miner = xmrig_miner
 
+        # --- watchdog state (ultra-light) ---
+        self._quiet_timeout_sec = max(5, int(quiet_timeout_sec))
+        self._poll_sec = max(1, int(poll_sec))
+        self._last_line_time = time.monotonic()
+        self._wd_stop = asyncio.Event()
+        self._wd_task: asyncio.Task | None = None
+        self._restart_requested = asyncio.Event()   # reader exits cleanly when set
+
+    async def _watchdog_loop(self):
+        # sleep a beat so the reader can start and set the first heartbeat
+        await asyncio.sleep(0.1)
+        while not self._wd_stop.is_set():
+            quiet_for = time.monotonic() - self._last_line_time
+            if quiet_for >= self._quiet_timeout_sec and not self._restart_requested.is_set():
+                # one log line on action; nothing on the hot path
+                self.logger.log_message(f"[Watchdog] No miner output for ≥{self._quiet_timeout_sec}s. Restarting miner...")
+                try:
+                    await self.xmrig_miner.stop_miner()
+                    await asyncio.sleep(2)
+                    await self.xmrig_miner.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
+                    self._restart_requested.set()
+                    self._last_line_time = time.monotonic()  # reset clock for new proc
+                except Exception as e:
+                    self.logger.log_message(f"[Watchdog] Restart failed: {e}")
+                    await asyncio.sleep(3)  # small backoff
+
+            # low-overhead poll
+            try:
+                await asyncio.wait_for(self._wd_stop.wait(), timeout=self._poll_sec)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _start_watchdog(self):
+        if self._wd_task and not self._wd_task.done():
+            return
+        self._wd_stop.clear()
+        self._restart_requested.clear()
+        self._wd_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _stop_watchdog(self):
+        self._wd_stop.set()
+        if self._wd_task:
+            try:
+                await asyncio.wait_for(self._wd_task, timeout=self._poll_sec + 2)
+            except asyncio.TimeoutError:
+                self._wd_task.cancel()
+            finally:
+                self._wd_task = None
+
     async def monitor_process(self, process):
+        # start watchdog for this monitoring session
+        await self._start_watchdog()
+        self._last_line_time = time.monotonic()
+        self._restart_requested.clear()
 
-        async for line_bytes in process.stdout:
-            decoded = line_bytes.decode("utf-8", errors="ignore").strip()
-            if not decoded or decoded.isspace() or len(decoded.strip()) == 0:
-                continue
+        try:
+            async for line_bytes in process.stdout:
+                if self._restart_requested.is_set():
+                    break  # watchdog restarted; stop reading old proc
 
-            lines = re.split(r'\r\n|\r|\n', decoded)
-
-            for line in lines:
-                clean_line = line.strip()
-                if not clean_line:
+                decoded = line_bytes.decode("utf-8", errors="ignore").strip()
+                if not decoded or decoded.isspace() or len(decoded.strip()) == 0:
                     continue
-                decoded = clean_line
-            self.logger.log_message(f"[XMRIG] {decoded}")
 
-            # --- Handle Error and Restart Conditions ---
-            if "error" in decoded.lower() or "compute error" in decoded.lower():
-                self.logger.log_message("[!] Error detected in miner output. Restarting miner...")
-                await self.xmrig_miner.stop_miner()
-                await asyncio.sleep(30)
-                await self.xmrig_miner.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
-                break # Stop monitoring the old, dead process
+                # heartbeat: single monotonic write (no logging impact)
+                self._last_line_time = time.monotonic()
 
-            # --- Parse Statistics ---
-            if "accepted" in decoded.lower():
-                self._parse_accepted_shares(decoded)
+                lines = re.split(r'\r\n|\r|\n', decoded)
+                for line in lines:
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
+                    decoded = clean_line
+                self.logger.log_message(f"[XMRIG] {decoded}")  # <-- unchanged
 
-            if "nvidia" in decoded.lower() and "c" in decoded.lower():
-                self._parse_gpu_stats(decoded)
+                # --- Handle Error and Restart Conditions ---
+                low = decoded.lower()
+                if "error" in low or "compute error" in low:
+                    self.logger.log_message("[!] Error detected in miner output. Restarting miner...")
+                    await self.xmrig_miner.stop_miner()
+                    await asyncio.sleep(30)
+                    await self.xmrig_miner.start_miner(self.xmrig_data.custom_pool_url, self.xmrig_data.threads)
+                    break  # Stop monitoring the old, dead process
 
-            if "miner" in decoded.lower() and "speed" in decoded.lower():
-                self._parse_hashrate(decoded)
+                # --- Parse Statistics ---
+                if "accepted" in low:
+                    self._parse_accepted_shares(decoded)
+                if "nvidia" in low and "c" in low:
+                    self._parse_gpu_stats(decoded)
+                if "miner" in low and "speed" in low:
+                    self._parse_hashrate(decoded)
 
-            # --- Parse New Job Information ---
-            if "new job from" in decoded.lower():
-                await self._handle_new_job(decoded)
+                # --- Parse New Job Information ---
+                if "new job from" in low:
+                    await self._handle_new_job(decoded)
+        finally:
+            # end watchdog for this monitor session (restart or shutdown)
+            await self._stop_watchdog()
+
+
 
     def _parse_accepted_shares(self, line):
         if "cpu" in line.lower():
@@ -383,9 +447,8 @@ class XmrigMiner:
 
         # Start monitoring
         await self.monitor.monitor_process(self.xmrig_data.xmrig_process)
-
     async def stop_miner(self):
-
+        await self.monitor._stop_watchdog()
         await self.kill_all_xmrig_processes()
         self.logger.log_message("[+] Stopped Miner now reporting")
         self.xmrig_data.client_status = "Stopped"
