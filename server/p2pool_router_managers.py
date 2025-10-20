@@ -6357,8 +6357,8 @@ class TransportDNSManager:
 
     Features:
       • Query/Response summaries with emojis 🧭📦
-      • RCODE/flags (RD, RA, AA, TC), EDNS(0) OPT summary (DO bit, UDP size)
-      • Answer preview (A/AAAA/CNAME/TXT/MX/SRV/NS/PTR/SOA…)
+      • RCODE/flags (RD, RA, AA, TC), EDNS(0) OPT summary (DO bit, UDP size + option hints)
+      • Answer preview (A/AAAA/CNAME/TXT/MX/SRV/NS/PTR/SOA/CAA/TLSA/…)
       • Basic latency tracking by (client_ip, client_port, txid, proto)
       • Lightweight GC for old pending queries
     """
@@ -6391,9 +6391,19 @@ class TransportDNSManager:
         46: "RRSIG",
         47: "NSEC",
         48: "DNSKEY",
-        65: "HTTPS",   # SVCB=64 / HTTPS=65 (newer)
         64: "SVCB",
+        65: "HTTPS",
+        # ---- NEW TYPES ----
+        257: "CAA",
+        52:  "TLSA",
+        59:  "CDS",
+        60:  "CDNSKEY",
+        50:  "NSEC3",
+        51:  "NSEC3PARAM",
     }
+
+    # ---- NEW: EDNS option codes for nicer names ----
+    _EDNS_OPT = {3: "NSID", 8: "ECS", 10: "COOKIE", 12: "PADDING", 15: "EXPIRE"}
 
     def __init__(
         self,
@@ -6422,7 +6432,7 @@ class TransportDNSManager:
 
     def handle(
         self,
-        packet: Packet,
+        packet: "Packet",
         src_ip: str,
         dst_ip: str,
         sport: int,
@@ -6488,7 +6498,14 @@ class TransportDNSManager:
         tc = bool(getattr(dns, "tc", 0))
 
         edns = self._extract_edns(dns)
-        edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''})" if edns else ""
+        # ---- NEW: add option hints (ECS/COOKIE) if present ----
+        if edns:
+            hints = []
+            if "ECS" in edns.get("opts", {}): hints.append("ECS")
+            if "COOKIE" in edns.get("opts", {}): hints.append("COOKIE")
+            edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''}{(' ' + ' '.join(hints)) if hints else ''})"
+        else:
+            edns_str = ""
 
         # Query preview (first name/type)
         head = qnames[0] if qnames else "?"
@@ -6521,8 +6538,16 @@ class TransportDNSManager:
         ad = bool(getattr(dns, "ad", 0))
 
         qn_preview = self._preview_qname(dns)
+
         edns = self._extract_edns(dns)
-        edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''})" if edns else ""
+        # ---- NEW: option hints in EDNS summary ----
+        if edns:
+            hints = []
+            if "ECS" in edns.get("opts", {}): hints.append("ECS")
+            if "COOKIE" in edns.get("opts", {}): hints.append("COOKIE")
+            edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''}{(' ' + ' '.join(hints)) if hints else ''})"
+        else:
+            edns_str = ""
 
         # Counts
         an, ns, ar = int(getattr(dns, "ancount", 0)), int(getattr(dns, "nscount", 0)), int(getattr(dns, "arcount", 0))
@@ -6724,23 +6749,50 @@ class TransportDNSManager:
             # swallow parse errors, return what we got
             pass
         return names, types
+
+    # ---- REPLACED: richer EDNS extractor with options ----
     def _extract_edns(self, dns: Any) -> Optional[Dict[str, Any]]:
         """
-        Look for OPT (type 41) in additional; return {'size': int, 'do': bool} if present.
+        Look for OPT (type 41) in additional; return
+        {'size': int, 'do': bool, 'opts': {name->string}} if present.
         """
         try:
             arcount = int(getattr(dns, "arcount", 0))
             rr = getattr(dns, "ar", None)
             for r in self._iter_rr(rr, arcount):
-                if int(getattr(r, "type", 0)) == 41:
-                    # In OPT, 'rclass' is UDP payload size; DO bit is in the Z field (scapy uses 'ttl')
-                    size = int(getattr(r, "rclass", 0))
-                    z = int(getattr(r, "ttl", 0))
-                    do = bool(z & 0x8000)
-                    return {"size": size, "do": do}
+                if int(getattr(r, "type", 0)) != 41:
+                    continue
+                size = int(getattr(r, "rclass", 0))  # UDP payload size
+                z    = int(getattr(r, "ttl", 0))     # Z field (DO bit lives here)
+                do   = bool(z & 0x8000)
+                out = {"size": size, "do": do, "opts": {}}
+                opts = getattr(r, "options", None) or getattr(r, "opt", None) or []
+                for o in opts:
+                    code = int(getattr(o, "optcode", getattr(o, "code", -1)))
+                    data = getattr(o, "optdata", getattr(o, "data", b""))
+                    name = self._EDNS_OPT.get(code, f"OPT{code}")
+                    out["opts"][name] = self._fmt_edns_opt(code, data)
+                return out
         except Exception:
             pass
         return None
+
+    # ---- NEW: EDNS option formatter ----
+    def _fmt_edns_opt(self, code: int, data: Any) -> str:
+        try:
+            b = bytes(data) if isinstance(data, (bytes, bytearray)) else b""
+            if code == 8 and len(b) >= 4:  # ECS
+                fam = int.from_bytes(b[0:2], "big"); src = b[2]; scope = b[3]
+                return f"fam={fam} src={src} scope={scope} addr={b[4:].hex()}"
+            if code == 10:  # COOKIE
+                return b.hex()
+            if code == 12:  # PADDING
+                return f"{len(b)}B"
+            if b:
+                return b.hex()
+            return "-"
+        except Exception:
+            return "?"
 
     def _iter_qr(self, qd: Any, count: int):
         """Iterate DNSQR chain safely."""
@@ -6768,19 +6820,35 @@ class TransportDNSManager:
                 break
             n += 1
 
+    # ---- UPDATED: richer type printing ----
+    def _fmt_svcparams(self, rr: Any) -> str:
+        """Best-effort pretty-print for HTTPS/SVCB records."""
+        parts = []
+        for k in ("alpn", "ech", "ipv4hint", "ipv6hint", "port", "no-default-alpn", "mandatory"):
+            v = getattr(rr, k, None)
+            if v is None:
+                continue
+            if isinstance(v, (bytes, bytearray)):
+                try:
+                    v = v.decode("ascii", "ignore")
+                except Exception:
+                    v = "<bin>"
+            parts.append(f"{k}={v}")
+        return "; ".join(parts)
+
     def _fmt_rr(self, rr: Any) -> str:
         """Compact one-line RR rendering with emojis by type."""
         try:
             name = self._safe_name(getattr(rr, "rrname", b""))
             rtype = int(getattr(rr, "type", 0))
             rttl = int(getattr(rr, "ttl", 0))
-            cls = int(getattr(rr, "rclass", 1))
+            # cls = int(getattr(rr, "rclass", 1))  # not shown
             tstr = self._QT.get(rtype, str(rtype))
 
             # Value by type
             val = "?"
             if tstr in ("A", "AAAA", "NS", "CNAME", "PTR"):
-                val = self._safe_name(getattr(rr, "rdata", b"")) if tstr != "A" and tstr != "AAAA" else getattr(rr, "rdata", "?")
+                val = self._safe_name(getattr(rr, "rdata", b"")) if tstr not in ("A", "AAAA") else getattr(rr, "rdata", "?")
             elif tstr == "MX":
                 pref = getattr(rr, "preference", None)
                 exch = self._safe_name(getattr(rr, "exchange", b""))
@@ -6800,6 +6868,39 @@ class TransportDNSManager:
                 rname = self._safe_name(getattr(rr, "rname", b""))
                 serial = getattr(rr, "serial", "?")
                 val = f"{mname} {rname} serial={serial}"
+            elif tstr in ("HTTPS", "SVCB"):
+                try:
+                    val = self._fmt_svcparams(rr) or self._safe(getattr(rr, "rdata", b""))
+                except Exception:
+                    val = "?"
+            elif tstr == "CAA":
+                tag = getattr(rr, "tag", None)
+                flg = getattr(rr, "flag", getattr(rr, "flags", None))
+                val = f"flag={flg} {tag}={self._safe(getattr(rr, 'value', b''))}"
+            elif tstr == "TLSA":
+                usage  = getattr(rr, "usage", None)
+                sel    = getattr(rr, "selector", None)
+                mtype  = getattr(rr, "mtype", getattr(rr, "matchingtype", None))
+                val = f"usage={usage} sel={sel} mtype={mtype}"
+            elif tstr == "DS":
+                keytag = getattr(rr, "keytag", None)
+                alg    = getattr(rr, "algorithm", None)
+                dgt    = getattr(rr, "digtype", getattr(rr, "digesttype", None))
+                val = f"keytag={keytag} alg={alg} dig={dgt}"
+            elif tstr == "DNSKEY":
+                flags = getattr(rr, "flags", None)
+                alg   = getattr(rr, "algorithm", None)
+                proto = getattr(rr, "protocol", None)
+                val = f"flags={flags} proto={proto} alg={alg}"
+            elif tstr == "RRSIG":
+                typcov = getattr(rr, "typecovered", None)
+                alg    = getattr(rr, "algorithm", None)
+                keytag = getattr(rr, "keytag", None)
+                exp    = getattr(rr, "expiration", None)
+                val = f"type={typcov} alg={alg} keytag={keytag} exp={exp}"
+            elif tstr in ("NSEC", "NSEC3", "NSEC3PARAM"):
+                nxt = self._safe_name(getattr(rr, "nextname", b"")) if hasattr(rr, "nextname") else ""
+                val = f"next={nxt}" if nxt else self._safe(getattr(rr, "rdata", b""))
             elif rtype == 41:
                 # OPT already summarized separately
                 val = "OPT"
@@ -6868,7 +6969,7 @@ class TransportDNSManager:
         if now - self._last_gc < self._gc_interval:
             return
         dead = []
-        for k, v in self._pending.items():
+        for k, v in list(self._pending.items()):
             if now - v.get("ts", 0) > self._pending_ttl:
                 dead.append(k)
         for k in dead:
