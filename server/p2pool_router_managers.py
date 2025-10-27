@@ -2117,19 +2117,487 @@ class TransportSCADAManager:
             self._metrics["flow_cache_evictions"] += excess
 
 class TransportSSHManager:
-    def __init__(self, logger): self.logger = logger
-    def handle(self, pkt, src, dst, sport, dport, inbound_iface):
-        self.logger.log_message(f"[Transport][🧵 TCP][💻 SSH] Port 22 traffic detected from {src}:{sport} to {dst}:{dport} on {inbound_iface}.")
+    """
+    Lightweight SSH detector/logger with global token-bucket and per-flow cooldown.
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+    """
+
+    # ---- Tunables ----
+    LOG_RPS           = 0.5
+    LOG_BURST         = 60
+    FLOW_COOLDOWN_S   = 20.0
+    COOLDOWN_JITTER_S = 0.50
+    BIG_PAYLOAD_BYTES = 1200
+    PORTS             = {22}
+
+    class _TokenBucket:
+        __slots__ = ("capacity", "refill", "tokens", "last")
+        def __init__(self, capacity: int, refill_rate_per_s: float):
+            self.capacity = float(max(1, capacity))
+            self.refill = float(max(0.05, refill_rate_per_s))
+            self.tokens = float(self.capacity)
+            self.last = time.time()
+        def _refill(self):
+            now = time.time()
+            delta = now - self.last
+            if delta > 0:
+                self.tokens = min(self.capacity, self.tokens + delta * self.refill)
+                self.last = now
+        def allow(self, cost: float = 1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def __init__(self, logger,
+                 *,
+                 log_rps: float = None,
+                 log_burst: int = None,
+                 flow_cooldown_s: float = None):
+        self.log = logger
+        self._tb = self._TokenBucket(
+            capacity=int(log_burst or self.LOG_BURST),
+            refill_rate_per_s=float(log_rps or self.LOG_RPS),
+        )
+        self._cooldown_until: dict[tuple, float] = {}
+        self._flow_cool = float(flow_cooldown_s or self.FLOW_COOLDOWN_S)
+        self._emit("[Transport][💻 SSH] Manager ready.")
+
+    # ---- Public API ----
+    def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        if not self._is_service_port(sport, dport):
+            return False
+        iface = (inbound_iface or "?").split("_")[-1]
+        payload = self._payload_sample(packet, cap=1024)
+        importance = self._importance(packet, payload)
+        fkey = self._flow_key(src_ip, sport, dst_ip, dport, iface)
+        if not self._should_log(fkey, importance):
+            return True
+        l7 = self._l7_hint(payload) if payload else "none"
+        size = len(payload)
+        direction = f"{src_ip}:{sport} → {dst_ip}:{dport}" if dport in self.PORTS else f"{dst_ip}:{dport} ← {src_ip}:{sport}"
+        self._emit(f"[Transport][🧵 TCP]💻 SSH if={iface} {direction} | payload={size}B l7={l7}")
+        return True
+
+    # ---- Helpers ----
+    def _is_service_port(self, sport: int, dport: int) -> bool:
+        try:
+            return int(sport) in self.PORTS or int(dport) in self.PORTS
+        except Exception:
+            return False
+
+    def _payload_sample(self, packet, cap: int = 1024) -> bytes:
+        try:
+            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                return bytes(getattr(packet[Raw], "load", b"") or b"")[:cap]
+        except Exception:
+            pass
+        try:
+            l4 = packet.getlayer(TCP) if hasattr(packet, "getlayer") else None
+            if l4 is not None:
+                pl = getattr(l4, "payload", None)
+                if pl and not isinstance(pl, NoPayload):
+                    return bytes(pl)[:cap]
+        except Exception:
+            pass
+        try:
+            return bytes(packet)[:cap]
+        except Exception:
+            return b""
+
+    def _importance(self, packet, payload: bytes) -> str:
+        try:
+            if TCP is not None and hasattr(packet, "getlayer"):
+                l4 = packet.getlayer(TCP)
+                if l4 is not None:
+                    flags = getattr(l4, "flags", 0)
+                    if hasattr(flags, "value"):
+                        fv = int(flags.value)
+                        if fv & 0x04 or fv & 0x01:  # RST or FIN
+                            return "high"
+                        if fv & 0x02:               # SYN
+                            return "med"
+                    else:
+                        s = str(flags)
+                        if "R" in s or "F" in s:
+                            return "high"
+                        if "S" in s:
+                            return "med"
+        except Exception:
+            pass
+        if len(payload) >= self.BIG_PAYLOAD_BYTES:
+            return "med"
+        return "low"
+
+    def _flow_key(self, src, sport, dst, dport, iface) -> tuple[str, ...]:
+        def _nh(x): return "" if x is None else str(x)
+        def _np(p):
+            try: return str(int(p))
+            except Exception: return "" if p is None else str(p)
+        sa = (_nh(src), _np(sport))
+        sb = (_nh(dst), _np(dport))
+        first, second = (sa, sb) if (sa < sb) else (sb, sa)
+        return first + second + (_nh(iface),)
+
+    def _should_log(self, fkey: tuple, importance: str) -> bool:
+        now = time.time()
+        last_ok = self._cooldown_until.get(fkey, 0.0)
+        if now < last_ok:
+            return False
+        cost = 1.0 if importance == "high" else (1.5 if importance == "med" else 3.0)
+        allowed = self._tb.allow(cost=1.0 if importance == "high" else cost)
+        if not allowed and importance == "high" and (now - self._tb.last) > 0.5:
+            allowed = True
+        if not allowed:
+            return False
+        jitter = (random.random() - 0.5) * 2 * self.COOLDOWN_JITTER_S
+        self._cooldown_until[fkey] = now + self._flow_cool + jitter
+        return True
+
+    def _l7_hint(self, payload: bytes) -> str:
+        try:
+            head = payload[:128]
+            if not head:
+                return "none"
+            if b"SSH-" in head:
+                return "banner"
+            return "likely-encrypted" if len(head) >= 64 else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _emit(self, msg: str):
+        try:
+            self.log.log_message(msg)
+        except Exception:
+            pass
+
 
 class TransportFTPManager:
-    def __init__(self, logger): self.logger = logger
-    def handle(self, pkt, src, dst, sport, dport):
-        self.logger.log_message(f"[Transport][🧵 TCP][📁 FTP] Port 21 (Control) traffic detected from {src}:{sport} to {dst}:{dport}.")
+    """
+    Lightweight FTP (control, port 21) detector/logger with global token-bucket and per-flow cooldown.
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+    """
+
+    # ---- Tunables ----
+    LOG_RPS           = 0.5
+    LOG_BURST         = 60
+    FLOW_COOLDOWN_S   = 20.0
+    COOLDOWN_JITTER_S = 0.50
+    BIG_PAYLOAD_BYTES = 1200
+    PORTS             = {21}
+
+    class _TokenBucket:
+        __slots__ = ("capacity", "refill", "tokens", "last")
+        def __init__(self, capacity: int, refill_rate_per_s: float):
+            self.capacity = float(max(1, capacity))
+            self.refill = float(max(0.05, refill_rate_per_s))
+            self.tokens = float(self.capacity)
+            self.last = time.time()
+        def _refill(self):
+            now = time.time()
+            delta = now - self.last
+            if delta > 0:
+                self.tokens = min(self.capacity, self.tokens + delta * self.refill)
+                self.last = now
+        def allow(self, cost: float = 1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def __init__(self, logger,
+                 *,
+                 log_rps: float = None,
+                 log_burst: int = None,
+                 flow_cooldown_s: float = None):
+        self.log = logger
+        self._tb = self._TokenBucket(
+            capacity=int(log_burst or self.LOG_BURST),
+            refill_rate_per_s=float(log_rps or self.LOG_RPS),
+        )
+        self._cooldown_until: dict[tuple, float] = {}
+        self._flow_cool = float(flow_cooldown_s or self.FLOW_COOLDOWN_S)
+        self._emit("[Transport][📁 FTP] Manager ready.")
+
+    # ---- Public API ----
+    def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        if not self._is_service_port(sport, dport):
+            return False
+        iface = (inbound_iface or "?").split("_")[-1]
+        payload = self._payload_sample(packet, cap=1024)
+        importance = self._importance(packet, payload)
+        fkey = self._flow_key(src_ip, sport, dst_ip, dport, iface)
+        if not self._should_log(fkey, importance):
+            return True
+        l7 = self._l7_hint(payload) if payload else "none"
+        size = len(payload)
+        direction = f"{src_ip}:{sport} → {dst_ip}:{dport}" if dport in self.PORTS else f"{dst_ip}:{dport} ← {src_ip}:{sport}"
+        self._emit(f"[Transport][🧵 TCP]📁 FTP if={iface} {direction} | payload={size}B l7={l7}")
+        return True
+
+    # ---- Helpers ----
+    def _is_service_port(self, sport: int, dport: int) -> bool:
+        try:
+            return int(sport) in self.PORTS or int(dport) in self.PORTS
+        except Exception:
+            return False
+
+    def _payload_sample(self, packet, cap: int = 1024) -> bytes:
+        try:
+            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                return bytes(getattr(packet[Raw], "load", b"") or b"")[:cap]
+        except Exception:
+            pass
+        try:
+            l4 = packet.getlayer(TCP) if hasattr(packet, "getlayer") else None
+            if l4 is not None:
+                pl = getattr(l4, "payload", None)
+                if pl and not isinstance(pl, NoPayload):
+                    return bytes(pl)[:cap]
+        except Exception:
+            pass
+        try:
+            return bytes(packet)[:cap]
+        except Exception:
+            return b""
+
+    def _importance(self, packet, payload: bytes) -> str:
+        try:
+            if TCP is not None and hasattr(packet, "getlayer"):
+                l4 = packet.getlayer(TCP)
+                if l4 is not None:
+                    flags = getattr(l4, "flags", 0)
+                    if hasattr(flags, "value"):
+                        fv = int(flags.value)
+                        if fv & 0x04 or fv & 0x01:  # RST or FIN
+                            return "high"
+                        if fv & 0x02:               # SYN
+                            return "med"
+                    else:
+                        s = str(flags)
+                        if "R" in s or "F" in s:
+                            return "high"
+                        if "S" in s:
+                            return "med"
+        except Exception:
+            pass
+        if len(payload) >= self.BIG_PAYLOAD_BYTES:
+            return "med"
+        return "low"
+
+    def _flow_key(self, src, sport, dst, dport, iface) -> tuple[str, ...]:
+        def _nh(x): return "" if x is None else str(x)
+        def _np(p):
+            try: return str(int(p))
+            except Exception: return "" if p is None else str(p)
+        sa = (_nh(src), _np(sport))
+        sb = (_nh(dst), _np(dport))
+        first, second = (sa, sb) if (sa < sb) else (sb, sa)
+        return first + second + (_nh(iface),)
+
+    def _should_log(self, fkey: tuple, importance: str) -> bool:
+        now = time.time()
+        last_ok = self._cooldown_until.get(fkey, 0.0)
+        if now < last_ok:
+            return False
+        cost = 1.0 if importance == "high" else (1.5 if importance == "med" else 3.0)
+        allowed = self._tb.allow(cost=1.0 if importance == "high" else cost)
+        if not allowed and importance == "high" and (now - self._tb.last) > 0.5:
+            allowed = True
+        if not allowed:
+            return False
+        jitter = (random.random() - 0.5) * 2 * self.COOLDOWN_JITTER_S
+        self._cooldown_until[fkey] = now + self._flow_cool + jitter
+        return True
+
+    def _l7_hint(self, payload: bytes) -> str:
+        if not payload:
+            return "none"
+        head = payload[:256]
+        for cmd in (b"USER ", b"PASS ", b"RETR ", b"STOR ", b"LIST", b"PASV", b"PORT ", b"PWD", b"CWD "):
+            if head.startswith(cmd):
+                return cmd.decode("ascii", "ignore").strip()
+        if b"227 " in head and b"Passive Mode" in head:
+            return "227-PASV"
+        for code in (b"220 ", b"221 ", b"230 ", b"331 ", b"530 "):
+            if head.startswith(code):
+                return code.decode("ascii", "ignore").strip()
+        asciiish = sum(1 for x in head if 9 <= x <= 13 or 32 <= x <= 126)
+        if asciiish >= max(1, int(0.9 * len(head))):
+            return "control-cleartext"
+        return "unknown"
+
+    def _emit(self, msg: str):
+        try:
+            self.log.log_message(msg)
+        except Exception:
+            pass
+
 
 class TransportRDPManager:
-    def __init__(self, logger): self.logger = logger
-    def handle(self, pkt, src, dst, sport, dport):
-        self.logger.log_message(f"[Transport][🧵 TCP][🖥️ RDP] Port 3389 traffic detected from {src}:{sport} to {dst}:{dport}.")
+    """
+    Lightweight RDP (3389) detector/logger with global token-bucket and per-flow cooldown.
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+    """
+
+    # ---- Tunables ----
+    LOG_RPS           = 0.5
+    LOG_BURST         = 60
+    FLOW_COOLDOWN_S   = 20.0
+    COOLDOWN_JITTER_S = 0.50
+    BIG_PAYLOAD_BYTES = 1200
+    PORTS             = {3389}
+
+    class _TokenBucket:
+        __slots__ = ("capacity", "refill", "tokens", "last")
+        def __init__(self, capacity: int, refill_rate_per_s: float):
+            self.capacity = float(max(1, capacity))
+            self.refill = float(max(0.05, refill_rate_per_s))
+            self.tokens = float(self.capacity)
+            self.last = time.time()
+        def _refill(self):
+            now = time.time()
+            delta = now - self.last
+            if delta > 0:
+                self.tokens = min(self.capacity, self.tokens + delta * self.refill)
+                self.last = now
+        def allow(self, cost: float = 1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def __init__(self, logger,
+                 *,
+                 log_rps: float = None,
+                 log_burst: int = None,
+                 flow_cooldown_s: float = None):
+        self.log = logger
+        self._tb = self._TokenBucket(
+            capacity=int(log_burst or self.LOG_BURST),
+            refill_rate_per_s=float(log_rps or self.LOG_RPS),
+        )
+        self._cooldown_until: dict[tuple, float] = {}
+        self._flow_cool = float(flow_cooldown_s or self.FLOW_COOLDOWN_S)
+        self._emit("[Transport][🧵 TCP]🖥️ RDP manager ready.")
+
+    # ---- Public API ----
+    def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        if not self._is_service_port(sport, dport):
+            return False
+        iface = (inbound_iface or "?").split("_")[-1]
+        payload = self._payload_sample(packet, cap=1024)
+        importance = self._importance(packet, payload)
+        fkey = self._flow_key(src_ip, sport, dst_ip, dport, iface)
+        if not self._should_log(fkey, importance):
+            return True
+        l7 = self._l7_hint(payload) if payload else "none"
+        size = len(payload)
+        direction = f"{src_ip}:{sport} → {dst_ip}:{dport}" if dport in self.PORTS else f"{dst_ip}:{dport} ← {src_ip}:{sport}"
+        self._emit(f"[Transport][🖥️ RDP] if={iface} {direction} | payload={size}B l7={l7}")
+        return True
+
+    # ---- Helpers ----
+    def _is_service_port(self, sport: int, dport: int) -> bool:
+        try:
+            return int(sport) in self.PORTS or int(dport) in self.PORTS
+        except Exception:
+            return False
+
+    def _payload_sample(self, packet, cap: int = 1024) -> bytes:
+        try:
+            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                return bytes(getattr(packet[Raw], "load", b"") or b"")[:cap]
+        except Exception:
+            pass
+        try:
+            l4 = packet.getlayer(TCP) if hasattr(packet, "getlayer") else None
+            if l4 is not None:
+                pl = getattr(l4, "payload", None)
+                if pl and not isinstance(pl, NoPayload):
+                    return bytes(pl)[:cap]
+        except Exception:
+            pass
+        try:
+            return bytes(packet)[:cap]
+        except Exception:
+            return b""
+
+    def _importance(self, packet, payload: bytes) -> str:
+        try:
+            if TCP is not None and hasattr(packet, "getlayer"):
+                l4 = packet.getlayer(TCP)
+                if l4 is not None:
+                    flags = getattr(l4, "flags", 0)
+                    if hasattr(flags, "value"):
+                        fv = int(flags.value)
+                        if fv & 0x04 or fv & 0x01:  # RST or FIN
+                            return "high"
+                        if fv & 0x02:               # SYN
+                            return "med"
+                    else:
+                        s = str(flags)
+                        if "R" in s or "F" in s:
+                            return "high"
+                        if "S" in s:
+                            return "med"
+        except Exception:
+            pass
+        if len(payload) >= self.BIG_PAYLOAD_BYTES:
+            return "med"
+        return "low"
+
+    def _flow_key(self, src, sport, dst, dport, iface) -> tuple[str, ...]:
+        def _nh(x): return "" if x is None else str(x)
+        def _np(p):
+            try: return str(int(p))
+            except Exception: return "" if p is None else str(p)
+        sa = (_nh(src), _np(sport))
+        sb = (_nh(dst), _np(dport))
+        first, second = (sa, sb) if (sa < sb) else (sb, sa)
+        return first + second + (_nh(iface),)
+
+    def _should_log(self, fkey: tuple, importance: str) -> bool:
+        now = time.time()
+        last_ok = self._cooldown_until.get(fkey, 0.0)
+        if now < last_ok:
+            return False
+        cost = 1.0 if importance == "high" else (1.5 if importance == "med" else 3.0)
+        allowed = self._tb.allow(cost=1.0 if importance == "high" else cost)
+        if not allowed and importance == "high" and (now - self._tb.last) > 0.5:
+            allowed = True
+        if not allowed:
+            return False
+        jitter = (random.random() - 0.5) * 2 * self.COOLDOWN_JITTER_S
+        self._cooldown_until[fkey] = now + self._flow_cool + jitter
+        return True
+
+    def _l7_hint(self, payload: bytes) -> str:
+        if not payload:
+            return "none"
+        if len(payload) >= 4 and payload[0] == 0x03 and payload[1] == 0x00:
+            return "tpkt-x224"
+        if len(payload) >= 5:
+            ct, ver = payload[0], (payload[1] << 8) | payload[2]
+            if ct in (0x14, 0x15, 0x16, 0x17) and ver in (0x0301, 0x0302, 0x0303, 0x0304):
+                return "tls-record"
+        if b"Cookie: mstshash=" in payload[:512]:
+            return "x224-cookie"
+        return "unknown"
+
+    def _emit(self, msg: str):
+        try:
+            self.log.log_message(msg)
+        except Exception:
+            pass
+
+
 
 
 class TransportInspectionManager:
