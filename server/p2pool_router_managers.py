@@ -2118,8 +2118,8 @@ class TransportSCADAManager:
 
 class TransportSSHManager:
     def __init__(self, logger): self.logger = logger
-    def handle(self, pkt, src, dst, sport, dport):
-        self.logger.log_message(f"[Transport][🧵 TCP][💻 SSH] Port 22 traffic detected from {src}:{sport} to {dst}:{dport}.")
+    def handle(self, pkt, src, dst, sport, dport, inbound_iface):
+        self.logger.log_message(f"[Transport][🧵 TCP][💻 SSH] Port 22 traffic detected from {src}:{sport} to {dst}:{dport} on {inbound_iface}.")
 
 class TransportFTPManager:
     def __init__(self, logger): self.logger = logger
