@@ -3528,8 +3528,71 @@ class TransportHTTPSManager:
             "sslv2_seen": 0,              # NEW
             "sslv2_handshake_labeled": 0, # NEW
         }
+        self._metrics.update({
+            "tcp_retx": 0,
+            "tcp_dup_ack": 0,
+            "tcp_ooo": 0,
+            "tcp_keepalive": 0,
+            "tcp_probe": 0,
+        })
         self._peek_tcp_meta_cached = None  # per-handle cache
         self._safe_log("[Transport][🔒 HTTPS] Manager ready")
+
+    def _dir_in_flow(self, src_ip, sport, dst_ip, dport, fkey):
+        # Determine whether this packet goes from the canonical "first" -> "second"
+        first = (str(src_ip), str(int(sport)))
+        second = (str(dst_ip), str(int(dport)))
+        # fkey is ('a_ip','a_port','b_ip','b_port') in sorted order (your _flow_key)
+        a_ip, a_po, b_ip, b_po = fkey
+        return (first == (a_ip, a_po)) and (second == (b_ip, b_po))
+
+    def _tcp_flow_tag(self, st, direction, tmeta):
+        """
+        Lightweight TCP dynamics tag using last seq/ack/payload.
+        Updates st['tcp'][direction] and returns an annotation string or None.
+        """
+        try:
+            if not tmeta:
+                return None
+            seq = tmeta.get("seq")
+            ack = tmeta.get("ack")
+            pay = tmeta.get("tcp_payload_bytes") or 0
+            flags = (tmeta.get("flags") or "")
+            d = st.setdefault("tcp", {}).setdefault(direction, {})
+
+            tag = None
+            # Keep-alive: ACK-only, no payload, identical seq/ack moving idle window
+            if "A" in flags and pay == 0 and d.get("last_seq") == seq and d.get("last_ack") == ack:
+                tag = "KA"  # keep-alive
+                self._metrics["tcp_keepalive"] += 1
+
+            # Window probe: 1-byte payload is common heuristic
+            elif pay == 1 and "A" in flags:
+                tag = "PROBE"
+                self._metrics["tcp_probe"] += 1
+
+            # Dup-ACK: no payload, repeated ack value while seq unchanged
+            elif pay == 0 and d.get("last_ack") == ack and d.get("last_seq") == seq and "A" in flags:
+                tag = "DUP-ACK"
+                self._metrics["tcp_dup_ack"] += 1
+
+            # Retransmit: same seq with payload > 0
+            elif pay > 0 and d.get("last_seq") == seq:
+                tag = "RETX"
+                self._metrics["tcp_retx"] += 1
+
+            # Out-of-order: lower-than-expected seq with payload
+            elif pay > 0 and d.get("last_seq") is not None and seq < d["last_seq"]:
+                tag = "OOO"
+                self._metrics["tcp_ooo"] += 1
+
+            # persist new snapshot
+            d["last_seq"] = seq
+            d["last_ack"] = ack
+            d["last_pay"] = pay
+            return tag
+        except Exception:
+            return None
 
     # ---------------------------
     # Public entrypoint
@@ -3537,11 +3600,11 @@ class TransportHTTPSManager:
     def handle(self, packet, inbound_iface: str) -> bool:
         """
         Hot-path with budgets & fast-path:
-        - QUICK QUIC detection for UDP:443 (so UDP 'Raw' lines make sense)
-        - Classify (TLS?) cheaply
-        - Parse ClientHello once to learn SNI/ALPN (then stop deep parsing)
-        - Always log SNI once learned, rate-limited per flow
-        - Mark flow 'noinspect' on first ApplicationData or after CH
+        - QUICK QUIC detection for UDP:443
+        - Early off-443 reject using cheap TLS signature
+        - Flow cache with directional TCP micro-state tagging
+        - Parse ClientHello once; cache SNI/ALPN; rate-limited flow logs
+        - noinspect after CH or first AppData or close_notify Alert
         """
         try:
             # ---- QUIC (UDP:443) quick path ----
@@ -3555,35 +3618,34 @@ class TransportHTTPSManager:
                         self._metrics["quic_seen"] += 1
                         if self.log_packet_prefix:
                             self._safe_log(self._format_quic_prefix(packet, inbound_iface, raw))
-                        return True  # QUIC handled (we don't deep-parse here)
+                        return True
 
             if not self._pre_checks(packet):
                 return False
 
             src_ip, dst_ip = self._resolve_ips(packet)
             sport, dport = self._resolve_ports(packet)
-
             on_443 = (sport == 443) or (dport == 443)
-            if not on_443:
-                if not self.detect_non443_tls:
-                    return False
+
+            # Cheap reject for off-443 unless explicitly allowed AND looks like TLS
+            if not on_443 and not self.detect_non443_tls:
+                return False
 
             raw = self._get_raw_bytes(packet)
+            if not on_443 and self.detect_non443_tls:
+                # If no payload or not matching cheap TLS signature, bail early
+                if not raw or not self._cheap_tls_signature(packet):
+                    return False
 
-            # Try TLSv1.x / TLS1.3 style first
             mv = memoryview(raw) if raw else None
             rhead = None
             sslv2 = None
-
             if raw:
                 rhead = self._peek_tls_record_header_mv(mv)
                 if not rhead:
-                    # Try SSLv2 record (older servers/clients or mis-labeled dissectors)
                     sslv2 = self._peek_sslv2_header(mv)
-                    if not sslv2:
-                        # Not TLS/SSLv2 — bail if off-443; else we may still prefix-log TCP
-                        if not on_443:
-                            return False
+                    if not sslv2 and not on_443:
+                        return False  # off-443 and not SSL/TLS
 
             now = time.time()
             fkey = self._flow_key(src_ip, sport, dst_ip, dport)
@@ -3593,10 +3655,14 @@ class TransportHTTPSManager:
                     "first": now, "last": now, "last_log": 0.0,
                     "sni": None, "alpn": None, "ja3": None,
                     "classified": False, "noinspect": False,
+                    # TCP microstate gets attached lazily: st["tcp"]["a2b"|"b2a"]
                 }
                 self._tls_flows[fkey] = st
             else:
                 st["last"] = now
+
+            # Direction (for TCP microstate)
+            direction = "a2b" if self._dir_in_flow(src_ip, sport, dst_ip, dport, fkey) else "b2a"
 
             # ----- Prefix (Scapy-like) line -----
             if self.log_packet_prefix:
@@ -3604,79 +3670,111 @@ class TransportHTTPSManager:
                     self._metrics["sslv2_seen"] += 1
                     self._safe_log(self._format_packet_prefix_ssl2(packet, inbound_iface, sslv2))
                 elif rhead:
-                    # Optionally peek ClientHello for subtype in prefix as well
                     ch = None
-                    if rhead["ct"] == "Handshake":
+                    # Pull cached CH bits (SNI/ALPN) if we already learned them
+                    if st.get("sni") is not None or st.get("alpn") is not None:
+                        self._metrics["sni_cache_hits"] += 1
+                        ch = {"sni": st.get("sni"), "alpn": st.get("alpn")}
+                    elif rhead["ct"] == "Handshake":
+                        # peek lightweightly to label ClientHello/ServerHello in the prefix
                         ch = self._peek_client_hello_rich_mv(mv)
                     self._safe_log(self._format_packet_prefix(packet, inbound_iface, rhead, ch))
                 else:
-                    # header-only TCP on 443 (no payload)
                     self._safe_log(self._format_packet_prefix_header_only(packet, inbound_iface))
 
-            # ----- Flow-oriented logic only for TLSv1.x+ -----
+            # ----- Header-only (no payload) -----
             if not raw:
-                # header-only packets: minimal log, mark classified
-                if self._should_log_flow(st, now):
-                    self._safe_log(f"[Transport][🧵 TCP][🔒 HTTPS] hdr-only "
-                                   f"{src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)} "
-                                   f"SNI={st.get('sni') or '-'}")
                 st["classified"] = True
+                # Tag TCP dynamics (dup-acks, keep-alives) if possible
+                if self.report_tcp_meta and self._peek_tcp_meta_cached:
+                    dyn = self._tcp_flow_tag(st, direction, self._peek_tcp_meta_cached)
+                    if dyn and self._should_log_flow(st, now):
+                        self._safe_log(
+                            f"[Transport][🧵 TCP][🔒 HTTPS] hdr-only {src_ip}:{sport} → {dst_ip}:{dport} "
+                            f"on {self._iface_suffix(inbound_iface)} dyn={dyn} SNI={st.get('sni') or '-'}"
+                        )
                 self._bump_seen(on_443)
                 self._clean_if_needed(now)
                 return True
 
+            # ----- SSLv2 minimal handling -----
             if sslv2 and not rhead:
-                # We detected SSLv2; we don't deep-parse beyond labeling.
                 if self._should_log_flow(st, now):
                     self._safe_log(self._format_logline_sslv2(src_ip, sport, dst_ip, dport, inbound_iface, st, sslv2))
-                self._bump_seen(on_443)  # count under 443 bucket
-                self._clean_if_needed(now)
-                return True
-
-            # From here, rhead is present => TLSv1.x+
-            st["classified"] = True
-
-            # Fast-path after classification & post-CH:
-            if st.get("noinspect", False):
-                self._metrics["fast_path_hits"] += 1
-                if self._should_log_flow(st, now):
-                    self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead))
                 self._bump_seen(on_443)
                 self._clean_if_needed(now)
                 return True
 
-            # If this is ApplicationData, set noinspect immediately
+            # From here: TLSv1.x+
+            st["classified"] = True
+
+            # Short-circuit fast path (post-CH or AppData)
+            if st.get("noinspect", False):
+                self._metrics["fast_path_hits"] += 1
+                # annotate TCP dynamics
+                if self.report_tcp_meta and self._peek_tcp_meta_cached:
+                    dyn = self._tcp_flow_tag(st, direction, self._peek_tcp_meta_cached)
+                    if self._should_log_flow(st, now):
+                        base = self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead)
+                        self._safe_log(base + (f" | dyn={dyn}" if dyn else ""))
+                else:
+                    if self._should_log_flow(st, now):
+                        self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead))
+                self._bump_seen(on_443)
+                self._clean_if_needed(now)
+                return True
+
+            # Flip to noinspect immediately on first ApplicationData
             if rhead["ct"] == "ApplicationData":
                 st["noinspect"] = True
                 self._metrics["noinspect_set"] += 1
+                # annotate TCP dynamics
+                dyn = None
+                if self.report_tcp_meta and self._peek_tcp_meta_cached:
+                    dyn = self._tcp_flow_tag(st, direction, self._peek_tcp_meta_cached)
                 if self._should_log_flow(st, now):
-                    self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead))
+                    base = self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead)
+                    self._safe_log(base + (f" | dyn={dyn}" if dyn else ""))
                 self._bump_seen(on_443)
                 self._clean_if_needed(now)
                 return True
 
-            # Only parse CH if we don't have SNI yet and meta reporting is enabled
+            # If this is an Alert, try to detect close_notify (0x01) and stop inspecting
+            if rhead["ct"] == "Alert" and mv and len(mv) >= 7:
+                # minimal peek: [ct=0x15, ver_hi,ver_lo, len_hi,len_lo, level, desc]
+                try:
+                    desc = mv[6]  # description byte
+                    if desc == 0x00:  # close_notify
+                        st["noinspect"] = True
+                        self._metrics["noinspect_set"] += 1
+                except Exception:
+                    pass
+
+            # Parse ClientHello only if SNI not known yet
             ch = None
-            if (st.get("sni") is None) and self.report_tls_meta and rhead["ct"] == "Handshake":
+            if st.get("sni") is None and self.report_tls_meta and rhead["ct"] == "Handshake":
                 ch = self._peek_client_hello_rich_mv(mv)
                 if ch and ch.get("client_hello"):
                     self._metrics["client_hello_seen"] += 1
                     if ch.get("sni"):
-                        st["sni"] = ch["sni"]
+                        st["sni"] = ch["sni"];
                         self._metrics["sni_parsed"] += 1
                     if ch.get("alpn"):
                         st["alpn"] = ch["alpn"]
                     if ch.get("ja3"):
                         st["ja3"] = ch["ja3"]
-                    # After seeing CH, move to noinspect to avoid extra work later
+                    # enter fast path post-CH
                     st["noinspect"] = True
                     self._metrics["noinspect_set"] += 1
 
-            # Flow log (rate-limited)
+            # Flow log (rate-limited), with TCP dynamics
+            dyn = None
+            if self.report_tcp_meta and self._peek_tcp_meta_cached:
+                dyn = self._tcp_flow_tag(st, direction, self._peek_tcp_meta_cached)
             if self._should_log_flow(st, now):
-                self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, ch))
+                base = self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, ch)
+                self._safe_log(base + (f" | dyn={dyn}" if dyn else ""))
 
-            # metrics/cleanup
             self._bump_seen(on_443)
             self._clean_if_needed(now)
             return True
@@ -3684,6 +3782,7 @@ class TransportHTTPSManager:
         except Exception:
             self._metrics["errors"] += 1
             return False
+
 
     # ---------------------------
     # Metrics
@@ -3708,15 +3807,34 @@ class TransportHTTPSManager:
                 f"{src_ip}:{sport} > {dst_ip}:{dport} len={length}")
 
     def _format_packet_prefix(self, pkt, inbound_iface: str, rhead: dict, ch: dict | None = None) -> str:
+        # --- tiny local helper: scan consecutive TLS records in this segment ---
+        def _scan_tls_records(mv, max_records=6):
+            recs = []
+            p = 0
+            # Only TLSv1.x style; SSLv2 handled elsewhere
+            while p + 5 <= len(mv) and len(recs) < max_records:
+                ct = mv[p]
+                ver = (mv[p + 1] << 8) | mv[p + 2]
+                rlen = (mv[p + 3] << 8) | mv[p + 4]
+                # Sanity checks
+                if ver not in (0x0301, 0x0302, 0x0303, 0x0304): break
+                if ct not in (0x14, 0x15, 0x16, 0x17): break
+                if rlen <= 0 or rlen > self.RECORD_MAX_LEN: break
+                if p + 5 + rlen > len(mv): break
+                recs.append((ct, ver, rlen))
+                p += 5 + rlen
+            return recs, p  # p = parsed bytes
+
         try:
             length = getattr(pkt, "wirelen", None) or len(bytes(pkt))
         except Exception:
             length = "?"
+
         src_ip, dst_ip = self._resolve_ips(pkt)
         sport, dport = self._resolve_ports(pkt)
 
         ver = rhead.get("version", "-")
-        ver_emoji = "🔒" if ver.startswith("TLS") else ("🧾" if "SSL" in ver else "❓")
+        ver_emoji = "🔒" if isinstance(ver, str) and ver.startswith("TLS") else ("🧾" if "SSL" in str(ver) else "❓")
 
         ct = rhead.get("ct", "-")
         ct_map = {
@@ -3727,19 +3845,64 @@ class TransportHTTPSManager:
         }
         ct_display = ct_map.get(ct, ct)
 
-        # If Handshake, show the exact first message (ClientHello / ServerHello / …)
+        # Default handshake detail (ClientHello / ServerHello / …)
         hs_detail = ""
+        app_detail = ""
+        tcp_tag = None
+
+        # Pull cached TCP meta if available (set by _resolve_ports)
+        tmeta = self._peek_tcp_meta_cached
+        if tmeta:
+            tcp_tag = tmeta.get("type") or tmeta.get("flags")
+
+        # Try to enrich based on payload
         try:
             raw = self._get_raw_bytes(pkt)
+            if not ch:
+                src, dst = src_ip, dst_ip
+                fkey = self._flow_key(src, sport, dst, dport)
+                st = self._tls_flows.get(fkey)
+                if st:
+                    ch = {"sni": st.get("sni"), "alpn": st.get("alpn")}
+
             if ct == "Handshake" and raw and len(raw) >= 6 and raw[0] == 0x16:
                 first_hs = raw[5]  # first handshake msg type in the record
                 hs_detail = f": {self._tls_hs_msg_name(first_hs)}"
+            elif ct == "ApplicationData" and raw:
+                mv = memoryview(raw)
+                recs, parsed = _scan_tls_records(mv, max_records=6)
+                if recs:
+                    # summarize: count, total bytes, first few sizes
+                    rec_count = len(recs)
+                    total_app = sum(rlen for (_ct, _ver, rlen) in recs)
+                    sizes = ",".join(str(rlen) for (_ct, _ver, rlen) in recs[:4])
+                    extra = f",+{rec_count - 4}" if rec_count > 4 else ""
+                    # If we know ALPN (from ch) surface it; otherwise '-'
+                    alpn = "-"
+                    if ch and isinstance(ch.get("alpn"), (list, tuple)):
+                        alpn = self._compact_list(ch["alpn"], max_items=3)
+                    # SNI if we learned it here
+                    sni = ch.get("sni") if (ch and "sni" in ch) else "-"
+                    # 443 vs non-443 tag
+                    port_tag = "443" if (sport == 443 or dport == 443) else "non-443"
+                    app_detail = (f" | tls{{{port_tag}; recs={rec_count}; bytes={total_app}; sizes=[{sizes}{extra}]"
+                                  f"; alpn={alpn}; sni={sni}}}")
         except Exception:
             pass
 
-        return (f"[Transport][{ver_emoji} {ver}][{ct_display}{hs_detail}] "
-                f"iface={self._iface_suffix(inbound_iface)} "
-                f"{src_ip}:{sport} > {dst_ip}:{dport} len={length}")
+        # Compose line
+        parts = [
+            f"[Transport][{ver_emoji} {ver}][{ct_display}{hs_detail}]",
+            f"iface={self._iface_suffix(inbound_iface)}",
+            f"{src_ip}:{sport} > {dst_ip}:{dport}",
+            f"len={length}",
+        ]
+        if tcp_tag:
+            parts.append(f"tcp={tcp_tag}")
+        if app_detail:
+            parts.append(app_detail)
+
+        return " ".join(parts)
 
     def _format_packet_prefix_ssl2(self, pkt, inbound_iface: str, s2: dict) -> str:
         """Scapy-like prefix for SSLv2 records."""
@@ -3816,11 +3979,11 @@ class TransportHTTPSManager:
             if tmeta:
                 parts.append(
                     " tcp{"
-                    f"flags={tmeta.get('flags','-')},"
-                    f"win={tmeta.get('win','-')},"
-                    f"ws={tmeta.get('wscale','-')},"
-                    f"mss={tmeta.get('mss','-')},"
-                    f"sack={tmeta.get('sack_perm','-')}"
+                    f"type={tmeta.get('type', '-')},"
+                    f"win={tmeta.get('win_effective', tmeta.get('win', '-'))},"
+                    f"mss={tmeta.get('mss', '-')},"
+                    f"sack={tmeta.get('sack_perm', '-')},"
+                    f"ts={tmeta.get('ts_val', '-')}/{tmeta.get('ts_ecr', '-')}"
                     "}"
                 )
         return " | ".join(parts)
@@ -4256,24 +4419,258 @@ class TransportHTTPSManager:
             return "-"
 
     def _peek_tcp_meta(self, pkt):
+        """
+        Return a rich, low-cost snapshot of TCP + (IP|IPv6) metadata.
+
+        Notes
+        -----
+        - Avoids expensive operations (no reassembly, no checksum recompute).
+        - Safe on missing fields / odd stacks.
+        - Option parsing handles MSS / WS / SACKok / SACK blocks / Timestamps / TFO cookie (if present).
+        - Derives effective advertised window (applies WS if present), header sizes, payload length,
+          ECN bits, and common flag tags (SYN, SYN-ACK, FIN-ACK, PSH-ACK, RST[-ACK], ACK-only, ECN).
+        """
         try:
+            if TCP is None or not pkt or not pkt.haslayer(TCP):
+                return None
+
+            # ------------ Base layers ------------
             t = pkt[TCP]
-            flags = t.sprintf("%TCP.flags%")
-            win = getattr(t, "window", None)
-            opts = getattr(t, "options", []) or []
-            wscale = mss = None
+            ip4 = pkt[IP] if (IP is not None and pkt.haslayer(IP)) else None
+            ip6 = pkt[IPv6] if (IPv6 is not None and pkt.haslayer(IPv6)) else None
+
+            # Some stacks don't provide .wirelen; fall back to len(bytes(pkt))
+            try:
+                total_len = getattr(pkt, "wirelen", None) or len(bytes(pkt))
+            except Exception:
+                total_len = None
+
+            # ------------ Flags ------------
+            flags_str = t.sprintf("%TCP.flags%")  # e.g. 'S', 'SA', 'PA', 'RA', 'FPA', ...
+            flags_set = set(flags_str or "")
+
+            # Derive a friendly "type" tag for quick triage
+            if "R" in flags_set and "A" not in flags_set:
+                tcp_type = "RST"
+            elif "R" in flags_set and "A" in flags_set:
+                tcp_type = "RST-ACK"
+            elif "S" in flags_set and "A" in flags_set:
+                tcp_type = "SYN-ACK"
+            elif "S" in flags_set:
+                tcp_type = "SYN"
+            elif "F" in flags_set and "A" in flags_set:
+                tcp_type = "FIN-ACK"
+            elif "F" in flags_set:
+                tcp_type = "FIN"
+            elif "P" in flags_set and "A" in flags_set:
+                tcp_type = "PSH-ACK"
+            elif "P" in flags_set:
+                tcp_type = "PSH"
+            elif "A" in flags_set:
+                tcp_type = "ACK"
+            elif "U" in flags_set:
+                tcp_type = "URG"
+            else:
+                tcp_type = f"TCP({flags_str})" if flags_str else "TCP"
+
+            # ECN bits at TCP level (ECE/CWR)
+            ecn_tcp = {"ECE": "E" in flags_set, "CWR": "C" in flags_set}
+
+            # ------------ Sequence / Ack / Ports ------------
+            sport = int(getattr(t, "sport", 0) or 0)
+            dport = int(getattr(t, "dport", 0) or 0)
+            seq = int(getattr(t, "seq", 0) or 0)
+            ack = int(getattr(t, "ack", 0) or 0)
+
+            # ------------ Header sizes & payload len ------------
+            # dataofs is TCP header length in 32-bit words; multiply by 4 to get bytes
+            hdr_len_tcp = None
+            try:
+                doff = int(getattr(t, "dataofs", 0) or 0)
+                hdr_len_tcp = 4 * doff if doff > 0 else None
+            except Exception:
+                hdr_len_tcp = None
+
+            # IP header size
+            hdr_len_ip = None
+            ip_payload_len = None
+            if ip4 is not None:
+                try:
+                    # IHL is 32-bit words
+                    ihl = int(getattr(ip4, "ihl", 0) or 0)
+                    hdr_len_ip = 4 * ihl if ihl > 0 else None
+                except Exception:
+                    hdr_len_ip = None
+                # Total length is in bytes (header + payload)
+                try:
+                    tot = int(getattr(ip4, "len", 0) or 0) or None
+                except Exception:
+                    tot = None
+                if tot is not None and hdr_len_ip is not None:
+                    ip_payload_len = max(tot - hdr_len_ip, 0)
+            elif ip6 is not None:
+                # IPv6 fixed header is 40 bytes; payload length is explicit
+                hdr_len_ip = 40
+                try:
+                    ip_payload_len = int(getattr(ip6, "plen", 0) or 0)  # payload after 40B header
+                except Exception:
+                    ip_payload_len = None
+
+            # TCP payload (best-effort; we don't depend on reassembly)
+            tcp_payload_len = None
+            try:
+                raw = self._get_raw_bytes(pkt)
+                tcp_payload_len = len(raw) if raw is not None else None
+            except Exception:
+                tcp_payload_len = None
+
+            # ------------ TCP options ------------
+            wscale = None
+            mss = None
             sack_perm = False
-            for name, val in opts:
-                n = (name or "").lower()
-                if n == "wscale":
-                    try: wscale = int(val)
-                    except Exception: wscale = None
-                elif n == "mss":
-                    try: mss = int(val)
-                    except Exception: mss = None
-                elif n == "sackok":
-                    sack_perm = True
-            return {"flags": flags, "win": win, "wscale": wscale, "mss": mss, "sack_perm": sack_perm}
+            sack_blocks = []
+            ts_val = None
+            ts_ecr = None
+            tfo_cookie = None
+            options_seen = []
+
+            try:
+                opts = getattr(t, "options", []) or []
+                for name, val in opts:
+                    n = (name or "").lower()
+                    options_seen.append(name)
+                    if n == "wscale":
+                        try:
+                            wscale = int(val)
+                        except Exception:
+                            wscale = None
+                    elif n == "mss":
+                        try:
+                            mss = int(val)
+                        except Exception:
+                            mss = None
+                    elif n == "sackok":
+                        sack_perm = True
+                    elif n == "sack":
+                        # val often comes as list of (left,right) tuples
+                        try:
+                            # Normalize to list of [l, r]
+                            blocks = []
+                            for blk in (val or []):
+                                try:
+                                    l, r = int(blk[0]), int(blk[1])
+                                    blocks.append([l, r])
+                                except Exception:
+                                    pass
+                            sack_blocks = blocks or sack_blocks
+                        except Exception:
+                            pass
+                    elif n == "timestamp":
+                        # Scapy format: (tsval, tsecr)
+                        try:
+                            ts_val = int(val[0]) if isinstance(val, (list, tuple)) and len(val) >= 1 else None
+                            ts_ecr = int(val[1]) if isinstance(val, (list, tuple)) and len(val) >= 2 else None
+                        except Exception:
+                            ts_val = ts_val or None
+                            ts_ecr = ts_ecr or None
+                    elif n in ("tfo", "fastopen", "tfo_cookie", "fastopencookie"):
+                        # Depending on Scapy version, names differ; just surface the raw value
+                        tfo_cookie = val
+            except Exception:
+                pass
+
+            # Effective advertised window (bytes), if WS present
+            try:
+                win_raw = int(getattr(t, "window", 0) or 0)
+                win_eff = win_raw * (1 << wscale) if (wscale is not None and wscale >= 0) else win_raw
+            except Exception:
+                win_raw = None
+                win_eff = None
+
+            # ------------ IP/IPv6 fields ------------
+            ip_meta = {}
+            if ip4 is not None:
+                try:
+                    # Flags: DF/MF (and "evil bit" if you care 😄)
+                    # Scapy exposes .flags as an IntEnum; use string as well for readability
+                    flags_val = getattr(ip4, "flags", None)
+                    flags_str_ip = str(flags_val) if flags_val is not None else None
+                    df = bool(getattr(ip4, "flags", 0) & 0x2) if isinstance(flags_val, int) else (
+                                "DF" in (flags_str_ip or ""))
+                    mf = bool(getattr(ip4, "flags", 0) & 0x1) if isinstance(flags_val, int) else (
+                                "MF" in (flags_str_ip or ""))
+
+                    # TOS/DSCP/ECN
+                    tos = getattr(ip4, "tos", None)
+                    dscp = (tos >> 2) & 0x3F if isinstance(tos, int) else None
+                    ecn = tos & 0x03 if isinstance(tos, int) else None
+
+                    ip_meta = {
+                        "version": 4,
+                        "ttl": getattr(ip4, "ttl", None),
+                        "id": getattr(ip4, "id", None),
+                        "tos": tos,
+                        "dscp": dscp,
+                        "ecn": ecn,  # 0..3
+                        "df": df,
+                        "mf": mf,
+                        "flags": flags_str_ip,
+                        "ihl_bytes": hdr_len_ip,
+                    }
+                except Exception:
+                    ip_meta = {"version": 4}
+            elif ip6 is not None:
+                try:
+                    tclass = getattr(ip6, "tc", None)
+                    ecn = (tclass & 0x03) if isinstance(tclass, int) else None
+                    dscp = ((tclass >> 2) & 0x3F) if isinstance(tclass, int) else None
+                    ip_meta = {
+                        "version": 6,
+                        "hop_limit": getattr(ip6, "hlim", None),
+                        "flow_label": getattr(ip6, "fl", None),
+                        "traffic_class": tclass,
+                        "dscp": dscp,
+                        "ecn": ecn,
+                        "hdr_bytes": hdr_len_ip,  # 40
+                    }
+                except Exception:
+                    ip_meta = {"version": 6}
+
+            # ------------ Assemble snapshot ------------
+            meta = {
+                # quick tag + basic TCP
+                "type": tcp_type,
+                "flags": flags_str,
+                "ecn_tcp": ecn_tcp,  # {"ECE":bool,"CWR":bool}
+                "sport": sport,
+                "dport": dport,
+                "seq": seq,
+                "ack": ack,
+
+                # sizes
+                "ip_hdr_bytes": hdr_len_ip,
+                "tcp_hdr_bytes": hdr_len_tcp,
+                "ip_payload_bytes": ip_payload_len,
+                "tcp_payload_bytes": tcp_payload_len,
+                "frame_bytes": total_len,
+
+                # window & options
+                "win": win_raw,
+                "wscale": wscale,
+                "win_effective": win_eff,  # advertised window in bytes (post-scale)
+                "mss": mss,
+                "sack_perm": sack_perm,
+                "sack_blocks": sack_blocks,  # [[l,r], ...]
+                "ts_val": ts_val,
+                "ts_ecr": ts_ecr,
+                "tfo_cookie": tfo_cookie,
+                "options": options_seen,  # raw option names as seen
+
+                # ip/ipv6 extras
+                "ip": ip_meta,
+            }
+
+            return meta
         except Exception:
             return None
 
@@ -6482,69 +6879,114 @@ class TransportDNSManager:
     # ---------- Query logging ----------
 
     def _log_query(
-        self,
-        iface: str,
-        sip: str, sport: int,
-        dip: str, dport: int,
-        txid: int, proto: str,
-        dns: Any,
-        qnames: List[str],
-        qtypes: List[str],
+            self,
+            iface: str,
+            sip: str, sport: int,
+            dip: str, dport: int,
+            txid: int, proto: str,
+            dns: Any,
+            qnames: List[str],
+            qtypes: List[str],
     ) -> None:
-        # flags
-        rd = bool(getattr(dns, "rd", 0))
-        ad = bool(getattr(dns, "ad", 0))
-        cd = bool(getattr(dns, "cd", 0))
-        tc = bool(getattr(dns, "tc", 0))
+        # --- 1. Extract and format query flags ---
+        # RD (Recursion Desired) and CD (Checking Disabled) are the key query flags.
+        # AD (Authentic Data) and TC (Truncated) are rare in queries but logged if set.
+        flag_parts = []
+        if bool(getattr(dns, "rd", 0)): flag_parts.append("RD")
+        if bool(getattr(dns, "cd", 0)): flag_parts.append("CD")  # DNSSEC: Client will validate
+        if bool(getattr(dns, "ad", 0)): flag_parts.append("AD")  # Unusual for a query
+        if bool(getattr(dns, "tc", 0)): flag_parts.append("TC")  # Very unusual for a query
+        flags_str = f" flags=[{','.join(flag_parts)}]" if flag_parts else ""
 
+        # --- 2. Advanced EDNS(0) summary with option values ---
         edns = self._extract_edns(dns)
-        # ---- NEW: add option hints (ECS/COOKIE) if present ----
+        edns_str = ""
         if edns:
-            hints = []
-            if "ECS" in edns.get("opts", {}): hints.append("ECS")
-            if "COOKIE" in edns.get("opts", {}): hints.append("COOKIE")
-            edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''}{(' ' + ' '.join(hints)) if hints else ''})"
-        else:
-            edns_str = ""
+            edns_parts = [f"udp={edns['size']}"]  # Start with UDP size
+            if edns['do']:
+                edns_parts.append("DO")  # DNSSEC OK (Client supports it)
 
-        # Query preview (first name/type)
+            opts = edns.get("opts", {})
+
+            # Log the *value* of the ECS option, not just its presence
+            if "ECS" in opts:
+                # Assumes opts['ECS'] is a string like "fam=1 src=24 ..."
+                edns_parts.append(f"ECS({opts['ECS']})")
+
+                # Log a *snippet* of the cookie
+            if "COOKIE" in opts:
+                cookie_val = opts.get('COOKIE', '')
+                cookie_preview = f"..{cookie_val[-6:]}" if len(cookie_val) > 6 else cookie_val
+                edns_parts.append(f"COOKIE({cookie_preview})")
+
+            # Log any other non-standard options
+            other_opts = [k for k in opts if k not in ("ECS", "COOKIE")]
+            if other_opts:
+                edns_parts.append(f"other=[{','.join(other_opts)}]")
+
+            edns_str = f" EDNS({', '.join(edns_parts)})"
+
+        # --- 3. Query preview (first name/type) ---
         head = qnames[0] if qnames else "?"
         qtype0 = qtypes[0] if qtypes else "?"
-        more = f" +{len(qnames)-1} more" if len(qnames) > 1 else ""
+        more = f" +{len(qnames) - 1} more" if len(qnames) > 1 else ""
 
+        # --- 4. ADVANCED: Anomaly Detection (ANY query) ---
+        # Queries for 'ANY' (255) are often used in DDoS reflection attacks
+        anomaly_str = ""
+        if "ANY" in qtypes or "255" in qtypes:
+            anomaly_str = " ⚠️(ANY_QUERY)"
+
+        # --- 5. Final Log Message ---
+        # We combine all parts for a dense, informative log line
         self.log.log_message(
             f"[Transport][🔎 DNS][🧭 Query] if={iface} {sip}:{sport} → {dip}:{dport} "
-            f"txid=0x{txid:04x} proto={proto.upper()} name={head} type={qtype0}{more} "
-            f"flags={'RD' if rd else '-'}{'|AD' if ad else ''}{'|CD' if cd else ''}{'|TC' if tc else ''}{edns_str}"
+            f"txid=0x{txid:04x} proto={proto.upper()} name={head} type={qtype0}{more}"
+            f"{flags_str}{edns_str}{anomaly_str}"
         )
 
     # ---------- Response logging ----------
 
     def _log_response(
-        self,
-        iface: str,
-        sip: str, sport: int,  # server:port
-        dip: str, dport: int,  # client:port
-        txid: int, proto: str,
-        dns: Any,
-        latency_ms: Optional[int],
+            self,
+            iface: str,
+            sip: str, sport: int,  # server:port
+            dip: str, dport: int,  # client:port
+            txid: int, proto: str,
+            dns: Any,
+            latency_ms: Optional[int],
     ) -> None:
         rcode = int(getattr(dns, "rcode", 0))
-        name, r_emoji = self._RCODES.get(rcode, (f"RCODE{rcode}", "❔"))
+
+        # --- ADVANCED: Trigger RCODE Anomaly Check ---
+        rcode_name, r_emoji = self._RCODES.get(rcode, (f"RCODE{rcode}", "❔"))
+        if rcode in (2, 3, 5):  # 2=SERVFAIL, 3=NXDOMAIN, 5=REFUSED
+            try:
+                # Assumes _check_rcode_anomaly(client_ip, rcode_name) exists
+                self._check_rcode_anomaly(dip, rcode_name)
+            except AttributeError:
+                pass  # Anomaly detection feature not present in this class version
 
         aa = bool(getattr(dns, "aa", 0))
         ra = bool(getattr(dns, "ra", 0))
-        tc = bool(getattr(dns, "tc", 0))
-        ad = bool(getattr(dns, "ad", 0))
+        tc = bool(getattr(dns, "tc", 0))  # Truncated
+        ad = bool(getattr(dns, "ad", 0))  # Authentic Data (DNSSEC)
 
         qn_preview = self._preview_qname(dns)
 
         edns = self._extract_edns(dns)
-        # ---- NEW: option hints in EDNS summary ----
         if edns:
+            # --- ADVANCED: More detailed EDNS option logging ---
             hints = []
-            if "ECS" in edns.get("opts", {}): hints.append("ECS")
-            if "COOKIE" in edns.get("opts", {}): hints.append("COOKIE")
+            opts = edns.get("opts", {})
+            # (This assumes _extract_edns populates opts with formatted strings)
+            if "ECS" in opts:
+                hints.append(f"ECS({opts['ECS']})")  # Show the actual value
+            if "COOKIE" in opts:
+                cookie_val = opts.get('COOKIE', '')
+                cookie_preview = f"..{cookie_val[-6:]}" if len(cookie_val) > 6 else cookie_val
+                hints.append(f"COOKIE({cookie_preview})")  # Show snippet
+
             edns_str = f" EDNS(udp={edns['size']}{' DO' if edns['do'] else ''}{(' ' + ' '.join(hints)) if hints else ''})"
         else:
             edns_str = ""
@@ -6552,50 +6994,93 @@ class TransportDNSManager:
         # Counts
         an, ns, ar = int(getattr(dns, "ancount", 0)), int(getattr(dns, "nscount", 0)), int(getattr(dns, "arcount", 0))
         lat = f" {latency_ms}ms" if latency_ms is not None else ""
-        trunc = " TC" if tc else ""
+
+        # --- ADVANCED: Highlight TC (Truncation) and AD (DNSSEC) bits ---
+        trunc_str = " TC ⚠️(TCP?)" if tc else ""  # Warn about potential TCP retry
+        ad_str = " AD 🛡️" if ad else ""  # Shield for "Authentic Data"
 
         # Header line
         self.log.log_message(
             f"[Transport][🔎 DNS][📦 Response] if={iface} {sip}:{sport} → {dip}:{dport} "
             f"txid=0x{txid:04x} proto={proto.upper()} q={qn_preview} "
-            f"rcode={name}{trunc} {r_emoji} an={an} ns={ns} ar={ar}{lat}{edns_str} "
-            f"flags={'AA' if aa else '-'}{'|RA' if ra else ''}{'|AD' if ad else ''}"
+            f"rcode={rcode_name}{trunc_str} {r_emoji} an={an} ns={ns} ar={ar}{lat}{edns_str} "
+            f"flags={'AA' if aa else '-'}{'|RA' if ra else ''}{ad_str}"
         )
 
-        # Answers preview
+        # --- ADVANCED: Group answers by owner name ---
+        try:
+            # Assumes _alert_on_rebind (bool) exists on self
+            rebind_check = getattr(self, "_alert_on_rebind", False)
+        except AttributeError:
+            rebind_check = False  # Fallback
+
         if an:
-            answers = self._iter_rr(dns.an, an)
-            lines = []
-            for i, rr in enumerate(answers):
-                if i >= self._max_ans:
-                    lines.append(f"… +{an - self._max_ans} more")
-                    break
-                lines.append(self._fmt_rr(rr))
-            for ln in lines:
-                self.log.log_message(f"[Transport][🔎 DNS][📜 Answer] {ln}")
+            grouped_answers = collections.defaultdict(list)
+            try:
+                for rr in self._iter_rr(dns.an, an):
+                    grouped_answers[self._safe_name(getattr(rr, "rrname", b""))].append(rr)
+            except Exception:
+                pass  # Safety for bad packet iter
 
-        # Authority (NS/SOA) preview
+            if not grouped_answers and an > 0:
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Answer] (Unable to group {an} answers)")
+
+            for name, rrs in grouped_answers.items():
+                # Format all RRs for this name, up to max_ans
+                rr_lines = [self._fmt_rr(rr, rebind_check) for rr in rrs[:self._max_ans]]
+
+                # Add a "more" line if we truncated *this group*
+                if len(rrs) > self._max_ans:
+                    rr_lines.append(f"… +{len(rrs) - self._max_ans} more")
+
+                # Log as a single, clean line for this name
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Answer] {name} -> [ {', '.join(rr_lines)} ]")
+
+        # --- ADVANCED: Group Authority section ---
         if ns:
-            auths = self._iter_rr(dns.ns, ns)
-            for i, rr in enumerate(auths):
-                if i >= 2:
-                    self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] … +{ns - 2} more")
-                    break
-                self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] {self._fmt_rr(rr)}")
+            grouped_ns = collections.defaultdict(list)
+            try:
+                for rr in self._iter_rr(dns.ns, ns):
+                    grouped_ns[self._safe_name(getattr(rr, "rrname", b""))].append(rr)
+            except Exception:
+                pass
 
-        # Additional preview
-        if ar:
-            adds = self._iter_rr(dns.ar, ar)
-            shown = 0
-            for rr in adds:
-                # Skip OPT detailed spam, we already summarized EDNS
-                if getattr(rr, "type", 0) == 41:
-                    continue
-                if shown >= 3:
-                    self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] … +{ar - shown} more")
+            if not grouped_ns and ns > 0:
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] (Unable to group {ns} records)")
+
+            for i, (name, rrs) in enumerate(grouped_ns.items()):
+                if i >= 2:  # Max 2 authority groups
+                    self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] … +{len(grouped_ns) - i} more groups")
                     break
-                self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] {self._fmt_rr(rr)}")
-                shown += 1
+                rr_lines = [self._fmt_rr(rr, False) for rr in rrs[:2]]  # Max 2 RRs per group
+                if len(rrs) > 2:
+                    rr_lines.append(f"… +{len(rrs) - 2} more")
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Authority] {name} -> [ {', '.join(rr_lines)} ]")
+
+        # --- ADVANCED: Group Additional section ---
+        if ar:
+            grouped_ar = collections.defaultdict(list)
+            opt_count = 0
+            try:
+                for rr in self._iter_rr(dns.ar, ar):
+                    if getattr(rr, "type", 0) == 41:  # Skip OPT
+                        opt_count += 1
+                        continue
+                    grouped_ar[self._safe_name(getattr(rr, "rrname", b""))].append(rr)
+            except Exception:
+                pass
+
+            if not grouped_ar and (ar - opt_count) > 0:
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] (Unable to group {ar - opt_count} records)")
+
+            for i, (name, rrs) in enumerate(grouped_ar.items()):
+                if i >= 3:  # Max 3 additional groups
+                    self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] … +{len(grouped_ar) - i} more groups")
+                    break
+                rr_lines = [self._fmt_rr(rr, False) for rr in rrs[:2]]  # Max 2 RRs per group
+                if len(rrs) > 2:
+                    rr_lines.append(f"… +{len(rrs) - 2} more")
+                self.log.log_message(f"[Transport][🔎 DNS][📜 Additional] {name} -> [ {', '.join(rr_lines)} ]")
 
     def handle_tcp_segment(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
         """

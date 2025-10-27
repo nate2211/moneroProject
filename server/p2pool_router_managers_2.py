@@ -5786,7 +5786,75 @@ class NATManager:
         self.add_static_mapping(external_port=3389, internal_ip="192.168.1.25", internal_port=3389)
         self.add_static_mapping(external_port=25565, internal_ip="192.168.1.75", internal_port=25565)
 
+        self.WAN_MTU = 1480  # try 1480 first; if pings fragment at 1472 bytes payload, drop to 1460
+        self.MSS_CLAMP_V4 = max(536, self.WAN_MTU - 40)  # TCP header 20 + IP 20
+        self.MSS_CLAMP_V6 = max(536, self.WAN_MTU - 60)  # TCP 20 + IPv6 40
+        self.CLAMP_MSS = True
+
+        self.TEMP_LEASES_POLICY = {
+            # exact gateway IPs to deny (strings)
+            "deny_gateways": {"192.168.1.254"},  # AT&T BGW-210/BGW-320 default
+            # gateway subnets to deny (CIDR strings)
+            "deny_cidrs": ["192.168.1.0/24"],  # deny any gateway in this /24
+            # optional: deny by egress iface name suffix (your iface naming: 'eth_out', 'wan0', etc)
+            "deny_ifaces": {"wan_att", "eth_att"},  # only if you use consistent names
+        }
+        # Cached uplink identity (refresh periodically)
+        self._uplink_cache_ttl = 10.0  # seconds
+        self._uplink_last_refresh = 0.0
+        self._uplink_gateway_ip = None  # str | None
+        self._uplink_iface = None  # str | None
+
         self.router_logger.log_message("[NAT] 🚀 Manager initialized with port scan detection and temporary leases.")
+
+    def _refresh_uplink_identity(self) -> None:
+        now = time.time()
+        if (now - self._uplink_last_refresh) < self._uplink_cache_ttl:
+            return
+        self._uplink_last_refresh = now
+
+        # Resolve the route to the Internet (public dest)
+        r = self._rip_manager_find_route("8.8.8.8")
+        if not r:
+            self._uplink_gateway_ip = None
+            self._uplink_iface = None
+            return
+
+        # next_hop can be "0.0.0.0" if directly connected; otherwise the gateway IP
+        nh = r.get("next_hop")
+        self._uplink_gateway_ip = None if not nh or nh == "0.0.0.0" else str(nh)
+        self._uplink_iface = r.get("interface")
+
+    def _is_temp_lease_allowed_on_uplink(self) -> bool:
+        self._refresh_uplink_identity()
+
+        gw = self._uplink_gateway_ip
+        iface = self._uplink_iface
+
+        # If we can’t identify the uplink, be conservative (allow) or flip to False if you prefer
+        if gw is None and iface is None:
+            return True
+
+        # If iface is in deny list
+        if iface and iface in self.TEMP_LEASES_POLICY.get("deny_ifaces", set()):
+            return False
+
+        # If exact gateway IP is denied
+        if gw and gw in self.TEMP_LEASES_POLICY.get("deny_gateways", set()):
+            return False
+
+        # If gateway is in any denied CIDR
+        if gw:
+            try:
+                ip_gw = ipaddress.ip_address(gw)
+                for cidr in self.TEMP_LEASES_POLICY.get("deny_cidrs", []):
+                    if ip_gw in ipaddress.ip_network(cidr, strict=False):
+                        return False
+            except Exception:
+                # If parsing fails, default to allow (or you can choose deny)
+                pass
+
+        return True
 
     def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
         """Creates a stateful NAT mapping for an established connection."""
@@ -5819,6 +5887,40 @@ class NATManager:
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
         self.router_logger.log_message("[NAT] 🛑 Manager stopped.")
+
+    def _maybe_clamp_mss(self, packet):
+        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
+            return
+        if not packet.haslayer(TCP):
+            return
+        tcp = packet[TCP]
+        # Only touch initial SYN (not SYN/ACK here because it's outbound client SYN)
+        if not tcp.flags & 0x02 or tcp.flags & 0x10:  # SYN set, ACK not set
+            return
+
+        # Pull options, clamp MSS
+        opts = tcp.options or []
+        new_opts = []
+        clamped = False
+        for kind, val in opts:
+            if kind == 'MSS':
+                want = self.MSS_CLAMP_V6 if packet.haslayer(IPv6) else self.MSS_CLAMP_V4
+                if val > want:
+                    val = want
+                    clamped = True
+            new_opts.append((kind, val))
+        # If MSS not present, add it (polite but optional)
+        if not any(k == 'MSS' for k, _ in opts):
+            want = self.MSS_CLAMP_V6 if packet.haslayer(IPv6) else self.MSS_CLAMP_V4
+            new_opts.append(('MSS', want))
+            clamped = True
+
+        if clamped:
+            tcp.options = new_opts
+            # Recompute lengths/checksums
+            del packet.chksum
+            if packet.haslayer(IP):  del packet[IP].chksum
+            del tcp.chksum
 
     def _cleanup_loop(self):
         """
@@ -6038,7 +6140,8 @@ class NATManager:
         # Apply the translation to the packet layers
         ip.src = self.public_ip
         t.sport = new_port
-
+        if self.CLAMP_MSS:
+            self._maybe_clamp_mss(packet)
         # Recalculate checksums
         del ip.chksum
         if packet.haslayer(TCP):
@@ -6192,7 +6295,13 @@ class NATManager:
         Returns the internal mapping (ip, port), or None if cooldown or flat IP limit prevents it.
         """
         now = time.time()
-
+        if not self._is_temp_lease_allowed_on_uplink():
+            self.router_logger.log_message(
+                f"[NAT][LEASE] ⛔ Temp leases blocked on uplink "
+                f"(gw={self._uplink_gateway_ip or '-'}, iface={self._uplink_iface or '-'}) "
+                f"for probe {src_ip}:{external_port}."
+            )
+            return None
         # Check the flat limit of active leases for this IP
         active_leases_for_ip = len([v for v in self._temp_nat_leases.get(src_ip, {}).values() if now < v["lease_end"]])
         if active_leases_for_ip >= self._max_temp_leases_per_ip:
