@@ -1,11 +1,13 @@
 import binascii
 import hashlib
+import hmac
 import queue
 import random
 import re
 import ssl
 import subprocess
-from collections import defaultdict, deque
+import zlib
+from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from functools import reduce
@@ -45,7 +47,7 @@ from scapy.sendrecv import srp1
 from p2pool_tools import RandomXLoader, RandomXFlags
 from scapy.layers.inet6 import ICMPv6NDOptPrefixInfo
 
-from p2pool_sniffer import DNSRR_AAAA
+from p2pool_sniffer import DNSRR_AAAA, ICMPv6
 
 bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
 
@@ -3573,49 +3575,34 @@ class TLSRecordManager:
         """
         self.ciphers.set_requirements(**kwargs)
 
+
 class HandshakeManager:
     """
-    Tracks TCP 3-way handshakes and teardowns AND streams TLS bytes into TLSRecordManager.
-    Requires a TLSRecordManager instance (or builds one) and wires its callbacks to:
-      - log ClientHello/ServerHello (SNI, ALPN, JA3/JA3S, version/cipher)
-      - log TLS Alerts
-      - forward TLS Application Data (optional; uses last seen TCP seq/ack)
-      - honor policy decisions (block/quarantine suppresses AppData forwarding)
-
-    NOTE: This class does not depend on Scapy’s TLS layers; TLS parsing is done in TLSRecordManager.
+    Tracks TCP 3-way handshakes/teardowns and pipes TLS bytes into TLSRecordManager.
+    Modular helpers and rich analytics (RTT/DUP-ACK/OOO/retransmits/options).
     """
     COMMON_TLS_PORTS = {443, 444, 8443, 9443, 10443, 4443}
-    def __init__(self, router_logger,
-                 arp_manager,
-                 nat_manager,
-                 rip_manager,
-                 packet_writer,
-                 tls_record_manager=None,              # NEW: inject or auto-create
+
+    # State labels
+    SYN_SENT = "SYN_SENT"
+    SYN_ACK  = "SYN_ACK_RECEIVED"
+    EST      = "ESTABLISHED"
+    CLOSING  = "CLOSING"
+    CLOSED   = "CLOSED"
+
+    def __init__(self, router_logger, arp_manager, nat_manager, rip_manager, packet_writer,
+                 tls_record_manager=None,
                  timeout_half_open: int = 60,
                  timeout_established: int = 300):
+        # deps
         self.logger = router_logger
         self.arp_manager = arp_manager
         self.nat_manager = nat_manager
         self.rip_manager = rip_manager
         self.packet_writer = packet_writer
 
-        # TCP session state: key -> (state:str, ts:float, src_ip, src_port, dst_ip, dst_port)
-        self._sessions: Dict[Tuple[Tuple[str, int], Tuple[str, int]],
-                             Tuple[str, float, str, int, str, int]] = {}
-
-        self._lock = threading.Lock()
-        self.timeout_half_open = timeout_half_open
-        self.timeout_established = timeout_established
-        self._stop_event = threading.Event()
-
         # TLS plumbing
         self._tls_mgr = tls_record_manager or TLSRecordManager(self.logger)
-        self._tls_records: Dict[Tuple, List[TLSRecord]] = defaultdict(list)  # per-flow record store
-        self._tls_streams: Dict[Tuple, List[bytes]] = defaultdict(list)      # per-flow AppData buckets
-        # last observed TCP packet per (flow, direction) to borrow seq/ack when forwarding
-        self._last_tcp_pkt: Dict[Tuple[Tuple, str], Packet] = {}
-
-        # decisions/meta passthrough
         self._tls_mgr.on_record = self._on_tls_record
         self._tls_mgr.on_handshake = self._on_tls_handshake
         self._tls_mgr.on_alert = self._on_tls_alert
@@ -3623,32 +3610,46 @@ class HandshakeManager:
         self._tls_mgr.on_event = self._on_tls_event
         self._tls_mgr.on_decision = self._on_tls_decision
 
-        # abuse control
+        # Flow state: key -> dict
+        self._flows: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Dict[str, Any]] = {}
+
+        # last seen TCP pkt per direction for forwarding
+        self._last_tcp_pkt: Dict[Tuple[Tuple, str], Packet] = {}
+
+        # timeouts
+        self.timeout_half_open = int(timeout_half_open)
+        self.timeout_established = int(timeout_established)
+
+        # abuse/ban
         self.ban_duration = 300
         self.rate_limit_threshold = 20
         self.rate_limit_period = 60
-        self._ban_list: Dict[str, float] = {}            # ip -> expiry
-        self._connection_rate_tracker: Dict[str, List[float]] = defaultdict(list)
+        self._ban_list: Dict[str, float] = {}
+        self._conn_rate: Dict[str, List[float]] = defaultdict(list)
 
-        # maintenance thread
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop,
-                                                daemon=True, name="HandshakeCleanup")
+        # threading
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
         self._cleanup_thread.start()
+
+        # optional sender
         self.sniffer = None
-        self.logger.log_message("[Handshake] Manager initialized (TLS wired to TLSRecordManager).")
 
-    def _canon_key(self, ip1: str, pt1: int, ip2: str, pt2: int):
-        return tuple(sorted([(ip1, pt1), (ip2, pt2)]))
-    # ---- lifecycle ------------------------------------------------------------
+        # external hooks
+        self.on_flow_new = None               # (key, meta) -> None
+        self.on_flow_established = None       # (key, meta) -> None
+        self.on_flow_closed = None            # (key, meta, reason) -> None
+        self.on_flow_timeout = None           # (key, meta, state) -> None
 
+        self.logger.log_message("[Handshake] Manager ready (modular).")
+
+    # ===== public lifecycle =====
     def start(self):
-        if not (self._cleanup_thread and self._cleanup_thread.is_alive()):
-            self._cleanup_thread = threading.Thread(target=self._cleanup_loop,
-                                                    daemon=True, name="HandshakeCleanup")
+        if not self._cleanup_thread.is_alive():
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
             self._cleanup_thread.start()
             self.logger.log_message("[Handshake] Cleanup thread started.")
-        else:
-            self.logger.log_message("[Handshake] Manager already running.")
 
     def stop(self):
         self._stop_event.set()
@@ -3656,404 +3657,497 @@ class HandshakeManager:
             self._cleanup_thread.join(timeout=2)
         self.logger.log_message("[Handshake] Manager stopped.")
 
-    # ---- cleanup / timeouts / bans -------------------------------------------
+    # ===== core handler =====
+    def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
+        ip, tcp = self._extract_layers(pkt)
+        if not ip or not tcp:
+            return False
 
+        now = time.time()
+        src_ip, dst_ip = ip.src, ip.dst
+        sport, dport = int(tcp.sport), int(tcp.dport)
+
+        # banned src?
+        if self._is_banned(src_ip, now):
+            return False
+
+        # rate-limit (per FIN close hint later too)
+        self._track_connection_rate(src_ip, now, initial=(tcp.flags & 0x02) != 0)
+
+        # NAT reverse if destined to our public
+        dst_ip, dport = self._nat_reverse_if_needed(ip, tcp, src_ip, sport, dst_ip, dport)
+
+        key = _get_canonical_session_key(src_ip, sport, dst_ip, dport)
+        flow = self._get_or_init_flow(key, src_ip, sport, dst_ip, dport, inbound_iface, now)
+
+        # TCP options & metrics (once per direction)
+        self._parse_tcp_options(flow, tcp, src_ip, sport, dst_ip, dport)
+
+        # TCP state machine & metrics
+        progressed = self._advance_fsm(flow, tcp, now, inbound_iface)
+        if progressed == "closed":
+            self._close_flow(key, flow, reason="teardown")
+            return False
+
+        # TLS feed (post-FSM)
+        fed = self._maybe_feed_tls(flow, key, pkt, ip, tcp, now)
+
+        # track last pkt for forwarding
+        direction = "c2s" if self._is_c2s(flow, src_ip, sport) else "s2c"
+        self._last_tcp_pkt[(key, direction)] = pkt
+
+        return fed
+
+    # ===== helpers: extraction / NAT / flow init =====
+    def _extract_layers(self, pkt: Packet):
+        if not (pkt and (pkt.haslayer(IP) or pkt.haslayer(IPv6)) and pkt.haslayer(TCP)):
+            return None, None
+        ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
+        tcp = pkt[TCP]
+        return ip, tcp
+
+    def _nat_reverse_if_needed(self, ip, tcp, src_ip, sport, dst_ip, dport):
+        try:
+            pub = getattr(self.nat_manager, "public_ip", None)
+            if pub and dst_ip == pub:
+                internal = self.nat_manager.get_internal_from_external(dport, src_ip)
+                if internal:
+                    nid, npt = internal
+                    self.logger.log_message(
+                        f"[Handshake] NAT reverse: {dst_ip}:{dport} -> {nid}:{npt}"
+                    )
+                    return nid, int(npt)
+        except Exception:
+            pass
+        return dst_ip, dport
+
+    def _get_or_init_flow(self, key, sip, sport, dip, dport, iface, now):
+        with self._lock:
+            flow = self._flows.get(key)
+            if flow:
+                return flow
+            flow = {
+                "state": None,
+                "first_seen": now,
+                "last_seen": now,
+                "client": (sip, sport),  # initial guess; refined by FSM
+                "server": (dip, dport),
+                "iface": iface,
+                "syn_ts": None,          # for RTT
+                "synack_ts": None,
+                "rtt_smoothed": None,
+                "counters": defaultdict(int),
+                "tcp_opts": {"c2s": {}, "s2c": {}},  # MSS/WS/SACK/TS per dir
+                "dup_acks": {"c2s": 0, "s2c": 0},
+                "seq_track": {           # per-dir sequence tracking
+                    "c2s": {"last_seq": None, "seen": set()},
+                    "s2c": {"last_seq": None, "seen": set()},
+                },
+                "app_bytes": {"c2s": 0, "s2c": 0},
+            }
+            self._flows[key] = flow
+        if callable(self.on_flow_new):
+            try: self.on_flow_new(key, flow)
+            except Exception: pass
+        return flow
+
+    # ===== helpers: TCP option parsing / RTT =====
+    def _parse_tcp_options(self, flow, tcp, sip, sport, dip, dport):
+        try:
+            opts = tcp.options or []
+        except Exception:
+            opts = []
+        direction = "c2s" if self._is_c2s(flow, sip, sport) else "s2c"
+        store = flow["tcp_opts"][direction]
+        updated = False
+        for k, v in opts:
+            if k == "MSS" and "mss" not in store:
+                store["mss"] = int(v); updated = True
+            elif k == "WScale" and "wscale" not in store:
+                store["wscale"] = int(v); updated = True
+            elif k == "SAckOK" and "sack_ok" not in store:
+                store["sack_ok"] = True; updated = True
+            elif k == "Timestamp" and "ts" not in store and isinstance(v, tuple) and len(v) == 2:
+                store["ts"] = {"tsval": int(v[0]), "tsecr": int(v[1])}; updated = True
+        if updated:
+            self.logger.log_message(
+                f"[Handshake] ⚙️ TCP opts {direction} mss={store.get('mss')} ws={store.get('wscale')} "
+                f"sack={store.get('sack_ok')} ts={store.get('ts') is not None}"
+            )
+
+    def _update_rtt(self, flow, now, reason: str):
+        """Update smoothed RTT using SYN/SYN-ACK or TS echo."""
+        rtt = None
+        # handshake-based
+        if flow["syn_ts"] and flow["synack_ts"] and reason == "handshake":
+            rtt = max(0.0, flow["synack_ts"] - flow["syn_ts"])
+        # TS-based (best-effort): if we ever had TS both ways, use echo diff
+        # (left as placeholder for your advanced TS tracking if desired)
+        if rtt is None:
+            return
+        alpha = 0.125
+        if flow["rtt_smoothed"] is None:
+            flow["rtt_smoothed"] = rtt
+        else:
+            flow["rtt_smoothed"] = (1 - alpha) * flow["rtt_smoothed"] + alpha * rtt
+        self.logger.log_message(f"[Handshake] ⏱️ RTT update ({reason}): {flow['rtt_smoothed']:.4f}s")
+
+    # ===== helpers: FSM / metrics =====
+    def _advance_fsm(self, flow, tcp, now, iface) -> Optional[str]:
+        st = flow["state"]
+        src, sport = tcp.sport, tcp.sport  # keep for logs (ints already)
+        flags = int(tcp.flags)
+
+        # retransmit/OOO quick checks (per-dir)
+        direction = "c2s" if self._is_c2s(flow, flow['client'][0], flow['client'][1]) else "s2c"
+        self._track_seq(flow, direction, tcp)
+
+        # FSM
+        if flags == 0x02:  # SYN
+            if st is None:
+                flow["state"] = self.SYN_SENT
+                flow["syn_ts"] = now
+                flow["last_seen"] = now
+                self.logger.log_message(f"[Handshake] 🔓 SYN {flow['client'][0]}:{flow['client'][1]} -> {flow['server'][0]}:{flow['server'][1]} on {iface}")
+            else:
+                flow["counters"]["syn_retx"] += 1
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] 🔁 SYN retransmit")
+            return None
+
+        if flags == 0x12:  # SYN+ACK
+            if st == self.SYN_SENT:
+                flow["state"] = self.SYN_ACK
+                flow["synack_ts"] = now
+                flow["last_seen"] = now
+                self._update_rtt(flow, now, "handshake")
+                self.logger.log_message("[Handshake] 🔐 SYN-ACK received")
+            elif st == self.SYN_ACK:
+                flow["counters"]["synack_retx"] += 1
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] 🔁 SYN-ACK retransmit")
+            else:
+                # midstream (didn't see SYN) → infer ESTABLISHED
+                flow["state"] = self.EST
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] ✅ Inferred ESTABLISHED by SYN-ACK (midstream)")
+                self._on_established(flow)
+            return None
+
+        if flags & 0x10 and not (flags & 0x01) and not (flags & 0x04):  # ACK (pure)
+            if st == self.SYN_ACK:
+                flow["state"] = self.EST
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] ✅ ESTABLISHED")
+                self._on_established(flow)
+            elif st in (self.EST, self.CLOSING):
+                flow["last_seen"] = now
+            else:
+                # midstream pickup: ACK-only
+                if st is None:
+                    flow["state"] = self.EST
+                    flow["last_seen"] = now
+                    self.logger.log_message("[Handshake] ✅ Implicit ESTABLISHED by ACK-only (midstream)")
+                    self._on_established(flow)
+            return None
+
+        if flags & 0x01:  # FIN
+            if st == self.EST:
+                flow["state"] = self.CLOSING
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] 🔻 CLOSING (FIN)")
+            elif st == self.CLOSING:
+                flow["state"] = self.CLOSED
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] ❎ CLOSED (ACK after FIN)")
+                return "closed"
+            else:
+                self.logger.log_message(f"[Handshake] ⚠️ FIN in state {st or 'None'}")
+            return None
+
+        if flags & 0x04:  # RST
+            flow["state"] = self.CLOSED
+            flow["last_seen"] = now
+            self.logger.log_message("[Handshake] ❌ CLOSED (RST)")
+            return "closed"
+
+        # data-bearing ACK/PSH combinations → keep alive freshness
+        if (flags & 0x10) and (len(bytes(tcp.payload) or b"") > 0):
+            flow["last_seen"] = now
+
+        return None
+
+    def _track_seq(self, flow, direction: str, tcp):
+        """Simple sequence/retransmit/out-of-order heuristics."""
+        seq = int(tcp.seq)
+        ack = int(tcp.ack)
+        payload_len = len(bytes(tcp.payload) or b"")
+        last_seq = flow["seq_track"][direction]["last_seq"]
+
+        # DUP-ACK: ack same, no payload, ACK flag
+        if (int(tcp.flags) & 0x10) and payload_len == 0 and seq == last_seq:
+            flow["dup_acks"][direction] += 1
+            if flow["dup_acks"][direction] >= 3:
+                self.logger.log_message(f"[Handshake] 📎 {direction} potential fast-retransmit (>=3 DUP-ACK)")
+        else:
+            flow["dup_acks"][direction] = 0
+
+        # retransmit/OOO (very light heuristic)
+        if last_seq is not None and seq < last_seq:
+            flow["counters"][f"{direction}_ooo"] += 1
+        if last_seq is not None and seq == last_seq and payload_len > 0:
+            flow["counters"][f"{direction}_retrans"] += 1
+
+        flow["seq_track"][direction]["last_seq"] = seq
+
+        # keepalive heuristic: zero payload, seq = prev ack - 1, ACK set (not fully enforced here)
+        # (left as a log-only: detailed keepalive pattern might be added if needed)
+
+    def _on_established(self, flow):
+        # NAT stateful mapping hint (optional)
+        try:
+            (c_ip, c_pt), (s_ip, s_pt) = flow["client"], flow["server"]
+            if hasattr(self.nat_manager, "add_stateful_mapping"):
+                self.nat_manager.add_stateful_mapping(src_ip=c_ip, src_port=c_pt, dst_ip=s_ip, dst_port=s_pt)
+        except Exception:
+            pass
+        if callable(self.on_flow_established):
+            try: self.on_flow_established(None, flow)
+            except Exception: pass
+
+    # ===== helpers: TLS feed =====
+    def _maybe_feed_tls(self, flow, key, pkt, ip, tcp, now) -> bool:
+        st = flow["state"]
+        if st != self.EST:
+            # midstream pickup if bytes look TLS-ish
+            payload = bytes(tcp.payload) if tcp.payload else b""
+            if payload and self._looks_tlsish(payload):
+                flow["state"] = self.EST
+                flow["last_seen"] = now
+                self.logger.log_message("[Handshake] ✅ Implicit ESTABLISHED by TLS payload")
+            else:
+                return False
+
+        payload = bytes(tcp.payload) if tcp.payload else b""
+        if not payload:
+            return False
+
+        is_c2s = self._is_c2s(flow, ip.src, tcp.sport)
+        dir_key = "c2s" if is_c2s else "s2c"
+
+        # remember last packet for optional forwarding
+        self._last_tcp_pkt[(key, dir_key)] = pkt
+
+        # feed to TLS manager
+        try:
+            self._tls_mgr.feed_tcp_segment(
+                canonical_key=key,
+                is_c2s=is_c2s,
+                payload=payload,
+                src_ip=ip.src, src_port=int(tcp.sport),
+                dst_ip=ip.dst, dst_port=int(tcp.dport),
+                ts=time.time()
+            )
+        except Exception as e:
+            self.logger.log_message(f"[TLS] ❌ feed error: {e}")
+            return False
+
+        # simple bytes accounting
+        flow["app_bytes"][dir_key] += len(payload)
+        return True
+
+    @staticmethod
+    def _looks_tlsish(b: bytes) -> bool:
+        if len(b) >= 5 and TLSRecordManager._looks_like_tls_header(b):
+            return True
+        # SSLv2 hello possibility
+        return bool(b) and (b[0] & 0x80) and len(b) >= 3
+
+    def _is_c2s(self, flow, src_ip, src_port) -> bool:
+        # prefer stored roles if established
+        c = flow.get("client")
+        if c and (src_ip, int(src_port)) == c:
+            return True
+        # heuristic by port
+        dport = flow.get("server", ("", 0))[1]
+        if dport in self.COMMON_TLS_PORTS and int(src_port) not in self.COMMON_TLS_PORTS:
+            return True
+        return False
+
+    # ===== cleanup / bans / rate =====
     def _cleanup_loop(self):
         while not self._stop_event.is_set():
             now = time.time()
+            timed_out: List[Tuple] = []
             with self._lock:
-                stale_keys = []
-                for key, (state, ts, _, _, _, _) in self._sessions.items():
-                    current_timeout = self.timeout_half_open if state in ["SYN_SENT", "SYN_ACK_RECEIVED"] else self.timeout_established
-                    if now - ts > current_timeout:
-                        stale_keys.append(key)
+                # bans expire
+                for ip, exp in list(self._ban_list.items()):
+                    if now >= exp:
+                        del self._ban_list[ip]
+                        self.logger.log_message(f"[Handshake][BAN] ✅ Ban expired for {ip}")
 
-                for key in stale_keys:
-                    state_at_timeout, _, src_ip, src_port, dst_ip, dst_port = self._sessions[key]
-                    self.logger.log_message(
-                        f"[Handshake] ❌ Session ({src_ip}:{src_port} ↔ {dst_ip}:{dst_port}) timed out "
-                        f"in state {state_at_timeout}"
-                    )
-                    del self._sessions[key]
+                # flows timeout
+                for key, flow in list(self._flows.items()):
+                    st = flow["state"]
+                    tmo = self.timeout_half_open if st in (None, self.SYN_SENT, self.SYN_ACK) else self.timeout_established
+                    if (now - flow["last_seen"]) > tmo:
+                        timed_out.append((key, flow))
+                        del self._flows[key]
 
-                expired_bans = [ip for ip, expiry_time in self._ban_list.items() if now >= expiry_time]
-                for ip in expired_bans:
-                    del self._ban_list[ip]
-                    if hasattr(self, '_probe_counts'):
-                        self._probe_counts.pop(ip, None)
-                    self.logger.log_message(f"[Handshake][BAN] ✅ Ban expired for {ip}. IP is no longer blocked.")
-            # modest cadence
+            for key, flow in timed_out:
+                self.logger.log_message(f"[Handshake] ⌛ Timeout {flow.get('state')} for {key}")
+                if callable(self.on_flow_timeout):
+                    try: self.on_flow_timeout(key, flow, flow.get("state"))
+                    except Exception: pass
+
             self._stop_event.wait(1.0)
 
-    def _check_and_apply_rate_limit(self, ip: str, now: float):
-        timestamps = self._connection_rate_tracker[ip]
-        timestamps.append(now)
-        self._connection_rate_tracker[ip] = [ts for ts in timestamps if now - ts <= self.rate_limit_period]
-        if len(self._connection_rate_tracker[ip]) > self.rate_limit_threshold:
-            self.logger.log_message(
-                f"[Handshake][BAN] 🚫 IP {ip} banned for {self.ban_duration}s. "
-                f"Reason: Exceeded connection rate limit (possible scan)."
-            )
+    def _is_banned(self, ip: str, now: float) -> bool:
+        exp = self._ban_list.get(ip)
+        return bool(exp and now < exp)
+
+    def _track_connection_rate(self, ip: str, now: float, initial: bool):
+        if not initial:
+            return
+        q = self._conn_rate[ip]
+        q.append(now)
+        # keep only recent
+        self._conn_rate[ip] = [t for t in q if now - t <= self.rate_limit_period]
+        if len(self._conn_rate[ip]) > self.rate_limit_threshold:
             self._ban_list[ip] = now + self.ban_duration
-            del self._connection_rate_tracker[ip]
+            del self._conn_rate[ip]
+            self.logger.log_message(f"[Handshake][BAN] 🚫 {ip} banned ({self.ban_duration}s) for connection burst")
 
-    # ---- Packet handling ------------------------------------------------------
+    # ===== flow close / snapshots / admin =====
+    def _close_flow(self, key, flow, reason="closed"):
+        if callable(self.on_flow_closed):
+            try: self.on_flow_closed(key, flow, reason)
+            except Exception: pass
+        # nothing else—GC handled in caller or cleanup
 
-    def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
-        if not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
-            return False
-        if not pkt.haslayer(TCP):
-            return False
+    def snapshot_flow(self, key) -> Optional[Dict[str, Any]]:
+        f = self._flows.get(key)
+        if not f:
+            return None
+        return {
+            "state": f["state"],
+            "first_seen": f["first_seen"],
+            "last_seen": f["last_seen"],
+            "client": f["client"],
+            "server": f["server"],
+            "rtt": f["rtt_smoothed"],
+            "counters": dict(f["counters"]),
+            "dup_acks": dict(f["dup_acks"]),
+            "tcp_opts": {
+                "c2s": dict(f["tcp_opts"]["c2s"]),
+                "s2c": dict(f["tcp_opts"]["s2c"]),
+            },
+            "app_bytes": dict(f["app_bytes"]),
+        }
 
-        ip_layer = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
-        tcp_layer = pkt[TCP]
-        flags = tcp_layer.flags
-        now = time.time()
+    def snapshot_all(self) -> List[Dict[str, Any]]:
+        return [self.snapshot_flow(k) for k in list(self._flows.keys()) if self.snapshot_flow(k)]
 
-        original_src_ip = ip_layer.src
-        original_src_port = tcp_layer.sport
-        original_dst_ip = ip_layer.dst
-        original_dst_port = tcp_layer.dport
+    def export_json(self) -> str:
+        return json.dumps(self.snapshot_all(), indent=2, default=str)
 
-        with self._lock:
-            if self._ban_list.get(original_src_ip, 0) > now:
-                return False
+    def block_ip(self, ip: str, seconds: Optional[int] = None):
+        self._ban_list[ip] = time.time() + (seconds or self.ban_duration)
+        self.logger.log_message(f"[Handshake][BAN] ⛔ Manually blocked {ip} for {seconds or self.ban_duration}s")
 
-        # NAT reverse: map public dst to internal if it matches our public IP
-        if original_dst_ip == getattr(self.nat_manager, "public_ip", None):
-            nat_reversed_dst_tuple = self.nat_manager.get_internal_from_external(original_dst_port, original_src_ip)
-            if nat_reversed_dst_tuple:
-                original_dst_ip, original_dst_port = nat_reversed_dst_tuple
-                self.logger.log_message(
-                    f"[Handshake] NAT reverse (DST): {ip_layer.dst}:{tcp_layer.dport} -> {original_dst_ip}:{original_dst_port}"
-                )
+    def allow_ip(self, ip: str):
+        if ip in self._ban_list:
+            del self._ban_list[ip]
+            self.logger.log_message(f"[Handshake][BAN] ✅ Unblocked {ip}")
 
-        canonical_key = _get_canonical_session_key(original_src_ip, original_src_port,
-                                                   original_dst_ip, original_dst_port)
+    def set_thresholds(self, *, rate_limit_threshold: Optional[int] = None,
+                       rate_limit_period: Optional[int] = None,
+                       ban_duration: Optional[int] = None,
+                       timeout_half_open: Optional[int] = None,
+                       timeout_established: Optional[int] = None):
+        if rate_limit_threshold is not None:
+            self.rate_limit_threshold = int(rate_limit_threshold)
+        if rate_limit_period is not None:
+            self.rate_limit_period = int(rate_limit_period)
+        if ban_duration is not None:
+            self.ban_duration = int(ban_duration)
+        if timeout_half_open is not None:
+            self.timeout_half_open = int(timeout_half_open)
+        if timeout_established is not None:
+            self.timeout_established = int(timeout_established)
 
-        with self._lock:
-            current_session_data = self._sessions.get(canonical_key)
-            session_state = current_session_data[0] if current_session_data else None
-
-            if session_state is None:
-                stored_original_src_ip = original_src_ip
-                stored_original_src_port = original_src_port
-                stored_original_dst_ip = original_dst_ip
-                stored_original_dst_port = original_dst_port
-            else:
-                _, _, stored_original_src_ip, stored_original_src_port, \
-                    stored_original_dst_ip, stored_original_dst_port = current_session_data
-
-            # --- TCP Handshake/Teardown state machine --------------------------
-            if flags == 0x02:  # SYN
-                if session_state is None:
-                    self._sessions[canonical_key] = ("SYN_SENT", now,
-                                                     original_src_ip, original_src_port,
-                                                     original_dst_ip, original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] 🔓 SYN {original_src_ip}:{original_src_port} -> "
-                        f"{original_dst_ip}:{original_dst_port} on {inbound_iface}"
-                    )
-                elif session_state == "SYN_SENT":
-                    self._sessions[canonical_key] = (session_state, now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] 🔁 SYN retransmit from {original_src_ip}:{original_src_port} to {original_dst_ip}:{original_dst_port} on {inbound_iface}"
-                    )
-                return False
-
-            elif flags == 0x12:  # SYN+ACK
-                if session_state == "SYN_SENT":
-                    self._sessions[canonical_key] = ("SYN_ACK_RECEIVED", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] 🔐 SYN-ACK {original_src_ip}:{original_src_port} -> {original_dst_ip}:{original_dst_port} "
-                        f"for {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                    )
-                elif session_state == "SYN_ACK_RECEIVED":
-                    self._sessions[canonical_key] = (session_state, now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(f"[Handshake] 🔁 SYN-ACK retransmit on {inbound_iface}")
-                else:
-                    # fast-path: infer established
-                    self._sessions[canonical_key] = ("ESTABLISHED", now,
-                                                     original_src_ip, original_src_port,
-                                                     original_dst_ip, original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] ✅ Inferred ESTABLISHED: {original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}"
-                    )
-                    # Add/stateful NAT mapping if you want
-                    try:
-                        self.nat_manager.add_stateful_mapping(
-                            src_ip=stored_original_src_ip, src_port=stored_original_src_port,
-                            dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
-                        )
-                    except Exception:
-                        pass
-                return False
-
-            elif flags == 0x10:  # ACK
-                if session_state == "SYN_ACK_RECEIVED":
-                    self._sessions[canonical_key] = ("ESTABLISHED", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] ✅ ESTABLISHED: {stored_original_src_ip}:{stored_original_src_port} ↔ "
-                        f"{stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                    )
-                    try:
-                        self.nat_manager.add_stateful_mapping(
-                            src_ip=stored_original_src_ip, src_port=stored_original_src_port,
-                            dst_ip=stored_original_dst_ip, dst_port=stored_original_dst_port
-                        )
-                    except Exception:
-                        pass
-
-                elif session_state == "ESTABLISHED":
-                    # refresh timestamp
-                    self._sessions[canonical_key] = ("ESTABLISHED", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                elif session_state == "CLOSING":
-                    self._sessions[canonical_key] = ("CLOSED", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] ❎ CLOSED (ACK after FIN): "
-                        f"{stored_original_src_ip}:{stored_original_src_port} ↔ "
-                        f"{stored_original_dst_ip}:{stored_original_dst_port} on {inbound_iface}"
-                    )
-                    del self._sessions[canonical_key]
-                else:
-                    # generic keepalive/ack progression
-                    self._sessions[canonical_key] = ("ESTABLISHED", now,
-                                                     original_src_ip, original_src_port,
-                                                     original_dst_ip, original_dst_port)
-
-            elif flags & 0x01:  # FIN
-                if session_state == "ESTABLISHED":
-                    self._sessions[canonical_key] = ("CLOSING", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] 🔻 CLOSING by {original_src_ip}:{original_src_port} "
-                        f"for {stored_original_src_ip}:{stored_original_src_port} ↔ {stored_original_dst_ip}:{stored_original_dst_port}"
-                    )
-                    self._check_and_apply_rate_limit(original_src_ip, now)
-                elif session_state == "CLOSING":
-                    self._sessions[canonical_key] = ("CLOSED", now,
-                                                     stored_original_src_ip, stored_original_src_port,
-                                                     stored_original_dst_ip, stored_original_dst_port)
-                    self.logger.log_message(
-                        f"[Handshake] ❎ CLOSED (Second FIN): {stored_original_src_ip}:{stored_original_src_port} ↔ "
-                        f"{stored_original_dst_ip}:{stored_original_dst_port}"
-                    )
-                    del self._sessions[canonical_key]
-                else:
-                    self.logger.log_message(
-                        f"[Handshake] ⚠️ Unexpected FIN {original_src_ip}:{original_src_port} -> "
-                        f"{original_dst_ip}:{original_dst_port} in state {session_state} on {inbound_iface}"
-                    )
-                return False
-
-            elif flags & 0x04:  # RST
-                if current_session_data:
-                    self.logger.log_message(
-                        f"[Handshake] ❌ RST on {stored_original_src_ip}:{stored_original_src_port} ↔ "
-                        f"{stored_original_dst_ip}:{stored_original_dst_port} (closing)."
-                    )
-                    del self._sessions[canonical_key]
-                return False
-
-        # ---- TLS wiring: feed bytes to TLSRecordManager when we have payload ---
-        if self._sessions.get(canonical_key, (None,))[0] == "ESTABLISHED":
-            # Extract TCP payload (could be empty)
-            tcp_payload_bytes = bytes(tcp_layer.payload) if tcp_layer.payload else b""
-
-            # Robust TLS/SSL record sniff (TLS 1.x or SSLv2 hello)
-            looks_tls = (
-                    len(tcp_payload_bytes) >= 5
-                    and TLSRecordManager._looks_like_tls_header(tcp_payload_bytes)  # ct in {20..23}, vmaj==3
-            )
-            sslv2_possible = bool(tcp_payload_bytes) and (tcp_payload_bytes[0] & 0x80) and len(tcp_payload_bytes) >= 3
-            tlsish = looks_tls or sslv2_possible
-
-            with self._lock:
-                current = self._sessions.get(canonical_key)
-                current_state = current[0] if current else None
-
-            # If we see TLS bytes but didn't observe the 3-way handshake (common on mirrors/offload),
-            # mark the flow ESTABLISHED for TLS parsing.
-            if tlsish and current_state not in ("ESTABLISHED", "SYN_ACK_RECEIVED"):
-                with self._lock:
-                    if not current:
-                        self._sessions[canonical_key] = ("ESTABLISHED", now,
-                                                         original_src_ip, original_src_port,
-                                                         original_dst_ip, original_dst_port)
-                    else:
-                        st, _ts, ssrc_ip, ssrc_pt, sdst_ip, sdst_pt = current
-                        self._sessions[canonical_key] = ("ESTABLISHED", now, ssrc_ip, ssrc_pt, sdst_ip, sdst_pt)
-                    current = self._sessions[canonical_key]
-                    current_state = "ESTABLISHED"
-                    self.logger.log_message(
-                        f"[Handshake] ✅ Implicit ESTABLISHED by TLS payload: "
-                        f"{original_src_ip}:{original_src_port} ↔ {original_dst_ip}:{original_dst_port}"
-                    )
-
-            # Feed if (a) we have bytes AND (b) either the flow is established OR payload looks TLS-ish
-            if tcp_payload_bytes and (current_state == "ESTABLISHED" or tlsish):
-                with self._lock:
-                    _, _, s_src_ip, s_src_port, s_dst_ip, s_dst_port = self._sessions[canonical_key]
-                    is_c2s = self._infer_is_c2s(
-                        original_src_ip, original_src_port, original_dst_ip, original_dst_port, current
-                    )
-
-                # Remember last pkt for optional AppData forwarding
-                dir_key = (canonical_key, "c2s" if is_c2s else "s2c")
-                self._last_tcp_pkt[dir_key] = pkt
-
-                # Feed to TLS manager
-                self._tls_mgr.feed_tcp_segment(
-                    canonical_key=canonical_key,
-                    is_c2s=is_c2s,
-                    payload=tcp_payload_bytes,
-                    src_ip=original_src_ip, src_port=original_src_port,
-                    dst_ip=original_dst_ip, dst_port=original_dst_port,
-                    ts=time.time()
-                )
-
-            return True
-
-        return False
-
-    def _infer_is_c2s(self, src_ip, src_port, dst_ip, dst_port, stored):
-        # Prefer stored session roles when we have them
-        if stored:
-            _, _, s_src_ip, s_src_port, s_dst_ip, s_dst_port = stored
-            return (src_ip == s_src_ip and src_port == s_src_port)
-        # Heuristic by port
-        if dst_port in self.COMMON_TLS_PORTS and src_port not in self.COMMON_TLS_PORTS:
-            return True  # client -> server: dport looks like TLS
-        if src_port in self.COMMON_TLS_PORTS and dst_port not in self.COMMON_TLS_PORTS:
-            return False  # server -> client
-        # Fallback: treat src as client
-        return True
-    # ---- TLSRecordManager callbacks ------------------------------------------
-
+    # ===== TLS callbacks =====
     def _on_tls_record(self, rec: "TLSRecord"):
-        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
-        self._tls_records[key].append(rec)
-        # brief log on first few records
-        if len(self._tls_records[key]) <= 3:
-            self.logger.log_message(
-                f"[TLS] 📄 Record ct={rec.content_type} ver={rec.version} len={rec.length} "
-                f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
-            )
+        # lightweight first-records log
+        self.logger.log_message(
+            f"[TLS] 📄 ct={rec.content_type} ver={rec.version} len={rec.length} "
+            f"{rec.direction} {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+        )
 
     def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
-        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
-        # Summarize interesting fields (SNI, ALPN, JA3/JA3S, version/cipher)
+        # compact summary
         for msg in info.get("messages", []):
             t = msg.get("type")
             if t == "client_hello":
-                sni = (msg.get("sni") or
-                       (info.get("client_hello") or {}).get("sni"))
+                sni = (msg.get("sni") or (info.get("client_hello") or {}).get("sni"))
                 ja3 = (info.get("client_hello") or {}).get("ja3_md5")
                 ver = (info.get("client_hello") or {}).get("version")
                 alpn = (info.get("client_hello") or {}).get("alpn") or []
-                self.logger.log_message(
-                    f"[TLS][ClientHello] SNI={sni or 'N/A'} JA3={ja3 or 'N/A'} ver={ver or 'N/A'} ALPN={','.join(alpn) or 'N/A'} "
-                    f"flow={key}"
-                )
+                self.logger.log_message(f"[TLS][CH] SNI={sni or 'N/A'} JA3={ja3 or 'N/A'} ver={ver or 'N/A'} ALPN={','.join(alpn) or 'N/A'}")
             elif t == "server_hello":
                 ver = (info.get("server_hello") or {}).get("version")
                 cipher = (info.get("server_hello") or {}).get("cipher_suite")
                 ja3s = (info.get("server_hello") or {}).get("ja3s_md5")
-                self.logger.log_message(
-                    f"[TLS][ServerHello] ver={ver or 'N/A'} cipher={cipher or 'N/A'} JA3S={ja3s or 'N/A'} flow={key}"
-                )
+                self.logger.log_message(f"[TLS][SH] ver={ver or 'N/A'} cipher={cipher or 'N/A'} JA3S={ja3s or 'N/A'}")
 
     def _on_tls_alert(self, rec: "TLSRecord", alert: Dict):
-        level = alert.get("level")
-        desc = alert.get("description")
         self.logger.log_message(
-            f"[TLS][Alert] level={level} desc={desc} {rec.direction} "
-            f"{rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+            f"[TLS][Alert] level={alert.get('level')} desc={alert.get('description')} "
+            f"{rec.direction} {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
         )
 
     def _on_tls_application_data(self, rec: "TLSRecord"):
-        """
-        Optional: forward TLS Application Data using the last seen TCP seq/ack for that direction.
-        If the TLS policy blocked/quarantined this flow, TLSRecordManager already suppresses this callback.
-        """
-        # Use the same canonicalizer you use elsewhere
-        key = self._canon_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
-
-        # Cache the payload if you want to reassemble later
-        self._tls_streams.setdefault(key, []).append(rec.payload)
-
+        # Optional: forward AppData using last TCP context
+        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
         dir_key = (key, rec.direction)
         last_pkt = self._last_tcp_pkt.get(dir_key)
         if not last_pkt:
-            self.logger.log_message(
-                f"[TLS] 🔒 AppData {len(rec.payload)}B (no TCP context for forwarding) "
-                f"{rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
-            )
+            self.logger.log_message(f"[TLS] 🔒 AppData {len(rec.payload)}B (no TCP ctx) {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}")
             return
-
         try:
-            # L2: reuse Ether if we saw it
             ether = last_pkt[Ether] if last_pkt.haslayer(Ether) else None
             base_eth = Ether(dst=ether.dst, src=ether.src) if ether else Ether()
-
-            # L3: decide v4 vs v6 WITHOUT indexing IPv6
             is_v6 = last_pkt.haslayer(IPv6)
-            ip_layer = (IPv6(src=rec.src, dst=rec.dst) if is_v6
-                        else IP(src=rec.src, dst=rec.dst))
-
-            # L4: borrow seq/ack/window from the last observed TCP in this direction
-            if not last_pkt.haslayer(TCP):
-                raise RuntimeError("No TCP layer on last_pkt for forwarding context")
+            ip_layer = (IPv6(src=rec.src, dst=rec.dst) if is_v6 else IP(src=rec.src, dst=rec.dst))
             tcp_prev = last_pkt[TCP]
-            tcp_seg = TCP(
-                sport=rec.src_port,
-                dport=rec.dst_port,
-                flags="PA",
-                seq=tcp_prev.seq,
-                ack=tcp_prev.ack,
-                window=tcp_prev.window
-            )
-
-            # Build full packet (note: conditional now only affects L2, not the whole chain)
-            out = base_eth / ip_layer / tcp_seg / Raw(load=rec.payload)
-
-            # Send via your writer (add iface if your writer requires it)
-            self.sniffer.send(out)
-            self.logger.log_message(
-                f"[TLS] 🔁 Forwarded AppData {len(rec.payload)}B {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
-            )
+            seg = TCP(sport=rec.src_port, dport=rec.dst_port, flags="PA",
+                      seq=int(tcp_prev.seq), ack=int(tcp_prev.ack), window=int(tcp_prev.window))
+            out = base_eth / ip_layer / seg / Raw(load=rec.payload)
+            # Replace with packet_writer if needed:
+            if self.sniffer:
+                self.sniffer.send(out)
+            else:
+                # try PacketWriter if provided
+                try:
+                    self.packet_writer._send_raw_packet(out, flow_iface := self._flows.get(key, {}).get("iface", None), allow_dst_ours=True, no_consume=False)
+                except Exception:
+                    pass
+            self.logger.log_message(f"[TLS] 🔁 Fwd AppData {len(rec.payload)}B {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}")
         except Exception as e:
-            self.logger.log_message(f"[TLS] ❌ Forwarding error: {e}")
+            self.logger.log_message(f"[TLS] ❌ Forward error: {e}")
 
     def _on_tls_event(self, evt: Dict):
-        # Optional: compact log of notable events from TLSRecordManager
         kind = evt.get("kind")
-        data = evt.get("data", {})
         if kind in ("block", "quarantine", "policy_alert"):
-            self.logger.log_message(f"[TLS][Policy] {kind.upper()} {data}")
+            self.logger.log_message(f"[TLS][Policy] {kind.upper()} {evt.get('data', {})}")
 
     def _on_tls_decision(self, flow_key, rec: "TLSRecord", decision):
-        # Surface decisions (allow/alert/block/quarantine)
         if decision.action != "allow":
             self.logger.log_message(
                 f"[TLS][Decision] {decision.action.upper()} flow={flow_key} reason={decision.reason} tags={decision.tags}"
             )
 
-    # ---- misc helpers ---------------------------------------------------------
-
+    # ===== misc =====
     def normalize_mac(self, mac: str) -> str:
         return mac.replace('-', ':').lower()
 
@@ -5708,14 +5802,16 @@ class RIPManager:
 
 class NATManager:
     """
-    Manages Network Address Translation (NAT) with both:
-      - dynamic NAT for outbound connections, and
-      - static port‐forwarding mappings for inbound services.
-    Enhanced with NAT timeouts, keep-alive handling, and a basic ALG placeholder.
-    Includes port scan detection, IP banning, and temporary NAT leases.
+    NAT with:
+      • Multi-IP (VIP) support for all features
+      • Dynamic SNAT (per-VIP port pools)
+      • Static DNAT
+      • Stateful pinning
+      • MSS clamp
+      • Probe->ban + advanced Temporary NAT Leases
+      • ICMP Port Unreachable fallback
     """
 
-    # Dictionary to map common ports to services and emojis
     PORT_SERVICES = {
         80: ("HTTP", "🌐"),
         443: ("HTTPS", "🔒"),
@@ -5726,86 +5822,1077 @@ class NATManager:
         53: ("DNS", "❓"),
         88: ("Kerberos", "🎟️"),
         520: ("RIP", "🗺️"),
-        25565: ("Minecraft", "🧱")
+        25565: ("Minecraft", "🧱"),
     }
 
+    # ---- Core tunables ----
+    NAT_PORT_MIN = 49152
+    NAT_PORT_MAX = 65535
+    NAT_TIMEOUT_SECONDS = 300
+    STATEFUL_NAT_TIMEOUT_SECONDS = 300
+
+    KEEP_ALIVE_PORT = 19999
+    KEEP_ALIVE_PAYLOAD_FORMAT = "!H32s"  # 2 bytes port + 32-byte HMAC
+
+    BAN_THRESHOLD = 3
+    BAN_DURATION_SEC = 120
+
+    # MTU / MSS clamp
+    WAN_MTU_DEFAULT = 1480
+    CLAMP_MSS = True
+
+    # ---- Advanced Temp-Lease Policy ----
+    DEFAULT_LEASE_SECS = 60
+    DEFAULT_COOLDOWN_SECS = 10
+    MAX_TEMP_LEASES_PER_IP = 2
+    MAX_TEMP_LEASES_PER_PREFIX = 8  # /24 for IPv4, /64 for IPv6
+    RATE_WINDOW_SEC = 60
+    RATE_MAX_ATTEMPTS_PER_IP = 20
+    RATE_MAX_ATTEMPTS_PER_PREFIX = 60
+
+    # Graylist pipeline → possible auto-promotion
+    WARMUP_REQUIRED_HITS = 3
+    TRUST_REQUIRED_HITS = 8
+    AUTO_PROMOTE_TO_DYNAMIC = True
+    AUTO_PROMOTE_TO_STATIC = False
+
+    TEMP_LEASE_SERVICE_POLICY: Dict[int, Dict] = {
+        80: {"mode": "allow", "max_per_ip": 2, "lease_secs": 90, "cooldown_secs": 10},
+        443: {"mode": "allow", "max_per_ip": 2, "lease_secs": 120, "cooldown_secs": 10},
+        22: {"mode": "throttle", "max_per_ip": 1, "lease_secs": 45, "cooldown_secs": 20},
+        3389: {"mode": "deny"},
+        25565: {"mode": "allow", "max_per_ip": 2, "lease_secs": 300, "cooldown_secs": 30},
+    }
+
+    # Uplink policy (deny temp-leases on certain uplinks)
+    TEMP_LEASES_POLICY = {
+        "deny_gateways": {"192.168.1.254"},
+        "deny_cidrs": ["192.168.1.0/24"],
+        "deny_ifaces": {"wan_att", "eth_att"},
+    }
+
+    # ---- NEW knobs ------------------------------------
+    # Traffic we will NEVER NAT (bypass end-to-end)
+    BYPASS_DST_CIDRS = [
+        "224.0.0.0/4",  # IPv4 multicast
+        "255.255.255.255/32",  # broadcast
+        "169.254.0.0/16",  # link-local v4
+    ]
+    BYPASS_SRC_CIDRS = [
+        "169.254.0.0/16",
+    ]
+    # NAT exemptions (no SNAT for these dsts; still allow DNAT inbound)
+    NAT_EXEMPT_DST_CIDRS = [
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # RFC1918
+        "100.64.0.0/10",  # CGNAT
+        "198.18.0.0/15",  # benchmarking nets
+    ]
+
+    # Treat these as “our” public VIPs (in addition to self.public_ip)
+    PUBLIC_VIPS: set[str] = set()
+
+    # Small fragment cache: (src,dst,proto,ident)->decision
+    _FRAG_CACHE_TTL = 20.0
+
     def __init__(self, router_logger, sendback_manager, router_public_ip: str, packet_writer,
-                 interfaces_config: Dict, rip_manager_find_route, arp_manager_resolve, function_call_tracker):
+                 interfaces_config: Dict, rip_manager_find_route, arp_manager_resolve, function_call_tracker,
+                 *, token_secret: Optional[bytes] = None):
+
+        # External collaborators
         self.router_logger = router_logger
-        self.public_ip = router_public_ip
+        self.sendback_manager = sendback_manager
+        self.public_ip = router_public_ip  # primary public IP
         self.packet_writer = packet_writer
         self._interfaces_config = interfaces_config
         self._rip_manager_find_route = rip_manager_find_route
         self._arp_manager_resolve = arp_manager_resolve
-        self.sendback_manager = sendback_manager
         self.function_call_tracker = function_call_tracker
 
-        # --- Dynamic NAT Configuration ---
-        self.NAT_PORT_MIN = 49152
-        self.NAT_PORT_MAX = 65535
-        self.NAT_TIMEOUT_SECONDS = 300
-        self._next_port = self.NAT_PORT_MIN
+        # NAT port pools (per external IP)
+        self._next_port_per_ip: Dict[str, int] = defaultdict(lambda: self.NAT_PORT_MIN)
 
-        # --- Keep-Alive Configuration ---
-        self.KEEP_ALIVE_PORT = 19999  # Dedicated UDP port for keep-alive signals
-        self.KEEP_ALIVE_PAYLOAD_FORMAT = "!H"  # Network byte order, unsigned short (for the target port)
+        # === Tables (Multi-IP aware) ===
+        # (src_ip, sport) -> (ext_ip, ext_port, ts)
+        self._nat_table: Dict[Tuple[str, int], Tuple[str, int, float]] = {}
+        # (ext_ip, ext_port) -> (src_ip, sport)
+        self._nat_reverse_table: Dict[Tuple[str, int], Tuple[str, int]] = {}
+        # (ext_ip, ext_port) -> (int_ip, int_port)
+        self._static_mappings: Dict[Tuple[str, int], Tuple[str, int]] = {}
+        # (canon_session) -> (ext_ip, ext_port, ts)
+        self._stateful_nat_outbound: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int, float]] = {}
+        # (ext_ip, ext_port) -> canon_session
+        self._stateful_nat_inbound: Dict[Tuple[str, int], Tuple[Tuple[str, int], Tuple[str, int]]] = {}
 
-        # --- NAT Tables ---
-        self._nat_table: Dict[
-            Tuple[str, int], Tuple[int, float]] = {}  # (internal_ip, internal_port) -> (external_port, timestamp)
-        self._nat_reverse_table: Dict[int, Tuple[str, int]] = {}  # external_port -> (internal_ip, internal_port)
-        self._static_mappings = {}  # external_port -> (internal_ip, internal_port)
-
-        # --- NAT Security & Temporary Leases ---
+        # Security / probes / bans
         self._port_probe_counts: Dict[str, int] = defaultdict(int)
-        self._ban_list: Dict[str, float] = {}  # ip -> ban_expiry_timestamp
-        self._ban_threshold = 3  # Number of unmapped port hits to trigger ban
-        self._ban_duration = 120  # Ban duration in seconds
+        self._ban_list: Dict[str, float] = {}
 
-        self._max_temp_leases_per_ip = 2  # NEW: Flat limit on active temporary leases per IP
-        self._temp_nat_leases: Dict[str, Dict[int, Dict[str, float | str | int]]] = defaultdict(
-            dict)  # ip -> {port -> lease_info}
-        self._temp_nat_lease_duration = 60  # seconds
-        self._temp_nat_cooldown_duration = 10  # seconds
+        # Temp leases: src_ip -> (ext_ip, ext_port) -> info
+        self._temp_nat_leases: Dict[str, Dict[Tuple[str, int], Dict[str, float | str | int]]] = defaultdict(
+            lambda: defaultdict(dict))
 
-        # --- Threading & Router State ---
-        self._lock = threading.Lock()
+        # Graylist score: (src_ip, ext_ip, ext_port) -> score
+        self._gray_score: Dict[Tuple[str, str, int], int] = defaultdict(int)
+
+        # Sliding windows (RL)
+        self._ip_attempts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=512))
+        self._prefix_attempts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1024))
+
+        # Concurrency
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._cleanup_thread = None
+        self._cleanup_thread: Optional[threading.Thread] = None
+
+        # Router settings
         self.router_internal_ip_for_self_mapping: str = "0.0.0.0"
+        self.WAN_MTU = self.WAN_MTU_DEFAULT
+        self.MSS_CLAMP_V4 = max(536, self.WAN_MTU - 40)
+        self.MSS_CLAMP_V6 = max(536, self.WAN_MTU - 60)
 
-        self._stateful_nat_outbound = {}  # Maps canonical_key -> (translated_port, last_seen_timestamp)
-        self._stateful_nat_inbound = {}  # Maps translated_port -> canonical_key
-        self.STATEFUL_NAT_TIMEOUT_SECONDS = 300  # A longer timeout for established connections
-
-        # Initialize with predefined static mappings
-        self.add_static_mapping(external_port=65406, internal_ip="192.168.1.50", internal_port=88)
-        self.add_static_mapping(external_port=80, internal_ip="192.168.1.100", internal_port=80)
-        self.add_static_mapping(external_port=443, internal_ip="192.168.1.100", internal_port=443)
-        self.add_static_mapping(external_port=2222, internal_ip="192.168.1.10", internal_port=22)
-        self.add_static_mapping(external_port=3389, internal_ip="192.168.1.25", internal_port=3389)
-        self.add_static_mapping(external_port=25565, internal_ip="192.168.1.75", internal_port=25565)
-
-        self.WAN_MTU = 1480  # try 1480 first; if pings fragment at 1472 bytes payload, drop to 1460
-        self.MSS_CLAMP_V4 = max(536, self.WAN_MTU - 40)  # TCP header 20 + IP 20
-        self.MSS_CLAMP_V6 = max(536, self.WAN_MTU - 60)  # TCP 20 + IPv6 40
-        self.CLAMP_MSS = True
-
-        self.TEMP_LEASES_POLICY = {
-            # exact gateway IPs to deny (strings)
-            "deny_gateways": {"192.168.1.254"},  # AT&T BGW-210/BGW-320 default
-            # gateway subnets to deny (CIDR strings)
-            "deny_cidrs": ["192.168.1.0/24"],  # deny any gateway in this /24
-            # optional: deny by egress iface name suffix (your iface naming: 'eth_out', 'wan0', etc)
-            "deny_ifaces": {"wan_att", "eth_att"},  # only if you use consistent names
-        }
-        # Cached uplink identity (refresh periodically)
-        self._uplink_cache_ttl = 10.0  # seconds
+        # Uplink cache
+        self._uplink_cache_ttl = 10.0
         self._uplink_last_refresh = 0.0
-        self._uplink_gateway_ip = None  # str | None
-        self._uplink_iface = None  # str | None
+        self._uplink_gateway_ip: Optional[str] = None
+        self._uplink_iface: Optional[str] = None
 
-        self.router_logger.log_message("[NAT] 🚀 Manager initialized with port scan detection and temporary leases.")
+        # Token/HMAC for keepalive auth
+        self._token_secret = token_secret or hashlib.sha256(f"{time.time()}:{random.random()}".encode()).digest()
+
+        # NEW: Control for verbose logging
+        self.debug_logging = False
+
+        # Example static mappings (primary IP unless explicit external_ip passed)
+        self.add_static_mapping(65406, "192.168.1.50", 88)
+        self.add_static_mapping(80, "192.168.1.100", 80)
+        self.add_static_mapping(443, "192.168.1.100", 443)
+        self.add_static_mapping(2222, "192.168.1.10", 22)
+        self.add_static_mapping(3389, "192.168.1.25", 3389)
+        self.add_static_mapping(25565, "192.168.1.75", 25565)
+        self._config_sanity()
+        self._log("[NAT] 🚀 Manager initialized with Multi-IP and advanced temporary leases.")
+
+    # ========================= VIP management =========================
+
+    def set_public_ips(self, primary: str, vips: Iterable[str] | None = None):
+        with self._lock:
+            self.public_ip = primary
+            self.PUBLIC_VIPS = set(vips or set())
+        self._config_sanity()
+        self._log(f"[NAT] 🌐 Public IP set to {primary}; VIPs={sorted(self.PUBLIC_VIPS)}")
+
+    def add_public_vip(self, vip: str):
+        with self._lock:
+            self.PUBLIC_VIPS.add(vip)
+        self._log(f"[NAT] ➕ Added VIP {vip}")
+
+    def remove_public_vip(self, vip: str):
+        with self._lock:
+            self.PUBLIC_VIPS.discard(vip)
+        self._log(f"[NAT] ➖ Removed VIP {vip}")
+
+    # ========================= Lifecycle =========================
+
+    def set_router_internal_ip(self, ip: str):
+        self.router_internal_ip_for_self_mapping = ip
+        self._log(f"[NAT] 🏠 Router internal IP set to {ip}")
+
+    def start(self):
+        self._stop_event.clear()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="NATCleanup")
+        self._cleanup_thread.start()
+        self._log("[NAT] ✅ Cleanup thread started.")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=2)
+        self._log("[NAT] 🛑 Manager stopped.")
+
+    # ---- Helpers ----------------------------------------
+    def _ip_in_any(self, ip: str, cidrs: List[str]) -> bool:
+        try:
+            ipx = ipaddress.ip_address(ip)
+            for c in cidrs:
+                if ipx in ipaddress.ip_network(c, strict=False):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _is_multicast_or_broadcast(self, ip: str) -> bool:
+        try:
+            ipx = ipaddress.ip_address(ip)
+            return ipx.is_multicast or ipx.is_unspecified or ipx.is_loopback
+        except Exception:
+            return False
+
+    def _is_global(self, ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip).is_global
+        except Exception:
+            return False
+
+    def _is_first_ipv4_fragment(self, pkt) -> bool:
+        if IP not in pkt:
+            return False
+        ip = pkt[IP]
+        off = int(getattr(ip, "frag", 0))
+        mf = bool(ip.flags.MF) if hasattr(ip.flags, "MF") else bool(int(ip.flags) & 0x1)
+        return mf and off == 0
+
+    def _is_nonfirst_ipv4_fragment(self, pkt) -> bool:
+        if IP not in pkt:
+            return False
+        ip = pkt[IP]
+        off = int(getattr(ip, "frag", 0))
+        return off > 0
+
+    def _frag_key(self, pkt) -> tuple | None:
+        try:
+            ip = pkt[IP]
+            proto = int(ip.proto)
+            return (ip.src, ip.dst, proto, int(ip.id))
+        except Exception:
+            return None
+
+    def _frag_cache_get(self, key):
+        ent = getattr(self, "_frag_cache", {}).get(key)
+        if not ent:
+            return None
+        decision, ts = ent
+        if (time.time() - ts) > self._FRAG_CACHE_TTL:
+            try:
+                del self._frag_cache[key]
+            except Exception:
+                pass
+            return None
+        return decision
+
+    def _frag_cache_set(self, key, decision: bool):
+        if not hasattr(self, "_frag_cache"):
+            self._frag_cache = {}
+        self._frag_cache[key] = (decision, time.time())
+
+    def _has_dnat_mapping(self, external_ip: str, external_port: int, src_ip: str) -> bool:
+        ext_key = (external_ip, int(external_port))
+        with self._lock:
+            if ext_key in self._static_mappings:
+                return True
+            if ext_key in self._stateful_nat_inbound:
+                # If pinned to a specific remote and it matches, count as “has mapping”
+                canon = self._stateful_nat_inbound[ext_key]
+                _a, b = canon  # ((int_ip,int_port), (src_ip,dst_port))
+                return src_ip == b[0]
+            if ext_key in self._nat_reverse_table:
+                return True
+        return False
+
+    def _classify_direction(self, inbound_iface: str, src_ip: str, dst_ip: str,
+                            router_ips: set[str], wan_ifaces: set[str], lan_ifaces: set[str] | None) -> str:
+        """
+        Returns 'inbound', 'outbound', 'hairpin', or 'none'.
+        Robust to tunnels/bridges: any pkt targeting our public/VIP is inbound-ish.
+        """
+        is_wan = inbound_iface in wan_ifaces
+        is_dst_ours = (dst_ip == self.public_ip) or (dst_ip in self.PUBLIC_VIPS) or (dst_ip in router_ips)
+        src_is_private = not self._is_global(src_ip)
+
+        # If the packet is heading to our public/VIP, it’s either inbound or hairpin
+        if is_dst_ours:
+            # Hairpin when source is from a private space (typical LAN) and iface is not a clear WAN
+            if src_is_private and not is_wan:
+                return "hairpin"
+            return "inbound"
+
+        # Classic outbound: LAN→global
+        if (lan_ifaces and inbound_iface in lan_ifaces) or (not is_wan):
+            if self._is_global(dst_ip):
+                return "outbound"
+
+        return "none"
+
+    def _handle_icmp_error_translation(self, packet) -> bool:
+        """
+        Translate ICMP error payloads so internal hosts get meaningful errors.
+        Returns True if translated (packet mutated), False otherwise.
+        """
+        try:
+            if ICMP in packet and IP in packet:
+                ic = packet[ICMP]
+                if ic.type in (3, 11, 12):  # dest unreachable, time exceeded, param problem
+                    inner = bytes(ic[Raw].load or b"") if Raw in ic else (
+                        bytes(ic.payload) if hasattr(ic, "payload") else b"")
+                    if len(inner) < 28:
+                        return False
+                    ver_ihl = inner[0]
+                    if (ver_ihl >> 4) != 4:
+                        return False
+                    ihl = (ver_ihl & 0x0F) * 4
+                    proto = inner[9]
+                    inner_src = ".".join(str(b) for b in inner[12:16])
+                    inner_dst = ".".join(str(b) for b in inner[16:20])
+                    sport = dport = None
+                    if proto in (6, 17) and len(inner) >= ihl + 4:
+                        sport = (inner[ihl] << 8) | inner[ihl + 1]
+                        dport = (inner[ihl + 2] << 8) | inner[ihl + 3]
+
+                    if dport and (inner_dst == self.public_ip or inner_dst in self.PUBLIC_VIPS):
+                        mapping = self.get_internal_from_external(inner_dst, dport, inner_src)
+                        if mapping:
+                            # Re-route the outer ICMP back toward the original sender
+                            packet[IP].dst = inner_src
+                            self._log(f"[NAT] ℹ️ ICMP error translated for {inner_dst}:{dport}")
+                            return True
+        except Exception:
+            pass
+        return False
+
+    def _is_private_or_cgn(self, ip: str) -> bool:
+        try:
+            ipx = ipaddress.ip_address(ip)
+            return (ipx.is_private or ipx.is_loopback or ipx.is_link_local or
+                    ipx.is_multicast or ipx.is_reserved or ipx.is_unspecified)
+        except Exception:
+            return True
+
+    def _config_sanity(self):
+        warn = []
+        if self._is_private_or_cgn(self.public_ip):
+            warn.append(f"public_ip={self.public_ip} looks private/CGN/loopback")
+        for vip in self.PUBLIC_VIPS:
+            if self._is_private_or_cgn(vip):
+                warn.append(f"VIP {vip} looks private/CGN/loopback")
+        if warn:
+            self._log("[NAT][SANITY] ⚠️ " + " | ".join(warn) +
+                      " — SNAT may be a no-op; inbound leases will never be hit unless you truly receive traffic to these addresses.")
+
+    # ========================= Entry =========================
+
+    def handle_packet(
+            self,
+            packet,
+            inbound_iface: str,
+            *,
+            router_ips: set[str],  # Includes self.public_ip AND self.PUBLIC_VIPS
+            wan_ifaces: set[str],
+            lan_ifaces: set[str] | None = None,
+    ) -> bool | None:
+        """
+        Main entry point for processing a packet.
+        This method is responsible for "learning" the packet's IP addresses
+        and directing it through the appropriate NAT translation path.
+        """
+        try:
+            if not self._is_ip(packet):
+                return None
+
+            has_tcp = TCP in packet
+            has_udp = UDP in packet
+            has_icmp = (ICMP in packet) or (ICMPv6 in packet)
+
+            # --- Learning the IP address of the packet itself ---
+            # Extract source and destination IP addresses from the packet's IP layer.
+            # This is where the NATManager "learns" the packet's IPs.
+            ipL = packet[IP] if IP in packet else packet[IPv6]
+            src_ip = ipL.src
+            dst_ip = ipL.dst
+            self._log_debug(f"PKT_IN {src_ip} → {dst_ip} on {inbound_iface}")
+
+            all_our_public_ips = self.PUBLIC_VIPS.union({self.public_ip}).union(router_ips)
+
+            # Global bans
+            with self._lock:
+                ban_exp = self._ban_list.get(src_ip)
+                if ban_exp and time.time() < ban_exp:
+                    self._log(f"[NAT] 🛡️ Drop banned IP {src_ip}")
+                    return False
+
+            # Early bypass for specific types of traffic (multicast, broadcast, link-local)
+            if self._is_multicast_or_broadcast(dst_ip) or \
+                    self._ip_in_any(dst_ip, self.BYPASS_DST_CIDRS) or \
+                    self._ip_in_any(src_ip, self.BYPASS_SRC_CIDRS):
+                #self._log(f"[NAT] ⏭️ Bypass packet {src_ip} → {dst_ip}")
+                return None
+
+            # ICMP error translation (best-effort)
+            if has_icmp and IP in packet:
+                try:
+                    if self._handle_icmp_error_translation(packet):
+                        # Log is inside the helper
+                        return None
+                except Exception:
+                    pass
+
+            # UDP keep-alive control plane (to whichever external IP it targeted)
+            if has_udp and UDP in packet and Raw in packet:
+                try:
+                    if int(packet[UDP].dport) == self.KEEP_ALIVE_PORT and (dst_ip in all_our_public_ips):
+                        self.handle_keep_alive(packet, dst_ip)
+                        return False  # Packet consumed by keep-alive
+                except Exception:
+                    pass
+
+            # Fragment awareness (IPv4)
+            if IP in packet and self._is_nonfirst_ipv4_fragment(packet):
+                key = self._frag_key(packet)
+                if key:
+                    prior = self._frag_cache_get(key)
+                    if prior is not None:
+                        return prior
+                return None  # Defer decision until first fragment
+
+            # Direction classification based on source, destination, and interface
+            direction = self._classify_direction(inbound_iface, src_ip, dst_ip, all_our_public_ips, wan_ifaces,
+                                                 lan_ifaces)
+            self._log_debug(f"DIR: {direction} for {src_ip} → {dst_ip}")
+
+            # ---- Hairpin handling (L4-aware) ----
+            # Hairpin traffic is when an internal host tries to reach another internal host
+            # using the router's public IP.
+            if direction == "hairpin":
+                if not (has_tcp or has_udp):
+                    return None
+                trans = packet[TCP] if has_tcp else packet[UDP]
+                ext_ip, ext_port = dst_ip, int(trans.dport)
+                # Attempt to find an existing mapping for the external IP/port
+                mapping = self.get_internal_from_external(ext_ip, ext_port, src_ip)
+                if mapping:
+                    internal_ip, internal_port = mapping
+                    ipL.dst = internal_ip  # Rewrite destination to internal IP
+                    trans.dport = int(internal_port)  # Rewrite destination port
+                    # If router internal IP is configured, SNAT the source to the router's internal IP
+                    if self.router_internal_ip_for_self_mapping and self.router_internal_ip_for_self_mapping != "0.0.0.0" and IP in packet:
+                        old = ipL.src
+                        ipL.src = self.router_internal_ip_for_self_mapping
+                        self._recalc_checksums(packet)
+                        self._log(f"[NAT][HAIRPIN] 🔁 {old} → {internal_ip}:{internal_port} (via {ext_ip}:{ext_port})")
+                    if self._is_first_ipv4_fragment(packet):
+                        key = self._frag_key(packet)
+                        if key: self._frag_cache_set(key, True)
+                    return True
+                else:
+                    # No mapping yet → let temp-lease path handle it explicitly
+                    direction = "hairprobe"
+                    self._log_debug(f"DIR: 🔁 hairprobe {src_ip} → {dst_ip}:{ext_port}")
+
+            # ---- Inbound (WAN→us) upgrade to grayprobe when no mapping yet ----
+            # If inbound to a public IP/VIP but no static/stateful mapping exists,
+            # it becomes a "grayprobe" to potentially trigger a temporary lease.
+            if direction == "inbound" and (has_tcp or has_udp):
+                trans = packet[TCP] if has_tcp else packet[UDP]
+                ext_port = int(trans.dport)
+                if not self._has_dnat_mapping(dst_ip, ext_port, src_ip):
+                    direction = "grayprobe"
+                    self._log_debug(f"DIR: 🕵️ grayprobe {src_ip} → {dst_ip}:{ext_port}")
+
+            # Gray probe: inbound to a VIP with no mapping yet.
+            # `translate_inbound()` will either find a late mapping or grant a temp lease.
+            if direction == "grayprobe":
+                ok = self.translate_inbound(packet, dst_ip)
+                if IP in packet and self._is_first_ipv4_fragment(packet):
+                    key = self._frag_key(packet)
+                    if key: self._frag_cache_set(key, bool(ok))
+                return True if ok else False
+
+            # Hair probe: hairpin to a VIP with no mapping yet (treat like inbound, but keep hairpin src NAT).
+            if direction == "hairprobe":
+                ok = self.translate_inbound(packet, dst_ip)
+                if ok and self.router_internal_ip_for_self_mapping and self.router_internal_ip_for_self_mapping != "0.0.0.0" and IP in packet:
+                    old = ipL.src
+                    ipL.src = self.router_internal_ip_for_self_mapping
+                    self._recalc_checksums(packet)
+                    self._log(f"[NAT][HAIRPROBE] 🔁 {old} → {ipL.dst} (dst was {dst_ip})")
+                if IP in packet and self._is_first_ipv4_fragment(packet):
+                    key = self._frag_key(packet)
+                    if key: self._frag_cache_set(key, bool(ok))
+                return True if ok else False
+
+            # Outbound SNAT (with exemptions)
+            # This path handles traffic originating from the internal network
+            # destined for external (global) IPs.
+            if direction == "outbound":
+                if self._ip_in_any(dst_ip, self.NAT_EXEMPT_DST_CIDRS):
+                    self._log(f"[NAT] ⏭️ Outbound exempt: {src_ip} → {dst_ip}")
+                    return None
+
+                # TCP SYN pre-pin stateful mapping for new connections
+                if has_tcp and (packet[TCP].flags & 0x02) and not (packet[TCP].flags & 0x10):  # SYN, not ACK
+                    try:
+                        sport = int(packet[TCP].sport)
+                        dport = int(packet[TCP].dport)
+                        internal_key = (src_ip, sport)
+                        canon = _get_canonical_session_key(src_ip, sport, dst_ip, dport)
+                        with self._lock:
+                            if internal_key not in self._nat_table:
+                                # Select an external IP (VIP) for this flow
+                                ext_ip = self._select_external_ip(dst_ip, internal_ip=src_ip, internal_port=sport)
+                                port = self._alloc_port(ext_ip)
+                                if port != -1:
+                                    now = time.time()
+                                    self._nat_table[internal_key] = (ext_ip, port, now)
+                                    self._nat_reverse_table[(ext_ip, port)] = internal_key
+                                    self._stateful_nat_outbound[canon] = (ext_ip, port, now)
+                                    self._log(f"[NAT][STATEFUL] 📌 Pre-pin {src_ip}:{sport} → {ext_ip}:{port}")
+                    except Exception as e:
+                        self._log_error(f"SYN pin error: {e}")
+
+                # Perform the actual outbound translation (SNAT)
+                self.translate_outbound(packet)
+                if IP in packet and self._is_first_ipv4_fragment(packet):
+                    key = self._frag_key(packet)
+                    if key: self._frag_cache_set(key, True)
+                return True
+
+            # None: intra-LAN / non-NAT traffic
+            #self._log(f"[NAT] ℹ️ No NAT action for {src_ip} → {dst_ip} (direction: {direction})")
+            return None
+
+        except Exception as e:
+            self._log_error(f"handle_packet error on {inbound_iface}: {e}")
+            return None
+
+    # ========================= Outbound (SNAT) =========================
+
+    def _select_external_ip(self, dst_ip: str, *, internal_ip: str | None = None,
+                            internal_port: int | None = None) -> str:
+        """
+        Choose an egress IP among primary + VIPs using sticky hashing.
+        This keeps flows consistently on the same external IP without a policy table.
+        """
+        with self._lock:
+            if not self.PUBLIC_VIPS:
+                return self.public_ip
+            pool = [self.public_ip, *sorted(self.PUBLIC_VIPS)]
+        seed = f"{internal_ip}:{internal_port}:{dst_ip}".encode()
+        idx = zlib.crc32(seed) % len(pool)
+        return pool[idx]
+
+    def translate_outbound(self, packet: Packet):
+        """
+        Translates the source IP and port of an outbound packet (SNAT).
+        This is applied to packets originating from the internal network
+        and destined for external IPs.
+        """
+        if not self._is_ip(packet):
+            self._log_debug(f"Outbound non-IP: {self._safe_summary(packet)}")
+            return
+        ip = packet[IP] if IP in packet else packet[IPv6]
+
+        if not (TCP in packet or UDP in packet):
+            if ICMP in packet:
+                self._log_debug(f"ICMP out {ip.src}→{ip.dst}")
+            elif DHCP in packet or IGMP in packet:
+                self._log_debug("DHCP/IGMP out (no NAT)")
+            else:
+                self._log_debug(f"Unhandled non-TCP/UDP out: {self._safe_summary(packet)}")
+            return
+
+        t = packet[TCP] if TCP in packet else packet[UDP]
+        ext_ip = None
+        new_port = None
+        now = time.time()
+
+        with self._lock:
+            canon = _get_canonical_session_key(ip.src, int(t.sport), ip.dst, int(t.dport))
+            stateful = self._stateful_nat_outbound.get(canon)
+            internal_key = (ip.src, int(t.sport))
+
+            if stateful:
+                # Reuse an existing stateful mapping
+                ext_ip, new_port, _ = stateful
+                self._stateful_nat_outbound[canon] = (ext_ip, new_port, now)
+                self._log(f"[NAT] ➡️ SNAT stateful {ip.src}:{t.sport} → {ext_ip}:{new_port}")
+
+            elif internal_key not in self._nat_table:
+                # Create a new dynamic NAT mapping
+                ext_ip = self._select_external_ip(ip.dst, internal_ip=ip.src, internal_port=int(t.sport))
+                new_port = self._alloc_port(ext_ip)
+                if new_port == -1:
+                    # _alloc_port logs the error
+                    return
+                self._nat_table[internal_key] = (ext_ip, new_port, now)
+                self._nat_reverse_table[(ext_ip, new_port)] = internal_key
+                self._log(f"[NAT] ➡️ SNAT new {ip.src}:{t.sport} → {ext_ip}:{new_port}")
+
+            else:
+                # Renew an existing dynamic NAT mapping
+                ext_ip, new_port, _ = self._nat_table[internal_key]
+                self._nat_table[internal_key] = (ext_ip, new_port, now)
+                self._log_debug(f"SNAT renew {ip.src}:{t.sport} → {ext_ip}:{new_port}")
+
+        if not (ext_ip and new_port is not None):
+            self._log_error(f"Failed to find/alloc mapping for {ip.src}:{t.sport}")
+            return
+
+        # Rewrite the packet's source IP and port
+        ip.src = ext_ip
+        t.sport = int(new_port)
+        if self.CLAMP_MSS:
+            self._maybe_clamp_mss(packet)
+        self._recalc_checksums(packet)
+        # Redundant log removed:
+        # self._log(f"[NAT] Outbound translated: {ip.src}:{t.sport} -> {ip.dst}:{t.dport}")
+
+    # ========================= Inbound (DNAT) =========================
+
+    def translate_inbound(self, packet: Packet, external_ip: str) -> bool:
+        """
+        Translates the destination IP and port of an inbound packet (DNAT).
+        This is applied to packets arriving from the external network
+        and destined for one of the router's public IPs/VIPs.
+        """
+        if not self._is_ip(packet):
+            self._log_debug(f"Inbound non-IP: {self._safe_summary(packet)}")
+            return False
+
+        ip_layer = packet[IP] if IP in packet else packet[IPv6]
+        src_ip = ip_layer.src  # The original source IP from the external network
+
+        with self._lock:
+            ban_exp = self._ban_list.get(src_ip)
+            if ban_exp and time.time() < ban_exp:
+                self._log(f"[NAT] 🛡️ Drop banned IP {src_ip}")
+                return False
+
+        if not (TCP in packet or UDP in packet):
+            if ICMP in packet:
+                self._log_debug("Inbound ICMP (no DNAT)")
+            elif DHCP in packet or IGMP in packet:
+                self._log_debug("Inbound DHCP/IGMP (no DNAT)")
+            else:
+                self._log_debug(f"Unhandled non-TCP/UDP inbound: {self._safe_summary(packet)}")
+            return False
+
+        trans = packet[TCP] if TCP in packet else packet[UDP]
+        ext_port = int(trans.dport)  # The original destination port on the external IP
+
+        # Get the internal mapping for the external IP and port.
+        # This function handles static mappings, stateful mappings, dynamic reverse mappings,
+        # and crucially, the temporary lease mechanism.
+        mapping = self.get_internal_from_external(external_ip, ext_port, src_ip)
+        if mapping:
+            internal_ip, internal_port = mapping
+            # Rewrite the packet's destination IP and port to the internal host
+            ip_layer.dst = internal_ip
+            trans.dport = int(internal_port)
+            self._apply_alg(packet, "inbound")
+            self._bump_gray_score(src_ip, external_ip, ext_port, reason="hit")
+            self._recalc_checksums(packet)
+            # Redundant log removed:
+            # self._log(f"[NAT] Inbound translated: {external_ip}:{ext_port} -> {internal_ip}:{internal_port} (from {src_ip})")
+            return True
+
+        # Log for failure is inside get_internal_from_external OR this:
+        self._log(f"[NAT] 🚫 No DNAT for {src_ip} → {external_ip}:{ext_port} (ICMP sent)")
+        self._icmp_port_unreachable(packet, ip_layer, external_ip)
+        return False
+
+    # ========================= Public Helpers =========================
+
+    def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
+        canon = _get_canonical_session_key(src_ip, int(src_port), dst_ip, int(dst_port))
+        with self._lock:
+            dyn = self._nat_table.get((src_ip, int(src_port)))
+            if dyn:
+                ext_ip, port, _ = dyn
+                ext_key = (ext_ip, port)
+                self._stateful_nat_outbound[canon] = (ext_ip, port, time.time())
+                self._stateful_nat_inbound[ext_key] = canon
+                self._log(f"[NAT][STATEFUL] 📌 Pinned {src_ip}:{src_port} at {ext_ip}:{port}")
+
+    def add_static_mapping(self, external_port: int, internal_ip: str, internal_port: int,
+                           external_ip: Optional[str] = None):
+        ext_ip = external_ip or self.public_ip
+        ext_key = (ext_ip, int(external_port))
+        with self._lock:
+            self._static_mappings[ext_key] = (internal_ip, int(internal_port))
+        name, emoji = self.PORT_SERVICES.get(int(external_port), ("Custom Service", "✳️"))
+        self._log(f"[NAT][STATIC] {emoji} {name}: {ext_ip}:{external_port} → {internal_ip}:{internal_port}")
+
+    def remove_static_mapping(self, external_port: int, external_ip: Optional[str] = None):
+        ext_ip = external_ip or self.public_ip
+        ext_key = (ext_ip, int(external_port))
+        with self._lock:
+            removed = self._static_mappings.pop(ext_key, None)
+        if removed:
+            self._log(f"[NAT][STATIC] 🗑️ Removed {ext_ip}:{external_port}")
+        else:
+            self._log(f"[NAT][STATIC] ❓ Not present: {ext_ip}:{external_port}")
+
+    def handle_keep_alive(self, packet: Packet, external_ip: str):
+        """
+        Secure lease refresh:
+          payload = struct("!H32s"): (target_port, HMAC_SHA256(token_secret, f"{src_ip}|{ext_ip}|{target_port}|epoch_10s"))
+        """
+        if not (UDP in packet and Raw in packet and IP in packet):
+            return
+        try:
+            payload = bytes(packet[Raw].load or b"")
+            want = struct.calcsize(self.KEEP_ALIVE_PAYLOAD_FORMAT)
+            if len(payload) != want:
+                self._log(f"[NAT][KA] ⚠️ Bad payload size from {packet[IP].src}")
+                return
+            target_port, mac = struct.unpack(self.KEEP_ALIVE_PAYLOAD_FORMAT, payload)
+        except Exception:
+            self._log("[NAT][KA] ⚠️ Parse error")
+            return
+
+        src_ip = packet[IP].src
+
+        if not self._verify_token(src_ip, external_ip, int(target_port), mac):
+            self._log(f"[NAT][KA] ⛔ HMAC invalid from {src_ip} for {external_ip}:{target_port}")
+            return
+
+        with self._lock:
+            ext_key = (external_ip, int(target_port))
+            li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
+
+            if li and time.time() < float(li["lease_end"]):
+                base = float(li.get("base_lease", self.DEFAULT_LEASE_SECS))
+                ext = min(base, 120.0)
+                li["lease_end"] = time.time() + ext
+                self._bump_gray_score(src_ip, external_ip, int(target_port), reason="keepalive")
+                self._log(f"[NAT][KA] 💓 Extended {src_ip}@{external_ip}:{target_port} by {int(ext)}s")
+            else:
+                self._log(f"[NAT][KA] ❓ No active lease for {src_ip}@{external_ip}:{target_port}")
+
+    def get_internal_from_external(self, external_ip: str, external_port: int, src_ip: str) -> Optional[
+        Tuple[str, int]]:
+        """
+        Determines the internal IP and port for an inbound connection
+        targeting a specific external IP and port. This is the core
+        logic for DNAT, including temporary leases.
+        """
+        ext_key = (external_ip, int(external_port))
+
+        with self._lock:
+            # Sliding-window Rate Limiting
+            now = time.time()
+            pref = self._prefix_of(src_ip)
+            self._prune_window(self._ip_attempts[src_ip], now)
+            self._prune_window(self._prefix_attempts[pref], now)
+            self._ip_attempts[src_ip].append(now)
+            self._prefix_attempts[pref].append(now)
+
+            if len(self._ip_attempts[src_ip]) > self.RATE_MAX_ATTEMPTS_PER_IP or \
+                    len(self._prefix_attempts[pref]) > self.RATE_MAX_ATTEMPTS_PER_PREFIX:
+                self._log(f"[NAT][RL] ⛔ Rate-limit {src_ip} or {pref}")
+                return None
+
+            # 1) Stateful return path (for existing connections)
+            if ext_key in self._stateful_nat_inbound:
+                canon = self._stateful_nat_inbound[ext_key]
+                a, b = canon
+                if src_ip == b[0]:  # Ensure the source IP matches the pinned remote
+                    self._stateful_nat_outbound[canon] = (external_ip, int(external_port), now)
+                    self._log(f"[NAT] ⬅️ DNAT stateful {external_ip}:{external_port} → {a[0]}:{a[1]} (from {src_ip})")
+                    return a[0], int(a[1])
+
+            # 2) Static DNAT (highest priority)
+            static = self._static_mappings.get(ext_key)
+            if static:
+                self._bump_gray_score(src_ip, external_ip, int(external_port), reason="static")
+                self._log(
+                    f"[NAT] ⬅️ DNAT static {external_ip}:{external_port} → {static[0]}:{static[1]} (from {src_ip})")
+                return static
+
+            # 3) Dynamic reverse mapping (for previously established outbound connections)
+            dyn = self._nat_reverse_table.get(ext_key)
+            if dyn:
+                if dyn in self._nat_table:
+                    ext_ip_dyn, port_now, _ = self._nat_table[dyn]
+                    self._nat_table[dyn] = (ext_ip_dyn, port_now, now)  # Refresh timestamp
+                self._bump_gray_score(src_ip, external_ip, int(external_port), reason="dynamic")
+                self._log(f"[NAT] ⬅️ DNAT dynamic {external_ip}:{external_port} → {dyn[0]}:{dyn[1]} (from {src_ip})")
+                return dyn
+
+            # 4) Probe path → advanced temporary lease policy
+            # If no static or existing dynamic/stateful mapping, consider a temporary lease.
+            self._port_probe_counts[src_ip] += 1
+            count = self._port_probe_counts[src_ip]
+            if count >= self.BAN_THRESHOLD:
+                self._ban_list[src_ip] = now + self.BAN_DURATION_SEC
+                self._log(f"[NAT] 🔒 Banned {src_ip} for {self.BAN_DURATION_SEC}s (probes={count})")
+                return None
+
+            # --- Applies temp leases between two different IPs ---
+            # This function attempts to grant a temporary lease, effectively creating
+            # a short-lived DNAT mapping from (external_ip, external_port) to a
+            # dynamically chosen internal IP and the same port.
+            lease = self._maybe_grant_temp_lease(src_ip, external_ip, int(external_port))
+            if lease:
+                # Logging is inside _maybe_grant_temp_lease
+                pass
+            return lease
+
+    def get_internal_ip_from_external(self, external_ip: str) -> Optional[str]:
+        if external_ip == self.public_ip:
+            self._log("[NAT] ℹ️ 1:1 NAT not configured; cannot map external→internal IP.")
+        return None
+
+    # ========================= Admin / Introspection =========================
+
+    def list_temp_leases(self) -> List[Dict]:
+        with self._lock:
+            out = []
+            now = time.time()
+            for sip, ext_map in self._temp_nat_leases.items():
+                for (ext_ip, p), li in ext_map.items():
+                    lease_end = float(li["lease_end"])
+                    out.append({
+                        "src_ip": sip,
+                        "external_ip": ext_ip,
+                        "external_port": int(p),
+                        "internal_ip": li["internal_ip"],
+                        "internal_port": int(li["internal_port"]),
+                        "lease_end": lease_end,
+                        "lease_ttl": max(0, int(lease_end - now)),
+                        "cooldown_end": float(li["cooldown_end"]),
+                        "state": li.get("state", "gray"),
+                        "score": int(self._gray_score.get((sip, ext_ip, int(p)), 0))
+                    })
+            return out
+
+    def revoke_temp_lease(self, src_ip: str, external_ip: str, external_port: int) -> bool:
+        ext_key = (external_ip, int(external_port))
+        with self._lock:
+            portmap = self._temp_nat_leases.get(src_ip, {})
+            if ext_key in portmap:
+                del portmap[ext_key]
+                if not portmap:
+                    del self._temp_nat_leases[src_ip]
+                self._gray_score.pop((src_ip, external_ip, int(external_port)), None)
+                self._log(f"[NAT][LEASE] ❌ Revoked {src_ip}@{external_ip}:{external_port}")
+                return True
+            return False
+
+    def promote_lease_to_static(self, src_ip: str, external_ip: str, external_port: int, internal_ip: str,
+                                internal_port: int) -> bool:
+        ext_key = (external_ip, int(external_port))
+        with self._lock:
+            if self.AUTO_PROMOTE_TO_STATIC:
+                self._static_mappings[ext_key] = (internal_ip, int(internal_port))
+                self._log(
+                    f"[NAT][LEASE] ⬆️ Promoted {src_ip}@{external_ip}:{external_port} → STATIC {internal_ip}:{internal_port}")
+                return True
+            return False
+
+    def snapshot(self) -> str:
+        with self._lock:
+            data = {
+                "public_ip": self.public_ip,
+                "public_vips": list(self.PUBLIC_VIPS),
+                "dynamic_nat_size": len(self._nat_table),
+                "static_nat_size": len(self._static_mappings),
+                "stateful_out": len(self._stateful_nat_outbound),
+                "bans": list(self._ban_list.keys()),
+                "leases_count": sum(len(v) for v in self._temp_nat_leases.values()),
+            }
+        try:
+            return json.dumps(data, indent=2, sort_keys=True)
+        except Exception:
+            return str(data)
+
+    # ========================= Internals: Temp Leases =========================
+
+    def _temp_ip_for(self, external_ip: str, external_port: int) -> str:
+        """
+        Pick a diagnostic-friendly internal IP for temp leases, sharded by VIP.
+        Keeps your original 192.168.X.Y layout but salts by VIP last octet.
+        This ensures that a temporary lease for a given (external_ip, external_port)
+        always maps to a consistent internal IP, facilitating debugging and
+        avoiding conflicts.
+        """
+        try:
+            vip_tail = int(external_ip.split(".")[-1]) % 50  # 0..49 -> 192.168.(200..249).*
+        except Exception:
+            vip_tail = 0
+        host = 100 + (external_port % 100)  # 100..199
+        return f"192.168.{200 + vip_tail}.{host}"
+
+    def _maybe_grant_temp_lease(self, src_ip: str, external_ip: str, external_port: int) -> Optional[Tuple[str, int]]:
+        """
+        Attempts to grant a temporary NAT lease for an inbound connection.
+        This creates a dynamic DNAT mapping from (external_ip, external_port)
+        to a temporary internal IP and the same port.
+        """
+        ext_key = (external_ip, external_port)
+
+        if not self._is_temp_lease_allowed_on_uplink():
+            self._log(f"[NAT][LEASE] ⛔ Blocked by uplink policy for {src_ip}@{external_ip}:{external_port}")
+            return None
+
+        pol = self.TEMP_LEASE_SERVICE_POLICY.get(external_port, {"mode": "allow"})
+        mode = pol.get("mode", "allow")
+        if mode == "deny":
+            self._log(f"[NAT][LEASE] ⛔ Service policy denies port {external_port}")
+            return None
+
+        now = time.time()
+        ip_active = self._active_lease_count_for_ip(src_ip, now)
+        ip_cap = int(pol.get("max_per_ip", self.MAX_TEMP_LEASES_PER_IP))
+        if ip_active >= ip_cap:
+            self._log(f"[NAT][LEASE] ❌ {src_ip} reached IP cap ({ip_active}/{ip_cap})")
+            return None
+
+        prefix = self._prefix_of(src_ip)
+        pre_active = self._active_lease_count_for_prefix(prefix, now)
+        pre_cap = int(pol.get("max_per_prefix", self.MAX_TEMP_LEASES_PER_PREFIX))
+        if pre_active >= pre_cap:
+            self._log(f"[NAT][LEASE] ❌ Prefix {prefix} reached cap ({pre_active}/{pre_cap})")
+            return None
+
+        li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
+        if li:
+            state = li.get("state", "gray")
+            if now < float(li["lease_end"]):
+                self._log(
+                    f"[NAT][LEASE] ⏱️ Active {src_ip}@{external_ip}:{external_port} → {li['internal_ip']}:{li['internal_port']}")
+                self._bump_gray_score(src_ip, external_ip, external_port, reason="active")
+                return str(li["internal_ip"]), int(li["internal_port"])
+            if now < float(li["cooldown_end"]):
+                backoff = self._calc_backoff(li.get("failures", 0))
+                li["cooldown_end"] = now + backoff
+                self._log(
+                    f"[NAT][LEASE] 🧯 Cooldown extended ({int(backoff)}s) for {src_ip}@{external_ip}:{external_port} (state={state})")
+                return None
+
+        if mode == "throttle" and random.random() > 0.5:
+            self._log(f"[NAT][LEASE] ⛔ Throttled {src_ip}@{external_ip}:{external_port}")
+            return None
+
+        lease_secs = float(pol.get("lease_secs", self.DEFAULT_LEASE_SECS))
+        cooldown_secs = float(pol.get("cooldown_secs", self.DEFAULT_COOLDOWN_SECS))
+        temp_ip = self._temp_ip_for(external_ip, external_port)  # Dynamically chosen internal IP
+        temp_port = int(external_port)  # The external port is mapped to the same internal port
+        base = lease_secs
+
+        self._temp_nat_leases[src_ip][ext_key] = {
+            "internal_ip": temp_ip,
+            "internal_port": temp_port,
+            "lease_end": now + lease_secs,
+            "cooldown_end": now + lease_secs + cooldown_secs,
+            "failures": 0,
+            "state": "gray",
+            "base_lease": base,
+        }
+        self._bump_gray_score(src_ip, external_ip, external_port, reason="grant")
+        self._log(
+            f"[NAT][LEASE] 🆕 {src_ip}@{external_ip}:{external_port} → {temp_ip}:{temp_port} for {int(lease_secs)}s (+{int(cooldown_secs)}s)")
+        return temp_ip, temp_port
+
+    def _bump_gray_score(self, src_ip: str, external_ip: str, external_port: int, *, reason: str):
+        key = (src_ip, external_ip, int(external_port))
+        ext_key = (external_ip, int(external_port))
+
+        self._gray_score[key] = int(self._gray_score.get(key, 0)) + 1
+        score = self._gray_score[key]
+
+        li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
+        if not li:
+            return
+
+        if li["state"] == "gray" and score >= self.WARMUP_REQUIRED_HITS:
+            li["state"] = "warmup"
+            self._log(
+                f"[NAT][LEASE] 🔶 {src_ip}@{external_ip}:{external_port} reached WARMUP (score={score}, reason={reason})")
+
+        elif li["state"] == "warmup" and score >= self.TRUST_REQUIRED_HITS:
+            li["state"] = "trusted"
+            self._log(f"[NAT][LEASE] 🟢 {src_ip}@{external_ip}:{external_port} is TRUSTED (score={score})")
+
+            if self.AUTO_PROMOTE_TO_DYNAMIC and ext_key not in self._nat_reverse_table:
+                self._log(f"[NAT][LEASE] ℹ️ Auto-promote to dynamic enabled for {ext_key} (no-op placeholder)")
+
+            if self.AUTO_PROMOTE_TO_STATIC and ext_key not in self._static_mappings:
+                self._static_mappings[ext_key] = (li["internal_ip"], li["internal_port"])
+                self._log(
+                    f"[NAT][LEASE] ⬆️ Promoted to STATIC: {external_ip}:{external_port}→{li['internal_ip']}:{li['internal_port']}")
+
+    def _calc_backoff(self, failures: int) -> float:
+        return min(300.0, 10.0 * (2 ** max(0, int(failures))))
+
+    def _active_lease_count_for_ip(self, ip: str, now: float) -> int:
+        return sum(1 for li in self._temp_nat_leases.get(ip, {}).values() if now < float(li["lease_end"]))
+
+    def _active_lease_count_for_prefix(self, prefix: str, now: float) -> int:
+        c = 0
+        for sip, ext_map in self._temp_nat_leases.items():
+            if self._prefix_of(sip) != prefix:
+                continue
+            for li in ext_map.values():
+                if now < float(li["lease_end"]):
+                    c += 1
+        return c
+
+    def _prefix_of(self, ip: str) -> str:
+        try:
+            ipx = ipaddress.ip_address(ip)
+            net = ipaddress.ip_network(ip + ("/24" if isinstance(ipx, ipaddress.IPv4Address) else "/64"), strict=False)
+            return str(net)
+        except Exception:
+            return "unknown"
+
+    def _prune_window(self, dq: deque, now: float):
+        cutoff = now - self.RATE_WINDOW_SEC
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    # ========================= Background Cleanup =========================
+
+    def _cleanup_loop(self):
+        interval = max(1.0, self.NAT_TIMEOUT_SECONDS / 2)
+        while not self._stop_event.is_set():
+            now = time.time()
+            with self._lock:
+                # Dynamic NAT expiry
+                for key in [k for k, (_, _, ts) in self._nat_table.items() if now - ts > self.NAT_TIMEOUT_SECONDS]:
+                    ext_ip, ext_port, _ = self._nat_table.pop(key, (None, None, None))
+                    ext_key = (ext_ip, ext_port)
+                    if ext_ip and ext_port is not None and self._nat_reverse_table.get(ext_key) == key:
+                        del self._nat_reverse_table[ext_key]
+                    self._log(f"[NAT] 🗑️ Dynamic expired: {key} ({ext_ip}:{ext_port})")
+
+                # Stateful expiry
+                for canon in [k for k, (_, _, ts) in self._stateful_nat_outbound.items()
+                              if now - ts > self.STATEFUL_NAT_TIMEOUT_SECONDS]:
+                    ext_ip, ext_port, _ = self._stateful_nat_outbound.pop(canon, (None, None, None))
+                    ext_key = (ext_ip, ext_port)
+                    if ext_ip and ext_port is not None and ext_key in self._stateful_nat_inbound:
+                        del self._stateful_nat_inbound[ext_key]
+                    self._log(f"[NAT][STATEFUL] 🗑️ Expired {canon}")
+
+                # Ban expiry
+                for ip in [i for i, exp in self._ban_list.items() if now >= exp]:
+                    del self._ban_list[ip]
+                    self._port_probe_counts.pop(ip, None)
+                    self._log(f"[NAT] ✅ Ban expired for {ip}")
+
+                # Temp leases expiry + cooldown normalization
+                for sip in list(self._temp_nat_leases.keys()):
+                    for ext_key in list(self._temp_nat_leases[sip].keys()):
+                        li = self._temp_nat_leases[sip][ext_key]
+                        if now >= float(li["cooldown_end"]):
+                            del self._temp_nat_leases[sip][ext_key]
+                            gray_key = (sip, ext_key[0], ext_key[1])
+                            self._gray_score.pop(gray_key, None)
+                            self._log(f"[NAT][LEASE] ⏳ Cleared lease+cooldown {sip}@{ext_key[0]}:{ext_key[1]}")
+                    if not self._temp_nat_leases[sip]:
+                        del self._temp_nat_leases[sip]
+
+            # Clean up fragment cache
+            if hasattr(self, "_frag_cache"):
+                with self._lock:
+                    cutoff = now - self._FRAG_CACHE_TTL
+                    for key in [k for k, (_, ts) in self._frag_cache.items() if ts < cutoff]:
+                        try:
+                            del self._frag_cache[key]
+                        except Exception:
+                            pass
+
+            self._stop_event.wait(interval)
+
+    # ========================= Uplink Policy =========================
 
     def _refresh_uplink_identity(self) -> None:
         now = time.time()
@@ -5813,37 +6900,24 @@ class NATManager:
             return
         self._uplink_last_refresh = now
 
-        # Resolve the route to the Internet (public dest)
         r = self._rip_manager_find_route("8.8.8.8")
         if not r:
             self._uplink_gateway_ip = None
             self._uplink_iface = None
             return
-
-        # next_hop can be "0.0.0.0" if directly connected; otherwise the gateway IP
         nh = r.get("next_hop")
-        self._uplink_gateway_ip = None if not nh or nh == "0.0.0.0" else str(nh)
+        self._uplink_gateway_ip = None if (not nh or nh == "0.0.0.0") else str(nh)
         self._uplink_iface = r.get("interface")
 
     def _is_temp_lease_allowed_on_uplink(self) -> bool:
         self._refresh_uplink_identity()
-
-        gw = self._uplink_gateway_ip
-        iface = self._uplink_iface
-
-        # If we can’t identify the uplink, be conservative (allow) or flip to False if you prefer
+        gw, iface = self._uplink_gateway_ip, self._uplink_iface
         if gw is None and iface is None:
             return True
-
-        # If iface is in deny list
         if iface and iface in self.TEMP_LEASES_POLICY.get("deny_ifaces", set()):
             return False
-
-        # If exact gateway IP is denied
         if gw and gw in self.TEMP_LEASES_POLICY.get("deny_gateways", set()):
             return False
-
-        # If gateway is in any denied CIDR
         if gw:
             try:
                 ip_gw = ipaddress.ip_address(gw)
@@ -5851,510 +6925,163 @@ class NATManager:
                     if ip_gw in ipaddress.ip_network(cidr, strict=False):
                         return False
             except Exception:
-                # If parsing fails, default to allow (or you can choose deny)
                 pass
-
         return True
 
-    def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
-        """Creates a stateful NAT mapping for an established connection."""
-        canonical_key = _get_canonical_session_key(src_ip, src_port, dst_ip, dst_port)
-        with self._lock:
-            # Check if a dynamic mapping already exists for this flow
-            existing_mapping = self._nat_table.get((src_ip, src_port))
-            if existing_mapping:
-                translated_port, _ = existing_mapping
-                self._stateful_nat_outbound[canonical_key] = (translated_port, time.time())
-                self._stateful_nat_inbound[translated_port] = canonical_key
-                self.router_logger.log_message(
-                    f"[NAT][STATEFUL] ✅ Created stateful mapping for {src_ip}:{src_port} -> {self.public_ip}:{translated_port}"
-                )
-
-    def set_router_internal_ip(self, ip: str):
-        self.router_internal_ip_for_self_mapping = ip
-        self.router_logger.log_message(f"[NAT] 🏠 Router's internal IP for self-mapping set to: {ip}")
-
-    def start(self):
-        """Starts the NAT cleanup thread."""
-        self._stop_event.clear()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="NATCleanup")
-        self._cleanup_thread.start()
-        self.router_logger.log_message("[NAT] ✅ Cleanup thread started.")
-
-    def stop(self):
-        """Stops the NAT cleanup thread gracefully."""
-        self._stop_event.set()
-        if self._cleanup_thread:
-            self._cleanup_thread.join(timeout=2)
-        self.router_logger.log_message("[NAT] 🛑 Manager stopped.")
-
-    def _maybe_clamp_mss(self, packet):
-        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            return
-        if not packet.haslayer(TCP):
-            return
-        tcp = packet[TCP]
-        # Only touch initial SYN (not SYN/ACK here because it's outbound client SYN)
-        if not tcp.flags & 0x02 or tcp.flags & 0x10:  # SYN set, ACK not set
-            return
-
-        # Pull options, clamp MSS
-        opts = tcp.options or []
-        new_opts = []
-        clamped = False
-        for kind, val in opts:
-            if kind == 'MSS':
-                want = self.MSS_CLAMP_V6 if packet.haslayer(IPv6) else self.MSS_CLAMP_V4
-                if val > want:
-                    val = want
-                    clamped = True
-            new_opts.append((kind, val))
-        # If MSS not present, add it (polite but optional)
-        if not any(k == 'MSS' for k, _ in opts):
-            want = self.MSS_CLAMP_V6 if packet.haslayer(IPv6) else self.MSS_CLAMP_V4
-            new_opts.append(('MSS', want))
-            clamped = True
-
-        if clamped:
-            tcp.options = new_opts
-            # Recompute lengths/checksums
-            del packet.chksum
-            if packet.haslayer(IP):  del packet[IP].chksum
-            del tcp.chksum
-
-    def _cleanup_loop(self):
-        """
-        Periodically removes stale dynamic NAT entries, expired bans,
-        and temporary leases.
-        """
-        while not self._stop_event.is_set():
-            now = time.time()
-            with self._lock:
-                # 1. Prune stale dynamic NAT entries
-                stale_internal_keys = [
-                    k for k, (_, ts) in self._nat_table.items() if now - ts > self.NAT_TIMEOUT_SECONDS
-                ]
-                for internal_key in stale_internal_keys:
-                    external_port, _ = self._nat_table.pop(internal_key, (None, None))
-                    if external_port and self._nat_reverse_table.get(external_port) == internal_key:
-                        del self._nat_reverse_table[external_port]
-                    self.router_logger.log_message(
-                        f"[NAT] 🗑️ Timed out dynamic port mapping: {internal_key[0]}:{internal_key[1]} → {self.public_ip}:{external_port}"
-                    )
-
-                # 2. Prune expired bans
-                expired_bans = [ip for ip, expiry in self._ban_list.items() if now >= expiry]
-                for ip in expired_bans:
-                    del self._ban_list[ip]
-                    self._port_probe_counts.pop(ip, None)  # Also clear any lingering counts
-                    self.router_logger.log_message(f"[NAT] ✅ Ban expired for {ip}.")
-
-                # 3. Prune expired temporary leases and cooldowns
-                for src_ip in list(self._temp_nat_leases.keys()):
-                    for port in list(self._temp_nat_leases[src_ip].keys()):
-                        lease_info = self._temp_nat_leases[src_ip][port]
-                        # Remove the entry if both the lease and cooldown have expired
-                        if now >= lease_info["cooldown_end"]:
-                            del self._temp_nat_leases[src_ip][port]
-                            self.router_logger.log_message(
-                                f"[NAT][LEASE] ⏳ Temp lease and cooldown expired for {src_ip} on port {port}.")
-                    # Clean up the outer dictionary if it's empty
-                    if not self._temp_nat_leases[src_ip]:
-                        del self._temp_nat_leases[src_ip]
-                now = time.time()
-                stale_stateful_keys = [
-                    k for k, (_, ts) in self._stateful_nat_outbound.items()
-                    if now - ts > self.STATEFUL_NAT_TIMEOUT_SECONDS
-                ]
-                for key in stale_stateful_keys:
-                    translated_port, _ = self._stateful_nat_outbound.pop(key, (None, None))
-                    if translated_port in self._stateful_nat_inbound:
-                        del self._stateful_nat_inbound[translated_port]
-                    self.router_logger.log_message(f"[NAT][STATEFUL] 🗑️ Timed out stateful mapping for {key}.")
-
-            self._stop_event.wait(self.NAT_TIMEOUT_SECONDS / 2)
-
-    def add_static_mapping(self, external_port: int, internal_ip: str, internal_port: int):
-        """Add a permanent port‐forwarding rule."""
-        with self._lock:
-            if external_port in self._static_mappings:
-                self.router_logger.log_message(
-                    f"[NAT][STATIC] ⚠️ Static mapping for {self.public_ip}:{external_port} already exists. Overwriting."
-                )
-            self._static_mappings[external_port] = (internal_ip, internal_port)
-
-        service_name, service_emoji = self.PORT_SERVICES.get(external_port, ("Custom Service", "✳️"))
-        self.router_logger.log_message(
-            f"[NAT][STATIC] {service_emoji} Added static mapping for {service_name}: {self.public_ip}:{external_port} "
-            f"→ {internal_ip}:{internal_port}"
-        )
-
-    def remove_static_mapping(self, external_port: int):
-        """Remove an existing static port-forwarding rule."""
-        with self._lock:
-            removed = self._static_mappings.pop(external_port, None)
-        if removed:
-            self.router_logger.log_message(
-                f"[NAT][STATIC] 🗑️ Removed static mapping for {self.public_ip}:{external_port}"
-            )
-        else:
-            self.router_logger.log_message(
-                f"[NAT][STATIC] ❓ No static mapping found for {self.public_ip}:{external_port} to remove"
-            )
-
-    def _get_next_port(self) -> int:
-        with self._lock:
-            initial_next_port = self._next_port
-            while True:
-                port = self._next_port
-                self._next_port += 1
-                if self._next_port > self.NAT_PORT_MAX:
-                    self._next_port = self.NAT_PORT_MIN
-
-                if port not in self._nat_reverse_table and port not in self._static_mappings:
-                    return port
-
-                if self._next_port == initial_next_port:
-                    self.router_logger.log_message("[NAT] ❌ No available dynamic NAT ports in pool.")
-                    return -1
+    # ========================= ALG / ICMP / Utility =========================
 
     def _apply_alg(self, packet: Packet, direction: str):
-        # Placeholder for ALG logic
-        if packet.haslayer(TCP) and (packet[TCP].dport == 21 or packet[TCP].sport == 21):
-            self.router_logger.log_message(
-                f"[NAT][ALG] 📁 FTP ALG triggered ({direction}). (Placeholder: Actual payload inspection/rewriting needed)")
-        if packet.haslayer(UDP) and packet.haslayer(DNS) and (packet[UDP].dport == 53 or packet[UDP].sport == 53):
-            self.router_logger.log_message(
-                f"[NAT][ALG] ❓ DNS traffic observed ({direction}). (No DNS payload rewriting by NAT.)")
+        if TCP in packet and (int(packet[TCP].dport) == 21 or int(packet[TCP].sport) == 21):
+            self._log_debug(f"ALG 📁 FTP ({direction})")
+        if UDP in packet and DNS in packet and (int(packet[UDP].dport) == 53 or int(packet[UDP].sport) == 53):
+            self._log_debug(f"ALG ❓ DNS ({direction})")
 
-    def handle_keep_alive(self, packet: Packet):
-        """
-        Handles an incoming keep-alive request to refresh a dynamic NAT mapping.
-
-        Expects a UDP packet on KEEP_ALIVE_PORT with the target external port
-        in the payload. This method should be called by the main router logic
-        when a UDP packet destined for self.KEEP_ALIVE_PORT is received.
-        """
-        if not packet.haslayer(UDP) or not packet.haslayer(Raw):
-            return
-
-        payload = packet[Raw].load
-        payload_size = struct.calcsize(self.KEEP_ALIVE_PAYLOAD_FORMAT)
-
-        if len(payload) != payload_size:
-            self.router_logger.log_message(
-                f"[NAT][KEEP-ALIVE] ⚠️ Received keep-alive with invalid payload size from {packet[IP].src}. "
-                f"Expected {payload_size}, got {len(payload)}."
-            )
-            return
-
+    def _icmp_port_unreachable(self, original_packet: Packet, original_ip_layer, external_ip: str):
         try:
-            target_port, = struct.unpack(self.KEEP_ALIVE_PAYLOAD_FORMAT, payload)
-        except struct.error:
-            self.router_logger.log_message(
-                f"[NAT][KEEP-ALIVE] ⚠️ Failed to unpack keep-alive payload from {packet[IP].src}."
-            )
+            icmp_src_ip = external_ip
+            icmp_dst_ip = original_ip_layer.src
+
+            r = self._rip_manager_find_route(icmp_dst_ip)
+            if not r:
+                self._log_debug(f"⚠️ No route to {icmp_dst_ip} for ICMP; using fallback")
+                self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3, src_ip=icmp_src_ip)
+                return
+
+            out_iface = r.get("interface")
+            iface_cfg = self._interfaces_config.get(out_iface) or {}
+            router_mac = iface_cfg.get("mac")
+            next_hop_ip = r.get("next_hop")
+            next_hop_ip = icmp_dst_ip if (not next_hop_ip or next_hop_ip == "0.0.0.0") else next_hop_ip
+            next_hop_mac = self._arp_manager_resolve(next_hop_ip, out_iface)
+
+            if not (router_mac and next_hop_mac):
+                self._log_debug("⚠️ ARP failed for ICMP; fallback")
+                self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3, src_ip=icmp_src_ip)
+                return
+
+            icmp = Ether(src=router_mac, dst=next_hop_mac) / IP(src=icmp_src_ip, dst=icmp_dst_ip) / ICMP(type=3,
+                                                                                                         code=3) / original_ip_layer
+            if IP in icmp and hasattr(icmp[IP], "chksum"): del icmp[IP].chksum
+            if ICMP in icmp and hasattr(icmp[ICMP], "chksum"): del icmp[ICMP].chksum
+            self.packet_writer._send_raw_packet(icmp, out_iface)
+            self._log(f"[NAT] 🔕 ICMP Port Unreachable ({icmp_src_ip} → {icmp_dst_ip}) via {out_iface}")
+        except Exception:
+            self._log_debug("⚠️ ICMP send failed; fallback")
+            try:
+                self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3, src_ip=external_ip)
+            except Exception:
+                pass
+
+    def _maybe_clamp_mss(self, packet: Packet):
+        if TCP not in packet:
             return
-
-        with self._lock:
-            internal_key = self._nat_reverse_table.get(target_port)
-            if internal_key and internal_key in self._nat_table:
-                # Mapping exists, refresh its timestamp
-                self._nat_table[internal_key] = (target_port, time.time())
-                self.router_logger.log_message(
-                    f"[NAT][KEEP-ALIVE] 💓 Refreshed mapping for port {target_port} "
-                    f"({internal_key[0]}:{internal_key[1]}) from {packet[IP].src}."
-                )
-            else:
-                self.router_logger.log_message(
-                    f"[NAT][KEEP-ALIVE] ❓ Received keep-alive for unknown/stale port {target_port} "
-                    f"from {packet[IP].src}."
-                )
-
-    def translate_outbound(self, packet: Packet):
-        """
-        Translates outbound packets using dynamic NAT.
-
-        If a connection is being established and a stateful mapping exists, it will
-        reuse that mapping. Otherwise, it creates or renews a dynamic mapping.
-        """
-        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            self.router_logger.log_message(
-                f"[NAT] ⏭️ Skipping outbound translation for non-IP packet: {packet.summary()}")
+        tcp = packet[TCP]
+        if not (tcp.flags & 0x02) or (tcp.flags & 0x10):  # SYN && !ACK
             return
-        ip = packet[IP] if packet.haslayer(IP) else packet[IPv6]
+        opts = tcp.options or []
+        new_opts, clamped, saw = [], False, False
+        want = self.MSS_CLAMP_V6 if (IPv6 in packet) else self.MSS_CLAMP_V4
+        for k, v in opts:
+            if k == 'MSS':
+                saw = True
+                if int(v) > want:
+                    v = int(want)
+                    clamped = True
+            new_opts.append((k, v))
+        if not saw:
+            new_opts.append(('MSS', int(want)))
+            clamped = True
+        if clamped:
+            tcp.options = new_opts
+            self._log(f"[NAT] ✂️ MSS clamp → {want}")
 
-        # Check for ICMP, DHCP, IGMP, which do not need port translation
-        if not (packet.haslayer(TCP) or packet.haslayer(UDP)):
-            if packet.haslayer(ICMP):
-                self.router_logger.log_message(
-                    f"[NAT] 핑 Passing outbound ICMP for {ip.src} to {ip.dst} without port NAT.")
-            elif packet.haslayer(DHCP):
-                self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for DHCP packet from {ip.src}.")
-            elif packet.haslayer(IGMP):
-                self.router_logger.log_message(f"[NAT] ⏭️ Skipping outbound NAT for IGMP packet from {ip.src}.")
-            else:
-                self.router_logger.log_message(
-                    f"[NAT] 🧐 Skipping outbound translation for unhandled non-TCP/UDP/ICMP packet: {packet.summary()}")
+    def _alloc_port(self, external_ip: str) -> int:
+        """Allocate a port for a specific external IP (per-IP pool)."""
+        n = self._next_port_per_ip[external_ip]
+        start = n
+        while True:
+            port = n
+            n += 1
+            if n > self.NAT_PORT_MAX:
+                n = self.NAT_PORT_MIN
+
+            ext_key = (external_ip, port)
+            if ext_key not in self._nat_reverse_table and ext_key not in self._static_mappings:
+                self._next_port_per_ip[external_ip] = n
+                return port
+
+            if n == start:
+                self._log_error(f"Port pool exhausted for {external_ip}")
+                return -1
+
+    def _is_ip(self, pkt: Packet) -> bool:
+        return (IP in pkt) or (IPv6 in pkt)
+
+    def _recalc_checksums(self, pkt: Packet):
+        try:
+            if IP in pkt and hasattr(pkt[IP], "chksum"): del pkt[IP].chksum
+        except Exception:
+            pass
+        try:
+            if TCP in pkt and hasattr(pkt[TCP], "chksum"): del pkt[TCP].chksum
+        except Exception:
+            pass
+        try:
+            if UDP in pkt and hasattr(pkt[UDP], "chksum"): del pkt[UDP].chksum
+        except Exception:
+            pass
+
+    # ========================= Logging Helpers (NEW) =========================
+
+    def _log(self, msg: str):
+        """Logs a standard (Info) message."""
+        try:
+            self.router_logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _log_debug(self, msg: str):
+        """Logs a verbose debug message, only if debug_logging is True."""
+        if not self.debug_logging:
             return
+        try:
+            self.router_logger.log_message(f"[NAT][DBG] {msg}")
+        except Exception:
+            pass
 
-        t = packet[TCP] if packet.haslayer(TCP) else packet[UDP]
-        internal_key = (ip.src, t.sport)
-
-        with self._lock:
-            # Check for an existing stateful mapping first, as it's more persistent
-            canonical_key = _get_canonical_session_key(ip.src, t.sport, ip.dst, t.dport)
-            stateful_mapping = self._stateful_nat_outbound.get(canonical_key)
-
-            if stateful_mapping:
-                # Reuse the existing translated port from the stateful table
-                new_port, _ = stateful_mapping
-                self.router_logger.log_message(
-                    f"[NAT] ➡️ Reusing stateful mapping: "
-                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
-                )
-                # Update timestamp to keep the session alive
-                self._stateful_nat_outbound[canonical_key] = (new_port, time.time())
-            elif internal_key not in self._nat_table:
-                # No existing mapping, create a new dynamic one
-                new_port = self._get_next_port()
-                if new_port == -1:
-                    self.router_logger.log_message("[NAT] ❌ Outbound port allocation failed.")
-                    return
-
-                self._nat_table[internal_key] = (new_port, time.time())
-                self._nat_reverse_table[new_port] = internal_key
-                self.router_logger.log_message(
-                    f"[NAT] ➡️ Created dynamic mapping: "
-                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
-                )
+    def _log_error(self, msg: str):
+        """Logs a critical error message."""
+        try:
+            if hasattr(self.router_logger, "log_error"):
+                self.router_logger.log_error(f"[NAT] ❗️ {msg}")
             else:
-                # An old dynamic mapping exists, renew its timestamp
-                new_port, _ = self._nat_table[internal_key]
-                self._nat_table[internal_key] = (new_port, time.time())
-                self.router_logger.log_message(
-                    f"[NAT] 🔄 Reusing dynamic mapping: "
-                    f"{ip.src}:{t.sport} -> {self.public_ip}:{new_port}"
-                )
+                self.router_logger.log_message(f"[NAT][ERROR] ❗️ {msg}")
+        except Exception:
+            pass
 
-        # Apply the translation to the packet layers
-        ip.src = self.public_ip
-        t.sport = new_port
-        if self.CLAMP_MSS:
-            self._maybe_clamp_mss(packet)
-        # Recalculate checksums
-        del ip.chksum
-        if packet.haslayer(TCP):
-            del packet[TCP].chksum
-        elif packet.haslayer(UDP):
-            del packet[UDP].chksum
+    def _safe_summary(self, pkt: Packet) -> str:
+        try:
+            return pkt.summary()
+        except Exception:
+            return "<pkt>"
 
-    def translate_inbound(self, packet: Packet) -> bool:
-        """Translates inbound packets using static, dynamic, or temporary NAT mappings."""
-        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
-            self.router_logger.log_message(
-                f"[NAT] ⏭️ Skipping inbound translation for non-IP packet: {packet.summary()}")
-            return False
+    # ========================= Token generation/verification =========================
 
-        ip_layer = packet[IP] if packet.haslayer(IP) else packet[IPv6]
-        src_ip = ip_layer.src
+    def _token_epoch(self, t: Optional[float] = None) -> int:
+        return int((t or time.time()) // 10)
 
-        with self._lock:
-            if src_ip in self._ban_list and time.time() < self._ban_list[src_ip]:
-                self.router_logger.log_message(f"[NAT] 🛡️ Dropping packet from banned IP: {src_ip}")
-                return False
+    def _sign_token(self, src_ip: str, external_ip: str, port: int, epoch: int) -> bytes:
+        msg = f"{src_ip}|{external_ip}|{int(port)}|{int(epoch)}".encode()
+        return hmac.new(self._token_secret, msg, hashlib.sha256).digest()
 
-        if not (packet.haslayer(TCP) or packet.haslayer(UDP)):
-            if packet.haslayer(ICMP):
-                self.router_logger.log_message(f"[NAT] 핑 Passing ICMP packet without NAT.")
-            elif packet.haslayer(DHCP) or packet.haslayer(IGMP):
-                self.router_logger.log_message(f"[NAT] ⏭️ Skipping NAT for {packet.name} packet.")
-            else:
-                self.router_logger.log_message(f"[NAT] 🧐 Unhandled non-TCP/UDP inbound packet: {packet.summary()}")
-            return False
-
-        transport = packet[TCP] if packet.haslayer(TCP) else packet[UDP]
-        ext_port = transport.dport
-
-        internal_mapping = self.get_internal_from_external(ext_port, src_ip)
-        if internal_mapping:
-            internal_ip, internal_port = internal_mapping
-            ip_layer.dst = internal_ip
-            transport.dport = internal_port
-            self._apply_alg(packet, "inbound")
-            return True
-
-        self.router_logger.log_message(
-            f"[NAT] 🚫 No mapping for {self.public_ip}:{ext_port} — sending ICMP Port Unreachable."
-        )
-        self._send_icmp_destination_unreachable(packet, ip_layer, transport)
+    def _verify_token(self, src_ip: str, external_ip: str, port: int, mac: bytes) -> bool:
+        now_ep = self._token_epoch()
+        for ep in (now_ep, now_ep - 1, now_ep + 1):
+            if hmac.compare_digest(self._sign_token(src_ip, external_ip, int(port), ep), mac):
+                return True
         return False
 
-    def _send_icmp_destination_unreachable(self, original_packet: Packet, original_ip_layer: IP | IPv6,
-                                           original_transport_layer: TCP | UDP):
-        """Constructs and sends an ICMP Destination Unreachable message."""
-        icmp_src_ip = self.public_ip
-        icmp_dst_ip = original_ip_layer.src
 
-        route_to_sender = self._rip_manager_find_route(icmp_dst_ip)
-        if not route_to_sender:
-            self.router_logger.log_message(
-                f"[NAT] ⚠️ Could not find route to original sender {icmp_dst_ip} for ICMP response. Dropping.")
-            self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-            return
-
-        outbound_iface_for_icmp = route_to_sender["interface"]
-        outbound_iface_config = self._interfaces_config.get(outbound_iface_for_icmp)
-        if not outbound_iface_config or 'mac' not in outbound_iface_config:
-            return
-        router_mac_out = outbound_iface_config['mac']
-        next_hop_ip_for_icmp = route_to_sender["next_hop"] if route_to_sender["next_hop"] != "0.0.0.0" else icmp_dst_ip
-        next_hop_mac_for_icmp = self._arp_manager_resolve(next_hop_ip_for_icmp, outbound_iface_for_icmp)
-
-        if not next_hop_mac_for_icmp:
-            self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-            return
-
-        icmp_response = Ether(src=router_mac_out, dst=next_hop_mac_for_icmp) / \
-                        IP(src=icmp_src_ip, dst=icmp_dst_ip) / \
-                        ICMP(type=3, code=3) / \
-                        original_ip_layer
-
-        del icmp_response[IP].chksum
-        del icmp_response[ICMP].chksum
-        self.router_logger.log_message(
-            f"[NAT] 🔕 Sent ICMP Dest Unreachable (Port) to {icmp_dst_ip} via {outbound_iface_for_icmp.split('_')[-1]}.")
-
-    def get_internal_from_external(self, external_port: int, src_ip: str) -> Optional[Tuple[str, int]]:
-        """
-        Returns (internal_ip, internal_port) for a NAT’d external port, with dynamic port scan detection and banning.
-        """
-        with self._lock:
-            # Step 1: Check if IP is currently banned
-            ban_expiry = self._ban_list.get(src_ip)
-            if ban_expiry and time.time() < ban_expiry:
-                self.function_call_tracker.track(
-                    identifier='NatInternalFromExternalBannedIP', threshold=20,
-                    final_message=f"[NAT] ⛔ get_internal_from_external: Banned IP {src_ip} attempted to access port {external_port}. Count: {{}}.",
-                    count_message=None
-                )
-                return None
-
-            if external_port in self._stateful_nat_inbound:
-                canonical_key = self._stateful_nat_inbound[external_port]
-                # Verify the return traffic's source IP matches the original flow's destination
-                original_src_ip = canonical_key[0][0]
-                original_dst_ip = canonical_key[1][0]
-                if src_ip == original_dst_ip:
-                    # Refresh the stateful timestamp
-                    self._stateful_nat_outbound[canonical_key] = (external_port, time.time())
-                    # Return the original source IP and port
-                    return canonical_key[0][0], canonical_key[0][1]
-            # Step 2: Check for a permanent static mapping
-            static_mapping = self._static_mappings.get(external_port)
-            if static_mapping:
-                self.router_logger.log_message(
-                    f"[NAT] 🎯 get_internal_from_external: Static hit for external port {external_port}.")
-                return static_mapping
-
-            # Step 3: Check for an existing dynamic mapping
-            dynamic_mapping = self._nat_reverse_table.get(external_port)
-            if dynamic_mapping:
-                self.router_logger.log_message(
-                    f"[NAT] 🔄 get_internal_from_external: Dynamic hit for external port {external_port}.")
-                # Refresh the timestamp for the dynamic mapping to prevent timeout
-                internal_key_for_nat_table = dynamic_mapping
-                if internal_key_for_nat_table in self._nat_table:
-                    current_ext_port, _ = self._nat_table[internal_key_for_nat_table]
-                    self._nat_table[internal_key_for_nat_table] = (current_ext_port, time.time())
-                return dynamic_mapping
-
-            # Step 4: No permanent mapping found. Handle as a probe.
-            self._port_probe_counts[src_ip] += 1
-            count = self._port_probe_counts[src_ip]
-
-            if count >= self._ban_threshold:
-                expiry_time = time.time() + self._ban_duration
-                self._ban_list[src_ip] = expiry_time
-                self.router_logger.log_message(
-                    f"[NAT] 🔒 IP {src_ip} banned for {self._ban_duration} seconds after {count} probes."
-                )
-                return None
-
-            # Step 5: Grant a temporary lease to handle the probe, respecting the per-IP limit
-            temp_mapping = self._grant_temp_nat_lease(src_ip, external_port)
-            if temp_mapping:
-                return temp_mapping
-
-            # If no lease is granted (e.g., due to cooldown or lease limit), no mapping is returned.
-            return None
-
-    def _grant_temp_nat_lease(self, src_ip: str, external_port: int) -> Optional[Tuple[str, int]]:
-        """
-        Grants a temporary internal mapping to an external port for a probing IP.
-        Returns the internal mapping (ip, port), or None if cooldown or flat IP limit prevents it.
-        """
-        now = time.time()
-        if not self._is_temp_lease_allowed_on_uplink():
-            self.router_logger.log_message(
-                f"[NAT][LEASE] ⛔ Temp leases blocked on uplink "
-                f"(gw={self._uplink_gateway_ip or '-'}, iface={self._uplink_iface or '-'}) "
-                f"for probe {src_ip}:{external_port}."
-            )
-            return None
-        # Check the flat limit of active leases for this IP
-        active_leases_for_ip = len([v for v in self._temp_nat_leases.get(src_ip, {}).values() if now < v["lease_end"]])
-        if active_leases_for_ip >= self._max_temp_leases_per_ip:
-            self.router_logger.log_message(
-                f"[NAT][LEASE] ❌ {src_ip} has reached the max lease limit of {self._max_temp_leases_per_ip}. Denying new lease for port {external_port}."
-            )
-            return None
-
-        lease_info = self._temp_nat_leases[src_ip].get(external_port)
-
-        if lease_info:
-            if now < lease_info["lease_end"]:
-                self.function_call_tracker.track(
-                    identifier='NatInternalTempLeaseActive', threshold=15,
-                    final_message=f"[NAT][LEASE] ⏱️ Active temp NAT lease for {src_ip}:{external_port} → {lease_info['internal_ip']}:{lease_info['internal_port']}. Count: {{}}.",
-                    count_message=None
-                )
-                return lease_info["internal_ip"], lease_info["internal_port"]
-            elif now < lease_info["cooldown_end"]:
-                self.function_call_tracker.track(
-                    identifier='NatInternalTempLeaseCooldown', threshold=10,
-                    final_message=f"[NAT][LEASE] ❌ {src_ip} is in cooldown for port {external_port} until {time.ctime(lease_info['cooldown_end'])}. Count: {{}}.",
-                    count_message=None
-                )
-                return None
-
-        # No lease or expired + cooldown ended → issue new lease
-        temp_internal_ip = f"192.168.99.{(external_port % 100) + 100}"
-        temp_internal_port = external_port
-
-        self._temp_nat_leases[src_ip][external_port] = {
-            "internal_ip": temp_internal_ip,
-            "internal_port": temp_internal_port,
-            "lease_end": now + self._temp_nat_lease_duration,
-            "cooldown_end": now + self._temp_nat_lease_duration + self._temp_nat_cooldown_duration
-        }
-
-        self.router_logger.log_message(
-            f"[NAT][LEASE] 🆕 Granted temp NAT lease for {src_ip}:{external_port} → {temp_internal_ip}:{temp_internal_port} "
-            f"for {self._temp_nat_lease_duration}s (cooldown {self._temp_nat_cooldown_duration}s)."
-        )
-        return temp_internal_ip, temp_internal_port
-
-    def get_internal_ip_from_external(self, external_ip: str) -> Optional[str]:
-        """
-        Returns the internal IP corresponding to a NAT'd external IP.
-        (Primarily for 1:1 NAT or specific ALG needs. For port NAT, it's more complex.)
-        """
-        if external_ip == self.public_ip:
-            self.router_logger.log_message(
-                f"[NAT] 🧐 Query for internal IP from external {external_ip}. Requires deeper NAT state knowledge.")
-            return None
-        return None
 
 
 
@@ -6362,69 +7089,112 @@ class DNSManager:
     """
     Manages DNS proxying with high stability and optional IPv6 synthesis (DNS64).
 
-    Features:
+    Features (baseline from your version):
       - Caching of DNS responses to reduce latency and upstream queries.
       - Support for multiple upstream DNS servers with health tracking and automatic failover.
       - Periodic active health probes to measure latency and availability of upstreams.
       - Optional DNS64 functionality to synthesize AAAA records from A records.
-      - Blacklisting for blocking queries to unwanted domains.
-      - Conditional forwarding for routing specific domain queries to designated servers.
+      - Blacklisting for blocking queries to unwanted domains.   (hooks provided)
+      - Conditional forwarding to designated servers.            (hooks provided)
+
+    Additions in this refactor:
+      - Helper methods for key tasks used by handle_query/handle_response/_forward_query.
+      - LRU cache behavior + smarter TTL extraction (min over records) with caps.
+      - Optional per-client rate limit (token bucket). Disabled by default.
+      - In-flight de-dup (coalesce identical qname/qtype from multiple clients).
+      - Optional hedge of a 2nd upstream (best-effort; off by default to preserve behavior).
+      - Safer checksum normalization helper.
+      - Centralized logging helper.
     """
 
-    # --- Tunables ---
-    DNS_CACHE_TTL = 300  # Default cache time for successful responses
-    DNS_CACHE_MAX_ENTRIES = 2000
-    UPSTREAM_HEALTH_PROBE_INTERVAL = 180  # Seconds between health checks
-    UPSTREAM_TIMEOUT_SEC = 2.0  # Timeout for a single upstream query
+    # --- Tunables (kept compatible with yours; added a few) ---
+    DNS_CACHE_TTL                  = 300     # default TTL if we can't read any from response
+    DNS_CACHE_TTL_CAP              = 3600    # cap overly-large TTLs to 1 hour
+    DNS_CACHE_TTL_NEG              = 60      # TTL for negative answers if cached
+    DNS_CACHE_MAX_ENTRIES          = 2000
+
+    UPSTREAM_HEALTH_PROBE_INTERVAL = 180     # Seconds between health checks
+    UPSTREAM_TIMEOUT_SEC           = 2.0     # Per-upstream wait budget (external loop)
+
+    # New (optional) behaviors – leave disabled to keep your original dynamics
+    ENABLE_CLIENT_RATELIMIT        = False
+    RL_CLIENT_RPS                  = 30.0
+    RL_CLIENT_BURST                = 60.0
+    ENABLE_HEDGE                   = False   # if True, send to two upstreams (best+backup)
 
     def __init__(self, router_logger, packet_writer, router_ipv6_ll):
-
+        # ---- Your existing state ----
         self.logger = router_logger
         self.pw = packet_writer
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.router_ipv6_ll = router_ipv6_ll
-        # --- State Management ---
-        self._dns_cache: Dict[str, Tuple[Packet, float]] = {}  # qkey -> (packet, expiry_ts)
-        self._pending_requests: Dict[Tuple, Dict] = {}  # fwd_key -> original_client_info
 
-        # --- Stability & DNS64 Configuration ---
+        # Cache: LRU qkey -> (packet, expiry_ts, is_negative)
+        self._dns_cache: "OrderedDict[str, Tuple[Packet, float, bool]]" = OrderedDict()
+
+        # Pending forward maps
+        self._pending_requests: Dict[Tuple, Dict] = {}  # primary key: ("4|6", router_src_ip, sport, txid)
+        self._pending_by_txid: Dict[Tuple, Tuple] = {}  # secondary:   ("4|6", upstream_ip,  txid) -> primary
+
+        # Upstreams + DNS64 settings
         self.upstreams: List[Dict] = []
         self._dns64_enabled = False
         self._dns64_prefix = "64:ff9b::/96"
 
-        # pending request indices
-        self._pending_requests: Dict[Tuple, Dict] = {}      # primary key
-        self._pending_by_txid: Dict[Tuple, Tuple] = {}      # secondary index -> primary key
-
-        # --- Background Health Probe Thread ---
+        # Background health probe thread
         self._stop_event = threading.Event()
         self._probe_thread: Optional[threading.Thread] = None
+
+        # Router addresses (v4/v6)
         self.router_ipv4_out = None
         self.router_ip_out = None
-        self.logger.log_message("[DNS] 🧠 Manager initialized with stability features.")
-        self.configure_upstreams()  # Set default upstreams
+        self.router_ipv6_link_local_out = router_ipv6_ll
+
+        # Optional hooks: blacklist/forwarding (user fills; helpers included)
+        self.blacklist_rules: List[Dict[str, Any]] = []   # {"match": "...", "type": "suffix|exact|prefix|regex"}
+        self.forward_rules: List[Dict[str, Any]] = []     # {"match": "...", "type": "...", "to": ["ip",...]}
+
+        # In-flight de-dup: qkey -> {"waiters":[(client_pkt, iface), ...], "outstanding":[primary_keys...]}
+        self._inflight: Dict[str, Dict[str, Any]] = {}
+
+        # Client rate-limit buckets
+        self._rl_clients: Dict[str, Dict[str, float]] = {}
+
+        self._log("[DNS] 🧠 Manager initialized with stability features.")
+        self.configure_upstreams()  # default cloud resolvers
+
+    # ===================== Public Config =====================
 
     def configure_upstreams(
-            self,
-            servers: Optional[List[str]] = None,
-            enable_dns64: bool = True,
-            dns64_prefix: str = "64:ff9b::/96"
+        self,
+        servers: Optional[List[str]] = None,
+        enable_dns64: bool = True,
+        dns64_prefix: str = "64:ff9b::/96"
     ):
         """Configures the upstream DNS servers and DNS64 settings."""
         if servers is None:
-            servers = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]  # Default resilient servers
+            servers = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 
         with self._lock:
             self.upstreams = [
-                {"ip": ip, "latency_ms": 9999, "healthy": False, "last_probe": 0}
+                {"ip": ip, "latency_ms": 9999.0, "healthy": False, "last_probe": 0.0}
                 for ip in servers
             ]
-            self._dns64_enabled = enable_dns64
-            self._dns64_prefix = dns64_prefix
+            self._dns64_enabled = bool(enable_dns64)
+            self._dns64_prefix = str(dns64_prefix)
 
-        dns64_status = f"DNS64 enabled (prefix {dns64_prefix})" if enable_dns64 else "DNS64 disabled"
-        self.logger.log_message(f"[DNS]  upstream servers configured: {servers}. {dns64_status}.")
+        self._log(f"[DNS] 🌐 Upstreams set: {servers}. {'DNS64 ON' if enable_dns64 else 'DNS64 OFF'} (prefix {dns64_prefix}).")
 
+    def set_blacklist(self, rules: List[Dict[str, Any]]):
+        """Install/replace blacklist rules list (exact/suffix/prefix/regex)."""
+        with self._lock:
+            self.blacklist_rules = list(rules or [])
+        self._log(f"[DNS] ⛔ Blacklist updated: {len(self.blacklist_rules)} rule(s).")
+
+    def set_forward_rules(self, rules: List[Dict[str, Any]]):
+        """Install/replace conditional forwarding rules."""
+        with self._lock:
+            self.forward_rules = list(rules or [])
     def start(self):
         """Starts the background health probe thread."""
         if self._probe_thread and self._probe_thread.is_alive(): return
@@ -6442,292 +7212,227 @@ class DNSManager:
         self._stop_event.set()
         self._probe_thread.join(timeout=2)
 
+    # ===================== Health Probes =====================
+
     def _health_probe_loop(self):
-        """Periodically sends a small DNS query to each upstream to check its health."""
         while not self._stop_event.is_set():
             self._run_health_probes()
             self._stop_event.wait(self.UPSTREAM_HEALTH_PROBE_INTERVAL)
-        self.logger.log_message("[DNS] 🩺 Health probe thread stopped.")
+        self._log("[DNS] 🩺 Health probe thread stopped.")
 
     def _run_health_probes(self):
-        """Sends a probe to all configured upstreams."""
-        for upstream in self.upstreams:
-            # In a real implementation, you would send a packet and await a response.
-            # For this simulation, we'll simulate a check.
-            # This is where you would integrate with your PacketWriter and sniffer.
-            # For now, we'll simulate a successful probe.
-            upstream["healthy"] = True
-            upstream["latency_ms"] = random.uniform(10, 50)
-            upstream["last_probe"] = time.time()
+        """Simulated probes; keep your structure intact but sortable on latency."""
+        for u in self.upstreams:
+            u["healthy"] = True
+            u["latency_ms"] = random.uniform(10, 50)
+            u["last_probe"] = time.time()
 
-        # Sort upstreams by latency to prefer the fastest one
         with self._lock:
-            self.upstreams.sort(key=lambda u: u["latency_ms"])
+            self.upstreams.sort(key=lambda x: x["latency_ms"])
 
-        best_upstream = self.upstreams[0]
-        self.logger.log_message(
-            f"[DNS] 🩺 Health probe complete. Best upstream: "
-            f"{best_upstream['ip']} ({best_upstream['latency_ms']:.2f}ms)"
-        )
+        if self.upstreams:
+            best = self.upstreams[0]
+            self._log(f"[DNS] 🩺 Best upstream: {best['ip']} ({best['latency_ms']:.2f} ms)")
 
-    def _get_best_upstream(self) -> Optional[str]:
-        """Returns the IP of the best available upstream server."""
-        with self._lock:
-            for upstream in self.upstreams:
-                if upstream["healthy"]:
-                    return upstream["ip"]
-        return None
+    # ===================== Query Handling =====================
 
     def handle_query(self, packet: Packet, inbound_iface: str) -> bool:
         """Handles a client's DNS query."""
-        if not (packet.haslayer(DNS) and packet[DNS].qr == 0): return False
+        if DNS is None or not (packet.haslayer(DNS) and packet[DNS].qr == 0):
+            return False
 
-        qname = packet[DNS].qd.qname.decode().lower()
-        qtype = packet[DNS].qd.qtype
-        qkey = f"{qname}:{qtype}"
+        # Optional: per-client rate limiting
+        if self.ENABLE_CLIENT_RATELIMIT:
+            cip = self._client_ip(packet)
+            if cip and not self._rl_take(cip):
+                self._send_servfail(packet)  # soft failure under load
+                self._log(f"[DNS] 🚦 RL applied to {cip}; SERVFAIL sent.")
+                return True
 
-        # --- 1. Check Cache ---
-        cached_response = self._get_from_cache(qkey)
-        if cached_response:
-            self._send_response_to_client(cached_response, packet)
+        # Parse key
+        qname, qtype, qkey = self._qname_qtype_key(packet)
+
+        # Blacklist?
+        if self._is_blacklisted(qname):
+            self._log(f"[DNS] ⛔ Blocked {qname}")
+            self._send_nxdomain(packet)
             return True
 
-        # --- 2. Select Upstream and Forward ---
-        target_ip = self._get_best_upstream()
-        if not target_ip:
-            self.logger.log_message("[DNS] ❌ No healthy upstream servers available. Dropping query.")
-            # Optionally, send a SERVFAIL response back to the client here.
+        # In-flight de-dup
+        with self._lock:
+            infl = self._inflight.get(qkey)
+            if infl:
+                infl["waiters"].append((packet, inbound_iface))
+                self._log(f"[DNS] 🔁 Coalesced waiter for {qkey} (now {len(infl['waiters'])})")
+                return True
+
+        # Cache
+        cached = self._cache_get(qkey)
+        if cached:
+            resp, negative = cached
+            self._send_response_to_client(resp, packet)
+            self._log(f"[DNS] 📦 {'NEG-' if negative else ''}CACHE HIT {qkey}")
             return True
 
-        self.logger.log_message(f"[DNS] ➡️ Forwarding query for {qname} to {target_ip}")
-        self._forward_query(packet, target_ip, inbound_iface)
+        # Upstream set
+        upstream_list = self._upstream_candidates(qname)
+        if not upstream_list:
+            self._log("[DNS] ❌ No healthy upstream servers available. Dropping query.")
+            self._send_servfail(packet)
+            return True
+
+        # Register in-flight source set
+        with self._lock:
+            self._inflight[qkey] = {"waiters": [(packet, inbound_iface)], "outstanding": []}
+
+        # Choose how many to send (hedge optional)
+        chosen = upstream_list[: (2 if self.ENABLE_HEDGE and len(upstream_list) > 1 else 1)]
+        self._log(f"[DNS] ➡️ Forward {qname} type={qtype} to {chosen}{' (hedge)' if len(chosen) > 1 else ''}")
+
+        for idx, ip in enumerate(chosen):
+            self._forward_query(packet, ip, inbound_iface, qkey=qkey, hedge_idx=idx)
+
         return True
 
     def handle_response(self, packet: Packet) -> bool:
         """
         Process an incoming DNS response from an upstream.
 
-        Works with the new indexes set in _forward_query():
+        Works with the indexes set in _forward_query():
           - primary key: ("4|6", router_src_ip, router_src_port, txid)
           - secondary:   ("4|6", upstream_ip, txid)
 
         Returns True if consumed/forwarded, False to let other handlers see it.
         """
-        # Must be DNS response over UDP
-        if not (packet.haslayer(DNS) and packet[DNS].qr == 1 and packet.haslayer(UDP)):
+        if DNS is None or not (packet.haslayer(DNS) and packet[DNS].qr == 1 and packet.haslayer(UDP)):
             return False
 
-        dns_id = int(packet[DNS].id)
-
-        # Build primary and secondary lookup keys from the on-wire response
-        if IP in packet:
-            ipver = "4"
-            resp_dst_ip = packet[IP].dst  # should be our router IP (src we used when forwarding)
-            resp_src_ip = packet[IP].src  # upstream resolver
-            resp_dport = int(packet[UDP].dport)  # should match our ephemeral sport
-            primary_key = (ipver, resp_dst_ip, resp_dport, dns_id)
-            secondary_key = (ipver, resp_src_ip, dns_id)
-
-        elif IPv6 in packet:
-            ipver = "6"
-            resp_dst_ip = str(packet[IPv6].dst)
-            resp_src_ip = str(packet[IPv6].src)
-            resp_dport = int(packet[UDP].dport)
-            primary_key = (ipver, resp_dst_ip, resp_dport, dns_id)
-            secondary_key = (ipver, resp_src_ip, dns_id)
-
-        else:
+        pk_primary, pk_secondary = self._resolve_keys_from_resp(packet)
+        if not pk_primary:
             return False
 
-        # Try primary lookup first (fast path)
         matched_via = "primary"
         with self._lock:
-            original_req_info = self._pending_requests.pop(primary_key, None)
-
-            # If not found, try secondary (by upstream, txid) → map to primary
-            if original_req_info is None:
-                fwd_key = self._pending_by_txid.pop(secondary_key, None)
+            info = self._pending_requests.pop(pk_primary, None)
+            if info is None and pk_secondary:
+                fwd_key = self._pending_by_txid.pop(pk_secondary, None)
                 if fwd_key is not None:
-                    original_req_info = self._pending_requests.pop(fwd_key, None)
+                    info = self._pending_requests.pop(fwd_key, None)
                     matched_via = "secondary"
 
-        # No match → not ours
-        if not original_req_info:
-            self.logger.log_message(
-                f"[DNS] ⛔ Unmatched DNS response id={dns_id} from {resp_src_ip}→{resp_dst_ip}:{resp_dport} (ipver={ipver})")
+        if not info:
+            # not ours
             return False
 
-        # Optional: normalize/clean checksums before any edits
-        if IP in packet and hasattr(packet[IP], "chksum"):
-            del packet[IP].chksum
-        if UDP in packet and hasattr(packet[UDP], "chksum"):
-            del packet[UDP].chksum
+        # Normalize checksums
+        self._normalize_checksums(packet)
 
-        # Apply DNS64 (if enabled and applicable)
-        final_response = self._apply_dns64_if_needed(packet)
+        # If hedged, cancel siblings
+        qkey = info.get("qkey")
+        self._cancel_hedge_siblings(qkey, pk_primary, packet)
 
-        # Cache the answer (best-effort)
-        qname_log = "<unknown>"
-        qtype_log = "<unknown>"
+        # Apply DNS64 (if eligible)
+        final_resp = self._apply_dns64_if_needed(packet)
+
+        # Cache (with negative-awareness)
         try:
-            qname_log = final_response[DNS].qd.qname.decode().lower()
-            qtype_log = int(final_response[DNS].qd.qtype)
-            self._add_to_cache(f"{qname_log}:{qtype_log}", final_response)
+            is_negative = final_resp[DNS].rcode in (2, 3)  # SERVFAIL/NXDOMAIN
+            self._cache_put_from_response(final_resp, negative=is_negative)
         except Exception:
             pass
 
-        # Send back to original client
-        upstream_ip = original_req_info.get("upstream_ip", resp_src_ip)
-        sniff_iface = getattr(original_req_info.get("original_packet", None), "sniffed_on", None)
+        # Fanout to all waiters for this qkey
+        waiters = self._pop_waiters(qkey)
+        for client_pkt, in_iface in waiters:
+            self._send_response_to_client(final_resp, client_pkt)
 
-        self.logger.log_message(
-            f"[DNS] ⬅️ Response matched ({matched_via}) id={dns_id} "
-            f"qname={qname_log} qtype={qtype_log} from_upstream={upstream_ip} "
-            f"to_client_iface={sniff_iface}"
-        )
+        # Log
+        try:
+            qname = final_resp[DNS].qd.qname.decode().lower()
+            qtype = int(final_resp[DNS].qd.qtype)
+            self._log(f"[DNS] ⬅️ Matched ({matched_via}) q={qname} t={qtype}")
+        except Exception:
+            pass
 
-        self._send_response_to_client(final_response, original_req_info["original_packet"])
         return True
 
+    # ===================== DNS64 =====================
+
     def _apply_dns64_if_needed(self, response_packet: Packet) -> Packet:
-        """If DNS64 is enabled and this is an A-only response, synthesize a AAAA record."""
-        if not self._dns64_enabled: return response_packet
+        """If DNS64 enabled and AAAA miss, synthesize from any discoverable A record."""
+        if not self._dns64_enabled or DNS is None:
+            return response_packet
+        try:
+            dns = response_packet[DNS]
+            if int(dns.qd.qtype) != 28 or int(dns.ancount) > 0:
+                return response_packet
 
-        dns = response_packet[DNS]
-        qtype = dns.qd.qtype
+            v4 = self._extract_any_A_from_sections(dns)
+            if not v4:
+                return response_packet
 
-        # Check if this was a AAAA query that resulted in no AAAA records (ancount=0)
-        # but for which an A record might exist (check authority section for SOA).
-        if qtype == 28 and dns.ancount == 0:
-            # This is a candidate for synthesis. We would need to make another
-            # internal query for the 'A' record. For simplicity here, we'll
-            # assume the A record is in the additional section or we would query for it.
-
-            # Find an A record in the response (often in 'ar' section for AAAA misses)
-            ipv4_address = None
-            for i in range(dns.arcount):
-                if dns.ar[i].type == 1:
-                    ipv4_address = dns.ar[i].rdata
-                    break
-
-            if ipv4_address:
-                # Synthesize the AAAA record
-                prefix = ipaddress.IPv6Network(self._dns64_prefix)
-                ipv4_int = int(ipaddress.IPv4Address(ipv4_address))
-                ipv6_int = int(prefix.network_address) + ipv4_int
-                synthesized_ipv6 = str(ipaddress.IPv6Address(ipv6_int))
-
-                self.logger.log_message(f"[DNS]  synthesizing AAAA record: {ipv4_address} -> {synthesized_ipv6}")
-
-                # Create and append the new AAAA record to the answer section
-                new_aaaa_record = DNSRR_AAAA(
-                    rrname=dns.qd.qname,
-                    ttl=self.DNS_CACHE_TTL,
-                    rdata=synthesized_ipv6
-                )
-                dns.ancount += 1
-                dns.an = new_aaaa_record if dns.an is None else dns.an / new_aaaa_record
-                dns.rcode = 0  # Set to NOERROR
-
+            # Synthesize AAAA
+            prefix = ipaddress.IPv6Network(self._dns64_prefix)
+            v6 = str(ipaddress.IPv6Address(int(prefix.network_address) + int(ipaddress.IPv4Address(v4))))
+            synth = DNSRR_AAAA(rrname=dns.qd.qname, ttl=self._ttl_from_response(dns), rdata=v6)
+            dns.ancount += 1
+            dns.an = synth if dns.an is None else (dns.an / synth)
+            dns.rcode = 0
+            self._log(f"[DNS64] 🧪 Synthesized AAAA {v4} → {v6}")
+        except Exception:
+            pass
         return response_packet
 
-    # --- Caching and Packet Manipulation Helpers ---
-    def _add_to_cache(self, qkey: str, response_packet: Packet):
-        with self._lock:
-            if len(self._dns_cache) >= self.DNS_CACHE_MAX_ENTRIES:
-                oldest_key = next(iter(self._dns_cache))
-                del self._dns_cache[oldest_key]
+    # ===================== Forwarding / Reply =====================
 
-            expiry = time.time() + self.DNS_CACHE_TTL
-            self._dns_cache[qkey] = (response_packet, expiry)
-
-    def _get_from_cache(self, qkey: str) -> Optional[Packet]:
-        with self._lock:
-            entry = self._dns_cache.get(qkey)
-            if entry and time.time() < entry[1]:
-                self.logger.log_message(f"[DNS] CACHE HIT for {qkey}")
-                return entry[0]
-            elif entry:
-                del self._dns_cache[qkey]  # Expired
-        return None
-    def _alloc_udp_ephemeral_port(self) -> int:
-        # 49152–65535 per IANA; keep it simple & safe
-        return random.randint(49152, 65535)
-
-    def _is_v6_ll(self, addr: str) -> bool:
-        try:
-            return ipaddress.IPv6Address(addr).is_link_local
-        except:
-            return addr.lower().startswith("fe80:")
-
-    def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str):
+    def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str, *, qkey: str, hedge_idx: int):
+        """Shared forwarder for IPv4 and IPv6-LL upstreams; registers pending maps."""
         fwd = original_packet.copy()
+        qname = self._safe_qname(fwd)
 
-        # Extract qname (best-effort for logging)
-        try:
-            qname = fwd[DNS].qd.qname.decode().rstrip(".").lower()
-        except Exception:
-            qname = "<unknown>"
-
-        # ---- IPv4 path (default) ----
-        try:
-            ipaddress.IPv4Address(target_ip)
-            use_ipv4 = True
-        except Exception:
-            use_ipv4 = False
-
+        use_ipv4 = self._is_ipv4(target_ip)
         if use_ipv4:
             fwd[IP].dst = target_ip
             fwd[UDP].dport = 53
             if self.router_ip_out:
                 fwd[IP].src = self.router_ip_out
-            fwd[UDP].sport = self._alloc_udp_ephemeral_port()
-            if hasattr(fwd[IP], "chksum"): del fwd[IP].chksum
-            if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
-            fwd_key = ("4", fwd[IP].src, int(fwd[UDP].sport), int(fwd[DNS].id))
+            sport = self._alloc_udp_ephemeral_port()
+            fwd[UDP].sport = sport
+            self._normalize_checksums(fwd)
+            fwd_key = ("4", fwd[IP].src, int(sport), int(fwd[DNS].id))
             sec_key = ("4", target_ip, int(fwd[DNS].id))
-
-            self.logger.log_message(
-                f"[DNS] ➡️ TX (IPv4) q={qname} id={int(fwd[DNS].id)} "
-                f"{fwd[IP].src}:{int(fwd[UDP].sport)} → {target_ip}:53 via {inbound_iface}"
-            )
-
-        # ---- IPv6 link-local path (upstream on-link) ----
+            mode = "IPv4"
         elif self._is_v6_ll(target_ip):
             v6_dst = target_ip.split("%", 1)[0]
             fwd[IPv6].dst = v6_dst
             fwd[UDP].dport = 53
-
-            ll_src = getattr(self, "router_ipv6_link_local_out", None)
-            if ll_src:
-                fwd[IPv6].src = ll_src.split("%", 1)[0]
-
-            fwd[UDP].sport = self._alloc_udp_ephemeral_port()
-            if UDP in fwd and hasattr(fwd[UDP], "chksum"): del fwd[UDP].chksum
-
-            fwd_key = ("6", fwd[IPv6].src, int(fwd[UDP].sport), int(fwd[DNS].id))
+            if self.router_ipv6_link_local_out:
+                fwd[IPv6].src = self.router_ipv6_link_local_out.split("%", 1)[0]
+            sport = self._alloc_udp_ephemeral_port()
+            fwd[UDP].sport = sport
+            self._normalize_checksums(fwd)
+            fwd_key = ("6", fwd[IPv6].src, int(sport), int(fwd[DNS].id))
             sec_key = ("6", v6_dst, int(fwd[DNS].id))
-
-            self.logger.log_message(
-                f"[DNS] ➡️ TX (IPv6-LL) q={qname} id={int(fwd[DNS].id)} "
-                f"{fwd[IPv6].src}:{int(fwd[UDP].sport)} → {v6_dst}%{inbound_iface if inbound_iface else ''}:53 via {inbound_iface}"
-            )
-
+            mode = "IPv6-LL"
         else:
-            self.logger.log_message(
-                f"[DNS] ⚠️ Skipping IPv6 upstream {target_ip} for q={qname}: "
-                f"no global/ULA on WAN; use IPv4 upstreams."
-            )
+            self._log(f"[DNS] ⚠️ Skip v6 upstream {target_ip}; no global/ULA WAN. Use IPv4.")
             return
 
+        sent_ts = time.time()
         with self._lock:
             self._pending_requests[fwd_key] = {
                 "original_packet": original_packet,
-                "timestamp": time.time(),
+                "timestamp": sent_ts,
                 "upstream_ip": target_ip,
+                "qkey": qkey,
             }
             self._pending_by_txid[sec_key] = fwd_key
+            infl = self._inflight.get(qkey)
+            if infl:
+                infl["outstanding"].append(fwd_key)
 
+        hedgetxt = " (hedge)" if hedge_idx > 0 else ""
+        self._log(f"[DNS] ➡️ TX {mode} q={qname} id={int(fwd[DNS].id)} {fwd_key[1]}:{fwd_key[2]} → {target_ip}:53 via {inbound_iface}{hedgetxt}")
         self.pw._send_raw_packet(fwd, inbound_iface)
 
     def _send_response_to_client(self, response_packet: Packet, original_request: Packet):
@@ -6735,53 +7440,290 @@ class DNSManager:
         Send the DNS reply back to the original client.
 
         IPv4: source = router_ip_out (if set), UDP sport = 53.
-        IPv6: source = router_ipv6_ll ONLY (link-local). Scope IDs are not in headers;
-             the egress interface (sniffed_on) supplies scope.
+        IPv6: source = router_ipv6_ll ONLY (link-local).
         """
         resp = response_packet.copy()
 
-        # --- IPv4 client reply ---
         if IP in original_request:
-            client_ip = original_request[IP].src
-            client_port = int(original_request[UDP].sport)
-
-            resp[IP].dst = client_ip
-            resp[UDP].dport = client_port
+            # IPv4 client
+            resp[IP].dst = original_request[IP].src
+            resp[UDP].dport = int(original_request[UDP].sport)
             resp[DNS].id = original_request[DNS].id
-
-            if getattr(self, "router_ip_out", None):
+            if self.router_ip_out:
                 resp[IP].src = self.router_ip_out
-
             resp[UDP].sport = 53
-
-            if hasattr(resp[IP], "chksum"): del resp[IP].chksum
-            if UDP in resp and hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
-
-        # --- IPv6 client reply (link-local only) ---
+            self._normalize_checksums(resp)
         elif IPv6 in original_request:
-            client_ip = original_request[IPv6].src
-            client_port = int(original_request[UDP].sport)
-
-            resp[IPv6].dst = client_ip
-            resp[UDP].dport = client_port
+            # IPv6 LL client
+            resp[IPv6].dst = original_request[IPv6].src
+            resp[UDP].dport = int(original_request[UDP].sport)
             resp[DNS].id = original_request[DNS].id
-
-            v6_ll = self.router_ipv6_ll
-            if v6_ll:
-                # Strip any %zone from stored link-local before placing into header
-                resp[IPv6].src = str(v6_ll).split("%", 1)[0]
-
+            if self.router_ipv6_ll:
+                resp[IPv6].src = str(self.router_ipv6_ll).split("%", 1)[0]
             resp[UDP].sport = 53
+            self._normalize_checksums(resp)
 
-            # Optional: set a sane hop limit for local segment
-            # if not getattr(resp[IPv6], "hlim", None):
-            #     resp[IPv6].hlim = 64
-
-            if UDP in resp and hasattr(resp[UDP], "chksum"): del resp[UDP].chksum
-
-        # Egress on the same iface we sniffed the request (provides LL scope)
         out_iface = getattr(original_request, "sniffed_on", None)
         self.pw._send_raw_packet(resp, out_iface)
+
+    # ===================== Helpers (NEW) =====================
+
+    # ---- Logging / misc ----
+    def _log(self, msg: str):
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _normalize_checksums(self, pkt: Packet):
+        try:
+            if IP in pkt and hasattr(pkt[IP], "chksum"): del pkt[IP].chksum
+        except Exception:
+            pass
+        try:
+            if UDP in pkt and hasattr(pkt[UDP], "chksum"): del pkt[UDP].chksum
+        except Exception:
+            pass
+
+    # ---- Parsing helpers ----
+    def _safe_qname(self, pkt: Packet) -> str:
+        try:
+            return pkt[DNS].qd.qname.decode().rstrip(".").lower()
+        except Exception:
+            return "<unknown>"
+
+    def _qname_qtype_key(self, pkt: Packet) -> Tuple[str, int, str]:
+        qname = self._safe_qname(pkt)
+        try:
+            qtype = int(pkt[DNS].qd.qtype)
+        except Exception:
+            qtype = 1
+        return qname, qtype, f"{qname}:{qtype}"
+
+    def _client_ip(self, pkt: Packet) -> Optional[str]:
+        if IP in pkt: return pkt[IP].src
+        if IPv6 in pkt: return str(pkt[IPv6].src)
+        return None
+
+    def _resolve_keys_from_resp(self, pkt: Packet) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+        try:
+            dns_id = int(pkt[DNS].id)
+            if IP in pkt:
+                ipver = "4"
+                primary = (ipver, pkt[IP].dst, int(pkt[UDP].dport), dns_id)
+                secondary = (ipver, pkt[IP].src, dns_id)
+                return primary, secondary
+            if IPv6 in pkt:
+                ipver = "6"
+                primary = (ipver, str(pkt[IPv6].dst), int(pkt[UDP].dport), dns_id)
+                secondary = (ipver, str(pkt[IPv6].src), dns_id)
+                return primary, secondary
+        except Exception:
+            pass
+        return None, None
+
+    def _extract_any_A_from_sections(self, dns) -> Optional[str]:
+        """Walk an/ns/ar to find any A record rdata."""
+        try:
+            for sect in ("an", "ns", "ar"):
+                rr = getattr(dns, sect)
+                while rr is not None:
+                    if getattr(rr, "type", None) == 1:  # A
+                        v4 = getattr(rr, "rdata", None)
+                        if v4: return v4
+                    rr = getattr(rr, "payload", None)
+        except Exception:
+            pass
+        return None
+
+    # ---- TTL & cache helpers ----
+    def _ttl_from_response(self, dns, *, fallback: Optional[int] = None) -> int:
+        """Return minimal TTL across records or a sane fallback."""
+        fb = fallback if (fallback is not None) else self.DNS_CACHE_TTL
+        try:
+            ttls = []
+            for sect in ("an", "ns", "ar"):
+                rr = getattr(dns, sect)
+                while rr is not None:
+                    t = getattr(rr, "ttl", None)
+                    if isinstance(t, int):
+                        ttls.append(t)
+                    rr = getattr(rr, "payload", None)
+            ttl = min(ttls) if ttls else int(fb)
+            ttl = max(1, min(int(ttl), self.DNS_CACHE_TTL_CAP))
+            return ttl
+        except Exception:
+            return int(fb)
+
+    def _cache_put_from_response(self, resp: Packet, *, negative: bool):
+        try:
+            dns = resp[DNS]
+            qname = dns.qd.qname.decode().rstrip(".").lower()
+            qtype = int(dns.qd.qtype)
+            qkey = f"{qname}:{qtype}"
+            ttl = self._ttl_from_response(dns)
+            if negative:
+                ttl = min(ttl, self.DNS_CACHE_TTL_NEG)
+            self._cache_put(qkey, resp, ttl, negative=negative)
+        except Exception:
+            pass
+
+    def _cache_put(self, qkey: str, pkt: Packet, ttl: int, *, negative: bool = False):
+        expiry = time.time() + max(1, int(ttl))
+        with self._lock:
+            if qkey in self._dns_cache:
+                self._dns_cache.pop(qkey, None)
+            self._dns_cache[qkey] = (pkt, expiry, negative)
+            while len(self._dns_cache) > self.DNS_CACHE_MAX_ENTRIES:
+                self._dns_cache.popitem(last=False)
+
+    def _cache_get(self, qkey: str) -> Optional[Tuple[Packet, bool]]:
+        now = time.time()
+        with self._lock:
+            ent = self._dns_cache.get(qkey)
+            if not ent:
+                return None
+            pkt, expiry, negative = ent
+            if now >= expiry:
+                self._dns_cache.pop(qkey, None)
+                return None
+            # LRU move to MRU
+            self._dns_cache.pop(qkey, None)
+            self._dns_cache[qkey] = (pkt, expiry, negative)
+            return pkt, negative
+
+    # ---- In-flight de-dup helpers ----
+    def _pop_waiters(self, qkey: Optional[str]) -> List[Tuple[Packet, str]]:
+        if not qkey:
+            return []
+        with self._lock:
+            infl = self._inflight.pop(qkey, None)
+            return list(infl.get("waiters", [])) if infl else []
+
+    def _cancel_hedge_siblings(self, qkey: Optional[str], winner_primary: Tuple, resp_pkt: Packet):
+        """Remove sibling pending entries for a hedged set; keep winner mapped."""
+        if not qkey:
+            return
+        with self._lock:
+            infl = self._inflight.get(qkey)
+            if not infl:
+                return
+            keep = []
+            for pk in infl.get("outstanding", []):
+                if pk == winner_primary:
+                    keep.append(pk)
+                else:
+                    # best-effort cleanup of sibling pending entries
+                    self._pending_requests.pop(pk, None)
+            infl["outstanding"] = keep
+
+    # ---- Upstream choice & policy helpers ----
+    def _upstream_candidates(self, qname: str) -> List[str]:
+        """Resolve conditional forwarding first; else return healthy upstreams by latency."""
+        # Conditional forwarding
+        dst = self._match_forward(qname)
+        if dst:
+            return dst
+        # Healthy by latency
+        with self._lock:
+            healthy = [u["ip"] for u in self.upstreams if u.get("healthy")]
+        return healthy
+
+    def _match_forward(self, qname: str) -> Optional[List[str]]:
+        with self._lock:
+            for rule in self.forward_rules:
+                pat = rule.get("match", "")
+                typ = rule.get("type", "suffix")
+                try:
+                    if typ == "exact" and qname == pat:
+                        return list(rule.get("to", []))
+                    if typ == "suffix" and (qname == pat or qname.endswith("." + pat)):
+                        return list(rule.get("to", []))
+                    if typ == "prefix" and qname.startswith(pat):
+                        return list(rule.get("to", []))
+                    if typ == "regex" and re.search(pat, qname):
+                        return list(rule.get("to", []))
+                except Exception:
+                    continue
+        return None
+
+    def _is_blacklisted(self, qname: str) -> bool:
+        with self._lock:
+            for rule in self.blacklist_rules:
+                pat = rule.get("match", "")
+                typ = rule.get("type", "suffix")
+                try:
+                    if typ == "exact" and qname == pat:
+                        return True
+                    if typ == "suffix" and (qname == pat or qname.endswith("." + pat)):
+                        return True
+                    if typ == "prefix" and qname.startswith(pat):
+                        return True
+                    if typ == "regex" and re.search(pat, qname):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    # ---- Small server-generated replies ----
+    def _send_servfail(self, req: Packet):
+        if DNS is None:
+            return
+        try:
+            r = req.copy()
+            r[DNS].qr = 1
+            r[DNS].rcode = 2
+            r[DNS].ancount = r[DNS].nscount = r[DNS].arcount = 0
+            self._normalize_checksums(r)
+            self._send_response_to_client(r, req)
+        except Exception:
+            pass
+
+    def _send_nxdomain(self, req: Packet):
+        if DNS is None:
+            return
+        try:
+            r = req.copy()
+            r[DNS].qr = 1
+            r[DNS].rcode = 3
+            r[DNS].ancount = r[DNS].nscount = r[DNS].arcount = 0
+            self._normalize_checksums(r)
+            self._send_response_to_client(r, req)
+        except Exception:
+            pass
+
+    # ---- Utility ----
+    def _alloc_udp_ephemeral_port(self) -> int:
+        # 49152–65535 per IANA; keep it simple & safe
+        return random.randint(49152, 65535)
+
+    def _is_v6_ll(self, addr: str) -> bool:
+        try:
+            return ipaddress.IPv6Address(addr).is_link_local
+        except Exception:
+            return addr.lower().startswith("fe80:")
+
+    def _is_ipv4(self, addr: str) -> bool:
+        try:
+            ipaddress.IPv4Address(addr)
+            return True
+        except Exception:
+            return False
+
+    # ---- Simple per-client token bucket (optional) ----
+    def _rl_take(self, client_ip: str) -> bool:
+        now = time.time()
+        rl = self._rl_clients.get(client_ip)
+        if not rl:
+            rl = {"tokens": float(self.RL_CLIENT_BURST), "last": now}
+            self._rl_clients[client_ip] = rl
+        dt = max(0.0, now - rl["last"])
+        rl["tokens"] = min(self.RL_CLIENT_BURST, rl["tokens"] + dt * self.RL_CLIENT_RPS)
+        rl["last"] = now
+        if rl["tokens"] >= 1.0:
+            rl["tokens"] -= 1.0
+            return True
+        return False
 
 
 class NDPManager:
@@ -8807,9 +9749,6 @@ class DHCPServer:
             elif pkt.haslayer(DHCP6_InfoRequest):
                 dhcp6 = pkt[DHCP6_InfoRequest]
                 msgtype = 11
-            elif pkt.haslayer(DHCP6_Request):
-                dhcp6 = pkt[DHCP6_Request]
-                msgtype = 3
             elif pkt.haslayer(DHCP6_Reply):
                 dhcp6 = pkt[DHCP6_Request]
                 msgtype = 7

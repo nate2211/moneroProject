@@ -1980,4 +1980,3 @@ class SnifferSoftware:
                     return l
 
         return None  # Not found or unsupported spec type
-

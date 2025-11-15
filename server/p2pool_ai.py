@@ -5,7 +5,9 @@ from google.genai import types
 from google.genai.types import Tool
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google import genai
-
+from dotenv import load_dotenv
+import os
+load_dotenv()
 
 class GeminiChatBot:
     """
@@ -13,11 +15,11 @@ class GeminiChatBot:
     Compatible with retry logic, chat history, and GUI loggers like GeminiLogger.
     """
 
-    def __init__(self, logger, model_name: str = "gemini-2.5-pro",
+    def __init__(self, logger, model_name: str = "gemini-2.5-flash",
                  initial_instruction: str = None):
 
         self.logger = logger
-        self.api_key = "AIzaSyCFjDQgqabJL6iQzzkjEpgP02-uKpl_o3w"
+        self.api_key = os.getenv("GOOGLE_API_KEY")
 
 
         self.model_name = model_name

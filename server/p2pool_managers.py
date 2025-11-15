@@ -1248,7 +1248,16 @@ class PythonRouterManager:
                         component="handshake",
                     )
                     return
-
+            nat_decision = self.nat_manager.handle_packet(
+                packet,
+                inbound_iface,
+                router_ips=self._get_all_local_ips(),
+                wan_ifaces=set(self.outbound_load_balancer.get_configured_interfaces()),
+                lan_ifaces=set(self.ethernet_manager.get_bridge_members())  # or your LAN iface set
+            )
+            if nat_decision is False:
+                # Dropped (e.g., banned or ICMP sent)
+                return
             is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
             if is_handled_by_transport:
