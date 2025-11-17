@@ -60,6 +60,7 @@ from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackM
 from p2pool_tools import ParallelPythonTool
 from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
+from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
 
 class PythonRouterManager:
@@ -176,7 +177,14 @@ class PythonRouterManager:
         }
         self.started = False
 
-
+        self.packet_analyzer = PacketPipelineBlock()
+        self.default_analysis_extras = create_pipeline_extras(
+            logger=self.router_logger,  # <-- Pass your logger instance here
+            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee",
+            memory_key="last_analyzed_packet",
+            debug=False,
+            stop_on_error=True
+        )
 
 
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
@@ -1237,7 +1245,10 @@ class PythonRouterManager:
             if not self.firewall_manager.process_packet(packet):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
-
+            self.packet_analyzer.execute(
+                packet,
+                params=self.default_analysis_extras
+            )
             transport_layer = self.sniffer._find_transport_layer(packet)
             if isinstance(transport_layer, TCP):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
@@ -1248,6 +1259,16 @@ class PythonRouterManager:
                         component="handshake",
                     )
                     return
+            nat_decision = self.nat_manager.handle_packet(
+                packet,
+                inbound_iface,
+                router_ips=self._get_all_local_ips(),
+                wan_ifaces=set(self.outbound_load_balancer.get_configured_interfaces()),
+                lan_ifaces=set(self.ethernet_manager.get_bridge_members())  # or your LAN iface set
+            )
+            if nat_decision is False:
+                # Dropped (e.g., banned or ICMP sent)
+                return
 
             is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
