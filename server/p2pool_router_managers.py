@@ -19979,7 +19979,20 @@ class ICMPManager:
             # Ours: reply normally
             self._handle_echo_request_v4(pkt, iface, router_mac, router_ip)
             return True
+        # Echo-requests
+        if t == 8:
+            if not is_for_router:
+                # Transit: unfold + act per policy
+                handled = self._handle_transit_echo_v4(pkt, iface)
+                return handled
+            # Ours: reply normally
+            self._handle_echo_request_v4(pkt, iface, router_mac, router_ip)
+            return True
 
+        # Echo-replies (transit only; if they're to us, treat as “not specially handled”)
+        if t == 0 and not is_for_router:
+            handled = self._handle_transit_echo_v4(pkt, iface)
+            return handled
         # Errors: unfold (even for transit) for diagnostics
         unfolded = self._icmpv4_unfold(pkt, iface)
         if unfolded:
@@ -20772,17 +20785,21 @@ class ICMPManager:
 
     def _handle_transit_echo_v4(self, pkt: Packet, iface: str) -> bool:
         """
-        Unfold a transit echo-request and optionally act:
+        Unfold a transit echo (request or reply) and optionally act:
           - 'reject' : send ICMP dest-unreach (admin-prohibited) back to sender
           - 'mirror' : tee the exact packet to MIRROR_IFACE (or inbound iface)
           - 'none'   : just unfold/log
         Returns True if we transmitted something or fully handled it.
         """
-        ip = pkt[IP];
+        ip = pkt[IP]
         icmp = pkt[ICMP]
-        if int(icmp.type) != 8:
+        icmp_type = int(getattr(icmp, "type", 255))
+
+        # Only care about echo messages
+        if icmp_type not in (0, 8):  # 0=echo-reply, 8=echo-request
             return False
 
+        is_reply = (icmp_type == 0)
         # --- Unfold/log details
         try:
             ihl_bytes = int(getattr(ip, "ihl", 5)) * 4
@@ -20795,8 +20812,9 @@ class ICMPManager:
         df = bool(int(getattr(ip, "flags", 0)) & 0x2)
         payload = bytes(icmp.payload) if hasattr(icmp, "payload") else b""
 
+        kind = "reply" if is_reply else "request"
         self.log.log_message(
-            f"[ICMP][UNFOLD][ECHO] transit v4 {ip.src}→{ip.dst} "
+            f"[ICMP][UNFOLD][ECHO] transit v4-{kind} {ip.src}→{ip.dst} "
             f"id={icmp_id} seq={icmp_seq} ttl={ttl} len={total} df={int(df)} "
             f"payload={len(payload)}B on {self._iface_suffix(iface)}"
         )
@@ -20816,9 +20834,13 @@ class ICMPManager:
                 shadow = pkt.copy()
             except Exception:
                 shadow = pkt
-            self.pw_send_raw_packet(shadow, out_if, allow_dst_ours=True, reason="mirror transit echo v4")
+            self.pw_send_raw_packet(
+                shadow,
+                out_if,
+                allow_dst_ours=True,
+                reason=f"mirror transit echo v4 ({'reply' if is_reply else 'request'})",
+            )
             return True
-
         # Reject path: send ICMP DestUnreach(code=13) back to sender
         if policy == "reject":
             if not self._transit_rl_ok(ip.src, ip.dst):
@@ -20829,7 +20851,8 @@ class ICMPManager:
             my_mac = cfg.get("mac")
             if not my_ip:
                 self.log.log_message(
-                    f"[ICMP][UNFOLD][ECHO] ⚠️ no iface IPv4 on {self._iface_suffix(iface)}; cannot reject.")
+                    f"[ICMP][UNFOLD][ECHO] ⚠️ no iface IPv4 on {self._iface_suffix(iface)}; cannot reject."
+                )
                 return True
 
             # Quote original IP header + 8 bytes of its payload (RFC 792)
@@ -20845,9 +20868,15 @@ class ICMPManager:
             else:
                 out = base / du / quoted
 
-            self.pw_send_raw_packet(out, iface, allow_dst_ours=True, reason="ICMPv4 reject (transit echo)")
+            self.pw_send_raw_packet(
+                out,
+                iface,
+                allow_dst_ours=True,
+                reason=f"ICMPv4 reject (transit echo {'reply' if is_reply else 'request'})",
+            )
             self.log.log_message(
-                f"[ICMP] 🚫 Sent v4 admin-prohibited to {ip.src} (for transit echo to {ip.dst}) "
+                f"[ICMP] 🚫 Sent v4 admin-prohibited to {ip.src} (for transit echo "
+                f"{'reply' if is_reply else 'request'} to {ip.dst}) "
                 f"on {self._iface_suffix(iface)}"
             )
             return True
