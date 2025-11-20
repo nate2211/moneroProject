@@ -1,50 +1,53 @@
-import datetime
-import traceback
-
-from google.genai import types
-from google.genai.types import Tool
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google import genai
-from dotenv import load_dotenv
 import os
+import traceback
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 load_dotenv()
+
+
+# 1. Define the custom exception FIRST, so it exists when the decorator needs it.
+class RateLimitException(Exception):
+    """Custom exception raised when the API sends a 429 or resource exhausted error."""
+    pass
 
 
 class GeminiChatBot:
     """
-    Modern Gemini chatbot using the stateful `chats` module.
+    Free-Tier optimized Gemini chatbot.
+    - Removes Google Search (Grounding) to avoid billing requirements.
+    - Uses 'gemini-2.0-flash' (or 1.5-flash) which are free-tier eligible.
+    - Aggressive retry logic for Free Tier Rate Limits (429 Errors).
     """
 
-    def __init__(self, logger, model_name: str = "gemini-2.5-flash",
+    def __init__(self, logger, model_name: str = "gemini-2.0-flash",
                  initial_instruction: str = None):
 
         self.logger = logger
         self.api_key = os.getenv("GOOGLE_API_KEY")
+
+        # Defaulting to 2.0 Flash, which is currently free and fast.
         self.model_name = model_name
         self.initial_instruction = initial_instruction
 
-        # 1. Initialize Client ONCE.
-        # Per docs: Client is the entry point.
+        # Initialize Client
         self.client = genai.Client(api_key=self.api_key)
 
-        # 2. Define Config (System Instruction goes here)
-        # Per docs: genai.types.GenerateContentConfig
+        # Define Config
         self.config = types.GenerateContentConfig(
             system_instruction=self.initial_instruction,
-            temperature=0.1,
-            top_p=1.0,
+            temperature=0.7,
+            top_p=0.95,
             top_k=40,
-            max_output_tokens=65536,
+            max_output_tokens=8192,
             response_modalities=["TEXT"],
-            # Consolidate tools list
-            tools=[
-                types.Tool(google_search=types.GoogleSearch()),
-                # Note: UrlContext is generally implied if not explicitly disabled/configured differently
-                # but can be added if specific configuration is needed.
-            ]
+            # Tools list is empty to ensure strict Free Tier compatibility
+            tools=[]
         )
 
-        # 3. Initialize the Chat Session
+        # Initialize the Chat Session
         self._start_new_chat()
 
     def _log(self, msg):
@@ -54,31 +57,41 @@ class GeminiChatBot:
             print(msg)
 
     def _start_new_chat(self):
-        """Helper to start/reset a chat session using client.chats"""
-        # Per docs: client.chats.create(model=..., config=...)
-        self.chat_session = self.client.chats.create(
-            model=self.model_name,
-            config=self.config
-        )
+        """Helper to start/reset a chat session."""
+        try:
+            self.chat_session = self.client.chats.create(
+                model=self.model_name,
+                config=self.config
+            )
+        except Exception as e:
+            self._log(f"Failed to create chat session: {e}")
 
+    # FREE TIER ADJUSTMENT:
+    # This logic waits: 2s, 4s, 8s, 16s, 32s... up to 60s if RateLimitException is raised.
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(Exception)
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
+        # Now RateLimitException is defined and valid here
+        retry=retry_if_exception_type((RateLimitException, Exception))
     )
     def send_message(self, user_message: str) -> str:
         if not isinstance(user_message, str) or not user_message.strip():
             return "Please enter a non-empty message."
 
         try:
-            # 4. Use send_message on the chat session (Stateful)
-            # Per docs: chat.send_message(message) sends history + new msg
             response = self.chat_session.send_message(user_message)
             return response.text
 
         except Exception as e:
-            self._log(f"Error sending message: {e}\n{traceback.format_exc()}")
-            # Re-raise for tenacity to handle the retry
+            # Check if this is a Rate Limit error (HTTP 429 or Resource Exhausted)
+            error_str = str(e).lower()
+            if "429" in error_str or "resource_exhausted" in error_str:
+                self._log(f"Rate limit hit (Free Tier). Retrying in a moment...")
+                # Raise the custom error to trigger specific retry logic
+                raise RateLimitException("Rate limit exceeded")
+
+            # Log other errors but allow retry if temporary
+            self._log(f"API Error: {e}")
             raise e
 
     def clear_chat_history(self):

@@ -12,7 +12,8 @@ import requests
 from PyQt5.QtGui import QTextCursor, QIcon, QPixmap
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
     QVBoxLayout, QHBoxLayout, QTextEdit, QListWidget, QCheckBox, QTreeWidgetItem, QTreeWidget, QTabWidget, QHeaderView, \
-    QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem, QSpinBox
+    QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem, QSpinBox, \
+    QSplitter
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer, Qt
 from pygments.formatters.html import HtmlFormatter
 
@@ -1213,7 +1214,7 @@ class GeminiChatTab(QWidget):
         self._connect_signals()
 
         # Initialize the chatbot backend FIRST
-        self.chatbot_backend = GeminiChatBot(self.gemini_logger,  # Pass self.gemini_logger
+        self.chatbot_backend = GeminiChatBot(self.gemini_logger,
                                              initial_instruction="You are a highly intelligent and analytical AI assistant. "
                                                                  "When providing code, please format it as if it were output from a blank terminal. "
                                                                  "Ensure there's ample blank space (e.g., a few empty lines) before and after "
@@ -1234,13 +1235,15 @@ class GeminiChatTab(QWidget):
         self.chat_output = QTextEdit()
         self.chat_output.setReadOnly(True)
         self.chat_output.setPlaceholderText("Gemini's responses will appear here...")
+        # Ensure rich text is accepted and formatting works
+        self.chat_output.setAcceptRichText(True)
 
-        self.user_input = QPlainTextEdit()  # Changed from QLineEdit to QPlainTextEdit
+        self.user_input = QPlainTextEdit()
         self.user_input.setPlaceholderText("Type your message here...")
-        self.user_input.setFixedHeight(80)  # Give it an initial height for multi-line input
+        # REMOVED: self.user_input.setFixedHeight(80) -> This allows the splitter to control size
 
         self.send_button = QPushButton("Send")
-        self.send_button.setObjectName("send_button")  # For potential styling
+        self.send_button.setObjectName("send_button")
 
         self.clear_history_button = QPushButton("Clear History")
         self.clear_history_button.setObjectName("clear_history_button")
@@ -1249,50 +1252,76 @@ class GeminiChatTab(QWidget):
         self.status_label.setStyleSheet("color: #dcdcdc; font-style: italic;")
 
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
+        """Sets up the layout for the tab with a QSplitter for resizing."""
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(5, 5, 5, 5) # Add slight margin around the whole tab
 
-        # Output console
-        main_layout.addWidget(self.chat_output, 1)  # Stretch factor 1 to take available space
+        # 1. Create a Vertical Splitter
+        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter.setHandleWidth(8) # Make the grab handle visible and easy to click
+        # Optional: Style the splitter handle
+        self.splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #444;
+                border: 1px solid #222;
+            }
+            QSplitter::handle:hover {
+                background-color: #666;
+            }
+        """)
 
-        # Input and buttons
-        # The input field is now QPlainTextEdit, which handles its own line breaks.
-        # The send button and clear history button should be next to it.
-        input_and_buttons_layout = QHBoxLayout()
-        input_and_buttons_layout.addWidget(self.user_input, 1)  # Stretch factor 1 for input area
+        # 2. Add Chat Output to Top of Splitter
+        self.splitter.addWidget(self.chat_output)
 
+        # 3. Create a container for the Input Area (Input Box + Buttons)
+        input_container = QWidget()
+        # Use horizontal layout for text box + buttons side-by-side
+        input_container_layout = QHBoxLayout(input_container)
+        input_container_layout.setContentsMargins(0, 0, 0, 0) # No extra margins inside the split
+
+        # Add User Input to container
+        input_container_layout.addWidget(self.user_input, 1) # Stretch factor 1
+
+        # Create Button Column
         button_column_layout = QVBoxLayout()
         button_column_layout.addWidget(self.send_button)
         button_column_layout.addWidget(self.clear_history_button)
-        button_column_layout.addStretch(1)  # Push buttons to the top of their column
+        button_column_layout.addStretch(1) # Push buttons to the top
 
-        input_and_buttons_layout.addLayout(button_column_layout)
+        # Add buttons to container
+        input_container_layout.addLayout(button_column_layout)
 
-        main_layout.addLayout(input_and_buttons_layout)
+        # 4. Add Input Container to Bottom of Splitter
+        self.splitter.addWidget(input_container)
+
+        # Set initial sizes (e.g., 80% Chat, 20% Input)
+        self.splitter.setStretchFactor(0, 4)
+        self.splitter.setStretchFactor(1, 1)
+        # Prevent sections from collapsing completely
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+
+        # 5. Add Splitter and Status Label to Main Layout
+        main_layout.addWidget(self.splitter)
         main_layout.addWidget(self.status_label)
 
     def _connect_signals(self):
         """Connects UI element signals to handler methods."""
         self.send_button.clicked.connect(self._on_send_button_clicked)
         self.clear_history_button.clicked.connect(self._on_clear_history_clicked)
-
-        # ADDED: Connect the timer's timeout signal to the animation slot
         self.thinking_timer.timeout.connect(self._update_thinking_animation)
 
     def _setup_worker_thread(self):
         """Sets up the QThread and worker for background API calls."""
         self.worker_thread = QThread()
-        # Pass the gemini_logger instance AND the already initialized chatbot_backend to the worker
         self.worker = GeminiChatWorker(self.gemini_logger, self.chatbot_backend)
         self.worker.moveToThread(self.worker_thread)
 
-        # Connect signals from worker to GUI slots
         self.worker.response_received.connect(self._handle_gemini_response)
         self.worker.error_occurred.connect(self._handle_gemini_error)
         self.worker.thinking_started.connect(self._on_thinking_started)
         self.worker.thinking_finished.connect(self._on_thinking_finished)
 
-        # Connect GUI signal to worker slot
         self.send_message_requested.connect(self.worker.process_message)
 
         self.worker_thread.started.connect(lambda: self.gemini_logger.log_message("GeminiChatWorker thread started."))
@@ -1301,9 +1330,8 @@ class GeminiChatTab(QWidget):
     @pyqtSlot()
     def _on_send_button_clicked(self):
         """Handles the send button click."""
-        user_message = self.user_input.toPlainText().strip()  # Use toPlainText() for QPlainTextEdit
+        user_message = self.user_input.toPlainText().strip()
         if user_message:
-            # Pass only the raw message, log_message will add prefixes/styling
             self.gemini_logger.log_message(user_message, "user")
             self.user_input.clear()
             self.send_message_requested.emit(user_message)
@@ -1322,31 +1350,26 @@ class GeminiChatTab(QWidget):
         """
         Receives and displays Gemini's response, parsing for code blocks.
         """
-
         code_block_pattern = re.compile(r"```(?P<lang>\w*)\n(?P<code>.*?)\n```", re.DOTALL)
-
         last_idx = 0
         formatted_response_parts = []
 
         for match in code_block_pattern.finditer(response):
-            # Add text before the code block
             if match.start() > last_idx:
                 text_before = response[last_idx:match.start()].strip()
                 if text_before:
                     formatted_response_parts.append(f"<p>{self._escape_html(text_before)}</p>")
 
-            # Add the code block
             lang = match.group('lang')
             code = match.group('code')
             try:
                 lexer = get_lexer_by_name(lang) if lang else guess_lexer(code)
             except Exception:
                 lexer = get_lexer_by_name("text")
-            # Using <pre><code> for code blocks for better formatting and copy-pasteability
-            # Added inline styles for code block appearance, and extra margin for spacing
+
             highlighted_code = highlight(code, lexer, self.pygments_formatter)
             formatted_response_parts.append(
-                f"<div style='margin-top:10px; margin-bottom:10px;'>"  # Add vertical spacing around code block
+                f"<div style='margin-top:10px; margin-bottom:10px;'>"
                 f"<pre style='background-color:#2a2a2a; color:#f8f8f2; padding:15px; border-radius:8px; overflow-x:auto; border:1px solid #444;'>"
                 f"<div style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{highlighted_code}</div>"
                 f"</pre>"
@@ -1354,69 +1377,50 @@ class GeminiChatTab(QWidget):
             )
             last_idx = match.end()
 
-            # Add any remaining text after the last code block
-            if last_idx < len(response):
-                text_after = response[last_idx:].strip()
-                if text_after:
-                    formatted_response_parts.append(f"<p>{self._escape_html(text_after)}</p>")
+        if last_idx < len(response):
+            text_after = response[last_idx:].strip()
+            if text_after:
+                formatted_response_parts.append(f"<p>{self._escape_html(text_after)}</p>")
 
-        # If no code blocks were found, treat the entire response as plain text
         if not formatted_response_parts and response.strip():
             formatted_response_parts.append(f"<p>{self._escape_html(response)}</p>")
-        elif not formatted_response_parts:  # Handle empty response
+        elif not formatted_response_parts:
             formatted_response_parts.append("<p><i>(Empty response)</i></p>")
 
-        # Join all parts and log them. log_message will now add the "Gemini:" prefix and color.
         full_html_content = "".join(formatted_response_parts)
         self.gemini_logger.log_message(full_html_content, "gemini")
 
     @pyqtSlot(str)
     def _handle_gemini_error(self, error_message: str):
-        """Receives and displays error messages from the worker."""
         self.gemini_logger.log_message(error_message, "error")
 
-    # NEW: Slot for handling the timer's timeout signal to animate text
     @pyqtSlot()
     def _update_thinking_animation(self):
-        """Cycles through animation states to update the status text."""
-        # Cycle through 1, 2, or 3 dots
         self.thinking_animation_state = (self.thinking_animation_state % 3) + 1
         dots = "." * self.thinking_animation_state
-
-        # Update the labels
         self.status_label.setText(f"Gemini is thinking{dots}")
         self.send_button.setText(f"Thinking{dots}")
 
-    # MODIFIED: Start the timer when thinking begins
     @pyqtSlot()
     def _on_thinking_started(self):
-        """Updates UI when Gemini starts thinking and starts the animation timer."""
         self.send_button.setEnabled(False)
         self.user_input.setEnabled(False)
-        self.status_label.setStyleSheet("color: #ffff00; font-style: italic;")  # Yellow for thinking
-
-        # Reset animation state and start the timer
+        self.status_label.setStyleSheet("color: #ffff00; font-style: italic;")
         self.thinking_animation_state = 0
-        self._update_thinking_animation()  # Call once immediately for instant feedback
-        self.thinking_timer.start(500)  # Update every 500ms
+        self._update_thinking_animation()
+        self.thinking_timer.start(500)
 
-    # MODIFIED: Stop the timer when thinking finishes
     @pyqtSlot()
     def _on_thinking_finished(self):
-        """Updates UI when Gemini finishes thinking and stops the animation timer."""
-        self.thinking_timer.stop()  # Stop the animation timer
-
+        self.thinking_timer.stop()
         self.send_button.setEnabled(True)
         self.user_input.setEnabled(True)
         self.status_label.setText("Ready")
-        self.status_label.setStyleSheet("color: #dcdcdc; font-style: italic;")  # Back to default
+        self.status_label.setStyleSheet("color: #dcdcdc; font-style: italic;")
         self.send_button.setText("Send")
 
     def _escape_html(self, text: str) -> str:
-        """Escapes HTML special characters in a string."""
-        # Ensure proper escaping for display in HTML
-        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'",
-                                                                                                                   "&#x27;")
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
 
     @pyqtSlot(str, str)
     def log_message(self, content: str, message_type: str = "info"):
@@ -1435,12 +1439,12 @@ class GeminiChatTab(QWidget):
 
         final_html = (
             f"<div style='color:{color}; margin-bottom: 12px;'>"
-            f"{prefix}{content}</div><br>"  # Add <br> outside to force newline
+            f"{prefix}{content}</div><br>"
         )
 
-        self.chat_output.moveCursor(QTextCursor.End)  # Always move to end before inserting
+        self.chat_output.moveCursor(QTextCursor.End)
         self.chat_output.insertHtml(final_html)
-        self.chat_output.insertHtml("<br>")  # Optional: extra newline
+        self.chat_output.insertHtml("<br>")
         self.chat_output.moveCursor(QTextCursor.End)
 
 
