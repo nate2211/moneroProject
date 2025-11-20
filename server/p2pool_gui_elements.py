@@ -1223,6 +1223,7 @@ class GeminiChatTab(QWidget):
                                                                  "offering detailed explanations, multiple perspectives, "
                                                                  "and asking clarifying questions when necessary to deepen the conversation. "
                                                                  "Always maintain a professional and helpful tone. More about myself my name is Nate and im coding a huge solo project."
+                                                                 "Also write as much code as possible and always include everything we need in the code."
                                              )
         # THEN setup the worker thread, passing the already initialized chatbot_backend
         self._setup_worker_thread()  # This now happens AFTER chatbot_backend is initialized
