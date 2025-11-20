@@ -70,9 +70,10 @@ class GeminiChatBot:
     # This logic waits: 2s, 4s, 8s, 16s, 32s... up to 60s if RateLimitException is raised.
     @retry(
         stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=2, max=60),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
         # Now RateLimitException is defined and valid here
-        retry=retry_if_exception_type((RateLimitException, Exception))
+        retry=retry_if_exception_type(RateLimitException),
+        reraise=True,
     )
     def send_message(self, user_message: str) -> str:
         if not isinstance(user_message, str) or not user_message.strip():
