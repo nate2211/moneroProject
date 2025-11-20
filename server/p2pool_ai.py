@@ -15,7 +15,7 @@ class GeminiChatBot:
     Modern Gemini chatbot using the stateful `chats` module.
     """
 
-    def __init__(self, logger, model_name: str = "gemini-2.5-pro",
+    def __init__(self, logger, model_name: str = "gemini-2.5-flash",
                  initial_instruction: str = None):
 
         self.logger = logger
