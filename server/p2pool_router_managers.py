@@ -16327,7 +16327,6 @@ class TransportManager:
         self.transport_scraper = TransportScraperManager(self.logger)
         self.transport_llmnr = TransportLLMNRManager(self.logger)
         self.transport_undecoded = TransportUndecodedManager(self.logger)
-
         self._MONERO_P2P_PORTS = [
             # Standard P2P
             18080,

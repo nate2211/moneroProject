@@ -22,7 +22,7 @@ class GeminiChatBot:
     - Aggressive retry logic for Free Tier Rate Limits (429 Errors).
     """
 
-    def __init__(self, logger, model_name: str = "gemini-2.0-flash",
+    def __init__(self, logger, model_name: str = "gemini-2.5-flash",
                  initial_instruction: str = None):
 
         self.logger = logger
@@ -41,7 +41,7 @@ class GeminiChatBot:
             temperature=0.7,
             top_p=0.95,
             top_k=40,
-            max_output_tokens=8192,
+            max_output_tokens=65536,
             response_modalities=["TEXT"],
             # Tools list is empty to ensure strict Free Tier compatibility
             tools=[]

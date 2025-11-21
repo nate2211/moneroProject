@@ -1347,49 +1347,87 @@ class GeminiChatTab(QWidget):
         self.gemini_logger.log_message("Chat history cleared.")
 
     @pyqtSlot(str)
+    @pyqtSlot(str)
     def _handle_gemini_response(self, response: str):
         """
-        Receives and displays Gemini's response, parsing for code blocks.
+        Parses markdown code blocks, highlights them, and handles plain text gracefully.
         """
-        code_block_pattern = re.compile(r"```(?P<lang>\w*)\n(?P<code>.*?)\n```", re.DOTALL)
+        # REGEX to find code blocks:
+        # 1. ``` matches opening
+        # 2. (?P<lang>[\w\-\+]+)? matches optional language
+        # 3. [^\n]*\n matches remainder of opening line
+        # 4. (?P<code>.*?) matches content
+        # 5. ``` matches closing
+        code_block_pattern = re.compile(r"```(?P<lang>[\w\-\+]+)?[^\n]*\n(?P<code>.*?)```", re.DOTALL)
+
         last_idx = 0
         formatted_response_parts = []
 
         for match in code_block_pattern.finditer(response):
+            # 1. Handle Plain Text BEFORE the code block
             if match.start() > last_idx:
-                text_before = response[last_idx:match.start()].strip()
-                if text_before:
-                    formatted_response_parts.append(f"<p>{self._escape_html(text_before)}</p>")
+                text_before = response[last_idx:match.start()]
+                # We process this text to preserve newlines
+                formatted_response_parts.append(self._format_text_block(text_before))
 
+            # 2. Extract Language and Code
             lang = match.group('lang')
             code = match.group('code')
+
+            # 3. Determine Lexer
             try:
-                lexer = get_lexer_by_name(lang) if lang else guess_lexer(code)
+                if lang:
+                    lexer = get_lexer_by_name(lang.strip())
+                else:
+                    lexer = guess_lexer(code)
             except Exception:
                 lexer = get_lexer_by_name("text")
 
+            # 4. Highlight
             highlighted_code = highlight(code, lexer, self.pygments_formatter)
+
+            # 5. Wrap code in styled HTML
             formatted_response_parts.append(
-                f"<div style='margin-top:10px; margin-bottom:10px;'>"
-                f"<pre style='background-color:#2a2a2a; color:#f8f8f2; padding:15px; border-radius:8px; overflow-x:auto; border:1px solid #444;'>"
-                f"<div style='font-family:Consolas, Courier New, monospace; font-size:11px; white-space:pre-wrap;'>{highlighted_code}</div>"
+                f"<div style='margin: 10px 0;'>"
+                f"<div style='background-color:#444; color:#ccc; padding: 2px 10px; font-size:10px; "
+                f"border-radius: 8px 8px 0 0; border:1px solid #555;'>{lang if lang else 'Code'}</div>"
+                f"<pre style='background-color:#2a2a2a; color:#f8f8f2; padding:15px; margin:0; "
+                f"border-radius: 0 0 8px 8px; overflow-x:auto; border:1px solid #555; border-top:none;'>"
+                f"<div style='font-family:Consolas, Courier New, monospace; font-size:12px; white-space:pre-wrap;'>"
+                f"{highlighted_code}</div>"
                 f"</pre>"
                 f"</div>"
             )
             last_idx = match.end()
 
+        # 6. Handle Plain Text AFTER the last code block (Or the WHOLE text if no code blocks exist)
         if last_idx < len(response):
-            text_after = response[last_idx:].strip()
-            if text_after:
-                formatted_response_parts.append(f"<p>{self._escape_html(text_after)}</p>")
+            text_after = response[last_idx:]
+            formatted_response_parts.append(self._format_text_block(text_after))
 
-        if not formatted_response_parts and response.strip():
-            formatted_response_parts.append(f"<p>{self._escape_html(response)}</p>")
-        elif not formatted_response_parts:
+        # 7. Fallback for completely empty strings
+        if not formatted_response_parts:
             formatted_response_parts.append("<p><i>(Empty response)</i></p>")
 
+        # Join and log
         full_html_content = "".join(formatted_response_parts)
         self.gemini_logger.log_message(full_html_content, "gemini")
+
+    def _format_text_block(self, text: str) -> str:
+        """
+        Helper to format plain text for HTML rendering.
+        It escapes HTML characters AND converts newlines to <br> so formatting isn't lost.
+        """
+        if not text.strip():
+            return ""
+
+        # 1. Escape HTML special characters (<, >, &)
+        safe_text = self._escape_html(text)
+
+        # 2. Convert Python newlines to HTML line breaks so lists/paragraphs render correctly
+        formatted_text = safe_text.replace("\n", "<br>")
+
+        return f"<p style='margin-bottom: 10px;'>{formatted_text}</p>"
 
     @pyqtSlot(str)
     def _handle_gemini_error(self, error_message: str):

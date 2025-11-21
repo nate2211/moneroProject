@@ -1269,7 +1269,6 @@ class PythonRouterManager:
             if nat_decision is False:
                 # Dropped (e.g., banned or ICMP sent)
                 return
-
             is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
             if is_handled_by_transport:
