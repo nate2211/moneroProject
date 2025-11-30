@@ -1,11 +1,77 @@
 import os
+import sys
 import traceback
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-load_dotenv()
+
+# ========================================================
+# Frozen / MEIPASS-safe dotenv loading
+# ========================================================
+
+def _base_dir() -> str:
+    """
+    Where bundled resources live.
+    - Dev: folder of this file
+    - PyInstaller: sys._MEIPASS (onefile) or exe dir (fallback)
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def _exe_dir() -> str:
+    """
+    Directory containing the executable in frozen mode,
+    else the script directory in dev.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def load_env_frozen_safe(logger=None) -> str | None:
+    """
+    Try to load env vars from:
+      1) exe dir (.env or env)  -> best for production overrides
+      2) MEIPASS dir (.env or env) -> if bundled inside onefile
+      3) default load_dotenv() fallback
+
+    Returns the path successfully loaded, or None.
+    """
+    candidates = [
+        os.path.join(_exe_dir(), ".env"),
+        os.path.join(_exe_dir(), "env"),         # PyInstaller may strip leading dot on Windows
+        os.path.join(_base_dir(), ".env"),
+        os.path.join(_base_dir(), "env"),
+    ]
+
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                load_dotenv(p, override=False)
+                if logger:
+                    try:
+                        logger.log_message(f"[env] Loaded env from: {p}")
+                    except Exception:
+                        pass
+                return p
+        except Exception:
+            pass
+
+    # Last resort: whatever python-dotenv finds by cwd
+    try:
+        load_dotenv(override=False)
+        if logger:
+            try:
+                logger.log_message("[env] load_dotenv() fallback used (cwd search).")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
 
 
 # 1. Define the custom exception FIRST, so it exists when the decorator needs it.
@@ -18,7 +84,7 @@ class GeminiChatBot:
     """
     Free-Tier optimized Gemini chatbot.
     - Removes Google Search (Grounding) to avoid billing requirements.
-    - Uses 'gemini-2.0-flash' (or 1.5-flash) which are free-tier eligible.
+    - Uses 'gemini-2.5-flash' (or 2.0/1.5-flash) which are free-tier eligible.
     - Aggressive retry logic for Free Tier Rate Limits (429 Errors).
     """
 
@@ -26,11 +92,24 @@ class GeminiChatBot:
                  initial_instruction: str = None):
 
         self.logger = logger
+
+        # IMPORTANT: load env safely for PyInstaller / MEIPASS
+        load_env_frozen_safe(logger=self.logger)
+
         self.api_key = os.getenv("GOOGLE_API_KEY")
 
-        # Defaulting to 2.0 Flash, which is currently free and fast.
         self.model_name = model_name
         self.initial_instruction = initial_instruction
+
+        if not self.api_key:
+            # Fail fast with a clear, logged error instead of a mysterious crash
+            msg = (
+                "Missing GOOGLE_API_KEY. "
+                "Ensure a .env (or env) file exists next to the exe, "
+                "or bundle it and load via MEIPASS."
+            )
+            self._log(msg)
+            raise RuntimeError(msg)
 
         # Initialize Client
         self.client = genai.Client(api_key=self.api_key)
@@ -43,16 +122,18 @@ class GeminiChatBot:
             top_k=40,
             max_output_tokens=65536,
             response_modalities=["TEXT"],
-            # Tools list is empty to ensure strict Free Tier compatibility
-            tools=[]
+            tools=[],
         )
 
         # Initialize the Chat Session
         self._start_new_chat()
 
     def _log(self, msg):
-        if self.logger:
-            self.logger.log_message(str(msg).rstrip())
+        if self.logger and hasattr(self.logger, "log_message"):
+            try:
+                self.logger.log_message(str(msg).rstrip())
+            except Exception:
+                print(msg)
         else:
             print(msg)
 
@@ -65,13 +146,12 @@ class GeminiChatBot:
             )
         except Exception as e:
             self._log(f"Failed to create chat session: {e}")
+            self._log(traceback.format_exc())
+            raise
 
-    # FREE TIER ADJUSTMENT:
-    # This logic waits: 2s, 4s, 8s, 16s, 32s... up to 60s if RateLimitException is raised.
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=2, min=2, max=30),
-        # Now RateLimitException is defined and valid here
         retry=retry_if_exception_type(RateLimitException),
         reraise=True,
     )
@@ -84,16 +164,13 @@ class GeminiChatBot:
             return response.text
 
         except Exception as e:
-            # Check if this is a Rate Limit error (HTTP 429 or Resource Exhausted)
             error_str = str(e).lower()
             if "429" in error_str or "resource_exhausted" in error_str:
-                self._log(f"Rate limit hit (Free Tier). Retrying in a moment...")
-                # Raise the custom error to trigger specific retry logic
+                self._log("Rate limit hit (Free Tier). Retrying in a moment...")
                 raise RateLimitException("Rate limit exceeded")
 
-            # Log other errors but allow retry if temporary
             self._log(f"API Error: {e}")
-            raise e
+            raise
 
     def clear_chat_history(self):
         """Resets the chat session without killing the client."""

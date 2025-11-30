@@ -180,11 +180,13 @@ class PythonRouterManager:
         self.packet_analyzer = PacketPipelineBlock()
         self.default_analysis_extras = create_pipeline_extras(
             logger=self.router_logger,  # <-- Pass your logger instance here
-            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee",
+            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
             memory_key="last_analyzed_packet",
             debug=False,
             stop_on_error=True
+
         )
+
 
 
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
@@ -5139,6 +5141,12 @@ class AsyncScrapingManager(QObject):
     An asynchronous manager for performing web scraping operations.
     Uses Playwright for JavaScript rendering and BeautifulSoup for parsing.
     Designed to integrate with PyQt5 signals and asyncio.
+
+    PyInstaller / missing-browser support:
+      - If Playwright launch fails due to missing browsers, this class will
+        run `python -m playwright install chromium` once and retry.
+      - In frozen (PyInstaller) builds, it installs into the normal user cache,
+        NOT _MEIPASS, so it persists across runs.
     """
 
     scraping_started_signal = pyqtSignal()
@@ -5174,7 +5182,9 @@ class AsyncScrapingManager(QObject):
                 self.async_loop.call_soon_threadsafe(lambda: on_complete_callback({"error": error_msg}))
             return
 
-        self.logger.log_message(f"[Scraper] ▶️ Starting scrape for: {self._current_url} with a {delay_seconds}s delay.")
+        self.logger.log_message(
+            f"[Scraper] ▶️ Starting scrape for: {self._current_url} with a {delay_seconds}s delay."
+        )
         self.status = "running"
         self.scraping_started_signal.emit()
 
@@ -5187,7 +5197,9 @@ class AsyncScrapingManager(QObject):
                 scraped_data = {"error": "Scrape cancelled."}
                 self.status = "cancelled"
             except Exception as e:
-                self.logger.log_message(f"[Scraper] 💥 Exception during scrape task: {e}\n{traceback.format_exc()}")
+                self.logger.log_message(
+                    f"[Scraper] 💥 Exception during scrape task: {e}\n{traceback.format_exc()}"
+                )
                 scraped_data = {"error": f"Scrape failed: {str(e)}"}
                 self.status = "error"
             finally:
@@ -5209,6 +5221,217 @@ class AsyncScrapingManager(QObject):
         if self._scrape_task:
             self._scrape_task.cancel()
 
+    # ------------------------------------------------------------------
+    # Playwright self-contained helpers
+    # ------------------------------------------------------------------
+
+    def _is_missing_playwright_browser_error(self, err: Exception) -> bool:
+        """
+        Detect the "please run playwright install" / missing executable errors.
+        """
+        s = str(err)
+        needles = [
+            "Executable doesn't exist",
+            "playwright install",
+            ".local-browsers",
+            "BrowserType.launch",
+            "chromium-",
+        ]
+        return any(n in s for n in needles)
+
+    def _persistent_browsers_path(self) -> str:
+        """
+        Where BOTH the frozen app and global-python installs will put browsers.
+        Use user-writable persistent location.
+        """
+        # Prefer Playwright default cache location:
+        # %LOCALAPPDATA%\ms-playwright  (Windows)
+        local_appdata = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        p = Path(local_appdata) / "ms-playwright"
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+
+    def _bundled_playwright_version(self) -> str | None:
+        """
+        Read playwright version from the environment the app is running in.
+        """
+        try:
+            import playwright
+            return getattr(playwright, "__version__", None)
+        except Exception:
+            return None
+
+    def _candidate_pythons(self) -> list[str]:
+        cands = []
+        env_exe = os.environ.get("PYTHON_EXE")
+        if env_exe and Path(env_exe).exists():
+            cands.append(env_exe)
+
+        py_launcher = shutil.which("py")
+        if py_launcher:
+            cands.append(py_launcher)
+
+        for name in ("python3", "python"):
+            p = shutil.which(name)
+            if p:
+                cands.append(p)
+
+        out, seen = [], set()
+        for c in cands:
+            if c not in seen:
+                out.append(c);
+                seen.add(c)
+        return out
+
+    def _python_has_playwright(self, py: str) -> bool:
+        try:
+            if Path(py).name.lower() in ("py.exe", "py"):
+                cmd = [py, "-3", "-c", "import playwright; print(playwright.__version__)"]
+            else:
+                cmd = [py, "-c", "import playwright; print(playwright.__version__)"]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, timeout=15)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def _pip_install_playwright(self, py: str, version: str | None) -> bool:
+        """
+        Install playwright into global python, pinned to bundled version if known.
+        """
+        try:
+            pkg = f"playwright=={version}" if version else "playwright"
+            if Path(py).name.lower() in ("py.exe", "py"):
+                cmd = [py, "-3", "-m", "pip", "install", "--upgrade", pkg]
+            else:
+                cmd = [py, "-m", "pip", "install", "--upgrade", pkg]
+
+            self.logger.log_message(f"[Scraper] 🔧 Installing playwright package: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=60 * 5)
+            self.logger.log_message("[Scraper] pip install playwright output:\n" + proc.stdout)
+            return proc.returncode == 0
+        except Exception as e:
+            self.logger.log_message(f"[Scraper] ❌ pip install playwright failed: {e}")
+            return False
+
+    def _run_playwright_install(self, browser: str = "chromium") -> bool:
+        """
+        Ensure global python has SAME playwright version as bundled app,
+        then install browsers into a persistent path that the frozen app uses too.
+        """
+        try:
+            bundled_ver = self._bundled_playwright_version()
+            browsers_path = self._persistent_browsers_path()
+
+            # find / choose a python
+            cands = self._candidate_pythons()
+            if not cands:
+                self.logger.log_message("[Scraper] ❌ No global Python found; cannot auto-install Playwright.")
+                return False
+
+            py = None
+            for c in cands:
+                if self._python_has_playwright(c):
+                    py = c
+                    break
+            if not py:
+                py = cands[0]
+                self.logger.log_message(
+                    f"[Scraper] ⚠️ No python with Playwright found. Will install into: {py}"
+                )
+                if not self._pip_install_playwright(py, bundled_ver):
+                    self.logger.log_message("[Scraper] ❌ Could not install playwright package.")
+                    return False
+
+            env = os.environ.copy()
+            env.pop("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", None)
+
+            # CRITICAL: force install into the SAME persistent place your app will read from
+            env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
+
+            if Path(py).name.lower() in ("py.exe", "py"):
+                cmd = [py, "-3", "-m", "playwright", "install", browser]
+            else:
+                cmd = [py, "-m", "playwright", "install", browser]
+
+            self.logger.log_message(f"[Scraper] 🔧 Running Playwright browser install: {' '.join(cmd)}")
+            proc = subprocess.run(
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60 * 8,
+            )
+            self.logger.log_message("[Scraper] Playwright install output:\n" + proc.stdout)
+
+            if proc.returncode != 0:
+                self.logger.log_message(
+                    f"[Scraper] ❌ Playwright browser install failed with code {proc.returncode}"
+                )
+                return False
+
+            self.logger.log_message(f"[Scraper] ✅ Playwright browsers installed into: {browsers_path}")
+            return True
+
+        except Exception as e:
+            self.logger.log_message(f"[Scraper] ❌ Exception while installing Playwright browsers: {e}")
+            return False
+
+    async def _start_playwright_and_browser(self):
+        playwright = None
+        browser = None
+        try:
+            # CRITICAL: make bundled Playwright look in persistent cache, not _MEI local-browsers
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = self._persistent_browsers_path()
+
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            return playwright, browser
+
+        except Exception as e:
+            # Cleanup partial Playwright start if needed
+            try:
+                if browser and browser.is_connected():
+                    await browser.close()
+            except Exception:
+                pass
+            try:
+                if playwright:
+                    await playwright.stop()
+            except Exception:
+                pass
+
+            if self._is_missing_playwright_browser_error(e):
+                self.logger.log_message(
+                    "[Scraper] ⚠️ Playwright browsers missing. Attempting automatic install..."
+                )
+                ok = self._run_playwright_install(browser="chromium")
+                if not ok:
+                    raise ValueError(f"Playwright error (auto-install failed): {e}")
+
+                # Retry once after install
+                playwright = await async_playwright().start()
+                browser = await playwright.chromium.launch(
+                    headless=False,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+                return playwright, browser
+
+            raise  # Not a missing-browser case; rethrow
+
+    # ------------------------------------------------------------------
+
     async def _perform_scrape(self, url: str, delay_seconds: int) -> dict:
         self.scraping_progress_signal.emit("Launching browser for interaction...")
         self.logger.log_message(f"[Scraper-DBG] Launching visible Playwright for {url}")
@@ -5218,14 +5441,8 @@ class AsyncScrapingManager(QObject):
         headless_browser = None
 
         try:
-            playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(headless=False,
-                                                       args=[
-                                                           "--disable-blink-features=AutomationControlled",
-                                                           "--no-sandbox",
-                                                           "--disable-dev-shm-usage",
-                                                           "--disable-gpu",
-                                                       ])
+            playwright, browser = await self._start_playwright_and_browser()
+
             context = await browser.new_context(accept_downloads=False)
             page = await context.new_page()
 
@@ -5249,34 +5466,40 @@ class AsyncScrapingManager(QObject):
             scraped_data["html_content"] = content
 
             hardcoded_headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/91.0.4472.124 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
             }
 
             self.scraping_progress_signal.emit("Downloading images...")
             failed_images = []
             for image_info in scraped_data.get("extracted_images", []):
-                img_url = image_info['src']
+                img_url = image_info["src"]
                 try:
-                    if img_url.startswith('data:image'):
-                        header, encoded = img_url.split(',', 1)
-                        image_data = base64.b64decode(encoded)
-                        image_info['data'] = image_data
+                    if img_url.startswith("data:image"):
+                        _, encoded = img_url.split(",", 1)
+                        image_info["data"] = base64.b64decode(encoded)
                     else:
-                        if img_url.startswith('//'):
-                            img_url = 'https:' + img_url
+                        if img_url.startswith("//"):
+                            img_url = "https:" + img_url
 
                         headers_for_request = hardcoded_headers.copy()
-                        headers_for_request['Referer'] = url
+                        headers_for_request["Referer"] = url
 
                         response = requests.get(img_url, headers=headers_for_request, timeout=10)
                         response.raise_for_status()
-                        image_info['data'] = response.content
+                        image_info["data"] = response.content
+
                 except Exception:
                     self.logger.log_message(
-                        f"[ImageDownloader] ⚠️ Request failed for {img_url[:100]}... Falling back to browser screenshot.")
+                        f"[ImageDownloader] ⚠️ Request failed for {img_url[:100]}... "
+                        f"Falling back to browser screenshot."
+                    )
                     failed_images.append(image_info)
 
             if failed_images:
@@ -5284,33 +5507,35 @@ class AsyncScrapingManager(QObject):
                 headless_browser = await playwright.chromium.launch(headless=True)
                 headless_context = await headless_browser.new_context(
                     storage_state=storage_state,
-                    extra_http_headers=hardcoded_headers
+                    extra_http_headers=hardcoded_headers,
                 )
+
                 for image_info in failed_images:
-                    img_url = image_info['src']
+                    img_url = image_info["src"]
                     try:
-                        if img_url.startswith('//'):
-                            img_url = 'https:' + img_url
+                        if img_url.startswith("//"):
+                            img_url = "https:" + img_url
+
                         img_page = await headless_context.new_page()
                         await img_page.goto(img_url, timeout=15000)
 
-                        dimensions = await img_page.evaluate('''() => {
-                            const img = document.querySelector('img');
-                            if (!img) return { width: 800, height: 600 }; // Default size
-                            return {
-                                width: img.naturalWidth,
-                                height: img.naturalHeight
-                            };
-                        }''')
+                        dimensions = await img_page.evaluate(
+                            """() => {
+                                const img = document.querySelector('img');
+                                if (!img) return { width: 800, height: 600 };
+                                return { width: img.naturalWidth, height: img.naturalHeight };
+                            }"""
+                        )
 
                         await img_page.set_viewport_size(dimensions)
-
-                        image_info['data'] = await img_page.screenshot()
+                        image_info["data"] = await img_page.screenshot()
                         await img_page.close()
+
                     except Exception as e:
                         self.logger.log_message(
-                            f"[ImageDownloader] ❌ Failed to process image {img_url[:100]}... with browser: {e}")
-                        image_info['data'] = None
+                            f"[ImageDownloader] ❌ Failed to process image {img_url[:100]}... with browser: {e}"
+                        )
+                        image_info["data"] = None
 
             self.status = "completed"
             return scraped_data
@@ -5320,23 +5545,35 @@ class AsyncScrapingManager(QObject):
             raise ValueError(f"Playwright error: {e}")
 
         finally:
-            if browser and browser.is_connected(): await browser.close()
-            if headless_browser and headless_browser.is_connected(): await headless_browser.close()
-            if playwright: await playwright.stop()
+            try:
+                if browser and browser.is_connected():
+                    await browser.close()
+            except Exception:
+                pass
+            try:
+                if headless_browser and headless_browser.is_connected():
+                    await headless_browser.close()
+            except Exception:
+                pass
+            try:
+                if playwright:
+                    await playwright.stop()
+            except Exception:
+                pass
 
     def _parse_content(self, html_content: str, base_url: str) -> dict:
-        soup = BeautifulSoup(html_content, 'html.parser')
+        soup = BeautifulSoup(html_content, "html.parser")
 
         for script in soup(["script", "style"]):
             script.extract()
 
-        extracted_text = soup.get_text(separator='\n', strip=True)
+        extracted_text = soup.get_text(separator="\n", strip=True)
 
         extracted_links = []
-        for a_tag in soup.find_all('a', href=True):
+        for a_tag in soup.find_all("a", href=True):
             link_text = a_tag.get_text(strip=True)
-            href = a_tag['href']
-            if not href.startswith('http') and not href.startswith('//'):
+            href = a_tag["href"]
+            if not href.startswith("http") and not href.startswith("//"):
                 try:
                     from requests.compat import urljoin
                     href = urljoin(base_url, href)
@@ -5345,18 +5582,18 @@ class AsyncScrapingManager(QObject):
             extracted_links.append({"text": link_text, "href": href})
 
         extracted_images = []
-        for img_tag in soup.find_all('img', src=True):
-            src = img_tag['src']
-            if not src.startswith('http') and not src.startswith('//'):
+        for img_tag in soup.find_all("img", src=True):
+            src = img_tag["src"]
+            if not src.startswith("http") and not src.startswith("//"):
                 try:
                     from requests.compat import urljoin
                     src = urljoin(base_url, src)
                 except Exception:
                     pass
-            extracted_images.append({"src": src, "alt": img_tag.get('alt', '')})
+            extracted_images.append({"src": src, "alt": img_tag.get("alt", "")})
 
         return {
             "extracted_text": extracted_text,
             "extracted_links": extracted_links,
-            "extracted_images": extracted_images
+            "extracted_images": extracted_images,
         }

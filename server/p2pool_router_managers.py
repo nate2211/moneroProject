@@ -19563,7 +19563,7 @@ class ICMPManager:
             self._nd_learn_mac(str(v6.src), mac)
 
         # If they’re asking for one of our addresses, send NA
-        if target_ip and self._is_for_router_v6(str(target_ip)):
+        if target_ip and self._is_for_router_v6_or_prefix(str(target_ip)):
             self._send_neighbor_advertisement(pkt, str(target_ip), iface)
 
     def _handle_na(self, pkt: Packet) -> None:
@@ -19623,16 +19623,26 @@ class ICMPManager:
 
         v6s = solicitation_pkt[IPv6]
         dst_ip = v6s.src
-        dst_mac = (solicitation_pkt[Ether].src if solicitation_pkt.haslayer(Ether)
-                   else self._solicited_node_mac_for_target(target_ip))
+        dst_mac = (
+            solicitation_pkt[Ether].src
+            if solicitation_pkt.haslayer(Ether)
+            else self._solicited_node_mac_for_target(target_ip)
+        )
 
         # Type 2 = Target LL Address (simple 8B opt: type=2, len=1, 6B MAC)
         tlla = self._pack_nd_lladdr_opt(opt_type=2, mac_str=my_mac)
+
+        # ✨ New log so you see every NA you send
+        self.log.log_message(
+            f"[ICMP][ND] 📤 Sending NA on {self._iface_suffix(iface)}: "
+            f"tgt={target_ip} src_ll={my_mac} dst_ip={dst_ip} dst_mac={dst_mac}"
+        )
+
         na = (
-            Ether(src=my_mac, dst=dst_mac) /
-            IPv6(src=target_ip, dst=dst_ip, hlim=255) /
-            ICMPv6ND_NA(R=1, S=1, O=1, tgt=target_ip) /
-            bytes(tlla)
+                Ether(src=my_mac, dst=dst_mac) /
+                IPv6(src=target_ip, dst=dst_ip, hlim=255) /
+                ICMPv6ND_NA(R=1, S=1, O=1, tgt=target_ip) /
+                bytes(tlla)
         )
         self.pw_send_raw_packet(na, iface, allow_dst_ours=True, reason="ND: Neighbor Advertisement")
 
@@ -20537,6 +20547,28 @@ class ICMPManager:
 
     def _is_for_router_v6(self, dst_ip: str) -> bool:
         return self._norm_v6(dst_ip) in self._iface_v6_set()
+
+    def _is_for_router_v6_or_prefix(self, dst_ip: str) -> bool:
+        norm = self._norm_v6(dst_ip)
+        if not norm:
+            return False
+
+        # direct match
+        if norm in self._iface_v6_set():
+            return True
+
+        # example: if iface has 'ipv6_prefix', treat anything in that /64 as "ours"
+        for iface_name, cfg in self.ifaces.items():
+            prefix = cfg.get("ipv6_prefix")
+            if not prefix:
+                continue
+            try:
+                net = ipaddress.IPv6Network(prefix, strict=False)
+                if ipaddress.IPv6Address(norm) in net:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _iface_mac_by_v6(self, ip6: str) -> Optional[str]:
         norm_ip6 = self._norm_v6(ip6)

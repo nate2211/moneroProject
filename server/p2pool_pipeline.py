@@ -45,6 +45,30 @@ except ImportError:
     HTTP = HTTPRequest = HTTPResponse = TLSClientHello = TLSServerHello = DummyPacket
     NTP = DummyPacket  # [FIXED] Removed TLSExtension_ServerName and SSDP
 
+# ========================================================
+# 0. FROZEN / MEIPASS PATH HELPERS
+# ========================================================
+
+def get_base_dir() -> str:
+    """
+    Base directory for bundled app resources.
+    In dev: directory of this file.
+    In PyInstaller onefile/onedir: sys._MEIPASS (temp extract dir).
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+BASE_DIR = get_base_dir()
+
+
+def resource_path(*parts: str) -> str:
+    """
+    Build an absolute path to a resource shipped with the app.
+    Example: resource_path("signatures", "tls_fingerprints.json")
+    """
+    return os.path.join(BASE_DIR, *parts)
 
 # ========================================================
 # 1. BLOCK REGISTRY
@@ -105,7 +129,20 @@ class BaseBlock:
 # 3. MEMORY & HELPERS
 # ========================================================
 
-APP_DIR = os.path.join(os.path.expanduser("~"), ".promptchat")
+# ========================================================
+# 3. MEMORY & HELPERS
+# ========================================================
+
+def _home_path(*parts: str) -> str:
+    """
+    Always resolve to user home, even when frozen.
+    Prevents accidental writes into sys._MEIPASS.
+    """
+    home = os.path.expanduser("~")
+    return os.path.join(home, *parts)
+
+
+APP_DIR = _home_path(".promptchat")
 MEMORY_PATH = os.path.join(APP_DIR, "memory.json")
 
 
@@ -173,17 +210,20 @@ def create_pipeline_extras(
     """
     Convenience helper: build an "extras" dict for PacketPipelineBlock.
     """
-    extras: Dict[str, Any] = {
-        "logger": logger,
-        "pipeline": {
-            "stages": stages,
-            "debug": bool(debug),
-            "stop_on_error": bool(stop_on_error),
-        },
-        "tee": {
-            "key": memory_key,
-        },
-    }
+    extras: Dict[str, Any] = {"logger": logger, "pipeline": {
+        "stages": stages,
+        "debug": bool(debug),
+        "stop_on_error": bool(stop_on_error),
+    }, "tee": {
+        "key": memory_key,
+    }, "ipc_emit": {
+        "host": "127.0.0.1",
+        "port": 9999,
+        "mode": "auto",  # <-- send UDP + TCP
+        "udp_nonblocking": True,
+        "tcp_connect_timeout": 0.1,
+        "tcp_use_jsonl": True,
+    }}
     return extras
 
 
@@ -873,4 +913,528 @@ class PacketPipelineBlock(BaseBlock):
             "stop_on_error": True,
             "debug": False,
             "example": "Use create_pipeline_extras(...) to build the 'params' dict.",
+        }
+
+
+@BLOCKS.register("ipc_emit", help="Send analysis data to an external program (e.g. PromptChat) via UDP/TCP.")
+@dataclass
+class IPCEmitterBlock(BaseBlock):
+    """
+    A fire-and-forget bridge that forwards packet analysis to other programs.
+
+    Modes:
+      • mode="udp"         (default): single JSON datagram per packet_event
+      • mode="tcp"        (alias for "tcp_client")
+      • mode="tcp_client": persistent JSONL stream as a TCP client
+      • mode="tcp_server": listen on host:port and broadcast JSONL to connected clients
+      • mode="auto":      fire UDP, TCP client, and TCP server broadcast in parallel (best-effort all)
+
+    Design goals:
+      • Never crash the pipeline if receivers are down.
+      • Minimize blocking; UDP + TCP server sockets are non-blocking.
+      • TCP client auto-reconnects on failure with a short timeout.
+    """
+
+    # Separate sockets for each role
+    _udp_sock: Any = field(default=None, init=False)
+    _tcp_client_sock: Any = field(default=None, init=False)
+    _tcp_server_sock: Any = field(default=None, init=False)
+    _tcp_server_clients: List[Any] = field(default_factory=list, init=False)
+
+    _udp_addr: Any = field(default=None, init=False)
+    _tcp_client_addr: Any = field(default=None, init=False)
+    _tcp_server_addr: Any = field(default=None, init=False)
+
+    # ------------------------------------------------------------------
+    # UDP helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_udp_socket(
+        self,
+        host: str,
+        port: int,
+        udp_nonblocking: bool,
+    ) -> bool:
+        """
+        Create/reuse a UDP socket bound to nothing (sending only).
+        """
+        import socket
+
+        if self._udp_sock is not None and self._udp_addr == (host, port):
+            return True
+
+        if self._udp_sock is not None:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
+            self._udp_sock = None
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setblocking(not udp_nonblocking)
+            self._udp_sock = s
+            self._udp_addr = (host, port)
+            return True
+        except Exception:
+            self._udp_sock = None
+            return False
+
+    def _send_udp(
+        self,
+        raw: bytes,
+        host: str,
+        port: int,
+        udp_nonblocking: bool,
+        max_udp_bytes: int,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        import socket
+
+        if len(raw) > max_udp_bytes:
+            raw = raw[:max_udp_bytes]
+
+        sock_ok = self._ensure_udp_socket(
+            host=host,
+            port=port,
+            udp_nonblocking=udp_nonblocking,
+        )
+
+        if not sock_ok or self._udp_sock is None:
+            return False, {
+                "error": "no_connection",
+                "mode": "udp",
+                "target": f"{host}:{port}",
+            }
+
+        try:
+            try:
+                sent = self._udp_sock.sendto(raw, (host, port))
+            except (BlockingIOError, InterruptedError):
+                return False, {
+                    "error": "udp_would_block",
+                    "mode": "udp",
+                    "target": f"{host}:{port}",
+                }
+            return True, {
+                "size": sent,
+                "mode": "udp",
+                "target": f"{host}:{port}",
+            }
+        except Exception as e:
+            return False, {
+                "error": "send_failed",
+                "exception": str(e),
+                "mode": "udp",
+                "target": f"{host}:{port}",
+            }
+
+    # ------------------------------------------------------------------
+    # TCP client helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_tcp_client_socket(
+        self,
+        host: str,
+        port: int,
+        tcp_connect_timeout: float,
+    ) -> bool:
+        """
+        Create/reuse a TCP client socket connected to host:port.
+        """
+        import socket
+
+        if self._tcp_client_sock is not None and self._tcp_client_addr == (host, port):
+            return True
+
+        if self._tcp_client_sock is not None:
+            try:
+                self._tcp_client_sock.close()
+            except Exception:
+                pass
+            self._tcp_client_sock = None
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(tcp_connect_timeout)
+            try:
+                s.connect((host, port))
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                self._tcp_client_sock = None
+                return False
+            # After connect, non-blocking best-effort
+            s.settimeout(0.0)
+            self._tcp_client_sock = s
+            self._tcp_client_addr = (host, port)
+            return True
+        except Exception:
+            self._tcp_client_sock = None
+            return False
+
+    def _send_tcp_client(
+        self,
+        raw: bytes,
+        host: str,
+        port: int,
+        tcp_connect_timeout: float,
+        tcp_use_jsonl: bool,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        import socket
+
+        if tcp_use_jsonl and not raw.endswith(b"\n"):
+            raw = raw + b"\n"
+
+        sock_ok = self._ensure_tcp_client_socket(
+            host=host,
+            port=port,
+            tcp_connect_timeout=tcp_connect_timeout,
+        )
+
+        if not sock_ok or self._tcp_client_sock is None:
+            return False, {
+                "error": "no_connection",
+                "mode": "tcp_client",
+                "target": f"{host}:{port}",
+            }
+
+        try:
+            try:
+                self._tcp_client_sock.send(raw)
+            except (BlockingIOError, InterruptedError):
+                return False, {
+                    "error": "tcp_would_block",
+                    "mode": "tcp_client",
+                    "target": f"{host}:{port}",
+                }
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                try:
+                    self._tcp_client_sock.close()
+                except Exception:
+                    pass
+                self._tcp_client_sock = None
+                return False, {
+                    "error": "tcp_broken_pipe",
+                    "exception": str(e),
+                    "mode": "tcp_client",
+                    "target": f"{host}:{port}",
+                }
+
+            return True, {
+                "size": len(raw),
+                "mode": "tcp_client",
+                "target": f"{host}:{port}",
+            }
+        except Exception as e:
+            return False, {
+                "error": "send_failed",
+                "exception": str(e),
+                "mode": "tcp_client",
+                "target": f"{host}:{port}",
+            }
+
+    # ------------------------------------------------------------------
+    # TCP server helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_tcp_server_socket(
+        self,
+        host: str,
+        port: int,
+    ) -> bool:
+        """
+        Create/reuse a TCP listening socket on host:port.
+        """
+        import socket
+
+        if self._tcp_server_sock is not None and self._tcp_server_addr == (host, port):
+            return True
+
+        # Tear down previous server + clients
+        if self._tcp_server_sock is not None:
+            try:
+                self._tcp_server_sock.close()
+            except Exception:
+                pass
+            self._tcp_server_sock = None
+
+        for c in self._tcp_server_clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._tcp_server_clients.clear()
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            s.listen(16)
+            s.setblocking(False)
+            self._tcp_server_sock = s
+            self._tcp_server_addr = (host, port)
+            return True
+        except Exception:
+            self._tcp_server_sock = None
+            self._tcp_server_addr = None
+            return False
+
+    def _tcp_server_accept_new_clients(self) -> None:
+        """
+        Non-blocking accept loop; adds new clients to _tcp_server_clients.
+        """
+        import socket
+
+        if self._tcp_server_sock is None:
+            return
+
+        while True:
+            try:
+                conn, addr = self._tcp_server_sock.accept()
+                conn.setblocking(False)
+                self._tcp_server_clients.append(conn)
+            except BlockingIOError:
+                break
+            except socket.error:
+                break
+            except Exception:
+                break
+
+    def _send_tcp_server(
+        self,
+        raw: bytes,
+        host: str,
+        port: int,
+        tcp_use_jsonl: bool,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Broadcast JSONL to all connected TCP clients.
+
+        If there are no connected clients, it's treated as a soft failure
+        (no data sent, but no crash).
+        """
+        if tcp_use_jsonl and not raw.endswith(b"\n"):
+            raw = raw + b"\n"
+
+        sock_ok = self._ensure_tcp_server_socket(host=host, port=port)
+        if not sock_ok or self._tcp_server_sock is None:
+            return False, {
+                "error": "listen_failed",
+                "mode": "tcp_server",
+                "target": f"{host}:{port}",
+            }
+
+        # Accept any pending incoming connections
+        self._tcp_server_accept_new_clients()
+
+        if not self._tcp_server_clients:
+            return False, {
+                "error": "no_clients",
+                "mode": "tcp_server",
+                "target": f"{host}:{port}",
+            }
+
+        alive_clients = []
+        sent_count = 0
+
+        for c in self._tcp_server_clients:
+            try:
+                c.send(raw)
+                sent_count += 1
+                alive_clients.append(c)
+            except (BlockingIOError, InterruptedError):
+                # keep client, just skip this send
+                alive_clients.append(c)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        self._tcp_server_clients = alive_clients
+
+        if sent_count == 0:
+            return False, {
+                "error": "no_clients_sent",
+                "mode": "tcp_server",
+                "target": f"{host}:{port}",
+            }
+
+        return True, {
+            "clients_sent": sent_count,
+            "clients_alive": len(self._tcp_server_clients),
+            "mode": "tcp_server",
+            "target": f"{host}:{port}",
+        }
+
+    # ------------------------------------------------------------------
+    # Main execute
+    # ------------------------------------------------------------------
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        # Configuration
+        host = str(params.get("host", "127.0.0.1"))
+        port = int(params.get("port", 9999))
+
+        mode_raw = str(params.get("mode", "udp")).lower()
+        # Backwards compatibility: "tcp" == "tcp_client"
+        if mode_raw == "tcp":
+            mode = "tcp_client"
+        else:
+            mode = mode_raw  # "udp" | "tcp_client" | "tcp_server" | "auto"
+
+        # UDP tuning
+        udp_nonblocking = bool(params.get("udp_nonblocking", True))
+        max_udp_bytes = int(params.get("max_udp_bytes", 65507))  # typical safe max
+
+        # TCP tuning
+        tcp_connect_timeout = float(params.get("tcp_connect_timeout", 0.1))
+        tcp_use_jsonl = bool(params.get("tcp_use_jsonl", True))
+
+        # 1. Validation
+        if not isinstance(payload, dict):
+            return payload, {
+                "ipc_sent": False,
+                "reason": "payload_not_dict",
+                "mode": mode,
+                "target": f"{host}:{port}",
+            }
+
+        # 2. Scrape & Sanitize
+        export_data = {
+            "type": "packet_event",
+            "timestamp": time.time(),
+            "analysis": payload.get("analysis", {}),
+            "metadata": payload.get("metadata", {}),
+            "summary": payload.get("metadata", {}).get("summary", "Unknown Packet"),
+        }
+
+        # 3. Serialize
+        try:
+            raw = json.dumps(export_data, default=str).encode("utf-8")
+        except Exception as e:
+            return payload, {
+                "ipc_sent": False,
+                "error": "serialization_failed",
+                "exception": str(e),
+                "mode": mode,
+                "target": f"{host}:{port}",
+            }
+
+        meta: Dict[str, Any] = {
+            "target": f"{host}:{port}",
+            "mode": mode,
+        }
+
+        # ---------------- Single-mode cases ----------------
+
+        if mode == "udp":
+            ok_udp, m_udp = self._send_udp(
+                raw=raw,
+                host=host,
+                port=port,
+                udp_nonblocking=udp_nonblocking,
+                max_udp_bytes=max_udp_bytes,
+            )
+            meta.update(m_udp)
+            meta["ipc_sent"] = ok_udp
+            meta["ipc_sent_udp"] = ok_udp
+            meta["ipc_sent_tcp_client"] = False
+            meta["ipc_sent_tcp_server"] = False
+            return payload, meta
+
+        if mode == "tcp_client":
+            ok_tc, m_tc = self._send_tcp_client(
+                raw=raw,
+                host=host,
+                port=port,
+                tcp_connect_timeout=tcp_connect_timeout,
+                tcp_use_jsonl=tcp_use_jsonl,
+            )
+            meta.update(m_tc)
+            meta["ipc_sent"] = ok_tc
+            meta["ipc_sent_udp"] = False
+            meta["ipc_sent_tcp_client"] = ok_tc
+            meta["ipc_sent_tcp_server"] = False
+            return payload, meta
+
+        if mode == "tcp_server":
+            ok_ts, m_ts = self._send_tcp_server(
+                raw=raw,
+                host=host,
+                port=port,
+                tcp_use_jsonl=tcp_use_jsonl,
+            )
+            meta.update(m_ts)
+            meta["ipc_sent"] = ok_ts
+            meta["ipc_sent_udp"] = False
+            meta["ipc_sent_tcp_client"] = False
+            meta["ipc_sent_tcp_server"] = ok_ts
+            return payload, meta
+
+        # ---------------- "auto" mode: do all three ----------------
+
+        if mode == "auto":
+            ok_udp, m_udp = self._send_udp(
+                raw=raw,
+                host=host,
+                port=port,
+                udp_nonblocking=udp_nonblocking,
+                max_udp_bytes=max_udp_bytes,
+            )
+            ok_tc, m_tc = self._send_tcp_client(
+                raw=raw,
+                host=host,
+                port=port,
+                tcp_connect_timeout=tcp_connect_timeout,
+                tcp_use_jsonl=tcp_use_jsonl,
+            )
+            ok_ts, m_ts = self._send_tcp_server(
+                raw=raw,
+                host=host,
+                port=port,
+                tcp_use_jsonl=tcp_use_jsonl,
+            )
+
+            meta["ipc_sent_udp"] = ok_udp
+            meta["ipc_sent_tcp_client"] = ok_tc
+            meta["ipc_sent_tcp_server"] = ok_ts
+            meta["ipc_sent"] = ok_udp or ok_tc or ok_ts
+            meta["udp_meta"] = m_udp
+            meta["tcp_client_meta"] = m_tc
+            meta["tcp_server_meta"] = m_ts
+            return payload, meta
+
+        # Unknown mode
+        meta.update({
+            "ipc_sent": False,
+            "error": "unsupported_mode",
+        })
+        meta.setdefault("ipc_sent_udp", False)
+        meta.setdefault("ipc_sent_tcp_client", False)
+        meta.setdefault("ipc_sent_tcp_server", False)
+        return payload, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "host": "127.0.0.1",
+            "port": 9999,
+            # "udp" | "tcp_client" | "tcp_server" | "auto" | ("tcp" alias for tcp_client)
+            "mode": "udp",
+            "udp_nonblocking": True,
+            "max_udp_bytes": 65507,
+            "tcp_connect_timeout": 0.1,
+            "tcp_use_jsonl": True,
+            "info": (
+                "Sends JSON analysis via UDP, TCP client JSONL stream, "
+                "TCP server broadcast, or all three (mode='auto'). "
+                "Designed to be safe even if receivers are down."
+            ),
         }

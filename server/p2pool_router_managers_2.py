@@ -6159,13 +6159,20 @@ class NATManager:
         warn = []
         if self._is_private_or_cgn(self.public_ip):
             warn.append(f"public_ip={self.public_ip} looks private/CGN/loopback")
+            # Behind AT&T-style private WAN, we SHOULD still NAT to RFC1918 dst
+            # or the upstream gateway won't know how to return packets.
+            self.NAT_EXEMPT_DST_CIDRS = [
+                "100.64.0.0/10",   # CGNAT
+                "198.18.0.0/15",   # benchmarking nets
+            ]
+            warn.append("[NAT] Adjusted NAT_EXEMPT_DST_CIDRS for private WAN (AT&T-style double NAT)")
+
         for vip in self.PUBLIC_VIPS:
             if self._is_private_or_cgn(vip):
                 warn.append(f"VIP {vip} looks private/CGN/loopback")
         if warn:
             self._log("[NAT][SANITY] ⚠️ " + " | ".join(warn) +
                       " — SNAT may be a no-op; inbound leases will never be hit unless you truly receive traffic to these addresses.")
-
     # ========================= Entry =========================
 
     def handle_packet(
@@ -6196,6 +6203,11 @@ class NATManager:
             ipL = packet[IP] if IP in packet else packet[IPv6]
             src_ip = ipL.src
             dst_ip = ipL.dst
+
+            if not (ipaddress.ip_address(src_ip) and ipaddress.ip_address(dst_ip)):
+                self._log_debug(f"⚠️ Dropping packet with invalid/resolved IP strings: {src_ip} → {dst_ip}")
+                return None
+
             self._log_debug(f"PKT_IN {src_ip} → {dst_ip} on {inbound_iface}")
 
             all_our_public_ips = self.PUBLIC_VIPS.union({self.public_ip}).union(router_ips)
