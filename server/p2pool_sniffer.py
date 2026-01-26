@@ -302,8 +302,11 @@ class SnifferSoftware:
         bind_layers(IGMP, IGMPv3mq, type=0x11)
         bind_layers(IGMP, IGMPv3mr, type=0x22)
         bind_layers(Ether, ARP, type=0x0806)
-        bind_layers(UDP, ISAKMP, dport=9999)
-        bind_layers(UDP, ISAKMP, sport=9999)
+        # Use the real ones:
+        bind_layers(UDP, ISAKMP, dport=500)
+        bind_layers(UDP, ISAKMP, sport=500)
+        bind_layers(UDP, ISAKMP, dport=4500)
+        bind_layers(UDP, ISAKMP, sport=4500)
         bind_layers(UDP, DNS, dport=53)
         bind_layers(UDP, DNS, sport=53)
         bind_layers(IP, ESP, proto=50)
