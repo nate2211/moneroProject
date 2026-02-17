@@ -1,4 +1,5 @@
 Monero Distributed Mining & Network Management Suite
+<img width="1334" height="725" alt="Screenshot 2026-02-16 221519" src="https://github.com/user-attachments/assets/28c14781-1203-4fa6-bab8-070d2c8154bf" />
 
 A comprehensive, modular toolkit designed for advanced Monero (XMR) mining management, network analysis, and server orchestration. This project integrates a high-performance audio engine, a custom digital audio workstation (DAW) interface, a cinematic graphics processor, and a robust network routing and security suite.
 🚀 Key Components
