@@ -1577,7 +1577,7 @@ class PythonRouterManager:
         if not ip_layer:
             self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
             return
-        l2_driver_ok = inbound_iface not in ("WinDivertBridge", "WireShark", "Nate's Tunnel")
+        egress_l2_ok = self._iface_supports_l2(inbound_iface)
         dst_ip = ip_layer.dst
         route = self.rip_manager.get_forwarding_route(dst_ip)
         # --- Multicast Handling (IPv4 and IPv6) ---
@@ -1597,8 +1597,8 @@ class PythonRouterManager:
             # Choose egress (keep your own policy; here we mirror inbound)
             egress_iface = inbound_iface
             # L2 is only OK when the driver is NOT windivert/rawip/winfw AND we have a MAC
-            src_mac = self.get_interface_mac(egress_iface) if l2_driver_ok else None
-            use_l2 = bool(l2_driver_ok and src_mac)
+            src_mac = self.get_interface_mac(egress_iface) if egress_l2_ok else None
+            use_l2 = bool(egress_l2_ok and src_mac)
 
             if use_l2:
                 # L2 path (Npcap): set Ether dst and ensure a valid src MAC
@@ -1678,26 +1678,40 @@ class PythonRouterManager:
         initial_outbound_iface = route["interface"]
         next_hop_ip = dst_ip if route["next_hop"] in ("0.0.0.0", "::") else route["next_hop"]
 
-        if ipaddress.ip_address(dst_ip).is_global:
+        wan_ifaces = set(self.outbound_load_balancer.get_configured_interfaces())
 
-            selected_iface = None
-            if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
-                selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
-                self.code_output_manager.submit_packet(
-                    packet,
-                    inbound_iface=inbound_iface,
-                    phase="interface",
-                    component="lag",
-                )
-            else:
-                selected_iface = initial_outbound_iface
-            if not selected_iface:
-                self.router_logger.log_message("[Router] ❌ No outbound interface. Dropping packet.")
-                return
+        selected_iface = None
+        if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
+            selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+            self.code_output_manager.submit_packet(
+                packet,
+                inbound_iface=inbound_iface,
+                phase="interface",
+                component="lag",
+            )
+        else:
+            selected_iface = initial_outbound_iface
+
+        if not selected_iface:
+            self.router_logger.log_message("[Router] ❌ No outbound interface. Dropping packet.")
+            return
+
+        is_wan_egress = selected_iface in wan_ifaces
+        if not is_wan_egress:
+            # Not a WAN egress packet — do NOT handle it here.
+            # Let it continue into your LAN/intra routing logic below this section.
+            pass
+        else:
             is_ipv6 = (ip_layer.version == 6)
-            if l2_driver_ok:
+
+            # IMPORTANT: egress_l2_ok must be computed from *selected_iface*, not inbound_iface.
+            # If you don't already have it above, you can uncomment this line:
+            # egress_l2_ok = self._iface_supports_l2(selected_iface)
+
+            if egress_l2_ok:
                 if is_ipv6:
-                    next_hop_mac = self.ndp_manager.resolve(next_hop_ip, initial_outbound_iface)
+                    # Resolve on the *actual* egress iface (selected_iface) so LAG doesn't break neighbor discovery
+                    next_hop_mac = self.ndp_manager.resolve(next_hop_ip, selected_iface)
                 else:
                     next_hop_mac = self.arp_manager.resolve(next_hop_ip, iface=selected_iface)
 
@@ -1706,41 +1720,48 @@ class PythonRouterManager:
                         f"[Router] 🕵️ No MAC for next hop {next_hop_ip} on {selected_iface.split('_')[-1]}. Dropping packet."
                     )
                     return
+
                 # Rewrite MACs
                 if packet.haslayer(Ether):
-                    # Standard case: The packet has an L2 frame, so we just modify it.
                     packet[Ether].src = self.get_interface_mac(selected_iface)
                     packet[Ether].dst = next_hop_mac
                 else:
-                    # HARDENING: Packet is missing the Ether layer. We'll build one.
                     self.router_logger.log_message(
                         RouterRandomMessages(
                             name="Router",
-                            message=f"Hardening internet-bound packet for {dst_ip}: Reconstructing missing Ether layer.",
+                            message=f"Hardening WAN-bound packet for {dst_ip}: Reconstructing missing Ether layer.",
                             emoticons=["🛠️️", "🏭", "⚙️", "🛡️", "🔩"]
                         )
                     )
                     src_mac = self.get_interface_mac(selected_iface)
-                    # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
                     packet = Ether(src=src_mac, dst=next_hop_mac) / packet
+
             else:
+                # L3-only egress path (WinDivert/rawip/etc)
                 if packet.haslayer(Ether):
                     packet = packet.payload  # strip L2 if present
                     self.router_logger.log_message(
                         RouterRandomMessages(
                             name="Router",
-                            message=f"Hardening internet-bound packet for {dst_ip} on {inbound_iface} stripping Ether for L3-only egress.",
+                            message=f"Hardening WAN-bound packet for {dst_ip}: stripping Ether for L3-only egress on {selected_iface}.",
                             emoticons=["🛰️", "📡", "🛸", "⚓", "🛟"]
                         )
                     )
 
+            # ---- NAT (IPv4): base it on WAN egress + private source, NOT Ether.src heuristics ----
             if not is_ipv6:
                 if packet.haslayer(UDP) and packet[UDP].dport == self.nat_manager.KEEP_ALIVE_PORT:
                     self.nat_manager.handle_keep_alive(packet)
                     return
-                if packet.haslayer(Ether) and (packet[Ether].src or "").lower() in self.router_macs:
-                    self.nat_manager.translate_outbound(packet)
 
+                try:
+                    if IP in packet and ipaddress.ip_address(packet[IP].src).is_private:
+                        self.nat_manager.translate_outbound(packet)
+                except Exception:
+                    # If IP parsing fails, don't NAT blindly
+                    pass
+
+            # ---- Fix checksums/lengths ----
             if is_ipv6:
                 if IPv6 in packet and hasattr(packet[IPv6], "plen"):
                     del packet[IPv6].plen
@@ -1752,7 +1773,7 @@ class PythonRouterManager:
             self.router_logger.log_message(
                 RouterRandomMessages(
                     name="Router",
-                    message=f"Internet-bound packet {self._proto_summary(packet)} to {selected_iface.split('_')[-1]}.",
+                    message=f"WAN-bound packet {self._proto_summary(packet)} to {selected_iface.split('_')[-1]}.",
                     emoticons=["👽", "🌍", "🌎", "🌏", "🌠", "🌌", "🪐", "🌗", "🌑", "🌈", "🎇", "🔮"]
                 )
             )
@@ -1764,6 +1785,7 @@ class PythonRouterManager:
             )
             self.sniffer.send(packet, selected_iface, verbose=0)
             return
+        # ===================== END PATCH =====================
 
         is_from_internal_bridge = self.ethernet_manager.is_bridge_member(inbound_iface)
         is_to_external_wan = initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces()
@@ -2017,7 +2039,7 @@ class PythonRouterManager:
             self._enable_nat_forwarding()
             self.arp_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ip_out = self.router_ip_out
-            self.dns_manager.router_ipv4_out = self.router_ipv6_link_local_out
+            self.dns_manager.router_ipv4_out = self.router_ip_out
             self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
             self.nat_manager.set_router_internal_ip("192.168.1.1")
             self.notification_manager = NotificationManager(
@@ -3006,6 +3028,15 @@ class PythonRouterManager:
             )
         )
         return fake_mac
+
+    def _iface_supports_l2(self, iface: str) -> bool:
+        # Interfaces that should never be used as an L2 egress
+        if iface in ("WinDivertBridge", "WireShark", "Nate's Tunnel"):
+            return False
+        try:
+            return bool(self.get_interface_mac(iface))
+        except Exception:
+            return False
     def create_l2_bridge(self, bridge_name: str, member_iface_full_names: List[str]) -> bool:
         """
         Public method to create a Layer 2 bridge.

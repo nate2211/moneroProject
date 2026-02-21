@@ -8930,6 +8930,7 @@ class TransportDNSManager:
         Tracks failure RCODEs per client IP and logs a warning if a
         threshold is breached within a time window.
         """
+
         if self._rcode_threshold <= 0:
             return  # Feature disabled
 
