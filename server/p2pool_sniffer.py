@@ -107,6 +107,7 @@ DLT_FRELAY          = 107     # Frame Relay (payload varies; often like CHDLC)
 DLT_IPV4            = 228
 DLT_IPV6            = 229
 
+
 # Optional capture direction (if supported by lib)
 PCAP_D_IN = 1  # inbound only
 
@@ -218,6 +219,11 @@ class SnifferSoftware:
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
         self.supported_ethertypes = {
+            0x888E,  # EAPOL (802.1X)
+            0x88CC,  # LLDP
+            0x8809,  # LACP / Slow Protocols
+            0x88F7,  # PTP
+            0x88E7,  # MACsec (encrypted but detectable)
             0x0800,  # IPv4
             0x86DD,  # IPv6
             0x0806,  # ARP
@@ -355,11 +361,6 @@ class SnifferSoftware:
         bind_layers(Ether, MPLS, type=0x8848)
 
         bind_layers(Dot1Q, Dot1Q, type=0x8100)  # nested VLANs (common)
-        bind_layers(Dot1Q, Ether, type=0x0800)  # IPv4 behind VLAN
-        bind_layers(Dot1Q, Ether, type=0x86DD)  # IPv6 behind VLAN
-        bind_layers(Dot1Q, Ether, type=0x0806)  # ARP behind VLAN
-        bind_layers(Dot1Q, Ether, type=0x88A8)  # QinQ continuation
-
         #
         load_layer("vxlan")
         load_layer("dhcp")
@@ -570,126 +571,89 @@ class SnifferSoftware:
     def _find_transport_layer(self, pkt: Packet) -> Optional[Packet]:
         """
         Return the **inner-most** transport layer (TCP/UDP/ICMP/ICMPv6) if discoverable.
-        Unwraps common tunnels (VLAN, PPPoE/PPP, MPLS, GRE, VXLAN/GENEVE/L2TP over UDP).
-        Handles IPv6 fragments: only offset 0 is examined; non-first returns None.
+
+        This version is aligned with your newer decapsulation helpers:
+          - _coerce_to_l3 / _descend_to_ip
+          - _walk_ipv4 / _walk_ipv6 (fragment-aware, GRE/IPsec-aware)
+          - _iter_layers_deep (decaps across GRE/PPPoE/PPP/MPLS/Dot1Q + UDP tunnels + Raw heuristics)
+
+        Fragment rules:
+          - IPv4 non-first fragment (frag>0) -> None
+          - IPv6 fragment offset!=0 -> None
+        IPsec:
+          - ESP -> None (encrypted)
+          - AH  -> allowed (authenticated only)
         """
-        # 1) Descend to an inner IP/IPv6 first (works from Ether or other L2)
-        ip = None
-        try:
-            if pkt.haslayer(IP) or pkt.haslayer(IPv6):
-                ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
-            else:
-                # Try to walk L2/tunnels to reach L3
-                top = pkt
-                if isinstance(top, Ether):
-                    ip = self._descend_to_ip(top)
-                else:
-                    # for RAW/RadioTap/Dot11 captures, Scapy usually provides IP directly if present
-                    ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
-        except Exception:
-            ip = None
-        if ip is None:
+        if pkt is None:
             return None
 
-        # 2) Once we have IP, walk to L4 (supporting tunnels nested at/after L4 as needed)
-        if isinstance(ip, IPv6):
-            tl = self._walk_ipv6(ip)
-        else:
-            tl = self._walk_ipv4(ip)
-        if tl is not None:
-            return tl
-
-        # 3) If L4 was UDP and carried an L2-over-UDP tunnel, unwrap and try inner IP again
+        # ---- 1) Fast path: get L3 and use the dedicated walkers ----
         try:
-            # Find the closest UDP if present on this path
-            udp = pkt.getlayer(UDP)
-            if udp:
-                inner = self._unwrap_udp_tunnels(udp)
-                if inner:
-                    ip2 = self._descend_to_ip(inner)
-                    if isinstance(ip2, IPv6):
-                        return self._walk_ipv6(ip2)
-                    elif isinstance(ip2, IP):
-                        return self._walk_ipv4(ip2)
+            ip, _why = self._coerce_to_l3(pkt)
+            if ip is None:
+                # Might still be a full Ether frame or some tunnel stack
+                if isinstance(pkt, Ether):
+                    ip = self._descend_to_ip(pkt)
+
+            if isinstance(ip, IPv6):
+                tl = self._walk_ipv6(ip)
+                if tl is not None:
+                    return tl
+            elif isinstance(ip, IP):
+                tl = self._walk_ipv4(ip)
+                if tl is not None:
+                    return tl
         except Exception:
             pass
 
-        # 4) GRE may be present below/inside IP (already handled), but try once from the packet root
+        # ---- 2) Deep path: decap across tunnels + Raw heuristics, pick deepest L4 ----
+        best: Optional[Packet] = None
         try:
-            gre = pkt.getlayer(GRE)
-            if gre:
-                inner = self._unwrap_gre(gre)
-                ip3 = self._descend_to_ip(inner)
-                if isinstance(ip3, IPv6):
-                    return self._walk_ipv6(ip3)
-                elif isinstance(ip3, IP):
-                    return self._walk_ipv4(ip3)
-        except Exception:
-            pass
-
-        return None
-
-    # --- UPDATED: IPv6 walker with fragment-0 handling -------------------------
-    def _walk_ipv6(self, ip6: IPv6) -> Optional[Packet]:
-        layer: Packet = ip6.payload
-        max_hops = 32
-
-        while layer is not None and max_hops > 0:
-            max_hops -= 1
-
-            # IPv6 extension headers
-            if isinstance(layer, (IPv6ExtHdrHopByHop, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt)):
-                layer = layer.payload
-                continue
-
-            if isinstance(layer, IPv6ExtHdrFragment):
-                # Only inspect first fragment (offset==0); otherwise we don't have L4 header
-                try:
-                    off = int(getattr(layer, "offset", 0))
-                except Exception:
-                    off = 0
-                if off == 0:
-                    layer = layer.payload
-                    # continue walking into first fragment payload
+            for layer in self._iter_layers_deep(pkt, max_nodes=128):
+                if layer is None:
                     continue
-                return None
 
-            # IPsec
-            if isinstance(layer, ESP):
-                return None
-            if isinstance(layer, AH):
-                layer = layer.payload
-                continue
+                # ---- Fragment / IPsec gates (if we hit these, L4 isn't safely knowable) ----
+                if isinstance(layer, IP):
+                    if int(getattr(layer, "frag", 0) or 0) > 0:
+                        return None
+                    continue
 
-            # Transport
-            if isinstance(layer, (TCP, UDP)):
-                return layer
-            if isinstance(layer, ICMPv6) or layer.__class__.__name__.startswith("ICMPv6"):
-                return layer
+                if isinstance(layer, IPv6ExtHdrFragment):
+                    try:
+                        off = int(getattr(layer, "offset", 0) or 0)
+                    except Exception:
+                        off = 0
+                    if off != 0:
+                        return None
+                    continue
 
-            # Tunnels (nested IP)
-            if isinstance(layer, IPv6):
-                return self._walk_ipv6(layer)
-            if isinstance(layer, IP):
-                return self._walk_ipv4(layer)
+                if isinstance(layer, ESP):
+                    return None
 
-            # GRE below v6?
-            if isinstance(layer, GRE):
-                inner = self._unwrap_gre(layer)
-                if isinstance(inner, IPv6):
-                    return self._walk_ipv6(inner)
-                if isinstance(inner, IP):
-                    return self._walk_ipv4(inner)
-                # inner Ether → descend to IP
-                ip_inner = self._descend_to_ip(inner)
-                if isinstance(ip_inner, IPv6):
-                    return self._walk_ipv6(ip_inner)
-                if isinstance(ip_inner, IP):
-                    return self._walk_ipv4(ip_inner)
-                return None
+                # AH isn't encryption; keep going
+                if isinstance(layer, AH):
+                    continue
 
-            return None
-        return None
+                # ---- Transport candidates (keep last one seen = deepest) ----
+                if isinstance(layer, (TCP, UDP, ICMP)):
+                    best = layer
+                    continue
+
+                # Your ICMPv6 world includes both scapy ICMPv6* classes + your custom ICMPv6 base
+                try:
+                    if isinstance(layer, self.ICMPV6_TYPES) or layer.__class__.__name__.startswith("ICMPv6"):
+                        best = layer
+                        continue
+                except Exception:
+                    # if ICMPV6_TYPES isn't initialized for some reason, fall back to name check only
+                    if layer.__class__.__name__.startswith("ICMPv6"):
+                        best = layer
+                        continue
+
+            return best
+        except Exception:
+            return best
 
     # --- UPDATED: IPv4 walker with more tunnels -------------------------------
     def _walk_ipv4(self, ip4: IP) -> Optional[Packet]:
@@ -1343,7 +1307,7 @@ class SnifferSoftware:
 
                     try:
                         if stop_filter and stop_filter(packet):
-                            continue  # don't break the loop; just skip this packet
+                            break
                     except Exception:
                         pass
 
@@ -1945,41 +1909,175 @@ class SnifferSoftware:
 
         return default
 
+    def get_layer_deep(
+            self,
+            pkt: Packet,
+            layer: str | type[Packet] | int,
+            *,
+            fmt: str = "show",
+            default: str = "",
+            nth: int = 0,  # NEW: choose nth match in deep walk
+    ) -> str:
+        if pkt is None:
+            return default
+
+        layers = list(self._iter_layers_deep(pkt))
+
+        # by index in deep list
+        if isinstance(layer, int):
+            if 0 <= layer < len(layers):
+                return self._layer_to_string(layers[layer], fmt=fmt)
+            return default
+
+        # by class
+        if isinstance(layer, type) and issubclass(layer, Packet):
+            matches = [l for l in layers if isinstance(l, layer)]
+            if len(matches) > nth:
+                return self._layer_to_string(matches[nth], fmt=fmt)
+            return default
+
+        # by name
+        if isinstance(layer, str):
+            q = layer.lower()
+            matches = [l for l in layers if (l.__class__.__name__.lower() == q or getattr(l, "name", "").lower() == q)]
+            if len(matches) > nth:
+                return self._layer_to_string(matches[nth], fmt=fmt)
+            return default
+
+        return default
+
+    # Optionally: make your existing get_ipv6_layer use the deep walker too
     def get_ipv6_layer(self, pkt: Packet, layer_spec: Union[type[Packet], str, int]) -> Optional[Packet]:
-        """
-        Finds and returns a specific layer object from within a Scapy packet.
-
-        This is a versatile helper that can find a layer by its Scapy class,
-        its name as a string, or its numerical index in the layer stack.
-
-        Args:
-            pkt: The Scapy Packet object to search within.
-            layer_spec: The layer to find, specified as:
-                - A Scapy class (e.g., IPv6, TCP, ICMPv6ND_RA)
-                - A string name (e.g., "IPv6", "Raw")
-                - An integer index (e.g., 0 for the outermost layer)
-
-        Returns:
-            The found Scapy layer object, or None if not found.
-        """
         if not isinstance(pkt, Packet):
             return None
 
-        # --- Find by Index ---
+        layers = list(self._iter_layers_deep(pkt))
+
         if isinstance(layer_spec, int):
-            for i, l in enumerate(self._iter_layers(pkt)):
-                if i == layer_spec:
-                    return l
-            return None  # Index out of bounds
+            return layers[layer_spec] if 0 <= layer_spec < len(layers) else None
 
-        # --- Find by Class ---
         if isinstance(layer_spec, type) and issubclass(layer_spec, Packet):
-            return pkt.getlayer(layer_spec)
-
-        # --- Find by Name ---
-        if isinstance(layer_spec, str):
-            for l in self._iter_layers(pkt):
-                if self._match_layer(l, layer_spec):
+            for l in layers:
+                if isinstance(l, layer_spec):
                     return l
+            return None
 
-        return None  # Not found or unsupported spec type
+        if isinstance(layer_spec, str):
+            q = layer_spec.lower()
+            for l in layers:
+                if l.__class__.__name__.lower() == q or getattr(l, "name", "").lower() == q:
+                    return l
+            return None
+
+        return None
+
+    def _maybe_parse_inner(self, b: bytes):
+        """Best-effort parse inner packet from raw bytes."""
+        if not b:
+            return None
+        # Try Ethernet first (common for VXLAN/GENEVE)
+        try:
+            p = Ether(b)
+            # sanity: Ether type looks plausible
+            if hasattr(p, "type") and int(p.type) not in (0,):
+                return p
+        except Exception:
+            pass
+
+        # Try IP/IPv6 by version nibble
+        ver = (b[0] >> 4) & 0xF
+        if ver == 4:
+            try:
+                return IP(b)
+            except Exception:
+                return None
+        if ver == 6:
+            try:
+                return IPv6(b)
+            except Exception:
+                return None
+
+        return None
+
+    def _iter_layers_deep(self, pkt: Packet, max_nodes: int = 128):
+        """
+        Yields layers across decapsulation boundaries (tunnels + Raw heuristics).
+        Prevents loops with a visited set.
+        """
+        from collections import deque
+
+        q = deque()
+        q.append(pkt)
+        visited = set()
+        nodes = 0
+
+        # Optional VXLAN class (depends on scapy build)
+        try:
+            from scapy.layers.vxlan import VXLAN
+        except Exception:
+            VXLAN = None  # type: ignore
+
+        while q and nodes < max_nodes:
+            cur = q.popleft()
+            if cur is None:
+                continue
+
+            # De-dupe by object id + class
+            key = (id(cur), cur.__class__)
+            if key in visited:
+                continue
+            visited.add(key)
+
+            nodes += 1
+            yield cur
+
+            # Normal payload path
+            pay = getattr(cur, "payload", None)
+
+            # Tunnel decap shortcuts
+            try:
+                if isinstance(cur, GRE):
+                    q.append(cur.payload)
+                    continue
+
+                if isinstance(cur, (PPPoE, PPP, MPLS, Dot1Q)):
+                    q.append(cur.payload)
+                    continue
+
+                if isinstance(cur, UDP):
+                    # VXLAN ports: 4789 + 8472 (common)
+                    if int(getattr(cur, "dport", -1)) in (4789, 8472) or int(getattr(cur, "sport", -1)) in (4789, 8472):
+                        if VXLAN and cur.haslayer(VXLAN):
+                            vx = cur.getlayer(VXLAN)
+                            if vx and hasattr(vx, "payload"):
+                                q.append(vx.payload)  # inner Ether normally
+                                continue
+
+                    # GENEVE (6081)
+                    if int(getattr(cur, "dport", -1)) == 6081 or int(getattr(cur, "sport", -1)) == 6081:
+                        ge = cur.getlayer(GENEVE) if cur.haslayer(GENEVE) else None
+                        if ge and hasattr(ge, "payload"):
+                            q.append(ge.payload)
+                            continue
+
+                    # L2TP (1701) often carries PPP
+                    if int(getattr(cur, "dport", -1)) == 1701 or int(getattr(cur, "sport", -1)) == 1701:
+                        l2tp = cur.getlayer(L2TP) if cur.haslayer(L2TP) else None
+                        if l2tp and hasattr(l2tp, "payload"):
+                            q.append(l2tp.payload)
+                            continue
+
+            except Exception:
+                pass
+
+            # If payload is a packet, traverse it
+            if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                q.append(pay)
+                continue
+
+            # If payload is Raw bytes, try to parse an inner frame
+            if isinstance(cur, Raw):
+                inner = self._maybe_parse_inner(bytes(cur.load or b""))
+                if inner is not None:
+                    q.append(inner)
+                continue
