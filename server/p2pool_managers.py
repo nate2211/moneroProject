@@ -1117,7 +1117,7 @@ class PythonRouterManager:
                 self.sniffer.sniff(
                     iface=name,
                     prn=direct_process,
-                    promisc=True,
+                    promisc=False,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
                     mac_filter_only=True,
@@ -1168,7 +1168,7 @@ class PythonRouterManager:
             self.dhcp_server_out = DHCPServer(
                 self.router_logger,
                 self.packet_writer,
-                self.interface_out_full_name,
+                self.interface_loopback_full_name,
                 dhcp_pool_out[0],
                 dhcp_pool_out[-1],
                 self._interfaces_config,
