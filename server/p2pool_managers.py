@@ -180,7 +180,7 @@ class PythonRouterManager:
         self.packet_analyzer = PacketPipelineBlock()
         self.default_analysis_extras = create_pipeline_extras(
             logger=self.router_logger,  # <-- Pass your logger instance here
-            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
+            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|ipc_emit",
             memory_key="last_analyzed_packet",
             debug=False,
             stop_on_error=True

@@ -757,43 +757,6 @@ class AnalyzePayloadBlock(BaseBlock):
         }
 
 
-
-@BLOCKS.register("tee", help="Save the current analysis dict to memory.json.")
-@dataclass
-class TeeToMemoryBlock(BaseBlock):
-    """
-    Serializes a JSON-safe snapshot of the analysis dict to memory.json
-    under Memory[key]. The raw Scapy packet object is stripped.
-    """
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        key = str(params.get("key", "last_packet_info"))
-        if not isinstance(payload, dict) or "analysis" not in payload:
-            err = "Payload is not a valid analysis dict, cannot save."
-            self.log(f"[Analysis][tee] ERROR: {err}")
-            return payload, {"error": err}
-        try:
-            serializable = json.loads(json.dumps(payload, default=str))
-            serializable.pop("packet", None)
-        except Exception as e:
-            err = f"Failed to serialize payload: {e}"
-            self.log(f"[Analysis][tee] ERROR: {err}")
-            return payload, {"error": err}
-        try:
-            store = Memory.load()
-            store[key] = serializable
-            Memory.save(store)
-            self.log(f"[Analysis][tee] Saved analysis snapshot to memory key '{key}'")
-            return payload, {"saved_to_memory": key, "size": len(str(serializable))}
-        except Exception as e:
-            err = f"Failed to save to memory: {e}"
-            self.log(f"[Analysis][tee] ERROR: {err}")
-            return payload, {"error": err}
-
-    def get_params_info(self) -> Dict[str, Any]:
-        return {"key": "last_packet_info"}
-
-
 # ========================================================
 # 5. PIPELINE RUNNER BLOCK
 # ========================================================
