@@ -6,6 +6,7 @@ import random
 import re
 import ssl
 import subprocess
+import uuid
 import zlib
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
@@ -26,7 +27,8 @@ from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3mq
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6_Reply, DHCP6_Solicit, DHCP6OptIA_NA, \
     DUID_LLT, DHCP6OptServerId, DHCP6_InfoRequest, DHCP6_Request, DHCP6OptClientId, DHCP6OptDNSServers, \
-    DHCP6OptDNSDomains, DHCP6OptInfoRefreshTime, DHCP6OptIAAddress
+    DHCP6OptDNSDomains, DHCP6OptInfoRefreshTime, DHCP6OptIAAddress, DHCP6_Renew, DHCP6_Confirm, DHCP6_Release, \
+    DHCP6_Decline, DHCP6_RelayReply, DHCP6OptStatusCode
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import ICMP, IPOption_Router_Alert
 from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
@@ -8032,7 +8034,7 @@ class ARPManager:
         self._cache_hit_table = defaultdict(lambda: deque(maxlen=10))
         self._IFACE_CACHE_TTL = 30.0
         self.arp_defend_on_probe = True
-        self.arp_defend_on_claim = True
+        self.arp_defend_on_claim = False
         self.arp_defense_cooldown = 5.0
         self._arp_defense_last = {}
         self.dai_enable = True
@@ -8055,7 +8057,7 @@ class ARPManager:
         self.ARP_PASSIVE_TTL = 20 * 60  # expire entries after 20 minutes (tune)
         self.ARP_MAX_ENTRIES = 10  # soft cap; oldest entries are trimmed
         self._last_passive_gc = 0.0  # last cleanup timestamp
-    # ---------- NEW: helpers to recognize gateways so we never lease them ----------
+
 
     def _in_quiet_start(self) -> bool:
         try:
@@ -8920,9 +8922,14 @@ class ARPManager:
         """
         if not pkt.haslayer(Ether):
             return
+
+
         now = time.time()
         eth = pkt[Ether]
         src_mac = (eth.src or "").lower()
+
+
+
         if not self._is_unicast_mac(src_mac):
             return
         if pkt.haslayer(ARP):
@@ -9211,6 +9218,7 @@ class ARPManager:
         self._ifcache_set(cache_key, None)
         return None
 
+
     def get_cache_view(self) -> dict:
         """Copy of current ARP cache."""
         with self._arp_cache_lock:
@@ -9301,6 +9309,13 @@ class DHCPServer:
         self._cleanup_thread = None
         self.sniffer = None
         self._dhcp6_srv_id = DHCP6OptServerId(duid=self.make_duid(in_mac))
+        # =========================
+        # 1) __init__(): add these DHCPv6 lease trackers (right after self._dhcp6_srv_id = ...)
+        # =========================
+        self.V6_LEASE_SECONDS = 3600
+        self._v6_leases = {}  # client_duid_hex -> (ipaddress.IPv6Address, expiry_ts)
+        self._v6_used = set()  # set[ipaddress.IPv6Address]
+        self._v6_declined = set()  # set[ipaddress.IPv6Address]
         self.logger.log_message(
             f"[DHCP] Server initialized. v4Relay={self.dhcp_relay_target_ip or 'None'} "
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
@@ -9530,6 +9545,30 @@ class DHCPServer:
                     return "v6", "client"
                 if sport == 547 and dport == 546:
                     return "v6", "server"
+            if pkt.haslayer(DHCP6_Request):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 546: return "v6", "server"
+            if pkt.haslayer(DHCP6_Renew):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 546: return "v6", "server"
+            if pkt.haslayer(DHCP6_Confirm):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 546: return "v6", "server"
+            if pkt.haslayer(DHCP6_Release):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 546: return "v6", "server"
+            if pkt.haslayer(DHCP6_Decline):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 546: return "v6", "server"
+            if pkt.haslayer(DHCP6_Advertise):
+                if dport == 546 and sport == 547: return "v6", "server"
+                if dport == 547 and sport == 546: return "v6", "client"
+            if pkt.haslayer(DHCP6_RelayForward):
+                if dport == 547 and sport == 546: return "v6", "client"
+                if sport == 547 and dport == 547: return "v6", "other"
+            if pkt.haslayer(DHCP6_RelayReply):
+                if sport == 547 and dport in (546, 547): return "v6", "server"
+                if dport == 547 and sport in (546, 547): return "v6", "other"
         return None, None
 
     def _iface_cfg_for(self, inbound_iface: str) -> dict:
@@ -9662,7 +9701,20 @@ class DHCPServer:
             # ---- REQUEST (includes SELECTING/INIT-REBOOT/RENEW/REBIND)
             if msg_type_norm == 3:
                 opt54 = self._get_server_id_opt54(dhcp_layer)  # server the client has chosen (if present)
-
+                # Inside DHCPServer.handle_packet, under DHCP Request handling
+                if opt54 and opt54 != router_in_ip:
+                    if self.rogue_policy == "nak_on_mismatch":
+                        # SAFETY CHECK: Only NAK if the IP they are requesting is actually
+                        # inside MY managed pool. If they are requesting an IP from the
+                        # other server's split pool, let it go.
+                        req_ip = self._get_requested_ip_opt50(dhcp_layer)
+                        if req_ip and req_ip in self.dynamic_ip_pool:
+                            # Force NAK only if they are trying to take OUR ip with WRONG server ID
+                            pass
+                        else:
+                            self.logger.log_message(
+                                f"[DHCP] Ignoring request for {req_ip} managed by other server {opt54}")
+                            return True
                 # If client explicitly selected a different server, optionally NAK (authoritative policy)
                 if opt54 and opt54 != router_in_ip and self.authoritative and self.rogue_policy == "nak_on_mismatch":
                     nak_l3 = (IP(src=router_in_ip, dst="255.255.255.255") /
@@ -9739,6 +9791,131 @@ class DHCPServer:
 
         # ================= DHCPv6 =================
         if version == "v6":
+            import re, hashlib
+
+            _ZONE_RE = re.compile(r'%(?:\d+|[A-Za-z0-9_.-]+)$')
+            def _rm_zone(addr: str | None) -> str | None:
+                if not addr or '%' not in addr:
+                    return addr
+                return _ZONE_RE.sub('', addr)
+
+            def _mk_clid_opt(pkt_):
+                cl = pkt_.getlayer(DHCP6OptClientId)
+                return DHCP6OptClientId(duid=cl.duid) if cl is not None else None
+
+            def _clid_hex(pkt_):
+                cl = pkt_.getlayer(DHCP6OptClientId)
+                if cl is None:
+                    return None
+                try:
+                    return bytes(getattr(cl, "duid", b"")).hex()
+                except Exception:
+                    return None
+
+            def _pick_v6_addr_for_client(pkt_):
+                # Deterministic-ish + cached lease. Requires self.dhcp6_prefix set.
+                if not self.dhcp6_prefix:
+                    return None
+
+                ipaddress, time = self.ipaddress, self.time
+                duid_hex = _clid_hex(pkt_) or ""
+                key = (duid_hex or "") + "|" + (client_mac or "") + "|" + str(self.dhcp6_prefix)
+
+                now = time.time()
+                if duid_hex and duid_hex in self._v6_leases:
+                    addr, exp = self._v6_leases[duid_hex]
+                    if now < exp and addr not in self._v6_declined:
+                        return addr
+
+                net = self.dhcp6_prefix
+                base = int(net.network_address)
+                host_bits = 128 - int(net.prefixlen)
+                if host_bits <= 0:
+                    return ipaddress.IPv6Address(base)
+
+                # Hash -> host offset
+                h = hashlib.sha256(key.encode("utf-8", "ignore")).digest()
+                off = int.from_bytes(h[:8], "big") & ((1 << min(host_bits, 64)) - 1)
+
+                # Avoid trivial offsets
+                if off < 2:
+                    off += 2
+
+                cand = ipaddress.IPv6Address(base + off)
+
+                # Avoid declined/used collisions: bump a little if needed
+                tries = 0
+                while (cand in self._v6_declined) or (cand in self._v6_used):
+                    tries += 1
+                    cand = ipaddress.IPv6Address(int(cand) + 1)
+                    if tries > 64:
+                        return None
+
+                if duid_hex:
+                    self._v6_leases[duid_hex] = (cand, now + self.V6_LEASE_SECONDS)
+                self._v6_used.add(cand)
+                return cand
+
+            def _first_iana(pkt_):
+                # returns first IA_NA option (or None)
+                try:
+                    ia = pkt_.getlayer(DHCP6OptIA_NA)
+                    return ia
+                except Exception:
+                    return None
+
+            def _send_v6_reply(dst_ip6: str, dst_mac: str | None, dhcp6_payload):
+                # Always UDP 547->546 for server replies
+                router_ll_nz = _rm_zone(router_ll)
+                dst_ip6_nz = _rm_zone(dst_ip6)
+                if not router_ll_nz or not dst_ip6_nz:
+                    return
+
+                ip6 = IPv6(src=router_ll_nz, dst=dst_ip6_nz, hlim=1)
+                udp = UDP(sport=547, dport=546)
+                if (not is_loopback) and dst_mac:
+                    out = Ether(src=router_in_mac, dst=dst_mac) / ip6 / udp / dhcp6_payload
+                elif not is_loopback:
+                    out = Ether(src=router_in_mac, dst="33:33:00:01:00:02") / IPv6(src=router_ll_nz, dst="ff02::1:2",
+                                                                                   hlim=1) / udp / dhcp6_payload
+                else:
+                    out = ip6 / udp / dhcp6_payload
+                self.sniffer.send(out, inbound_iface)
+
+            def _add_dns_opts(reply_pkt):
+                # DNSServers + DNSDomains (stateless options)
+                try:
+                    def _to_list_ipv6(v):
+                        if v is None: return []
+                        if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                        return [str(v)]
+
+                    dns_list = _to_list_ipv6(self.dns_v6)
+                    if dns_list:
+                        reply_pkt /= DHCP6OptDNSServers(dnsservers=dns_list)
+                except Exception:
+                    pass
+                try:
+                    def _to_list_str(v):
+                        if v is None: return []
+                        if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                        if isinstance(v, str) and "," in v:
+                            return [s.strip() for s in v.split(",") if s.strip()]
+                        return [str(v)]
+
+                    dom_list = _to_list_str(self.search_domains)
+                    if dom_list:
+                        reply_pkt /= DHCP6OptDNSDomains(domains=dom_list)
+                except Exception:
+                    pass
+                return reply_pkt
+
+            def _status(code: int, msg: str = ""):
+                # DHCP6OptStatusCode exists in scapy.contrib.dhcp6
+                try:
+                    return DHCP6OptStatusCode(statuscode=int(code), statusmsg=str(msg or ""))
+                except Exception:
+                    return None
 
             # One link-local for everything
             router_ll = self.router_ipv6_link_local_out
@@ -9761,71 +9938,65 @@ class DHCPServer:
             elif pkt.haslayer(DHCP6_InfoRequest):
                 dhcp6 = pkt[DHCP6_InfoRequest]
                 msgtype = 11
-            elif pkt.haslayer(DHCP6_Reply):
+            elif pkt.haslayer(DHCP6_Request):
                 dhcp6 = pkt[DHCP6_Request]
-                msgtype = 7
+                msgtype = 3
+            elif pkt.haslayer(DHCP6_Renew):
+                dhcp6 = pkt[DHCP6_Renew]
+                msgtype = 5
+            elif pkt.haslayer(DHCP6_Confirm):
+                dhcp6 = pkt[DHCP6_Confirm]
+                msgtype = 4
+            elif pkt.haslayer(DHCP6_Release):
+                dhcp6 = pkt[DHCP6_Release]
+                msgtype = 8
+            elif pkt.haslayer(DHCP6_Decline):
+                dhcp6 = pkt[DHCP6_Decline]
+                msgtype = 9
+            elif pkt.haslayer(DHCP6_Advertise):
+                dhcp6 = pkt[DHCP6_Advertise]
+                msgtype = 2
+            elif pkt.haslayer(DHCP6_Reply):
+                dhcp6 = pkt[DHCP6_Reply]
+                msgtype = 7  # FIXED (was DHCP6_Request)
+            elif pkt.haslayer(DHCP6_RelayForward):
+                dhcp6 = pkt[DHCP6_RelayForward]
+                msgtype = 12
+            elif pkt.haslayer(DHCP6_RelayReply):
+                dhcp6 = pkt[DHCP6_RelayReply]
+                msgtype = 13
 
-            if msgtype == 7:  # DHCPv6 Reply (server -> client)
+            if msgtype in (2, 7, 10, 13):
                 src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "(no-ether)"
                 dst_ll = str(pkt[IPv6].dst) if pkt.haslayer(IPv6) else "(no-ip)"
-
-                # Notable options
                 srv_id = pkt.getlayer(DHCP6OptServerId)
                 cli_id = pkt.getlayer(DHCP6OptClientId)
                 dns_opt = pkt.getlayer(DHCP6OptDNSServers)
                 dom_opt = pkt.getlayer(DHCP6OptDNSDomains)
 
-                # IA_NA blocks & IA Address children
-                ia_blocks = pkt.getlayer(DHCP6OptIA_NA, nb=999) or []
-                if not isinstance(ia_blocks, list):
-                    ia_blocks = [ia_blocks]
-                ia_info = []
-                for ia in ia_blocks:
-                    iaid = int(getattr(ia, "iaid", 0))
-                    T1 = int(getattr(ia, "T1", 0))
-                    T2 = int(getattr(ia, "T2", 0))
-                    addrs = []
-                    for sub in getattr(ia, "ianaopts", []) or []:
-                        if isinstance(sub, DHCP6OptIAAddress):
-                            addrs.append({
-                                "addr": str(getattr(sub, "addr", "")),
-                                "pref": int(getattr(sub, "preflft", 0)),
-                                "valid": int(getattr(sub, "validlft", 0)),
-                            })
-                    ia_info.append({"iaid": iaid, "T1": T1, "T2": T2, "addrs": addrs})
-
-                # Tag as our/other by DUID (optional but handy)
                 our_duid = bytes(getattr(self._dhcp6_srv_id, "duid", b""))
                 srv_duid = bytes(getattr(srv_id, "duid", b"")) if srv_id else b""
-                cli_duid = bytes(getattr(cli_id, "duid", b"")) if cli_id else b""
                 tag = "our" if (srv_duid and our_duid and srv_duid == our_duid) else "other"
 
                 dns_list = [str(x) for x in getattr(dns_opt, "dnsservers", [])] if dns_opt else []
                 dom_list = [str(x) for x in getattr(dom_opt, "domains", [])] if dom_opt else []
 
-                # Record by client link-local
                 self._seen_v6_replies[dst_ll] = {
                     "ts": self.time.time(),
                     "iface": inbound_iface,
                     "server_mac": src_mac,
                     "server_duid_hex": srv_duid.hex() if srv_duid else "",
-                    "client_duid_hex": cli_duid.hex() if cli_duid else "",
+                    "client_duid_hex": (bytes(getattr(cli_id, "duid", b"")).hex() if cli_id else ""),
                     "dns": dns_list,
                     "domains": dom_list,
-                    "ia_na": ia_info,
+                    "msgtype": msgtype,
                     "tag": tag,
                 }
 
-                # Log concise summary
-                ia_str = "; ".join(
-                    f"IAID={e['iaid']}[{','.join(a['addr'] for a in e['addrs'])}]"
-                    for e in ia_info
-                ) or "no-ia"
-                dns_str = ",".join(dns_list) or "no-dns"
-                dom_str = ",".join(dom_list) or "no-domains"
+                name = {2: "ADVERTISE", 7: "REPLY", 10: "RECONFIGURE", 13: "RELAY-REPLY"}.get(msgtype,
+                                                                                              f"type={msgtype}")
                 self.logger.log_message(
-                    f"[DHCP] v6 REPLY observed from {src_mac} → {dst_ll} [{tag}] "
-                    f"DNS=[{dns_str}] DOM=[{dom_str}] {ia_str}"
+                    f"[DHCP] v6 {name} observed from {src_mac} → {dst_ll} [{tag}] DNS={dns_list or '[]'} DOM={dom_list or '[]'}"
                 )
                 return True
 
@@ -9845,7 +10016,23 @@ class DHCPServer:
                 out = (Ether(src=router_in_mac, dst=client_mac) / relay) if (client_mac and not is_loopback) else relay
                 self.sniffer.send(out, inbound_iface)
                 return True
+            # ---- DECLINE (9): mark declined, drop lease, Reply ----
+            if msgtype == 9:
+                du = _clid_hex(pkt)
+                if du and du in self._v6_leases:
+                    addr, _ = self._v6_leases.pop(du)
+                    self._v6_used.discard(addr)
+                    self._v6_declined.add(addr)
 
+                clid = _mk_clid_opt(pkt)
+                if clid:
+                    reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
+                    st = _status(0, "Declined")
+                    if st: reply /= st
+                    reply = _add_dns_opts(reply)
+                    _send_v6_reply(v6src, client_mac, reply)
+                self.logger.log_message(f"[DHCP] v6 DECLINE handled for {v6src} (iface={inbound_iface})")
+                return True
             # -------- Server replies (ADVERTISE / REPLY) ----------
             if msgtype == 1:  # SOLICIT
                 _ZONE_RE = re.compile(r'%(?:\d+|[A-Za-z0-9_.-]+)$')
@@ -9959,17 +10146,56 @@ class DHCPServer:
                 self.sniffer.send(out, inbound_iface)
                 self.logger.log_message(f"[DHCP] v6 INFO-REPLY → {v6src} (iface={inbound_iface})")
                 return True
-            if msgtype == 3:  # REQUEST -> REPLY
-                opts = [
-                    # TODO: include IA_NA/IA_PD/DNS; mirror what you advertised/leased
-                    "end"
-                ]
-                reply = (IPv6(src=router_ll, dst=v6src, hlim=255) /
-                         UDP(sport=547, dport=546) /
-                         DHCP6_Reply(trid=dhcp6.trid, options=opts))
-                out = (Ether(src=router_in_mac, dst=client_mac) / reply) if (client_mac and not is_loopback) else reply
-                self.sniffer.send(out, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 REPLY → {v6src} (iface={inbound_iface})")
+
+            # ---- CONFIRM (4) -> REPLY with StatusCode (success / not-on-link) ----
+            if msgtype == 4:
+                clid = _mk_clid_opt(pkt)
+                if not clid:
+                    self.logger.log_message("[DHCP] v6 CONFIRM missing Client-ID; ignoring.")
+                    return True
+
+                reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
+                st = _status(0, "On-link") if self.dhcp6_prefix else _status(4, "NotOnLink")
+                if st: reply /= st
+                reply = _add_dns_opts(reply)
+                _send_v6_reply(v6src, client_mac, reply)
+                self.logger.log_message(f"[DHCP] v6 CONFIRM-REPLY → {v6src} (iface={inbound_iface})")
+                return True
+            if msgtype in (3, 5, 6):
+                clid = _mk_clid_opt(pkt)
+                if not clid:
+                    self.logger.log_message(f"[DHCP] v6 msg={msgtype} missing Client-ID; ignoring.")
+                    return True
+
+                reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
+
+                ia = _first_iana(pkt)
+                if self.dhcp6_prefix and ia is not None:
+                    addr = _pick_v6_addr_for_client(pkt)
+                    if addr is None:
+                        st = _status(2, "NoAddrsAvail")
+                        if st: reply /= st
+                    else:
+                        try:
+                            T1 = int(self.V6_LEASE_SECONDS * 0.5)
+                            T2 = int(self.V6_LEASE_SECONDS * 0.8)
+                            ia_reply = DHCP6OptIA_NA(iaid=int(getattr(ia, "iaid", 0)), T1=T1, T2=T2)
+                            ia_reply /= DHCP6OptIAAddress(addr=str(addr), preflft=self.V6_LEASE_SECONDS,
+                                                          validlft=self.V6_LEASE_SECONDS)
+                            reply /= ia_reply
+                        except Exception:
+                            st = _status(1, "UnspecFail")
+                            if st: reply /= st
+                else:
+                    # No prefix -> stateless-only reply
+                    st = _status(0, "Stateless")
+                    if st: reply /= st
+
+                reply = _add_dns_opts(reply)
+                _send_v6_reply(v6src, client_mac, reply)
+
+                name = {3: "REQUEST", 5: "RENEW", 6: "REBIND"}.get(msgtype, str(msgtype))
+                self.logger.log_message(f"[DHCP] v6 {name}-REPLY → {v6src} (iface={inbound_iface})")
                 return True
 
             self.logger.log_message(f"[DHCP] v6 msgtype {msgtype} not handled; ignoring.")

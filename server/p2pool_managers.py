@@ -97,6 +97,7 @@ class PythonRouterManager:
 
 
         self.router_logger = router_logger
+        self.nat_instance_name = f"PythonRouterNAT_{socket.gethostname()}"
         self.code_output_manager = CodeOutputManager(self.router_logger)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
@@ -2130,6 +2131,7 @@ class PythonRouterManager:
             self.code_output_manager.set_verbose(2)
             self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
 
+
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
@@ -2592,109 +2594,63 @@ class PythonRouterManager:
             if iface['full_name'] == full_name:
                 return iface['friendly_name']
         return full_name
+
     def _enable_nat_forwarding(self):
-        """
-        Enables NAT forwarding by first removing any old NAT instances and then creating a new one.
-        This makes the operation idempotent and resilient to crashes.
-        Falls back or warns if the OS does not support New-NetNat (e.g., Windows Home).
-        """
-        if platform.system() != "Windows":
-            self.router_logger.log_message("[NAT Setup] ❌ NAT setup is only supported on Windows.")
+        if platform.system() != "Windows" or not self.router_network_in:
             return
-
-        if not self.router_network_in:
-            self.router_logger.log_message("[NAT Setup] ⚠️ Cannot enable NAT: IN network is not configured.")
-            return
-
-        # --- Check Windows Edition ---
-        try:
-            edition_output = subprocess.check_output(
-                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
-                text=True
-            ).strip()
-
-            unsupported_skus = {"100", "103", "104"}  # Excludes 101 (Win11 Home), which works
-
-            if edition_output in unsupported_skus:
-                self.router_logger.log_message("[NAT Setup] 🏠 Windows Home or unsupported edition detected.")
-                return
-        except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ⚠️ Could not determine Windows edition: {e}")
 
         lan_network_cidr = str(self.router_network_in)
-        self.router_logger.log_message(f"[NAT Setup] 🚀 Enabling NAT for network {lan_network_cidr}...")
+        nat_name = self.nat_instance_name
+
+        self.router_logger.log_message(f"[NAT Setup] 🚀 Initializing NAT '{nat_name}' for {lan_network_cidr}...")
 
         try:
-            # Remove any existing NAT instance with the same name
-            cleanup_cmd = [
-                "powershell.exe",
-                "-Command",
-                "if (Get-NetNat -Name 'PythonRouterNAT' -ErrorAction SilentlyContinue) {"
-                " Remove-NetNat -Name 'PythonRouterNAT' -Confirm:$false }"
-            ]
-            subprocess.run(cleanup_cmd, capture_output=True, text=True, check=True,
+            # 1. Broad Cleanup: Find ANY NAT object managing this subnet and remove it
+            # This prevents the "Duplicate Name/Subnet" error if a previous instance died
+            cleanup_script = f"""
+            $existing = Get-NetNat | Where-Object {{ $_.InternalIPInterfaceAddressPrefix -eq '{lan_network_cidr}' }}
+            if ($existing) {{
+                $existing | Remove-NetNat -Confirm:$false
+            }}
+            if (Get-NetNat -Name '{nat_name}' -ErrorAction SilentlyContinue) {{
+                Remove-NetNat -Name '{nat_name}' -Confirm:$false
+            }}
+            """
+            subprocess.run(["powershell.exe", "-Command", cleanup_script], capture_output=True,
                            creationflags=subprocess.CREATE_NO_WINDOW)
 
-            # Now create the new NAT rule
+            # 2. Create the new unique NAT rule
             ps_command = [
-                "powershell.exe",
-                "-Command",
-                f'New-NetNat -Name "PythonRouterNAT" -InternalIPInterfaceAddressPrefix "{lan_network_cidr}"'
+                "powershell.exe", "-Command",
+                f'New-NetNat -Name "{nat_name}" -InternalIPInterfaceAddressPrefix "{lan_network_cidr}"'
             ]
             result = subprocess.run(ps_command, capture_output=True, text=True, check=True,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
 
-            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding enabled successfully.")
-            if result.stdout:
-                self.router_logger.log_message(f"[NAT Setup] PowerShell output: {result.stdout.strip()}")
+            self.router_logger.log_message(f"[NAT Setup] ✅ NAT '{nat_name}' successfully bound to {lan_network_cidr}")
 
         except subprocess.CalledProcessError as e:
-            if "0x80041010" in e.stderr:
-                return
-            else:
-                self.router_logger.log_message(f"[NAT Setup] ❌ Failed to enable NAT. Error: {e.stderr.strip()}")
-            self.router_logger.log_message(
-                "[NAT Setup] ℹ️ Please ensure this script is run with Administrator privileges.")
-        except FileNotFoundError:
-            self.router_logger.log_message("[NAT Setup] ❌ PowerShell not found. Cannot enable NAT.")
-        except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ❌ An unexpected error occurred while enabling NAT: {e}")
+            self.router_logger.log_message(f"[NAT Setup] ❌ Kernel Error: {e.stderr.strip()}")
 
     def _disable_nat_forwarding(self):
         """
-        Removes the NAT forwarding rule created by the router, but only if running
-        on a supported edition (Windows Pro or higher).
+        Removes only the NAT forwarding rule owned by this instance.
         """
-        self.router_logger.log_message("[NAT Setup] 🧹 Disabling NAT forwarding...")
+        nat_name = self.nat_instance_name
+        self.router_logger.log_message(f"[NAT Setup] 🧹 Removing NAT rule: {nat_name}")
 
         if platform.system() != "Windows":
-            self.router_logger.log_message("[NAT Setup] ❌ NAT disabling is only supported on Windows.")
             return
 
-        try:
-            # Check if the system is a supported SKU (i.e., not Home/Starter)
-            edition_output = subprocess.check_output(
-                ["powershell", "-Command", "(Get-WmiObject -Class Win32_OperatingSystem).OperatingSystemSKU"],
-                text=True
-            ).strip()
-            unsupported_skus = {"101", "100", "103", "104"}  # Home/Starter SKUs
-            if edition_output in unsupported_skus:
-                return
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[NAT Setup] ⚠️ Could not determine Windows edition. Skipping NAT disable. Reason: {e}")
-            return
         ps_command = [
-            "powershell.exe",
-            "-Command",
-            'Remove-NetNat -Name "PythonRouterNAT" -Confirm:$false'
+            "powershell.exe", "-Command",
+            f'Remove-NetNat -Name "{nat_name}" -Confirm:$false -ErrorAction SilentlyContinue'
         ]
         try:
             subprocess.run(ps_command, capture_output=True, text=True, check=False,
                            creationflags=subprocess.CREATE_NO_WINDOW)
-            self.router_logger.log_message("[NAT Setup] ✅ NAT forwarding rule removed (if it existed).")
         except Exception as e:
-            self.router_logger.log_message(f"[NAT Setup] ⚠️ An error occurred while disabling NAT: {e}")
+            self.router_logger.log_message(f"[NAT Setup] ⚠️ Error during NAT cleanup: {e}")
 
     def _get_default_gateway_for_interface(self, iface_friendly_name: str) -> str | None:
         """
