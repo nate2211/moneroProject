@@ -179,14 +179,7 @@ class PythonRouterManager:
         self.started = False
 
         self.packet_analyzer = PacketPipelineBlock()
-        self.default_analysis_extras = create_pipeline_extras(
-            logger=self.router_logger,  # <-- Pass your logger instance here
-            stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|ipc_emit",
-            memory_key="last_analyzed_packet",
-            debug=False,
-            stop_on_error=True
 
-        )
 
 
 
@@ -2022,7 +2015,7 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -2131,6 +2124,15 @@ class PythonRouterManager:
             self.code_output_manager.set_verbose(2)
             self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
 
+            self.default_analysis_extras = create_pipeline_extras(
+                logger=self.router_logger,  # <-- Pass your logger instance here
+                stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|ipc_emit",
+                memory_key="last_analyzed_packet",
+                debug=False,
+                stop_on_error=True,
+                router_ip_in=ipc_emit_host
+            )
+            self.router_logger.log_message(f"[IPCEmit][Pipeline] Hosting on {ipc_emit_host}")
 
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
@@ -2749,7 +2751,14 @@ class PythonRouterManager:
 
         lan_network_cidr = str(self.router_network_in)
         self.router_logger.log_message(f"[Firewall] Adding dynamic rules for LAN: {lan_network_cidr}")
-
+        self.firewall_manager.add_rule(
+            action='permit', protocol='tcp', src_ip='any', dst_ip='any',
+            src_port='any', dst_port=9999
+        )
+        self.firewall_manager.add_rule(
+            action='permit', protocol='udp', src_ip='any', dst_ip='any',
+            src_port='any', dst_port=9999
+        )
         # Rule 1: Allow all traffic within the LAN
         self.firewall_manager.add_rule(
             action='permit', protocol='any', src_ip=lan_network_cidr, dst_ip=lan_network_cidr,

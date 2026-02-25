@@ -1670,7 +1670,9 @@ class RouterTab(QWidget):
         # New p2pool_server_ip field
         self.p2pool_server_ip_input = QLineEdit()
         self.p2pool_server_ip_input.setPlaceholderText("")
-
+        # [NEW] IPC Host IP field
+        self.ipc_host_input = QLineEdit()
+        self.ipc_host_input.setText("127.0.0.1")
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
         self.dhcp_out_checkbox.setChecked(True)
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
@@ -1706,6 +1708,9 @@ class RouterTab(QWidget):
         # Added P2Pool IP field and its label
         top_row_layout.addWidget(QLabel("P2Pool IP:"))
         top_row_layout.addWidget(self.p2pool_server_ip_input)
+        # [NEW] IPC Host
+        top_row_layout.addWidget(QLabel("IPC Host:"))
+        top_row_layout.addWidget(self.ipc_host_input)
 
         top_row_layout.addWidget(QLabel("Manual LAN IP:"))
         top_row_layout.addWidget(self.router_ip_out_input)

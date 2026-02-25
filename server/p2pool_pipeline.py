@@ -206,6 +206,7 @@ def create_pipeline_extras(
         memory_key: str = "last_packet_info",
         debug: bool = False,
         stop_on_error: bool = True,
+        router_ip_in: str = "127.0.0.1"
 ) -> Dict[str, Any]:
     """
     Convenience helper: build an "extras" dict for PacketPipelineBlock.
@@ -217,7 +218,7 @@ def create_pipeline_extras(
     }, "tee": {
         "key": memory_key,
     }, "ipc_emit": {
-        "host": "0.0.0.0",
+        "host": router_ip_in,
         "port": 9999,
         "mode": "auto",  # <-- send UDP + TCP
         "udp_nonblocking": True,
@@ -789,14 +790,30 @@ class PacketPipelineBlock(BaseBlock):
             pipe_params: Dict[str, Any],
     ) -> Dict[str, Any]:
         merged: Dict[str, Any] = {}
+
+        stage_key = stage.strip().lower()
+
+        # 1) Global "all" group
         if isinstance(extras.get("all"), dict):
             merged.update(extras.get("all", {}))
-        if isinstance(extras.get(stage.lower()), dict):
-            merged.update(extras.get(stage.lower(), {}))
-        prefix = f"{stage}."
+
+        # 2) Stage group at top-level extras: extras["ipc_emit"], extras["tee"], etc.
+        if isinstance(extras.get(stage_key), dict):
+            merged.update(extras.get(stage_key, {}))
+
+        # 3) Stage group nested under extras["pipeline"]: extras["pipeline"]["ipc_emit"], etc.
+        pipeline_cfg = extras.get("pipeline")
+        if isinstance(pipeline_cfg, dict):
+            nested = pipeline_cfg.get(stage_key)
+            if isinstance(nested, dict):
+                merged.update(nested)
+
+        # 4) Prefix overrides from pipe_params: "ipc_emit.host=..." etc.
+        prefix = f"{stage_key}."
         for k, v in pipe_params.items():
-            if k.startswith(prefix):
+            if isinstance(k, str) and k.startswith(prefix):
                 merged[k[len(prefix):]] = v
+
         return merged
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -1243,7 +1260,7 @@ class IPCEmitterBlock(BaseBlock):
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         # Configuration
-        host = str(params.get("host", "0.0.0.0"))
+        host = str(params.get("host", "127.0.0.1"))
         port = int(params.get("port", 9999))
 
         mode_raw = str(params.get("mode", "udp")).lower()
