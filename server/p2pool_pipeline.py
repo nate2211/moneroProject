@@ -217,7 +217,7 @@ def create_pipeline_extras(
     }, "tee": {
         "key": memory_key,
     }, "ipc_emit": {
-        "host": "127.0.0.1",
+        "host": "0.0.0.0",
         "port": 9999,
         "mode": "auto",  # <-- send UDP + TCP
         "udp_nonblocking": True,
@@ -1243,7 +1243,7 @@ class IPCEmitterBlock(BaseBlock):
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         # Configuration
-        host = str(params.get("host", "127.0.0.1"))
+        host = str(params.get("host", "0.0.0.0"))
         port = int(params.get("port", 9999))
 
         mode_raw = str(params.get("mode", "udp")).lower()
