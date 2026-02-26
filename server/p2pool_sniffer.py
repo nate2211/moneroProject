@@ -210,10 +210,11 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
-    def __init__(self, arp_manager, rip_manager, lag_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
+    def __init__(self,router, arp_manager, rip_manager, lag_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
         self.lag_manager = lag_manager
+        self.router = router
         self._interfaces_config = _interfaces_config
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
@@ -1662,8 +1663,8 @@ class SnifferSoftware:
                         f"[Sniffer] 🪈 sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31) sending down PYPIPE.")
                     self.hyperv_manager.send_packet(bytes(packet))
                 else:
-                    self.hyperv_manager.send_packet(bytes(packet))
-                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out} sending down PYPIPE")
+                    self.router.process_packet(bytes(packet))
+                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out} sending to Router")
                 return None
 
             if verbose >= 1:
@@ -1768,8 +1769,8 @@ class SnifferSoftware:
                         f"[Sniffer] 🪈 sr2 send failed on {iface_out}: Device not functioning (likely Win32 error 31) sending down PYPIPE.")
                     self.hyperv_manager.send_packet(bytes(packet))
                 else:
-                    self.hyperv_manager.send_packet(bytes(packet))
-                    self.logger.log_message(f"[Sniffer] 🪈 sr2 send failed on {iface_out} sending down PYPIPE")
+                    self.router.process_packet(bytes(packet))
+                    self.logger.log_message(f"[Sniffer] 🪈 sr2 send failed on {iface_out} sending to Router")
                 return None
 
             if verbose >= 1:
