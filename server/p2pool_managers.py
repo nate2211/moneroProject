@@ -1206,6 +1206,19 @@ class PythonRouterManager:
                 except Exception as e:
                     return
 
+            # ==========================================================
+            # ✅ ARP HANDLING BLOCK (reply/learn) BEFORE "no IP layer" drop
+            # ==========================================================
+            if packet.haslayer(ARP):
+                if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
+                    self.router_logger.log_message(
+                        f"[Router] 🚫 Dropped ARP on {iface_short} (failed inspection)."
+                    )
+                    return
+                self.arp_manager.learn_from_packet(packet, inbound_iface)
+                self.arp_manager.learn_arp_response(packet)
+                self.arp_manager.reply_to_arp_request(packet, inbound_iface)
+                return
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
                 self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
@@ -1340,12 +1353,6 @@ class PythonRouterManager:
                     packet = p
                     ip_layer = new_ip_layer
 
-            if packet.haslayer(ARP):
-                if not self.arp_manager.perform_arp_inspection(packet, inbound_iface):
-                    self.router_logger.log_message(
-                        f"[Router] 🚫 Dropped ARP on {iface_short} (failed inspection)."
-                    )
-                    return
 
             if IP in packet:
                 if packet.haslayer(ESP):
