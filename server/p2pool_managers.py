@@ -2049,7 +2049,7 @@ class PythonRouterManager:
                 self.NOTIFICATION_TARGET_PORT,
                 self.interface_in_full_name
             )
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
+            self.sniffer = SnifferSoftware(self, self.arp_manager, self.rip_manager, self.lag_manager, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
