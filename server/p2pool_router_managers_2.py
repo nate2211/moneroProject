@@ -10657,10 +10657,13 @@ class P2PPeerManager:
     def __init__(self, router_logger, router_ip: str, broadcast_ip: str = "255.255.255.255", port: int = 49999):
         self.router_logger = router_logger
         self.router_ip = router_ip
+        # STRONGLY RECOMMENDED: Pass the subnet broadcast (e.g., 192.168.1.255) instead of 255.255.255.255
         self.broadcast_ip = broadcast_ip
         self.port = port
 
-        # References to other managers to pull data from
+        # Unique ID so we can ignore our own broadcasts even if testing on the same machine
+        self.node_id = str(uuid.uuid4())
+
         self.arp_manager = None
         self.rip_manager = None
 
@@ -10669,20 +10672,16 @@ class P2PPeerManager:
         self._broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
 
-        # Peer state storage: {peer_ip: {"last_seen": timestamp, "arp_table": {...}, "routes": [...]}}
         self.peers: Dict[str, Dict[str, Any]] = {}
-        self.peer_timeout = 35.0  # Seconds before a peer is considered dead
+        self.peer_timeout = 35.0
         self.broadcast_interval = 10.0
 
     def set_managers(self, arp_manager, rip_manager):
-        """Inject managers so the P2P system can pull their state to share."""
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
 
     def start(self):
-        """Starts the P2P listener and broadcaster threads."""
         if self.running:
-            self.router_logger.log_message("[P2P] ⚠️ Peer Manager is already running.")
             return
 
         if not self.router_ip or self.router_ip == "0.0.0.0":
@@ -10698,17 +10697,15 @@ class P2PPeerManager:
         self._broadcast_thread.start()
 
         self.router_logger.log_message(
-            f"[P2P] 🟢 Started on {self.router_ip}:{self.port} (Broadcast: {self.broadcast_ip})")
+            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} (Targeting: {self.broadcast_ip})")
 
     def stop(self):
-        """Stops the P2P threads and cleans up sockets."""
         if not self.running:
             return
 
         self.running = False
         self.router_logger.log_message("[P2P] 🛑 Stopping Peer Manager...")
 
-        # Threads will exit shortly due to self.running = False and socket timeouts
         if self._listen_thread:
             self._listen_thread.join(timeout=2.0)
         if self._broadcast_thread:
@@ -10718,13 +10715,11 @@ class P2PPeerManager:
             self.peers.clear()
 
     def get_known_peers(self) -> Dict[str, Dict[str, Any]]:
-        """Returns a copy of all active peers and their shared data."""
         self._prune_dead_peers()
         with self._lock:
             return self.peers.copy()
 
     def _prune_dead_peers(self):
-        """Removes peers that haven't broadcasted recently."""
         now = time.time()
         with self._lock:
             dead_peers = [ip for ip, data in self.peers.items() if (now - data["last_seen"]) > self.peer_timeout]
@@ -10733,19 +10728,13 @@ class P2PPeerManager:
                 self.router_logger.log_message(f"[P2P] 👻 Peer {ip} timed out and was removed.")
 
     def _listener_loop(self):
-        """Listens for UDP broadcasts from other routers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Enable broadcast receiving
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        except Exception:
-            pass
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         try:
-            # Bind to all interfaces on the designated port
-            sock.bind(("", self.port))
+            # Bind to all interfaces. On Windows, 0.0.0.0 is usually required to catch broadcasts.
+            sock.bind(("0.0.0.0", self.port))
         except Exception as e:
             self.router_logger.log_message(f"[P2P] ❌ Failed to bind listener socket: {e}")
             self.running = False
@@ -10758,31 +10747,33 @@ class P2PPeerManager:
                 data, addr = sock.recvfrom(65535)
                 sender_ip = addr[0]
 
-                # Ignore our own broadcasts
-                if sender_ip == self.router_ip:
-                    continue
-
                 payload = json.loads(data.decode('utf-8'))
 
                 if payload.get("magic") != self.MAGIC_HEADER:
                     continue
 
+                # Ignore our own packets using the UUID, NOT the IP address.
+                if payload.get("node_id") == self.node_id:
+                    continue
+
                 with self._lock:
                     is_new = sender_ip not in self.peers
                     self.peers[sender_ip] = {
+                        "node_id": payload.get("node_id"),
                         "last_seen": time.time(),
                         "arp_table": payload.get("arp_table", {}),
                         "routes": payload.get("routes", [])
                     }
 
                 if is_new:
-                    self.router_logger.log_message(f"[P2P] 🤝 Discovered new router peer: {sender_ip}")
+                    self.router_logger.log_message(
+                        f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})")
 
             except socket.timeout:
                 self._prune_dead_peers()
                 continue
             except json.JSONDecodeError:
-                pass  # Ignore malformed packets
+                pass
             except Exception as e:
                 if self.running:
                     self.router_logger.log_message(f"[P2P] ⚠️ Listener error: {e}")
@@ -10790,16 +10781,21 @@ class P2PPeerManager:
         sock.close()
 
     def _broadcaster_loop(self):
-        """Periodically broadcasts this router's state to the LAN."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+        # Optional but recommended: explicitly bind the sending socket to your router's internal IP
+        # This forces the OS to send the broadcast out of the LAN interface, not the WAN interface.
+        try:
+            sock.bind((self.router_ip, 0))
+        except Exception as e:
+            self.router_logger.log_message(
+                f"[P2P] ⚠️ Could not bind broadcast sender to {self.router_ip}: {e}. Proceeding with default routing.")
+
         while self.running:
             try:
-                # Gather state
                 arp_data = {}
                 if self.arp_manager:
-                    # Sanitize ARP tuples/objects for JSON serialization
                     raw_arp = self.arp_manager.get_cache_view()
                     for ip, val in raw_arp.items():
                         if isinstance(val, tuple):
@@ -10813,6 +10809,7 @@ class P2PPeerManager:
 
                 payload = {
                     "magic": self.MAGIC_HEADER,
+                    "node_id": self.node_id,  # Added node_id
                     "router_ip": self.router_ip,
                     "arp_table": arp_data,
                     "routes": route_data
@@ -10825,7 +10822,6 @@ class P2PPeerManager:
                 if self.running:
                     self.router_logger.log_message(f"[P2P] ⚠️ Broadcast error: {e}")
 
-            # Sleep in small chunks so we can exit quickly when stopped
             for _ in range(int(self.broadcast_interval * 10)):
                 if not self.running:
                     break
