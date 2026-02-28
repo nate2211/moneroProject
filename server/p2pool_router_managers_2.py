@@ -10650,10 +10650,10 @@ class FirewallManager:
 class P2PPeerManager:
     """
     Manages peer-to-peer discovery.
-    Sends via Scapy/Sniffer (L2 Injection).
-    Listens via standard OS UDP sockets (Background thread).
+    Sends via SnifferSoftware (direct L2 injection to bypass Windows routing).
+    Listens via standard OS UDP sockets (background thread).
     """
-    MAGIC_HEADER = "PYROUTER_P2P_V4"
+    MAGIC_HEADER = "PYROUTER_P2P_V5"
 
     def __init__(self, router_logger, router_ip: str, sniffer, out_iface: str, broadcast_ip: str = "255.255.255.255",
                  port: int = 49999):
@@ -10663,8 +10663,9 @@ class P2PPeerManager:
         self.port = port
         self.node_id = str(uuid.uuid4())
 
-        # Initialize our custom sender socket
-        self.sender_sock = PcapUDPSocket(sniffer, out_iface, router_ip, port)
+        # Store sniffer and interface directly instead of using a custom socket wrapper
+        self.sniffer = sniffer
+        self.out_iface = out_iface
 
         self.arp_manager = None
         self.rip_manager = None
@@ -10696,7 +10697,7 @@ class P2PPeerManager:
         self._broadcast_thread.start()
 
         self.router_logger.log_message(
-            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port}"
+            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} (Hybrid Mode)"
         )
 
     def stop(self):
@@ -10731,7 +10732,11 @@ class P2PPeerManager:
         """Standard Python socket listening for incoming broadcasts."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except Exception:
+            pass
 
         try:
             # Bind to all interfaces to catch the broadcasts
@@ -10784,7 +10789,7 @@ class P2PPeerManager:
         sock.close()
 
     def _broadcaster_loop(self):
-        """Gathers router state and broadcasts it using the PcapUDPSocket."""
+        """Gathers router state and broadcasts it using SnifferSoftware."""
         while self.running:
             try:
                 # Gather state
@@ -10808,8 +10813,19 @@ class P2PPeerManager:
 
                 packet_bytes = json.dumps(payload).encode('utf-8')
 
-                # Use our custom PcapUDPSocket to send the data
-                self.sender_sock.sendto(packet_bytes, (self.broadcast_ip, self.port))
+                # Construct the L3 Scapy Packet
+                pkt = IP(src=self.router_ip, dst=self.broadcast_ip) / UDP(sport=self.port, dport=self.port) / Raw(
+                    load=packet_bytes)
+
+                # Inject directly via SnifferSoftware
+                # Providing dst_mac="ff:ff:ff:ff:ff:ff" forces it to broadcast without triggering an ARP request
+                if self.sniffer:
+                    self.sniffer.send(
+                        pkt,
+                        iface=self.out_iface,
+                        dst_mac="ff:ff:ff:ff:ff:ff",
+                        verbose=0
+                    )
 
             except Exception as e:
                 if self.running:
@@ -10820,38 +10836,3 @@ class P2PPeerManager:
                     break
                 time.sleep(0.1)
 
-
-class PcapUDPSocket:
-    """
-    A pseudo-socket that uses SnifferSoftware to inject packets directly at Layer 2.
-    This guarantees the broadcast goes out the correct interface, ignoring Windows routing.
-    """
-
-    def __init__(self, sniffer, iface_name: str, src_ip: str, src_port: int):
-        self.sniffer = sniffer
-        self.iface_name = iface_name
-        self.src_ip = src_ip
-        self.src_port = src_port
-
-        try:
-            # Assumes iface_name is the Scapy/OS name (e.g. \Device\NPF_...)
-            self.src_mac = get_if_hwaddr(iface_name.split('_')[-1])
-        except Exception:
-            self.src_mac = "02:00:00:00:00:01"
-
-    def sendto(self, data: bytes, address: tuple):
-        dst_ip, dst_port = address
-
-        if dst_ip == "255.255.255.255" or dst_ip.endswith(".255"):
-            dst_mac = "ff:ff:ff:ff:ff:ff"
-        else:
-            dst_mac = "ff:ff:ff:ff:ff:ff"
-
-        pkt = (
-                Ether(src=self.src_mac, dst=dst_mac) /
-                IP(src=self.src_ip, dst=dst_ip) /
-                UDP(sport=self.src_port, dport=dst_port) /
-                Raw(load=data)
-        )
-
-        self.sniffer.sendp(pkt, iface=self.iface_name, verbose=0)
