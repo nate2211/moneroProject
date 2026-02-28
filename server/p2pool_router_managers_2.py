@@ -10649,26 +10649,27 @@ class FirewallManager:
 
 class P2PPeerManager:
     """
-    Manages peer-to-peer discovery and state sharing between multiple PythonRouters on the same LAN.
-    Operates over UDP broadcast to share ARP tables, routes, and general presence.
+    Manages peer-to-peer discovery and state sharing between multiple PythonRouters.
+    Bypasses OS sockets and uses SnifferSoftware to inject and receive Scapy packets directly.
     """
-    MAGIC_HEADER = "PYROUTER_P2P_V1"
+    MAGIC_HEADER = "PYROUTER_P2P_V2"
 
-    def __init__(self, router_logger, router_ip: str, broadcast_ip: str = "255.255.255.255", port: int = 49999):
+    def __init__(self, router_logger, router_ip: str, sniffer, out_iface: str, broadcast_ip: str = "255.255.255.255",
+                 port: int = 49999):
         self.router_logger = router_logger
         self.router_ip = router_ip
-        # STRONGLY RECOMMENDED: Pass the subnet broadcast (e.g., 192.168.1.255) instead of 255.255.255.255
+        self.sniffer = sniffer
+        self.out_iface = out_iface  # The full scapy name of the interface to broadcast out of
         self.broadcast_ip = broadcast_ip
         self.port = port
 
-        # Unique ID so we can ignore our own broadcasts even if testing on the same machine
+        # Unique ID to ignore our own broadcasts
         self.node_id = str(uuid.uuid4())
 
         self.arp_manager = None
         self.rip_manager = None
 
         self.running = False
-        self._listen_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
 
@@ -10684,20 +10685,19 @@ class P2PPeerManager:
         if self.running:
             return
 
-        if not self.router_ip or self.router_ip == "0.0.0.0":
-            self.router_logger.log_message("[P2P] ❌ Cannot start Peer Manager without a valid router IP.")
+        if not self.router_ip or not self.sniffer or not self.out_iface:
+            self.router_logger.log_message("[P2P] ❌ Cannot start Peer Manager: Missing IP, Sniffer, or Interface.")
             return
 
         self.running = True
 
-        self._listen_thread = threading.Thread(target=self._listener_loop, daemon=True, name="P2P-Listener")
+        # Note: We no longer need a listener thread. Packets will be fed to handle_packet()
         self._broadcast_thread = threading.Thread(target=self._broadcaster_loop, daemon=True, name="P2P-Broadcaster")
-
-        self._listen_thread.start()
         self._broadcast_thread.start()
 
         self.router_logger.log_message(
-            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} (Targeting: {self.broadcast_ip})")
+            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} via {self.out_iface.split('_')[-1]}"
+        )
 
     def stop(self):
         if not self.running:
@@ -10706,8 +10706,6 @@ class P2PPeerManager:
         self.running = False
         self.router_logger.log_message("[P2P] 🛑 Stopping Peer Manager...")
 
-        if self._listen_thread:
-            self._listen_thread.join(timeout=2.0)
         if self._broadcast_thread:
             self._broadcast_thread.join(timeout=2.0)
 
@@ -10727,107 +10725,72 @@ class P2PPeerManager:
                 del self.peers[ip]
                 self.router_logger.log_message(f"[P2P] 👻 Peer {ip} timed out and was removed.")
 
-    def _listener_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    def handle_packet(self, packet, inbound_iface: str) -> bool:
+        """
+        Hook this into your main router's process_packet loop!
+        Returns True if the packet was a P2P packet and was consumed.
+        """
+        if not self.running:
+            return False
+
+        # Only process UDP packets destined for our P2P port
+        if not (packet.haslayer(UDP) and packet.haslayer(Raw)):
+            return False
+
+        if packet[UDP].dport != self.port:
+            return False
 
         try:
-            # Bind to all interfaces. On Windows, 0.0.0.0 is usually required to catch broadcasts.
-            sock.bind(("0.0.0.0", self.port))
+            # Extract and parse the payload
+            payload_data = packet[Raw].load.decode('utf-8')
+            payload = json.loads(payload_data)
+
+            if payload.get("magic") != self.MAGIC_HEADER:
+                return False
+
+            # Ignore our own broadcasts
+            if payload.get("node_id") == self.node_id:
+                return True  # It's ours, consume it so it doesn't get routed
+
+            sender_ip = payload.get("router_ip", "Unknown")
+
+            with self._lock:
+                is_new = sender_ip not in self.peers
+                self.peers[sender_ip] = {
+                    "node_id": payload.get("node_id"),
+                    "last_seen": time.time(),
+                    "arp_table": payload.get("arp_table", {}),
+                    "routes": payload.get("routes", [])
+                }
+
+            if is_new:
+                self.router_logger.log_message(
+                    f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})"
+                )
+
+            return True  # Successfully consumed
+
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False  # Malformed or unrelated packet
         except Exception as e:
-            self.router_logger.log_message(f"[P2P] ❌ Failed to bind listener socket: {e}")
-            self.running = False
-            return
-
-        sock.settimeout(1.0)
-
-        while self.running:
-            try:
-                data, addr = sock.recvfrom(65535)
-                sender_ip = addr[0]
-
-                payload = json.loads(data.decode('utf-8'))
-
-                if payload.get("magic") != self.MAGIC_HEADER:
-                    continue
-
-                # Ignore our own packets using the UUID, NOT the IP address.
-                if payload.get("node_id") == self.node_id:
-                    continue
-
-                with self._lock:
-                    is_new = sender_ip not in self.peers
-                    self.peers[sender_ip] = {
-                        "node_id": payload.get("node_id"),
-                        "last_seen": time.time(),
-                        "arp_table": payload.get("arp_table", {}),
-                        "routes": payload.get("routes", [])
-                    }
-
-                if is_new:
-                    self.router_logger.log_message(
-                        f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})")
-
-            except socket.timeout:
-                self._prune_dead_peers()
-                continue
-            except json.JSONDecodeError:
-                pass
-            except Exception as e:
-                if self.running:
-                    self.router_logger.log_message(f"[P2P] ⚠️ Listener error: {e}")
-
-        sock.close()
+            self.router_logger.log_message(f"[P2P] ⚠️ Packet handling error: {e}")
+            return False
 
     def _broadcaster_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        # ---------------------------------------------------------
-        # FIX: Wait for the OS to actually apply the IP address
-        # ---------------------------------------------------------
-        bound = False
-        for attempt in range(15):
-            if not self.running:
-                sock.close()
-                return
-            try:
-                sock.bind((self.router_ip, 0))
-                bound = True
-                if attempt > 0:
-                    self.router_logger.log_message(f"[P2P] ✅ Successfully bound to {self.router_ip} on attempt {attempt + 1}.")
-                break
-            except OSError as e:
-                # 10049 = WSAEADDRNOTAVAIL (Cannot assign requested address)
-                if getattr(e, 'winerror', None) == 10049 or e.errno == 10049:
-                    time.sleep(1.0)  # Give Windows a second to configure the adapter
-                else:
-                    self.router_logger.log_message(f"[P2P] ⚠️ Unexpected bind error on {self.router_ip}: {e}")
-                    break
-
-        if not bound:
-            self.router_logger.log_message(
-                f"[P2P] ⚠️ Could not bind broadcast sender to {self.router_ip} after 15 seconds. "
-                "The OS might route broadcasts out the wrong interface."
-            )
-        # ---------------------------------------------------------
-
         while self.running:
             try:
+                # 1. Gather state
                 arp_data = {}
                 if self.arp_manager:
                     raw_arp = self.arp_manager.get_cache_view()
                     for ip, val in raw_arp.items():
-                        if isinstance(val, tuple):
-                            arp_data[ip] = list(val)
-                        else:
-                            arp_data[ip] = val
+                        arp_data[ip] = list(val) if isinstance(val, tuple) else val
 
                 route_data = []
                 if self.rip_manager and hasattr(self.rip_manager, 'get_routing_table_view'):
                     route_data = self.rip_manager.get_routing_table_view()
 
+                # 2. Build Payload
                 payload = {
                     "magic": self.MAGIC_HEADER,
                     "node_id": self.node_id,
@@ -10835,9 +10798,20 @@ class P2PPeerManager:
                     "arp_table": arp_data,
                     "routes": route_data
                 }
-
                 packet_bytes = json.dumps(payload).encode('utf-8')
-                sock.sendto(packet_bytes, (self.broadcast_ip, self.port))
+
+                # 3. Construct Scapy Packet
+                pkt = IP(src=self.router_ip, dst=self.broadcast_ip) / UDP(sport=self.port, dport=self.port) / Raw(
+                    load=packet_bytes)
+
+                # 4. Blast it out using the Sniffer
+                # By providing dst_mac="ff:ff:ff:ff:ff:ff", we bypass any ARP resolution failures
+                self.sniffer.send(
+                    pkt,
+                    iface=self.out_iface,
+                    dst_mac="ff:ff:ff:ff:ff:ff",
+                    verbose=0
+                )
 
             except Exception as e:
                 if self.running:
@@ -10848,5 +10822,3 @@ class P2PPeerManager:
                 if not self.running:
                     break
                 time.sleep(0.1)
-
-        sock.close()
