@@ -10784,13 +10784,34 @@ class P2PPeerManager:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-        # Optional but recommended: explicitly bind the sending socket to your router's internal IP
-        # This forces the OS to send the broadcast out of the LAN interface, not the WAN interface.
-        try:
-            sock.bind((self.router_ip, 0))
-        except Exception as e:
+        # ---------------------------------------------------------
+        # FIX: Wait for the OS to actually apply the IP address
+        # ---------------------------------------------------------
+        bound = False
+        for attempt in range(15):
+            if not self.running:
+                sock.close()
+                return
+            try:
+                sock.bind((self.router_ip, 0))
+                bound = True
+                if attempt > 0:
+                    self.router_logger.log_message(f"[P2P] ✅ Successfully bound to {self.router_ip} on attempt {attempt + 1}.")
+                break
+            except OSError as e:
+                # 10049 = WSAEADDRNOTAVAIL (Cannot assign requested address)
+                if getattr(e, 'winerror', None) == 10049 or e.errno == 10049:
+                    time.sleep(1.0)  # Give Windows a second to configure the adapter
+                else:
+                    self.router_logger.log_message(f"[P2P] ⚠️ Unexpected bind error on {self.router_ip}: {e}")
+                    break
+
+        if not bound:
             self.router_logger.log_message(
-                f"[P2P] ⚠️ Could not bind broadcast sender to {self.router_ip}: {e}. Proceeding with default routing.")
+                f"[P2P] ⚠️ Could not bind broadcast sender to {self.router_ip} after 15 seconds. "
+                "The OS might route broadcasts out the wrong interface."
+            )
+        # ---------------------------------------------------------
 
         while self.running:
             try:
@@ -10809,7 +10830,7 @@ class P2PPeerManager:
 
                 payload = {
                     "magic": self.MAGIC_HEADER,
-                    "node_id": self.node_id,  # Added node_id
+                    "node_id": self.node_id,
                     "router_ip": self.router_ip,
                     "arp_table": arp_data,
                     "routes": route_data
@@ -10820,8 +10841,9 @@ class P2PPeerManager:
 
             except Exception as e:
                 if self.running:
-                    self.router_logger.log_message(f"[P2P] ⚠️ Broadcast error: {e}")
+                    self.router_logger.log_message(f"[P2P] ⚠️ Broadcast send error: {e}")
 
+            # Sleep in chunks to allow fast shutdown
             for _ in range(int(self.broadcast_interval * 10)):
                 if not self.running:
                     break
