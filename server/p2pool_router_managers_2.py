@@ -10649,27 +10649,28 @@ class FirewallManager:
 
 class P2PPeerManager:
     """
-    Manages peer-to-peer discovery and state sharing between multiple PythonRouters.
-    Bypasses OS sockets and uses SnifferSoftware to inject and receive Scapy packets directly.
+    Manages peer-to-peer discovery.
+    Sends via Scapy/Sniffer (L2 Injection).
+    Listens via standard OS UDP sockets (Background thread).
     """
-    MAGIC_HEADER = "PYROUTER_P2P_V2"
+    MAGIC_HEADER = "PYROUTER_P2P_V4"
 
     def __init__(self, router_logger, router_ip: str, sniffer, out_iface: str, broadcast_ip: str = "255.255.255.255",
                  port: int = 49999):
         self.router_logger = router_logger
         self.router_ip = router_ip
-        self.sniffer = sniffer
-        self.out_iface = out_iface  # The full scapy name of the interface to broadcast out of
         self.broadcast_ip = broadcast_ip
         self.port = port
-
-        # Unique ID to ignore our own broadcasts
         self.node_id = str(uuid.uuid4())
+
+        # Initialize our custom sender socket
+        self.sender_sock = PcapUDPSocket(sniffer, out_iface, router_ip, port)
 
         self.arp_manager = None
         self.rip_manager = None
 
         self.running = False
+        self._listen_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
 
@@ -10685,18 +10686,17 @@ class P2PPeerManager:
         if self.running:
             return
 
-        if not self.router_ip or not self.sniffer or not self.out_iface:
-            self.router_logger.log_message("[P2P] ❌ Cannot start Peer Manager: Missing IP, Sniffer, or Interface.")
-            return
-
         self.running = True
 
-        # Note: We no longer need a listener thread. Packets will be fed to handle_packet()
+        # Spawn both background threads
+        self._listen_thread = threading.Thread(target=self._listener_loop, daemon=True, name="P2P-Listener")
         self._broadcast_thread = threading.Thread(target=self._broadcaster_loop, daemon=True, name="P2P-Broadcaster")
+
+        self._listen_thread.start()
         self._broadcast_thread.start()
 
         self.router_logger.log_message(
-            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} via {self.out_iface.split('_')[-1]}"
+            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port}"
         )
 
     def stop(self):
@@ -10706,6 +10706,8 @@ class P2PPeerManager:
         self.running = False
         self.router_logger.log_message("[P2P] 🛑 Stopping Peer Manager...")
 
+        if self._listen_thread:
+            self._listen_thread.join(timeout=2.0)
         if self._broadcast_thread:
             self._broadcast_thread.join(timeout=2.0)
 
@@ -10725,61 +10727,67 @@ class P2PPeerManager:
                 del self.peers[ip]
                 self.router_logger.log_message(f"[P2P] 👻 Peer {ip} timed out and was removed.")
 
-    def handle_packet(self, packet, inbound_iface: str) -> bool:
-        """
-        Hook this into your main router's process_packet loop!
-        Returns True if the packet was a P2P packet and was consumed.
-        """
-        if not self.running:
-            return False
-
-        # Only process UDP packets destined for our P2P port
-        if not (packet.haslayer(UDP) and packet.haslayer(Raw)):
-            return False
-
-        if packet[UDP].dport != self.port:
-            return False
+    def _listener_loop(self):
+        """Standard Python socket listening for incoming broadcasts."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         try:
-            # Extract and parse the payload
-            payload_data = packet[Raw].load.decode('utf-8')
-            payload = json.loads(payload_data)
-
-            if payload.get("magic") != self.MAGIC_HEADER:
-                return False
-
-            # Ignore our own broadcasts
-            if payload.get("node_id") == self.node_id:
-                return True  # It's ours, consume it so it doesn't get routed
-
-            sender_ip = payload.get("router_ip", "Unknown")
-
-            with self._lock:
-                is_new = sender_ip not in self.peers
-                self.peers[sender_ip] = {
-                    "node_id": payload.get("node_id"),
-                    "last_seen": time.time(),
-                    "arp_table": payload.get("arp_table", {}),
-                    "routes": payload.get("routes", [])
-                }
-
-            if is_new:
-                self.router_logger.log_message(
-                    f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})"
-                )
-
-            return True  # Successfully consumed
-
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return False  # Malformed or unrelated packet
+            # Bind to all interfaces to catch the broadcasts
+            sock.bind(("0.0.0.0", self.port))
         except Exception as e:
-            self.router_logger.log_message(f"[P2P] ⚠️ Packet handling error: {e}")
-            return False
+            self.router_logger.log_message(f"[P2P] ❌ Failed to bind listener socket: {e}")
+            self.running = False
+            return
 
-    def _broadcaster_loop(self):
+        sock.settimeout(1.0)
+
         while self.running:
             try:
-                # 1. Gather state
+                data, addr = sock.recvfrom(65535)
+                sender_ip = addr[0]
+
+                payload = json.loads(data.decode('utf-8'))
+
+                if payload.get("magic") != self.MAGIC_HEADER:
+                    continue
+
+                # Ignore packets sent by ourselves (using UUID)
+                if payload.get("node_id") == self.node_id:
+                    continue
+
+                # It's a valid peer, update state
+                with self._lock:
+                    is_new = sender_ip not in self.peers
+                    self.peers[sender_ip] = {
+                        "node_id": payload.get("node_id"),
+                        "last_seen": time.time(),
+                        "arp_table": payload.get("arp_table", {}),
+                        "routes": payload.get("routes", [])
+                    }
+
+                if is_new:
+                    self.router_logger.log_message(
+                        f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})"
+                    )
+
+            except socket.timeout:
+                self._prune_dead_peers()
+                continue
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                if self.running:
+                    self.router_logger.log_message(f"[P2P] ⚠️ Listener error: {e}")
+
+        sock.close()
+
+    def _broadcaster_loop(self):
+        """Gathers router state and broadcasts it using the PcapUDPSocket."""
+        while self.running:
+            try:
+                # Gather state
                 arp_data = {}
                 if self.arp_manager:
                     raw_arp = self.arp_manager.get_cache_view()
@@ -10790,7 +10798,6 @@ class P2PPeerManager:
                 if self.rip_manager and hasattr(self.rip_manager, 'get_routing_table_view'):
                     route_data = self.rip_manager.get_routing_table_view()
 
-                # 2. Build Payload
                 payload = {
                     "magic": self.MAGIC_HEADER,
                     "node_id": self.node_id,
@@ -10798,27 +10805,53 @@ class P2PPeerManager:
                     "arp_table": arp_data,
                     "routes": route_data
                 }
+
                 packet_bytes = json.dumps(payload).encode('utf-8')
 
-                # 3. Construct Scapy Packet
-                pkt = IP(src=self.router_ip, dst=self.broadcast_ip) / UDP(sport=self.port, dport=self.port) / Raw(
-                    load=packet_bytes)
-
-                # 4. Blast it out using the Sniffer
-                # By providing dst_mac="ff:ff:ff:ff:ff:ff", we bypass any ARP resolution failures
-                self.sniffer.send(
-                    pkt,
-                    iface=self.out_iface,
-                    dst_mac="ff:ff:ff:ff:ff:ff",
-                    verbose=0
-                )
+                # Use our custom PcapUDPSocket to send the data
+                self.sender_sock.sendto(packet_bytes, (self.broadcast_ip, self.port))
 
             except Exception as e:
                 if self.running:
                     self.router_logger.log_message(f"[P2P] ⚠️ Broadcast send error: {e}")
 
-            # Sleep in chunks to allow fast shutdown
             for _ in range(int(self.broadcast_interval * 10)):
                 if not self.running:
                     break
                 time.sleep(0.1)
+
+
+class PcapUDPSocket:
+    """
+    A pseudo-socket that uses SnifferSoftware to inject packets directly at Layer 2.
+    This guarantees the broadcast goes out the correct interface, ignoring Windows routing.
+    """
+
+    def __init__(self, sniffer, iface_name: str, src_ip: str, src_port: int):
+        self.sniffer = sniffer
+        self.iface_name = iface_name
+        self.src_ip = src_ip
+        self.src_port = src_port
+
+        try:
+            # Assumes iface_name is the Scapy/OS name (e.g. \Device\NPF_...)
+            self.src_mac = get_if_hwaddr(iface_name.split('_')[-1])
+        except Exception:
+            self.src_mac = "02:00:00:00:00:01"
+
+    def sendto(self, data: bytes, address: tuple):
+        dst_ip, dst_port = address
+
+        if dst_ip == "255.255.255.255" or dst_ip.endswith(".255"):
+            dst_mac = "ff:ff:ff:ff:ff:ff"
+        else:
+            dst_mac = "ff:ff:ff:ff:ff:ff"
+
+        pkt = (
+                Ether(src=self.src_mac, dst=dst_mac) /
+                IP(src=self.src_ip, dst=dst_ip) /
+                UDP(sport=self.src_port, dport=dst_port) /
+                Raw(load=data)
+        )
+
+        self.sniffer.sendp(pkt, iface=self.iface_name, verbose=0)

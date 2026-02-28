@@ -1220,12 +1220,10 @@ class PythonRouterManager:
                 self.arp_manager.reply_to_arp_request(packet, inbound_iface)
                 return
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-
             if not ip_layer:
                 self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
                 return
-            if self.p2p_manager and self.p2p_manager.handle_packet(packet, inbound_iface):
-                return  # P2P Manager consumed the packet, stop routing it
+
             src_ip=None
             dst_ip=None
             if packet.haslayer(IP):
