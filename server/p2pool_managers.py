@@ -2137,7 +2137,8 @@ class PythonRouterManager:
                     router_logger=self.router_logger,
                     router_ip=self.router_ip_in,
                     broadcast_ip=broadcast_ip,
-                    sniffer=self.sniffer
+                    sniffer=self.sniffer,
+                    out_iface=self.interface_in_full_name,
                 )
                 self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
                 self.p2p_manager.start()
