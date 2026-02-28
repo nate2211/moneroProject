@@ -1673,6 +1673,8 @@ class RouterTab(QWidget):
         # [NEW] IPC Host IP field
         self.ipc_host_input = QLineEdit()
         self.ipc_host_input.setText("127.0.0.1")
+        self.peer_to_peer_checkbox = QCheckBox("Use Peer to Peer")
+        self.peer_to_peer_checkbox.setChecked(False)
         self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
         self.dhcp_out_checkbox.setChecked(True)
         self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
@@ -1680,7 +1682,7 @@ class RouterTab(QWidget):
         self.use_static_checkbox = QCheckBox("Use Static for all interfaces")
         self.use_static_checkbox.setChecked(False)
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
-        self.use_hyperv_checkbox.setChecked(True)
+        self.use_hyperv_checkbox.setChecked(False)
 
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("(optional)")
@@ -1716,6 +1718,7 @@ class RouterTab(QWidget):
         top_row_layout.addWidget(self.router_ip_out_input)
         top_row_layout.addWidget(QLabel("Netmask:"))
         top_row_layout.addWidget(self.router_netmask_out_input)
+        top_row_layout.addWidget(self.peer_to_peer_checkbox)
         top_row_layout.addWidget(self.dhcp_out_checkbox)
         top_row_layout.addWidget(self.dhcp_in_checkbox)
         top_row_layout.addWidget(self.use_static_checkbox)

@@ -381,6 +381,7 @@ class P2PoolGUI(QMainWindow):
             ipc_emit_host = self.router_tab.ipc_host_input.text().strip()
             p2pool_sever_ip = self.router_tab.p2pool_server_ip_input.text().strip()
             use_startum_comm = self.router_tab.startum_comm_checkbox.isChecked()
+            use_peer_to_peer = self.router_tab.peer_to_peer_checkbox.isChecked()
             use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
             use_static = self.router_tab.use_static_checkbox.isChecked()
@@ -388,7 +389,7 @@ class P2PoolGUI(QMainWindow):
             netmask_out = self.router_tab.router_netmask_out_input.text().strip()
             use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
             try:
-                self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host)
+                self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host, use_peer_to_peer)
             except Exception as e:
                 self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
             self.router_tab.start_router_button.setEnabled(False)

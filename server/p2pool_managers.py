@@ -52,7 +52,8 @@ from scapy.sessions import TCPSession
 from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
-    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager
+    StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
+    P2PPeerManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -180,8 +181,7 @@ class PythonRouterManager:
 
         self.packet_analyzer = PacketPipelineBlock()
 
-
-
+        self.p2p_manager = None
 
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
@@ -2022,9 +2022,10 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host, use_peer_to_peer):
         """Configures interfaces and starts all manager threads."""
         try:
+
             try:
                 self._initialize_interface_discovery()
                 if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
@@ -2127,6 +2128,18 @@ class PythonRouterManager:
                                                           "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
                                                           "PythonProxy")
                     self.stratum_connection_manager.start()
+            if use_peer_to_peer:  # Or however you pass the flag
+                # Use the IN network broadcast address if available, else generic
+                broadcast_ip = str(
+                    self.router_network_in.broadcast_address) if self.router_network_in else "255.255.255.255"
+
+                self.p2p_manager = P2PPeerManager(
+                    router_logger=self.router_logger,
+                    router_ip=self.router_ip_in,
+                    broadcast_ip=broadcast_ip
+                )
+                self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
+                self.p2p_manager.start()
             self.code_output_manager.start()
             self.code_output_manager.set_verbose(2)
             self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
@@ -2187,6 +2200,8 @@ class PythonRouterManager:
             if self.nat_manager:
                 self.nat_manager.stop()
             self.dns_manager.stop()
+            if self.p2p_manager:
+                self.p2p_manager.stop()
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")
