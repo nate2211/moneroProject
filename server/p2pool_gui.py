@@ -377,25 +377,55 @@ class P2PoolGUI(QMainWindow):
 
     def start_router(self):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
-        if self.helper.router_manager:
-            ipc_emit_host = self.router_tab.ipc_host_input.text().strip()
-            p2pool_sever_ip = self.router_tab.p2pool_server_ip_input.text().strip()
-            use_startum_comm = self.router_tab.startum_comm_checkbox.isChecked()
-            use_peer_to_peer = self.router_tab.peer_to_peer_checkbox.isChecked()
-            use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
-            use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
-            use_static = self.router_tab.use_static_checkbox.isChecked()
-            lan_ip = self.router_tab.router_ip_out_input.text().strip()
-            netmask_out = self.router_tab.router_netmask_out_input.text().strip()
-            use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
-            try:
-                self.helper.router_manager.start_routing(use_dhcp_out, use_dhcp_in, lan_ip, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host, use_peer_to_peer)
-            except Exception as e:
-                self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
-            self.router_tab.start_router_button.setEnabled(False)
-            self.router_tab.stop_router_button.setEnabled(True)
-        else:
+
+        if not self.helper.router_manager:
             self.router_logger.log_message("[GUI] Router manager not available.")
+            return
+
+        ipc_emit_host = self.router_tab.ipc_host_input.text().strip()
+        p2pool_server_ip = self.router_tab.p2pool_server_ip_input.text().strip()
+
+        use_stratum_comm = self.router_tab.stratum_comm_checkbox.isChecked()
+        use_blocknet = self.router_tab.blocknet_checkbox.isChecked()
+        use_peer_to_peer = self.router_tab.peer_to_peer_checkbox.isChecked()
+
+        use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
+        use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
+        use_static = self.router_tab.use_static_checkbox.isChecked()
+        use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
+
+        lan_ip = self.router_tab.router_ip_out_input.text().strip()
+        netmask_out = self.router_tab.router_netmask_out_input.text().strip()
+
+        blocknet_relay = self.router_tab.blocknet_relay_input.text().strip()
+        blocknet_token = self.router_tab.blocknet_token_input.text().strip()
+
+        if use_blocknet and not blocknet_relay:
+            self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
+            return
+
+        try:
+            self.helper.router_manager.start_routing(
+                use_dhcp_out=use_dhcp_out,
+                use_dhcp_in=use_dhcp_in,
+                router_ip_out=lan_ip,
+                netmask_out=netmask_out,
+                use_static=use_static,
+                use_hyperv=use_hyperv,
+                use_stratum_comm=use_stratum_comm,
+                p2pool_server_ip=p2pool_server_ip,
+                ipc_emit_host=ipc_emit_host,
+                use_peer_to_peer=use_peer_to_peer,
+                use_blocknet=use_blocknet,
+                blocknet_relay=blocknet_relay,
+                blocknet_token=blocknet_token,
+            )
+        except Exception as e:
+            self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
+            return
+
+        self.router_tab.start_router_button.setEnabled(False)
+        self.router_tab.stop_router_button.setEnabled(True)
 
     def stop_router(self):
         self.router_logger.log_message("[GUI] Requesting to stop Router...")

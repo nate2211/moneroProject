@@ -1638,132 +1638,186 @@ class WiresharkTab(QWidget):
 
 
 class RouterTab(QWidget):
-    """
-    A QWidget that encapsulates all UI elements and logic for the Router tab,
-    including categorized console panes and log filtering based on message prefixes.
-    """
-
     def __init__(self, logger, parent=None):
         super().__init__(parent)
         self.router_logger = logger
-        self._console_panes = {}  # name → QPlainTextEdit
+        self._console_panes = {}
+        self._pane_index = {}
 
         self.presets = {
-            "Full": ["General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing", "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
-                     "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher", "Notifier", "NAT/RIP/ARP/NDP/Bridge", "mDNS", "Firewall", "Packet", "Analysis"],
+            "Full": [
+                "General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing",
+                "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
+                "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher",
+                "Notifier", "NAT/RIP/ARP/NDP/Bridge", "mDNS", "Firewall", "Packet", "Analysis"
+            ],
             "Minimal": ["General"],
         }
+
         self._hot_prefix_to_pane = {
             self._norm("C++"): "C++",
         }
+
         self._create_widgets()
         self._configure_layout()
         self._connect_signals()
+
         self.router_logger.message_signal.connect(self.log_message)
 
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
         self.stop_router_button = QPushButton("Stop Router")
-        self.startum_comm_checkbox = QCheckBox("Use Stratum Comm")
-        self.startum_comm_checkbox.setChecked(False)
+        self.stop_router_button.setEnabled(False)
 
-        # New p2pool_server_ip field
-        self.p2pool_server_ip_input = QLineEdit()
-        self.p2pool_server_ip_input.setPlaceholderText("")
-        # [NEW] IPC Host IP field
-        self.ipc_host_input = QLineEdit()
-        self.ipc_host_input.setText("127.0.0.1")
+        self.stratum_comm_checkbox = QCheckBox("Use Stratum Comm")
+        self.stratum_comm_checkbox.setChecked(False)
+
+        self.blocknet_checkbox = QCheckBox("Use BlockNet")
+        self.blocknet_checkbox.setChecked(False)
+
         self.peer_to_peer_checkbox = QCheckBox("Use Peer to Peer")
         self.peer_to_peer_checkbox.setChecked(False)
-        self.dhcp_out_checkbox = QCheckBox("Use DHCP for OUT interface")
+
+        self.dhcp_out_checkbox = QCheckBox("DHCP OUT")
         self.dhcp_out_checkbox.setChecked(True)
-        self.dhcp_in_checkbox = QCheckBox("Use DHCP for IN interface")
+
+        self.dhcp_in_checkbox = QCheckBox("DHCP IN")
         self.dhcp_in_checkbox.setChecked(False)
-        self.use_static_checkbox = QCheckBox("Use Static for all interfaces")
+
+        self.use_static_checkbox = QCheckBox("Use Static (all)")
         self.use_static_checkbox.setChecked(False)
+
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(False)
 
         self.router_ip_out_input = QLineEdit()
-        self.router_ip_out_input.setPlaceholderText("(optional)")
+        self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
+
         self.router_netmask_out_input = QLineEdit()
         self.router_netmask_out_input.setText("255.255.255.0")
-        self.router_ip_out_input = QLineEdit()
-        self.router_ip_out_input.setPlaceholderText("")
+
+        self.ipc_host_input = QLineEdit()
+        self.ipc_host_input.setText("127.0.0.1")
+
+        self.p2pool_server_ip_input = QLineEdit()
+        self.p2pool_server_ip_input.setPlaceholderText("P2Pool IP:PORT (optional)")
+
+        self.blocknet_relay_input = QLineEdit()
+        self.blocknet_relay_input.setPlaceholderText("http://HOST:PORT (BlockNet Relay)")
+
+        self.blocknet_token_input = QLineEdit()
+        self.blocknet_token_input.setPlaceholderText("BlockNet Token (optional)")
+        self.blocknet_token_input.setEchoMode(QLineEdit.Password)
+
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
+
         self.add_pane_button = QPushButton("➕")
         self.remove_pane_button = QPushButton("➖")
+
         self.console_tabs = QTabWidget()
+
         self.preset_dropdown = QComboBox()
         self.preset_dropdown.addItems(self.presets.keys())
+
         self._load_presets("Full")
+        self._sync_enable_states()
 
     def _configure_layout(self):
         layout = QVBoxLayout(self)
-        # --- Top Row (Buttons, IP, Netmask, Checkboxes) ---
-        top_row_layout = QHBoxLayout()
-        top_row_layout.addWidget(self.start_router_button)
-        top_row_layout.addWidget(self.stop_router_button)
-        top_row_layout.addWidget(self.startum_comm_checkbox)
 
-        # Added P2Pool IP field and its label
-        top_row_layout.addWidget(QLabel("P2Pool IP:"))
-        top_row_layout.addWidget(self.p2pool_server_ip_input)
-        # [NEW] IPC Host
-        top_row_layout.addWidget(QLabel("IPC Host:"))
-        top_row_layout.addWidget(self.ipc_host_input)
+        top_row = QHBoxLayout()
+        top_row.addWidget(self.start_router_button)
+        top_row.addWidget(self.stop_router_button)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
 
-        top_row_layout.addWidget(QLabel("Manual LAN IP:"))
-        top_row_layout.addWidget(self.router_ip_out_input)
-        top_row_layout.addWidget(QLabel("Netmask:"))
-        top_row_layout.addWidget(self.router_netmask_out_input)
-        top_row_layout.addWidget(self.peer_to_peer_checkbox)
-        top_row_layout.addWidget(self.dhcp_out_checkbox)
-        top_row_layout.addWidget(self.dhcp_in_checkbox)
-        top_row_layout.addWidget(self.use_static_checkbox)
-        top_row_layout.addWidget(self.use_hyperv_checkbox)
-        top_row_layout.addStretch(1)
+        group_row = QHBoxLayout()
 
-        # --- Combined Pane Add/Remove + Preset Dropdown Row ---
-        pane_and_preset_layout = QHBoxLayout()
-        pane_and_preset_layout.addWidget(QLabel("Pane:"))
-        pane_and_preset_layout.addWidget(self.add_pane_input)
-        pane_and_preset_layout.addWidget(self.add_pane_button)
-        pane_and_preset_layout.addWidget(self.remove_pane_button)
-        pane_and_preset_layout.addStretch(1)
-        pane_and_preset_layout.addWidget(QLabel("Presets:"))
-        pane_and_preset_layout.addWidget(self.preset_dropdown)
+        routing_box = QGroupBox("Routing")
+        routing_form = QFormLayout(routing_box)
+        routing_form.addRow(self.dhcp_out_checkbox, self.dhcp_in_checkbox)
+        routing_form.addRow(self.use_static_checkbox, self.use_hyperv_checkbox)
+        routing_form.addRow(QLabel("Manual LAN IP:"), self.router_ip_out_input)
+        routing_form.addRow(QLabel("Netmask:"), self.router_netmask_out_input)
 
-        # --- Final Assembly ---
-        layout.addLayout(top_row_layout)
-        layout.addLayout(pane_and_preset_layout)
+        comms_box = QGroupBox("Comms")
+        comms_form = QFormLayout(comms_box)
+        comms_form.addRow(self.peer_to_peer_checkbox, self.stratum_comm_checkbox)
+        comms_form.addRow(QLabel("IPC Host:"), self.ipc_host_input)
+        comms_form.addRow(QLabel("P2Pool IP:"), self.p2pool_server_ip_input)
+
+        blocknet_box = QGroupBox("BlockNet")
+        blocknet_form = QFormLayout(blocknet_box)
+        blocknet_form.addRow(self.blocknet_checkbox)
+        blocknet_form.addRow(QLabel("Relay:"), self.blocknet_relay_input)
+        blocknet_form.addRow(QLabel("Token:"), self.blocknet_token_input)
+
+        group_row.addWidget(routing_box, 2)
+        group_row.addWidget(comms_box, 2)
+        group_row.addWidget(blocknet_box, 2)
+
+        layout.addLayout(group_row)
+
+        pane_row = QHBoxLayout()
+        pane_row.addWidget(QLabel("Pane:"))
+        pane_row.addWidget(self.add_pane_input)
+        pane_row.addWidget(self.add_pane_button)
+        pane_row.addWidget(self.remove_pane_button)
+        pane_row.addStretch(1)
+        pane_row.addWidget(QLabel("Presets:"))
+        pane_row.addWidget(self.preset_dropdown)
+
+        layout.addLayout(pane_row)
         layout.addWidget(self.console_tabs)
 
     def _connect_signals(self):
-        self.start_router_button.clicked.connect(self._on_start_router)
         self.add_pane_button.clicked.connect(self._on_add_pane)
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
-        self.use_static_checkbox.stateChanged.connect(self._on_use_static_changed)
+        self.use_static_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.dhcp_out_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.dhcp_in_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.blocknet_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.stratum_comm_checkbox.stateChanged.connect(self._sync_enable_states)
 
-    def _on_use_static_changed(self, state):
-        self.use_static = bool(state)
+    def _sync_enable_states(self):
+        use_static = self.use_static_checkbox.isChecked()
+
+        self.dhcp_out_checkbox.setEnabled(not use_static)
+        self.dhcp_in_checkbox.setEnabled(not use_static)
+
+        self.router_ip_out_input.setEnabled(not self.dhcp_out_checkbox.isChecked())
+        self.router_netmask_out_input.setEnabled(True)
+
+        use_stratum = self.stratum_comm_checkbox.isChecked()
+        self.p2pool_server_ip_input.setEnabled(use_stratum)
+
+        use_blocknet = self.blocknet_checkbox.isChecked()
+        self.blocknet_relay_input.setEnabled(use_blocknet)
+        self.blocknet_token_input.setEnabled(use_blocknet)
+
+        if not use_blocknet:
+            self.blocknet_relay_input.setText("")
+            self.blocknet_token_input.setText("")
+
+        if not use_stratum:
+            self.p2pool_server_ip_input.setText("")
+
+    def _on_preset_selected(self, preset_name: str):
+        self._load_presets(preset_name)
 
     def _load_presets(self, preset_name: str):
         panes_to_add = self.presets.get(preset_name, [])
 
-        # Remove all non-General panes
         for pane in list(self._console_panes):
             if pane != "General":
                 self._remove_console_pane(pane)
 
-        # Add new panes
         for pane in panes_to_add:
             self._add_console_pane(pane)
 
-    def _on_preset_selected(self, preset_name: str):
-        self._load_presets(preset_name)
+        self._rebuild_pane_index()
 
     def _add_console_pane(self, name: str):
         if name not in self._console_panes:
@@ -1771,12 +1825,14 @@ class RouterTab(QWidget):
             console.setReadOnly(True)
             self.console_tabs.addTab(console, name)
             self._console_panes[name] = console
+            self._rebuild_pane_index()
 
     def _remove_console_pane(self, name: str):
         if name in self._console_panes and name != "General":
             index = self.console_tabs.indexOf(self._console_panes[name])
             self.console_tabs.removeTab(index)
             del self._console_panes[name]
+            self._rebuild_pane_index()
 
     def _on_add_pane(self):
         name = self.add_pane_input.text().strip()
@@ -1792,28 +1848,20 @@ class RouterTab(QWidget):
             self._log("General", f"[UI] Removed pane: {name}")
             self.add_pane_input.clear()
 
-    def _on_start_router(self):
-        self.start_router_button.setEnabled(False)
-        self.stop_router_button.setEnabled(True)
-        self._log("General", "Router started!")
-
     def _norm(self, s: str) -> str:
-        # keep numbers/symbols; just strip whitespace + casefold
-        return ''.join(s.split()).casefold()
+        return "".join(s.split()).casefold()
 
     def _rebuild_pane_index(self):
-        # map normalized part -> list of (pane_key, depth)
         idx = {}
         for pane_key in self._console_panes:
-            for depth, part in enumerate(pane_key.split('/')):
+            for depth, part in enumerate(pane_key.split("/")):
                 n = self._norm(part)
                 idx.setdefault(n, []).append((pane_key, depth))
         self._pane_index = idx
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        prefixes = [self._norm(p) for p in re.findall(r'\[(.*?)\]', message)]
-        # Fast path: route noisy prefixes directly to their pane (C++)
+        prefixes = [self._norm(p) for p in re.findall(r"\[(.*?)\]", message)]
 
         for sprefix in reversed(prefixes):
             pane = self._hot_prefix_to_pane.get(sprefix)
@@ -1821,14 +1869,13 @@ class RouterTab(QWidget):
                 self._log(pane, message)
                 return
 
-        # Slow path: do the indexed lookup
         if not hasattr(self, "_pane_index"):
             self._rebuild_pane_index()
 
         for sprefix in reversed(prefixes):
             hits = self._pane_index.get(sprefix)
             if hits:
-                target_pane = max(hits, key=lambda x: x[1])[0]  # most specific segment
+                target_pane = max(hits, key=lambda x: x[1])[0]
                 self._log(target_pane, message)
                 return
 

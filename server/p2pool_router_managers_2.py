@@ -46,7 +46,7 @@ from scapy.packet import Packet, Raw
 from scapy.layers.inet import IP, TCP
 from scapy.sendrecv import srp1
 
-from p2pool_tools import RandomXLoader, RandomXFlags
+from randomx_ctypes import RandomX, RxUtils
 from scapy.layers.inet6 import ICMPv6NDOptPrefixInfo
 
 from p2pool_sniffer import DNSRR_AAAA, ICMPv6
@@ -58,23 +58,1105 @@ bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
 # -------------------------------------------------------------------
 
 
+@dataclass
+class ShareEvent:
+    job_id: str
+    nonce_hex: str
+    result_hex: str
+
+
+class StratumManager:
+    """
+    Local RandomX Stratum job engine.
+
+    Ingress:
+      - process_messages(session_id, msgs) where msgs are dict/list[dict]
+      - handle_packet(raw_bytes, session_id=...) where raw_bytes are newline JSON
+
+    Egress:
+      - share submits via attach_submitter(session_id, fn)
+
+    Submitter signature preferred:
+      submitter(job_id=..., nonce=..., result_hash=...)
+    Backward compat:
+      submitter(..., result=...)
+    """
+
+    NONCE_BYTE_OFFSET = 39
+
+    def __init__(self, code_output_manager: Any, logger: Any):
+        self.code_output_manager = code_output_manager
+        self.logger = logger
+
+        self._lock = threading.RLock()
+
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.session_buffers: Dict[str, bytes] = {}
+
+        self._job_queues: Dict[str, queue.Queue] = {}
+        self._stop_events: Dict[str, threading.Event] = {}
+        self._workers: Dict[str, threading.Thread] = {}
+        self._submitters: Dict[str, Callable[..., None]] = {}
+
+        # RandomX engine
+        self.rx = RandomX(logger=self.logger)
+        self._rx_seed_hex: Optional[str] = None
+
+        self.logger.log_message("[Stratum] ✅ Manager initialized (local RandomX).")
+
+    # ---------------- lifecycle ----------------
+
+    def stop(self) -> None:
+        self.logger.log_message("[Stratum] 🛑 Stopping...")
+        for sid in list(self.sessions.keys()):
+            self.deregister_session(sid)
+        self.logger.log_message("[Stratum] ✅ Stopped.")
+
+    def register_session(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self.sessions:
+                return
+            self.sessions[session_id] = {
+                "job_ver": 0,
+                "difficulty": None,
+                "seed_hash": None,
+                "current_job": None,
+                "submitted": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "last_submit_status": None,
+                "last_submit_error": None,
+            }
+            self.session_buffers[session_id] = b""
+            self._job_queues[session_id] = queue.Queue(maxsize=8)
+            self._stop_events[session_id] = threading.Event()
+
+        t = threading.Thread(
+            target=self._share_worker,
+            name=f"StratumWorker-{session_id}",
+            args=(session_id,),
+            daemon=True,
+        )
+        with self._lock:
+            self._workers[session_id] = t
+        t.start()
+        self.logger.log_message(f"[Stratum] ✅ Session registered: {session_id}")
+
+    def deregister_session(self, session_id: str) -> None:
+        with self._lock:
+            evt = self._stop_events.get(session_id)
+            if evt:
+                evt.set()
+            q = self._job_queues.get(session_id)
+
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+
+        t = None
+        with self._lock:
+            t = self._workers.get(session_id)
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+
+        with self._lock:
+            self.sessions.pop(session_id, None)
+            self.session_buffers.pop(session_id, None)
+            self._job_queues.pop(session_id, None)
+            self._stop_events.pop(session_id, None)
+            self._workers.pop(session_id, None)
+            self._submitters.pop(session_id, None)
+
+        self.logger.log_message(f"[Stratum] 🧹 Session deregistered: {session_id}")
+
+    def attach_submitter(self, session_id: str, submit_func: Callable[..., None]) -> None:
+        with self._lock:
+            self._submitters[session_id] = submit_func
+        self.logger.log_message(f"[Stratum] ✅ Submitter attached: {session_id}")
+
+    # ---------------- ingress: bytes -> json -> routed ----------------
+
+    def handle_packet(self, data: Any, session_id: str = "stratum/default") -> None:
+        """Accept bytes/str (newline JSON), or already parsed dict/list."""
+        if session_id not in self.sessions:
+            self.register_session(session_id)
+
+        if isinstance(data, (dict, list)):
+            self.process_messages(session_id, data)
+            return
+
+        if isinstance(data, str):
+            data = data.encode("utf-8", "ignore")
+        if not isinstance(data, (bytes, bytearray)):
+            return
+
+        with self._lock:
+            buf = self.session_buffers.get(session_id, b"") + bytes(data)
+
+        if len(buf) > 2_000_000:
+            self.logger.log_message(f"[Stratum] ⚠️ {session_id} buffer too large; truncating.")
+            buf = buf[-200_000:]
+
+        buf = buf.replace(b"\r\n", b"\n")
+        out_msgs: List[dict] = []
+
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            if line.lstrip()[:1] not in (b"{", b"["):
+                continue
+            try:
+                decoded = json.loads(line)
+            except Exception:
+                continue
+
+            if isinstance(decoded, dict):
+                out_msgs.append(decoded)
+            elif isinstance(decoded, list):
+                out_msgs.extend([x for x in decoded if isinstance(x, dict)])
+
+        with self._lock:
+            self.session_buffers[session_id] = buf
+
+        if out_msgs:
+            self.process_messages(session_id, out_msgs)
+
+    def process_messages(self, session_id: str, messages: Any) -> None:
+        """Accept dict or list[dict]. Routes method messages vs result/error responses."""
+        if session_id not in self.sessions:
+            self.register_session(session_id)
+
+        if isinstance(messages, dict):
+            msg_list = [messages]
+        elif isinstance(messages, list):
+            msg_list = messages
+        else:
+            return
+
+        for msg in msg_list:
+            if not isinstance(msg, dict):
+                continue
+            if "method" in msg:
+                self.ingest_stratum_json(session_id, msg)
+            else:
+                self._handle_rpc_response(session_id, msg)
+
+    def ingest_stratum_json(self, session_id: str, msg: dict) -> None:
+        method = msg.get("method")
+        params = msg.get("params")
+
+        # ✅ Your pipeline sends this everywhere
+        if method == "job":
+            if isinstance(params, dict):
+                job = self._normalize_job_obj(params)
+                if job:
+                    self._accept_job(session_id, job)
+            return
+
+        # Optional: other styles
+        if method in ("set_difficulty", "mining.set_difficulty"):
+            diff = None
+            if isinstance(params, list) and params:
+                diff = params[0]
+            elif isinstance(params, dict) and "difficulty" in params:
+                diff = params.get("difficulty")
+            with self._lock:
+                if session_id in self.sessions:
+                    self.sessions[session_id]["difficulty"] = diff
+            return
+
+        # Some pools embed job at top-level
+        if isinstance(msg.get("job"), dict):
+            job = self._normalize_job_obj(msg["job"])
+            if job:
+                self._accept_job(session_id, job)
+            return
+
+    # ---------------- rpc responses (submit accepted/rejected) ----------------
+
+    def _handle_rpc_response(self, session_id: str, msg: dict) -> None:
+        try:
+            with self._lock:
+                sess = self.sessions.get(session_id)
+            if not sess:
+                return
+
+            if msg.get("error"):
+                err = msg.get("error") or {}
+                with self._lock:
+                    sess["last_submit_error"] = err
+                    sess["rejected"] = int(sess.get("rejected", 0)) + 1
+
+                self.logger.log_message(
+                    f"[Stratum] ❗ {session_id} RPC error: {err.get('code')} {err.get('message')}"
+                )
+
+                # If low-diff, print last computed debug
+                emsg = (err.get("message") or "").lower()
+                if "low diff" in emsg:
+                    dbg = None
+                    with self._lock:
+                        dbg = (sess or {}).get("_last_share_debug")
+                    if isinstance(dbg, dict):
+                        self.logger.log_message(
+                            "[Stratum] 🔍 low-diff debug "
+                            f"job={dbg.get('job_id')} nonce={dbg.get('nonce')} "
+                            f"target_kind={dbg.get('target_kind')} target64={dbg.get('target64')} "
+                            f"jobdiff≈{dbg.get('jobdiff')} lane3={dbg.get('lane3_u64')} "
+                            f"share_diff≈{dbg.get('share_diff')} target_hex={dbg.get('target_hex')}"
+                        )
+                return
+
+            res = msg.get("result")
+
+            # login can embed job
+            if isinstance(res, dict) and isinstance(res.get("job"), dict):
+                job = self._normalize_job_obj(res["job"])
+                if job:
+                    self._accept_job(session_id, job)
+
+            if isinstance(res, dict):
+                status = (res.get("status") or res.get("state") or "").upper()
+                accepted = bool(res.get("accepted")) or (status == "OK")
+
+                looks_like_submit_ack = (
+                    ("status" in res) or ("accepted" in res) or status in ("OK", "REJECTED", "INVALID", "ERROR")
+                )
+                if looks_like_submit_ack:
+                    with self._lock:
+                        sess["last_submit_status"] = status or ("OK" if accepted else "UNKNOWN")
+                        if accepted:
+                            sess["accepted"] = int(sess.get("accepted", 0)) + 1
+                        else:
+                            sess["rejected"] = int(sess.get("rejected", 0)) + 1
+                    self.logger.log_message(
+                        f"[Stratum] 📨 {session_id} submit result: {'ACCEPTED' if accepted else (status or 'REJECTED')}"
+                    )
+        except Exception as e:
+            self.logger.log_message(f"[Stratum] ❌ _handle_rpc_response error: {type(e).__name__}: {e}")
+
+    # ---------------- job handling ----------------
+
+    def _normalize_job_obj(self, job_obj: dict) -> Optional[dict]:
+        if not isinstance(job_obj, dict):
+            return None
+
+        job_id = job_obj.get("job_id") or job_obj.get("id") or job_obj.get("jobId")
+        blob = job_obj.get("blob") or job_obj.get("blob_hex") or job_obj.get("blobHex")
+        target = job_obj.get("target") or job_obj.get("target_hex") or job_obj.get("targetHex")
+        seed_hash = job_obj.get("seed_hash") or job_obj.get("seedHash") or job_obj.get("seed")
+
+        job_id = job_id if isinstance(job_id, str) else None
+        blob = blob if isinstance(blob, str) else None
+        target = target if isinstance(target, str) else None
+        seed_hash = seed_hash if isinstance(seed_hash, str) else None
+
+        if seed_hash:
+            seed_hash = RxUtils.norm_hex(seed_hash)
+        if blob:
+            blob = RxUtils.norm_hex(blob)
+        if target:
+            target = RxUtils.norm_hex(target)
+
+        if not job_id or not blob:
+            return None
+
+        return {"job_id": job_id, "blob": blob, "target": target, "seed_hash": seed_hash}
+
+    def _accept_job(self, session_id: str, job: dict) -> None:
+        seed_hex = job.get("seed_hash")
+        if isinstance(seed_hex, str) and seed_hex:
+            self._maybe_reinit_randomx(seed_hex)
+
+        with self._lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                return
+            sess["job_ver"] = int(sess.get("job_ver", 0)) + 1
+            sess["seed_hash"] = seed_hex
+            sess["current_job"] = job
+            job_ver = int(sess["job_ver"])
+            q = self._job_queues.get(session_id)
+
+        if q is not None:
+            try:
+                q.put_nowait({"job": job, "job_ver": job_ver})
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait({"job": job, "job_ver": job_ver})
+                except Exception:
+                    pass
+
+    def _maybe_reinit_randomx(self, seed_hex: str) -> None:
+        seed_hex = RxUtils.norm_hex(seed_hex) or ""
+        if len(seed_hex) < 64:
+            return
+        seed_hex = seed_hex[:64]
+        if seed_hex == self._rx_seed_hex:
+            return
+
+        try:
+            seed = bytes.fromhex(seed_hex)
+        except Exception:
+            self.logger.log_message(f"[Stratum] ⚠️ Invalid seed_hash hex: {seed_hex!r}")
+            return
+
+        self.rx.ensure_seed(seed)
+        self._rx_seed_hex = seed_hex
+        self.logger.log_message(f"[Stratum] ✅ RandomX ready for seed {seed_hex[:12]}…")
+
+    # ---------------- hashing worker ----------------
+    @staticmethod
+    def _u64_lane3_from_hash32_le(h32: bytes) -> int:
+        """
+        XMRig-style lane selection:
+          reinterpret_cast<const uint64_t*>(hash)[3]
+        => bytes 24..31 as little-endian u64.
+        """
+        if not isinstance(h32, (bytes, bytearray)) or len(h32) != 32:
+            return 0
+        return int.from_bytes(h32[24:32], "little", signed=False)
+
+    @staticmethod
+    def _target_u64_from_pool_target_hex(target_hex: Optional[str]) -> Optional[int]:
+        """
+        Pool 'target' is commonly 4 bytes (8 hex chars) LE.
+        XMRig scales that to a 64-bit target using:
+          target64 = 0xFFFFFFFFFFFFFFFF / (0xFFFFFFFF / target32)
+        """
+        s = RxUtils.norm_hex(target_hex)
+        if not s:
+            return None
+        if len(s) % 2 == 1:
+            s = "0" + s
+
+        try:
+            raw = bytes.fromhex(s)
+        except Exception:
+            return None
+
+        if len(raw) == 4:
+            t32 = int.from_bytes(raw, "little", signed=False)
+            if t32 <= 0:
+                return None
+            denom = (0xFFFFFFFF // t32)
+            if denom <= 0:
+                return None
+            return (0xFFFFFFFFFFFFFFFF // denom)
+
+        if len(raw) >= 8:
+            return int.from_bytes(raw[:8], "little", signed=False)
+
+        return int.from_bytes(raw.ljust(8, b"\x00"), "little", signed=False)
+    @staticmethod
+    def _target_u256_from_hex_le(target_hex: Optional[str]) -> Optional[int]:
+        if not isinstance(target_hex, str) or not target_hex:
+            return None
+        s = RxUtils.norm_hex(target_hex)
+        if not s:
+            return None
+        try:
+            tb = bytes.fromhex(s)
+        except Exception:
+            return None
+        return int.from_bytes(tb, "little", signed=False)
+
+    @staticmethod
+    def _target_len_bytes(target_hex: Optional[str]) -> int:
+        if not isinstance(target_hex, str) or not target_hex:
+            return 32
+        s = RxUtils.norm_hex(target_hex)
+        return max(1, len(s) // 2) if s else 32
+
+    def _share_worker(self, session_id: str) -> None:
+        import random  # ensure imported
+
+        q = self._job_queues[session_id]
+        stop_evt = self._stop_events[session_id]
+
+        stride_seed = abs(hash(session_id)) or 1
+        stride = ((stride_seed & 0xFFFF) | 1)
+
+        vm = None
+        vm_seed = None
+
+        LOG_INTERVAL = 2.0
+        self.logger.log_message(f"[Stratum] Worker started for {session_id} (stride={stride})")
+
+        while True:
+            job_wrap = q.get()
+            if job_wrap is None or stop_evt.is_set():
+                break
+
+            job = job_wrap.get("job") if isinstance(job_wrap, dict) else None
+            my_ver = job_wrap.get("job_ver") if isinstance(job_wrap, dict) else None
+            if not isinstance(job, dict) or not isinstance(my_ver, int):
+                continue
+
+            job_id = job.get("job_id")
+            blob_hex = job.get("blob")
+            target_hex = job.get("target")
+            seed_hex = job.get("seed_hash")
+
+            if not isinstance(job_id, str) or not isinstance(blob_hex, str):
+                continue
+
+            blob_hex = RxUtils.norm_hex(blob_hex) or ""
+            if not blob_hex:
+                continue
+
+            try:
+                base = bytearray(bytes.fromhex(blob_hex))
+            except Exception as e:
+                self.logger.log_message(f"[Stratum] ❌ bad blob hex for job {job_id}: {e}")
+                continue
+
+            off = int(self.NONCE_BYTE_OFFSET)
+            if off + 4 > len(base):
+                self.logger.log_message(f"[Stratum] ❌ blob too short for nonce offset (job {job_id})")
+                continue
+
+            if isinstance(seed_hex, str) and seed_hex:
+                seed_hex = RxUtils.norm_hex(seed_hex) or None
+            if not seed_hex:
+                self.logger.log_message(f"[Stratum] ⚠️ job {job_id} missing seed_hash; waiting for next job")
+                continue
+
+            if seed_hex != self._rx_seed_hex:
+                self._maybe_reinit_randomx(seed_hex)
+
+            if vm is None or vm_seed != self._rx_seed_hex:
+                try:
+                    if vm is not None:
+                        self.rx.destroy_vm(vm)
+                except Exception:
+                    pass
+                vm = self.rx.create_vm()
+                vm_seed = self._rx_seed_hex
+
+            # -----------------------------
+            # Correct target handling
+            # -----------------------------
+            tnorm = RxUtils.norm_hex(target_hex) or ""
+            if tnorm and (len(tnorm) % 2 == 1):
+                tnorm = "0" + tnorm
+
+            tb = b""
+            if tnorm:
+                try:
+                    tb = bytes.fromhex(tnorm)
+                except Exception:
+                    tb = b""
+
+            target64: Optional[int] = None
+            target256: Optional[int] = None
+            target_kind = "none"
+
+            if tb:
+                # Pool targets are usually 4 bytes (sometimes 8). Template-style targets are longer.
+                if len(tb) <= 8:
+                    target64 = self._target_u64_from_pool_target_hex(target_hex)
+                    target_kind = f"pool_t{len(tb)}"
+                else:
+                    # Treat as 256-bit LE (pad/truncate to 32 bytes)
+                    tb32 = (tb + b"\x00" * 32)[:32]
+                    target256 = int.from_bytes(tb32, "little", signed=False)
+                    target_kind = f"tpl_t{len(tb)}"
+
+            if target64 is None and target256 is None:
+                self.logger.log_message(f"[Stratum] ⚠️ job {job_id} missing/invalid target; skipping job")
+                continue
+
+            # Helpful debug numbers
+            jobdiff = None
+            if target64 is not None and target64 > 0:
+                jobdiff = (0xFFFFFFFFFFFFFFFF // target64)
+
+            def meets_target(h32: bytes) -> bool:
+                if target256 is not None:
+                    return int.from_bytes(h32, "little", signed=False) <= target256
+                # pool-style check: lane3 u64 <= target64
+                v = self._u64_lane3_from_hash32_le(h32)
+                return v != 0 and (target64 is not None) and (v <= target64)
+
+            self.logger.log_message(
+                f"[Stratum] ▶️ Working job {job_id} on {session_id} (target={target_kind}"
+                + (f" jobdiff≈{jobdiff}" if jobdiff is not None else "")
+                + ")"
+            )
+
+            nonce = random.getrandbits(32)
+            tries = 0
+            ema = None
+            last_log = time.perf_counter()
+            submitted: set[str] = set()
+
+            while True:
+                if stop_evt.is_set():
+                    break
+
+                with self._lock:
+                    cur_ver = int(self.sessions.get(session_id, {}).get("job_ver", my_ver))
+                if cur_ver != my_ver:
+                    break
+
+                base[off:off + 4] = int(nonce).to_bytes(4, "little", signed=False)
+                h32 = self.rx.hash(vm, bytes(base))
+
+                if meets_target(h32):
+                    nonce_hex = int(nonce).to_bytes(4, "little", signed=False).hex()
+                    if nonce_hex not in submitted:
+                        submitted.add(nonce_hex)
+                        result_hex = h32.hex()
+
+                        # Save debug for rejection logs
+                        try:
+                            with self._lock:
+                                sess = self.sessions.get(session_id)
+                                if sess is not None:
+                                    v = self._u64_lane3_from_hash32_le(h32)
+                                    share_diff = (0xFFFFFFFFFFFFFFFF // v) if v else None
+                                    sess["_last_share_debug"] = {
+                                        "job_id": job_id,
+                                        "nonce": nonce_hex,
+                                        "target_hex": (tnorm or None),
+                                        "target_kind": target_kind,
+                                        "target64": target64,
+                                        "jobdiff": jobdiff,
+                                        "lane3_u64": v,
+                                        "share_diff": share_diff,
+                                    }
+                        except Exception:
+                            pass
+
+                        if self._submit_share(session_id, job_id, nonce_hex, result_hex):
+                            self.logger.log_message(f"[Stratum] 🎯 SHARE job={job_id} nonce={nonce_hex}")
+
+                nonce = (nonce + stride) & 0xFFFFFFFF
+                tries += 1
+
+                now = time.perf_counter()
+                if (now - last_log) >= LOG_INTERVAL:
+                    rate = tries / (now - last_log)
+                    ema = rate if ema is None else (0.2 * rate + 0.8 * ema)
+                    tries = 0
+                    last_log = now
+
+                    try:
+                        self.code_output_manager.submit_packet(
+                            {"job_id": job_id, "hashrate": float(ema)},
+                            inbound_iface="stratum",
+                            phase="handled",
+                            component="work",
+                        )
+                    except Exception:
+                        pass
+
+                    self.logger.log_message(f"[Stratum] ⏱️ {session_id} job {job_id}: {ema:.0f} H/s")
+
+        try:
+            if vm is not None:
+                self.rx.destroy_vm(vm)
+        except Exception:
+            pass
+
+        self.logger.log_message(f"[Stratum] 🛑 Worker stopped for {session_id}")
+    # ---------------- submit ----------------
+
+    def _submit_share(self, session_id: str, job_id: str, nonce_hex: str, result_hex: str) -> bool:
+        with self._lock:
+            submitter = self._submitters.get(session_id)
+            sess = self.sessions.get(session_id)
+
+        if not submitter:
+            return False
+
+        try:
+            if sess is not None:
+                with self._lock:
+                    sess["submitted"] = int(sess.get("submitted", 0)) + 1
+        except Exception:
+            pass
+
+        try:
+            submitter(job_id=job_id, nonce=nonce_hex, result_hash=result_hex)
+            return True
+        except TypeError:
+            pass
+
+        try:
+            submitter(job_id=job_id, nonce=nonce_hex, result=result_hex)
+            return True
+        except Exception as e:
+            self.logger.log_message(f"[Stratum] ❌ Submitter failed: {e}")
+            return False
 
 class ConnectionState(Enum):
-    """Represents the explicit state of the direct pool connection."""
     DISCONNECTED = auto()
     CONNECTING = auto()
     CONNECTED = auto()
     STOPPING = auto()
 
+
+class StratumConnectionManager:
+    """
+    - Direct connect to pool (login, read, submit)
+    - Optional proxy listener for miners (relay both ways)
+    - Forwards all decoded msgs to StratumManager.process_messages(...)
+    """
+
+    LIKELY_TLS_PORTS = {443, 3333, 5555, 7443, 8443}
+
+    def __init__(self, code_output_manager, router_logger: Any, stratum_manager: StratumManager):
+        self.code_output_manager = code_output_manager
+        self.logger = router_logger
+        self.stratum_manager = stratum_manager
+
+        self.proxy_host = "127.0.0.1"
+        self.proxy_port = 3333
+
+        self.pool_ip: Optional[str] = None
+        self.pool_port: Optional[int] = None
+        self.pool_host: Optional[str] = None
+        self.use_tls: str | bool = "auto"
+
+        self.wallet_address: Optional[str] = None
+        self.worker_name = "default"
+        self.user_agent = "pystratum/0.5"
+
+        self._threads: list[threading.Thread] = []
+        self._active_sockets: list[socket.socket] = []
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._pending_by_id: Dict[int, str] = {}
+
+        self._direct_conn_state = ConnectionState.DISCONNECTED
+        self.direct_session_id: Optional[str] = None
+        self._pool_socket: Optional[socket.socket] = None
+        self.KEEPALIVE_INTERVAL_S = 30
+        self._next_keepalive_ts = 0.0
+
+        # proxy upstream id mapping
+        self._proxy_session_ids: Dict[str, str] = {}
+
+        self.logger.log_message("[StratumConn] ✅ initialized")
+
+    def configure(
+        self,
+        pool_ip: str,
+        pool_port: int,
+        wallet: str,
+        worker: str = "default",
+        listen_port: int = 3333,
+        use_tls: str | bool = "auto",
+        pool_host: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
+        self.pool_ip = pool_ip
+        self.pool_port = int(pool_port)
+        self.wallet_address = wallet
+        self.worker_name = worker
+        self.proxy_port = int(listen_port)
+        self.use_tls = use_tls
+        self.pool_host = pool_host or pool_ip
+        if user_agent:
+            self.user_agent = user_agent
+
+        self.logger.log_message(
+            f"[StratumConn] 🎯 pool={self.pool_ip}:{self.pool_port} tls={self.use_tls} sni={self.pool_host} "
+            f"proxy={self.proxy_host}:{self.proxy_port}"
+        )
+
+    def start(self) -> None:
+        if not all([self.pool_ip, self.pool_port, self.wallet_address]):
+            self.logger.log_message("[StratumConn] ❌ missing config")
+            return
+        if self._threads:
+            return
+
+        self._stop_event.clear()
+        t1 = threading.Thread(target=self._direct_connection_loop, daemon=True, name="StratumDirectConnector")
+        t2 = threading.Thread(target=self._listen_for_miners, daemon=True, name="StratumProxyListener")
+        self._threads = [t1, t2]
+        for t in self._threads:
+            t.start()
+
+    def stop(self) -> None:
+        if not self._threads:
+            return
+        self._stop_event.set()
+        self.stratum_manager.stop()
+
+        for s in list(self._active_sockets):
+            self._close_socket(s)
+
+        for t in self._threads:
+            if t.is_alive():
+                t.join(timeout=2)
+        self._threads.clear()
+        self.logger.log_message("[StratumConn] ✅ stopped")
+
+    # ---------------- sockets ----------------
+
+    def _add_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._active_sockets.append(sock)
+
+    def _remove_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            if sock in self._active_sockets:
+                self._active_sockets.remove(sock)
+
+    def _close_socket(self, sock: Optional[socket.socket]) -> None:
+        if not sock:
+            return
+        self._remove_socket(sock)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _schedule_keepalive(self) -> None:
+        self._next_keepalive_ts = time.time() + self.KEEPALIVE_INTERVAL_S + random.uniform(-5, 5)
+
+    def _open_pool_socket(self) -> socket.socket:
+        assert self.pool_ip and self.pool_port
+
+        def connect_plain() -> socket.socket:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(10.0)
+            s.connect((self.pool_ip, self.pool_port))
+            s.settimeout(1.0)
+            self.logger.log_message("[StratumConn] 🔓 TCP")
+            return s
+
+        want_tls = (self.use_tls is True) or (self.use_tls == "auto" and self.pool_port in self.LIKELY_TLS_PORTS)
+        if not want_tls:
+            return connect_plain()
+
+        ctx = ssl.create_default_context()
+        if not self.pool_host or self.pool_host == self.pool_ip:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.logger.log_message("[StratumConn] ⚠️ TLS no hostname; disabling cert verification")
+
+        plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        plain.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        plain.settimeout(10.0)
+
+        try:
+            plain.connect((self.pool_ip, self.pool_port))
+            tls_sock = ctx.wrap_socket(plain, server_hostname=self.pool_host)
+            tls_sock.settimeout(1.0)
+            self.logger.log_message(f"[StratumConn] 🔐 TLS (SNI {self.pool_host})")
+            return tls_sock
+        except Exception as e:
+            self._close_socket(plain)
+            if self.use_tls is True:
+                raise
+            self.logger.log_message(f"[StratumConn] ⚠️ TLS failed ({type(e).__name__}); falling back to TCP")
+            return connect_plain()
+
+    # ---------------- direct connection ----------------
+
+    def _send_json_rpc_request(self, sock: socket.socket, message: dict) -> None:
+        req = (json.dumps(message) + "\n").encode("utf-8")
+        sock.sendall(req)
+        mid = message.get("id")
+        mth = message.get("method")
+        if isinstance(mid, int) and isinstance(mth, str):
+            self._pending_by_id[mid] = mth
+
+    def _send_authorize_request(self, sock: socket.socket) -> None:
+        params = {"login": self.wallet_address, "pass": "x", "agent": self.user_agent, "rigid": self.worker_name}
+        self._send_json_rpc_request(sock, {"jsonrpc": "2.0", "id": 1, "method": "login", "params": params})
+        self._schedule_keepalive()
+
+    def _send_keepalive(self, sock: socket.socket) -> None:
+        if not self.direct_session_id:
+            return
+        self._send_json_rpc_request(sock, {"jsonrpc": "2.0", "id": 2, "method": "keepalived", "params": {"id": self.direct_session_id}})
+        self._schedule_keepalive()
+
+    def submit_share(self, job_id: str, nonce: str, result_hash: str) -> None:
+        with self._lock:
+            if self._direct_conn_state != ConnectionState.CONNECTED or not self._pool_socket:
+                return
+            sock = self._pool_socket
+
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "submit",
+            "params": {"id": self.direct_session_id, "job_id": job_id, "nonce": nonce, "result": result_hash},
+        }
+        try:
+            self._send_json_rpc_request(sock, msg)
+        except OSError as e:
+            self.logger.log_message(f"[StratumConn] ❌ submit send failed: {e}")
+
+    def _parse_json_line(self, line: bytes) -> Optional[list[dict]]:
+        line = line.strip()
+        if not line.startswith((b"{", b"[")):
+            return None
+        try:
+            decoded = json.loads(line)
+            msgs = decoded if isinstance(decoded, list) else [decoded]
+            return [m for m in msgs if isinstance(m, dict)]
+        except Exception:
+            return None
+
+    def _process_received_data(self, buffer: bytes, session_id: str) -> bytes:
+        buffer = buffer.replace(b"\r\n", b"\n")
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            msgs = self._parse_json_line(line)
+            if not msgs:
+                continue
+
+            for msg in msgs:
+                # result/error response
+                if "result" in msg or "error" in msg:
+                    mid = msg.get("id")
+                    last_method = self._pending_by_id.pop(mid, None) if isinstance(mid, int) else None
+
+                    res = msg.get("result") or {}
+                    if last_method == "login" and isinstance(res, dict):
+                        sid = res.get("id")
+                        if isinstance(sid, str) and sid:
+                            self.direct_session_id = sid
+                            self.logger.log_message(f"[StratumConn] 🔑 login ok id={sid}")
+                            self._schedule_keepalive()
+
+                    # embed job
+                    if isinstance(res, dict) and isinstance(res.get("job"), dict):
+                        j = res["job"]
+                        for k in ("blob", "seed_hash", "next_seed_hash", "target"):
+                            if k in j and isinstance(j[k], str):
+                                j[k] = RxUtils.norm_hex(j[k])
+                        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": j}])
+
+                    self.stratum_manager.process_messages(session_id, [msg])
+                    continue
+
+                # method message
+                mth = (msg.get("method") or "").lower()
+                params = msg.get("params") or {}
+                if mth == "job" and isinstance(params, dict):
+                    for k in ("blob", "seed_hash", "next_seed_hash", "target"):
+                        if k in params and isinstance(params[k], str):
+                            params[k] = RxUtils.norm_hex(params[k])
+                    self.stratum_manager.process_messages(session_id, [{"method": "job", "params": params}])
+                else:
+                    self.stratum_manager.process_messages(session_id, [msg])
+
+        return buffer
+
+    def _direct_connection_loop(self) -> None:
+        DIRECT_SESSION = "direct_pool_connection"
+        reconnect = 5.0
+
+        while not self._stop_event.is_set():
+            pool = None
+            try:
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.CONNECTING
+
+                pool = self._open_pool_socket()
+                self._add_socket(pool)
+                self._pool_socket = pool
+
+                self.stratum_manager.attach_submitter(DIRECT_SESSION, self.submit_share)
+                self.stratum_manager.register_session(DIRECT_SESSION)
+
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.CONNECTED
+
+                self._send_authorize_request(pool)
+
+                buf = b""
+                while not self._stop_event.is_set():
+                    if self.direct_session_id and time.time() >= self._next_keepalive_ts:
+                        self._send_keepalive(pool)
+                    try:
+                        data = pool.recv(8192)
+                        if not data:
+                            break
+                        buf += data
+                        buf = self._process_received_data(buf, DIRECT_SESSION)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+
+            except Exception as e:
+                self.logger.log_message(f"[StratumConn] ❌ direct loop error: {e}")
+            finally:
+                try:
+                    self.stratum_manager.deregister_session(DIRECT_SESSION)
+                except Exception:
+                    pass
+                with self._lock:
+                    self._direct_conn_state = ConnectionState.DISCONNECTED
+                self._close_socket(pool)
+                self._pool_socket = None
+                self.direct_session_id = None
+
+            if not self._stop_event.is_set():
+                self._stop_event.wait(reconnect)
+                reconnect = min(reconnect * 1.5, 60.0)
+
+    # ---------------- proxy mode ----------------
+
+    def _listen_for_miners(self) -> None:
+        srv = None
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.proxy_host, self.proxy_port))
+            srv.listen(64)
+            srv.settimeout(1.0)
+            self.logger.log_message(f"[StratumConn] 👂 proxy listening {self.proxy_host}:{self.proxy_port}")
+        except OSError as e:
+            self.logger.log_message(f"[StratumConn] ❌ proxy listener failed: {e}")
+            return
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    miner, addr = srv.accept()
+                    miner.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    miner.settimeout(60.0)
+                    threading.Thread(target=self._handle_miner_session, args=(miner,), daemon=True).start()
+                except socket.timeout:
+                    continue
+        finally:
+            self._close_socket(srv)
+
+    def _handle_miner_session(self, miner_socket: socket.socket) -> None:
+        pool_socket: Optional[socket.socket] = None
+        miner_addr = miner_socket.getpeername()
+        session_id = f"proxy_{miner_addr[0]}:{miner_addr[1]}"
+        send_q: queue.PriorityQueue[tuple[int, bytes]] = queue.PriorityQueue()
+
+        try:
+            self._add_socket(miner_socket)
+            self.stratum_manager.register_session(session_id)
+
+            pool_socket = self._open_pool_socket()
+            self._add_socket(pool_socket)
+
+            # submitter for proxy session
+            def _submit_via_proxy(*, job_id: str, nonce: str, result_hash: str) -> None:
+                upstream_id = self._proxy_session_ids.get(session_id)
+                params = {"job_id": job_id, "nonce": nonce, "result": result_hash}
+                if upstream_id:
+                    params["id"] = upstream_id
+                msg = {"jsonrpc": "2.0", "id": 1, "method": "submit", "params": params}
+                send_q.put_nowait((1, (json.dumps(msg) + "\n").encode("utf-8")))
+
+            self.stratum_manager.attach_submitter(session_id, _submit_via_proxy)
+
+            threading.Thread(target=self._sender_worker, args=(send_q, pool_socket), daemon=True).start()
+            threading.Thread(target=self._relay_data, args=(miner_socket, send_q, "Miner -> Pool", session_id), daemon=True).start()
+            threading.Thread(target=self._relay_data, args=(pool_socket, miner_socket, "Pool -> Miner", session_id), daemon=True).start()
+
+        except Exception as e:
+            self.logger.log_message(f"[StratumConn] ❌ proxy session failed: {e}")
+        finally:
+            self.stratum_manager.deregister_session(session_id)
+            self._proxy_session_ids.pop(session_id, None)
+            try:
+                send_q.put_nowait((99, b""))
+            except Exception:
+                pass
+            self._close_socket(miner_socket)
+            self._close_socket(pool_socket)
+
+    def _sender_worker(self, send_queue: queue.PriorityQueue[tuple[int, bytes]], dest_socket: socket.socket) -> None:
+        while not self._stop_event.is_set():
+            try:
+                _, data = send_queue.get(timeout=1.0)
+                if not data:
+                    break
+                dest_socket.sendall(data)
+            except queue.Empty:
+                continue
+            except OSError:
+                break
+
+    def _relay_data(self, src_socket: socket.socket, dest: socket.socket | queue.PriorityQueue, direction: str, session_id: str = "") -> None:
+        while not self._stop_event.is_set():
+            try:
+                data = src_socket.recv(8192)
+                if not data:
+                    break
+
+                # parse pool->miner for upstream login id + job
+                if direction == "Pool -> Miner" and session_id:
+                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+                    for line in filter(None, lines):
+                        msgs = self._parse_json_line(line) or []
+                        for m in msgs:
+                            try:
+                                res = (m.get("result") or {})
+                                sid = res.get("id")
+                                if isinstance(sid, str) and sid:
+                                    self._proxy_session_ids[session_id] = sid
+                            except Exception:
+                                pass
+                        if msgs:
+                            self.stratum_manager.process_messages(session_id, msgs)
+
+                if isinstance(dest, queue.PriorityQueue):
+                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+                    for line in filter(None, lines):
+                        pr = 3
+                        try:
+                            decoded = json.loads(line)
+                            if isinstance(decoded, dict) and decoded.get("method") == "submit":
+                                pr = 1
+                            elif isinstance(decoded, dict) and decoded.get("method") == "job":
+                                pr = 2
+                        except Exception:
+                            pass
+                        dest.put_nowait((pr, line + b"\n"))
+                else:
+                    dest.sendall(data)
+
+            except (socket.timeout, OSError):
+                break
+            except Exception:
+                break
+
+    # ---------------- daemon synergy ----------------
+
+    def distribute_job_from_daemon(self, job: Dict[str, Any]) -> None:
+        session_id = "daemon_local"
+        for k in ("blob", "seed_hash", "target"):
+            if k in job and isinstance(job[k], str):
+                job[k] = RxUtils.norm_hex(job[k])
+        self.stratum_manager.register_session(session_id)
+        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": job}])
+
 class ZMQReader:
-    """
-    A dedicated thread for subscribing to monerod's ZeroMQ feed.
-    Forwards received messages to a callback function.
-    """
-    def __init__(self,
-                 zmq_address: str,
-                 message_handler: Callable[[bytes], None],
-                 logger: Any):
+    def __init__(self, zmq_address: str, message_handler, logger: Any):
         self.zmq_address = zmq_address
         self.message_handler = message_handler
         self.logger = logger
@@ -103,49 +1185,36 @@ class ZMQReader:
     def _run_loop(self):
         context = zmq.Context()
         socket = context.socket(zmq.SUB)
-        socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-txpool_add")
-        socket.setsockopt(zmq.SUBSCRIBE, b"json-full-txpool_add")
+        # keep broad; we just use it as “new activity” triggers
         socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-block")
         socket.setsockopt(zmq.SUBSCRIBE, b"json-full-block")
         socket.setsockopt(zmq.SUBSCRIBE, b"json-minimal-miner_data")
         socket.setsockopt(zmq.SUBSCRIBE, b"json-full-miner_data")
-        socket.RCVTIMEO = 500  # ms (so we can check stop flag regularly)
+        socket.RCVTIMEO = 500
 
         try:
             socket.connect(self.zmq_address)
             while not self._stop_event.is_set():
                 try:
-                    # Try multipart first (topic, payload)
-                    frames = socket.recv_multipart(flags=0)  # blocks up to RCVTIMEO
+                    frames = socket.recv_multipart(flags=0)
                     if not frames:
                         continue
-
                     if len(frames) >= 2:
-                        # Normalize to "topic payload" so existing handler keeps working
                         topic = frames[0]
-                        payload = b" ".join(frames[1:])  # in case of >2 frames
+                        payload = b" ".join(frames[1:])
                         self.message_handler(topic + b" " + payload)
                     else:
-                        # Single-frame: could be "topic:payload" or just "topic"
                         self.message_handler(frames[0])
-
                 except zmq.Again:
                     continue
-                except Exception as e:
-                    self.logger.log_message(f"[ZMQ] ❌ Error receiving message: {e}")
         except zmq.ZMQError as e:
-            self.logger.log_message(f"[ZMQ] ❌ Failed to connect to ZMQ socket: {e}")
+            self.logger.log_message(f"[ZMQ] ❌ connect error: {e}")
         finally:
             socket.close(0)
             context.term()
 
 
 class MoneroDaemonManager:
-    """
-    Talks to monerod: listens for ZMQ notifications, fetches new block templates via RPC,
-    distributes jobs to Stratum, and submits blocks found by workers.
-    """
-
     NONCE_BYTE_OFFSET = 39
     DEFAULT_RESERVE_SIZE = 60
     _DAEMON_SESSION_ID = "daemon_local"
@@ -155,10 +1224,11 @@ class MoneroDaemonManager:
         code_output_manager,
         daemon_url: str,
         zmq_address: str,
-        stratum_conn_manager: "StratumConnectionManager",
+        stratum_conn_manager: StratumConnectionManager,
         logger: Any,
         reserve_size: int = DEFAULT_RESERVE_SIZE,
     ):
+        self.code_output_manager = code_output_manager
         self.daemon_url = daemon_url.rstrip("/")
         self.zmq_address = zmq_address
         self.stratum_conn_manager = stratum_conn_manager
@@ -169,313 +1239,45 @@ class MoneroDaemonManager:
         self._stop_event = threading.Event()
 
         self.zmq_reader = ZMQReader(self.zmq_address, self._handle_zmq_message, self.logger)
+
         self._templates_by_job_id: Dict[str, str] = {}
         self._difficulty_by_job_id: Dict[str, int] = {}
-        self._last_distributed_fingerprint = None
-        # IMPORTANT: attach submitter for the daemon session specifically
+        self._last_fp = None
+        self._last_refresh = 0.0
+
+        # attach submitter for daemon session
         self.stratum_conn_manager.stratum_manager.attach_submitter(
             self._DAEMON_SESSION_ID, self.submit_block_to_daemon
         )
-        self.code_output_manager = code_output_manager
-    # ----- Lifecycle -----
 
     def start(self) -> None:
         if self._running:
-            self.logger.log_message("[Daemon] Manager is already running.")
             return
         self._running = True
         self._stop_event.clear()
-
-        # Start ZMQ and do an initial template fetch
         self.zmq_reader.start()
-        threading.Thread(target=self._initial_job_fetch, daemon=True).start()
-        self.logger.log_message("[Daemon] Listening for ZMQ messages...")
+        threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
+        self.logger.log_message("[Daemon] ✅ started")
 
     def stop(self) -> None:
         if not self._running:
             return
-        self.logger.log_message("[Daemon] Stopping manager...")
         self._running = False
         self._stop_event.set()
         self.zmq_reader.stop()
-
-        # Stop the daemon-local share worker in StratumManager
         try:
             self.stratum_conn_manager.stratum_manager.deregister_session(self._DAEMON_SESSION_ID)
-        except Exception as e:
-            self.logger.log_message(f"[Daemon] ⚠️ Failed to stop Stratum worker: {e}")
+        except Exception:
+            pass
+        self.logger.log_message("[Daemon] ✅ stopped")
 
-        self.logger.log_message("[Daemon] Manager stopped.")
-
-    def _initial_job_fetch(self):
-        self.logger.log_message("[Daemon] Performing initial job fetch via RPC...")
-        try:
-            self._fetch_and_distribute_job()
-        except Exception as e:
-            self.logger.log_message(f"[Daemon] ❌ Initial job fetch failed: {e}")
-
-    # ----- ZMQ -----
-
-    def _handle_zmq_message(self, raw_message: bytes):
-        """
-        Handles monerod ZMQ publications for:
-          - block/json-full-chain_main/json-minimal-block
-          - txpool_add/json-*-txpool_add
-          - miner_data/json-*-miner_data
-        Accepts both multipart (normalized by ZMQReader) and single-frame "topic:payload".
-        """
-        try:
-            topic, payload = self._split_topic_payload(raw_message)
-            nt = self._norm_topic(topic)
-
-            # Topic families (normalized with underscores)
-            block_topics = {
-                b"block",
-                b"json_full_chain_main",
-                b"json_minimal_chain_main",
-                b"json_full_block",
-                b"json_minimal_block",
-            }
-            tx_topics = {b"txpool_add", b"json_full_txpool_add", b"json_minimal_txpool_add"}
-            miner_topics = {b"miner_data", b"json_full_miner_data", b"json_minimal_miner_data"}
-
-            def _debounced_refresh(label: str, min_interval: float = 0.5):
-                now = time.time()
-                last = getattr(self, "_last_template_refresh", 0.0)
-                if now - last >= min_interval:
-                    setattr(self, "_last_template_refresh", now)
-                    self.logger.log_message(f"[Daemon] ZMQ {label} → fetching template...")
-                    threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
-
-            # ---------- Decode JSON if present ----------
-            j = None
-            if payload and payload.lstrip()[:1] in (b"{", b"["):
-                try:
-                    j = json.loads(payload.decode("utf-8", "ignore"))
-                except Exception:
-                    j = None
-
-            # ---------- Miner data ----------
-            if nt in miner_topics:
-                # Example keys: height, seed_hash, difficulty (hex), median_weight, tx_backlog[...]
-                height = None
-                seed_hash = None
-                diff_int = None
-                backlog_n = None
-                try:
-                    if isinstance(j, dict):
-                        height = j.get("height")
-                        seed_hash = j.get("seed_hash")
-                        diff_raw = j.get("difficulty")
-                        if isinstance(diff_raw, str):
-                            diff_int = int(diff_raw, 16) if diff_raw.startswith(("0x", "0X")) else int(diff_raw)
-                        backlog = j.get("tx_backlog")
-                        backlog_n = len(backlog) if isinstance(backlog, list) else None
-                except Exception:
-                    pass
-
-                # Optional: refresh template—miner_data changes (seed/diff) imply new job economics
-                _debounced_refresh("miner_data", min_interval=1.0)
-
-                # Surface for UI/metrics
-                try:
-                    self.code_output_manager.submit_packet(
-                        {
-                            "topic": topic.decode("utf-8", "ignore"),
-                            "height": height,
-                            "seed_hash": seed_hash,
-                            "difficulty": diff_int,
-                            "tx_backlog_len": backlog_n,
-                        },
-                        inbound_iface="daemon",
-                        phase="handled",
-                        component="daemon-miner-data",
-                    )
-                except Exception:
-                    pass
-
-                self.logger.log_message(
-                    f"[Daemon] ZMQ miner_data h={height} diff={diff_int} backlog={backlog_n}"
-                )
-                return
-
-            # ---------- Block / chain_main ----------
-            if nt in block_topics:
-                _debounced_refresh("new block")
-
-                height = None
-                block_hash = None
-                reward = None
-                ts = int(time.time())
-                tx_count = None
-
-                if isinstance(j, dict):
-                    height = self._peek(j, "height", ("block_header", "height"))
-                    block_hash = self._peek(j, "hash", ("block_header", "hash"))
-                    reward = self._peek(j, "reward", ("block_header", "reward"), "block_reward")
-                    ts = self._peek(j, "timestamp", ("block_header", "timestamp"), default=ts)
-                    txs_hashes = self._peek(j, "tx_hashes")
-                    txs_full = self._peek(j, "txs")
-                    if isinstance(txs_hashes, list):
-                        tx_count = len(txs_hashes)
-                    elif isinstance(txs_full, list):
-                        tx_count = len(txs_full)
-
-                elif isinstance(j, list) and j:
-                    # json-full-chain_main sometimes emits a one-element array
-                    elem = j[0] if isinstance(j[0], dict) else None
-                    if elem:
-                        height = self._peek(elem, "height", ("block_header", "height"))
-                        block_hash = self._peek(elem, "hash", ("block_header", "hash"))
-                        reward = self._peek(elem, "reward", ("block_header", "reward"), "block_reward")
-                        ts = self._peek(elem, "timestamp", ("block_header", "timestamp"), default=ts)
-                        txs_hashes = self._peek(elem, "tx_hashes")
-                        txs_full = self._peek(elem, "txs")
-                        if isinstance(txs_hashes, list):
-                            tx_count = len(txs_hashes)
-                        elif isinstance(txs_full, list):
-                            tx_count = len(txs_full)
-
-                # Update local chain snapshot for stale analytics
-                try:
-                    if height is not None:
-                        self._last_block_height = int(height)
-                    self._last_block_ts = float(ts) if ts is not None else time.time()
-                except Exception:
-                    pass
-
-                # Optional UI packet
-                try:
-                    self.code_output_manager.submit_packet(
-                        {
-                            "topic": topic.decode("utf-8", "ignore"),
-                            "height": height,
-                            "hash": block_hash,
-                            "reward": reward,
-                            "tx_count": tx_count,
-                            "timestamp": ts,
-                        },
-                        inbound_iface="daemon",
-                        phase="handled",
-                        component="daemon-block",
-                    )
-                except Exception:
-                    pass
-
-                h_disp = f"h={height}" if height is not None else "h=?"
-                tx_disp = f", txs={tx_count}" if tx_count is not None else ""
-                rw_disp = f", reward={reward}" if reward is not None else ""
-                self.logger.log_message(f"[Daemon] ZMQ block {h_disp}{tx_disp}{rw_disp}")
-                return
-
-            # ---------- Tx pool add ----------
-            if nt in tx_topics:
-                _debounced_refresh("txpool_add")
-                tx_hash = fee = size = receive_time = None
-
-                if isinstance(j, dict):
-                    tx_hash = self._peek(j, "tx_hash", "hash")
-                    fee = self._peek(j, "fee", ("tx", "rct_signatures", "fee"))
-                    size = self._peek(j, "size", ("tx", "size"))
-                    receive_time = self._peek(j, "receive_time", "timestamp")
-                else:
-                    # Fallback for bare "txpool_add" (non-JSON): payload is often raw 32-byte txid
-                    try:
-                        # our ZMQReader joined extra frames already; if you change it to keep frames,
-                        # handle the second frame explicitly here
-                        if payload and len(payload) in (32, 64):  # 32 bytes or 64 hex chars
-                            tx_hash = payload.hex() if len(payload) == 32 else payload.decode("ascii", "ignore")
-                        elif payload and all(c in b"0123456789abcdef" for c in payload.strip().lower()) and len(
-                                payload.strip()) in (64, 66):
-                            tx_hash = payload.strip().decode("ascii", "ignore").lstrip("0x")
-                    except Exception:
-                        pass
-
-                h = (tx_hash[:10] + "…") if isinstance(tx_hash, str) and len(tx_hash) > 10 else (tx_hash or "?")
-                self.logger.log_message(f"[Daemon] ZMQ txpool_add tx={h} fee={fee} size={size}")
-                return
-
-            # ---------- Unknown topic ----------
-            if payload:
-                if payload.lstrip()[:1] in (b"{", b"["):
-                    try:
-                        jj = json.loads(payload.decode("utf-8", "ignore"))
-                        k = list(jj) if isinstance(jj, dict) else (["list"] if isinstance(jj, list) else [])
-                        self.logger.log_message(f"[Daemon] ZMQ {topic!r} (json keys={k[:4]})")
-                    except Exception:
-                        self.logger.log_message(f"[Daemon] ZMQ {topic!r} ({len(payload)}B json-like payload)")
-                else:
-                    self.logger.log_message(f"[Daemon] ZMQ {topic!r} ({len(payload)}B non-json payload)")
-            else:
-                self.logger.log_message(f"[Daemon] ZMQ {topic!r} (no payload)")
-
-        except Exception as e:
-            self.logger.log_message(f"[Daemon] ⚠️ Malformed ZMQ message received: {e}")
-
-    @staticmethod
-    def _norm_topic(t: bytes) -> bytes:
-        # Lowercase and unify separators so json-full-chain_main == json-full-chain-main
-        return t.strip().lower().replace(b"-", b"_")
-
-    @staticmethod
-    def _split_topic_payload(raw: bytes) -> tuple[bytes, bytes]:
-        """
-        Accepts:
-          • "topic payload"
-          • "topic:payload"
-          • "topic" (no payload)
-        Returns (topic, payload)
-        """
-        raw = (raw or b"").strip()
-        if not raw:
-            return b"", b""
-
-        # Prefer space once (older code path)
-        if b" " in raw:
-            t, p = raw.split(b" ", 1)
-            return t.strip(), p
-
-        # Fallback: colon form (as seen in your logs)
-        i = raw.find(b":")
-        if i != -1:
-            t, p = raw[:i], raw[i + 1:]
-            return t.strip(), p
-
-        # Topic only
-        return raw, b""
-    @staticmethod
-    def _peek(d: dict, *keys, default=None):
-        """Try multiple paths; returns first found non-None value."""
-        for k in keys:
-            try:
-                # support nested "a.b.c" or tuple path
-                if isinstance(k, (tuple, list)):
-                    cur = d
-                    ok = True
-                    for part in k:
-                        if not isinstance(cur, dict) or part not in cur:
-                            ok = False
-                            break
-                        cur = cur[part]
-                    if ok and cur is not None:
-                        return cur
-                elif isinstance(k, str) and "." in k:
-                    cur = d
-                    ok = True
-                    for part in k.split("."):
-                        if not isinstance(cur, dict) or part not in cur:
-                            ok = False
-                            break
-                        cur = cur[part]
-                    if ok and cur is not None:
-                        return cur
-                else:
-                    if isinstance(d, dict) and k in d and d[k] is not None:
-                        return d[k]
-            except Exception:
-                pass
-        return default
-    # ----- RPC -----
+    def _handle_zmq_message(self, raw: bytes):
+        # debounce: don’t spam RPC
+        now = time.time()
+        if (now - self._last_refresh) < 0.5:
+            return
+        self._last_refresh = now
+        threading.Thread(target=self._fetch_and_distribute_job, daemon=True).start()
 
     def _rpc_call(self, method: str, params: Optional[Any] = None) -> Dict[str, Any]:
         headers = {"Content-Type": "application/json"}
@@ -483,57 +1285,40 @@ class MoneroDaemonManager:
         r = requests.post(f"{self.daemon_url}/json_rpc", data=json.dumps(payload), headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()
-        if "error" in data and data["error"]:
+        if data.get("error"):
             err = data["error"]
-            code = err.get("code")
-            msg = err.get("message") or str(err)
-            raise RuntimeError(f"RPC {method} error {code}: {msg}")
+            raise RuntimeError(f"RPC {method} error {err.get('code')}: {err.get('message')}")
         return data
 
-    # ----- Template fetch / distribution -----
-    def _tpl_fingerprint(self, *, height: int, prev_hash: str, seed_hash: str | None,
-                         target_hex: str, blob_hex: str) -> tuple:
-        # short, stable de-dup key
-        try:
-            import hashlib
-            h8 = hashlib.blake2b(bytes.fromhex(blob_hex), digest_size=8).hexdigest()
-        except Exception:
-            h8 = hex(len(blob_hex) // 2)[2:]
-        return (int(height), (prev_hash or "")[:16], (seed_hash or "")[:16], target_hex[:16], h8)
+    def _fingerprint(self, height: int, prev_hash: str, seed_hash: str, target_hex: str, blob_hex: str) -> tuple:
+        return (height, prev_hash[:16], seed_hash[:16], target_hex[:16], len(blob_hex))
 
-    # --- replace _fetch_and_distribute_job with this version (or merge diffs) ---
     def _fetch_and_distribute_job(self) -> None:
         wa = (self.stratum_conn_manager.wallet_address or "").strip()
         if not wa:
-            self.logger.log_message("[Daemon] ❌ No wallet_address configured; cannot request block template.")
+            self.logger.log_message("[Daemon] ❌ no wallet_address configured")
             return
 
-        reserve = int(self.reserve_size)
-        if reserve < 0 or reserve > 127:
-            self.logger.log_message(f"[Daemon] ⚠️ reserve_size {reserve} out of range; clamping to 60.")
-            reserve = 60
-
+        reserve = max(0, min(127, int(self.reserve_size)))
         params = {"wallet_address": wa, "reserve_size": reserve}
 
         try:
             resp = self._rpc_call("get_block_template", params)
             res = resp.get("result") or {}
-            needed = ("blocktemplate_blob", "height")
-            if not all(k in res for k in needed):
-                self.logger.log_message("[Daemon] ⚠️ Template missing required fields (daemon syncing or wrong net?).")
+            tpl = RxUtils.norm_hex(res.get("blocktemplate_blob"))
+            if not tpl:
                 return
 
-            tpl = RandomXLoader.norm_hex(res["blocktemplate_blob"])
-            if not tpl or (len(tpl) % 2 != 0):
-                self.logger.log_message("[Daemon] ⚠️ Invalid blocktemplate_blob from daemon.")
-                return
+            height = int(res.get("height", 0))
+            prev_hash = RxUtils.norm_hex(res.get("prev_hash") or "") or ""
+            seed_hash = RxUtils.norm_hex(res.get("seed_hash") or "") or ""
 
-            # Difficulty (prefer wide_difficulty, accept hex or decimal)
+            # difficulty (wide preferred)
             D = None
             wide = res.get("wide_difficulty")
-            if isinstance(wide, (str, int)) and str(wide).strip():
-                ws = str(wide).strip()
+            if wide is not None:
                 try:
+                    ws = str(wide).strip()
                     D = int(ws, 16) if ws.lower().startswith("0x") else int(ws)
                 except Exception:
                     D = None
@@ -541,1633 +1326,76 @@ class MoneroDaemonManager:
                 low = int(res.get("difficulty", 0))
                 high = int(res.get("difficulty_top64", 0))
                 D = (high << 64) | low
+
             if not isinstance(D, int) or D <= 0:
-                self.logger.log_message("[Daemon] ⚠️ Difficulty missing/invalid.")
                 return
 
-            height = int(res["height"])
-            seed_hash = RandomXLoader.norm_hex(res.get("seed_hash"))
-            seed_height = res.get("seed_height")
-            prev_hash = RandomXLoader.norm_hex(res.get("prev_hash")) or ""
-            reserved_offset = int(res.get("reserved_offset", 0))
+            target_hex = RxUtils.target_hex_from_difficulty(D)
 
-            # Compute target from difficulty (LE hex, 32 bytes)
-            target_hex = RandomXLoader.target_hex_from_difficulty(D)
-            if not isinstance(target_hex, str) or len(target_hex) not in (16, 64):
-                self.logger.log_message("[Daemon] ⚠️ Computed target has unexpected length.")
+            fp = self._fingerprint(height, prev_hash, seed_hash, target_hex, tpl)
+            if fp == self._last_fp:
                 return
+            self._last_fp = fp
 
-            # Sanity: Nonce position and reserve bounds
-            blob_len_bytes = len(tpl) // 2
-            nonce_off = self.NONCE_BYTE_OFFSET
-            if blob_len_bytes < (nonce_off + 4):
-                self.logger.log_message("[Daemon] ⚠️ Blob too short to contain nonce at expected offset.")
-                return
+            job_id = f"daemon-{height}-{prev_hash[:16]}-{int(time.time()*1000)%1_000_000:06d}"
 
-            # Validate reserve window
-            reserve_size = int(self.reserve_size)
-            if reserve_size < 0: reserve_size = 0
-            if reserved_offset <= 0:
-                # Older/alt nodes may omit; fall back to end of blob
-                reserved_offset = blob_len_bytes  # no reserved region in coinbase extra
-            if reserved_offset + reserve_size > blob_len_bytes:
-                new_size = max(0, blob_len_bytes - reserved_offset)
-                self.logger.log_message(
-                    f"[Daemon] ⚠️ reserve window {reserved_offset}+{reserve_size} > {blob_len_bytes}; clamping to {new_size}."
-                )
-                reserve_size = new_size
-
-            # De-dup identical templates (height/prev/seed/target/blob hash)
-            fp = self._tpl_fingerprint(height=height, prev_hash=prev_hash, seed_hash=seed_hash,
-                                       target_hex=target_hex, blob_hex=tpl)
-            if fp == getattr(self, "_last_distributed_fingerprint", None):
-                self.logger.log_message("[Daemon] ⏸️ Template unchanged; not redistributing job.")
-                return
-            self._last_distributed_fingerprint = fp
-
-            # Synthesize job_id
-            job_id = f"daemon-{height}-{prev_hash[:16]}-{int(time.time() * 1000) % 1_000_000:06d}"
-
-            # Stratum job payload (carry useful extras)
-            stratum_job = {
+            job = {
                 "id": job_id,
                 "blob": tpl,
                 "target": target_hex,
                 "height": height,
                 "difficulty": D,
                 "seed_hash": seed_hash,
-                "seed_height": seed_height,
                 "prev_hash": prev_hash,
-                "reserved_offset": reserved_offset,
-                "reserve_size": reserve_size,
-                # Optional: some pools like to see where the nonce is (debug/metrics)
                 "nonce_byte_offset": self.NONCE_BYTE_OFFSET,
             }
 
-            # Cache + distribute
             self._templates_by_job_id[job_id] = tpl
             self._difficulty_by_job_id[job_id] = D
-            self._cleanup_templates()
 
-            self.stratum_conn_manager.distribute_job_from_daemon(stratum_job)
-            self.code_output_manager.submit_packet(
-                {
-                    "job_id": job_id,
-                    "height": height,
-                    "difficulty": D,
-                    "target": target_hex,
-                    "seed_hash": seed_hash,
-                    "prev_hash": prev_hash,
-                    "reserved_offset": reserved_offset,
-                    "reserve_size": reserve_size,
-                },
-                inbound_iface="daemon",
-                phase="handled",
-                component="daemon-job",
-            )
-            self.logger.log_message(
-                f"[Daemon] ✅ Distributed new job {job_id} (h={height}, diff={D}, seed={str(seed_hash)[:12]}…)."
-            )
+            self.stratum_conn_manager.distribute_job_from_daemon(job)
+            self.logger.log_message(f"[Daemon] ✅ distributed job {job_id} h={height} diff={D}")
 
-        except requests.exceptions.RequestException as e:
-            self.logger.log_message(f"[Daemon] ❌ Network error fetching template: {e}")
         except Exception as e:
-            self.logger.log_message(f"[Daemon] ❌ Error preparing job: {type(e).__name__}: {e}")
-    # ----- Submission -----
+            self.logger.log_message(f"[Daemon] ❌ job fetch error: {type(e).__name__}: {e}")
 
-    def submit_block_to_daemon(self, job_id: str, nonce: str, result_hash: str) -> None:
+    def submit_block_to_daemon(self, *, job_id: str, nonce: str, result_hash: str) -> None:
         try:
-
             tpl = self._templates_by_job_id.get(job_id)
             if not tpl:
-                self.logger.log_message(f"[Daemon] ⚠️ Missing template for job {job_id}; unable to submit.")
+                self.logger.log_message(f"[Daemon] ⚠️ missing template for {job_id}")
                 return
 
-            nonce = RandomXLoader.norm_hex(nonce)
-            if not nonce or len(nonce) != 8:
-                raise ValueError(f"Invalid nonce hex (need 8 chars LE): {nonce!r}")
+            nonce = RxUtils.norm_hex(nonce) or ""
+            if len(nonce) != 8:
+                raise ValueError("nonce must be 4 bytes LE (8 hex chars)")
 
-            off = self.NONCE_BYTE_OFFSET * 2  # hex chars index
-            if len(tpl) < off + 8:
-                raise ValueError("Template blob too short to write nonce.")
-
+            off = self.NONCE_BYTE_OFFSET * 2
             full_blob_hex = tpl[:off] + nonce + tpl[off + 8:]
 
-            # Optional: client-side difficulty check before RPC submit
-            difficulty = self._difficulty_by_job_id.get(job_id)
-            if difficulty:
-                t_int = RandomXLoader.target_from_difficulty_int(difficulty)
-                hb = bytes.fromhex(result_hash)
-                if int.from_bytes(hb, "little") > t_int:
-                    self.logger.log_message(f"[Daemon] ⚠️ Share for job {job_id} doesn’t meet difficulty. Not submitting.")
+            # client-side diff check (optional)
+            D = self._difficulty_by_job_id.get(job_id)
+            if D:
+                target_int = RxUtils.target_from_difficulty_int(D)
+                hb = bytes.fromhex(RxUtils.norm_hex(result_hash) or "")
+                if int.from_bytes(hb, "little") > target_int:
+                    self.logger.log_message(f"[Daemon] ⚠️ share below diff; not submitting")
                     return
-                self.logger.log_message(f"[Daemon] Verifying share for job {job_id} meets difficulty {difficulty}.")
 
             resp = self._rpc_call("submit_block", [full_blob_hex])
             status = (resp.get("result") or {}).get("status", "")
             if status.upper() == "OK":
-                self.logger.log_message(f"[Daemon] ✅ Block accepted by daemon for job {job_id}.")
+                self.logger.log_message(f"[Daemon] ✅ block accepted for job {job_id}")
                 self._templates_by_job_id.pop(job_id, None)
                 self._difficulty_by_job_id.pop(job_id, None)
             else:
-                err = resp.get("error") or {}
-                self.logger.log_message(f"[Daemon] ❗ Block submission not OK for job {job_id}: {status or err}")
-            self.code_output_manager.submit_packet(
-                {
-                    "job_id": job_id,
-                    "nonce": nonce,
-                    "result_hash": result_hash,
-                    "status": status,
-                },
-                inbound_iface="daemon",
-                phase="handled",
-                component="daemon-submit"
-            )
-        except requests.exceptions.RequestException as e:
-            self.logger.log_message(f"[Daemon] ❌ Network error submitting block: {e}")
-        except Exception as e:
-            self.logger.log_message(f"[Daemon] ❌ Error submitting block: {type(e).__name__}: {e}")
-
-    # ----- Cache -----
-
-    def _cleanup_templates(self):
-        # keep cache bounded
-        if len(self._templates_by_job_id) > 100:
-            oldest = next(iter(self._templates_by_job_id))
-            self._templates_by_job_id.pop(oldest, None)
-            self._difficulty_by_job_id.pop(oldest, None)
-            self.logger.log_message("[Daemon] Cleaning up old block template cache.")
-
-
-
-class StratumConnectionManager:
-    """
-    Dual-mode Stratum proxy + direct-pool connector.
-    Forwards parsed messages to StratumManager; accepts local jobs from MoneroDaemonManager.
-    """
-    MONERO_ALLOWED_METHODS = {"login", "submit", "job", "keepalived", "getjob"}
-    LIKELY_TLS_PORTS = {443, 3333, 5555, 7443, 8443}
-
-    def __init__(self, code_output_manager, router_logger: Any, stratum_manager: "StratumManager", packet_processor_callback: Callable):
-        import threading as _th
-        self.logger = router_logger
-        self.stratum_manager = stratum_manager
-        self.packet_processor = packet_processor_callback
-        self.code_output_manager = code_output_manager
-        # Proxy listener
-        self.proxy_host = "127.0.0.1"
-        self.proxy_port = 3333
-
-        # Pool config
-        self.pool_ip: Optional[str] = None
-        self.pool_port: Optional[int] = None
-        self.pool_host: Optional[str] = None  # For TLS SNI
-        self.use_tls: str | bool = "auto"
-        self.wallet_address: Optional[str] = None
-        self.worker_name = "default"
-        self.user_agent = "pystratum/0.5-synergy"
-
-        # State
-        self._threads: list[_th.Thread] = []
-        self._active_sockets: list[socket.socket] = []
-        self._stop_event = _th.Event()
-        self._lock = _th.Lock()
-        self._pending_by_id: Dict[int, str] = {}
-
-        # Direct connection
-        self._direct_conn_state = ConnectionState.DISCONNECTED
-        self.direct_session_id: Optional[str] = None
-        self._pool_socket: Optional[socket.socket] = None
-        self.KEEPALIVE_INTERVAL_S = 30
-        self._next_keepalive_ts = 0.0
-
-        # NEW: track upstream pool session ids for proxy sessions
-        self._proxy_session_ids: Dict[str, str] = {}
-
-        self.logger.log_message("[StratumConn] ⛏️ Synergized Dual-Mode Manager initialized.")
-
-    # ----- Config / lifecycle -----
-
-    def configure(
-        self,
-        pool_ip: str,
-        pool_port: int,
-        wallet: str,
-        worker: str = "default",
-        listen_port: int = 3333,
-        use_tls: str | bool = "auto",
-        pool_host: Optional[str] = None,
-        user_agent: Optional[str] = None,
-    ) -> None:
-        self.pool_ip = pool_ip
-        self.pool_port = pool_port
-        self.wallet_address = wallet
-        self.worker_name = worker
-        self.proxy_port = listen_port
-        self.use_tls = use_tls
-        self.pool_host = pool_host or pool_ip
-        if user_agent:
-            self.user_agent = user_agent
-
-        self.logger.log_message(
-            f"[StratumConn] 🎯 Configured for pool {self.pool_ip}:{self.pool_port} "
-            f"(TLS={self.use_tls}, SNI={self.pool_host}). "
-            f"Proxy listening on {self.proxy_host}:{self.proxy_port}"
-        )
-
-        # Ensure RandomX is ready before work arrives
-        self.stratum_manager.rx_start()
-
-    def start(self) -> None:
-        if not all([self.pool_ip, self.wallet_address, self.pool_port]):
-            self.logger.log_message("[StratumConn] ❌ Cannot start: Configuration is incomplete.")
-            return
-        if self._threads:
-            self.logger.log_message("[StratumConn] Manager is already running.")
-            return
-
-        self._stop_event.clear()
-        t1 = threading.Thread(target=self._direct_connection_loop, daemon=True, name="StratumDirectConnector")
-        t2 = threading.Thread(target=self._listen_for_miners, daemon=True, name="StratumProxyListener")
-        self._threads.extend([t1, t2])
-        t1.start()
-        t2.start()
-
-    def stop(self) -> None:
-        if not self._threads:
-            return
-        self.logger.log_message("[StratumConn] 🛑 Stopping all operations...")
-        self._stop_event.set()
-        self.stratum_manager.stop()
-
-        for s in list(self._active_sockets):
-            self._close_socket(s)
-
-        for t in self._threads:
-            if t.is_alive():
-                t.join(timeout=2)
-        self._threads.clear()
-        self.logger.log_message("[StratumConn] ✅ All operations stopped.")
-
-
-    def handle_packet(self, packet: "Any", inbound_iface: str = "stratum") -> bool:
-        """
-        Lightweight ingress for Stratum-like traffic coming from the router pipeline/sniffer.
-        Forwards JSON-RPC bytes to StratumManager.handle_packet with a stable session_id.
-
-        Returns True if this looked like Stratum and was forwarded/consumed; False otherwise.
-        """
-        try:
-            # Fast-path: direct byte/str/dict events from other components
-            if isinstance(packet, (bytes, bytearray)):
-                self.stratum_manager.handle_packet(bytes(packet), session_id="stratum/default")
-                return True
-            if isinstance(packet, str):
-                self.stratum_manager.handle_packet(packet.encode("utf-8", "ignore"), session_id="stratum/default")
-                return True
-            if isinstance(packet, dict):
-                # Common envelope fields (payload/data/message/raw/body)
-                for k in ("payload", "data", "message", "raw", "body"):
-                    if k in packet:
-                        v = packet[k]
-                        if isinstance(v, (bytes, bytearray)):
-                            self.stratum_manager.handle_packet(bytes(v), session_id="stratum/default")
-                            return True
-                        if isinstance(v, str):
-                            self.stratum_manager.handle_packet(v.encode("utf-8", "ignore"),
-                                                               session_id="stratum/default")
-                            return True
-                # Already-parsed JSON-RPC dict/list? Forward as-is.
-                self.stratum_manager.handle_packet(packet, session_id="stratum/default")
-                return True
-
-            # Scapy path (TCP only)
-            if not hasattr(packet, "haslayer"):
-                return False
-
-            # Import lazily to avoid top-level dependency
-            try:
-                from scapy.layers.inet import IP, TCP
-                from scapy.layers.inet6 import IPv6
-                from scapy.packet import Raw
-            except Exception:
-                return False
-
-            if not packet.haslayer(TCP):
-                return False
-
-            tcp = packet[TCP]
-            sport = int(tcp.sport)
-            dport = int(tcp.dport)
-
-            # Only consider flows that touch our known Stratum endpoints
-            relevant_ports = {self.proxy_port}
-            if self.pool_port:
-                relevant_ports.add(int(self.pool_port))
-            if sport not in relevant_ports and dport not in relevant_ports:
-                return False
-
-            # Need payload
-            if not packet.haslayer(Raw):
-                self._rl_log("no_raw",
-                             f"[StratumConn] ⚠️ handle_packet: TCP flow {sport}->{dport} has no Raw payload; skipping.")
-                return False
-
-            raw = packet[Raw].load
-            if not raw:
-                self._rl_log("empty_raw",
-                             f"[StratumConn] ⚠️ handle_packet: Empty TCP payload on {sport}->{dport}; skipping.")
-                return False
-
-            # Quick sniff: if it obviously isn't JSON at start, it's likely TLS or binary → ignore.
-            # (We still let direct socket loops handle the true upstream pool traffic.)
-            first = raw[:1]
-            if first not in (b"{", b"["):
-                # Occasionally pools send \n-delimited JSON preceded by whitespace
-                peek = raw.lstrip()[:1]
-                if peek not in (b"{", b"["):
-                    # Not JSON-looking; treat as non-Stratum content on these ports.
-                    self._rl_log("non_json",
-                                 f"[StratumConn] ℹ️ Non-JSON TCP bytes on {sport}->{dport}; probable TLS/binary. Suppressing.")
-                    return False
-
-            # Build a stable session id from the 5-tuple so multiple miners are isolated
-            sip, dip = None, None
-            if packet.haslayer(IP):
-                ip = packet[IP]
-                sip, dip = ip.src, ip.dst
-            elif packet.haslayer(IPv6):
-                ip6 = packet[IPv6]
-                sip, dip = ip6.src, ip6.dst
-            sess = self._flow_session_id(sip, sport, dip, dport)
-
-            # Forward just the bytes to StratumManager (it will buffer & parse)
-            self.stratum_manager.handle_packet(bytes(raw), session_id=sess)
-            # Optional: mirror to code_output_manager for visibility
-            try:
-                self.code_output_manager.submit_packet(
-                    bytes(raw),
-                    inbound_iface=inbound_iface,
-                    phase="ingress",
-                    component="stratum-conn"
-                )
-            except Exception:
-                pass
-            return True
+                self.logger.log_message(f"[Daemon] ❗ submit not OK: {status or resp.get('error')}")
 
         except Exception as e:
-            self.logger.log_message(f"[StratumConn] ❗ handle_packet error: {type(e).__name__}: {e}")
-            return False
+            self.logger.log_message(f"[Daemon] ❌ submit error: {type(e).__name__}: {e}")
 
-    def _flow_session_id(self, sip: "Optional[str]", sport: int, dip: "Optional[str]", dport: int) -> str:
-        """
-        Deterministic session id for proxy/upstream flows so per-miner buffers don't collide.
-        """
-        # Tag direction to keep client/server halves distinct if needed
-        if sip and dip:
-            return f"flow/{sip}:{sport}->{dip}:{dport}"
-        return "stratum/default"
 
-    def _rl_log(self, key: str, msg: str, interval: float = 5.0) -> None:
-        """
-        Simple per-key rate-limited logger to avoid spam in noisy environments.
-        """
-        import time as _t
-        if not hasattr(self, "_rl_state"):
-            self._rl_state = {}
-        now = _t.monotonic()
-        last, count = self._rl_state.get(key, (0.0, 0))
-        count += 1
-        if (now - last) >= interval:
-            self._rl_state[key] = (now, 0)
-            suppressed = max(0, count - 1)
-            if suppressed:
-                self.logger.log_message(f"{msg} (suppressed {suppressed} similar)")
-            else:
-                self.logger.log_message(msg)
-        else:
-            self._rl_state[key] = (last, count)
-    # ----- Synergy: accept local daemon jobs -----
 
-    def distribute_job_from_daemon(self, job: Dict[str, Any]) -> None:
-        session_id = MoneroDaemonManager._DAEMON_SESSION_ID
-        # normalize expected hex fields via RandomXLoader helpers
-        for k in ("blob", "seed_hash", "target"):
-            if k in job and isinstance(job[k], str):
-                job[k] = RandomXLoader.norm_hex(job[k])
-
-        # Make sure worker exists then forward like an inbound pool message
-        self.stratum_manager.register_session(session_id)
-        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": job}])
-        self.code_output_manager.submit_packet(
-            job,
-            inbound_iface="stratum",
-            phase="handled",
-            component="daemon-job-distribute"
-        )
-
-    # ----- Socket helpers -----
-
-    def _add_socket(self, sock: socket.socket) -> None:
-        with self._lock:
-            self._active_sockets.append(sock)
-
-    def _remove_socket(self, sock: socket.socket) -> None:
-        with self._lock:
-            if sock in self._active_sockets:
-                self._active_sockets.remove(sock)
-
-    def _close_socket(self, sock: Optional[socket.socket]) -> None:
-        if not sock:
-            return
-        self._remove_socket(sock)
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-    def _schedule_keepalive(self) -> None:
-        self._next_keepalive_ts = time.time() + self.KEEPALIVE_INTERVAL_S + random.uniform(-5, 5)
-
-    # ----- Network connection helpers -----
-
-    def _open_pool_socket(self) -> socket.socket:
-        assert self.pool_ip and self.pool_port, "Pool IP and port must be configured."
-
-        def connect_plain() -> socket.socket:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(10.0)
-            s.connect((self.pool_ip, self.pool_port))
-            s.settimeout(1.0)
-            self.logger.log_message("[StratumConn] 🔓 Using cleartext TCP to pool.")
-            return s
-
-        want_tls = (self.use_tls is True) or (self.use_tls == "auto" and self.pool_port in self.LIKELY_TLS_PORTS)
-        if not want_tls:
-            return connect_plain()
-
-        ctx = ssl.create_default_context()
-        if not self.pool_host or self.pool_host == self.pool_ip:
-            self.logger.log_message("[StratumConn] ⚠️ No pool hostname; disabling TLS cert verification.")
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-        plain_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        plain_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        plain_socket.settimeout(10.0)
-
-        try:
-            plain_socket.connect((self.pool_ip, self.pool_port))
-            tls_sock = ctx.wrap_socket(plain_socket, server_hostname=self.pool_host)
-            tls_sock.settimeout(1.0)
-            self.logger.log_message(f"[StratumConn] 🔐 Using TLS to pool (SNI: {self.pool_host}).")
-            return tls_sock
-        except (ssl.SSLCertVerificationError, ssl.SSLError, socket.timeout, ConnectionRefusedError) as e:
-            self._close_socket(plain_socket)
-            if self.use_tls is True:
-                self.logger.log_message(f"[StratumConn] ❌ TLS required but failed: {e}")
-                raise
-            self.logger.log_message(f"[StratumConn] ⚠️ TLS failed ({type(e).__name__}); falling back to TCP.")
-            return connect_plain()
-
-    # ----- Direct connection -----
-
-    def _direct_connection_loop(self) -> None:
-        DIRECT_SESSION_ID = "direct_pool_connection"
-        reconnect_delay = 5.0
-        self.stratum_manager.rx_start()
-
-        while not self._stop_event.is_set():
-            pool_socket = None
-            try:
-                with self._lock:
-                    self._direct_conn_state = ConnectionState.CONNECTING
-                self.logger.log_message(f"[StratumConn] 🔌 (Direct) Connecting to {self.pool_ip}:{self.pool_port}...")
-                pool_socket = self._open_pool_socket()
-                self._add_socket(pool_socket)
-                self._pool_socket = pool_socket
-
-                # Attach submitter for the direct session
-                self.stratum_manager.attach_submitter(DIRECT_SESSION_ID, self.submit_share)
-                self.stratum_manager.register_session(DIRECT_SESSION_ID)
-
-                with self._lock:
-                    self._direct_conn_state = ConnectionState.CONNECTED
-                self.logger.log_message("[StratumConn] ✅ (Direct) Connected and session registered.")
-
-                reconnect_delay = 5.0
-                self._send_authorize_request(pool_socket)
-                receive_buffer = b""
-
-                while not self._stop_event.is_set():
-                    if self.direct_session_id and time.time() >= self._next_keepalive_ts:
-                        self._send_keepalive(pool_socket)
-
-                    try:
-                        data = pool_socket.recv(8192)
-                        if not data:
-                            self.logger.log_message("[StratumConn] 💔 (Direct) Connection closed by peer.")
-                            break
-                        receive_buffer += data
-                        receive_buffer = self._process_received_data(receive_buffer, DIRECT_SESSION_ID)
-                    except socket.timeout:
-                        continue
-                    except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
-                        self.logger.log_message(f"[StratumConn] 💔 (Direct) Connection error: {e}")
-                        break
-
-            except Exception as e:
-                self.logger.log_message(f"[StratumConn] ❌ (Direct) Connection loop failed: {e}")
-            finally:
-                self.stratum_manager.deregister_session(DIRECT_SESSION_ID)
-                with self._lock:
-                    self._direct_conn_state = ConnectionState.DISCONNECTED
-                self._close_socket(pool_socket)
-                self._pool_socket = None
-                self.direct_session_id = None
-
-            if not self._stop_event.is_set():
-                self.logger.log_message(f"💤 Reconnecting in {reconnect_delay:.1f} seconds...")
-                self._stop_event.wait(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 1.5, 60.0)
-
-    # ----- Proxy mode -----
-
-    def _listen_for_miners(self) -> None:
-        server_socket = None
-        try:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self.proxy_host, self.proxy_port))
-            server_socket.listen(64)
-            server_socket.settimeout(1.0)
-            # DO NOT add the listener to _active_sockets (avoids WinError 10038 on stop)
-            self.logger.log_message(f"[StratumConn] 👂 (Proxy) Listening on {self.proxy_host}:{self.proxy_port}")
-        except OSError as e:
-            self.logger.log_message(f"[StratumConn] ❌ (Proxy) Failed to start listener: {e}")
-            return
-
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    miner_conn, miner_addr = server_socket.accept()
-                    miner_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    miner_conn.settimeout(60.0)
-                    self.logger.log_message(f"[StratumConn] 🤝 (Proxy) Miner connected: {miner_addr}")
-
-                    h = threading.Thread(target=self._handle_miner_session, args=(miner_conn,), daemon=True)
-                    h.start()
-                except socket.timeout:
-                    continue
-        finally:
-            self._close_socket(server_socket)
-
-    def _handle_miner_session(self, miner_socket: socket.socket) -> None:
-        pool_socket: Optional[socket.socket] = None
-        miner_addr = miner_socket.getpeername()
-        session_id = f"proxy_{miner_addr[0]}:{miner_addr[1]}"
-        send_q: queue.PriorityQueue[tuple[int, bytes]] = queue.PriorityQueue()
-
-        try:
-            self._add_socket(miner_socket)
-            self.stratum_manager.register_session(session_id)
-            self.logger.log_message(f"[StratumConn] (Proxy) Session {session_id} registered.")
-
-
-            self.logger.log_message(f"[StratumConn] 🔌 (Proxy) Connecting upstream for {session_id}...")
-            pool_socket = self._open_pool_socket()
-            self._add_socket(pool_socket)
-
-            # Per-session submitter for this proxy session
-            def _submit_via_proxy(*, job_id: str, nonce: str, result_hash: str) -> None:
-                # Include upstream session id if we have it (p2pool compatibility)
-                upstream_id = self._proxy_session_ids.get(session_id)
-                params = {
-                    "id": upstream_id,  # CRITICAL: This must be the ID P2Pool provided
-                    "job_id": job_id,
-                    "nonce": nonce,
-                    "result": result_hash
-                }
-                if upstream_id:
-                    params["id"] = upstream_id
-                msg = {
-                    "jsonrpc": "2.0",
-                    "id": 1,  # Some P2Pool versions prefer static IDs for submits
-                    "method": "submit",
-                    "params": params
-                }
-                try:
-                    send_q.put_nowait((1, (json.dumps(msg) + "\n").encode("utf-8")))
-                    self.logger.log_message(
-                        f"[StratumConn] ⛏️ (Proxy) Submitted share for {session_id}, job {job_id}"
-                    )
-                except Exception as e:
-                    self.logger.log_message(
-                        f"[StratumConn] ❌ (Proxy) Failed to enqueue submit for {session_id}: {e}"
-                    )
-
-            self.stratum_manager.attach_submitter(session_id, _submit_via_proxy)
-
-            threading.Thread(target=self._sender_worker, args=(send_q, pool_socket), daemon=True).start()
-            threading.Thread(
-                target=self._relay_data, args=(miner_socket, send_q, "Miner -> Pool", session_id), daemon=True
-            ).start()
-            threading.Thread(
-                target=self._relay_data, args=(pool_socket, miner_socket, "Pool -> Miner", session_id), daemon=True
-            ).start()
-
-        except Exception as e:
-            self.logger.log_message(f"[StratumConn] ❌ (Proxy) Session {session_id} failed: {e}")
-        finally:
-            self.stratum_manager.deregister_session(session_id)
-            self._proxy_session_ids.pop(session_id, None)
-            self.logger.log_message(f"[StratumConn] 💔 (Proxy) Session {session_id} ended.")
-            try:
-                send_q.put_nowait((99, b""))
-            except Exception:
-                pass
-            self._close_socket(miner_socket)
-            self._close_socket(pool_socket)
-
-    def _sender_worker(self, send_queue: queue.PriorityQueue[tuple[int, bytes]], dest_socket: socket.socket) -> None:
-        while not self._stop_event.is_set():
-            try:
-                _, data = send_queue.get(timeout=1.0)
-                if not data:
-                    break
-                dest_socket.sendall(data)
-            except queue.Empty:
-                continue
-            except OSError:
-                self.logger.log_message("[StratumConn] Sender worker socket error.")
-                break
-
-    def _relay_data(self, src_socket: socket.socket, dest: socket.socket | queue.PriorityQueue, direction: str, session_id: str = "") -> None:
-        while not self._stop_event.is_set():
-            try:
-                data = src_socket.recv(8192)
-                if not data:
-                    self.logger.log_message(f"[StratumConn] Relay {direction}: Connection closed.")
-                    break
-
-                if direction == "Pool -> Miner" and session_id:
-                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
-                    for line in filter(None, lines):
-                        msgs = self._parse_monero_json(line)
-                        if msgs:
-                            # Capture upstream session id from login result, for this proxy session
-                            for m in msgs:
-                                try:
-                                    res = (m.get("result") or {})
-                                    sid = res.get("id")
-                                    if isinstance(sid, str) and sid:
-                                        self._proxy_session_ids[session_id] = sid
-                                except Exception:
-                                    pass
-                            self.stratum_manager.process_messages(session_id, msgs)
-
-                if isinstance(dest, queue.PriorityQueue):
-                    lines = data.replace(b"\r\n", b"\n").split(b"\n")
-                    for line in filter(None, lines):
-                        pr = self._get_message_priority(line)
-                        dest.put_nowait((pr, line + b"\n"))
-                else:
-                    dest.sendall(data)
-
-            except (socket.timeout, ConnectionAbortedError, ConnectionResetError, OSError):
-                break
-            except Exception as e:
-                self.logger.log_message(f"[StratumConn] Relay error in {direction} for {session_id}: {e}")
-                break
-
-    # ----- Protocol helpers -----
-
-    def _parse_monero_json(self, line: bytes) -> Optional[list[dict]]:
-        line = line.strip()
-        if not line.startswith((b"{", b"[")):
-            return None
-        try:
-            decoded = json.loads(line)
-            messages = decoded if isinstance(decoded, list) else [decoded]
-            valid: list[dict] = []
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    self.logger.log_message(f"[StratumConn] ℹ️ Skipping non-dict message: {msg}")
-                    continue
-                valid.append(msg)  # keep unknown methods (p2pool extras)
-            return valid
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.logger.log_message(f"[StratumConn] ❌ JSON decode error: {e} for line: {line[:100]!r}")
-            return None
-
-    def _get_message_priority(self, msg_bytes: bytes) -> int:
-        try:
-            decoded = json.loads(msg_bytes)
-            m = decoded.get("method")
-            if m == "submit":
-                return 1
-            if m == "job":
-                return 2
-        except Exception:
-            pass
-        return 3
-
-    def _note_outgoing(self, msg: dict) -> None:
-        mid = msg.get("id")
-        mth = msg.get("method")
-        if isinstance(mid, int) and isinstance(mth, str):
-            self._pending_by_id[mid] = mth
-
-    def _send_json_rpc_request(self, sock: socket.socket, message: dict) -> None:
-        try:
-            request = json.dumps(message) + "\n"
-            sock.sendall(request.encode("utf-8"))
-            self._note_outgoing(message)
-            method = message.get("method", "response")
-            self.logger.log_message(f"[StratumConn] ➡️ Sent {method} request.")
-        except OSError as e:
-            self.logger.log_message(f"[StratumConn] ❌ Failed to send request: {e}")
-            raise
-
-    def _send_authorize_request(self, sock: socket.socket) -> None:
-        params = {"login": self.wallet_address, "pass": "x", "agent": self.user_agent, "rigid": self.worker_name}
-        self._send_json_rpc_request(sock, {"jsonrpc": "2.0", "id": 1, "method": "login", "params": params})
-        self._schedule_keepalive()
-
-    def _send_keepalive(self, sock: socket.socket) -> None:
-        if self.direct_session_id:
-            self._send_json_rpc_request(sock, {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "keepalived",
-                "params": {"id": self.direct_session_id}  # <— add this
-            })
-            self._schedule_keepalive()
-        else:
-            self.logger.log_message("[StratumConn] ⚠️ Skipping keepalive: No active session ID.")
-
-    def submit_share(self, job_id: str, nonce: str, result_hash: str) -> None:
-        # Direct connection submit
-        with self._lock:
-            if self._direct_conn_state != ConnectionState.CONNECTED or not self._pool_socket:
-                self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: Direct connection not active.")
-                return
-            sock_to_use = self._pool_socket
-
-        if not all([job_id, nonce, result_hash]):
-            self.logger.log_message("[StratumConn] ❌ Cannot submit share: Missing required data.")
-            return
-
-        submit_msg = {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "submit",
-            "params": {
-                "id": self.direct_session_id,  # <— add this
-                "job_id": job_id,
-                "nonce": nonce,
-                "result": result_hash,
-            },
-        }
-        self.code_output_manager.submit_packet(
-            {
-                "job_id": job_id,
-                "nonce": nonce,
-                "result": result_hash,
-            },
-            inbound_iface="stratum",
-            phase="handled",
-            component="stratum-submit"
-        )
-        if sock_to_use.fileno() != -1:
-            self.logger.log_message(f"[StratumConn] ⛏️ Submitting share for job {job_id}...")
-            self._send_json_rpc_request(sock_to_use, submit_msg)
-        else:
-            self.logger.log_message("[StratumConn] ⚠️ Cannot submit share: Pool socket is closed.")
-
-    def _process_received_data(self, buffer: bytes, session_id: str) -> bytes:
-        buffer = buffer.replace(b"\r\n", b"\n")
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-
-            messages = self._parse_monero_json(line)
-            if not messages:
-                self.logger.log_message(f"[StratumConn] ⚠️ Discarding malformed data: {line[:100]}")
-                continue
-
-            for msg in messages:
-                try:
-                    if "result" in msg or "error" in msg:
-                        mid = msg.get("id")
-                        last_method = self._pending_by_id.pop(mid, None) if isinstance(mid, int) else None
-                        err = msg.get("error")
-                        if err:
-                            self.logger.log_message(
-                                f"[StratumConn] ❗ RPC error for {last_method or 'unknown'}: "
-                                f"{err.get('code')} {err.get('message')}"
-                            )
-                            self.stratum_manager.process_messages(session_id, [msg])
-                            continue
-
-                        res = msg.get("result") or {}
-                        if isinstance(res, dict):
-                            if "job" in res and isinstance(res["job"], dict):
-                                j = res["job"]
-                                for k in ("blob", "seed_hash", "next_seed_hash", "target"):
-                                    if k in j and isinstance(j[k], str):
-                                        j[k] = RandomXLoader.norm_hex(j[k])
-                                self.stratum_manager.process_messages(session_id, [{"method": "job", "params": j}])
-
-                            if last_method == "login":
-                                sid = res.get("id")
-                                if isinstance(sid, str):
-                                    self.direct_session_id = sid
-                                    self.logger.log_message(
-                                        f"🔑 (Direct) Login successful. Session ID: {self.direct_session_id}"
-                                    )
-                                    self._schedule_keepalive()
-
-                            if last_method == "submit":
-                                status = (res.get("status") or res.get("state") or "").upper()
-                                accepted = bool(res.get("accepted") or (status == "OK"))
-                                self.logger.log_message(
-                                    f"[StratumConn] 📨 Submit result: {'ACCEPTED' if accepted else status or 'UNKNOWN'}"
-                                )
-                                self.stratum_manager.process_messages(session_id, [msg])
-
-                            if last_method in ("keepalived", "getjob"):
-                                self.stratum_manager.process_messages(session_id, [msg])
-                        continue
-
-                    method = (msg.get("method") or "").lower()
-                    params = msg.get("params") or {}
-
-                    if method == "job" and isinstance(params, dict):
-                        for k in ("blob", "seed_hash", "next_seed_hash", "target"):
-                            if k in params and isinstance(params[k], str):
-                                params[k] = RandomXLoader.norm_hex(params[k])
-                        if "height" in params:
-                            try:
-                                self.logger.log_message(f"[StratumConn] 📦 New job height={int(params['height'])}")
-                            except Exception:
-                                pass
-                        self.stratum_manager.process_messages(session_id, [{"method": "job", "params": params}])
-                        continue
-
-                    if method in ("block_notify", "new_block", "p2pool.block", "p2pool.tip", "pool.stats",
-                                  "set_target", "set_difficulty", "set_extranonce"):
-                        for k in ("target", "seed_hash", "next_seed_hash", "block_hash"):
-                            if k in params and isinstance(params[k], str):
-                                params[k] = RandomXLoader.norm_hex(params[k])
-                        if "height" in params:
-                            try:
-                                self.logger.log_message(f"[StratumConn] ⛓️ {method} height={int(params['height'])}")
-                            except Exception:
-                                self.logger.log_message(f"[StratumConn] ⛓️ {method}")
-                        self.stratum_manager.process_messages(session_id, [msg])
-                        continue
-
-                    # Forward unknown-but-valid pool messages for visibility
-                    self.stratum_manager.process_messages(session_id, [msg])
-
-                except Exception as e:
-                    self.logger.log_message(f"[StratumConn] ❌ Message handling error: {type(e).__name__}: {e}")
-
-        return buffer
-
-
-class StratumManager:
-    """
-    Tracks sessions, feeds jobs to persistent workers, performs RandomX hashing,
-    and calls back to a submitter (daemon/pool) when a solution is found.
-    """
-    NONCE_BYTE_OFFSET = 39
-
-    def __init__(self, code_output_manager, router_logger: Any):
-        self.logger = router_logger
-        self.sessions: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-
-        self.rx: Optional[RandomXLoader] = None
-        self._rx_seed: Optional[bytes] = None
-        self._rx_started: bool = False
-        self._rx_ready_event = threading.Event()
-
-        self._workers: Dict[str, threading.Thread] = {}
-        self._job_queues: Dict[str, queue.Queue] = {}
-        # Per-session submitters
-        self._submitters: Dict[str, Callable[..., None]] = {}
-
-        self.session_buffers: Dict[str, bytes] = {}
-        self.STRATUM_PORTS = {3333, 4444, 5555, 7777, 18081}
-        self.code_output_manager = code_output_manager
-        self._stop_events: Dict[str, threading.Event] = {}
-        self.logger.log_message("[Stratum] Streamlined Manager initialized.")
-
-    # ----- lifecycle -----
-
-    def stop(self):
-        self.logger.log_message("[Stratum] 🛑 Stopping all workers and cleaning up...")
-        # Stop workers first
-        for sid in list(self.sessions.keys()):
-            self.deregister_session(sid)
-        # Extra wait to ensure hashing loops are gone
-        for _ in range(10):  # up to ~5s total
-            alive = any(t.is_alive() for t in list(self._workers.values()))
-            if not alive:
-                break
-            time.sleep(0.5)
-
-        # Now it is safe to destroy RandomX
-        try:
-            if self.rx and hasattr(self.rx, "destroy"):
-                self.rx.destroy()
-
-            with self._lock:
-                self.sessions.clear()
-                self._workers.clear()
-                self._job_queues.clear()
-            self.logger.log_message("[Stratum] ✅ Manager stopped and cleaned up.")
-        finally:
-            self.rx = None   # avoid stale handle on restart
-            self._rx_started = False
-            self._rx_seed = None
-            self._rx_ready_event.set()
-
-
-    def rx_start(self):
-        # Choose flags appropriate for your environment
-        fast_flags = (RandomXFlags.HARD_AES | RandomXFlags.JIT | RandomXFlags.LARGE_PAGES)
-        self.rx = RandomXLoader("tools/randomx.dll", flags=fast_flags, logger=self.logger)
-
-    # ----- pipeline -----
-    def _extract_payload_from_scapy(self, pkt) -> tuple[bytes | None, Optional[str]]:
-        """
-        Best-effort extraction of app bytes from a Scapy packet that may be Ether/IP/IPv6.
-        Returns (payload_bytes_or_None, derived_session_id_or_None).
-        - Prefers TCP; extracts bytes from Raw OR from TCP.payload when Raw missing.
-        - Filters to STRATUM_PORTS to avoid noise (edit STRATUM_PORTS above).
-        - Derives a stable session id from 4/5-tuple.
-        """
-        try:
-            from scapy.packet import Raw, NoPayload
-            from scapy.layers.inet import IP, TCP
-            try:
-                from scapy.layers.inet6 import IPv6
-            except Exception:
-                IPv6 = None
-
-            # Find L3
-            ip = None
-            if IP in pkt:
-                ip = pkt[IP]
-                family = "ipv4"
-            elif IPv6 and IPv6 in pkt:
-                ip = pkt[IPv6]
-                family = "ipv6"
-            else:
-                return None, None
-
-            # Require TCP
-            if TCP not in pkt:
-                return None, None
-            tcp = pkt[TCP]
-
-            # Ports filter (edit set if needed)
-            sport = int(getattr(tcp, "sport", 0) or 0)
-            dport = int(getattr(tcp, "dport", 0) or 0)
-            if sport not in self.STRATUM_PORTS and dport not in self.STRATUM_PORTS:
-                return None, None
-
-            # Session id from 5-tuple
-            src = getattr(ip, "src", None) or getattr(ip, "psrc", None) or "?"
-            dst = getattr(ip, "dst", None) or getattr(ip, "pdst", None) or "?"
-            sid = f"{family}:{src}:{sport}->{dst}:{dport}"
-
-            # Extract bytes:
-            # 1) If Raw exists, use it.
-            if Raw in pkt:
-                rawload = pkt[Raw].load
-                if rawload:
-                    return (bytes(rawload), sid)
-
-            # 2) Sometimes Scapy doesn’t build Raw; try TCP.payload directly.
-            pay = tcp.payload
-            if pay and not isinstance(pay, NoPayload):
-                try:
-                    b = bytes(pay)
-                    if b:
-                        return (b, sid)
-                except Exception:
-                    pass
-
-            # 3) No payload for this segment (e.g., pure ACK/handshake)
-            return None, sid
-
-        except Exception:
-            return None, None
-
-    def handle_packet(self, packet: "Any", *, session_id: Optional[str] = None) -> None:
-        """
-        General entry point for Stratum traffic arriving from the router's process_packet pipeline.
-
-        Accepts:
-          - bytes/str containing JSON-RPC (newline-delimited or stream-framed)
-          - dict 'event' with payload under common fields (payload/data/message/raw)
-          - already-parsed JSON-RPC dict or list[dict]
-          - Scapy packets: only TCP payloads on STRATUM_PORTS are considered
-        Derives a stable session_id when not provided (from event/flow keys), buffers partial
-        frames per session, decodes objects, and routes them to process_messages().
-        """
-
-        # --- 1) Derive/initialize session buffer --------------------------------------
-        sid = self._derive_session_id(session_id, packet) or "stratum/default"
-        # make sure the buffer exists and is bytes (never None)
-        buf0 = self.session_buffers.get(sid)
-        if not isinstance(buf0, (bytes, bytearray)):
-            self.session_buffers[sid] = b""
-        # keep a local reference (as bytes)
-        cur_buf = bytes(self.session_buffers[sid])
-
-        # --- 2) Fast path: already-parsed JSON-RPC objects -----------------------------
-        def _is_jsonrpc_obj(o: Any) -> bool:
-            return isinstance(o, dict) and any(k in o for k in ("method", "result", "params", "id"))
-
-        if isinstance(packet, list) and packet and all(_is_jsonrpc_obj(x) for x in packet):
-            self.process_messages(sid, packet)
-            return
-        if _is_jsonrpc_obj(packet):
-            self.process_messages(sid, [packet])
-            return
-
-        # --- 3) Extract raw payload bytes from common shapes ---------------------------
-        payload_bytes: Optional[bytes] = None
-
-        if isinstance(packet, (bytes, bytearray)):
-            payload_bytes = bytes(packet)
-        elif isinstance(packet, str):
-            payload_bytes = packet.encode("utf-8", "ignore")
-        elif isinstance(packet, dict):
-            # direct keys
-            for key in ("payload", "data", "message", "raw", "buf", "body"):
-                if key in packet:
-                    v = packet[key]
-                    if isinstance(v, (bytes, bytearray)):
-                        payload_bytes = bytes(v)
-                        break
-                    if isinstance(v, str):
-                        payload_bytes = v.encode("utf-8", "ignore")
-                        break
-            else:
-                # nested one level under "payload"
-                p = packet.get("payload", {}) if isinstance(packet.get("payload"), dict) else {}
-                for key in ("data", "message", "raw", "body"):
-                    v = p.get(key)
-                    if isinstance(v, (bytes, bytearray)):
-                        payload_bytes = bytes(v)
-                        break
-                    if isinstance(v, str):
-                        payload_bytes = v.encode("utf-8", "ignore")
-                        break
-
-        # --- 4) Scapy fallback (only if it looks like Stratum TCP) ---------------------
-        if payload_bytes is None and hasattr(packet, "haslayer"):
-            try:
-                # Only treat as Stratum if it's TCP and matches the known ports
-                from scapy.layers.inet import TCP
-                from scapy.packet import Raw  # scapy Raw layer (payload)
-                is_tcp = packet.haslayer(TCP)
-                if is_tcp:
-                    sport = int(packet[TCP].sport)
-                    dport = int(packet[TCP].dport)
-                    if (sport in getattr(self, "STRATUM_PORTS", set())) or (
-                            dport in getattr(self, "STRATUM_PORTS", set())):
-                        if packet.haslayer(Raw):
-                            lb = packet[Raw].load
-                            if isinstance(lb, (bytes, bytearray)):
-                                payload_bytes = bytes(lb)
-                            elif isinstance(lb, str):
-                                payload_bytes = lb.encode("utf-8", "ignore")
-            except Exception:
-                # ignore scapy extraction failures
-                payload_bytes = None
-
-        # --- 5) If no bytes, rate-limit a log and exit safely --------------------------
-        if payload_bytes is None:
-            self._log_no_payload_rate_limited(sid, type(packet).__name__)
-            return
-
-        # --- 6) Buffer & drain JSON frames (supports stream framing/newlines) ----------
-        try:
-            buf = cur_buf + payload_bytes  # safe: both are bytes
-        except Exception:
-            # absolute fallback: treat as fresh payload
-            buf = bytes(payload_bytes)
-
-        objects, remainder = self._drain_json_frames(buf)
-        self.session_buffers[sid] = remainder  # always store remainder, even if empty
-
-        if not objects:
-            # partial frame; keep buffering silently
-            return
-
-        # --- 7) Normalize to list[dict] and dispatch ----------------------------------
-        msgs: list[dict] = []
-        for obj in objects:
-            if isinstance(obj, list):
-                msgs.extend([x for x in obj if isinstance(x, dict)])
-            elif isinstance(obj, dict):
-                msgs.append(obj)
-
-        if not msgs:
-            # Non-dict JSON (e.g., "ok", true) — keep buffers but don't error
-            preview = payload_bytes[:120]
-            try:
-                pv = preview.decode("utf-8", "ignore")
-            except Exception:
-                pv = repr(preview)
-            self.logger.log_message(f"[Stratum] ℹ️ handle_packet({sid}): non-object JSON ignored: {pv}")
-            return
-
-        self.process_messages(sid, msgs)
-
-    # -------------------- helpers (keep inside the class) --------------------------
-    def _log_no_payload_rate_limited(self, sid: str, pkt_type: str):
-        """
-        Collapse noisy 'no payload' messages to at most once every few seconds per class.
-        """
-        import time as _t
-        key = "_nopayload_rl"
-        now = _t.monotonic()
-        rl = getattr(self, key, None)
-        if rl is None:
-            rl = {"last": 0.0, "count": 0}
-            setattr(self, key, rl)
-        rl["count"] += 1
-        if now - rl["last"] >= 5.0:  # log at most every 5s
-            rl["last"] = now
-            c = rl["count"]
-            rl["count"] = 0
-            self.logger.log_message(f"[Stratum] ⚠️ handle_packet({sid}): no JSON payload ({pkt_type}); "
-                                    f"suppressed={max(0, c - 1)} in last window.")
-    def _derive_session_id(self, explicit_sid: Optional[str], packet: "Any") -> Optional[str]:
-        """
-        Best-effort session id derivation:
-          • respects explicit sid
-          • uses common event keys (session_id/conn_id/flow_id/sid)
-          • falls back to 5-tuple-ish strings if present in dict
-        """
-        if explicit_sid:
-            return str(explicit_sid)
-
-        if isinstance(packet, dict):
-            for k in ("session_id", "conn_id", "connection_id", "flow_id", "sid"):
-                if k in packet and packet[k]:
-                    return str(packet[k])
-
-            # Try to build a stable flow key from common fields
-            src = packet.get("src") or packet.get("saddr") or packet.get("source_ip")
-            dst = packet.get("dst") or packet.get("daddr") or packet.get("dest_ip")
-            sp = packet.get("sport") or packet.get("src_port")
-            dp = packet.get("dport") or packet.get("dst_port")
-            if src and dst and sp and dp:
-                return f"{src}:{sp}->{dst}:{dp}"
-
-            # Nested
-            net = packet.get("network") or packet.get("flow") or {}
-            if isinstance(net, dict):
-                src = net.get("src") or net.get("saddr")
-                dst = net.get("dst") or net.get("daddr")
-                sp = net.get("sport") or net.get("src_port")
-                dp = net.get("dport") or net.get("dst_port")
-                if src and dst and sp and dp:
-                    return f"{src}:{sp}->{dst}:{dp}"
-
-        # As a last resort, return None; caller will use default.
-        return None
-
-    def _drain_json_frames(self, buf: bytes) -> tuple[list[Any], bytes]:
-        """
-        Extract as many JSON values as possible from a byte buffer, tolerating:
-          • leading/trailing whitespace
-          • newline-delimited JSON
-          • back-to-back objects/arrays in a stream
-        Returns (objects, remainder_bytes).
-        """
-        import json
-
-        if not buf:
-            return [], b""
-
-        # Fast path: if there's at least one newline, try line-delimited first.
-        out: list[Any] = []
-        s = buf.decode("utf-8", "ignore")
-        if "\n" in s:
-            lines = s.splitlines(keepends=True)
-            tail = ""
-            for ln in lines:
-                try:
-                    obj = json.loads(ln)
-                    out.append(obj)
-                except json.JSONDecodeError:
-                    # Keep partial/incomplete in tail (accumulate)
-                    tail += ln
-            return out, tail.encode("utf-8")
-
-        # Stream-framed path: use JSONDecoder.raw_decode repeatedly.
-        dec = json.JSONDecoder()
-        i, n = 0, len(s)
-        while i < n:
-            # Skip whitespace and any non-JSON noise until a plausible starter
-            while i < n and s[i] not in "{[\"tfn-0123456789":  # objects, arrays, strings, true/false/null/number
-                i += 1
-            if i >= n:
-                break
-            try:
-                obj, j = dec.raw_decode(s, i)
-                out.append(obj)
-                i = j  # continue after parsed value
-            except json.JSONDecodeError:
-                # Need more bytes for a complete value
-                break
-        remainder = s[i:].encode("utf-8") if i < n else b""
-        return out, remainder
-    def attach_submitter(self, session_id: str, submit_func: Callable[..., None]):
-        self._submitters[session_id] = submit_func
-        self.logger.log_message(f"[Stratum] Submitter attached for session: {session_id}")
-
-    def register_session(self, session_id: str) -> None:
-        with self._lock:
-            t = self._workers.get(session_id)
-            if session_id in self.sessions and t is not None and t.is_alive():
-                return
-
-            self.sessions[session_id] = {"job_ver": 0}
-            self._stop_events[session_id] = threading.Event()
-
-            jq = queue.Queue(maxsize=1)
-            self._job_queues[session_id] = jq
-
-            t = threading.Thread(target=self._share_worker,
-                                 args=(session_id, jq),
-                                 daemon=True, name=f"rx-{session_id}")
-            self._workers[session_id] = t
-            t.start()
-        self.logger.log_message(f"[Stratum] ✅ Session registered and worker started for: {session_id}")
-
-    def deregister_session(self, session_id: str) -> None:
-        self.logger.log_message(f"[Stratum] 🛑 Deregistering session: {session_id}")
-
-        stop_evt = None
-        q = None
-        t = None
-        with self._lock:
-            # signal stop + force version bump so inner loop breaks ASAP
-            s = self.sessions.get(session_id)
-            if isinstance(s, dict):
-                s["job_ver"] = int(s.get("job_ver", 0)) + 1  # 🔸 preempt current job
-
-            stop_evt = self._stop_events.get(session_id)
-            if stop_evt:
-                stop_evt.set()
-
-            q = self._job_queues.get(session_id)
-            t = self._workers.get(session_id)
-
-        if q:
-            try:
-                q.put_nowait(None)  # unblock outer job_q.get()
-            except Exception:
-                pass
-
-        if t and t.is_alive():
-            t.join(timeout=2.0)
-
-        with self._lock:
-            self.sessions.pop(session_id, None)
-            self._workers.pop(session_id, None)
-            self._job_queues.pop(session_id, None)
-            self._submitters.pop(session_id, None)
-            self._stop_events.pop(session_id, None)
-
-    def process_messages(self, session_id: str, messages: list[dict]) -> None:
-        if session_id not in self.sessions:
-            self.register_session(session_id)
-        for msg in messages:
-            if isinstance(msg, dict):
-                self._process_single_message(session_id, msg)
-
-    def _process_single_message(self, session_id: str, data: Dict[str, Any]):
-        method = data.get("method")
-        params = data.get("params") or {}
-        result = data.get("result") or {}
-
-        job_data = result.get("job") if isinstance(result, dict) and "job" in result else (
-            params if method == "job" else None
-        )
-        if job_data:
-            self._handle_job(session_id, job_data)
-        elif method == "submit":
-            self._track_submit(session_id, params)
-
-    # ----- job handling -----
-
-    def _ensure_rx(self):
-        if self.rx is None:
-            self.rx_start()
-
-    def _maybe_reinit_randomx(self, seed_hash_hex: Optional[str]):
-        if not seed_hash_hex:
-            return
-        try:
-            seed = bytes.fromhex(seed_hash_hex)
-        except ValueError:
-            self.logger.log_message(f"[Stratum] ⚠️ Invalid seed_hash: {seed_hash_hex}")
-            return
-        self._ensure_rx()
-        if (not self._rx_started) or (self._rx_seed != seed):
-            self._rx_ready_event.clear()
-            try:
-                self.rx.ensure_started(seed, use_dataset=False)
-                self._rx_seed = seed
-                self._rx_started = True
-                self.logger.log_message(f"[Stratum] ✅ RandomX VM ready, seed: {seed_hash_hex[:12]}...")
-            except Exception as e:
-                self._rx_started = False
-                self.logger.log_message(f"[Stratum] ❌ RandomX init failed: {e}")
-            finally:
-                self._rx_ready_event.set()
-
-    def _handle_job(self, session_id: str, job: Dict[str, Any]):
-        self._maybe_reinit_randomx(job.get("seed_hash"))
-        # bump per-session job version so workers can preempt immediately
-        with self._lock:
-            s = self.sessions.setdefault(session_id, {})
-            s["job_ver"] = int(s.get("job_ver", 0)) + 1
-            cur_ver = s["job_ver"]
-        if session_id in self._job_queues:
-            jq = self._job_queues[session_id]
-            try:
-                jq.get_nowait()  # drop stale
-            except queue.Empty:
-                pass
-            jq.put(job)
-            # (optional) visibility
-            try:
-                self.code_output_manager.submit_packet(
-                    {**job, "_job_ver": cur_ver},
-                    inbound_iface="stratum",
-                    phase="handled",
-                    component="stratum-job"
-                )
-            except Exception:
-                pass
-
-    def _track_submit(self, session_id: str, params: dict):
-        with self._lock:
-            s = self.sessions.setdefault(session_id, {})
-            s["shares"] = s.get("shares", 0) + 1
-        self.logger.log_message(f"[Stratum] ⛏️ {session_id} submitted share for job: {params.get('job_id', '?')}")
-
-    # ----- hashing helpers -----
-
-    @staticmethod
-    def _prepare_blob_template(blob_hex: str) -> tuple[bytearray, int]:
-        if len(blob_hex) < (StratumManager.NONCE_BYTE_OFFSET + 4) * 2:
-            raise ValueError("Blob is too short to contain a nonce")
-        return bytearray.fromhex(blob_hex), StratumManager.NONCE_BYTE_OFFSET
-
-    @staticmethod
-    def _write_nonce_le_inplace(buf: bytearray, offset: int, nonce: int):
-        buf[offset:offset + 4] = nonce.to_bytes(4, "little")
-
-    # ----- worker -----
-
-    def _share_worker(self, session_id: str, job_q: queue.Queue):
-        from time import perf_counter
-        import time
-        import random
-
-        logger = self.logger
-        submitter = self._submitters.get(session_id)
-
-        BATCH = 4
-        LOG_INTERVAL = 2.0
-        max_backoff = 0.5
-
-        stride_seed = abs(hash(session_id)) or 1
-        stride = ((stride_seed & 0xFFFF) | 1)
-
-        def _u256_le(x) -> int:
-            if isinstance(x, int): return x
-            if isinstance(x, (bytes, bytearray)):
-                if len(x) != 32: raise ValueError(f"digest length != 32 (got {len(x)})")
-                return int.from_bytes(x, "little")
-            raise TypeError(f"Unsupported digest type: {type(x)}")
-
-        def _target_u256_from_hex_le(hex_str: str | None) -> int | None:
-            if not hex_str: return None
-            return int.from_bytes(bytes.fromhex(hex_str), "little")
-
-        def _target_len_bytes(hex_str: str | None) -> int:
-            return len(hex_str) // 2 if hex_str else 0
-
-        def _meets_target(d_u256: int, T: int, T_len_bytes: int) -> bool:
-            if T_len_bytes == 8:
-                return (d_u256 & ((1 << 64) - 1)) <= T
-            return d_u256 <= T
-        stop_evt = self._stop_events.get(session_id)
-        while True:
-            job = job_q.get()
-            if job is None:
-                logger.log_message(f"[Stratum] 🛑 Worker received stop signal for session={session_id}")
-                break
-            if stop_evt.is_set():
-                self.logger.log_message(f"[Stratum] 🛑 Worker received stop signal for session={session_id}")
-                break
-            # Snapshot the job version *after* this job was enqueued
-            with self._lock:
-                my_ver = int(self.sessions.get(session_id, {}).get("job_ver", 0))
-
-            job_id = job.get("id") or job.get("job_id")
-            blob_hex = job.get("blob")
-            share_hex = job.get("target")
-            block_hex = job.get("block_target")
-            diff_val = job.get("network_difficulty") or job.get("block_difficulty") or job.get("difficulty")
-
-            if not all([job_id, blob_hex, share_hex]):
-                logger.log_message(f"[Stratum] ⚠️ Skipping invalid job on {session_id}: missing fields.")
-                continue
-
-            self._rx_ready_event.wait()
-            if not self._rx_started or not self.rx:
-                logger.log_message(f"[Stratum] ⚠️ Worker for {session_id} waiting for RandomX...")
-                continue
-            rx = self.rx
-
-            try:
-                share_T = _target_u256_from_hex_le(share_hex)
-                share_T_len = _target_len_bytes(share_hex)
-                if block_hex:
-                    block_T = _target_u256_from_hex_le(block_hex)
-                    block_T_len = _target_len_bytes(block_hex)
-                else:
-                    block_T = None
-                    block_T_len = 0
-                    if diff_val:
-                        block_T = RandomXLoader.target_from_difficulty_int(int(diff_val))
-                        block_T_len = 32
-                buf, off = self._prepare_blob_template(blob_hex)
-            except Exception as e:
-                logger.log_message(f"[Stratum] ❌ Job setup failed for {job_id}: {e}")
-                continue
-
-            has_pipe = all(
-                hasattr(rx, m) for m in ("calculate_hash_first", "calculate_hash_next", "calculate_hash_last"))
-            calc_hash = getattr(rx, "calculate_hash", None)
-            if not callable(calc_hash):
-                logger.log_message("[Stratum] ❌ Hashing backend (rx) is not ready.")
-                continue
-
-            nonce = random.getrandbits(32)
-            tries, ema_rate, last_log, error_streak = 0, None, perf_counter(), 0
-            submitted_nonces: set[str] = set()
-            min_h64 = (1 << 64) - 1
-            min_h256 = (1 << 256) - 1
-
-            logger.log_message(f"[Stratum] ▶️ Working job {job_id} (stride={stride}, batch={BATCH if has_pipe else 1})")
-
-            while True:
-                if stop_evt and stop_evt.is_set():
-                    logger.log_message(f"[Stratum] ⛔ Stop requested; leaving job {job_id} on {session_id}.")
-                    break
-
-                with self._lock:
-                    sess = self.sessions.get(session_id)
-                    if sess is None:
-                        logger.log_message(f"[Stratum] ⛔ Session removed; leaving job {job_id} on {session_id}.")
-                        break
-                    cur_ver = int(sess.get("job_ver", my_ver))
-
-                # ---- instant preemption: switch as soon as a newer job arrives ----
-                with self._lock:
-                    cur_ver = int(self.sessions.get(session_id, {}).get("job_ver", my_ver))
-                if cur_ver != my_ver:
-                    logger.log_message(
-                        f"[Stratum] 🔄 New job detected for {session_id} (ver {cur_ver} > {my_ver}); switching.")
-                    break
-
-                try:
-                    if has_pipe and BATCH >= 2:
-                        nonces, digests_u256 = [], []
-                        self._write_nonce_le_inplace(buf, off, nonce)
-                        nonces.append(nonce)
-                        rx.calculate_hash_first(bytes(buf))
-
-                        cur = nonce
-                        for _ in range(1, BATCH):
-                            cur = (cur + stride) & 0xFFFFFFFF
-                            self._write_nonce_le_inplace(buf, off, cur)
-                            d_prev = rx.calculate_hash_next(bytes(buf))
-                            d_prev_u256 = _u256_le(d_prev)
-                            digests_u256.append(d_prev_u256)
-                            nonces.append(cur)
-
-                        d_last = rx.calculate_hash_last()
-                        digests_u256.append(_u256_le(d_last))
-
-                        for n_val, d_u256 in zip(nonces, digests_u256):
-                            h64 = d_u256 & ((1 << 64) - 1)
-                            if h64 < min_h64: min_h64 = h64
-                            if d_u256 < min_h256: min_h256 = d_u256
-
-                            if share_T is not None and _meets_target(d_u256, share_T, share_T_len):
-                                n_hex = n_val.to_bytes(4, "little").hex()
-                                if n_hex not in submitted_nonces:
-                                    submitted_nonces.add(n_hex)
-                                    if submitter:
-                                        try:
-                                            result_hex = d_u256.to_bytes(32, "little").hex()
-                                            submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
-                                        except Exception as e:
-                                            logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
-                                    logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
-                                    if block_T and _meets_target(d_u256, block_T, block_T_len):
-                                        logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
-
-                        tries += BATCH
-                        nonce = (nonces[-1] + stride) & 0xFFFFFFFF
-
-                    else:
-                        self._write_nonce_le_inplace(buf, off, nonce)
-                        d_single = _u256_le(calc_hash(bytes(buf)))
-                        h64 = d_single & ((1 << 64) - 1)
-                        if h64 < min_h64: min_h64 = h64
-                        if d_single < min_h256: min_h256 = d_single
-
-                        if share_T is not None and _meets_target(d_single, share_T, share_T_len):
-                            n_hex = nonce.to_bytes(4, "little").hex()
-                            if n_hex not in submitted_nonces:
-                                submitted_nonces.add(n_hex)
-                                if submitter:
-                                    try:
-                                        result_hex = d_single.to_bytes(32, "little").hex()
-                                        submitter(job_id=job_id, nonce=n_hex, result_hash=result_hex)
-                                    except Exception as e:
-                                        logger.log_message(f"[Stratum] ❌ Submit failed: {e}")
-                                logger.log_message(f"[Stratum] 🎯 SHARE: job={job_id} nonce={n_hex}")
-                                if block_T and _meets_target(d_single, block_T, block_T_len):
-                                    logger.log_message(f"[Stratum] 🎉 BLOCK FOUND by {session_id} (nonce={n_hex})")
-
-                        tries += 1
-                        nonce = (nonce + stride) & 0xFFFFFFFF
-
-                    now = perf_counter()
-                    if (now - last_log) >= LOG_INTERVAL:
-                        rate = tries / (now - last_log) if now > last_log else 0.0
-                        ema_rate = (0.2 * rate + 0.8 * (ema_rate or rate))
-                        try:
-                            self.code_output_manager.submit_packet(
-                                {"job_id": job_id, "hashrate": ema_rate},
-                                inbound_iface="stratum",
-                                phase="handled",
-                                component="work"
-                            )
-                        except Exception:
-                            pass
-                        msg = f"[Stratum] ⏱️ {session_id} job {job_id}: {ema_rate:.0f} H/s"
-                        try:
-                            sh_bytes = bytes.fromhex(share_hex)
-                            if len(sh_bytes) == 8:
-                                T64 = int.from_bytes(sh_bytes, "little")
-                                msg += f" | min_h64=0x{min_h64:016x} vs T64=0x{T64:016x}"
-                            elif len(sh_bytes) == 32:
-                                T256 = int.from_bytes(sh_bytes, "little")
-                                msg += f" | min_h256=0x{min_h256:064x} vs T256=0x{T256:064x}"
-                        except Exception:
-                            pass
-                        logger.log_message(msg)
-                        tries, last_log = 0, now
-                    error_streak = 0
-
-                except Exception as e:
-                    error_streak = min(error_streak + 1, 10)
-                    backoff = min(max_backoff, 0.01 * (2 ** min(error_streak, 6)))
-                    logger.log_message(
-                        f"[Stratum] ❌ Worker error on {session_id}/{job_id}: {type(e).__name__}: {e} "
-                        f"(backoff {backoff:.3f}s)"
-                    )
-                    time.sleep(backoff)
-
-        logger.log_message(f"[Stratum] ✅ Worker shutdown complete for session={session_id}")
 
 class BroadcastManager:
     """

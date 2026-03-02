@@ -155,13 +155,8 @@ class PythonRouterManager:
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
         self.forwarding_manager = ForwardingManager(self.function_call_tracker, router_logger=self.router_logger,)
         self.kerberos_manager = KerberosManager(router_logger, self.packet_writer)
-        self.stratum_manager = StratumManager(self.code_output_manager, router_logger)
-        self.stratum_connection_manager = StratumConnectionManager(
-            self.code_output_manager,
-            self.router_logger,
-            self.stratum_manager,
-            self.process_packet  # Callback for reinjection
-        )
+        self.stratum_manager = None
+        self.stratum_connection_manager = None
         self.daemon_manager = None
         self.ethernet_l2_manager = EthernetL2Manager(self.function_call_tracker, router_logger)
         self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python, self.packet_writer)
@@ -2022,10 +2017,9 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_startum_comm, p2pool_sever_ip, ipc_emit_host, use_peer_to_peer):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token):
         """Configures interfaces and starts all manager threads."""
         try:
-
             try:
                 self._initialize_interface_discovery()
                 if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
@@ -2034,6 +2028,13 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
+
+            self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
+            self.stratum_connection_manager = StratumConnectionManager(
+                self.code_output_manager,
+                self.router_logger,
+                self.stratum_manager,
+            )
             self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
@@ -2112,9 +2113,9 @@ class PythonRouterManager:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_in, self.mac_in, self.interface_in_full_name)
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
-            if use_startum_comm:
-                if p2pool_sever_ip == "":
-                    self.stratum_connection_manager.configure(p2pool_sever_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
+            if use_stratum_comm:
+                if p2pool_server_ip == "":
+                    self.stratum_connection_manager.configure(p2pool_server_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
                     self.daemon_manager = MoneroDaemonManager(
                         self.code_output_manager,
                         daemon_url="http://127.0.0.1:18081",
@@ -2124,7 +2125,7 @@ class PythonRouterManager:
                         )
                     self.daemon_manager.start()
                 else:
-                    self.stratum_connection_manager.configure(p2pool_sever_ip, 3333,
+                    self.stratum_connection_manager.configure(p2pool_server_ip, 3333,
                                                           "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
                                                           "PythonProxy")
                     self.stratum_connection_manager.start()

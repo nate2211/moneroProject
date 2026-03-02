@@ -48,7 +48,7 @@ from collections import defaultdict as _dd
 from collections import deque as _dq
 from p2pool_router_managers_2 import TLSRecordManager, TLSRecord,ZMQReader
 from p2pool_sniffer import MLDQuery, MLDReport, MLDDone, ICMPv6
-from server.p2pool_tools import RandomXLoader
+
 from tools.pythontools import yield_no_gil
 import time as _t
 class FunctionCallTracker:
