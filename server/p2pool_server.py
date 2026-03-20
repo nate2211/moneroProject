@@ -1,61 +1,96 @@
+from __future__ import annotations
+
 import asyncio
 import atexit
 import datetime
 import multiprocessing
 import os
-import subprocess
 import sys
 import threading
+from typing import Optional
+
 from PyQt5.QtWidgets import QApplication
-from waitress import serve
 from flask import Flask, send_from_directory
 from flask_cors import CORS
-from p2pool_data import AsyncEventLogger
+from waitress import serve
 
-# --- Import components ---
-from p2pool_helper import p2pool_helper, ProcessManager
+from p2pool_data import AsyncEventLogger
 from p2pool_endpoints import api_b
-# Import all loggers, including the new GeminiLogger
-from p2pool_gui import P2PoolGUI, ConsoleLogger, WiresharkLogger, PacketLogger, RouterLogger, GeminiLogger, \
-    NmapLogger, GobusterLogger, ScrapingLogger  # Ensure GeminiLogger is imported
+from p2pool_gui import (
+    P2PoolGUI,
+    ConsoleLogger,
+    WiresharkLogger,
+    PacketLogger,
+    RouterLogger,
+    GeminiLogger,
+    NmapLogger,
+    GobusterLogger,
+    ScrapingLogger,
+)
+from p2pool_helper import p2pool_helper
 from p2pool_managers import PythonRouterManager
 
-# Global variable to hold references to non-Qt background threads for cleanup
-# This is a simple way to manage them for atexit.
-_non_qt_background_threads = []
-_flask_server_instance = None  # To hold the waitress server object if needed for explicit shutdown
 
-# === FLASK APP SETUP ===
-app = Flask(__name__, static_folder='p2pool-dashboard/dist')
+_non_qt_background_threads: list[threading.Thread] = []
+_flask_thread: Optional[threading.Thread] = None
+_async_event_logger: Optional[AsyncEventLogger] = None
+
+app = Flask(__name__, static_folder="p2pool-dashboard/dist")
 CORS(app)
 app.register_blueprint(api_b)
 
-router_logger = RouterLogger()  # Global instance for router logging
+router_logger = RouterLogger()
 gui_logger = ConsoleLogger()
 sys.stdout = gui_logger
 sys.stderr = gui_logger
-# --- Routes for serving the React frontend ---
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
 def serve_react(path):
-    # Check if the requested path corresponds to an existing file in the static folder
-    # This handles direct requests for static assets like CSS, JS, images, etc.
     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    else:
-        # If no specific file is found, or if it's the root path, serve index.html.
-        # This is crucial for Single Page Applications (SPAs) where client-side routing
-        # handles different "pages" within the single index.html file.
-        return send_from_directory(app.static_folder, 'index.html')
+    return send_from_directory(app.static_folder, "index.html")
+
 
 def start_flask():
-    """Starts the Flask server using Waitress."""
-    # The serve function from waitress runs indefinitely, serving the Flask app.
-    serve(app, host="0.0.0.0", port=5000)
+    """
+    Run Flask/Waitress in-process so the API shares the same live p2pool_helper
+    state as the GUI and background managers.
+    """
+    serve(app, host="0.0.0.0", port=5000, threads=8)
+
+
+def ensure_flask_thread_started():
+    global _flask_thread
+
+    if _flask_thread is not None and _flask_thread.is_alive():
+        return
+
+    _flask_thread = threading.Thread(
+        target=start_flask,
+        daemon=True,
+        name="FlaskServerThread",
+    )
+    _flask_thread.start()
+    _non_qt_background_threads.append(_flask_thread)
+
+    if getattr(p2pool_helper, "logger", None):
+        p2pool_helper.logger.log_message("[Main] Flask server thread started.")
+
+
+def ensure_background_thread(target, name: str) -> Optional[threading.Thread]:
+    for thread in _non_qt_background_threads:
+        if thread.name == name and thread.is_alive():
+            return thread
+
+    thread = threading.Thread(target=target, daemon=True, name=name)
+    thread.start()
+    _non_qt_background_threads.append(thread)
+    return thread
 
 
 def log_to_file(message):
-    """A simple, dependency-free logger that writes to a file."""
     try:
         with open("p2pool.log", "a", encoding="utf-8") as f:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -65,8 +100,19 @@ def log_to_file(message):
 
 
 async def application_main_loop(stop_event=None):
-    """The main async logic for the application's background services."""
+    """
+    Main async logic for the application's background services.
 
+    Important:
+      - Flask/API starts
+      - background log/event workers start
+      - ProcessManager starts watching IP transitions
+      - P2Pool itself does NOT auto-start here
+    """
+    global _async_event_logger
+
+    if stop_event is None:
+        stop_event = threading.Event()
 
     p2pool_helper.set_p2pool_stop_event(stop_event)
     p2pool_helper.clear_all_client_data()
@@ -74,170 +120,184 @@ async def application_main_loop(stop_event=None):
     p2pool_helper.clear_file_contents(p2pool_helper.p2pooldata.RAW_LOG)
 
     asyncio_main_loop = asyncio.get_running_loop()
-    p2pool_helper.asyncio_main_loop = asyncio_main_loop
+    p2pool_helper.set_asyncio_main_loop(asyncio_main_loop)
 
-    async_event_logger = AsyncEventLogger(p2pool_helper.p2pooldata, asyncio_main_loop, p2pool_helper.logger)
-
-    # Start and track non-Qt threads for proper cleanup
-    async_event_logger_thread = threading.Thread(target=async_event_logger.start, daemon=True,
-                                                 name="AsyncEventLoggerThread")
-    async_event_logger_thread.start()
-    _non_qt_background_threads.append(
-        (async_event_logger_thread, async_event_logger))  # Store thread and its target object
-
-    flask_thread = threading.Thread(target=start_flask, daemon=True, name="FlaskServerThread")
-    flask_thread.start()
-    _non_qt_background_threads.append((flask_thread, None)) # Flask target doesn't have a direct stop() method
-    p2pool_helper.router_manager = PythonRouterManager(router_logger)
-    p2pool_helper.set_router_logger(router_logger)
-    p2pool_helper.process_manager = ProcessManager(
+    _async_event_logger = AsyncEventLogger(
         p2pool_helper.p2pooldata,
-        start_flask,  # This argument might be for internal process management, not the actual thread
-        p2pool_helper.processor,
-        p2pool_helper.logger
+        asyncio_main_loop,
+        p2pool_helper.logger,
+        stop_event=stop_event,
     )
-    p2pool_helper.process_manager.start()  # This might start its own subprocesses/threads.
-    # Ensure ProcessManager has its own cleanup.
+    _async_event_logger.start()
 
-    # Start the RawLogProcessor and EventProcessor threads
-    raw_log_processor_thread = threading.Thread(target=p2pool_helper.raw_log_processor.run_in_background, daemon=True,
-                                                name="RawLogProcessorThread")
-    raw_log_processor_thread.start()
-    _non_qt_background_threads.append((raw_log_processor_thread, p2pool_helper.raw_log_processor))
+    ensure_flask_thread_started()
 
-    event_processor_thread = threading.Thread(target=p2pool_helper.event_processor.run_in_background, daemon=True,
-                                              name="EventProcessorThread")
-    event_processor_thread.start()
-    _non_qt_background_threads.append((event_processor_thread, p2pool_helper.event_processor))
+    if p2pool_helper.router_manager is None:
+        p2pool_helper.router_manager = PythonRouterManager(router_logger)
+    p2pool_helper.set_router_logger(router_logger)
 
+    p2pool_helper.create_process_manager(
+        flask_restart_callback=None,
+        asyncio_main_loop=asyncio_main_loop,
+    )
+    p2pool_helper.process_manager.start()
+
+    ensure_background_thread(
+        p2pool_helper.raw_log_processor.run_in_background,
+        "RawLogProcessorThread",
+    )
+    ensure_background_thread(
+        p2pool_helper.event_processor.run_in_background,
+        "EventProcessorThread",
+    )
+
+    p2pool_helper.logger.log_message("[Main] Background services started. P2Pool will not auto-start.")
 
     try:
-        while not (stop_event and stop_event.is_set()):
+        while not stop_event.is_set():
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\n[!] Shutdown signal (Ctrl+C) received...")
+        p2pool_helper.logger.log_message("[Main] Shutdown signal received.")
     finally:
-        # These are now handled by cleanup_on_exit, but keeping them here
-        # ensures they are called if application_main_loop exits before atexit.
-        # For full robustness, ensure these managers have proper stop methods.
-        p2pool_helper.router_manager.stop_routing()
-        p2pool_helper.p2pool_stop_event.set()
-        # This call needs to be awaited in an async context.
-        # It's better to ensure `stop_p2pool` is robustly handled in cleanup_on_exit.
-        # For now, keeping it as is, but noting the async context.
-        await p2pool_helper.processor.stop_p2pool()
-        print("[+] Async shutdown complete.")
+        p2pool_helper.logger.log_message("[Main] Beginning async shutdown...")
+
+        try:
+            if p2pool_helper.process_manager is not None:
+                p2pool_helper.process_manager.stop()
+        except Exception as e:
+            p2pool_helper.logger.log_message(f"[Main] ProcessManager stop error: {e}")
+
+        try:
+            stop_event.set()
+            p2pool_helper.p2pool_stop_event.set()
+        except Exception:
+            pass
+
+        try:
+            if p2pool_helper.router_manager is not None:
+                p2pool_helper.router_manager.stop_routing()
+        except Exception as e:
+            p2pool_helper.logger.log_message(f"[Main] Router shutdown error: {e}")
+
+        try:
+            await p2pool_helper.processor.stop_p2pool(reason="application_shutdown")
+        except Exception as e:
+            p2pool_helper.logger.log_message(f"[Main] P2Pool shutdown error: {e}")
+
+        try:
+            if _async_event_logger is not None:
+                _async_event_logger.stop()
+        except Exception as e:
+            p2pool_helper.logger.log_message(f"[Main] AsyncEventLogger stop error: {e}")
+
+        p2pool_helper.logger.log_message("[Main] Async shutdown complete.")
 
 
 def cleanup_on_exit():
-    """
-    Ensures all background services and threads are cleanly shut down on application exit.
-    This function is registered with atexit.
-    """
-    if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-        p2pool_helper.logger.log_message("Running final cleanup on application exit...")
+    logger = getattr(p2pool_helper, "logger", None)
+    if logger:
+        logger.log_message("[atexit] Running final cleanup on application exit...")
     else:
-        print("Running final cleanup on application exit...")
+        print("[atexit] Running final cleanup on application exit...")
 
-    # --- Stop and join non-Qt background threads ---
-    global _non_qt_background_threads
-    for thread, target_obj in _non_qt_background_threads:
-        if thread.is_alive():
-            if target_obj and hasattr(target_obj, 'stop'):  # Check if target object has a stop method
-                try:
-                    target_obj.stop()
-                    if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                        p2pool_helper.logger.log_message(f"[atexit] Signaled {thread.name} to stop.")
-                    else:
-                        print(f"[atexit] Signaled {thread.name} to stop.")
-                except Exception as e:
-                    if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                        p2pool_helper.logger.log_message(f"[atexit] Error signaling {thread.name} to stop: {e}")
-                    else:
-                        print(f"[atexit] Error signaling {thread.name} to stop: {e}")
+    try:
+        p2pool_helper.p2pool_stop_event.set()
+    except Exception:
+        pass
 
-            thread.join(timeout=5)  # Give thread 5 seconds to finish
-            if thread.is_alive():
-                if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                    p2pool_helper.logger.log_message(
-                        f"[atexit] WARNING: {thread.name} did not terminate gracefully. It might be forcefully terminated.")
-                else:
-                    print(
-                        f"[atexit] WARNING: {thread.name} did not terminate gracefully. It might be forcefully terminated.")
-        else:
-            if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                p2pool_helper.logger.log_message(f"[atexit] {thread.name} was already stopped.")
-            else:
-                print(f"[atexit] {thread.name} was already stopped.")
+    try:
+        if p2pool_helper.process_manager is not None:
+            p2pool_helper.process_manager.stop()
+    except Exception as e:
+        if logger:
+            logger.log_message(f"[atexit] ProcessManager stop error: {e}")
 
-    # --- Stop P2Pool process if running ---
-    if hasattr(p2pool_helper, 'p2pooldata') and p2pool_helper.p2pooldata and p2pool_helper.p2pooldata.p2pool_proc:
+    try:
+        if p2pool_helper.wireshark_manager is not None:
+            p2pool_helper.wireshark_manager.stop_capture()
+    except Exception as e:
+        if logger:
+            logger.log_message(f"[atexit] Wireshark stop error: {e}")
+
+    try:
+        if p2pool_helper.router_manager is not None:
+            p2pool_helper.router_manager.stop_routing()
+    except Exception as e:
+        if logger:
+            logger.log_message(f"[atexit] Router stop error: {e}")
+
+    try:
+        if _async_event_logger is not None:
+            _async_event_logger.stop()
+    except Exception as e:
+        if logger:
+            logger.log_message(f"[atexit] AsyncEventLogger stop error: {e}")
+
+    proc = None
+    try:
         proc = p2pool_helper.p2pooldata.p2pool_proc
-        if proc and proc.returncode is None:
-            if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                p2pool_helper.logger.log_message(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
-            else:
-                print(f"[atexit] Failsafe: Terminating p2pool process (PID: {proc.pid}).")
+    except Exception:
+        proc = None
+
+    if proc and proc.returncode is None:
+        try:
+            if logger:
+                logger.log_message(f"[atexit] Failsafe: terminating P2Pool process PID {proc.pid}.")
             proc.terminate()
+        except Exception:
+            pass
+
+        try:
+            import psutil
+            psutil.Process(proc.pid).wait(timeout=5)
+        except Exception:
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
                 proc.kill()
-                if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-                    p2pool_helper.logger.log_message(f"[atexit] P2Pool process (PID: {proc.pid}) killed after timeout.")
-                else:
-                    print(f"[atexit] P2Pool process (PID: {proc.pid}) killed after timeout.")
+            except Exception:
+                pass
 
-    # --- Stop WiresharkManager ---
-    if hasattr(p2pool_helper, 'wireshark_manager') and p2pool_helper.wireshark_manager:
-        p2pool_helper.wireshark_manager.stop_capture()
-        if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-            p2pool_helper.logger.log_message("[atexit] Wireshark capture stopped via manager.")
-        else:
-            print("[atexit] Wireshark capture stopped via manager.")
+    for thread in _non_qt_background_threads:
+        if thread.is_alive() and thread.name != "FlaskServerThread":
+            thread.join(timeout=2)
 
-    # --- Stop RouterManager ---
-    if hasattr(p2pool_helper, 'router_manager') and p2pool_helper.router_manager:
-        p2pool_helper.router_manager.stop_routing()
-        if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-            p2pool_helper.logger.log_message("[atexit] Router stopped via manager.")
-        else:
-            print("[atexit] Router stopped via manager.")
-
-    # --- Final message ---
-    if hasattr(p2pool_helper, 'logger') and p2pool_helper.logger:
-        p2pool_helper.logger.log_message("[atexit] All background services cleanup attempted.")
-    else:
-        print("[atexit] All background services cleanup attempted.")
+    if logger:
+        logger.log_message("[atexit] Cleanup attempted.")
 
 
 if __name__ == "__main__":
     try:
+        multiprocessing.freeze_support()
         atexit.register(cleanup_on_exit)
-        qapp = QApplication(sys.argv)
 
+        qapp = QApplication(sys.argv)
 
         wireshark_logger = WiresharkLogger()
         packet_logger = PacketLogger()
-        router_logger = RouterLogger()  # Ensure router_logger is instantiated
-        gemini_logger = GeminiLogger()  # Instantiate GeminiLogger here
+        router_logger = RouterLogger()
+        gemini_logger = GeminiLogger()
         nmap_logger = NmapLogger()
-        scraping_logger = ScrapingLogger()
         gobuster_logger = GobusterLogger()
-        # Redirect stdout/stderr to the GUI console logger
+        scraping_logger = ScrapingLogger()
 
-
-        # Set loggers in p2pool_helper
         p2pool_helper.set_gui_logger(gui_logger)
         p2pool_helper.set_wireshark_logger(wireshark_logger)
         p2pool_helper.set_packet_logger(packet_logger)
-        # Note: router_logger is set via p2pool_helper.set_router_logger in application_main_loop
-        # GeminiLogger is passed directly to P2PoolGUI and then to GeminiChatTab/Bot
 
-        window = P2PoolGUI(gui_logger, wireshark_logger, packet_logger, router_logger, gemini_logger, nmap_logger, gobuster_logger, scraping_logger, application_main_loop,
-                           p2pool_helper)
-
+        window = P2PoolGUI(
+            gui_logger,
+            wireshark_logger,
+            packet_logger,
+            router_logger,
+            gemini_logger,
+            nmap_logger,
+            gobuster_logger,
+            scraping_logger,
+            application_main_loop,
+            p2pool_helper,
+        )
         window.show()
         sys.exit(qapp.exec_())
+
     except Exception as e:
         log_to_file(f"[FATAL] Unhandled top-level exception: {e}")
+        raise

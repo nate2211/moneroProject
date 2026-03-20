@@ -250,7 +250,7 @@ class P2PoolGUI(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        self.p2pool_tab = P2PoolTab()
+        self.p2pool_tab = P2PoolTab(self.helper)
         self.wireshark_tab = WiresharkTab()
         self.packet_sender_tab = PacketSenderTab()
         self.router_tab = RouterTab(self.router_logger)
@@ -393,7 +393,7 @@ class P2PoolGUI(QMainWindow):
         use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
         use_static = self.router_tab.use_static_checkbox.isChecked()
         use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
-
+        use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
         lan_ip = self.router_tab.router_ip_out_input.text().strip()
         netmask_out = self.router_tab.router_netmask_out_input.text().strip()
 
@@ -419,6 +419,7 @@ class P2PoolGUI(QMainWindow):
                 use_blocknet=use_blocknet,
                 blocknet_relay=blocknet_relay,
                 blocknet_token=blocknet_token,
+                use_netroute=use_netroute,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
@@ -429,17 +430,46 @@ class P2PoolGUI(QMainWindow):
 
     def stop_router(self):
         self.router_logger.log_message("[GUI] Requesting to stop Router...")
-        if self.helper.router_manager:
-            use_startum_comm = self.router_tab.startum_comm_checkbox.isChecked()
+
+        if not self.helper.router_manager:
+            self.router_logger.log_message("[GUI] Router manager not available.")
+            return
+
+        # Prevent double-stop clicks immediately
+        self.router_tab.stop_router_button.setEnabled(False)
+
+        try:
+            use_stratum_comm = self.router_tab.stratum_comm_checkbox.isChecked()
             use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
             use_static = self.router_tab.use_static_checkbox.isChecked()
             use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
-            self.helper.router_manager.stop_routing(use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_startum_comm)
+            use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
+
+            self.router_logger.log_message(
+                f"[GUI] stop_router flags: "
+                f"stratum={use_stratum_comm}, "
+                f"dhcp_out={use_dhcp_out}, "
+                f"dhcp_in={use_dhcp_in}, "
+                f"static={use_static}, "
+                f"hyperv={use_hyperv}"
+            )
+
+            self.helper.router_manager.stop_routing(
+                use_dhcp_out,
+                use_dhcp_in,
+                use_static,
+                use_hyperv,
+                use_stratum_comm,
+                use_netroute,
+            )
+
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
-        else:
-            self.router_logger.log_message("[GUI] Router manager not available.")
+
+        except Exception as e:
+            self.router_logger.log_message(f"[GUI] Exception during router stop: {e}")
+            self.router_tab.stop_router_button.setEnabled(True)
 
     def closeEvent(self, event):
         """Ensures all worker threads are cleanly shut down on application exit."""

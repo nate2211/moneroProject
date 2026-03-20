@@ -1558,15 +1558,24 @@ class PacketSendingThread(threading.Thread):
 
 class P2PoolTab(QWidget):
     """
-    A QWidget that encapsulates all UI elements and logic for the P2Pool tab.
+    P2Pool tab with:
+      - Start/Stop buttons
+      - Console log
+      - Command textbox that writes to the running P2Pool process stdin
     """
-    def __init__(self, parent=None):
+
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, p2pool_helper=None, parent=None):
         super().__init__(parent)
+        self.p2pool_helper = p2pool_helper
+
         self._create_widgets()
         self._configure_layout()
 
+        self.log_signal.connect(self.log_message)
+
     def _create_widgets(self):
-        """Creates all the widgets for the tab."""
         self.start_p2pool_button = QPushButton("Start P2Pool")
         self.start_p2pool_button.setObjectName("start_button")
         self.start_p2pool_button.setEnabled(False)
@@ -1575,24 +1584,94 @@ class P2PoolTab(QWidget):
         self.stop_p2pool_button.setObjectName("stop_button")
         self.stop_p2pool_button.setEnabled(False)
 
+        self.command_label = QLabel("P2Pool Command:")
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText("Type a P2Pool command and press Enter...")
+        self.command_input.returnPressed.connect(self.send_command_to_p2pool)
+
+        self.send_command_button = QPushButton("Send Command")
+        self.send_command_button.setObjectName("send_command_button")
+        self.send_command_button.clicked.connect(self.send_command_to_p2pool)
+
         self.console_log = QPlainTextEdit()
         self.console_log.setReadOnly(True)
 
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
         layout = QVBoxLayout(self)
-        control_layout = QHBoxLayout()
 
+        control_layout = QHBoxLayout()
         control_layout.addWidget(self.start_p2pool_button)
         control_layout.addWidget(self.stop_p2pool_button)
         control_layout.addStretch(1)
 
+        command_layout = QHBoxLayout()
+        command_layout.addWidget(self.command_label)
+        command_layout.addWidget(self.command_input, 1)
+        command_layout.addWidget(self.send_command_button)
+
         layout.addLayout(control_layout)
+        layout.addLayout(command_layout)
         layout.addWidget(self.console_log)
+
+    def set_p2pool_helper(self, p2pool_helper):
+        self.p2pool_helper = p2pool_helper
+
+    def _get_running_proc(self):
+        if not self.p2pool_helper:
+            return None
+
+        try:
+            return self.p2pool_helper.p2pooldata.p2pool_proc
+        except Exception:
+            return None
+
+    def _get_async_loop(self):
+        if not self.p2pool_helper:
+            return None
+
+        return getattr(self.p2pool_helper, "asyncio_main_loop", None)
+
+    def _append_local_status(self, text: str):
+        self.log_signal.emit(text)
+
+    def send_command_to_p2pool(self):
+        command = self.command_input.text().strip()
+        if not command:
+            self._append_local_status("[P2PoolTab] No command entered.")
+            return
+
+        if not self.p2pool_helper:
+            self._append_local_status("[P2PoolTab] No p2pool_helper is attached.")
+            return
+
+        loop = self._get_async_loop()
+        if loop is None:
+            self._append_local_status("[P2PoolTab] Asyncio loop is not available.")
+            return
+
+        proc = self._get_running_proc()
+        if proc is None or proc.returncode is not None:
+            self._append_local_status("[P2PoolTab] P2Pool is not running.")
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.p2pool_helper.processor.write_to_stdin(command),
+                loop,
+            )
+            ok = future.result(timeout=5)
+
+            if ok:
+                self._append_local_status(f"> {command}")
+                self.command_input.clear()
+            else:
+                self._append_local_status(f"[P2PoolTab] Failed to send command: {command}")
+
+        except Exception as e:
+            self._append_local_status(f"[P2PoolTab] Error sending command: {e}")
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """Appends a message to the P2Pool console log."""
         self.console_log.appendPlainText(message)
 
 class WiresharkTab(QWidget):
@@ -1679,13 +1758,16 @@ class RouterTab(QWidget):
         self.peer_to_peer_checkbox.setChecked(False)
 
         self.dhcp_out_checkbox = QCheckBox("DHCP OUT")
-        self.dhcp_out_checkbox.setChecked(True)
+        self.dhcp_out_checkbox.setChecked(False)
 
         self.dhcp_in_checkbox = QCheckBox("DHCP IN")
         self.dhcp_in_checkbox.setChecked(False)
 
         self.use_static_checkbox = QCheckBox("Use Static (all)")
         self.use_static_checkbox.setChecked(False)
+
+        self.use_netroute_checkbox = QCheckBox("Use NetRoute")
+        self.use_netroute_checkbox.setChecked(False)
 
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(False)
@@ -1738,6 +1820,7 @@ class RouterTab(QWidget):
         routing_form = QFormLayout(routing_box)
         routing_form.addRow(self.dhcp_out_checkbox, self.dhcp_in_checkbox)
         routing_form.addRow(self.use_static_checkbox, self.use_hyperv_checkbox)
+        routing_form.addRow(self.use_netroute_checkbox)
         routing_form.addRow(QLabel("Manual LAN IP:"), self.router_ip_out_input)
         routing_form.addRow(QLabel("Netmask:"), self.router_netmask_out_input)
 

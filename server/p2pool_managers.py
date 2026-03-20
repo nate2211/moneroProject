@@ -53,7 +53,7 @@ from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
-    P2PPeerManager
+    P2PPeerManager, NetRouteManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -177,7 +177,7 @@ class PythonRouterManager:
         self.packet_analyzer = PacketPipelineBlock()
 
         self.p2p_manager = None
-
+        self.netroute_manager = None
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
@@ -1200,7 +1200,8 @@ class PythonRouterManager:
 
                 except Exception as e:
                     return
-
+            if self.netroute_manager:
+                self.netroute_manager.observe_packet(packet, inbound_iface)
             # ==========================================================
             # ✅ ARP HANDLING BLOCK (reply/learn) BEFORE "no IP layer" drop
             # ==========================================================
@@ -1273,9 +1274,20 @@ class PythonRouterManager:
             if nat_decision is False:
                 # Dropped (e.g., banned or ICMP sent)
                 return
+
             is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
 
             if is_handled_by_transport:
+                if self.netroute_manager:
+                    self.netroute_manager.handle_packet(
+                        packet,
+                        inbound_iface,
+                        transport_handled=True,
+                        transport_component="transport",
+                        install_host_route=True,
+                        host_route_cost=1,
+                    )
+
                 self.code_output_manager.submit_packet(
                     packet,
                     inbound_iface=inbound_iface,
@@ -1528,13 +1540,6 @@ class PythonRouterManager:
 
             if self.forwarding_manager.is_duplicate(ip_layer.src, ip_layer.dst, sport, dport, proto):
                 return
-            if (sport in self.stratum_manager.STRATUM_PORTS) or (dport in self.stratum_manager.STRATUM_PORTS):
-                from scapy.packet import Raw
-                if packet.haslayer(Raw):
-                    raw = packet[Raw].load or b""
-                    if raw.lstrip()[:1] in (b"{", b"["):
-                        if self.stratum_connection_manager.handle_packet(packet, inbound_iface=iface_short):
-                            return
             if dst_ip in self._get_all_local_ips():
                 self.function_call_tracker.track(
                     identifier="DroppedDstIPSame",
@@ -1632,6 +1637,7 @@ class PythonRouterManager:
                 # Scapy will send the L3 packet out the given iface. For WinDivert, this
                 # remains L3-only (no MAC), which is exactly what we want here.
                 self.sniffer.send(packet, iface=egress_iface, verbose=0)
+
                 self.router_logger.log_message(
                     RouterRandomMessages(
                         name="Router",
@@ -1780,6 +1786,8 @@ class PythonRouterManager:
                 component="internet",
             )
             self.sniffer.send(packet, selected_iface, verbose=0)
+            if self.netroute_manager:
+                self.netroute_manager.mark_route_success(selected_iface, next_hop_ip)
             return
         # ===================== END PATCH =====================
 
@@ -2017,7 +2025,7 @@ class PythonRouterManager:
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -2143,6 +2151,24 @@ class PythonRouterManager:
                 )
                 self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
                 self.p2p_manager.start()
+            if use_netroute:
+                self.netroute_manager = NetRouteManager(
+                    self.router_logger,
+                    self.rip_manager,
+                    self.arp_manager,
+                    self.ndp_manager,
+                    outbound_load_balancer=self.outbound_load_balancer,
+                    interfaces_config=self._interfaces_config,
+                    enable_os_route_sync=True,
+                    enable_host_route_sync=True,
+                    enable_default_route_sync=True,  # safest for Wi-Fi stability
+                    enable_ipv6_os_sync=True,
+                    enable_metric_tuning=True,  # safest for Wi-Fi stability
+                )
+                self.netroute_manager.set_interfaces_config(self._interfaces_config)
+                self.netroute_manager.start()
+            else:
+                self.netroute_manager = False
             self.code_output_manager.start()
             self.code_output_manager.set_verbose(2)
             self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
@@ -2161,7 +2187,7 @@ class PythonRouterManager:
             for iface_name in self._interfaces_config.keys():
                 sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
-            self.parallel_python.increase_ram_usage(3000)
+            self.parallel_python.increase_ram_usage(1000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
 
@@ -2178,7 +2204,7 @@ class PythonRouterManager:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm):
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute):
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
@@ -2205,6 +2231,9 @@ class PythonRouterManager:
             self.dns_manager.stop()
             if self.p2p_manager:
                 self.p2p_manager.stop()
+            if use_netroute:
+                if self.netroute_manager:
+                    self.netroute_manager.stop()
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")

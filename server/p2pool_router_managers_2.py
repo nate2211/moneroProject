@@ -1,11 +1,15 @@
+import atexit
 import binascii
 import hashlib
 import hmac
+import os
+import platform
 import queue
 import random
 import re
 import ssl
 import subprocess
+import tempfile
 import uuid
 import zlib
 from collections import defaultdict, deque, OrderedDict
@@ -9883,15 +9887,21 @@ class P2PPeerManager:
     """
     MAGIC_HEADER = "PYROUTER_P2P_V5"
 
-    def __init__(self, router_logger, router_ip: str, sniffer, out_iface: str, broadcast_ip: str = "255.255.255.255",
-                 port: int = 49999):
+    def __init__(
+        self,
+        router_logger,
+        router_ip: str,
+        sniffer,
+        out_iface: str,
+        broadcast_ip: str = "255.255.255.255",
+        port: int = 49999,
+    ):
         self.router_logger = router_logger
         self.router_ip = router_ip
         self.broadcast_ip = broadcast_ip
         self.port = port
         self.node_id = str(uuid.uuid4())
 
-        # Store sniffer and interface directly instead of using a custom socket wrapper
         self.sniffer = sniffer
         self.out_iface = out_iface
 
@@ -9901,7 +9911,10 @@ class P2PPeerManager:
         self.running = False
         self._listen_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
+        self._listen_sock: Optional[socket.socket] = None
+
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
 
         self.peers: Dict[str, Dict[str, Any]] = {}
         self.peer_timeout = 35.0
@@ -9912,36 +9925,73 @@ class P2PPeerManager:
         self.rip_manager = rip_manager
 
     def start(self):
-        if self.running:
-            return
+        with self._lock:
+            if self.running:
+                return
 
-        self.running = True
+            self.running = True
+            self._stop_event.clear()
 
-        # Spawn both background threads
-        self._listen_thread = threading.Thread(target=self._listener_loop, daemon=True, name="P2P-Listener")
-        self._broadcast_thread = threading.Thread(target=self._broadcaster_loop, daemon=True, name="P2P-Broadcaster")
+            # Prefer non-daemon since we explicitly manage shutdown
+            self._listen_thread = threading.Thread(
+                target=self._listener_loop,
+                daemon=False,
+                name="P2P-Listener",
+            )
+            self._broadcast_thread = threading.Thread(
+                target=self._broadcaster_loop,
+                daemon=False,
+                name="P2P-Broadcaster",
+            )
 
-        self._listen_thread.start()
-        self._broadcast_thread.start()
+            self._listen_thread.start()
+            self._broadcast_thread.start()
 
         self.router_logger.log_message(
             f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} (Hybrid Mode)"
         )
 
     def stop(self):
-        if not self.running:
-            return
+        with self._lock:
+            if not self.running and not self._listen_thread and not self._broadcast_thread:
+                return
 
-        self.running = False
+            self.running = False
+            self._stop_event.set()
+            listen_sock = self._listen_sock
+            listen_thread = self._listen_thread
+            broadcast_thread = self._broadcast_thread
+
         self.router_logger.log_message("[P2P] 🛑 Stopping Peer Manager...")
 
-        if self._listen_thread:
-            self._listen_thread.join(timeout=2.0)
-        if self._broadcast_thread:
-            self._broadcast_thread.join(timeout=2.0)
+        # Force recvfrom() to unblock immediately
+        if listen_sock is not None:
+            try:
+                listen_sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                listen_sock.close()
+            except Exception:
+                pass
+
+        if listen_thread:
+            listen_thread.join(timeout=5.0)
+            if listen_thread.is_alive():
+                self.router_logger.log_message("[P2P] ⚠️ Listener thread did not stop cleanly.")
+
+        if broadcast_thread:
+            broadcast_thread.join(timeout=5.0)
+            if broadcast_thread.is_alive():
+                self.router_logger.log_message("[P2P] ⚠️ Broadcaster thread did not stop cleanly.")
 
         with self._lock:
+            self._listen_thread = None
+            self._broadcast_thread = None
+            self._listen_sock = None
             self.peers.clear()
+
+        self.router_logger.log_message("[P2P] ✅ Peer Manager stopped.")
 
     def get_known_peers(self) -> Dict[str, Dict[str, Any]]:
         self._prune_dead_peers()
@@ -9951,13 +10001,15 @@ class P2PPeerManager:
     def _prune_dead_peers(self):
         now = time.time()
         with self._lock:
-            dead_peers = [ip for ip, data in self.peers.items() if (now - data["last_seen"]) > self.peer_timeout]
+            dead_peers = [
+                ip for ip, data in self.peers.items()
+                if (now - data["last_seen"]) > self.peer_timeout
+            ]
             for ip in dead_peers:
                 del self.peers[ip]
                 self.router_logger.log_message(f"[P2P] 👻 Peer {ip} timed out and was removed.")
 
     def _listener_loop(self):
-        """Standard Python socket listening for incoming broadcasts."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -9967,100 +10019,1773 @@ class P2PPeerManager:
             pass
 
         try:
-            # Bind to all interfaces to catch the broadcasts
             sock.bind(("0.0.0.0", self.port))
+            sock.settimeout(1.0)
+            with self._lock:
+                self._listen_sock = sock
         except Exception as e:
             self.router_logger.log_message(f"[P2P] ❌ Failed to bind listener socket: {e}")
-            self.running = False
+            with self._lock:
+                self.running = False
+                self._listen_sock = None
+            self._stop_event.set()
+            try:
+                sock.close()
+            except Exception:
+                pass
             return
 
-        sock.settimeout(1.0)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    data, addr = sock.recvfrom(65535)
+                    sender_ip = addr[0]
 
-        while self.running:
+                    payload = json.loads(data.decode("utf-8"))
+
+                    if payload.get("magic") != self.MAGIC_HEADER:
+                        continue
+
+                    if payload.get("node_id") == self.node_id:
+                        continue
+
+                    with self._lock:
+                        is_new = sender_ip not in self.peers
+                        self.peers[sender_ip] = {
+                            "node_id": payload.get("node_id"),
+                            "last_seen": time.time(),
+                            "arp_table": payload.get("arp_table", {}),
+                            "routes": payload.get("routes", []),
+                        }
+
+                    if is_new:
+                        node = payload.get("node_id", "")[:8]
+                        self.router_logger.log_message(
+                            f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {node})"
+                        )
+
+                except socket.timeout:
+                    self._prune_dead_peers()
+                    continue
+                except OSError:
+                    # Expected when stop() closes the socket
+                    if self._stop_event.is_set():
+                        break
+                    raise
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    if not self._stop_event.is_set():
+                        self.router_logger.log_message(f"[P2P] ⚠️ Listener error: {e}")
+
+        finally:
             try:
-                data, addr = sock.recvfrom(65535)
-                sender_ip = addr[0]
-
-                payload = json.loads(data.decode('utf-8'))
-
-                if payload.get("magic") != self.MAGIC_HEADER:
-                    continue
-
-                # Ignore packets sent by ourselves (using UUID)
-                if payload.get("node_id") == self.node_id:
-                    continue
-
-                # It's a valid peer, update state
-                with self._lock:
-                    is_new = sender_ip not in self.peers
-                    self.peers[sender_ip] = {
-                        "node_id": payload.get("node_id"),
-                        "last_seen": time.time(),
-                        "arp_table": payload.get("arp_table", {}),
-                        "routes": payload.get("routes", [])
-                    }
-
-                if is_new:
-                    self.router_logger.log_message(
-                        f"[P2P] 🤝 Discovered new router peer: {sender_ip} (Node: {payload.get('node_id')[:8]})"
-                    )
-
-            except socket.timeout:
-                self._prune_dead_peers()
-                continue
-            except json.JSONDecodeError:
+                sock.close()
+            except Exception:
                 pass
-            except Exception as e:
-                if self.running:
-                    self.router_logger.log_message(f"[P2P] ⚠️ Listener error: {e}")
-
-        sock.close()
+            with self._lock:
+                if self._listen_sock is sock:
+                    self._listen_sock = None
 
     def _broadcaster_loop(self):
-        """Gathers router state and broadcasts it using SnifferSoftware."""
-        while self.running:
+        while not self._stop_event.is_set():
             try:
-                # Gather state
                 arp_data = {}
-                if self.arp_manager:
-                    raw_arp = self.arp_manager.get_cache_view()
+                arp_manager = self.arp_manager
+                rip_manager = self.rip_manager
+                sniffer = self.sniffer
+                out_iface = self.out_iface
+
+                if arp_manager:
+                    raw_arp = arp_manager.get_cache_view()
                     for ip, val in raw_arp.items():
                         arp_data[ip] = list(val) if isinstance(val, tuple) else val
 
                 route_data = []
-                if self.rip_manager and hasattr(self.rip_manager, 'get_routing_table_view'):
-                    route_data = self.rip_manager.get_routing_table_view()
+                if rip_manager and hasattr(rip_manager, "get_routing_table_view"):
+                    route_data = rip_manager.get_routing_table_view()
 
                 payload = {
                     "magic": self.MAGIC_HEADER,
                     "node_id": self.node_id,
                     "router_ip": self.router_ip,
                     "arp_table": arp_data,
-                    "routes": route_data
+                    "routes": route_data,
                 }
 
-                packet_bytes = json.dumps(payload).encode('utf-8')
+                packet_bytes = json.dumps(payload).encode("utf-8")
 
-                # Construct the L3 Scapy Packet
-                pkt = IP(src=self.router_ip, dst=self.broadcast_ip) / UDP(sport=self.port, dport=self.port) / Raw(
-                    load=packet_bytes)
+                pkt = (
+                    IP(src=self.router_ip, dst=self.broadcast_ip)
+                    / UDP(sport=self.port, dport=self.port)
+                    / Raw(load=packet_bytes)
+                )
 
-                # Inject directly via SnifferSoftware
-                # Providing dst_mac="ff:ff:ff:ff:ff:ff" forces it to broadcast without triggering an ARP request
-                if self.sniffer:
-                    self.sniffer.send(
+                if sniffer and out_iface and not self._stop_event.is_set():
+                    sniffer.send(
                         pkt,
-                        iface=self.out_iface,
+                        iface=out_iface,
                         dst_mac="ff:ff:ff:ff:ff:ff",
-                        verbose=0
+                        verbose=0,
                     )
 
             except Exception as e:
-                if self.running:
+                if not self._stop_event.is_set():
                     self.router_logger.log_message(f"[P2P] ⚠️ Broadcast send error: {e}")
 
-            for _ in range(int(self.broadcast_interval * 10)):
-                if not self.running:
-                    break
-                time.sleep(0.1)
+            if self._stop_event.wait(self.broadcast_interval):
+                break
 
+
+@dataclass
+class UpstreamCandidate:
+    key: str
+    interface: str
+    gateway_ip: Optional[str]
+    family: int
+    source: str
+    priority: int = 0
+
+    healthy: bool = False
+    score: float = -1000.0
+    last_refresh: float = 0.0
+    last_ok: float = 0.0
+    last_fail: float = 0.0
+    consecutive_failures: int = 0
+    last_remote_seen: float = 0.0
+
+    # transport-aware state
+    last_transport_seen: float = 0.0
+    transport_hits: int = 0
+    last_transport_component: str = ""
+
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+class NetRouteManager:
+    """
+    Transport-aware upstream selector + SAFE Windows route mirroring.
+
+    Safe defaults:
+      - Host-route OS sync: ON
+      - Default-route OS sync: OFF
+      - Interface metric tuning: OFF
+
+    That means:
+      - it WILL install concrete host routes (/32, /128) for destinations you touch
+      - it will NOT override Windows default routing unless you explicitly enable it
+      - it will NOT change Wi-Fi metrics unless you explicitly enable it
+
+    This keeps Wi-Fi stable while still letting you inject real routes.
+    """
+
+    DEFAULT_MONITOR_INTERVAL = 10.0
+    DEFAULT_CANDIDATE_REFRESH_INTERVAL = 10.0
+    DEFAULT_PROBE_INTERVAL = 5.0
+    DEFAULT_PASSIVE_SUCCESS_WINDOW = 60.0
+    DEFAULT_TRANSPORT_SUCCESS_WINDOW = 45.0
+    DEFAULT_MIN_HEALTHY_SCORE = 25.0
+
+    DEFAULT_WINDOWS_V4_IF_METRIC = 5
+    DEFAULT_WINDOWS_V4_ROUTE_METRIC = 5
+    DEFAULT_WINDOWS_HOST_ROUTE_METRIC = 3
+    DEFAULT_WINDOWS_V6_ROUTE_METRIC = 5
+    DEFAULT_HOST_ROUTE_TTL = 180.0
+
+    def __init__(
+        self,
+        router_logger,
+        rip_manager,
+        arp_manager,
+        ndp_manager,
+        outbound_load_balancer=None,
+        interfaces_config: Optional[Dict[str, Dict[str, Any]]] = None,
+        *,
+        monitor_interval: float = DEFAULT_MONITOR_INTERVAL,
+        candidate_refresh_interval: float = DEFAULT_CANDIDATE_REFRESH_INTERVAL,
+        probe_interval: float = DEFAULT_PROBE_INTERVAL,
+        passive_success_window: float = DEFAULT_PASSIVE_SUCCESS_WINDOW,
+        transport_success_window: float = DEFAULT_TRANSPORT_SUCCESS_WINDOW,
+        min_healthy_score: float = DEFAULT_MIN_HEALTHY_SCORE,
+        enable_os_route_sync: bool = True,
+        enable_host_route_sync: bool = True,
+        enable_default_route_sync: bool = False,
+        enable_ipv6_os_sync: bool = True,
+        enable_metric_tuning: bool = False,
+        windows_v4_if_metric: int = DEFAULT_WINDOWS_V4_IF_METRIC,
+        windows_v4_route_metric: int = DEFAULT_WINDOWS_V4_ROUTE_METRIC,
+        windows_v6_route_metric: int = DEFAULT_WINDOWS_V6_ROUTE_METRIC,
+        windows_host_route_metric: int = DEFAULT_WINDOWS_HOST_ROUTE_METRIC,
+        host_route_ttl: float = DEFAULT_HOST_ROUTE_TTL,
+    ):
+        self.router_logger = router_logger
+        self.rip_manager = rip_manager
+        self.arp_manager = arp_manager
+        self.ndp_manager = ndp_manager
+        self.outbound_load_balancer = outbound_load_balancer
+
+        self._interfaces_config = interfaces_config or {}
+        self._lock = threading.RLock()
+
+        self._candidates: Dict[str, UpstreamCandidate] = {}
+        self._manual_candidates: Dict[str, UpstreamCandidate] = {}
+
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self.monitor_interval = float(monitor_interval)
+        self.candidate_refresh_interval = float(candidate_refresh_interval)
+        self.probe_interval = float(probe_interval)
+        self.passive_success_window = float(passive_success_window)
+        self.transport_success_window = float(transport_success_window)
+        self.min_healthy_score = float(min_healthy_score)
+
+        self.enable_os_route_sync = bool(enable_os_route_sync)
+        self.enable_host_route_sync = bool(enable_host_route_sync)
+        self.enable_default_route_sync = bool(enable_default_route_sync)
+        self.enable_ipv6_os_sync = bool(enable_ipv6_os_sync)
+        self.enable_metric_tuning = bool(enable_metric_tuning)
+
+        self.windows_v4_if_metric = int(windows_v4_if_metric)
+        self.windows_v4_route_metric = int(windows_v4_route_metric)
+        self.windows_v6_route_metric = int(windows_v6_route_metric)
+        self.windows_host_route_metric = int(windows_host_route_metric)
+        self.host_route_ttl = float(host_route_ttl)
+
+        self._last_candidate_refresh = 0.0
+
+        # routes/metrics we own and must revert
+        # key = (family_name, prefix, next_hop, interface_alias)
+        self._os_route_records: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._os_metric_restore: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # pending host routes discovered from traffic
+        self._pending_host_routes: Dict[str, Dict[str, Any]] = {}
+
+        # duplicate suppression
+        self._last_default_sync_key_v4: Optional[str] = None
+        self._last_default_sync_key_v6: Optional[str] = None
+        self._last_log_keys: Dict[str, float] = {}
+
+        self._atexit_registered = False
+        self._register_atexit_restore()
+
+        self._log("[NetRoute] 🚦 Manager initialized.")
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name="NetRouteManagerThread",
+        )
+        self._thread.start()
+        self._log("[NetRoute] ✅ Monitor thread started.")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._restore_windows_state()
+        self._log("[NetRoute] 🛑 Monitor thread stopped.")
+
+    def _monitor_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self.refresh_candidates(force=True)
+                self._probe_all_candidates(force=True)
+                self._sync_windows_state()
+            except Exception as e:
+                self._log(f"[NetRoute] ❌ Monitor loop error: {e}")
+            self._stop_event.wait(self.monitor_interval)
+
+    def _register_atexit_restore(self):
+        if self._atexit_registered:
+            return
+        self._atexit_registered = True
+        atexit.register(self._safe_atexit_restore)
+
+    def _safe_atexit_restore(self):
+        try:
+            self._restore_windows_state()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # public config
+    # ------------------------------------------------------------------
+
+    def set_interfaces_config(self, interfaces_config: Dict[str, Dict[str, Any]]):
+        with self._lock:
+            self._interfaces_config = interfaces_config or {}
+        self._log(f"[NetRoute] 🔧 Interfaces updated: {len(self._interfaces_config)} interface(s).")
+
+    def register_manual_upstream(
+        self,
+        gateway_ip: Optional[str],
+        interface: str,
+        *,
+        family: int = 4,
+        source: str = "manual",
+        priority: int = 100,
+        meta: Optional[Dict[str, Any]] = None,
+    ):
+        gateway_ip = self._normalize_next_hop(gateway_ip)
+        key = self._candidate_key(interface, gateway_ip, family)
+        cand = UpstreamCandidate(
+            key=key,
+            interface=interface,
+            gateway_ip=gateway_ip,
+            family=int(family),
+            source=source,
+            priority=int(priority),
+            meta=dict(meta or {}),
+        )
+        with self._lock:
+            old = self._manual_candidates.get(key)
+            if old:
+                cand = self._merge_candidate(old, cand)
+            self._manual_candidates[key] = cand
+            self._candidates[key] = cand
+        self._log(
+            f"[NetRoute] ➕ Manual upstream registered: "
+            f"iface={self._iface_short(interface)} gw={gateway_ip or 'direct'} family={family}"
+        )
+
+    def unregister_manual_upstream(self, gateway_ip: Optional[str], interface: str, *, family: int = 4):
+        gateway_ip = self._normalize_next_hop(gateway_ip)
+        key = self._candidate_key(interface, gateway_ip, family)
+        with self._lock:
+            self._manual_candidates.pop(key, None)
+            self._candidates.pop(key, None)
+        self._log(
+            f"[NetRoute] ➖ Manual upstream removed: "
+            f"iface={self._iface_short(interface)} gw={gateway_ip or 'direct'}"
+        )
+
+    # ------------------------------------------------------------------
+    # candidate discovery
+    # ------------------------------------------------------------------
+
+    def refresh_candidates(self, *, force: bool = False):
+        now = time.time()
+        with self._lock:
+            if not force and (now - self._last_candidate_refresh) < self.candidate_refresh_interval:
+                return
+            self._last_candidate_refresh = now
+
+        discovered: Dict[str, UpstreamCandidate] = {}
+
+        # 1) manual candidates
+        with self._lock:
+            for key, cand in self._manual_candidates.items():
+                discovered[key] = self._clone_candidate(cand)
+
+        # 2) RIP/default/static/direct candidates
+        try:
+            table = self.rip_manager.get_routing_table_view() or []
+        except Exception as e:
+            self._log(f"[NetRoute] ⚠️ Failed to read RIP table: {e}")
+            table = []
+
+        for entry in table:
+            try:
+                network = str(entry.get("network", ""))
+                iface = entry.get("interface")
+                next_hop = self._normalize_next_hop(entry.get("next_hop"))
+                route_type = str(entry.get("type", "unknown"))
+                cost = int(entry.get("cost", 16))
+
+                if not iface or cost >= 16:
+                    continue
+
+                if network in ("0.0.0.0/0", "::/0"):
+                    family = 6 if ":" in network else 4
+                    key = self._candidate_key(iface, next_hop, family)
+                    discovered[key] = self._merge_candidate(
+                        self._candidates.get(key),
+                        UpstreamCandidate(
+                            key=key,
+                            interface=iface,
+                            gateway_ip=next_hop,
+                            family=family,
+                            source=route_type,
+                            priority=self._priority_for_source(route_type),
+                            meta={"network": network, "cost": cost},
+                        ),
+                    )
+                    continue
+
+                # promote gateway-bearing routes into upstream candidates too
+                if next_hop:
+                    family = 6 if ":" in next_hop else 4
+                    key = self._candidate_key(iface, next_hop, family)
+                    if key not in discovered:
+                        discovered[key] = self._merge_candidate(
+                            self._candidates.get(key),
+                            UpstreamCandidate(
+                                key=key,
+                                interface=iface,
+                                gateway_ip=next_hop,
+                                family=family,
+                                source=f"route:{route_type}",
+                                priority=max(20, self._priority_for_source(route_type) - 10),
+                                meta={"promoted_from": network, "cost": cost},
+                            ),
+                        )
+            except Exception as e:
+                self._log(f"[NetRoute] ⚠️ Failed to parse RIP candidate: {e}")
+
+        # 3) interface-config gateways
+        for iface, cfg in (self._interfaces_config or {}).items():
+            try:
+                if not cfg:
+                    continue
+
+                gateway_ip = self._normalize_next_hop(cfg.get("gateway"))
+                if not gateway_ip:
+                    continue
+
+                family = 6 if ":" in gateway_ip else 4
+                key = self._candidate_key(iface, gateway_ip, family)
+
+                discovered[key] = self._merge_candidate(
+                    self._candidates.get(key),
+                    UpstreamCandidate(
+                        key=key,
+                        interface=iface,
+                        gateway_ip=gateway_ip,
+                        family=family,
+                        source="iface-gateway",
+                        priority=75,
+                        meta={
+                            "ip_addr": cfg.get("ip_addr"),
+                            "driver": cfg.get("driver"),
+                            "friendly_name": cfg.get("friendly_name"),
+                        },
+                    ),
+                )
+            except Exception as e:
+                self._log(f"[NetRoute] ⚠️ Failed iface-gateway candidate on {iface}: {e}")
+
+        # 4) default gateway iface candidates
+        try:
+            default_gw = self._normalize_next_hop(getattr(self.arp_manager, "default_gateway_ip", None))
+        except Exception:
+            default_gw = None
+
+        for iface, cfg in (self._interfaces_config or {}).items():
+            try:
+                if not cfg or not bool(cfg.get("is_default_gateway_iface")):
+                    continue
+
+                gateway_ip = self._normalize_next_hop(cfg.get("gateway") or default_gw)
+                family = 6 if (gateway_ip and ":" in gateway_ip) else 4
+                key = self._candidate_key(iface, gateway_ip, family)
+
+                discovered[key] = self._merge_candidate(
+                    self._candidates.get(key),
+                    UpstreamCandidate(
+                        key=key,
+                        interface=iface,
+                        gateway_ip=gateway_ip,
+                        family=family,
+                        source="iface-default",
+                        priority=90,
+                        meta={"friendly_name": cfg.get("friendly_name")},
+                    ),
+                )
+            except Exception as e:
+                self._log(f"[NetRoute] ⚠️ Failed iface-default candidate on {iface}: {e}")
+
+        # 5) Windows current routes
+        for cand in self._discover_windows_route_candidates():
+            discovered[cand.key] = self._merge_candidate(self._candidates.get(cand.key), cand)
+
+        with self._lock:
+            self._candidates = discovered
+
+        if discovered:
+            self._log(f"[NetRoute] 🔄 Candidates refreshed: {len(discovered)}")
+        else:
+            self._log("[NetRoute] ⚠️ No upstream candidates discovered.")
+
+    def _discover_windows_route_candidates(self) -> List[UpstreamCandidate]:
+        out: List[UpstreamCandidate] = []
+        if not self._is_windows():
+            return out
+
+        for family_name, family_num, default_prefix in (("IPv4", 4, "0.0.0.0/0"), ("IPv6", 6, "::/0")):
+            ps = f"""
+$rows = Get-NetRoute -AddressFamily {family_name} -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.DestinationPrefix -eq {self._ps_quote(default_prefix)} -and
+        $_.State -eq 'Alive' -and
+        $_.InterfaceAlias -ne $null
+    }} |
+    Select-Object InterfaceAlias, NextHop, RouteMetric
+$rows | ConvertTo-Json -Compress
+"""
+            ok, stdout, stderr = self._run_ps(ps)
+            if not ok or not stdout:
+                continue
+
+            try:
+                rows = json.loads(stdout)
+                if isinstance(rows, dict):
+                    rows = [rows]
+
+                for row in rows:
+                    alias = str(row.get("InterfaceAlias") or "").strip()
+                    gw = self._normalize_next_hop(row.get("NextHop"))
+                    iface = self._find_interface_key_by_alias(alias)
+                    if not alias or not iface:
+                        continue
+
+                    key = self._candidate_key(iface, gw, family_num)
+                    out.append(
+                        UpstreamCandidate(
+                            key=key,
+                            interface=iface,
+                            gateway_ip=gw,
+                            family=family_num,
+                            source="windows-route",
+                            priority=85,
+                            meta={
+                                "alias": alias,
+                                "route_metric": row.get("RouteMetric"),
+                            },
+                        )
+                    )
+            except Exception as e:
+                self._log(f"[NetRoute] ⚠️ Failed parsing Windows route candidates: {e}")
+
+        return out
+
+    # ------------------------------------------------------------------
+    # probes
+    # ------------------------------------------------------------------
+
+    def _probe_all_candidates(self, *, force: bool = False):
+        with self._lock:
+            keys = list(self._candidates.keys())
+        for key in keys:
+            self._probe_candidate(key, force=force)
+
+    def _probe_candidate(self, key: str, *, force: bool = False) -> Optional[UpstreamCandidate]:
+        now = time.time()
+
+        with self._lock:
+            cand = self._candidates.get(key)
+            if not cand:
+                return None
+            if not force and (now - cand.last_refresh) < self.probe_interval:
+                return self._clone_candidate(cand)
+            probe = self._clone_candidate(cand)
+
+        score = 0.0
+        healthy = False
+        reasons: List[str] = []
+
+        iface_cfg = (self._interfaces_config or {}).get(probe.interface) or {}
+        iface_ip = iface_cfg.get("ip_addr")
+        iface_net = iface_cfg.get("network")
+
+        if iface_cfg:
+            score += 5.0
+            reasons.append("iface-known")
+        else:
+            score -= 80.0
+            reasons.append("iface-missing")
+
+        if probe.source in ("manual", "iface-default"):
+            score += 25.0
+            reasons.append(probe.source)
+        elif probe.source == "iface-gateway":
+            score += 22.0
+            reasons.append("iface-gateway")
+        elif probe.source == "windows-route":
+            score += 22.0
+            reasons.append("windows-route")
+        elif probe.source == "static":
+            score += 20.0
+            reasons.append("static")
+        elif probe.source == "direct":
+            score += 15.0
+            reasons.append("direct")
+        elif probe.source.startswith("route:"):
+            score += 12.0
+            reasons.append(probe.source)
+        elif probe.source == "rip":
+            score += 8.0
+            reasons.append("rip")
+
+        if probe.last_remote_seen and (now - probe.last_remote_seen) <= self.passive_success_window:
+            score += 20.0
+            reasons.append("passive-seen")
+
+        if probe.last_transport_seen and (now - probe.last_transport_seen) <= self.transport_success_window:
+            score += 25.0
+            reasons.append(f"transport:{probe.last_transport_component or 'seen'}")
+
+        if probe.family == 4:
+            score, healthy, reasons = self._probe_candidate_v4(probe, iface_ip, iface_net, score, healthy, reasons)
+        else:
+            score, healthy, reasons = self._probe_candidate_v6(probe, iface_ip, iface_net, score, healthy, reasons)
+
+        if probe.consecutive_failures:
+            score -= float(probe.consecutive_failures * 20)
+            reasons.append(f"fails={probe.consecutive_failures}")
+
+        if score >= self.min_healthy_score:
+            healthy = True
+
+        with self._lock:
+            live = self._candidates.get(key)
+            if not live:
+                return None
+
+            live.score = score
+            live.healthy = healthy
+            live.last_refresh = now
+            live.meta["reasons"] = reasons
+            if healthy:
+                live.last_ok = now
+            else:
+                live.last_fail = now
+
+            return self._clone_candidate(live)
+
+    def _probe_candidate_v4(
+        self,
+        probe: UpstreamCandidate,
+        iface_ip: Optional[str],
+        iface_net: Any,
+        score: float,
+        healthy: bool,
+        reasons: List[str],
+    ):
+        gw = self._normalize_next_hop(probe.gateway_ip)
+
+        cidr = None
+        if isinstance(iface_net, ipaddress.IPv4Network):
+            cidr = str(iface_net)
+        elif isinstance(iface_net, str):
+            try:
+                net = ipaddress.ip_network(iface_net, strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    cidr = str(net)
+            except Exception:
+                cidr = None
+
+        if gw:
+            verdict_ok = True
+
+            if cidr and hasattr(self.arp_manager, "_validate_gateway_onlink"):
+                try:
+                    verdict = self.arp_manager._validate_gateway_onlink(gw, cidr, iface_ip)
+                    verdict_ok = bool(verdict.ok)
+                    if verdict_ok:
+                        score += 20.0
+                        reasons.append(f"onlink:{verdict.reason}")
+                    else:
+                        score -= 80.0
+                        reasons.append(f"bad-gw:{verdict.reason}")
+                except Exception as e:
+                    score -= 25.0
+                    reasons.append(f"validate-err:{e}")
+
+            mac = None
+            if verdict_ok:
+                try:
+                    if cidr and hasattr(self.arp_manager, "resolve_gateway_mac"):
+                        mac = self.arp_manager.resolve_gateway_mac(
+                            gw, probe.interface, cidr, timeout=0.35, retries=1
+                        )
+                    elif hasattr(self.arp_manager, "resolve"):
+                        mac = self.arp_manager.resolve(gw, probe.interface)
+                except Exception as e:
+                    reasons.append(f"arp-err:{e}")
+                    mac = None
+
+            if mac:
+                score += 30.0
+                healthy = True
+                reasons.append("gw-mac")
+            else:
+                score -= 20.0
+                reasons.append("no-gw-mac")
+        else:
+            if iface_ip:
+                score += 10.0
+                healthy = True
+                reasons.append("direct-ipv4")
+            else:
+                score -= 15.0
+                reasons.append("no-gw-no-ip")
+
+        return score, healthy, reasons
+
+    def _probe_candidate_v6(
+        self,
+        probe: UpstreamCandidate,
+        iface_ip: Optional[str],
+        iface_net: Any,
+        score: float,
+        healthy: bool,
+        reasons: List[str],
+    ):
+        gw = self._normalize_next_hop(probe.gateway_ip)
+
+        if gw:
+            if not self._is_valid_ipv6_gateway_for_os(gw):
+                score -= 50.0
+                reasons.append("bad-ipv6-gw")
+                return score, healthy, reasons
+
+            mac = None
+            try:
+                if hasattr(self.ndp_manager, "resolve"):
+                    mac = self.ndp_manager.resolve(gw, probe.interface)
+            except Exception as e:
+                reasons.append(f"ndp-err:{e}")
+
+            if mac:
+                score += 30.0
+                healthy = True
+                reasons.append("gw-ndp")
+            else:
+                score -= 20.0
+                reasons.append("no-gw-ndp")
+        else:
+            if iface_ip:
+                score += 10.0
+                healthy = True
+                reasons.append("direct-ipv6")
+            else:
+                score -= 15.0
+                reasons.append("no-gw-no-ip")
+
+        return score, healthy, reasons
+
+    # ------------------------------------------------------------------
+    # passive learning
+    # ------------------------------------------------------------------
+
+    def observe_packet(self, packet, inbound_iface: str):
+        now = time.time()
+
+        try:
+            if IP in packet:
+                self._note_passive_traffic(inbound_iface, packet[IP].src, packet[IP].dst, now, family=4)
+            elif IPv6 in packet:
+                self._note_passive_traffic(inbound_iface, packet[IPv6].src, packet[IPv6].dst, now, family=6)
+        except Exception:
+            pass
+
+        try:
+            if ARP in packet and int(packet[ARP].op) == 2:
+                spa = str(packet[ARP].psrc).strip()
+                with self._lock:
+                    for cand in self._candidates.values():
+                        if cand.family == 4 and cand.interface == inbound_iface and cand.gateway_ip == spa:
+                            cand.last_remote_seen = now
+                            cand.last_ok = now
+                            cand.healthy = True
+        except Exception:
+            pass
+
+    def _note_passive_traffic(self, inbound_iface: str, src_ip: str, dst_ip: str, now: float, family: int):
+        with self._lock:
+            for cand in self._candidates.values():
+                if cand.interface != inbound_iface or cand.family != family:
+                    continue
+
+                if cand.gateway_ip and src_ip == cand.gateway_ip:
+                    cand.last_remote_seen = now
+                    cand.last_ok = now
+                    cand.healthy = True
+                    continue
+
+                try:
+                    src_obj = ipaddress.ip_address(src_ip)
+                    dst_obj = ipaddress.ip_address(dst_ip)
+                    if self._is_routable_remote(src_obj) or self._is_routable_remote(dst_obj):
+                        cand.last_remote_seen = now
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # transport-aware path
+    # ------------------------------------------------------------------
+
+    def observe_transport_result(
+        self,
+        packet,
+        inbound_iface: str,
+        *,
+        handled: bool,
+        component: str = "transport",
+        install_host_route: bool = False,
+        host_route_cost: int = 1,
+        prefer_route_to_dst: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        self.observe_packet(packet, inbound_iface)
+
+        if not handled:
+            return None
+
+        dst_ip = self._extract_dest_ip(packet)
+        if not dst_ip:
+            return None
+
+        route = self.get_best_route(dst_ip, inbound_iface=inbound_iface) if prefer_route_to_dst else None
+
+        self._note_transport_activity(
+            packet=packet,
+            inbound_iface=inbound_iface,
+            route=route,
+            component=component,
+        )
+
+        if route:
+            gateway_ip = self._normalize_next_hop(route.get("next_hop"))
+            self.mark_route_success(route["interface"], gateway_ip=gateway_ip)
+
+        if install_host_route and dst_ip:
+            self.install_host_route(dst_ip, inbound_iface=inbound_iface, cost=host_route_cost)
+
+        return route
+
+    def note_transport_failure(
+        self,
+        packet,
+        inbound_iface: str,
+        *,
+        component: str = "transport",
+        reason: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        self.observe_packet(packet, inbound_iface)
+
+        dst_ip = self._extract_dest_ip(packet)
+        if not dst_ip:
+            return None
+
+        route = self.get_best_route(dst_ip, inbound_iface=inbound_iface)
+        if route:
+            gateway_ip = self._normalize_next_hop(route.get("next_hop"))
+            self.mark_route_failure(
+                route["interface"],
+                gateway_ip=gateway_ip,
+                reason=f"transport:{component}:{reason}",
+            )
+        return route
+
+    def _note_transport_activity(
+        self,
+        packet,
+        inbound_iface: str,
+        route: Optional[Dict[str, Any]],
+        component: str,
+    ):
+        now = time.time()
+        target_ifaces = {inbound_iface}
+        if route and route.get("interface"):
+            target_ifaces.add(route["interface"])
+
+        with self._lock:
+            for cand in self._candidates.values():
+                if cand.interface not in target_ifaces:
+                    continue
+
+                cand.last_transport_seen = now
+                cand.transport_hits += 1
+                cand.last_transport_component = component
+                cand.last_ok = now
+                cand.healthy = True
+
+                boost = min(12.0, 2.0 + (cand.transport_hits * 0.5))
+                cand.score = max(cand.score, self.min_healthy_score + boost)
+
+                cand.meta["last_transport_component"] = component
+                cand.meta["last_transport_seen"] = now
+
+    def queue_host_route(self, dest_ip: str, inbound_iface: Optional[str] = None, *, cost: int = 1):
+        try:
+            ip_obj = ipaddress.ip_address(str(dest_ip).strip())
+        except Exception:
+            return
+
+        if self._is_special_destination(ip_obj):
+            return
+
+        with self._lock:
+            self._pending_host_routes[str(ip_obj)] = {
+                "dest_ip": str(ip_obj),
+                "expires": time.time() + self.host_route_ttl,
+                "cost": int(cost),
+                "inbound_iface": inbound_iface,
+            }
+
+    # ------------------------------------------------------------------
+    # success/failure
+    # ------------------------------------------------------------------
+
+    def mark_route_success(self, interface: str, gateway_ip: Optional[str] = None):
+        now = time.time()
+        gateway_ip = self._normalize_next_hop(gateway_ip)
+        with self._lock:
+            for cand in self._candidates.values():
+                if cand.interface != interface:
+                    continue
+                if gateway_ip is not None and cand.gateway_ip != gateway_ip:
+                    continue
+                cand.last_ok = now
+                cand.healthy = True
+                cand.consecutive_failures = 0
+                cand.score = max(cand.score, self.min_healthy_score + 10.0)
+
+    def mark_route_failure(self, interface: str, gateway_ip: Optional[str] = None, reason: str = ""):
+        now = time.time()
+        gateway_ip = self._normalize_next_hop(gateway_ip)
+        with self._lock:
+            for cand in self._candidates.values():
+                if cand.interface != interface:
+                    continue
+                if gateway_ip is not None and cand.gateway_ip != gateway_ip:
+                    continue
+                cand.last_fail = now
+                cand.consecutive_failures += 1
+                cand.healthy = False
+                cand.score -= 25.0
+                if reason:
+                    cand.meta["last_fail_reason"] = reason
+
+    # ------------------------------------------------------------------
+    # unified packet path
+    # ------------------------------------------------------------------
+
+    def handle_packet(
+        self,
+        packet,
+        inbound_iface: str,
+        *,
+        transport_handled: bool = False,
+        transport_component: str = "transport",
+        install_host_route: bool = False,
+        host_route_cost: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        if transport_handled:
+            return self.observe_transport_result(
+                packet,
+                inbound_iface,
+                handled=True,
+                component=transport_component,
+                install_host_route=install_host_route,
+                host_route_cost=host_route_cost,
+            )
+
+        self.observe_packet(packet, inbound_iface)
+
+        dst_ip = self._extract_dest_ip(packet)
+        if not dst_ip:
+            return None
+
+        return self.get_best_route(dst_ip, inbound_iface=inbound_iface)
+
+    # ------------------------------------------------------------------
+    # route selection
+    # ------------------------------------------------------------------
+
+    def get_best_route(self, dest_ip: str, inbound_iface: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        try:
+            dest_obj = ipaddress.ip_address(str(dest_ip).strip())
+        except Exception:
+            return None
+
+        if self._is_special_destination(dest_obj):
+            return None
+
+        # Prefer specific routing-table entries first
+        specific = self._find_best_table_entry(dest_obj)
+        if specific and str(specific["network"]) not in ("0.0.0.0/0", "::/0"):
+            return {
+                "network": specific["network"],
+                "next_hop": specific["next_hop"],
+                "interface": specific["interface"],
+                "cost": specific["cost"],
+                "source": specific["type"],
+                "is_wan": bool(specific["interface"] in self._wan_ifaces()),
+                "health_score": 999.0,
+            }
+
+        self.refresh_candidates(force=False)
+        self._probe_all_candidates(force=False)
+
+        family = 6 if dest_obj.version == 6 else 4
+
+        with self._lock:
+            candidates = [self._clone_candidate(c) for c in self._candidates.values() if c.family == family]
+
+        if inbound_iface:
+            alt = [c for c in candidates if c.interface != inbound_iface]
+            if alt:
+                candidates = alt
+
+        candidates.sort(
+            key=lambda c: (
+                int(c.healthy),
+                float(c.score),
+                int(c.priority),
+                float(c.last_ok),
+                float(c.last_transport_seen),
+                -float(c.last_fail),
+            ),
+            reverse=True,
+        )
+
+        if candidates:
+            best = candidates[0]
+            if best.healthy or best.score > -50.0:
+                return {
+                    "network": "0.0.0.0/0" if family == 4 else "::/0",
+                    "next_hop": best.gateway_ip or ("0.0.0.0" if family == 4 else "::"),
+                    "interface": best.interface,
+                    "cost": 1,
+                    "source": f"netroute:{best.source}",
+                    "is_wan": bool(best.interface in self._wan_ifaces()),
+                    "health_score": best.score,
+                }
+
+        if specific:
+            return {
+                "network": specific["network"],
+                "next_hop": specific["next_hop"],
+                "interface": specific["interface"],
+                "cost": specific["cost"],
+                "source": specific["type"],
+                "is_wan": bool(specific["interface"] in self._wan_ifaces()),
+                "health_score": -999.0,
+            }
+
+        return None
+
+    # ------------------------------------------------------------------
+    # host route install
+    # ------------------------------------------------------------------
+
+    def install_host_route(self, dest_ip: str, inbound_iface: Optional[str] = None, *, cost: int = 1) -> bool:
+        """
+        Installs BOTH:
+          1) a host route in your RIP/static table
+          2) a host route in Windows ActiveStore if enabled
+
+        This is the method you wanted to make sure actually sets routes.
+        """
+        try:
+            ip_obj = ipaddress.ip_address(str(dest_ip).strip())
+        except Exception:
+            return False
+
+        if self._is_special_destination(ip_obj):
+            return False
+
+        route = self.get_best_route(str(ip_obj), inbound_iface=inbound_iface)
+        if not route:
+            self._log(f"[NetRoute] ❌ No route candidate available for {dest_ip}")
+            return False
+
+        family = 6 if ip_obj.version == 6 else 4
+        network_str = f"{ip_obj}/32" if family == 4 else f"{ip_obj}/128"
+        next_hop = self._normalize_next_hop(route["next_hop"])
+        interface = route["interface"]
+
+        ok_any = False
+
+        # 1) RIP/static table
+        try:
+            ok = self.rip_manager.add_static_route(
+                network_str=network_str,
+                next_hop=next_hop or ("0.0.0.0" if family == 4 else "::"),
+                interface=interface,
+                cost=int(cost),
+            )
+            if ok:
+                ok_any = True
+                self._log(
+                    f"[NetRoute] ✅ Installed static host route {network_str} via "
+                    f"{next_hop or 'direct'} on {self._iface_short(interface)}"
+                )
+        except Exception as e:
+            self._log(f"[NetRoute] ⚠️ Failed RIP/static host route {network_str}: {e}")
+
+        # 2) Windows ActiveStore host route
+        self.queue_host_route(str(ip_obj), inbound_iface=inbound_iface, cost=cost)
+
+        if self.enable_os_route_sync and self.enable_host_route_sync and self._is_windows():
+            route_dict = self._build_os_route_dict(
+                family=family,
+                prefix=network_str,
+                next_hop=next_hop,
+                interface=interface,
+                route_metric=self.windows_host_route_metric,
+            )
+            if route_dict:
+                if self._ensure_os_route(route_dict):
+                    ok_any = True
+
+        return ok_any
+
+    # ------------------------------------------------------------------
+    # Windows OS sync
+    # ------------------------------------------------------------------
+
+    def _sync_windows_state(self):
+        if not self._is_windows() or not self.enable_os_route_sync:
+            return
+
+        desired_routes: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+        # Default route sync is OFF by default so Wi-Fi stays undisturbed.
+        if self.enable_default_route_sync:
+            best_v4 = self._best_default_candidate_for_family(4)
+            if best_v4:
+                route = self._build_os_route_from_candidate(
+                    best_v4,
+                    prefix="0.0.0.0/0",
+                    route_metric=self.windows_v4_route_metric,
+                )
+                if route:
+                    desired_routes[self._os_route_key(route)] = route
+                    self._last_default_sync_key_v4 = best_v4.key
+
+                    if self.enable_metric_tuning:
+                        alias = route["interface_alias"]
+                        self._ensure_interface_metric(alias, family_name="IPv4", target_metric=self.windows_v4_if_metric)
+
+            if self.enable_ipv6_os_sync:
+                best_v6 = self._best_default_candidate_for_family(6)
+                if best_v6:
+                    route = self._build_os_route_from_candidate(
+                        best_v6,
+                        prefix="::/0",
+                        route_metric=self.windows_v6_route_metric,
+                    )
+                    if route:
+                        desired_routes[self._os_route_key(route)] = route
+                        self._last_default_sync_key_v6 = best_v6.key
+
+        # Host routes are ON by default.
+        if self.enable_host_route_sync:
+            self._prune_pending_host_routes()
+            with self._lock:
+                pending_host_routes = list(self._pending_host_routes.values())
+
+            for item in pending_host_routes:
+                dest_ip = item["dest_ip"]
+                inbound_iface = item.get("inbound_iface")
+                route = self.get_best_route(dest_ip, inbound_iface=inbound_iface)
+                if not route:
+                    continue
+
+                family = 6 if ":" in dest_ip else 4
+                prefix = f"{dest_ip}/32" if family == 4 else f"{dest_ip}/128"
+
+                route_dict = self._build_os_route_dict(
+                    family=family,
+                    prefix=prefix,
+                    next_hop=self._normalize_next_hop(route.get("next_hop")),
+                    interface=route["interface"],
+                    route_metric=self.windows_host_route_metric,
+                )
+                if route_dict:
+                    desired_routes[self._os_route_key(route_dict)] = route_dict
+
+        # ensure desired routes exist
+        for route_key, route in desired_routes.items():
+            self._ensure_os_route(route)
+
+        # remove only stale routes WE own
+        for route_key, rec in list(self._os_route_records.items()):
+            if route_key not in desired_routes and rec.get("owned"):
+                self._remove_os_route(route_key, quiet=False)
+
+    def _best_default_candidate_for_family(self, family: int) -> Optional[UpstreamCandidate]:
+        self.refresh_candidates(force=False)
+        self._probe_all_candidates(force=False)
+
+        with self._lock:
+            candidates = [self._clone_candidate(c) for c in self._candidates.values() if c.family == family]
+
+        candidates.sort(
+            key=lambda c: (
+                int(c.healthy),
+                float(c.score),
+                int(c.priority),
+                float(c.last_ok),
+                float(c.last_transport_seen),
+                -float(c.last_fail),
+            ),
+            reverse=True,
+        )
+
+        if not candidates:
+            return None
+
+        best = candidates[0]
+        if best.healthy or best.score > -50.0:
+            return best
+        return None
+
+    def _build_os_route_from_candidate(
+        self,
+        cand: UpstreamCandidate,
+        *,
+        prefix: str,
+        route_metric: int,
+    ) -> Optional[Dict[str, Any]]:
+        return self._build_os_route_dict(
+            family=cand.family,
+            prefix=prefix,
+            next_hop=self._normalize_next_hop(cand.gateway_ip),
+            interface=cand.interface,
+            route_metric=route_metric,
+        )
+
+    def _build_os_route_dict(
+        self,
+        *,
+        family: int,
+        prefix: str,
+        next_hop: Optional[str],
+        interface: str,
+        route_metric: int,
+    ) -> Optional[Dict[str, Any]]:
+        alias = self._find_interface_alias(interface)
+        if not alias:
+            return None
+
+        if family == 4:
+            # host routes/direct routes still need a concrete next hop for OS insertion
+            if not self._is_valid_ipv4_gateway_for_os(next_hop, interface):
+                return None
+        else:
+            if not self.enable_ipv6_os_sync:
+                return None
+            if not self._is_valid_ipv6_gateway_for_os(next_hop):
+                return None
+
+        return {
+            "family_name": "IPv4" if family == 4 else "IPv6",
+            "family": family,
+            "prefix": prefix,
+            "next_hop": next_hop,
+            "interface": interface,
+            "interface_alias": alias,
+            "route_metric": int(route_metric),
+        }
+
+    def _ensure_os_route(self, route: Dict[str, Any]) -> bool:
+        route_key = self._os_route_key(route)
+        rec = self._os_route_records.get(route_key, {})
+
+        exists = self._os_route_exists(route)
+        if exists:
+            self._os_route_records[route_key] = {
+                **rec,
+                "owned": rec.get("owned", False),
+                "active_logged": True,
+                "route": dict(route),
+            }
+            return True
+
+        ok, err = self._add_os_route(route)
+        if ok:
+            self._os_route_records[route_key] = {
+                "owned": True,
+                "active_logged": True,
+                "route": dict(route),
+            }
+            self._log_once(
+                f"osroute:{route_key}",
+                f"[NetRoute][OS] ✅ Route active {route['prefix']} via {route['next_hop']} on {route['interface_alias']}",
+                cooldown=30.0,
+            )
+            return True
+
+        self._log_once(
+            f"osroutefail:{route_key}",
+            f"[NetRoute][OS] ⚠️ Failed route {route['prefix']} via {route['next_hop']} on {route['interface_alias']}: {err}",
+            cooldown=30.0,
+        )
+        return False
+
+    def _restore_windows_state(self):
+        if not self._is_windows():
+            return
+
+        # remove only routes we added
+        for route_key, rec in list(self._os_route_records.items()):
+            if rec.get("owned"):
+                self._remove_os_route(route_key, quiet=False)
+
+        # restore metrics only if we changed them
+        for metric_key, old in list(self._os_metric_restore.items()):
+            alias, family_name = metric_key
+            self._restore_interface_metric(alias, family_name, old)
+
+        self._os_metric_restore.clear()
+        self._os_route_records.clear()
+
+    def _ensure_interface_metric(self, alias: str, *, family_name: str, target_metric: int):
+        metric_key = (alias, family_name)
+        if metric_key not in self._os_metric_restore:
+            snap = self._snapshot_interface_metric(alias, family_name)
+            if snap is not None:
+                self._os_metric_restore[metric_key] = snap
+
+        current = self._snapshot_interface_metric(alias, family_name)
+        if not current:
+            return
+
+        current_metric = int(current.get("InterfaceMetric", 0) or 0)
+        current_auto = bool(current.get("AutomaticMetric", False))
+
+        if (not current_auto) and current_metric == int(target_metric):
+            return
+
+        ps = f"""
+Set-NetIPInterface -AddressFamily {family_name} -InterfaceAlias {self._ps_quote(alias)} `
+    -AutomaticMetric Disabled -InterfaceMetric {int(target_metric)} -ErrorAction Stop | Out-Null
+"""
+        ok, stdout, stderr = self._run_ps(ps)
+        if ok:
+            self._log_once(
+                f"metric:{alias}:{family_name}",
+                f"[NetRoute][OS] 🔧 Set {alias} {family_name} metric -> {int(target_metric)}",
+                cooldown=30.0,
+            )
+        else:
+            self._log_once(
+                f"metricfail:{alias}:{family_name}",
+                f"[NetRoute][OS] ⚠️ Failed setting {alias} {family_name} metric: {stderr or stdout}",
+                cooldown=30.0,
+            )
+
+    def _restore_interface_metric(self, alias: str, family_name: str, old: Dict[str, Any]):
+        automatic = bool(old.get("AutomaticMetric", False))
+        metric = int(old.get("InterfaceMetric", 0) or 0)
+
+        if automatic:
+            ps = f"""
+Set-NetIPInterface -AddressFamily {family_name} -InterfaceAlias {self._ps_quote(alias)} `
+    -AutomaticMetric Enabled -ErrorAction Stop | Out-Null
+"""
+        else:
+            ps = f"""
+Set-NetIPInterface -AddressFamily {family_name} -InterfaceAlias {self._ps_quote(alias)} `
+    -AutomaticMetric Disabled -InterfaceMetric {metric} -ErrorAction Stop | Out-Null
+"""
+
+        ok, stdout, stderr = self._run_ps(ps)
+        if ok:
+            self._log(f"[NetRoute][OS] ↩️ Restored {alias} {family_name} metric")
+        else:
+            self._log(f"[NetRoute][OS] ⚠️ Failed restoring {alias} {family_name} metric: {stderr or stdout}")
+
+    def _snapshot_interface_metric(self, alias: str, family_name: str) -> Optional[Dict[str, Any]]:
+        ps = f"""
+$row = Get-NetIPInterface -AddressFamily {family_name} -InterfaceAlias {self._ps_quote(alias)} -ErrorAction SilentlyContinue |
+    Select-Object -First 1 InterfaceMetric, AutomaticMetric
+if ($row) {{ $row | ConvertTo-Json -Compress }}
+"""
+        ok, stdout, stderr = self._run_ps(ps)
+        if not ok or not stdout:
+            return None
+        try:
+            row = json.loads(stdout)
+            if isinstance(row, dict):
+                return row
+        except Exception:
+            return None
+        return None
+
+    def _os_route_exists(self, route: Dict[str, Any]) -> bool:
+        family_name = route["family_name"]
+        prefix = route["prefix"]
+        next_hop = route["next_hop"]
+        alias = route["interface_alias"]
+
+        ps = f"""
+$rows = Get-NetRoute -AddressFamily {family_name} -DestinationPrefix {self._ps_quote(prefix)} -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.InterfaceAlias -eq {self._ps_quote(alias)} -and
+        $_.NextHop -eq {self._ps_quote(next_hop)}
+    }} |
+    Select-Object -First 1 DestinationPrefix
+if ($rows) {{ '1' }} else {{ '0' }}
+"""
+        ok, stdout, stderr = self._run_ps(ps)
+        return bool(ok and stdout.strip() == "1")
+
+    def _add_os_route(self, route: Dict[str, Any]) -> Tuple[bool, str]:
+        family_name = route["family_name"]
+        prefix = route["prefix"]
+        next_hop = route["next_hop"]
+        alias = route["interface_alias"]
+        metric = int(route["route_metric"])
+
+        ps = f"""
+New-NetRoute -PolicyStore ActiveStore -AddressFamily {family_name} `
+    -DestinationPrefix {self._ps_quote(prefix)} `
+    -InterfaceAlias {self._ps_quote(alias)} `
+    -NextHop {self._ps_quote(next_hop)} `
+    -RouteMetric {metric} `
+    -Confirm:$false -ErrorAction Stop | Out-Null
+"""
+        ok, stdout, stderr = self._run_ps(ps)
+        return ok, (stderr or stdout)
+
+    def _remove_os_route(self, route_key: Tuple[str, str, str, str], *, quiet: bool = False):
+        rec = self._os_route_records.get(route_key)
+        if not rec:
+            return
+
+        family_name, prefix, next_hop, alias = route_key
+
+        if rec.get("owned"):
+            ps = f"""
+Get-NetRoute -AddressFamily {family_name} -DestinationPrefix {self._ps_quote(prefix)} -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.InterfaceAlias -eq {self._ps_quote(alias)} -and
+        $_.NextHop -eq {self._ps_quote(next_hop)}
+    }} |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+"""
+            ok, stdout, stderr = self._run_ps(ps)
+            if not quiet and ok:
+                self._log(f"[NetRoute][OS] ↩️ Removed route {prefix} via {next_hop} on {alias}")
+            elif not quiet and (stderr or stdout):
+                self._log(f"[NetRoute][OS] ⚠️ Failed removing route {prefix} via {next_hop} on {alias}: {stderr or stdout}")
+
+        self._os_route_records.pop(route_key, None)
+
+    def _prune_pending_host_routes(self):
+        now = time.time()
+        with self._lock:
+            for dest_ip, item in list(self._pending_host_routes.items()):
+                if now >= float(item.get("expires", 0.0)):
+                    self._pending_host_routes.pop(dest_ip, None)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _extract_dest_ip(self, packet) -> Optional[str]:
+        try:
+            if IP in packet:
+                return packet[IP].dst
+            if IPv6 in packet:
+                return packet[IPv6].dst
+        except Exception:
+            pass
+        return None
+
+    def _normalize_next_hop(self, next_hop: Optional[str]) -> Optional[str]:
+        if next_hop in (None, "", "0.0.0.0", "::"):
+            return None
+        s = str(next_hop).strip()
+        if not s:
+            return None
+        if "%" in s:
+            s = s.split("%", 1)[0].strip()
+        if s in ("::1",):
+            return None
+        return s
+
+    def _find_best_table_entry(self, dest_obj) -> Optional[Dict[str, Any]]:
+        try:
+            table = self.rip_manager.get_routing_table_view() or []
+        except Exception:
+            return None
+
+        best = None
+        best_prefix = -1
+
+        for entry in table:
+            try:
+                network = ipaddress.ip_network(str(entry["network"]), strict=False)
+                if dest_obj.version != network.version:
+                    continue
+                if dest_obj not in network:
+                    continue
+
+                cost = int(entry.get("cost", 16))
+                if cost >= 16:
+                    continue
+
+                better = False
+                if best is None:
+                    better = True
+                elif network.prefixlen > best_prefix:
+                    better = True
+                elif network.prefixlen == best_prefix:
+                    if cost < int(best.get("cost", 16)):
+                        better = True
+                    elif cost == int(best.get("cost", 16)):
+                        if str(entry.get("type")) == "static" and str(best.get("type")) != "static":
+                            better = True
+
+                if better:
+                    best_prefix = network.prefixlen
+                    best = {
+                        "network": str(network),
+                        "next_hop": self._normalize_next_hop(entry.get("next_hop")) or ("0.0.0.0" if dest_obj.version == 4 else "::"),
+                        "interface": entry.get("interface"),
+                        "cost": cost,
+                        "type": str(entry.get("type", "unknown")),
+                    }
+            except Exception:
+                continue
+
+        return best
+
+    def _wan_ifaces(self) -> set[str]:
+        try:
+            if self.outbound_load_balancer:
+                return set(self.outbound_load_balancer.get_configured_interfaces())
+        except Exception:
+            pass
+        return set()
+
+    def _is_special_destination(self, ip_obj) -> bool:
+        try:
+            if ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_loopback:
+                return True
+            if isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj == ipaddress.IPv4Address("255.255.255.255"):
+                return True
+            return False
+        except Exception:
+            return True
+
+    def _is_routable_remote(self, ip_obj) -> bool:
+        try:
+            if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_unspecified:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _priority_for_source(self, source: str) -> int:
+        if source == "manual":
+            return 100
+        if source == "iface-default":
+            return 90
+        if source == "windows-route":
+            return 85
+        if source == "static":
+            return 80
+        if source == "iface-gateway":
+            return 75
+        if source == "direct":
+            return 70
+        if source.startswith("route:"):
+            return 60
+        if source == "rip":
+            return 50
+        return 10
+
+    def _candidate_key(self, interface: str, gateway_ip: Optional[str], family: int) -> str:
+        return f"{family}|{interface}|{gateway_ip or 'direct'}"
+
+    def _merge_candidate(self, old: Optional[UpstreamCandidate], new: UpstreamCandidate) -> UpstreamCandidate:
+        if not old:
+            return new
+
+        new.healthy = old.healthy
+        new.score = old.score
+        new.last_refresh = old.last_refresh
+        new.last_ok = old.last_ok
+        new.last_fail = old.last_fail
+        new.consecutive_failures = old.consecutive_failures
+        new.last_remote_seen = old.last_remote_seen
+        new.last_transport_seen = old.last_transport_seen
+        new.transport_hits = old.transport_hits
+        new.last_transport_component = old.last_transport_component
+
+        merged_meta = {}
+        merged_meta.update(old.meta or {})
+        merged_meta.update(new.meta or {})
+        new.meta = merged_meta
+        return new
+
+    def _clone_candidate(self, cand: UpstreamCandidate) -> UpstreamCandidate:
+        return UpstreamCandidate(
+            key=cand.key,
+            interface=cand.interface,
+            gateway_ip=cand.gateway_ip,
+            family=cand.family,
+            source=cand.source,
+            priority=cand.priority,
+            healthy=cand.healthy,
+            score=cand.score,
+            last_refresh=cand.last_refresh,
+            last_ok=cand.last_ok,
+            last_fail=cand.last_fail,
+            consecutive_failures=cand.consecutive_failures,
+            last_remote_seen=cand.last_remote_seen,
+            last_transport_seen=cand.last_transport_seen,
+            transport_hits=cand.transport_hits,
+            last_transport_component=cand.last_transport_component,
+            meta=dict(cand.meta or {}),
+        )
+
+    def _os_route_key(self, route: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        return (
+            str(route["family_name"]),
+            str(route["prefix"]),
+            str(route["next_hop"]),
+            str(route["interface_alias"]),
+        )
+
+    def _find_interface_alias(self, interface: str) -> Optional[str]:
+        cfg = (self._interfaces_config or {}).get(interface) or {}
+        alias = str(cfg.get("friendly_name") or "").strip()
+        if alias:
+            return alias
+
+        s = str(interface or "").strip()
+        if s:
+            return s.split("_")[-1]
+        return None
+
+    def _find_interface_key_by_alias(self, alias: str) -> Optional[str]:
+        alias_l = str(alias or "").strip().lower()
+        if not alias_l:
+            return None
+
+        for iface, cfg in (self._interfaces_config or {}).items():
+            friendly = str((cfg or {}).get("friendly_name") or "").strip().lower()
+            if friendly == alias_l:
+                return iface
+
+        for iface in (self._interfaces_config or {}).keys():
+            if str(iface).strip().lower() == alias_l:
+                return iface
+
+        for iface in (self._interfaces_config or {}).keys():
+            if str(iface).split("_")[-1].strip().lower() == alias_l:
+                return iface
+
+        return None
+
+    def _iface_short(self, iface: str) -> str:
+        try:
+            cfg = (self._interfaces_config or {}).get(iface) or {}
+            return str(cfg.get("friendly_name") or "").strip() or str(iface).split("_")[-1]
+        except Exception:
+            return str(iface).split("_")[-1]
+
+    def _is_windows(self) -> bool:
+        return os.name == "nt"
+
+    def _ps_quote(self, s: str) -> str:
+        return "'" + str(s).replace("'", "''") + "'"
+
+    def _run_ps(self, script: str) -> Tuple[bool, str, str]:
+        if not self._is_windows():
+            return False, "", "not-windows"
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                creationflags=creationflags,
+            )
+            return proc.returncode == 0, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+        except Exception as e:
+            return False, "", str(e)
+
+    def _is_valid_ipv4_gateway_for_os(self, next_hop: Optional[str], interface: str) -> bool:
+        if not next_hop:
+            return False
+
+        try:
+            gw = ipaddress.IPv4Address(next_hop)
+        except Exception:
+            return False
+
+        if gw.is_loopback or gw.is_multicast or gw.is_unspecified:
+            return False
+
+        cfg = (self._interfaces_config or {}).get(interface) or {}
+        iface_ip = cfg.get("ip_addr")
+        iface_net = cfg.get("network")
+
+        cidr = None
+        if isinstance(iface_net, ipaddress.IPv4Network):
+            cidr = str(iface_net)
+        elif isinstance(iface_net, str):
+            try:
+                net = ipaddress.ip_network(iface_net, strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    cidr = str(net)
+            except Exception:
+                cidr = None
+
+        if cidr and hasattr(self.arp_manager, "_validate_gateway_onlink"):
+            try:
+                verdict = self.arp_manager._validate_gateway_onlink(str(gw), cidr, iface_ip)
+                return bool(verdict.ok)
+            except Exception:
+                return False
+
+        return True
+
+    def _is_valid_ipv6_gateway_for_os(self, next_hop: Optional[str]) -> bool:
+        if not next_hop:
+            return False
+
+        try:
+            gw = ipaddress.IPv6Address(str(next_hop).split("%", 1)[0])
+        except Exception:
+            return False
+
+        if gw.is_loopback or gw.is_multicast or gw.is_unspecified:
+            return False
+
+        if gw.is_link_local:
+            return True
+        if gw.is_private or gw.is_global:
+            return True
+        return False
+
+    def _log_once(self, key: str, msg: str, *, cooldown: float = 10.0):
+        now = time.time()
+        last = self._last_log_keys.get(key, 0.0)
+        if (now - last) < float(cooldown):
+            return
+        self._last_log_keys[key] = now
+        self._log(msg)
+
+    def _log(self, msg: str):
+        try:
+            self.router_logger.log_message(msg)
+        except Exception:
+            pass

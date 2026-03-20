@@ -8,7 +8,7 @@ import time
 from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
 import sys
 from typing import Optional, List, Union
-
+import importlib
 import psutil
 from scapy.arch import get_if_hwaddr, get_windows_if_list
 from scapy.config import conf
@@ -106,7 +106,9 @@ DLT_LINUX_SLL2      = 276
 DLT_FRELAY          = 107     # Frame Relay (payload varies; often like CHDLC)
 DLT_IPV4            = 228
 DLT_IPV6            = 229
-
+DLT_PRISM_HEADER       = 119
+DLT_TZSP               = 128
+DLT_IEEE802_11_RADIO_AVS = 163
 
 # Optional capture direction (if supported by lib)
 PCAP_D_IN = 1  # inbound only
@@ -223,7 +225,9 @@ class SnifferSoftware:
             0x88CC,  # LLDP
             0x8809,  # LACP / Slow Protocols
             0x88F7,  # PTP
-            0x88E7,  # MACsec (encrypted but detectable)
+            0x88E7,  # keep if you already want it tolerated
+            0x8808,  # MAC Control
+            0x8902,  # OAM / CFM / Y.1731
             0x0800,  # IPv4
             0x86DD,  # IPv6
             0x0806,  # ARP
@@ -237,6 +241,15 @@ class SnifferSoftware:
         self.local_ips = self._get_local_ips()
         self.banned_packets = []
         self._load_pcap_library()
+        # Load extra Scapy contrib dissectors we want available
+        for mod in (
+            "lldp", "lacp", "slowprot", "cdp", "vtp", "dtp",
+            "oam", "mac_control", "erspan", "tzsp", "avs"
+        ):
+            try:
+                importlib.import_module(f"scapy.contrib.{mod}")
+            except Exception as e:
+                self.logger.log_message(f"[Scapy] contrib load failed: {mod}: {e}")
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
         self.logged_packets = []
@@ -369,7 +382,15 @@ class SnifferSoftware:
         load_layer("kerberos")
         load_layer("rip")
         load_layer("dns")
+        load_layer("dot11")
 
+        # TZSP automatic dissection on default UDP port 0x9090
+        try:
+            from scapy.contrib.tzsp import TZSP
+            bind_layers(UDP, TZSP, sport=0x9090)
+            bind_layers(UDP, TZSP, dport=0x9090)
+        except Exception as e:
+            self.logger.log_message(f"[Scapy] TZSP bind failed: {e}")
     def _load_pcap_library(self):
         if self.libpcap:
             return
@@ -725,12 +746,16 @@ class SnifferSoftware:
             # Ethernet
             if dlt == DLT_EN10MB:
                 return Ether(raw)
-
+            if dlt == DLT_PRISM_HEADER:
+                from scapy.layers.dot11 import PrismHeader
+                return PrismHeader(raw)
             # 802.11 (with or without Radiotap/PPI)
             if dlt == DLT_IEEE802_11_RADIO:
                 from scapy.layers.dot11 import RadioTap
                 return RadioTap(raw)
-
+            if dlt == DLT_IEEE802_11_RADIO_AVS:
+                from scapy.contrib.avs import AVSWLANHeader
+                return AVSWLANHeader(raw)
             if dlt == DLT_PPI:
                 # PPI often wraps 802.11; Scapy understands inner payload
                 from scapy.layers.ppi import PPI
@@ -739,7 +764,9 @@ class SnifferSoftware:
             if dlt == DLT_IEEE802_11:
                 from scapy.layers.dot11 import Dot11
                 return Dot11(raw)
-
+            if dlt == DLT_TZSP:
+                from scapy.contrib.tzsp import TZSP
+                return TZSP(raw)
             # Linux "cooked" captures
             if dlt == DLT_LINUX_SLL:
                 from scapy.layers.l2 import CookedLinux
@@ -861,6 +888,9 @@ class SnifferSoftware:
             DLT_FRELAY: "FRELAY",
             DLT_IPV4: "IPV4",
             DLT_IPV6: "IPV6",
+            DLT_PRISM_HEADER: "PRISM_HEADER",
+            DLT_TZSP: "TZSP",
+            DLT_IEEE802_11_RADIO_AVS: "IEEE802_11_RADIO_AVS",
         }
         return names.get(dlt, f"DLT({dlt})")
 
@@ -940,7 +970,7 @@ class SnifferSoftware:
             if expect_reply:
                 # Use a tight BPF so we don’t pick up unrelated traffic.
                 try:
-                    reply = self.sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0, filter=bpf)
+                    reply = self.sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0)
                 except TypeError:
                     # Some builds don’t support 'filter' kw; fall back without it.
                     reply = self.sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0)
@@ -1369,8 +1399,12 @@ class SnifferSoftware:
                             continue
 
                     # For non-Ether captures, check for L3 presence
-                    if not (packet.haslayer(IP) or packet.haslayer(IPv6) or packet.haslayer(ARP)):
-                        # Likely 802.11 mgmt/ctrl etc.
+                    if not (
+                        packet.haslayer(Ether) or
+                        packet.haslayer(IP) or
+                        packet.haslayer(IPv6) or
+                        packet.haslayer(ARP)
+                    ):
                         continue
                     src_ip, dst_ip = None, None
                     if packet.haslayer(IP):
@@ -2011,18 +2045,37 @@ class SnifferSoftware:
         visited = set()
         nodes = 0
 
-        # Optional VXLAN class (depends on scapy build)
         try:
             from scapy.layers.vxlan import VXLAN
         except Exception:
-            VXLAN = None  # type: ignore
+            VXLAN = None
+
+        try:
+            from scapy.layers.dot11 import PrismHeader
+        except Exception:
+            PrismHeader = None
+
+        try:
+            from scapy.contrib.avs import AVSWLANHeader
+        except Exception:
+            AVSWLANHeader = None
+
+        try:
+            from scapy.contrib.tzsp import TZSP
+        except Exception:
+            TZSP = None
+
+        try:
+            from scapy.contrib.erspan import ERSPAN, ERSPAN_II, ERSPAN_III
+            ERSPAN_TYPES = tuple(x for x in (ERSPAN, ERSPAN_II, ERSPAN_III) if x is not None)
+        except Exception:
+            ERSPAN_TYPES = ()
 
         while q and nodes < max_nodes:
             cur = q.popleft()
             if cur is None:
                 continue
 
-            # De-dupe by object id + class
             key = (id(cur), cur.__class__)
             if key in visited:
                 continue
@@ -2031,51 +2084,118 @@ class SnifferSoftware:
             nodes += 1
             yield cur
 
-            # Normal payload path
             pay = getattr(cur, "payload", None)
 
-            # Tunnel decap shortcuts
             try:
+                # Prism / AVS monitor wrappers
+                if PrismHeader is not None and isinstance(cur, PrismHeader):
+                    if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                        q.append(pay)
+                    continue
+
+                if AVSWLANHeader is not None and isinstance(cur, AVSWLANHeader):
+                    if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                        q.append(pay)
+                    continue
+
+                # GRE / ERSPAN
                 if isinstance(cur, GRE):
-                    q.append(cur.payload)
+                    if ERSPAN_TYPES:
+                        try:
+                            erspan_pkt = None
+                            if isinstance(pay, Packet) and any(isinstance(pay, t) for t in ERSPAN_TYPES):
+                                erspan_pkt = pay
+                            elif isinstance(pay, Raw):
+                                for t in ERSPAN_TYPES:
+                                    try:
+                                        tmp = t(bytes(pay.load or b""))
+                                        erspan_pkt = tmp
+                                        break
+                                    except Exception:
+                                        pass
+                            if erspan_pkt is not None:
+                                q.append(erspan_pkt)
+                                continue
+                        except Exception:
+                            pass
+
+                    if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                        q.append(pay)
+                    continue
+
+                # ERSPAN payload is usually inner Ether
+                if ERSPAN_TYPES and any(isinstance(cur, t) for t in ERSPAN_TYPES):
+                    if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                        q.append(pay)
                     continue
 
                 if isinstance(cur, (PPPoE, PPP, MPLS, Dot1Q)):
-                    q.append(cur.payload)
+                    if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
+                        q.append(pay)
                     continue
 
                 if isinstance(cur, UDP):
-                    # VXLAN ports: 4789 + 8472 (common)
+                    # TZSP
+                    if int(getattr(cur, "dport", -1)) == 0x9090 or int(getattr(cur, "sport", -1)) == 0x9090:
+                        tz = None
+                        if TZSP is not None:
+                            try:
+                                if cur.haslayer(TZSP):
+                                    tz = cur.getlayer(TZSP)
+                                elif isinstance(pay, Raw):
+                                    tz = TZSP(bytes(pay.load or b""))
+                            except Exception:
+                                tz = None
+
+                        if tz is not None:
+                            q.append(tz)
+                            try:
+                                inner = tz.get_encapsulated_payload()
+                                if isinstance(inner, Packet) and not isinstance(inner, NoPayload):
+                                    q.append(inner)
+                            except Exception:
+                                pass
+                            continue
+
+                    # VXLAN ports: 4789 + 8472
                     if int(getattr(cur, "dport", -1)) in (4789, 8472) or int(getattr(cur, "sport", -1)) in (4789, 8472):
                         if VXLAN and cur.haslayer(VXLAN):
                             vx = cur.getlayer(VXLAN)
                             if vx and hasattr(vx, "payload"):
-                                q.append(vx.payload)  # inner Ether normally
+                                q.append(vx.payload)
                                 continue
 
-                    # GENEVE (6081)
+                    # GENEVE
                     if int(getattr(cur, "dport", -1)) == 6081 or int(getattr(cur, "sport", -1)) == 6081:
                         ge = cur.getlayer(GENEVE) if cur.haslayer(GENEVE) else None
                         if ge and hasattr(ge, "payload"):
                             q.append(ge.payload)
                             continue
 
-                    # L2TP (1701) often carries PPP
+                    # L2TP
                     if int(getattr(cur, "dport", -1)) == 1701 or int(getattr(cur, "sport", -1)) == 1701:
                         l2tp = cur.getlayer(L2TP) if cur.haslayer(L2TP) else None
                         if l2tp and hasattr(l2tp, "payload"):
                             q.append(l2tp.payload)
                             continue
 
+                # If the current layer is TZSP itself, try to unwrap it too
+                if TZSP is not None and isinstance(cur, TZSP):
+                    try:
+                        inner = cur.get_encapsulated_payload()
+                        if isinstance(inner, Packet) and not isinstance(inner, NoPayload):
+                            q.append(inner)
+                            continue
+                    except Exception:
+                        pass
+
             except Exception:
                 pass
 
-            # If payload is a packet, traverse it
             if isinstance(pay, Packet) and not isinstance(pay, NoPayload):
                 q.append(pay)
                 continue
 
-            # If payload is Raw bytes, try to parse an inner frame
             if isinstance(cur, Raw):
                 inner = self._maybe_parse_inner(bytes(cur.load or b""))
                 if inner is not None:
