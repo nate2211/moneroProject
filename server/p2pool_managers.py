@@ -53,7 +53,7 @@ from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
-    P2PPeerManager, NetRouteManager
+    P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -178,6 +178,7 @@ class PythonRouterManager:
 
         self.p2p_manager = None
         self.netroute_manager = None
+        self.host_connectivity_boundary = None
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
@@ -1237,11 +1238,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 synthesized_ll = self._synthesize_link_local_ipv6(out_mac)
                 if synthesized_ll:
                     self.router_ipv6_link_local_out = synthesized_ll
-                    conf.route6.add(
-                        dst="::/0",  # For any destination
-                        gw=self.router_ipv6_link_local_out,
-                        dev=self.interface_out_full_name
-                    )
                     self.router_logger.log_message(
                         f"[Router] ✅ Synthesized EUI-64 link-local address: {self.router_ipv6_link_local_out}")
             self.ndp_manager.router_ipv6_link_local_out = self.router_ipv6_link_local_out
@@ -1369,6 +1365,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
                 except Exception as e:
                     return
+            if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
+                                                                                                        inbound_iface):
+                return
             if self.netroute_manager:
                 self.netroute_manager.observe_packet(packet, inbound_iface)
             # ==========================================================
@@ -2194,7 +2193,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -2206,6 +2205,20 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
             self._configure_host_preserving_upstream_mode()
+            if use_hostbypass:
+                self.host_connectivity_boundary = HostConnectivityBoundaryManager(
+                    self.router_logger,
+                    get_local_ips_fn=self._get_all_local_ips,
+                    get_router_macs_fn=lambda: self.router_macs or set(),
+                    get_bridge_members_fn=lambda: self.ethernet_manager.get_bridge_members(),
+                    get_wan_iface_fn=lambda: self.interface_out_full_name,
+                    get_wan_ip_fn=lambda: self.router_ip_out,
+                    get_gateway_ip_fn=lambda: self.router_gateway_out_ip,
+                    health_probe_fn=self._probe_host_internet_health,
+                    fail_open_after_failures=3,
+                    recover_after_successes=3,
+                )
+                self.host_connectivity_boundary.start()
             self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
             self.stratum_connection_manager = StratumConnectionManager(
                 self.code_output_manager,
@@ -2403,6 +2416,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if use_netroute:
                 if self.netroute_manager:
                     self.netroute_manager.stop()
+            if self.host_connectivity_boundary:
+                self.host_connectivity_boundary.stop()
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")
@@ -2435,6 +2450,26 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
+    def _probe_host_internet_health(self) -> bool:
+        targets = [("1.1.1.1", 443), ("8.8.8.8", 443), ("208.67.222.222", 443)]
+        for host, port in targets:
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                if self.router_ip_out:
+                    s.bind((self.router_ip_out, 0))
+                s.connect((host, port))
+                return True
+            except Exception:
+                pass
+            finally:
+                try:
+                    if s:
+                        s.close()
+                except Exception:
+                    pass
+        return False
     def _proto_summary(self, pkt):
         """
         Inspect the packet structure only:

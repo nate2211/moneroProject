@@ -19,6 +19,7 @@ from functools import reduce
 from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set, Iterable
 import ipaddress
 import time
+from urllib.parse import urlparse
 
 import psutil
 import requests
@@ -36,7 +37,8 @@ from scapy.layers.dhcp6 import DHCP6, DHCP6_RelayForward, DHCP6_Advertise, DHCP6
 from scapy.layers.dns import DNS, DNSRR
 from scapy.layers.inet import ICMP, IPOption_Router_Alert
 from scapy.layers.inet6 import IPv6, ICMPv6MLQuery, ICMPv6ND_RA, ICMPv6MLReport, ICMPv6MLReport2, ICMPv6MLDone, \
-    IPv6ExtHdrHopByHop, RouterAlert, ICMPv6NDOptDstLLAddr, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr, ICMPv6ND_NS
+    IPv6ExtHdrHopByHop, RouterAlert, ICMPv6NDOptDstLLAddr, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr, ICMPv6ND_NS, \
+    ICMPv6EchoRequest, ICMPv6EchoReply
 from scapy.layers.l2 import ARP, getmacbyip
 from scapy.layers.rip import RIPEntry, RIP
 from scapy.packet import bind_layers
@@ -55,8 +57,11 @@ from scapy.layers.inet6 import ICMPv6NDOptPrefixInfo
 
 from p2pool_sniffer import DNSRR_AAAA, ICMPv6
 
-bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
 
+bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
+def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
+    emoji = random.choice(emoticons) if emoticons else ''
+    return f"[{name}] {emoji} {message}"
 # -------------------------------------------------------------------
 # MLDv1 (Query/Report/Done) — light shims if your Scapy lacks them
 # -------------------------------------------------------------------
@@ -11783,6 +11788,681 @@ Get-NetRoute -AddressFamily {family_name} -DestinationPrefix {self._ps_quote(pre
             return
         self._last_log_keys[key] = now
         self._log(msg)
+
+    def _log(self, msg: str):
+        try:
+            self.router_logger.log_message(msg)
+        except Exception:
+            pass
+
+
+@dataclass
+class PacketBoundaryDecision:
+    action: str  # "bypass" | "process" | "observe"
+    reason: str
+    explanation: str
+    confidence: int = 0
+
+
+@dataclass
+class HostConnectivityState:
+    started: bool = False
+    fail_open: bool = False
+    last_health_ok: float = 0.0
+    last_health_fail: float = 0.0
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    notes: List[str] = field(default_factory=list)
+
+
+class HostConnectivityBoundaryManager:
+    """
+    Smart host/transit boundary classifier.
+
+    Goals:
+      - protect host applications like Firefox / Discord
+      - still allow legitimate transit packets to cross the router
+      - never let one ambiguous packet kill router connectivity
+      - only bypass on strong host-ownership evidence
+      - explicitly allow router-service packets to continue
+    """
+
+    def __init__(
+        self,
+        router_logger,
+        *,
+        get_local_ips_fn,
+        get_router_macs_fn,
+        get_bridge_members_fn,
+        get_wan_iface_fn,
+        get_wan_ip_fn,
+        get_gateway_ip_fn,
+        health_probe_fn=None,
+        fail_open_after_failures: int = 3,
+        recover_after_successes: int = 3,
+        socket_refresh_sec: float = 1.0,
+        log_cooldown_sec: float = 10.0,
+        flow_ttl_sec: float = 180.0,
+        transit_ifaces_fn=None,
+        router_dns_ports: Optional[Set[int]] = None,
+        router_udp_service_ports: Optional[Set[int]] = None,
+        router_tcp_service_ports: Optional[Set[int]] = None,
+    ):
+        self.router_logger = router_logger
+
+        self.get_local_ips_fn = get_local_ips_fn
+        self.get_router_macs_fn = get_router_macs_fn
+        self.get_bridge_members_fn = get_bridge_members_fn
+        self.get_wan_iface_fn = get_wan_iface_fn
+        self.get_wan_ip_fn = get_wan_ip_fn
+        self.get_gateway_ip_fn = get_gateway_ip_fn
+        self.health_probe_fn = health_probe_fn
+        self.transit_ifaces_fn = transit_ifaces_fn
+
+        self.fail_open_after_failures = max(1, int(fail_open_after_failures))
+        self.recover_after_successes = max(1, int(recover_after_successes))
+        self.socket_refresh_sec = max(0.5, float(socket_refresh_sec))
+        self.log_cooldown_sec = max(1.0, float(log_cooldown_sec))
+        self.flow_ttl_sec = max(30.0, float(flow_ttl_sec))
+
+        self.router_dns_ports = set(router_dns_ports or {53, 5353})
+        self.router_udp_service_ports = set(router_udp_service_ports or {67, 68, 69, 88, 123, 137, 138, 161, 389, 464, 500, 520, 4500})
+        self.router_tcp_service_ports = set(router_tcp_service_ports or {53, 88, 135, 139, 389, 443, 445, 464})
+
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self.state = HostConnectivityState()
+
+        # ownership cache: key -> owner
+        self._flow_owner: Dict[Tuple[Any, ...], str] = {}
+        self._flow_last_seen: Dict[Tuple[Any, ...], float] = {}
+
+        # learned active host sockets from OS
+        self._active_exact_sockets: Set[Tuple[str, str, int, str, int]] = set()
+        self._active_local_sockets: Set[Tuple[str, str, int]] = set()
+        self._active_wildcard_ports: Set[Tuple[str, int]] = set()
+
+        self._last_socket_refresh = 0.0
+        self._last_log: Dict[str, float] = {}
+
+    # ---------------------------------------------------------
+    # lifecycle
+    # ---------------------------------------------------------
+
+    def start(self):
+        with self._lock:
+            if self.state.started:
+                return
+
+            self.state.started = True
+            self.state.fail_open = False
+            self.state.last_health_ok = time.time()
+            self.state.last_health_fail = 0.0
+            self.state.consecutive_failures = 0
+            self.state.consecutive_successes = 0
+            self.state.notes.clear()
+
+            self._flow_owner.clear()
+            self._flow_last_seen.clear()
+            self._active_exact_sockets.clear()
+            self._active_local_sockets.clear()
+            self._active_wildcard_ports.clear()
+            self._last_log.clear()
+            self._last_socket_refresh = 0.0
+
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._maintenance_loop,
+                name="HostConnectivityBoundaryManager",
+                daemon=True,
+            )
+            self._thread.start()
+
+        self._log(
+            RouterRandomMessages(
+                "HostBoundary",
+                "Started. Only strong host-owned flows will bypass the router; ambiguous packets will continue through process_packet.",
+                ["🛡️", "🌐", "🧠", "🔐", "📡"]
+            )
+        )
+
+    def stop(self):
+        with self._lock:
+            self._stop_event.set()
+            t = self._thread
+
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+
+        with self._lock:
+            self.state.started = False
+            self.state.fail_open = False
+            self._thread = None
+            self._flow_owner.clear()
+            self._flow_last_seen.clear()
+            self._active_exact_sockets.clear()
+            self._active_local_sockets.clear()
+            self._active_wildcard_ports.clear()
+            self._last_log.clear()
+
+        self._log(
+            RouterRandomMessages(
+                "HostBoundary",
+                "Stopped.",
+                ["🛑", "📴", "🔒"]
+            )
+        )
+
+    # ---------------------------------------------------------
+    # maintenance
+    # ---------------------------------------------------------
+
+    def _maintenance_loop(self):
+        while not self._stop_event.wait(1.0):
+            try:
+                now = time.time()
+
+                if (now - self._last_socket_refresh) >= self.socket_refresh_sec:
+                    self._refresh_active_host_sockets()
+                    self._last_socket_refresh = now
+
+                ok = bool(self.health_probe_fn()) if self.health_probe_fn else True
+                self._update_health(ok)
+                self._gc_flows()
+            except Exception as e:
+                self._log(f"[HostBoundary] Maintenance loop error: {e}")
+
+    def _refresh_active_host_sockets(self):
+        exact: Set[Tuple[str, str, int, str, int]] = set()
+        local_only: Set[Tuple[str, str, int]] = set()
+        wildcard_ports: Set[Tuple[str, int]] = set()
+
+        try:
+            conns = psutil.net_connections(kind="inet")
+        except Exception:
+            conns = []
+
+        for c in conns:
+            try:
+                proto = "TCP" if c.type == socket.SOCK_STREAM else "UDP" if c.type == socket.SOCK_DGRAM else None
+                if not proto or not c.laddr:
+                    continue
+
+                local_ip = str(getattr(c.laddr, "ip", "") or "")
+                local_port = int(getattr(c.laddr, "port", 0) or 0)
+                if local_port <= 0:
+                    continue
+
+                remote_ip = ""
+                remote_port = 0
+                if c.raddr:
+                    remote_ip = str(getattr(c.raddr, "ip", "") or "")
+                    remote_port = int(getattr(c.raddr, "port", 0) or 0)
+
+                local_only.add((proto, local_ip, local_port))
+
+                if local_ip in ("0.0.0.0", "::", ""):
+                    wildcard_ports.add((proto, local_port))
+
+                if remote_ip and remote_port > 0:
+                    exact.add((proto, local_ip, local_port, remote_ip, remote_port))
+            except Exception:
+                continue
+
+        with self._lock:
+            self._active_exact_sockets = exact
+            self._active_local_sockets = local_only
+            self._active_wildcard_ports = wildcard_ports
+
+    # ---------------------------------------------------------
+    # health / fail-open
+    # ---------------------------------------------------------
+
+    def _update_health(self, ok: bool):
+        now = time.time()
+        with self._lock:
+            if ok:
+                self.state.last_health_ok = now
+                self.state.consecutive_successes += 1
+                self.state.consecutive_failures = 0
+                if self.state.fail_open and self.state.consecutive_successes >= self.recover_after_successes:
+                    self.state.fail_open = False
+                    self.state.notes.append("recovered")
+                    self._log(
+                        RouterRandomMessages(
+                            "HostBoundary",
+                            "WAN health recovered. Leaving fail-open mode.",
+                            ["✅", "🌐", "🟢", "🛡️"]
+                        )
+                    )
+            else:
+                self.state.last_health_fail = now
+                self.state.consecutive_failures += 1
+                self.state.consecutive_successes = 0
+                if not self.state.fail_open and self.state.consecutive_failures >= self.fail_open_after_failures:
+                    self.state.fail_open = True
+                    self.state.notes.append("entered-fail-open")
+                    self._log(
+                        RouterRandomMessages(
+                            "HostBoundary",
+                            "WAN health degraded. Entering fail-open mode so host-owned WAN traffic is protected.",
+                            ["🚨", "🧯", "🛡️", "🌩️"]
+                        )
+                    )
+
+    def in_fail_open(self) -> bool:
+        with self._lock:
+            return self.state.fail_open
+
+    # ---------------------------------------------------------
+    # public API
+    # ---------------------------------------------------------
+
+    def inspect_packet(self, packet, inbound_iface: str) -> PacketBoundaryDecision:
+        """
+        Returns one of:
+          - bypass: strong host-owned evidence, router should return immediately
+          - process: strong router/transit evidence, router should continue
+          - observe: ambiguous, router should continue and decide later
+        """
+        if packet is None:
+            return PacketBoundaryDecision(
+                action="bypass",
+                reason="null-packet",
+                explanation="null packet cannot be safely processed",
+                confidence=100,
+            )
+
+        # Do not interfere with non-IP traffic here.
+        # ARP/L2/bridge logic should continue elsewhere.
+        if not self._is_ip_packet(packet):
+            return PacketBoundaryDecision(
+                action="observe",
+                reason="non-ip",
+                explanation="non-IP packet left to normal router/L2 logic",
+                confidence=0,
+            )
+
+        src_ip, dst_ip = self._extract_ips(packet)
+        src_mac, dst_mac = self._extract_macs(packet)
+        proto, sport, dport = self._extract_proto_ports(packet)
+
+        local_ips = set(self.get_local_ips_fn() or [])
+        wan_ip = str(self.get_wan_ip_fn() or "")
+        gateway_ip = str(self.get_gateway_ip_fn() or "")
+        wan_iface = str(self.get_wan_iface_fn() or "")
+        bridge_members = self._get_bridge_members()
+        transit_ifaces = self._get_transit_ifaces(bridge_members, wan_iface)
+
+        router_macs = {str(x).lower() for x in (self.get_router_macs_fn() or set()) if x}
+        if wan_ip:
+            local_ips.add(wan_ip)
+
+        # 1) Explicit router-service traffic should continue
+        router_service = self._is_definitely_router_service(packet, src_ip, dst_ip, proto, sport, dport, local_ips)
+        if router_service:
+            return PacketBoundaryDecision(
+                action="process",
+                reason="router-service",
+                explanation=router_service,
+                confidence=95,
+            )
+
+        # 2) Previously-known transit flow should continue
+        owner = self._get_known_owner(packet)
+        if owner == "transit":
+            return PacketBoundaryDecision(
+                action="process",
+                reason="known-transit-flow",
+                explanation="flow was previously learned as transit, so it should keep crossing the router",
+                confidence=90,
+            )
+
+        # 3) Strong host socket ownership (best signal for Discord/Firefox)
+        socket_reason = self._match_active_host_socket(proto, src_ip, sport, dst_ip, dport, local_ips)
+        if socket_reason:
+            self._remember_owner(packet, "host")
+            return PacketBoundaryDecision(
+                action="bypass",
+                reason="active-host-socket",
+                explanation=f"packet matches an active host {proto} socket ({socket_reason}), so a real local application owns this flow",
+                confidence=100,
+            )
+
+        # 4) Source IP is local AND packet did not come from transit side
+        if src_ip and src_ip in local_ips and inbound_iface not in transit_ifaces:
+            self._remember_owner(packet, "host")
+            return PacketBoundaryDecision(
+                action="bypass",
+                reason="host-src-ip",
+                explanation=f"source IP {src_ip} belongs to this machine and ingress '{inbound_iface}' is not a downstream transit interface",
+                confidence=90,
+            )
+
+        # 5) Source MAC is host NIC AND not already known transit
+        if src_mac and src_mac.lower() in router_macs and inbound_iface not in transit_ifaces:
+            self._remember_owner(packet, "host")
+            return PacketBoundaryDecision(
+                action="bypass",
+                reason="host-src-mac",
+                explanation=f"source MAC {src_mac} belongs to the host machine, so this is a host-originated capture copy",
+                confidence=85,
+            )
+
+        # 6) In fail-open mode, protect exact WAN/gateway/self flows, not everything
+        if self.in_fail_open():
+            if (
+                (wan_iface and inbound_iface == wan_iface and (src_ip == wan_ip or dst_ip == wan_ip)) or
+                (gateway_ip and (src_ip == gateway_ip or dst_ip == gateway_ip))
+            ):
+                self._remember_owner(packet, "host")
+                return PacketBoundaryDecision(
+                    action="bypass",
+                    reason="fail-open-wan-protect",
+                    explanation="fail-open mode is active and this packet is directly on the host WAN/gateway path",
+                    confidence=95,
+                )
+
+        # 7) Strong transit evidence
+        if inbound_iface in transit_ifaces:
+            self._remember_owner(packet, "transit")
+            return PacketBoundaryDecision(
+                action="process",
+                reason="transit-ingress",
+                explanation=f"packet arrived from downstream transit interface '{inbound_iface}', so it may need to cross the router",
+                confidence=80,
+            )
+
+        # 8) Destination local by itself is NOT enough to bypass.
+        # Let process_packet decide whether it is DNS/DHCP/ICMP/router-service/etc.
+        if dst_ip and dst_ip in local_ips:
+            return PacketBoundaryDecision(
+                action="observe",
+                reason="local-destination-ambiguous",
+                explanation=f"destination IP {dst_ip} is local, but packet did not strongly match a host app socket or a router service yet",
+                confidence=25,
+            )
+
+        # 9) Default: ambiguous packets continue through process_packet
+        return PacketBoundaryDecision(
+            action="observe",
+            reason="ambiguous",
+            explanation="packet did not strongly match host ownership or strong transit ownership, so router processing may continue",
+            confidence=10,
+        )
+
+    def should_bypass_router(self, packet, inbound_iface: str) -> bool:
+        decision = self.inspect_packet(packet, inbound_iface)
+        if decision.action == "bypass":
+            self._log_decision(packet, inbound_iface, decision)
+            return True
+
+        if decision.action == "process":
+            self._remember_owner(packet, "transit")
+        return False
+
+    # ---------------------------------------------------------
+    # router service detection
+    # ---------------------------------------------------------
+
+    def _is_definitely_router_service(
+        self,
+        packet,
+        src_ip: Optional[str],
+        dst_ip: Optional[str],
+        proto: str,
+        sport: int,
+        dport: int,
+        local_ips: Set[str],
+    ) -> Optional[str]:
+        try:
+            # Router DNS/mDNS logic
+            if DNS and packet.haslayer(DNS):
+                return "packet contains DNS and may be for router DNS handling"
+
+            # DHCP / DHCPv6
+            if (DHCP and packet.haslayer(DHCP)) or \
+               (DHCP6 and packet.haslayer(DHCP6)) or \
+               (DHCP6_Solicit and packet.haslayer(DHCP6_Solicit)) or \
+               (DHCP6_InfoRequest and packet.haslayer(DHCP6_InfoRequest)) or \
+               (DHCP6_Reply and packet.haslayer(DHCP6_Reply)):
+                return "packet contains DHCP/DHCPv6 and must be allowed to reach router DHCP logic"
+        except Exception:
+            pass
+
+        if proto == "UDP":
+            if dport in self.router_dns_ports or sport in self.router_dns_ports:
+                return f"UDP port {sport}->{dport} matches router DNS/mDNS service ports"
+            if dport in self.router_udp_service_ports or sport in self.router_udp_service_ports:
+                if dst_ip in local_ips or dst_ip in ("255.255.255.255", "224.0.0.9") or (dst_ip and dst_ip.startswith("ff02::")):
+                    return f"UDP port {sport}->{dport} matches router-managed UDP service traffic"
+
+        if proto == "TCP":
+            if dport in self.router_tcp_service_ports or sport in self.router_tcp_service_ports:
+                if dst_ip in local_ips:
+                    return f"TCP port {sport}->{dport} matches router-managed TCP service traffic"
+
+        # ICMP destined to router should keep going
+        if proto in ("ICMP", "ICMPv6") and dst_ip in local_ips:
+            return "ICMP/ICMPv6 packet is destined to a local router address and should be processed normally"
+
+        return None
+
+    # ---------------------------------------------------------
+    # socket ownership matching
+    # ---------------------------------------------------------
+
+    def _match_active_host_socket(
+        self,
+        proto: str,
+        src_ip: Optional[str],
+        sport: int,
+        dst_ip: Optional[str],
+        dport: int,
+        local_ips: Set[str],
+    ) -> Optional[str]:
+        if proto not in ("TCP", "UDP"):
+            return None
+
+        # outbound local app packet
+        if src_ip in local_ips and sport > 0:
+            if self._socket_exact_exists(proto, src_ip, sport, dst_ip, dport):
+                return f"exact local socket {src_ip}:{sport} -> {dst_ip}:{dport}"
+            if self._socket_local_exists(proto, src_ip, sport):
+                return f"local bound socket {src_ip}:{sport}"
+            if self._socket_wildcard_exists(proto, sport):
+                return f"wildcard-bound socket *:{sport}"
+
+        # inbound reply for local app
+        if dst_ip in local_ips and dport > 0:
+            if self._socket_exact_exists(proto, dst_ip, dport, src_ip, sport):
+                return f"exact local socket {dst_ip}:{dport} <- {src_ip}:{sport}"
+            if self._socket_local_exists(proto, dst_ip, dport):
+                return f"local bound socket {dst_ip}:{dport}"
+            if self._socket_wildcard_exists(proto, dport):
+                return f"wildcard-bound socket *:{dport}"
+
+        return None
+
+    def _socket_exact_exists(self, proto: str, local_ip: Optional[str], local_port: int, remote_ip: Optional[str], remote_port: int) -> bool:
+        if not local_ip or local_port <= 0 or not remote_ip or remote_port <= 0:
+            return False
+        with self._lock:
+            return (
+                (proto, local_ip, local_port, remote_ip, remote_port) in self._active_exact_sockets or
+                (proto, "0.0.0.0", local_port, remote_ip, remote_port) in self._active_exact_sockets or
+                (proto, "::", local_port, remote_ip, remote_port) in self._active_exact_sockets
+            )
+
+    def _socket_local_exists(self, proto: str, local_ip: Optional[str], local_port: int) -> bool:
+        if not local_ip or local_port <= 0:
+            return False
+        with self._lock:
+            return (
+                (proto, local_ip, local_port) in self._active_local_sockets or
+                (proto, "0.0.0.0", local_port) in self._active_local_sockets or
+                (proto, "::", local_port) in self._active_local_sockets
+            )
+
+    def _socket_wildcard_exists(self, proto: str, local_port: int) -> bool:
+        if local_port <= 0:
+            return False
+        with self._lock:
+            return (proto, local_port) in self._active_wildcard_ports
+
+    # ---------------------------------------------------------
+    # flow ownership cache
+    # ---------------------------------------------------------
+
+    def _flow_key(self, packet):
+        src_ip, dst_ip = self._extract_ips(packet)
+        proto, sport, dport = self._extract_proto_ports(packet)
+        if not src_ip or not dst_ip:
+            return None
+        return (proto, src_ip, sport, dst_ip, dport)
+
+    def _reverse_flow_key(self, key):
+        if not key:
+            return None
+        proto, src_ip, sport, dst_ip, dport = key
+        return (proto, dst_ip, dport, src_ip, sport)
+
+    def _remember_owner(self, packet, owner: str):
+        key = self._flow_key(packet)
+        if not key:
+            return
+
+        rev = self._reverse_flow_key(key)
+        now = time.time()
+
+        with self._lock:
+            self._flow_owner[key] = owner
+            self._flow_last_seen[key] = now
+            if rev:
+                self._flow_owner[rev] = owner
+                self._flow_last_seen[rev] = now
+
+    def _get_known_owner(self, packet) -> Optional[str]:
+        key = self._flow_key(packet)
+        if not key:
+            return None
+        with self._lock:
+            return self._flow_owner.get(key)
+
+    def _gc_flows(self):
+        now = time.time()
+        stale_before = now - self.flow_ttl_sec
+        with self._lock:
+            stale_keys = [k for k, ts in self._flow_last_seen.items() if ts < stale_before]
+            for k in stale_keys:
+                self._flow_last_seen.pop(k, None)
+                self._flow_owner.pop(k, None)
+
+    # ---------------------------------------------------------
+    # helpers
+    # ---------------------------------------------------------
+
+    def _get_bridge_members(self) -> Set[str]:
+        try:
+            return set(self.get_bridge_members_fn() or [])
+        except Exception:
+            return set()
+
+    def _get_transit_ifaces(self, bridge_members: Set[str], wan_iface: str) -> Set[str]:
+        try:
+            explicit = set(self.transit_ifaces_fn() or []) if self.transit_ifaces_fn else set()
+        except Exception:
+            explicit = set()
+        # Bridge members are primary transit ingress interfaces.
+        # Explicit transit interfaces can add to that.
+        result = set(bridge_members) | explicit
+        if wan_iface in result:
+            result.discard(wan_iface)
+        return result
+
+    def _is_ip_packet(self, packet) -> bool:
+        try:
+            return bool((IP and packet.haslayer(IP)) or (IPv6 and packet.haslayer(IPv6)))
+        except Exception:
+            return False
+
+    def _extract_ips(self, packet):
+        try:
+            if IP and packet.haslayer(IP):
+                return str(packet[IP].src), str(packet[IP].dst)
+            if IPv6 and packet.haslayer(IPv6):
+                return str(packet[IPv6].src), str(packet[IPv6].dst)
+        except Exception:
+            pass
+        return None, None
+
+    def _extract_macs(self, packet):
+        try:
+            if Ether and packet.haslayer(Ether):
+                return str(packet[Ether].src), str(packet[Ether].dst)
+        except Exception:
+            pass
+        return None, None
+
+    def _extract_proto_ports(self, packet):
+        proto = "IP"
+        sport = 0
+        dport = 0
+        try:
+            if TCP and packet.haslayer(TCP):
+                proto = "TCP"
+                sport = int(packet[TCP].sport or 0)
+                dport = int(packet[TCP].dport or 0)
+            elif UDP and packet.haslayer(UDP):
+                proto = "UDP"
+                sport = int(packet[UDP].sport or 0)
+                dport = int(packet[UDP].dport or 0)
+            elif ICMP and packet.haslayer(ICMP):
+                proto = "ICMP"
+            elif (ICMPv6EchoRequest and packet.haslayer(ICMPv6EchoRequest)) or (ICMPv6EchoReply and packet.haslayer(ICMPv6EchoReply)):
+                proto = "ICMPv6"
+            elif IPv6 and packet.haslayer(IPv6):
+                proto = "IPv6"
+            elif IP and packet.haslayer(IP):
+                proto = "IPv4"
+        except Exception:
+            pass
+        return proto, sport, dport
+
+    def _describe_packet(self, packet) -> str:
+        src_ip, dst_ip = self._extract_ips(packet)
+        proto, sport, dport = self._extract_proto_ports(packet)
+
+        if src_ip or dst_ip:
+            if sport or dport:
+                return f"{proto} {src_ip}:{sport} -> {dst_ip}:{dport}"
+            return f"{proto} {src_ip} -> {dst_ip}"
+
+        try:
+            return packet.summary()
+        except Exception:
+            return "unknown-packet"
+
+    def _log_decision(self, packet, inbound_iface: str, decision: PacketBoundaryDecision):
+        flow = self._describe_packet(packet)
+        key = f"{decision.action}|{decision.reason}|{flow}|{inbound_iface}"
+        now = time.time()
+
+        with self._lock:
+            last = self._last_log.get(key, 0.0)
+            if (now - last) < self.log_cooldown_sec:
+                return
+            self._last_log[key] = now
+
+        self._log(
+            RouterRandomMessages(
+                "HostBoundary",
+                f"{decision.action.upper()} on '{inbound_iface}'. Flow: {flow}. Reason: {decision.reason}. Why: {decision.explanation}",
+                ["🛡️", "🌐", "🧠", "📡", "↪️", "🔐", "🧭"]
+            )
+        )
 
     def _log(self, msg: str):
         try:

@@ -1725,7 +1725,7 @@ class RouterTab(QWidget):
 
         self.presets = {
             "Full": [
-                "General", "Router", "DHCP", "Transport", "TLS", "Python", "C++", "Signing",
+                "General", "Router", "DHCP", "Transport", "HostBoundary", "TLS", "Python", "C++", "Signing",
                 "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
                 "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher",
                 "Notifier", "NAT/RIP/ARP/NDP/Bridge", "mDNS", "Firewall", "Packet", "Analysis"
@@ -1768,7 +1768,8 @@ class RouterTab(QWidget):
 
         self.use_netroute_checkbox = QCheckBox("Use NetRoute")
         self.use_netroute_checkbox.setChecked(False)
-
+        self.use_hostbypass_checkbox = QCheckBox("Use Host Bypass")
+        self.use_hostbypass_checkbox.setChecked(False)
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(False)
 
@@ -1820,7 +1821,7 @@ class RouterTab(QWidget):
         routing_form = QFormLayout(routing_box)
         routing_form.addRow(self.dhcp_out_checkbox, self.dhcp_in_checkbox)
         routing_form.addRow(self.use_static_checkbox, self.use_hyperv_checkbox)
-        routing_form.addRow(self.use_netroute_checkbox)
+        routing_form.addRow(self.use_netroute_checkbox, self.use_hostbypass_checkbox)
         routing_form.addRow(QLabel("Manual LAN IP:"), self.router_ip_out_input)
         routing_form.addRow(QLabel("Netmask:"), self.router_netmask_out_input)
 

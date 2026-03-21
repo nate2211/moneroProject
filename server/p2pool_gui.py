@@ -396,7 +396,7 @@ class P2PoolGUI(QMainWindow):
         use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
         lan_ip = self.router_tab.router_ip_out_input.text().strip()
         netmask_out = self.router_tab.router_netmask_out_input.text().strip()
-
+        use_hostbypass = self.router_tab.use_hostbypass_checkbox.isChecked()
         blocknet_relay = self.router_tab.blocknet_relay_input.text().strip()
         blocknet_token = self.router_tab.blocknet_token_input.text().strip()
 
@@ -420,6 +420,7 @@ class P2PoolGUI(QMainWindow):
                 blocknet_relay=blocknet_relay,
                 blocknet_token=blocknet_token,
                 use_netroute=use_netroute,
+                use_hostbypass=use_hostbypass
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
