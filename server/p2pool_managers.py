@@ -448,6 +448,175 @@ class PythonRouterManager:
                     setattr(manager, 'sniffer', self.sniffer)
                     self.router_logger.log_message(f"[Sniffer] -> Injected sniffer into {manager.__class__.__name__}")
 
+    def _ps_quote(self, value: str | None) -> str:
+        return str(value or "").replace("'", "''")
+
+    def _run_powershell_hidden(self, script: str, label: str = "PowerShell") -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", script
+                ],
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+
+            if result.returncode == 0:
+                if stdout:
+                    self.router_logger.log_message(f"[{label}] {stdout}")
+                return True
+
+            self.router_logger.log_message(f"[{label}] ❌ Failed with code {result.returncode}")
+            if stdout:
+                self.router_logger.log_message(f"[{label}] STDOUT: {stdout}")
+            if stderr:
+                self.router_logger.log_message(f"[{label}] STDERR: {stderr}")
+            return False
+        except Exception as e:
+            self.router_logger.log_message(f"[{label}] ❌ Exception: {e}")
+            return False
+
+    def _configure_host_preserving_upstream_mode(
+            self,
+            preferred_metric: int = 5,
+            internal_metric: int = 500,
+            aux_metric: int = 550,
+            loopback_metric: int = 900,
+    ) -> bool:
+        """
+        Configure Windows so the HOST keeps using the real upstream router for its own internet,
+        while this Python router can still forward/NAT transit traffic.
+
+        What this does:
+          - pins the host's preferred default path to the active OUT interface
+          - de-prioritizes internal/router-side adapters
+          - removes default routes from internal/router-side adapters
+          - enables forwarding on LAN/WAN router interfaces
+          - prevents loopback/internal adapters from influencing host default routing
+        """
+        wan_alias = (self.interface_out_friendly_name or "").strip()
+        wan_gateway = (self.router_gateway_out_ip or "").strip()
+
+        if not wan_alias:
+            self.router_logger.log_message(
+                "[HostRoute] ⚠️ No active OUT interface alias is set. Skipping host-preserving upstream mode."
+            )
+            return False
+
+        lan_router_aliases: list[str] = []
+        for alias in (
+                self.interface_in_friendly_name,
+                self.interface_ethernet_2_friendly_name,
+                self.interface_lac_friendly_name,
+                self.interface_lac_2_friendly_name,
+        ):
+            alias = (alias or "").strip()
+            if alias and alias.lower() != wan_alias.lower() and alias not in lan_router_aliases:
+                lan_router_aliases.append(alias)
+
+        loopback_alias = ""
+        if self.interface_loopback_full_name:
+            loopback_alias = self._get_friendly_name_from_full(self.interface_loopback_full_name) or ""
+            loopback_alias = loopback_alias.strip()
+
+        wan_alias_ps = self._ps_quote(wan_alias)
+        wan_gateway_ps = self._ps_quote(wan_gateway)
+        loopback_alias_ps = self._ps_quote(loopback_alias)
+
+        lan_aliases_ps = ", ".join(f"'{self._ps_quote(x)}'" for x in lan_router_aliases)
+        if not lan_aliases_ps:
+            lan_aliases_ps = ""
+
+        script = f"""
+$ErrorActionPreference = "Stop"
+
+$wanAlias = '{wan_alias_ps}'
+$wanGateway = '{wan_gateway_ps}'
+$loopbackAlias = '{loopback_alias_ps}'
+$lanAliases = @({lan_aliases_ps})
+
+function Apply-IfPolicy([string]$Alias, [int]$Metric, [string]$Forwarding, [string]$IgnoreDefaultRoutes) {{
+    if ([string]::IsNullOrWhiteSpace($Alias)) {{ return }}
+
+    $if4 = Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    if ($if4) {{
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -AutomaticMetric Disabled -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -InterfaceMetric $Metric -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $Forwarding -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -IgnoreDefaultRoutes $IgnoreDefaultRoutes -ErrorAction SilentlyContinue | Out-Null
+    }}
+
+    $if6 = Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv6 -ErrorAction SilentlyContinue
+    if ($if6) {{
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv6 -AutomaticMetric Disabled -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv6 -InterfaceMetric ($Metric + 10) -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv6 -Forwarding $Forwarding -ErrorAction SilentlyContinue | Out-Null
+        Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv6 -IgnoreDefaultRoutes $IgnoreDefaultRoutes -ErrorAction SilentlyContinue | Out-Null
+    }}
+}}
+
+function Remove-DefaultRoutesOnAlias([string]$Alias) {{
+    if ([string]::IsNullOrWhiteSpace($Alias)) {{ return }}
+
+    Get-NetRoute -InterfaceAlias $Alias -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
+    Get-NetRoute -InterfaceAlias $Alias -DestinationPrefix "::/0" -ErrorAction SilentlyContinue |
+        Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+}}
+
+# 1) Prefer the real WAN/upstream for HOST traffic
+Apply-IfPolicy -Alias $wanAlias -Metric {preferred_metric} -Forwarding "Enabled" -IgnoreDefaultRoutes "Disabled"
+
+# 2) De-prioritize all router-side LAN/aux interfaces and strip any default routes from them
+foreach ($alias in $lanAliases) {{
+    if (-not [string]::IsNullOrWhiteSpace($alias) -and $alias -ne $wanAlias) {{
+        Apply-IfPolicy -Alias $alias -Metric {internal_metric} -Forwarding "Enabled" -IgnoreDefaultRoutes "Enabled"
+        Remove-DefaultRoutesOnAlias -Alias $alias
+    }}
+}}
+
+# 3) Loopback should never influence host default routing
+if (-not [string]::IsNullOrWhiteSpace($loopbackAlias) -and $loopbackAlias -ne $wanAlias) {{
+    Apply-IfPolicy -Alias $loopbackAlias -Metric {loopback_metric} -Forwarding "Disabled" -IgnoreDefaultRoutes "Enabled"
+    Remove-DefaultRoutesOnAlias -Alias $loopbackAlias
+}}
+
+# 4) Make sure the WAN has a default route if the OS somehow lost it
+if (-not [string]::IsNullOrWhiteSpace($wanAlias) -and -not [string]::IsNullOrWhiteSpace($wanGateway)) {{
+    $existingWanDefault = @(
+        Get-NetRoute -InterfaceAlias $wanAlias -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
+    )
+
+    if (-not $existingWanDefault -or $existingWanDefault.Count -eq 0) {{
+        New-NetRoute -InterfaceAlias $wanAlias `
+                     -DestinationPrefix "0.0.0.0/0" `
+                     -NextHop $wanGateway `
+                     -RouteMetric {preferred_metric} `
+                     -PolicyStore ActiveStore `
+                     -ErrorAction SilentlyContinue | Out-Null
+    }}
+}}
+
+Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs={2}" -f $wanAlias, $wanGateway, ($lanAliases -join ", "))
+"""
+        ok = self._run_powershell_hidden(script, label="HostRoute")
+        if ok:
+            self.router_logger.log_message(
+                f"[HostRoute] ✅ Host-preserving upstream mode active. "
+                f"Host default path stays on '{wan_alias}' via {wan_gateway or 'existing OS route'}."
+            )
+        else:
+            self.router_logger.log_message(
+                "[HostRoute] ⚠️ Could not fully apply host-preserving upstream mode."
+            )
+        return ok
     def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
                                    router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
                                    router_netmask_out: str = "255.255.255.0"):
@@ -2036,7 +2205,7 @@ class PythonRouterManager:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
                 self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
-
+            self._configure_host_preserving_upstream_mode()
             self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
             self.stratum_connection_manager = StratumConnectionManager(
                 self.code_output_manager,
