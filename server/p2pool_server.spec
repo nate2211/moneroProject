@@ -50,9 +50,7 @@ datas_list = [
     ('p2pool_endpoints.py', '.'),
     ('p2pool_hyperv.py', '.'),
     ('p2pool_java.py', '.'),
-    ("blocknet_client.py", "."),
-    ("blocks_blocknet.py", "."),
-    ("randomx_ctypes.py", ".")
+    ('randomx_ctypes.py', '.'),
 ]
 
 # Identify all Python files to scan for imports.
