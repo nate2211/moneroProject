@@ -13,6 +13,52 @@ from contextlib import suppress
 from xmrig_managers import AsyncPsutilManager
 
 REPORT_INTERVAL_SECONDS = 5
+SERVER_POLL_INTERVAL_SECONDS = 5
+SERVER_POST_TIMEOUT_SECONDS = 10
+SUPERVISOR_QUIET_TIMEOUT_SECONDS = 90
+SUPERVISOR_POLL_SECONDS = 5
+POOL_RESTART_ERROR_STREAK = 8
+POOL_RESTART_STALL_SECONDS = 120
+POOL_BOOTSTRAP_RESTART_SECONDS = 180
+
+_FATAL_OUTPUT_PATTERNS = (
+    "compute error",
+    "cuda error",
+    "opencl error",
+    "fatal error",
+    "access violation",
+    "segmentation fault",
+    "illegal memory access",
+)
+
+_TRANSIENT_POOL_ERROR_PATTERNS = (
+    "connect error",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "job timeout",
+    "retry after",
+    "retry in",
+    "reconnect",
+    "read error",
+    "write error",
+    "socket error",
+    "timed out",
+    "dns error",
+    "network error",
+    "pool login failed",
+    "invalid connection",
+    "no active pools",
+)
+
+_POOL_ACTIVITY_PATTERNS = (
+    "new job from",
+    "accepted",
+    "use pool",
+    "connected to",
+    "new diff",
+    "login succeeded",
+)
 
 
 class MinerRestartRequested(Exception):
@@ -25,7 +71,7 @@ class PeriodicReporter:
 
     Important:
     - Reporter failures should not immediately kill mining.
-    - Only after repeated internal failures do we request a restart.
+    - Reporter problems must never require the user to restart the GUI.
     """
 
     def __init__(self, xmrig_miner, xmrig_data, logger):
@@ -74,15 +120,19 @@ class PeriodicReporter:
                 await session.post(
                     f"{self.xmrig_data.FLASK_SERVER_URL}/hashrate",
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
                 )
 
+                self.xmrig_data.last_server_ok_at = time.monotonic()
+                self.xmrig_data.last_server_error = ""
                 consecutive_internal_failures = 0
 
             except asyncio.CancelledError:
                 raise
 
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+                self.xmrig_data.last_server_error_at = time.monotonic()
+                self.xmrig_data.last_server_error = str(e)
                 self.logger.log_message(f"[!] Network error in PeriodicReporter: {e}")
 
             except Exception:
@@ -107,10 +157,16 @@ class ServerPoller:
             await session.post(
                 f"{self.xmrig_data.FLASK_SERVER_URL}/miners_gui_settings/{self.xmrig_data.client_id}",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
             )
+            self.xmrig_data.last_server_ok_at = time.monotonic()
+            self.xmrig_data.last_server_error = ""
         except asyncio.CancelledError:
             raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            self.xmrig_data.last_server_error_at = time.monotonic()
+            self.xmrig_data.last_server_error = str(e)
+            self.logger.log_message(f"[!] Exception in post_gui_settings: {e}")
         except Exception as e:
             self.logger.log_message(f"[!] Exception in post_gui_settings: {e}")
 
@@ -122,15 +178,18 @@ class ServerPoller:
                 await session.post(
                     f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
                     json={"status": self.xmrig_data.client_status},
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
                 )
 
                 async with session.get(
                     f"{self.xmrig_data.FLASK_SERVER_URL}/get_command/{self.xmrig_data.client_id}",
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
                 ) as response:
                     response.raise_for_status()
                     command = await response.json()
+
+                self.xmrig_data.last_server_ok_at = time.monotonic()
+                self.xmrig_data.last_server_error = ""
 
                 if command:
                     cmd = command.get("command")
@@ -191,7 +250,9 @@ class ServerPoller:
                     f"[!] ServerPoller Error: Received malformed command from server. Details: {e}"
                 )
 
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+                self.xmrig_data.last_server_error_at = time.monotonic()
+                self.xmrig_data.last_server_error = str(e)
                 self.logger.log_message(
                     f"[!] ServerPoller Network Error: Cannot connect to server. Details: {e}"
                 )
@@ -200,19 +261,39 @@ class ServerPoller:
                 self.logger.log_message("[!] An unexpected critical error occurred in ServerPoller:")
                 self.logger.log_message(traceback.format_exc())
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(SERVER_POLL_INTERVAL_SECONDS)
 
 
 class OutputMonitor:
     """
     Parses miner output only.
-    It does not stop/start the miner directly.
+
+    Important:
+    - Transient pool/network errors must not force the user to restart the app.
+    - Hard compute/runtime failures should still request a restart.
     """
 
     def __init__(self, xmrig_miner, xmrig_data, logger):
         self.xmrig_data = xmrig_data
         self.logger = logger
         self.xmrig_miner = xmrig_miner
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self):
+        now = time.monotonic()
+        self.process_started_at = now
+        self.last_output_at = now
+        self.last_pool_activity_at = 0.0
+        self.last_share_at = 0.0
+        self.last_pool_error_at = 0.0
+        self.last_restart_request_at = 0.0
+        self.consecutive_pool_errors = 0
+        self.connected_once = False
+        self.current_pool = ""
+        self.last_pool_error = ""
+
+    def mark_process_started(self):
+        self.reset_runtime_state()
 
     async def handle_line(self, line_bytes: bytes):
         decoded = line_bytes.decode("utf-8", errors="ignore").strip()
@@ -230,12 +311,21 @@ class OutputMonitor:
             self.logger.log_message(f"[XMRIG] {decoded}")
 
             low = decoded.lower()
+            now = time.monotonic()
+            self.last_output_at = now
 
-            if "error" in low or "compute error" in low:
-                self.logger.log_message("[!] Error detected in miner output.")
+            if self._is_fatal_output(low):
+                self.logger.log_message("[!] Fatal miner output detected. Restart requested.")
                 return "restart"
 
+            if self._is_pool_activity(low):
+                self.last_pool_activity_at = now
+                self.connected_once = True
+                self.consecutive_pool_errors = 0
+                self.last_pool_error = ""
+
             if "accepted" in low:
+                self.last_share_at = now
                 self._parse_accepted_shares(decoded)
 
             if "nvidia" in low and "c" in low:
@@ -247,7 +337,55 @@ class OutputMonitor:
             if "new job from" in low:
                 await self._handle_new_job(decoded)
 
+            if self._is_transient_pool_error(low):
+                self.last_pool_error_at = now
+                self.consecutive_pool_errors += 1
+                self.last_pool_error = decoded
+                self.xmrig_data.last_pool_error_at = now
+                self.xmrig_data.last_pool_error = decoded
+
+                if self.should_force_pool_recovery(now):
+                    self.last_restart_request_at = now
+                    self.logger.log_message(
+                        "[!] Pool connectivity looks wedged. Requesting managed miner restart."
+                    )
+                    return "restart"
+
         return None
+
+    def should_force_pool_recovery(self, now=None) -> bool:
+        now = time.monotonic() if now is None else now
+
+        if self.last_pool_error_at <= 0:
+            return False
+
+        if self.last_restart_request_at and (now - self.last_restart_request_at) < 15:
+            return False
+
+        process_age = now - self.process_started_at
+        last_good_activity = max(self.last_pool_activity_at, self.last_share_at)
+
+        if self.consecutive_pool_errors >= POOL_RESTART_ERROR_STREAK:
+            if last_good_activity <= 0 and process_age >= POOL_BOOTSTRAP_RESTART_SECONDS:
+                return True
+            if last_good_activity > 0 and (now - last_good_activity) >= POOL_RESTART_STALL_SECONDS:
+                return True
+
+        return False
+
+    @staticmethod
+    def _is_fatal_output(low: str) -> bool:
+        return any(pattern in low for pattern in _FATAL_OUTPUT_PATTERNS)
+
+    @staticmethod
+    def _is_transient_pool_error(low: str) -> bool:
+        if "compute error" in low:
+            return False
+        return any(pattern in low for pattern in _TRANSIENT_POOL_ERROR_PATTERNS)
+
+    @staticmethod
+    def _is_pool_activity(low: str) -> bool:
+        return any(pattern in low for pattern in _POOL_ACTIVITY_PATTERNS)
 
     def _parse_accepted_shares(self, line):
         low = line.lower()
@@ -278,7 +416,13 @@ class OutputMonitor:
             self.xmrig_data._latest_hashrate = float(match.group(1))
 
     async def _handle_new_job(self, line):
+        self.xmrig_data.last_pool_job_at = time.monotonic()
+
         try:
+            session = self.xmrig_data.aiohttp_client_session
+            if session is None or session.closed:
+                return
+
             match = re.search(
                 r"new job from ([\d.:]+).*?diff (\d+).*?algo ([^\s]+).*?height (\d+).*?\((\d+) tx\)",
                 line,
@@ -292,13 +436,19 @@ class OutputMonitor:
                     "height": int(match.group(4)),
                     "tx_count": int(match.group(5)),
                 }
-                await self.xmrig_data.aiohttp_client_session.post(
+                await session.post(
                     f"{self.xmrig_data.FLASK_SERVER_URL}/newjob",
                     json=job_info,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
                 )
+                self.xmrig_data.last_server_ok_at = time.monotonic()
+                self.xmrig_data.last_server_error = ""
         except asyncio.CancelledError:
             raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            self.xmrig_data.last_server_error_at = time.monotonic()
+            self.xmrig_data.last_server_error = str(e)
+            self.logger.log_message(f"[!] Error sending new job info: {e}")
         except Exception as e:
             self.logger.log_message(f"[!] Error sending new job info: {e}")
 
@@ -309,7 +459,7 @@ class XmrigSupervisor:
     No other component should directly stop/start the process pairwise.
     """
 
-    def __init__(self, miner, quiet_timeout_sec: int = 60, poll_sec: int = 5):
+    def __init__(self, miner, quiet_timeout_sec: int = SUPERVISOR_QUIET_TIMEOUT_SECONDS, poll_sec: int = SUPERVISOR_POLL_SECONDS):
         self.miner = miner
         self.xmrig_data = miner.xmrig_data
         self.logger = miner.logger
@@ -319,7 +469,7 @@ class XmrigSupervisor:
 
         self._control_lock = asyncio.Lock()
         self._wake = asyncio.Event()
-        self._runner_task: asyncio.Task | None = None
+        self._runner_task = None
 
         self._desired_running = False
         self._manual_stop = False
@@ -481,14 +631,38 @@ class XmrigSupervisor:
 
                 await asyncio.sleep(self.poll_sec)
 
+        async def pool_recovery_watchdog():
+            nonlocal restart_reason
+
+            await asyncio.sleep(self.poll_sec)
+
+            while True:
+                if generation != self._generation:
+                    return
+
+                if process.returncode is not None:
+                    return
+
+                if self.miner.monitor.should_force_pool_recovery():
+                    restart_reason = (
+                        f"pool recovery restart after repeated connection failures: "
+                        f"{self.miner.monitor.last_pool_error or 'unknown pool error'}"
+                    )
+                    self.logger.log_message(f"[Watchdog] {restart_reason}")
+                    restart_event.set()
+                    return
+
+                await asyncio.sleep(self.poll_sec)
+
         wait_task = asyncio.create_task(process.wait())
         reader_task = asyncio.create_task(stdout_reader())
         watchdog_task = asyncio.create_task(quiet_watchdog())
+        pool_watchdog_task = asyncio.create_task(pool_recovery_watchdog())
         restart_wait_task = asyncio.create_task(restart_event.wait())
 
         try:
             done, pending = await asyncio.wait(
-                {wait_task, reader_task, watchdog_task, restart_wait_task},
+                {wait_task, reader_task, watchdog_task, pool_watchdog_task, restart_wait_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -501,7 +675,7 @@ class XmrigSupervisor:
             if wait_task in done:
                 return
 
-            if reader_task in done or watchdog_task in done:
+            if reader_task in done or watchdog_task in done or pool_watchdog_task in done:
                 if self.miner.is_running():
                     await self.miner._terminate_current_process()
                     with suppress(Exception):
@@ -510,11 +684,18 @@ class XmrigSupervisor:
                 return
 
         finally:
-            for task in (wait_task, reader_task, watchdog_task, restart_wait_task):
+            for task in (wait_task, reader_task, watchdog_task, pool_watchdog_task, restart_wait_task):
                 if not task.done():
                     task.cancel()
             with suppress(Exception):
-                await asyncio.gather(wait_task, reader_task, watchdog_task, restart_wait_task, return_exceptions=True)
+                await asyncio.gather(
+                    wait_task,
+                    reader_task,
+                    watchdog_task,
+                    pool_watchdog_task,
+                    restart_wait_task,
+                    return_exceptions=True,
+                )
 
 
 class XmrigMiner:
@@ -528,7 +709,11 @@ class XmrigMiner:
         self.periodic_reporter = PeriodicReporter(self, self.xmrig_data, self.logger)
         self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
         self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
-        self.supervisor = XmrigSupervisor(self, quiet_timeout_sec=60, poll_sec=5)
+        self.supervisor = XmrigSupervisor(
+            self,
+            quiet_timeout_sec=SUPERVISOR_QUIET_TIMEOUT_SECONDS,
+            poll_sec=SUPERVISOR_POLL_SECONDS,
+        )
 
         self.priority = False
         self.cpu_priority = 2
@@ -553,7 +738,7 @@ class XmrigMiner:
 
     def is_running(self) -> bool:
         proc = self.xmrig_data.xmrig_process
-        return proc is not None and proc.returncode is None and self.xmrig_data.client_status == "Started"
+        return proc is not None and proc.returncode is None
 
     async def start_miner(self, pool_url="", thread_count=None):
         await self.supervisor.start(pool_url, thread_count)
@@ -622,6 +807,7 @@ class XmrigMiner:
                 creationflags=creationflags,
             )
 
+            self.monitor.mark_process_started()
             self.xmrig_data.xmrig_process = proc
             self.psutil_xmrig_manager = AsyncPsutilManager(proc.pid, self.logger)
             self.psutil_xmrig = self.psutil_xmrig_manager.proc
@@ -632,14 +818,20 @@ class XmrigMiner:
             except Exception as e:
                 self.logger.log_message(f"[!] Failed applying process settings: {e}")
 
-            try:
-                await self.xmrig_data.aiohttp_client_session.post(
-                    f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
-                    json={"status": self.xmrig_data.client_status},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                )
-            except aiohttp.ClientError as e:
-                self.logger.log_message(f"[!] Error reporting miner status: {e}")
+            session = self.xmrig_data.aiohttp_client_session
+            if session is not None and not session.closed:
+                try:
+                    await session.post(
+                        f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
+                        json={"status": self.xmrig_data.client_status},
+                        timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
+                    )
+                    self.xmrig_data.last_server_ok_at = time.monotonic()
+                    self.xmrig_data.last_server_error = ""
+                except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+                    self.xmrig_data.last_server_error_at = time.monotonic()
+                    self.xmrig_data.last_server_error = str(e)
+                    self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
             return proc
 
@@ -691,7 +883,9 @@ class XmrigMiner:
                             f"to PPT={self.pl1_pl2} for AMD."
                         )
 
-            await self.server_poller.post_gui_settings(self.xmrig_data.aiohttp_client_session)
+            session = self.xmrig_data.aiohttp_client_session
+            if session is not None and not session.closed:
+                await self.server_poller.post_gui_settings(session)
 
         except psutil.Error as e:
             self.logger.log_message(
@@ -728,14 +922,20 @@ class XmrigMiner:
 
             self.logger.log_message("[+] Stopped Miner now reporting")
 
-            try:
-                await self.xmrig_data.aiohttp_client_session.post(
-                    f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
-                    json={"status": self.xmrig_data.client_status},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                )
-            except aiohttp.ClientError as e:
-                self.logger.log_message(f"[!] Error reporting miner status: {e}")
+            session = self.xmrig_data.aiohttp_client_session
+            if session is not None and not session.closed:
+                try:
+                    await session.post(
+                        f"{self.xmrig_data.FLASK_SERVER_URL}/miners/{self.xmrig_data.client_id}",
+                        json={"status": self.xmrig_data.client_status},
+                        timeout=aiohttp.ClientTimeout(total=SERVER_POST_TIMEOUT_SECONDS),
+                    )
+                    self.xmrig_data.last_server_ok_at = time.monotonic()
+                    self.xmrig_data.last_server_error = ""
+                except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+                    self.xmrig_data.last_server_error_at = time.monotonic()
+                    self.xmrig_data.last_server_error = str(e)
+                    self.logger.log_message(f"[!] Error reporting miner status: {e}")
 
     async def get_current_threads_from_config_async(self):
         async with self.xmrig_data.miner_lock:
