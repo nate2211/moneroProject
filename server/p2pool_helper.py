@@ -223,6 +223,12 @@ class ProcessManager:
         self._public_ip_missing = False
         self._last_restart_reason = None
 
+    def _manual_stop_latched(self) -> bool:
+        try:
+            return bool(self.p2pool_processor.manual_stop_latched())
+        except Exception:
+            return False
+
     def start(self):
         if self.asyncio_loop is None:
             raise RuntimeError("ProcessManager requires a valid asyncio loop.")
@@ -248,6 +254,16 @@ class ProcessManager:
         while not self._stop_event.wait(self.monitor_interval):
             try:
                 current_ip = self.helper.get_public_ip()
+
+                if self._manual_stop_latched():
+                    self._pending_ip = None
+                    self._pending_hits = 0
+                    if current_ip:
+                        self._current_ip = current_ip
+                        self._public_ip_missing = False
+                    else:
+                        self._public_ip_missing = True
+                    continue
 
                 if not current_ip:
                     if not self._public_ip_missing:
@@ -318,6 +334,12 @@ class ProcessManager:
                 self.logger.log_message(f"[ProcessManager] Error in monitor loop: {e}")
 
     async def _restart_services(self, old_ip, new_ip, reason) -> bool:
+        if self._manual_stop_latched():
+            self.logger.log_message(
+                f"[ProcessManager] Skipping P2Pool restart because manual stop latch is active ({reason})."
+            )
+            return False
+
         self.logger.log_message(
             f"[ProcessManager] Restarting P2Pool because {reason}: {old_ip} -> {new_ip}"
         )
