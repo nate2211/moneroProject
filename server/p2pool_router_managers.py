@@ -18968,46 +18968,49 @@ class SYNScanner:
     Manages periodic TCP scans, does banner grabs on sensible ports, and emits
     stateful notifications about port status changes.
 
-    Key changes vs. previous version:
-      • Uses L3 scanning (IP/TCP) so the OS routes via the gateway (no ARP to Internet hosts)
-      • On banner-friendly ports, performs a real TCP connect() to "open the port" and pull a banner
-      • TLS-aware probe for 443/8443/993/995/465/587 (best-effort, returns CN/cipher)
-      • Quieter logging for ports where banners are not expected
+    Stability-oriented rewrite goals:
+      • Keep the exact same public method signatures
+      • Avoid destabilizing weak uplinks / router-host stacks
+      • Prefer OS-routed L3 behavior over brittle L2 assumptions
+      • Add conservative pacing, interface health checks, and backoff
+      • Avoid bad source binds that can flap connectivity on Windows
+      • Keep banner/TLS probing best-effort and quiet when services are not chatty
+      • Add small helper features only; no breaking behavior changes
     """
 
     # Plaintext services that commonly expose a banner on connect()
     BANNER_PORTS = {
-        21,   # FTP
-        22,   # SSH
-        23,   # Telnet
-        25,   # SMTP
-        80,   # HTTP
-        110,  # POP3
-        143,  # IMAP
-        389,  # LDAP
-        445,  # SMB (often no banner, but sometimes responds)
-        8080, # Alt-HTTP
+        21,    # FTP
+        22,    # SSH
+        23,    # Telnet
+        25,    # SMTP
+        80,    # HTTP
+        110,   # POP3
+        143,   # IMAP
+        389,   # LDAP
+        445,   # SMB (usually not banner-y, but we allow light probing)
+        8080,  # Alt-HTTP
     }
 
     # Services where a direct TLS handshake can provide useful info
     TLS_PORTS = {
         443, 8443,  # HTTPS
         993, 995,   # IMAPS / POP3S
-        465, 587,   # SMTPS / SMTP(STARTTLS-capable but we just try direct TLS)
+        465, 587,   # SMTPS / SMTP
         990,        # FTPS
     }
 
     # Minimal text probes to coax banners (only for plaintext ports)
     _PLAINTEXT_PROBES: Dict[int, bytes] = {
-        21:  b"FEAT\r\n",                                                # FTP
-        25:  b"EHLO scanner.local\r\nQUIT\r\n",                          # SMTP
-        80:  b"HEAD / HTTP/1.0\r\nHost: example\r\n\r\n",                # HTTP
-        8080:b"HEAD / HTTP/1.0\r\nHost: example\r\n\r\n",                # Alt-HTTP
-        110: b"QUIT\r\n",                                                # POP3
-        143: b". CAPABILITY\r\n",                                        # IMAP
-        389: b"\x30\x0a\x02\x01\x01\x60\x05\x02\x01\x03\x80\x00",        # LDAP simple bind (anon) preface
-        23:  b"\r\n",                                                    # Telnet
-        # 445/SMB not probed with raw text; leave it passive
+        21:   b"FEAT\r\n",
+        25:   b"EHLO scanner.local\r\nQUIT\r\n",
+        80:   b"HEAD / HTTP/1.0\r\nHost: example\r\nConnection: close\r\n\r\n",
+        8080: b"HEAD / HTTP/1.0\r\nHost: example\r\nConnection: close\r\n\r\n",
+        110:  b"QUIT\r\n",
+        143:  b". CAPABILITY\r\n",
+        389:  b"\x30\x0a\x02\x01\x01\x60\x05\x02\x01\x03\x80\x00",
+        23:   b"\r\n",
+        # 445 intentionally passive
     }
 
     def __init__(
@@ -19025,13 +19028,13 @@ class SYNScanner:
         self.router_logger = router_logger
         self.packet_writer = packet_writer
         self.arp_manager = arp_manager
-        self.interfaces_config = interfaces_config
+        self.interfaces_config = interfaces_config or {}
         self.notification_manager = notification_manager
         self.scan_targets = scan_targets if scan_targets is not None else [
             ("8.8.8.8", [53, 80]),
             ("1.1.1.1", [443, 80]),
         ]
-        self.scan_interval = scan_interval
+        self.scan_interval = max(5, int(scan_interval or 60))
 
         self._scannable_interfaces: List[str] = []
         self._populate_scannable_interfaces()
@@ -19039,8 +19042,29 @@ class SYNScanner:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # Stateful set of (ip,port) currently known-open
+        # Stateful set of (ip, port) currently known-open
         self.open_ports_state: set[Tuple[str, int]] = set()
+
+        # Added stability state
+        self._last_cycle_started_at = 0.0
+        self._last_good_cycle_at = 0.0
+        self._consecutive_cycle_failures = 0
+        self._target_backoff_until: Dict[Tuple[str, int], float] = {}
+        self._last_status_by_target: Dict[Tuple[str, int], str] = {}
+        self._last_banner_by_target: Dict[Tuple[str, int], Optional[str]] = {}
+        self._last_notification_at: Dict[Tuple[str, int, str], float] = {}
+        self._connect_fail_counts: Dict[Tuple[str, int], int] = {}
+        self._quiet_statuses = {"CLOSED", "FILTERED (no response)", "FILTERED (timeout)", "FILTERED (ICMP)"}
+
+        # Conservative pacing knobs
+        self._per_probe_pause = 0.04
+        self._per_target_pause = 0.10
+        self._cycle_jitter_max = 0.50
+        self._max_banner_bytes = 4096
+        self._status_log_repeat_seconds = 300.0
+        self._notification_cooldown_seconds = 10.0
+        self._connect_failure_backoff_base = 15.0
+        self._connect_failure_backoff_cap = 300.0
 
         self.router_logger.log_message("[SYNScanner] Initialized.")
         if not self._scannable_interfaces:
@@ -19052,10 +19076,32 @@ class SYNScanner:
 
     def _populate_scannable_interfaces(self):
         self._scannable_interfaces.clear()
-        for iface_full, cfg in self.interfaces_config.items():
-            ip = cfg.get("ip_addr")
-            if ip and not ("loopback" in iface_full.lower() or iface_full.lower() == "lo"):
-                self._scannable_interfaces.append(iface_full)
+        seen = set()
+
+        for iface_full, cfg in (self.interfaces_config or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+
+            iface_name = str(iface_full or "").strip()
+            if not iface_name:
+                continue
+
+            if "loopback" in iface_name.lower() or iface_name.lower() == "lo":
+                continue
+
+            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4") or cfg.get("ipv6")
+            if not ip:
+                continue
+
+            try:
+                ipaddress.ip_address(str(ip))
+            except Exception:
+                continue
+
+            if iface_name not in seen:
+                seen.add(iface_name)
+                self._scannable_interfaces.append(iface_name)
+
         self.router_logger.log_message(
             f"[SYNScanner] Found {len(self._scannable_interfaces)} scannable interfaces."
         )
@@ -19064,10 +19110,12 @@ class SYNScanner:
         if self._thread and self._thread.is_alive():
             self.router_logger.log_message("[SYNScanner] Already running.")
             return
+
         self._populate_scannable_interfaces()
         if not self._scannable_interfaces:
             self.router_logger.log_message("[SYNScanner] Cannot start: No scannable interfaces available.")
             return
+
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_scan_loop, daemon=True, name="SYNScannerThread")
         self._thread.start()
@@ -19076,39 +19124,94 @@ class SYNScanner:
     def stop(self):
         if not self._thread or not self._thread.is_alive():
             return
+
         self.router_logger.log_message("[SYNScanner] Stopping thread...")
         self._stop_event.set()
-        self._thread.join(timeout=5)
+
+        try:
+            self._thread.join(timeout=5)
+        except Exception as e:
+            self.router_logger.log_message(f"[SYNScanner] Stop join warning: {e}")
+
         self.router_logger.log_message("[SYNScanner] Thread stopped.")
 
     # ---------------- main loop ----------------
 
     def _run_scan_loop(self):
         self.router_logger.log_message("[SYNScanner] Scan loop started.")
+
         while not self._stop_event.is_set():
-            if not self._scannable_interfaces:
-                self.router_logger.log_message("[SYNScanner] No active scannable interfaces. Waiting...")
-                self._stop_event.wait(self.scan_interval)
+            self._last_cycle_started_at = time.time()
+
+            try:
                 self._populate_scannable_interfaces()
-                continue
+                if not self._scannable_interfaces:
+                    self.router_logger.log_message("[SYNScanner] No active scannable interfaces. Waiting...")
+                    self._stop_event.wait(self.scan_interval)
+                    continue
 
-            iface = random.choice(self._scannable_interfaces)
-            self.router_logger.log_message(f"[SYNScanner] Commencing scan cycle using {iface.split('_')[-1]}")
+                iface = self._choose_iface_for_cycle()
+                iface_short = iface.split("_")[-1] if iface else "unknown"
+                self.router_logger.log_message(f"[SYNScanner] Commencing scan cycle using {iface_short}")
 
-            for target_ip, ports in self.scan_targets:
-                if self._stop_event.is_set():
-                    break
-                for port in ports:
+                cycle_had_success = False
+
+                for target_ip, ports in list(self.scan_targets or []):
                     if self._stop_event.is_set():
                         break
-                    status, banner = self._scan_one(target_ip, port, iface)
-                    self.router_logger.log_message(
-                        f"[SYNScanner] Result for {target_ip}:{port} on {iface.split('_')[-1]} -> {status}"
-                    )
-                    self._handle_state_change(target_ip, port, status, banner)
 
-            self.router_logger.log_message(f"[SYNScanner] Scan cycle completed. Waiting for {self.scan_interval}s.")
-            self._stop_event.wait(self.scan_interval)
+                    if not self._is_valid_ip_literal(target_ip):
+                        self.router_logger.log_message(f"[SYNScanner] Skipping invalid target IP: {target_ip}")
+                        continue
+
+                    if not ports:
+                        continue
+
+                    for port in list(ports):
+                        if self._stop_event.is_set():
+                            break
+
+                        if not self._is_valid_port(port):
+                            self.router_logger.log_message(f"[SYNScanner] Skipping invalid port: {target_ip}:{port}")
+                            continue
+
+                        if self._is_backed_off(target_ip, port):
+                            continue
+
+                        # Re-evaluate route/interface family sanity before each probe
+                        if not self._iface_usable_for_target(iface, target_ip):
+                            alt_iface = self._find_better_iface_for_target(target_ip)
+                            if alt_iface:
+                                iface = alt_iface
+                                iface_short = iface.split("_")[-1] if iface else "unknown"
+
+                        status, banner = self._scan_one(target_ip, port, iface)
+
+                        if status.startswith("OPEN"):
+                            cycle_had_success = True
+                            self._connect_fail_counts[(target_ip, port)] = 0
+                        elif status == "ERROR":
+                            self._bump_backoff(target_ip, port)
+
+                        self._log_probe_result(target_ip, port, iface_short, status, banner)
+                        self._handle_state_change(target_ip, port, status, banner)
+
+                        if self._stop_event.wait(self._per_probe_pause):
+                            break
+
+                    if self._stop_event.wait(self._per_target_pause):
+                        break
+
+                self._last_good_cycle_at = time.time() if cycle_had_success else self._last_good_cycle_at
+                self._consecutive_cycle_failures = 0 if cycle_had_success else (self._consecutive_cycle_failures + 1)
+
+            except Exception as e:
+                self._consecutive_cycle_failures += 1
+                self.router_logger.log_message(f"[SYNScanner] Scan loop error: {e}")
+
+            wait_for = self._compute_next_cycle_wait()
+            self.router_logger.log_message(f"[SYNScanner] Scan cycle completed. Waiting for {wait_for:.2f}s.")
+            self._stop_event.wait(wait_for)
 
         self.router_logger.log_message("[SYNScanner] Scan loop has exited.")
 
@@ -19117,103 +19220,144 @@ class SYNScanner:
     def _scan_one(self, ip: str, port: int, iface: str, timeout: float = 2.0) -> Tuple[str, Optional[str]]:
         """
         Returns ('OPEN'|'CLOSED'|'FILTERED'|'ERROR'|...), banner_or_None.
+
         Strategy:
-          • If port is banner-friendly → do a real connect() probe (opens connection) and read banner
-          • Else → do a L3 SYN probe with scapy (no L2 crafting)
-          • On connect() failure, fall back to SYN to discriminate CLOSED vs FILTERED
+          • If port is banner-friendly → do a real connect() probe first
+          • Else → do a lightweight routed SYN probe
+          • On connect() failure, fall back to SYN to refine CLOSED vs FILTERED
         """
-        # Try banner path first if sensible
+        if self._stop_event.is_set():
+            return "STOPPED", None
+
+        if not self._is_valid_ip_literal(ip) or not self._is_valid_port(port):
+            return "ERROR", None
+
+        # Banner/TLS path first for meaningful services
         if self._is_banner_port(port):
             status, banner = self._banner_probe(ip, port, iface, timeout=timeout)
-            if status != "ERROR" and (status != "CLOSED"):
-                # OPEN, FILTERED, or something meaningful → return it
+            if status not in ("ERROR", "CLOSED"):
                 return status, banner
-            # else fall through to SYN to refine CLOSED/FILTERED
 
-        # SYN probe via scapy (L3; OS routes)
+        # Conservative L3 SYN path
         try:
-            syn = IP(dst=ip) / TCP(dport=port, flags="S")
-            resp = self.sniffer.sr1(syn, timeout=timeout, verbose=0, iface=iface)
+            pkt = IP(dst=ip) / TCP(
+                dport=int(port),
+                flags="S",
+                sport=self._pick_safe_sport(),
+                seq=random.randint(0, 0xFFFFFFFF),
+                window=8192,
+            )
+
+            # Avoid forcing bad interface behavior unless the iface is clearly usable
+            sr1_kwargs = {
+                "timeout": timeout,
+                "verbose": 0,
+            }
+
+            if self._iface_usable_for_target(iface, ip):
+                sr1_kwargs["iface"] = iface
+
+            resp = self.sniffer.sr1(pkt, **sr1_kwargs)
+
             if resp is None:
                 return "FILTERED (no response)", None
+
             if resp.haslayer(TCP):
-                f = int(resp[TCP].flags)
-                if f & 0x12:  # SYN-ACK
-                    # We won't send RST here; if caller wants a banner, they can connect() separately
+                tcp = resp.getlayer(TCP)
+                flags = int(getattr(tcp, "flags", 0))
+
+                if flags & 0x12:  # SYN+ACK
+                    # Politely send RST to avoid half-open accumulation
+                    self._best_effort_reset(ip, port, iface, resp)
                     return "OPEN", None
-                if f & 0x04:  # RST
+
+                if flags & 0x04:  # RST
                     return "CLOSED", None
-                return f"UNEXPECTED_TCP_FLAGS ({hex(f)})", None
+
+                return f"UNEXPECTED_TCP_FLAGS ({hex(flags)})", None
+
             if resp.haslayer(ICMP):
                 return "FILTERED (ICMP)", None
+
             return "UNEXPECTED_NON_TCP_RESPONSE", None
+
         except Exception as e:
             self.router_logger.log_message(f"[SYNScanner] Error during SYN scan of {ip}:{port}: {e}")
             return "ERROR", None
 
     def _is_banner_port(self, port: int) -> bool:
-        return port in self.BANNER_PORTS or port in self.TLS_PORTS
+        return int(port) in self.BANNER_PORTS or int(port) in self.TLS_PORTS
 
     # ---------------- banner probes ----------------
 
     def _banner_probe(self, ip: str, port: int, iface: str, timeout: float = 3.0) -> Tuple[str, Optional[str]]:
         """
         Full-connect banner probe. Returns (status, banner/info).
+
           • TLS ports: attempt a TLS handshake (no hostname checking); report CN/cipher
-          • Plaintext: connect, read initial bytes, optionally send a single probe
+          • Plaintext: connect, read initial bytes, optionally send one gentle probe
+          • Stability: use short timeouts and conservative fallback handling
         """
         import ssl
-        # --- TLS first (for known TLS ports) ---
-        if port in getattr(self, "TLS_PORTS", {443, 853, 993, 995, 465, 8443, 8883, 10443}):
+
+        if self._stop_event.is_set():
+            return "STOPPED", None
+
+        # --- TLS path ---
+        if port in getattr(self, "TLS_PORTS", {443, 8443, 993, 995, 465, 587, 990}):
             try:
                 ctx = ssl.create_default_context()
-                # Accept any cert + don't check hostnames; we're only fingerprinting
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
 
-                # Use our robust connector that retries without binding on 10049/EADDRNOTAVAIL
                 with self._create_conn(ip, port, iface, timeout) as s:
                     s.settimeout(timeout)
-                    # Don't pass server_hostname to avoid SNI/hostname mismatch failures on raw IPs
                     with ctx.wrap_socket(s, server_hostname=None) as tls:
-                        # Try to extract something useful
                         cert = tls.getpeercert() or {}
                         cn = None
+
                         for tup in cert.get("subject", []):
-                            # subject is a list of tuples like ((('commonName','example.com'),), ...)
-                            if tup and tup[0][0] == "commonName":
-                                cn = tup[0][1]
-                                break
-                        # If SAN exists, prefer first DNS name as a fallback CN
+                            try:
+                                if tup and tup[0][0] == "commonName":
+                                    cn = tup[0][1]
+                                    break
+                            except Exception:
+                                pass
+
                         if not cn:
                             for k, v in cert.get("subjectAltName", []):
                                 if k == "DNS":
                                     cn = v
                                     break
+
                         cipher = tls.cipher()[0] if tls.cipher() else "unknown"
-                        info = f"TLS OK; CN={cn or 'unknown'}; cipher={cipher}"
+                        proto = tls.version() or "TLS"
+                        info = f"{proto} OK; CN={cn or 'unknown'}; cipher={cipher}"
                         return "OPEN", info
+
             except (ssl.SSLError, TimeoutError, OSError) as e:
-                # Log and fall back to plaintext probe (some services speak TLS on odd ports or require SNI)
                 self.router_logger.log_message(f"[SYNScanner] TLS probe {ip}:{port} no banner ({e}).")
-                # continue to plaintext path
+                # fall through to plaintext / connect classification
 
         # --- Plaintext path ---
         try:
             with self._create_conn(ip, port, iface, timeout) as s:
                 s.settimeout(timeout)
-                banner = self._recv_some(s)  # should return bytes or b""
-                probe = getattr(self, "_PLAINTEXT_PROBES", {}).get(port)
+
+                banner = self._recv_some(s)
+                probe = getattr(self, "_PLAINTEXT_PROBES", {}).get(int(port))
+
                 if not banner and probe:
                     try:
                         s.sendall(probe)
                         banner = self._recv_some(s)
                     except Exception:
                         pass
+
                 if banner:
-                    b = banner.strip()
-                    b = (b.splitlines() or [""])[0][:200]
-                    return "OPEN", (b or None)
+                    line = self._sanitize_banner_bytes(banner)
+                    return "OPEN", line or None
+
                 return "OPEN", None
 
         except ConnectionRefusedError:
@@ -19221,106 +19365,263 @@ class SYNScanner:
         except TimeoutError:
             return "FILTERED (timeout)", None
         except OSError as e:
-            # Windows 10013 (permission), treat as filtered/policy; others bubble to ERROR
-            if getattr(e, "winerror", None) == 10013:
+            winerror = getattr(e, "winerror", None)
+            errno_ = getattr(e, "errno", None)
+
+            if winerror == 10061:
+                return "CLOSED", None
+            if winerror == 10060:
+                return "FILTERED (timeout)", None
+            if winerror == 10013:
                 self.router_logger.log_message(f"[SYNScanner] (info) Access blocked to {ip}:{port} (WinError 10013).")
                 return "FILTERED (policy)", None
+            if winerror in (10049, 10051, 10065) or errno_ in (99, 101, 113):
+                return "FILTERED (unreachable)", None
+
             return "ERROR", None
         except Exception as e:
             self.router_logger.log_message(f"[SYNScanner] Plain probe {ip}:{port} error: {e}")
             return "ERROR", None
+
     def _recv_some(self, sock: socket.socket, bufsize: int = 4096) -> bytes:
         """
         Try to receive up to bufsize bytes from the socket.
         Returns b"" on timeout or error.
         """
         try:
-            data = sock.recv(bufsize)
+            data = sock.recv(min(int(bufsize), self._max_banner_bytes))
             return data if data else b""
         except (socket.timeout, BlockingIOError):
             return b""
         except Exception:
-            # don’t raise inside a scanner
             return b""
-    # --- replace _iface_src_ip with this ---
+
     def _iface_src_ip(self, iface: str, target_ip: str) -> str | None:
         """
         Best-effort source IP for binding sockets:
-          • Return the interface IP only if it exists AND matches target family (v4/v6)
+          • Return the interface IP only if it exists AND matches target family
           • Otherwise return None so the OS picks a valid source
         """
-        cfg = self.interfaces_config.get(iface) or {}
-        ip = cfg.get("ip_addr")
+        cfg = (self.interfaces_config or {}).get(iface) or {}
+        ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4") or cfg.get("ipv6")
         if not ip:
             return None
+
         try:
-            t_is_v6 = ipaddress.ip_address(target_ip).version == 6
+            t_is_v6 = ipaddress.ip_address(str(target_ip)).version == 6
             s_is_v6 = ipaddress.ip_address(str(ip)).version == 6
             return str(ip) if (t_is_v6 == s_is_v6) else None
         except Exception:
             return None
 
-    # --- new tiny helper (use in both TLS and plaintext probes) ---
     def _create_conn(self, ip: str, port: int, iface: str, timeout: float):
         """
-        Try binding to the interface IP if valid; on Windows 10049 or any bind error,
-        retry with no source binding so the OS chooses the right address.
+        Try binding to the interface IP if valid; on Windows 10049 / EADDRNOTAVAIL,
+        retry unbound so the OS chooses a valid source.
         """
         src = self._iface_src_ip(iface, ip)
+
         try:
             if src:
-                return socket.create_connection((ip, port), timeout=timeout, source_address=(src, 0))
-            else:
-                return socket.create_connection((ip, port), timeout=timeout)
+                return socket.create_connection((ip, int(port)), timeout=timeout, source_address=(src, 0))
+            return socket.create_connection((ip, int(port)), timeout=timeout)
+
         except OSError as e:
-            # WinError 10049: "requested address is not valid in its context" → retry unbound
-            if getattr(e, "winerror", None) == 10049 or getattr(e, "errno", None) in (99,):  # EADDRNOTAVAIL
-                return socket.create_connection((ip, port), timeout=timeout)
+            if getattr(e, "winerror", None) == 10049 or getattr(e, "errno", None) in (99,):
+                return socket.create_connection((ip, int(port)), timeout=timeout)
             raise
+
     # ---------------- state changes & notifications ----------------
 
     def _handle_state_change(self, ip: str, port: int, status: str, banner: Optional[str]) -> None:
         """
         Emit "new open" and "closed" events, with banner text if present.
         """
+        ident = (ip, int(port))
         is_open_now = status.startswith("OPEN")
-        ident = (ip, port)
         was_open = ident in self.open_ports_state
+
+        self._last_status_by_target[ident] = status
+        self._last_banner_by_target[ident] = banner
 
         if is_open_now and not was_open:
             self.open_ports_state.add(ident)
             self.router_logger.log_message(f"[SYNScanner] ✅ NEW OPEN PORT: {ip}:{port}")
             if banner:
                 self.router_logger.log_message(f"[SYNScanner]    Banner: {banner}")
-            if self.notification_manager:
-                self.notification_manager.send_notification({
-                    "event": "Port Opened",
-                    "ip": ip,
-                    "port": port,
-                    "banner": banner or "N/A",
-                })
+
+            if self.notification_manager and self._notification_allowed(ip, port, "opened"):
+                try:
+                    self.notification_manager.send_notification({
+                        "event": "Port Opened",
+                        "ip": ip,
+                        "port": port,
+                        "banner": banner or "N/A",
+                    })
+                except Exception as e:
+                    self.router_logger.log_message(f"[SYNScanner] Notification error (opened): {e}")
             return
 
         if (not is_open_now) and was_open:
             self.open_ports_state.remove(ident)
             self.router_logger.log_message(f"[SYNScanner] ❌ PORT CLOSED: {ip}:{port}")
-            if self.notification_manager:
-                self.notification_manager.send_notification({
-                    "event": "Port Closed",
-                    "ip": ip,
-                    "port": port,
-                })
+
+            if self.notification_manager and self._notification_allowed(ip, port, "closed"):
+                try:
+                    self.notification_manager.send_notification({
+                        "event": "Port Closed",
+                        "ip": ip,
+                        "port": port,
+                    })
+                except Exception as e:
+                    self.router_logger.log_message(f"[SYNScanner] Notification error (closed): {e}")
             return
 
-        # No state change → avoid noisy repeats; optionally log terse info for debugging
-        if status.startswith("FILTERED"):
-            # Reduce verbosity: don't spam every cycle
+        # No noisy repeats for normal closed/filtered states
+        if status in self._quiet_statuses or status.startswith("FILTERED"):
             return
-        if status == "CLOSED":
-            return
-        # For unusual statuses, keep a single line
+
         if not was_open and not is_open_now:
             self.router_logger.log_message(f"[SYNScanner] Note: {ip}:{port} status={status}")
+
+    # ---------------- added helpers only ----------------
+
+    def _choose_iface_for_cycle(self) -> str:
+        usable = [i for i in self._scannable_interfaces if self._iface_has_ip(i)]
+        if usable:
+            return random.choice(usable)
+        return random.choice(self._scannable_interfaces)
+
+    def _iface_has_ip(self, iface: str) -> bool:
+        try:
+            cfg = (self.interfaces_config or {}).get(iface) or {}
+            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4") or cfg.get("ipv6")
+            if not ip:
+                return False
+            ipaddress.ip_address(str(ip))
+            return True
+        except Exception:
+            return False
+
+    def _iface_usable_for_target(self, iface: str, target_ip: str) -> bool:
+        src_ip = self._iface_src_ip(iface, target_ip)
+        if not src_ip:
+            return False
+        try:
+            return ipaddress.ip_address(str(src_ip)).version == ipaddress.ip_address(str(target_ip)).version
+        except Exception:
+            return False
+
+    def _find_better_iface_for_target(self, target_ip: str) -> Optional[str]:
+        for iface in self._scannable_interfaces:
+            if self._iface_usable_for_target(iface, target_ip):
+                return iface
+        return None
+
+    def _compute_next_cycle_wait(self) -> float:
+        base = float(self.scan_interval)
+        penalty = min(60.0, self._consecutive_cycle_failures * 2.0)
+        jitter = random.uniform(0.0, self._cycle_jitter_max)
+        return max(5.0, base + penalty + jitter)
+
+    def _is_valid_ip_literal(self, value: str) -> bool:
+        try:
+            ipaddress.ip_address(str(value))
+            return True
+        except Exception:
+            return False
+
+    def _is_valid_port(self, port: int) -> bool:
+        try:
+            port = int(port)
+            return 1 <= port <= 65535
+        except Exception:
+            return False
+
+    def _pick_safe_sport(self) -> int:
+        # avoid well-known ports and keep away from low privileged ranges
+        return random.randint(40000, 60000)
+
+    def _best_effort_reset(self, ip: str, port: int, iface: str, resp) -> None:
+        try:
+            ack_val = int(resp[TCP].seq) + 1 if resp.haslayer(TCP) else 0
+            rst = IP(dst=ip) / TCP(
+                dport=int(port),
+                sport=self._pick_safe_sport(),
+                flags="R",
+                seq=0,
+                ack=ack_val,
+            )
+            send_kwargs = {"verbose": 0}
+            if self._iface_usable_for_target(iface, ip):
+                send_kwargs["iface"] = iface
+            self.sniffer.send(rst, **send_kwargs)
+        except Exception:
+            pass
+
+    def _sanitize_banner_bytes(self, banner: bytes) -> str:
+        try:
+            text = banner[: self._max_banner_bytes].decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                text = banner[: self._max_banner_bytes].decode("latin1", errors="replace")
+            except Exception:
+                return ""
+
+        text = text.replace("\r", " ").replace("\n", " ").strip()
+        while "  " in text:
+            text = text.replace("  ", " ")
+        return text[:200]
+
+    def _log_probe_result(self, ip: str, port: int, iface_short: str, status: str, banner: Optional[str]) -> None:
+        ident = (ip, int(port))
+        previous = self._last_status_by_target.get(ident)
+        should_log = (
+            previous != status
+            or status not in self._quiet_statuses
+            or status.startswith("OPEN")
+            or self._status_repeat_elapsed(ident)
+        )
+
+        if not should_log:
+            return
+
+        self.router_logger.log_message(
+            f"[SYNScanner] Result for {ip}:{port} on {iface_short} -> {status}"
+        )
+
+        if banner and status.startswith("OPEN"):
+            self.router_logger.log_message(f"[SYNScanner] Banner/info for {ip}:{port}: {banner}")
+
+        self._last_notification_at[(ip, int(port), f"log:{status}")] = time.time()
+
+    def _status_repeat_elapsed(self, ident: Tuple[str, int]) -> bool:
+        key = (ident[0], ident[1], f"log:{self._last_status_by_target.get(ident, '')}")
+        last = self._last_notification_at.get(key, 0.0)
+        return (time.time() - last) >= self._status_log_repeat_seconds
+
+    def _notification_allowed(self, ip: str, port: int, event: str) -> bool:
+        key = (ip, int(port), event)
+        now = time.time()
+        last = self._last_notification_at.get(key, 0.0)
+        if (now - last) < self._notification_cooldown_seconds:
+            return False
+        self._last_notification_at[key] = now
+        return True
+
+    def _is_backed_off(self, ip: str, port: int) -> bool:
+        until = self._target_backoff_until.get((ip, int(port)), 0.0)
+        return time.time() < until
+
+    def _bump_backoff(self, ip: str, port: int) -> None:
+        ident = (ip, int(port))
+        failures = self._connect_fail_counts.get(ident, 0) + 1
+        self._connect_fail_counts[ident] = failures
+        duration = min(
+            self._connect_failure_backoff_cap,
+            self._connect_failure_backoff_base * max(1, failures),
+        )
+        self._target_backoff_until[ident] = time.time() + duration
 
 class ICMPManager:
     # ------------------------------ Tuning -----------------------------------

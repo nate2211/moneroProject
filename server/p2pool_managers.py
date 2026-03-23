@@ -2212,7 +2212,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -2291,7 +2291,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
-            self._enable_nat_forwarding()
+            if nat_os:
+                self._enable_nat_forwarding()
             self.arp_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ipv4_out = self.router_ip_out
@@ -2487,7 +2488,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute):
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os):
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
@@ -2508,7 +2509,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()
-            self._disable_nat_forwarding()
+            if nat_os:
+                self._disable_nat_forwarding()
             if self.nat_manager:
                 self.nat_manager.stop()
             self.dns_manager.stop()
@@ -2552,7 +2554,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.syn_scanner.stop()
             self.cleanup_all_network_changes()
             if use_hyperv:
-                self.hypervrouter_manager.start()
+                self.hypervrouter_manager.stop()
                 self.windivert_manager.stop()
                 self.wintun_manager.stop()
                 self.hyperv_manager.teardown()

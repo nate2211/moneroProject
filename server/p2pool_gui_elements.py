@@ -1778,7 +1778,8 @@ class RouterTab(QWidget):
         self.use_lan_checkbox.setChecked(False)
         self.use_uplink_checkbox = QCheckBox("Use Uplink Manager")
         self.use_uplink_checkbox.setChecked(False)
-
+        self.nat_os_checkbox = QCheckBox("Use OS Nat")
+        self.nat_os_checkbox.setChecked(False)
 
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
@@ -1825,14 +1826,34 @@ class RouterTab(QWidget):
         group_row = QHBoxLayout()
 
         routing_box = QGroupBox("Routing")
-        routing_form = QFormLayout(routing_box)
-        routing_form.addRow(self.dhcp_out_checkbox, self.dhcp_in_checkbox)
-        routing_form.addRow(self.use_static_checkbox, self.use_hyperv_checkbox)
-        routing_form.addRow(self.use_netroute_checkbox, self.use_hostbypass_checkbox)
-        routing_form.addRow(self.use_gateway_checkbox, self.use_lan_checkbox)
-        routing_form.addRow(self.use_uplink_checkbox)
-        routing_form.addRow(QLabel("Manual LAN IP:"), self.router_ip_out_input)
-        routing_form.addRow(QLabel("Netmask:"), self.router_netmask_out_input)
+        routing_grid = QGridLayout(routing_box)
+        routing_grid.setContentsMargins(8, 8, 8, 8)
+        routing_grid.setHorizontalSpacing(18)
+        routing_grid.setVerticalSpacing(10)
+
+        routing_grid.addWidget(self.dhcp_out_checkbox, 0, 0)
+        routing_grid.addWidget(self.dhcp_in_checkbox, 0, 1)
+        routing_grid.addWidget(self.use_static_checkbox, 0, 2)
+        routing_grid.addWidget(self.use_hyperv_checkbox, 0, 3)
+
+        routing_grid.addWidget(self.use_netroute_checkbox, 1, 0)
+        routing_grid.addWidget(self.use_hostbypass_checkbox, 1, 1)
+        routing_grid.addWidget(self.use_gateway_checkbox, 1, 2)
+        routing_grid.addWidget(self.use_lan_checkbox, 1, 3)
+
+        routing_grid.addWidget(self.use_uplink_checkbox, 2, 0)
+        routing_grid.addWidget(self.nat_os_checkbox, 2, 1)
+
+        ip_row = QWidget()
+        ip_layout = QHBoxLayout(ip_row)
+        ip_layout.setContentsMargins(0, 0, 0, 0)
+        ip_layout.setSpacing(10)
+        ip_layout.addWidget(QLabel("Manual LAN IP:"))
+        ip_layout.addWidget(self.router_ip_out_input)
+        ip_layout.addWidget(QLabel("Netmask:"))
+        ip_layout.addWidget(self.router_netmask_out_input)
+
+        routing_grid.addWidget(ip_row, 3, 0, 1, 4)
 
         comms_box = QGroupBox("Comms")
         comms_form = QFormLayout(comms_box)

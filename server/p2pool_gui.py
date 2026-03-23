@@ -402,6 +402,7 @@ class P2PoolGUI(QMainWindow):
         use_gateway = self.router_tab.use_gateway_checkbox.isChecked()
         use_lan = self.router_tab.use_lan_checkbox.isChecked()
         use_uplink = self.router_tab.use_uplink_checkbox.isChecked()
+        nat_os = self.router_tab.nat_os_checkbox.isChecked()
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
@@ -426,6 +427,7 @@ class P2PoolGUI(QMainWindow):
                 use_gateway=use_gateway,
                 use_lan=use_lan,
                 use_uplink=use_uplink,
+                nat_os=nat_os,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
@@ -451,7 +453,7 @@ class P2PoolGUI(QMainWindow):
             use_static = self.router_tab.use_static_checkbox.isChecked()
             use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
             use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
-
+            nat_os = self.router_tab.nat_os_checkbox.isChecked()
             self.router_logger.log_message(
                 f"[GUI] stop_router flags: "
                 f"stratum={use_stratum_comm}, "
@@ -468,6 +470,7 @@ class P2PoolGUI(QMainWindow):
                 use_hyperv,
                 use_stratum_comm,
                 use_netroute,
+                nat_os,
             )
 
             self.router_tab.start_router_button.setEnabled(True)
