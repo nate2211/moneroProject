@@ -16687,13 +16687,13 @@ class HyperVRouterManager:
         )
 
     def register_hyperv_backend(
-        self,
-        sender_id: str,
-        backend: Any,
-        *,
-        allow_protocols: Optional[Set[str]] = None,
-        enabled: bool = True,
-        start_backend: bool = False,
+            self,
+            sender_id: str,
+            backend: Any,
+            *,
+            allow_protocols: Optional[Set[str]] = None,
+            enabled: bool = True,
+            start_backend: bool = False,
     ) -> None:
         send_fn = getattr(backend, "send_packet", None)
         if not callable(send_fn):
@@ -16706,7 +16706,8 @@ class HyperVRouterManager:
             allow_protocols=set(allow_protocols or {"ESP", "AH", "GRE", "ISAKMP", "IKEv2"}),
             enabled=bool(enabled),
             start_fn=getattr(backend, "start", None) if start_backend else None,
-            stop_fn=getattr(backend, "teardown", None) or getattr(backend, "stop", None),
+            stop_fn=(getattr(backend, "teardown", None) or getattr(backend, "stop", None)) if start_backend else None,
+            started_by_manager=bool(start_backend),
             send_q=queue.Queue(maxsize=self.sender_queue_size),
         )
 
@@ -16867,26 +16868,10 @@ class HyperVRouterManager:
             self._started = False
             self._stop_event.set()
 
+        # 1. stop network ingress first
         self._close_sockets()
 
-        for t in (self._hello_thread, self._recv_thread, self._health_thread):
-            if t and t.is_alive():
-                t.join(timeout=3.0)
-
-        with self._lock:
-            senders = list(self._senders.values())
-
-        for state in senders:
-            try:
-                state.send_q.put_nowait(None)
-            except Exception:
-                pass
-
-        for state in senders:
-            if state.worker and state.worker.is_alive():
-                state.worker.join(timeout=3.0)
-            self._maybe_stop_sender(state)
-
+        # 2. stop tunnel/capture managers before sender teardown
         if self._windivert_manager is not None and self._manage_windivert_lifecycle:
             try:
                 self._windivert_manager.stop()
@@ -16901,8 +16886,30 @@ class HyperVRouterManager:
             except Exception as e:
                 self._log(f"failed to stop WinTunManager: {type(e).__name__}: {e}", ["⚠️", "🧯"])
 
-        self._log("HyperVRouterManager stopped", ["🌙", "🛑"])
+        # 3. then join manager threads
+        for t in (self._hello_thread, self._recv_thread, self._health_thread):
+            if t and t.is_alive():
+                t.join(timeout=3.0)
 
+        # 4. then drain sender workers
+        with self._lock:
+            senders = list(self._senders.values())
+
+        for state in senders:
+            try:
+                state.send_q.put_nowait(None)
+            except Exception:
+                pass
+
+        for state in senders:
+            if state.worker and state.worker.is_alive():
+                state.worker.join(timeout=3.0)
+
+        # 5. only now stop owned backends
+        for state in senders:
+            self._maybe_stop_sender(state)
+
+        self._log("HyperVRouterManager stopped", ["🌙", "🛑"])
     # ---------------------------------------------------------
     # router hot path
     # ---------------------------------------------------------
@@ -17091,16 +17098,13 @@ class HyperVRouterManager:
     def _maybe_stop_sender(self, state: _LocalSender) -> None:
         if not state.started_by_manager:
             return
-        if not callable(state.stop_fn):
+        fn = state.stop_fn
+        if not callable(fn):
             return
         try:
-            state.stop_fn()
+            fn()
         except Exception as e:
-            self._log(
-                f"sender stop for '{state.sender_id}' failed: {type(e).__name__}: {e}",
-                ["⚠️", "🧯"],
-            )
-        state.started_by_manager = False
+            self._log(f"failed stopping sender '{state.sender_id}': {type(e).__name__}: {e}", ["⚠️", "🧯"])
 
     def _enqueue_local(self, state: _LocalSender, raw: bytes) -> bool:
         try:

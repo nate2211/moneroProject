@@ -50,16 +50,32 @@ class CppLogger(QObject):
             self._logger.log_message(formatted_message)
 
 
+
 class HyperVManager:
     """
     Runs HyperVProject.exe as a subprocess and pipes output to the logger.
+
+    Main goals:
+      - no noisy/random exit-code logging on intentional shutdown
+      - idempotent teardown
+      - consistent Windows process-group handling
+      - pipe close before process break/terminate
     """
+
+    _EXPECTED_WINDOWS_EXITS = {
+        0,                  # normal
+        1,                  # some apps use this on manual stop
+        3221225786,         # 0xC000013A STATUS_CONTROL_C_EXIT
+        -1073741510,        # signed form of 0xC000013A
+    }
 
     def __init__(
         self,
         logger: Any,
         exe_name: str = "tools/Linux/HyperVProject/HyperVProject.exe",
-        linux_dir_arg: str = ".",           # passed to the exe, like your CLI example
+        linux_dir_arg: str = ".",
+        stop_timeout_soft: float = 5.0,
+        stop_timeout_hard: float = 3.0,
     ):
         self._logger = CppLogger(logger)
         self._exe_path = self._resolve_exe_path(exe_name)
@@ -68,6 +84,17 @@ class HyperVManager:
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
 
+        self._proc_lock = threading.RLock()
+        self._pipe_lock = threading.RLock()
+        self._pipe_handle = None
+
+        self._stop_timeout_soft = float(stop_timeout_soft)
+        self._stop_timeout_hard = float(stop_timeout_hard)
+
+        self._stopping = False
+        self._started_by_us = False
+        self._suppress_exit_log = False
+        self._last_exit_code: Optional[int] = None
 
         atexit.register(self.teardown)
 
@@ -80,157 +107,230 @@ class HyperVManager:
             base_path = Path(__file__).parent
         return base_path.joinpath(exe_name)
 
+    def _is_expected_exit(self, rc: Optional[int]) -> bool:
+        if rc is None:
+            return False
+        return int(rc) in self._EXPECTED_WINDOWS_EXITS
+
+    def _log_exit(self, rc: Optional[int]) -> None:
+        self._last_exit_code = rc
+        if rc is None:
+            return
+
+        if self._suppress_exit_log or (self._stopping and self._is_expected_exit(rc)):
+            self._logger.log_message(f"[HyperV] Process stopped cleanly (exit={rc}).")
+            return
+
+        if self._stopping:
+            self._logger.log_message(f"[HyperV] Process stopped during teardown (exit={rc}).")
+            return
+
+        self._logger.log_message(f"[HyperV] Process exited unexpectedly with code {rc}.")
+
     def _pump_stdout(self):
-        assert self._proc is not None
-        stream = self._proc.stdout
+        proc = self._proc
+        if proc is None:
+            return
+
+        stream = proc.stdout
         if not stream:
             return
 
-        for line in stream:
-            line = line.rstrip("\r\n")
-            if line:
-                self._logger.log_message(line)
+        try:
+            for line in stream:
+                if line is None:
+                    break
+                line = line.rstrip("\r\n")
+                if line:
+                    self._logger.log_message(line)
+        except Exception as e:
+            if not self._stopping:
+                self._logger.log_message(f"[HyperV] stdout pump error: {e}")
+        finally:
+            rc = None
+            try:
+                rc = proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    rc = proc.poll()
+                except Exception:
+                    rc = None
+            self._log_exit(rc)
 
-        # Wait for real exit code after stream ends
-        rc = self._proc.wait()
-        self._logger.log_message(f"process exited with code {rc}")
+    def _safe_close_stdin(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stdin:
+            return
+        try:
+            proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
 
     # ---------- public API ----------
 
     def start(self) -> bool:
-        if self._proc and self._proc.poll() is None:
-            self._logger.log_message("Process already running.")
-            return True
+        with self._proc_lock:
+            if self._proc and self._proc.poll() is None:
+                self._logger.log_message("[HyperV] Process already running.")
+                return True
 
-        if not self._exe_path.exists():
-            self._logger.log_message(f"Error: executable not found at {self._exe_path}")
-            return False
+            if not self._exe_path.exists():
+                self._logger.log_message(f"[HyperV] Error: executable not found at {self._exe_path}")
+                return False
 
-        try:
-            creationflags = 0
-            if os.name == "nt":
+            self._stopping = False
+            self._suppress_exit_log = False
+            self._last_exit_code = None
 
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                creationflags = 0
+                if os.name == "nt":
+                    creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-            self._proc = subprocess.Popen(
-                [str(self._exe_path), self._linux_dir_arg],
-                cwd=str(self._exe_path.parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,  # line-buffered
-                creationflags=creationflags,
-            )
+                self._proc = subprocess.Popen(
+                    [str(self._exe_path), self._linux_dir_arg],
+                    cwd=str(self._exe_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
+                )
 
-            self._reader_thread = threading.Thread(target=self._pump_stdout, daemon=True)
-            self._reader_thread.start()
+                self._started_by_us = True
+                self._reader_thread = threading.Thread(
+                    target=self._pump_stdout,
+                    name="HyperVStdoutPump",
+                    daemon=True,
+                )
+                self._reader_thread.start()
 
-            self._logger.log_message(f"Started {self._exe_path.name} (pid {self._proc.pid})")
-            return True
+                self._logger.log_message(f"[HyperV] Started {self._exe_path.name} (pid {self._proc.pid})")
+                return True
 
-        except Exception as e:
-            self._logger.log_message(f"Error starting process: {e}")
-            return False
+            except Exception as e:
+                self._proc = None
+                self._reader_thread = None
+                self._logger.log_message(f"[HyperV] Error starting process: {e}")
+                return False
 
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        proc = self._proc
+        return proc is not None and proc.poll() is None
 
     def send_enter(self) -> None:
-        """
-        Signals the app to continue/quit where it waits on std::cin.get().
-        """
-        if not self._proc or not self._proc.stdin:
+        proc = self._proc
+        if not proc or not proc.stdin:
             return
         try:
-            self._proc.stdin.write("\n")
-            self._proc.stdin.flush()
+            proc.stdin.write("\n")
+            proc.stdin.flush()
         except Exception:
             pass
 
+    def close_pipe(self, graceful: bool = True) -> None:
+        import struct
+
+        with self._pipe_lock:
+            h = self._pipe_handle
+            if not h:
+                return
+
+            if graceful:
+                try:
+                    h.write(struct.pack("<I", 0))
+                    h.flush()
+                except Exception:
+                    pass
+
+            try:
+                h.close()
+            except Exception:
+                pass
+            finally:
+                self._pipe_handle = None
+
     def teardown(self) -> None:
+        with self._proc_lock:
+            proc = self._proc
+            if not proc:
+                return
+            if self._stopping:
+                return
+            self._stopping = True
+            self._suppress_exit_log = True
 
         try:
             self.close_pipe(graceful=True)
         except Exception:
             pass
+
         proc = self._proc
         if not proc:
-            self._logger.log_message("Teardown called with no running process.")
             return
 
-        # 1) Gentle: send ENTER to stdin (the exe waits on std::cin.get())
+        # Step 1: let the app exit on its own if it is waiting on std::cin.get()
         self.send_enter()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=self._stop_timeout_soft)
         except Exception:
             pass
 
-        # 2) Ask nicely on Windows: CTRL_BREAK_EVENT to the process group
+        # Step 2: ask the process group nicely
         if proc.poll() is None and os.name == "nt":
             try:
-                os.kill(proc.pid, signal.CTRL_BREAK_EVENT)  # requires CREATE_NEW_PROCESS_GROUP
-                proc.wait(timeout=5)
+                os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=self._stop_timeout_soft)
             except Exception:
                 pass
 
-        # 3) Terminate/kill if still alive
+        # Step 3: terminate, then kill if needed
         if proc.poll() is None:
             try:
                 proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        # Join reader thread
-        if self._reader_thread and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1)
-
-        self._proc = None
-        self._reader_thread = None
-        self._logger.log_message("Successfully tore down the virtual machine and cleaned up.")
-
-    def close_pipe(self, graceful: bool = True) -> None:
-        """
-        Gracefully disconnect from \\\\.\\pipe\\vmrouter_packets and drop the handle.
-        If 'graceful' is True, send a 0-length frame first so the C++ reader
-        exits its loop without error.
-        """
-        import struct
-        if not hasattr(self, "_pipe_lock"):
-            return
-        with self._pipe_lock:
-            h = getattr(self, "_pipe_handle", None)
-            if not h:
-                return
-            if graceful:
-                try:
-                    # Our wire format is <uint32 LE len> + data; len=0 asks server to stop reading.
-                    h.write(struct.pack('<I', 0))
-                    h.flush()
-                except Exception:
-                    pass
-            try:
-                h.close()
+                proc.wait(timeout=self._stop_timeout_hard)
             except Exception:
                 pass
-            self._pipe_handle = None
-    def send_packet(self, packet, connect_timeout: float = 3.0) -> bool:
-        PIPE_NAME = r'\\.\pipe\vmrouter_packets'
 
-        # --- normalize input to raw bytes ---
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=self._stop_timeout_hard)
+            except Exception:
+                pass
+
+        self._safe_close_stdin()
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
+
+        rc = proc.poll()
+        self._log_exit(rc)
+
+        with self._proc_lock:
+            self._proc = None
+            self._reader_thread = None
+            self._stopping = False
+            self._started_by_us = False
+
+        self._logger.log_message("[HyperV] Teardown complete.")
+
+    def send_packet(self, packet, connect_timeout: float = 3.0) -> bool:
+        PIPE_NAME = r"\\.\pipe\vmrouter_packets"
+
         def _to_bytes(obj):
             if obj is None:
                 return None
-
             if isinstance(obj, (bytes, bytearray, memoryview)):
                 return bytes(obj)
-
             if isinstance(obj, str):
                 s = obj.strip().lower()
                 for ch in (" ", ":", "-", "\n", "\r", "\t"):
@@ -241,29 +341,23 @@ class HyperVManager:
                     return bytes.fromhex(s)
                 except ValueError:
                     return None
-
             if isinstance(obj, (list, tuple)):
                 try:
                     return bytes(obj)
                 except Exception:
                     return None
-
             if hasattr(obj, "original"):
                 try:
                     return bytes(obj.original)
                 except Exception:
                     pass
-
             for meth in ("build", "to_bytes"):
                 if hasattr(obj, meth):
                     try:
                         b = getattr(obj, meth)()
-                        if not isinstance(b, (bytes, bytearray, memoryview)):
-                            b = bytes(b)
                         return bytes(b)
                     except Exception:
                         pass
-
             try:
                 return bytes(obj)
             except Exception:
@@ -271,50 +365,34 @@ class HyperVManager:
 
         frame = _to_bytes(packet)
         if not frame:
-            self._logger.log_message("[PYPIPE] Could not normalize packet to bytes")
+            self._logger.log_message("[HyperV][PIPE] Could not normalize packet to bytes")
             return False
 
-        import struct, time
-        payload = struct.pack('<I', len(frame)) + frame
-
-        # Cache a handle/file object across calls
-        if not hasattr(self, "_pipe_handle"):
-            self._pipe_handle = None
-        if not hasattr(self, "_pipe_lock"):
-            import threading
-            self._pipe_lock = threading.Lock()
+        import struct
+        payload = struct.pack("<I", len(frame)) + frame
+        deadline = time.time() + max(0.0, float(connect_timeout))
 
         with self._pipe_lock:
-            deadline = time.time() + max(0.0, connect_timeout)
-
-            # Connect if needed (simple retry loop)
             while self._pipe_handle is None:
                 try:
-                    # Opening a named pipe with built-in open() works once the server is ready
                     self._pipe_handle = open(PIPE_NAME, "wb", buffering=0)
                 except Exception as e:
                     if time.time() >= deadline:
-                        self._logger.log_message(f"[PYPIPE] Could not connect to pipe: {e}")
+                        self._logger.log_message(f"[HyperV][PIPE] Could not connect: {e}")
                         return False
                     time.sleep(0.1)
-                    continue
 
-            # Write the payload
             try:
                 self._pipe_handle.write(payload)
                 self._pipe_handle.flush()
                 return True
             except Exception as e:
-                # Likely broken pipe; drop handle so we reconnect next time
                 try:
-                    if self._pipe_handle:
-                        self._pipe_handle.close()
+                    self._pipe_handle.close()
                 except Exception:
                     pass
-                finally:
-                    self._pipe_handle = None
-
-                self._logger.log_message(f"[PYPIPE] Write failed (handle reset): {e}")
+                self._pipe_handle = None
+                self._logger.log_message(f"[HyperV][PIPE] Write failed, handle reset: {e}")
                 return False
 
 

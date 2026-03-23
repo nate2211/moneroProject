@@ -65,6 +65,7 @@ from p2pool_router_managers_3 import CodeOutputManager
 from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
 
+
 class PythonRouterManager:
 
     """
