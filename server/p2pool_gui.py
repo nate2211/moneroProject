@@ -399,7 +399,9 @@ class P2PoolGUI(QMainWindow):
         use_hostbypass = self.router_tab.use_hostbypass_checkbox.isChecked()
         blocknet_relay = self.router_tab.blocknet_relay_input.text().strip()
         blocknet_token = self.router_tab.blocknet_token_input.text().strip()
-
+        use_gateway = self.router_tab.use_gateway_checkbox.isChecked()
+        use_lan = self.router_tab.use_lan_checkbox.isChecked()
+        use_uplink = self.router_tab.use_uplink_checkbox.isChecked()
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
@@ -420,7 +422,10 @@ class P2PoolGUI(QMainWindow):
                 blocknet_relay=blocknet_relay,
                 blocknet_token=blocknet_token,
                 use_netroute=use_netroute,
-                use_hostbypass=use_hostbypass
+                use_hostbypass=use_hostbypass,
+                use_gateway=use_gateway,
+                use_lan=use_lan,
+                use_uplink=use_uplink,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")

@@ -53,7 +53,8 @@ from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
-    P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager
+    P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, \
+    HyperVRouterManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -179,6 +180,10 @@ class PythonRouterManager:
         self.p2p_manager = None
         self.netroute_manager = None
         self.host_connectivity_boundary = None
+        self.gateway_manager = None
+        self.lan_manager = None
+        self.uplink_manager = None
+        self.hypervrouter_manager = None
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
@@ -1365,6 +1370,20 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
                 except Exception as e:
                     return
+            if self.uplink_manager:
+                self.uplink_manager.observe_packet(packet, inbound_iface)
+            if self.gateway_manager:
+                self.gateway_manager.observe_packet(packet, inbound_iface)
+            if self.lan_manager:
+                self.lan_manager.observe_packet(packet, inbound_iface)
+
+            if self.lan_manager and self.lan_manager.handle_packet(packet, inbound_iface):
+                return
+
+            if self.gateway_manager and self.gateway_manager.handle_packet(packet, inbound_iface):
+                return
+            if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface):
+                return
             if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
                                                                                                         inbound_iface):
                 return
@@ -2193,7 +2212,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink):
         """Configures interfaces and starts all manager threads."""
         try:
             try:
@@ -2219,6 +2238,49 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     recover_after_successes=3,
                 )
                 self.host_connectivity_boundary.start()
+            if use_gateway:
+                self.gateway_manager = GatewayManager(self, DNSManager)
+                self.gateway_manager.configure(
+                    auto_configure_router_interfaces=False,
+                    use_dhcp_out=use_dhcp_out,
+                    use_dhcp_in=use_dhcp_in,
+                    router_ip_out=router_ip_out,
+                    router_netmask_out=netmask_out,
+                    force_wan_to_dhcp_on_start=False,
+                    ensure_host_dns_from_wan=True,
+                    repair_on_failure=True,
+                    pin_gateway_arp=True,
+                    runtime_set_wan_to_dhcp=False,
+                    disable_netroute_default_sync=True,
+                    disable_netroute_metric_tuning=True,
+                )
+                self.gateway_manager.start()
+            if use_lan:
+                self.lan_manager = LanManager(self, DHCPServer, gateway_manager=self.gateway_manager)
+                self.lan_manager.configure(
+                    bridge_name="ManagedLANBridge",
+                    create_bridge=True,
+                    serve_on_all_lan_ifaces=False,
+                    authoritative=True,
+                    rogue_policy="nak_on_mismatch",
+                    enforce_same_subnet=True,
+                    allow_out_of_pool=False,
+                    start_transport_dhcp_client=True,
+                    handle_icmp=True,
+                )
+                self.lan_manager.start()
+            if use_uplink:
+                self.uplink_manager = UplinkManager(self, gateway_manager=self.gateway_manager)
+                self.uplink_manager.configure(
+                    health_interval_sec=15.0,
+                    preferred_iface_names=["Wi-Fi"],
+                    allow_router_failover=True,
+                    preserve_wifi_link=True,
+                    disable_netroute_default_sync=True,
+                    disable_netroute_metric_tuning=True,
+                    remove_public_host_routes=True,
+                )
+                self.uplink_manager.start()
             self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
             self.stratum_connection_manager = StratumConnectionManager(
                 self.code_output_manager,
@@ -2375,9 +2437,39 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             start_cpu_boost(threads=len(pcores), target_util=0.75, cores=pcores, pin_per_thread=True, unhinge=True)
             if use_hyperv:
+                # after creating managers
+                self.hypervrouter_manager = HyperVRouterManager(self.router_logger)
+
+                self.hypervrouter_manager.configure(
+                    segment_id="main-lan",
+                    bind_ip=self.router_ip_out or "0.0.0.0",
+                )
+
+                self.hypervrouter_manager.register_hyperv_backend(
+                    "hyperv-main",
+                    self.hyperv_manager,
+                    start_backend=False,
+                )
+
+                self.hypervrouter_manager.attach_wintun_manager(
+                    self.wintun_manager,
+                    start_manager=False,
+                    expose_as_sender=False,  # set True only if you have a real wintun send callable
+                )
+
+                self.hypervrouter_manager.attach_windivert_manager(
+                    self.windivert_manager,
+                    start_manager=False,
+                    expose_as_sender=False,  # set True only if you have a real windivert reinject callable
+                )
+
+                if self.host_connectivity_boundary:
+                    self.hypervrouter_manager.attach_hostboundary_manager(self.host_connectivity_boundary)
+
                 self.hyperv_manager.start()
                 self.windivert_manager.start()
                 self.wintun_manager.start()
+                self.hypervrouter_manager.start()
                 self.hyperv_enabled = True
             else:
                 self.hyperv_enabled = False
@@ -2418,6 +2510,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     self.netroute_manager.stop()
             if self.host_connectivity_boundary:
                 self.host_connectivity_boundary.stop()
+            if self.lan_manager:
+                self.lan_manager.stop()
+                self.lan_manager = None
+
+            if self.gateway_manager:
+                self.gateway_manager.stop()
+                self.gateway_manager = None
+            if self.uplink_manager:
+                self.uplink_manager.stop()
+                self.uplink_manager = None
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")
@@ -2441,6 +2543,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.syn_scanner.stop()
             self.cleanup_all_network_changes()
             if use_hyperv:
+                self.hypervrouter_manager.start()
                 self.windivert_manager.stop()
                 self.wintun_manager.stop()
                 self.hyperv_manager.teardown()
@@ -3532,6 +3635,7 @@ class WiresharkManager:
         self.vpn_interface_id = None
         self.min_packet_len = 60
         self.router_manager = None
+
 
 
     def _initialize_geoip(self):

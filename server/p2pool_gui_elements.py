@@ -1772,6 +1772,13 @@ class RouterTab(QWidget):
         self.use_hostbypass_checkbox.setChecked(False)
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(False)
+        self.use_gateway_checkbox = QCheckBox("Use Gateway Manager")
+        self.use_gateway_checkbox.setChecked(False)
+        self.use_lan_checkbox = QCheckBox("Use Lan Manager")
+        self.use_lan_checkbox.setChecked(False)
+        self.use_uplink_checkbox = QCheckBox("Use Uplink Manager")
+        self.use_uplink_checkbox.setChecked(False)
+
 
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
@@ -1822,6 +1829,8 @@ class RouterTab(QWidget):
         routing_form.addRow(self.dhcp_out_checkbox, self.dhcp_in_checkbox)
         routing_form.addRow(self.use_static_checkbox, self.use_hyperv_checkbox)
         routing_form.addRow(self.use_netroute_checkbox, self.use_hostbypass_checkbox)
+        routing_form.addRow(self.use_gateway_checkbox, self.use_lan_checkbox)
+        routing_form.addRow(self.use_uplink_checkbox)
         routing_form.addRow(QLabel("Manual LAN IP:"), self.router_ip_out_input)
         routing_form.addRow(QLabel("Netmask:"), self.router_netmask_out_input)
 
