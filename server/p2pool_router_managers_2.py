@@ -6351,6 +6351,10 @@ class NATManager:
 
 
 
+
+
+
+
 class DNSManager:
     """
     Manages DNS proxying with high stability and optional IPv6 synthesis (DNS64).
@@ -6992,6 +6996,7 @@ class DNSManager:
         return False
 
 
+
 class NDPManager:
     """
     Manages IPv6 Neighbor Discovery Protocol (NDP) resolution, caching, and
@@ -7155,8 +7160,6 @@ class NDPManager:
             if not existing_entry or existing_entry[0] != src_mac:
                 self.router_logger.log_message(f"[NDP] 🧠 Passively learned: {src_ip} is-at {src_mac} on {iface.split('_')[-1]}")
                 self._ndp_cache[src_ip] = (src_mac, now)
-
-
 
 
 class ARPManager:
@@ -8487,6 +8490,7 @@ class ARPManager:
         with self._arp_cache_lock:
             self._arp_cache.clear()
         self.router_logger.log_message("[ARP] 🧹 ARP cache cleared.")
+
 
 class DHCPServer:
     """

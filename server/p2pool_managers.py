@@ -2295,8 +2295,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.arp_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ipv4_out = self.router_ip_out
-            self.nat_manager = NATManager(self.router_logger, self.sendback_manager, self.router_ip_out, self.packet_writer, self._interfaces_config, self.rip_manager.find_route, self.arp_manager.resolve, self.function_call_tracker)
-            self.nat_manager.set_router_internal_ip("192.168.1.1")
+            self.nat_manager = NATManager(
+                router_logger=self.router_logger,
+                sendback_manager=self.sendback_manager,
+                router_public_ip=self.router_ip_out,  # OUT/WAN-side IP
+                packet_writer=self.packet_writer,
+                interfaces_config=self._interfaces_config,  # full interface map built in _auto_configure_interfaces
+                rip_manager_find_route=self.rip_manager.find_route,
+                arp_manager_resolve=self.arp_manager.resolve,
+                function_call_tracker=self.function_call_tracker,
+            )
+            self.nat_manager.set_router_internal_ip(self.router_ip_in)
             self.notification_manager = NotificationManager(
                 self.router_logger,
                 self.NOTIFICATION_TARGET_IP,
