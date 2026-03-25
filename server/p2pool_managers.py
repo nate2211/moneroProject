@@ -2216,6 +2216,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
     def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os):
         """Configures interfaces and starts all manager threads."""
         try:
+            if self.started:
+                self.router_logger.log_message("[Router] Start requested while already running; ignoring.")
+                return
+            self.started = True
             try:
                 self._initialize_interface_discovery()
                 if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
@@ -2239,6 +2243,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     recover_after_successes=3,
                 )
                 self.host_connectivity_boundary.start()
+            self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
+            self.dns_manager.router_ip_out = self.router_ip_out
+            self.dns_manager.router_ipv4_out = self.router_ip_out
             if use_gateway:
                 self.gateway_manager = GatewayManager(self, DNSManager)
                 self.gateway_manager.configure(
@@ -2288,15 +2295,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.router_logger,
                 self.stratum_manager,
             )
-            self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
+            self.arp_manager.router_ip_out = self.router_ip_out
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
             if nat_os:
                 self._enable_nat_forwarding()
-            self.arp_manager.router_ip_out = self.router_ip_out
-            self.dns_manager.router_ip_out = self.router_ip_out
-            self.dns_manager.router_ipv4_out = self.router_ip_out
+
             self.nat_manager = NATManager(
                 router_logger=self.router_logger,
                 sendback_manager=self.sendback_manager,
@@ -2392,17 +2397,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                                                           "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
                                                           "PythonProxy")
                     self.stratum_connection_manager.start()
-            if use_peer_to_peer:  # Or however you pass the flag
-                # Use the IN network broadcast address if available, else generic
-                broadcast_ip = str(
-                    self.router_network_in.broadcast_address) if self.router_network_in else "255.255.255.255"
+            if use_peer_to_peer:
+                broadcast_ip = "255.255.255.255"
+                if self.router_network_out:
+                    broadcast_ip = str(self.router_network_out.broadcast_address)
 
                 self.p2p_manager = P2PPeerManager(
                     router_logger=self.router_logger,
-                    router_ip=self.router_ip_in,
+                    router_ip=self.router_ip_out,
                     broadcast_ip=broadcast_ip,
                     sniffer=self.sniffer,
-                    out_iface=self.interface_in_full_name,
+                    out_iface=self.interface_out_full_name,
                 )
                 self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
                 self.p2p_manager.start()
@@ -2482,6 +2487,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.wintun_manager.start()
                 self.hypervrouter_manager.start()
                 self.hyperv_enabled = True
+                self.parallel_python.increase_ram_usage(1500)
             else:
                 self.hyperv_enabled = False
             self.started = True

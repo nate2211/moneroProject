@@ -16787,54 +16787,87 @@ class TransportManager:
         """Handles and logs details for QUIC packets."""
         self.transport_quic.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    # p2pool_router_managers.py
+
+    def _raw_payload_or_empty(self, packet) -> bytes:
+        try:
+            if packet is None:
+                return b""
+            if hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                raw_layer = packet[Raw]
+                load = getattr(raw_layer, "load", b"")
+                return bytes(load) if load else b""
+        except Exception:
+            return b""
+        return b""
+
     def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for NTP packets."""
-        raw_data = bytes(packet[Raw].load)
-        if len(raw_data) >= 48:
-            try:
-                first_byte = raw_data[0]
-                li = (first_byte >> 6) & 0x03
-                vn = (first_byte >> 3) & 0x07
-                mode = first_byte & 0x07
-                stratum = raw_data[1]
-                mode_str = {1: "Symmetric Active", 2: "Symmetric Passive", 3: "Client",
-                            4: "Server", 5: "Broadcast"}.get(mode, "Unknown")
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][🕰️ NTP] NTP packet from {src_ip}:{sport} | "
-                    f"Mode: {mode_str} | Version: {vn} | Stratum: {stratum}"
-                )
-            except IndexError:
-                self.logger.log_message(
-                    f"[Transport][🚀 UDP][🕰️ NTP] Malformed NTP packet from {src_ip}:{sport}"
-                )
+        """Handles and logs details for NTP packets safely."""
+        raw_data = self._raw_payload_or_empty(packet)
+        if len(raw_data) < 48:
+            return False
+
+        try:
+            first_byte = raw_data[0]
+            li = (first_byte >> 6) & 0x03
+            vn = (first_byte >> 3) & 0x07
+            mode = first_byte & 0x07
+            stratum = raw_data[1]
+            mode_str = {
+                1: "Symmetric Active",
+                2: "Symmetric Passive",
+                3: "Client",
+                4: "Server",
+                5: "Broadcast",
+            }.get(mode, "Unknown")
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🕰️ NTP] NTP packet from {src_ip}:{sport} | "
+                f"Mode: {mode_str} | Version: {vn} | Stratum: {stratum}"
+            )
+            return True
+        except Exception as e:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][🕰️ NTP] Malformed NTP packet from {src_ip}:{sport}: {e}"
+            )
+            return False
 
     def _handle_tftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for TFTP packets."""
-        raw_data = bytes(packet[Raw].load)
-        if len(raw_data) >= 2:
-            try:
-                opcode = struct.unpack("!H", raw_data[0:2])[0]
-                opcode_str = {1: "RRQ (Read Request)", 2: "WRQ (Write Request)",
-                              3: "DATA", 4: "ACK", 5: "ERROR"}.get(opcode, "Unknown")
-                if opcode == 3 or opcode == 4:
-                    if len(raw_data) >= 4:
-                        block_number = struct.unpack("!H", raw_data[2:4])[0]
-                        self.logger.log_message(
-                            f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport} | "
-                            f"Block #: {block_number}"
-                        )
-                    else:
-                        self.logger.log_message(
-                            f"[Transport][🚀 UDP][📄 TFTP] Malformed {opcode_str} packet from {src_ip}:{sport}"
-                        )
+        """Handles and logs details for TFTP packets safely."""
+        raw_data = self._raw_payload_or_empty(packet)
+        if len(raw_data) < 2:
+            return False
+
+        try:
+            opcode = struct.unpack("!H", raw_data[0:2])[0]
+            opcode_str = {
+                1: "RRQ (Read Request)",
+                2: "WRQ (Write Request)",
+                3: "DATA",
+                4: "ACK",
+                5: "ERROR",
+            }.get(opcode, "Unknown")
+
+            if opcode in (3, 4):
+                if len(raw_data) >= 4:
+                    block_number = struct.unpack("!H", raw_data[2:4])[0]
+                    self.logger.log_message(
+                        f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport} | "
+                        f"Block #: {block_number}"
+                    )
                 else:
                     self.logger.log_message(
-                        f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport}"
+                        f"[Transport][🚀 UDP][📄 TFTP] Malformed {opcode_str} packet from {src_ip}:{sport}"
                     )
-            except (struct.error, IndexError):
+            else:
                 self.logger.log_message(
-                    f"[Transport][🚀 UDP][📄 TFTP] Malformed TFTP packet from {src_ip}:{sport}"
+                    f"[Transport][🚀 UDP][📄 TFTP] {opcode_str} from {src_ip}:{sport} to {dst_ip}:{dport}"
                 )
+            return True
+        except Exception as e:
+            self.logger.log_message(
+                f"[Transport][🚀 UDP][📄 TFTP] Malformed TFTP packet from {src_ip}:{sport}: {e}"
+            )
+            return False
 
     def _handle_sip_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         """Handles and logs details for SIP packets."""
@@ -19086,16 +19119,31 @@ class SYNScanner:
             if not iface_name:
                 continue
 
-            if "loopback" in iface_name.lower() or iface_name.lower() == "lo":
+            low = iface_name.lower()
+            if "loopback" in low or low == "lo":
                 continue
 
-            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4") or cfg.get("ipv6")
+            # Exclude noisy / virtual / bridge-style interfaces by default
+            if any(tag in low for tag in (
+                    "windivert", "wintun", "hyper-v", "hyperv", "vethernet",
+                    "tunnel", "npcap", "tap", "bridge", "virtual", "vmware",
+                    "virtualbox", "local area connection*"
+            )):
+                continue
+
+            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4")
             if not ip:
                 continue
 
             try:
-                ipaddress.ip_address(str(ip))
+                ip_obj = ipaddress.ip_address(str(ip))
             except Exception:
+                continue
+
+            # Only stable IPv4 interfaces for external scanning
+            if ip_obj.version != 4:
+                continue
+            if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
                 continue
 
             if iface_name not in seen:
@@ -19103,7 +19151,7 @@ class SYNScanner:
                 self._scannable_interfaces.append(iface_name)
 
         self.router_logger.log_message(
-            f"[SYNScanner] Found {len(self._scannable_interfaces)} scannable interfaces."
+            f"[SYNScanner] Found {len(self._scannable_interfaces)} stable scannable interfaces."
         )
 
     def start(self):
@@ -19135,6 +19183,31 @@ class SYNScanner:
 
         self.router_logger.log_message("[SYNScanner] Thread stopped.")
 
+    def _choose_iface_for_cycle(self) -> str:
+        usable = [i for i in self._scannable_interfaces if self._iface_has_ip(i)]
+        if not usable:
+            return random.choice(self._scannable_interfaces)
+
+        # Prefer interfaces with a real non-link-local IPv4
+        scored = []
+        for iface in usable:
+            cfg = (self.interfaces_config or {}).get(iface) or {}
+            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4")
+            score = 0
+            try:
+                ip_obj = ipaddress.ip_address(str(ip))
+                if ip_obj.version == 4:
+                    score += 10
+                if not ip_obj.is_link_local:
+                    score += 10
+                if not ip_obj.is_private:
+                    score += 2
+            except Exception:
+                pass
+            scored.append((score, iface))
+
+        scored.sort(reverse=True)
+        return scored[0][1]
     # ---------------- main loop ----------------
 
     def _run_scan_loop(self):
@@ -19150,10 +19223,6 @@ class SYNScanner:
                     self._stop_event.wait(self.scan_interval)
                     continue
 
-                iface = self._choose_iface_for_cycle()
-                iface_short = iface.split("_")[-1] if iface else "unknown"
-                self.router_logger.log_message(f"[SYNScanner] Commencing scan cycle using {iface_short}")
-
                 cycle_had_success = False
 
                 for target_ip, ports in list(self.scan_targets or []):
@@ -19164,10 +19233,15 @@ class SYNScanner:
                         self.router_logger.log_message(f"[SYNScanner] Skipping invalid target IP: {target_ip}")
                         continue
 
-                    if not ports:
+                    iface = self._choose_iface_for_target(target_ip)
+                    if not iface:
+                        self.router_logger.log_message(f"[SYNScanner] No usable iface for target {target_ip}")
                         continue
 
-                    for port in list(ports):
+                    iface_short = iface.split("_")[-1] if iface else "unknown"
+                    self.router_logger.log_message(f"[SYNScanner] Scanning {target_ip} using {iface_short}")
+
+                    for port in list(ports or []):
                         if self._stop_event.is_set():
                             break
 
@@ -19178,19 +19252,13 @@ class SYNScanner:
                         if self._is_backed_off(target_ip, port):
                             continue
 
-                        # Re-evaluate route/interface family sanity before each probe
-                        if not self._iface_usable_for_target(iface, target_ip):
-                            alt_iface = self._find_better_iface_for_target(target_ip)
-                            if alt_iface:
-                                iface = alt_iface
-                                iface_short = iface.split("_")[-1] if iface else "unknown"
-
                         status, banner = self._scan_one(target_ip, port, iface)
 
                         if status.startswith("OPEN"):
                             cycle_had_success = True
                             self._connect_fail_counts[(target_ip, port)] = 0
-                        elif status == "ERROR":
+                        elif status in ("ERROR", "FILTERED (timeout)", "FILTERED (unreachable)",
+                                        "FILTERED (no response)"):
                             self._bump_backoff(target_ip, port)
 
                         self._log_probe_result(target_ip, port, iface_short, status, banner)
@@ -19218,42 +19286,32 @@ class SYNScanner:
     # ---------------- scanning primitives ----------------
 
     def _scan_one(self, ip: str, port: int, iface: str, timeout: float = 2.0) -> Tuple[str, Optional[str]]:
-        """
-        Returns ('OPEN'|'CLOSED'|'FILTERED'|'ERROR'|...), banner_or_None.
-
-        Strategy:
-          • If port is banner-friendly → do a real connect() probe first
-          • Else → do a lightweight routed SYN probe
-          • On connect() failure, fall back to SYN to refine CLOSED vs FILTERED
-        """
         if self._stop_event.is_set():
             return "STOPPED", None
 
         if not self._is_valid_ip_literal(ip) or not self._is_valid_port(port):
             return "ERROR", None
 
-        # Banner/TLS path first for meaningful services
         if self._is_banner_port(port):
             status, banner = self._banner_probe(ip, port, iface, timeout=timeout)
             if status not in ("ERROR", "CLOSED"):
                 return status, banner
 
-        # Conservative L3 SYN path
         try:
+            sport = self._pick_safe_sport()
             pkt = IP(dst=ip) / TCP(
                 dport=int(port),
                 flags="S",
-                sport=self._pick_safe_sport(),
+                sport=sport,
                 seq=random.randint(0, 0xFFFFFFFF),
                 window=8192,
             )
 
-            # Avoid forcing bad interface behavior unless the iface is clearly usable
+            # Prefer OS routing. Only pin iface if clearly usable.
             sr1_kwargs = {
                 "timeout": timeout,
                 "verbose": 0,
             }
-
             if self._iface_usable_for_target(iface, ip):
                 sr1_kwargs["iface"] = iface
 
@@ -19266,12 +19324,11 @@ class SYNScanner:
                 tcp = resp.getlayer(TCP)
                 flags = int(getattr(tcp, "flags", 0))
 
-                if flags & 0x12:  # SYN+ACK
-                    # Politely send RST to avoid half-open accumulation
-                    self._best_effort_reset(ip, port, iface, resp)
+                if flags & 0x12:
+                    self._best_effort_reset(ip, port, iface, resp, sport)
                     return "OPEN", None
 
-                if flags & 0x04:  # RST
+                if flags & 0x04:
                     return "CLOSED", None
 
                 return f"UNEXPECTED_TCP_FLAGS ({hex(flags)})", None
@@ -19485,20 +19542,29 @@ class SYNScanner:
             self.router_logger.log_message(f"[SYNScanner] Note: {ip}:{port} status={status}")
 
     # ---------------- added helpers only ----------------
+    def _choose_iface_for_target(self, target_ip: str) -> Optional[str]:
+        # First try an interface with matching address family and a real usable IP
+        best = self._find_better_iface_for_target(target_ip)
+        if best:
+            return best
 
-    def _choose_iface_for_cycle(self) -> str:
-        usable = [i for i in self._scannable_interfaces if self._iface_has_ip(i)]
-        if usable:
-            return random.choice(usable)
-        return random.choice(self._scannable_interfaces)
+        # Fall back to cycle choice
+        if self._scannable_interfaces:
+            return self._choose_iface_for_cycle()
+
+        return None
 
     def _iface_has_ip(self, iface: str) -> bool:
         try:
             cfg = (self.interfaces_config or {}).get(iface) or {}
-            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4") or cfg.get("ipv6")
+            ip = cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4")
             if not ip:
                 return False
-            ipaddress.ip_address(str(ip))
+            ip_obj = ipaddress.ip_address(str(ip))
+            if ip_obj.version != 4:
+                return False
+            if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
+                return False
             return True
         except Exception:
             return False
@@ -19542,12 +19608,12 @@ class SYNScanner:
         # avoid well-known ports and keep away from low privileged ranges
         return random.randint(40000, 60000)
 
-    def _best_effort_reset(self, ip: str, port: int, iface: str, resp) -> None:
+    def _best_effort_reset(self, ip: str, port: int, iface: str, resp, sport: int) -> None:
         try:
             ack_val = int(resp[TCP].seq) + 1 if resp.haslayer(TCP) else 0
             rst = IP(dst=ip) / TCP(
                 dport=int(port),
-                sport=self._pick_safe_sport(),
+                sport=int(sport),
                 flags="R",
                 seq=0,
                 ack=ack_val,
