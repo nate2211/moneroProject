@@ -483,7 +483,11 @@ class P2PoolGUI(QMainWindow):
     def closeEvent(self, event):
         """Ensures all worker threads are cleanly shut down on application exit."""
         self.gui_logger.log_message("[GUI] Closing. Signaling all services to shut down...")
-
+        try:
+            if getattr(self, "router_tab", None):
+                self.router_tab.shutdown_logging()
+        except Exception:
+            pass
         # 1. Signal the main application's async loop to stop
         if self.main_worker_stop_event:
             self.main_worker_stop_event.set()

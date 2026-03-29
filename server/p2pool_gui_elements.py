@@ -7,7 +7,7 @@ import queue
 import threading
 import asyncio
 from urllib.parse import urljoin, urlparse, quote_plus, parse_qs
-
+from collections import defaultdict, deque
 import requests
 from PyQt5.QtGui import QTextCursor, QIcon, QPixmap
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
@@ -1595,6 +1595,7 @@ class P2PoolTab(QWidget):
 
         self.console_log = QPlainTextEdit()
         self.console_log.setReadOnly(True)
+        self.console_log.setMaximumBlockCount(25000)
 
     def _configure_layout(self):
         layout = QVBoxLayout(self)
@@ -1695,6 +1696,7 @@ class WiresharkTab(QWidget):
 
         self.wireshark_log = QPlainTextEdit()
         self.wireshark_log.setReadOnly(True)
+        self.wireshark_log.setMaximumBlockCount(10000)
 
     def _configure_layout(self):
         """Sets up the layout for the tab."""
@@ -1717,6 +1719,8 @@ class WiresharkTab(QWidget):
 
 
 class RouterTab(QWidget):
+    _PREFIX_RE = re.compile(r"\[([^\[\]]{1,64})\]")
+
     def __init__(self, logger, parent=None):
         super().__init__(parent)
         self.router_logger = logger
@@ -1737,11 +1741,30 @@ class RouterTab(QWidget):
             self._norm("C++"): "C++",
         }
 
+        # -------- safe logging state --------
+        self._log_queue = deque()
+        self._max_log_queue = 8000
+        self._flush_batch_size = 250
+        self._logging_shutdown = False
+        self._flush_in_progress = False
+        self._dropping_logs = False
+
         self._create_widgets()
         self._configure_layout()
         self._connect_signals()
 
-        self.router_logger.message_signal.connect(self.log_message)
+        if "General" not in self._console_panes:
+            self._add_console_pane("General")
+
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setInterval(50)
+        self._log_flush_timer.timeout.connect(self._flush_log_queue)
+        self._log_flush_timer.start()
+
+        self.router_logger.message_signal.connect(
+            self.log_message,
+            Qt.ConnectionType.QueuedConnection
+        )
 
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
@@ -1937,6 +1960,8 @@ class RouterTab(QWidget):
         if name not in self._console_panes:
             console = QPlainTextEdit()
             console.setReadOnly(True)
+            console.setCenterOnScroll(False)  # important
+            console.document().setMaximumBlockCount(10000 if name == "C++" else 3000)
             self.console_tabs.addTab(console, name)
             self._console_panes[name] = console
             self._rebuild_pane_index()
@@ -1944,7 +1969,10 @@ class RouterTab(QWidget):
     def _remove_console_pane(self, name: str):
         if name in self._console_panes and name != "General":
             index = self.console_tabs.indexOf(self._console_panes[name])
-            self.console_tabs.removeTab(index)
+            if index >= 0:
+                widget = self._console_panes[name]
+                self.console_tabs.removeTab(index)
+                widget.deleteLater()
             del self._console_panes[name]
             self._rebuild_pane_index()
 
@@ -1952,18 +1980,18 @@ class RouterTab(QWidget):
         name = self.add_pane_input.text().strip()
         if name:
             self._add_console_pane(name)
-            self._log("General", f"[UI] Added pane: {name}")
+            self._append_batch_to_pane("General", [f"[UI] Added pane: {name}"])
             self.add_pane_input.clear()
 
     def _on_remove_pane(self):
         name = self.add_pane_input.text().strip()
         if name:
             self._remove_console_pane(name)
-            self._log("General", f"[UI] Removed pane: {name}")
+            self._append_batch_to_pane("General", [f"[UI] Removed pane: {name}"])
             self.add_pane_input.clear()
 
     def _norm(self, s: str) -> str:
-        return "".join(s.split()).casefold()
+        return "".join(str(s).split()).casefold()
 
     def _rebuild_pane_index(self):
         idx = {}
@@ -1973,35 +2001,144 @@ class RouterTab(QWidget):
                 idx.setdefault(n, []).append((pane_key, depth))
         self._pane_index = idx
 
-    @pyqtSlot(str)
-    def log_message(self, message: str):
-        prefixes = [self._norm(p) for p in re.findall(r"\[(.*?)\]", message)]
+    def _extract_prefixes_fast(self, message: str):
+        try:
+            return [self._norm(p) for p in self._PREFIX_RE.findall(message)]
+        except Exception:
+            return []
+
+    def _route_message_to_pane(self, message: str) -> str:
+        prefixes = self._extract_prefixes_fast(message)
 
         for sprefix in reversed(prefixes):
             pane = self._hot_prefix_to_pane.get(sprefix)
             if pane:
-                self._log(pane, message)
-                return
-
-        if not hasattr(self, "_pane_index"):
-            self._rebuild_pane_index()
+                return pane
 
         for sprefix in reversed(prefixes):
             hits = self._pane_index.get(sprefix)
             if hits:
-                target_pane = max(hits, key=lambda x: x[1])[0]
-                self._log(target_pane, message)
+                try:
+                    return max(hits, key=lambda x: x[1])[0]
+                except Exception:
+                    return hits[0][0]
+
+        return "General"
+
+
+    def _append_batch_to_pane(self, category: str, messages: list[str]):
+        if self._logging_shutdown or not messages:
+            return
+
+        pane = self._console_panes.get(category)
+        if pane is None:
+            pane = self._console_panes.get("General")
+            if pane is None:
                 return
 
-        self._log("General", message)
+        text = "\n".join(messages)
+        if not text:
+            return
 
-    def _log(self, category: str, message: str):
-        if category in self._console_panes:
-            self._console_panes[category].appendPlainText(message)
+        try:
+            scrollbar = pane.verticalScrollBar()
+            old_value = scrollbar.value()
+            old_max = scrollbar.maximum()
+
+            # only auto-scroll if the user was already basically at the bottom
+            bottom_threshold = 4
+            was_at_bottom = old_value >= max(0, old_max - bottom_threshold)
+
+            # append without hijacking the visible cursor/selection
+            cursor = QTextCursor(pane.document())
+            cursor.movePosition(QTextCursor.End)
+
+            if not pane.document().isEmpty():
+                cursor.insertText("\n")
+
+            cursor.insertText(text)
+
+            if was_at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+            else:
+                # keep the user's current reading position
+                scrollbar.setValue(min(old_value, scrollbar.maximum()))
+
+        except RuntimeError:
+            self._logging_shutdown = True
+
+    @pyqtSlot(str)
+    def log_message(self, message: str):
+        if self._logging_shutdown:
+            return
+
+        try:
+            msg = str(message).rstrip()
+        except Exception:
+            return
+
+        if not msg:
+            return
+
+        if len(msg) > 8000:
+            msg = msg[:8000] + " ... [truncated]"
+
+        if len(self._log_queue) >= self._max_log_queue:
+            try:
+                self._log_queue.popleft()
+            except Exception:
+                pass
+
+            if not self._dropping_logs:
+                self._dropping_logs = True
+                self._log_queue.append("[RouterTab] ⚠️ Log queue overflow; dropping oldest messages.")
         else:
-            if "General" not in self._console_panes:
-                self._add_console_pane("General")
-            self._console_panes["General"].appendPlainText(message)
+            self._dropping_logs = False
+
+        self._log_queue.append(msg)
+
+    @pyqtSlot()
+    def _flush_log_queue(self):
+        if self._logging_shutdown:
+            self._log_queue.clear()
+            return
+
+        if self._flush_in_progress:
+            return
+
+        self._flush_in_progress = True
+        try:
+            per_pane = defaultdict(list)
+            processed = 0
+
+            while self._log_queue and processed < self._flush_batch_size:
+                message = self._log_queue.popleft()
+                pane_name = self._route_message_to_pane(message)
+                per_pane[pane_name].append(message)
+                processed += 1
+
+            for pane_name, messages in per_pane.items():
+                self._append_batch_to_pane(pane_name, messages)
+
+        finally:
+            self._flush_in_progress = False
+
+    def shutdown_logging(self):
+        self._logging_shutdown = True
+
+        try:
+            if self._log_flush_timer.isActive():
+                self._log_flush_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            self.router_logger.message_signal.disconnect(self.log_message)
+        except Exception:
+            pass
+
+        self._log_queue.clear()
+
 
 
 

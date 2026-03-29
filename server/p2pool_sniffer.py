@@ -212,10 +212,11 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
-    def __init__(self, arp_manager, rip_manager, lag_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
+    def __init__(self, arp_manager, rip_manager, lag_manager, outbound_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
         self.lag_manager = lag_manager
+        self.outbound_manager = outbound_manager
         self._interfaces_config = _interfaces_config
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
@@ -1465,7 +1466,7 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface.encode(), 65535, 1, 100, errbuf)
         if not handle:
-            iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+            iface_out = self.outbound_manager.get_next_interface(packet)
             handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, 100, errbuf)
             if not handle:
                 self.logger.log_message(f"Sendp error on '{iface}': {errbuf.value.decode(errors='ignore')}")
@@ -1515,7 +1516,7 @@ class SnifferSoftware:
             iface_cidr = self._ipv4_cidr_for_iface(iface_out)
             if not iface_cidr:
                 verbose = 1
-                iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+                iface_out = self.outbound_manager.get_next_interface(packet)
                 iface_cidr = self._ipv4_cidr_for_iface(iface_out)
                 if not iface_cidr:
                     self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
@@ -1599,7 +1600,7 @@ class SnifferSoftware:
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
         if not handle:
-            iface_out = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+            iface_out = self.outbound_manager.get_next_interface(packet)
             handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
             if not handle:
                 self.logger.log_message(

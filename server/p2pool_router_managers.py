@@ -16256,39 +16256,43 @@ class TransportUndecodedManager:
         return {"flows": out, "cooldowns": len(self._cooldown_until)}
 class TransportManager:
     """
-    Manages the processing and logging of Transport Layer packets (TCP, UDP, etc.).
-    This version supports a wide variety of protocols including DNS, DHCP, NTP, TFTP,
-    VoIP (SIP/RTP), QUIC, ZeroTier/SSDP, and dynamic ports.
+    Safer TransportManager for Hyper-V / WinDivert / WinTun environments.
 
-    TLS dissection is performed passively by TLSRecordManager using TCP Raw bytes.
+    Main safety changes:
+      - never pass live Scapy Packet objects into ParallelPython
+      - freeze inbound packets to immutable bytes immediately
+      - main TCP/UDP dispatch runs locally on the caller thread
+      - only optional analysis wrappers use ParallelPython, and they receive bytes
+      - serialize main dispatch paths to reduce cross-thread packet-writer races
     """
 
     def __init__(self, router_logger, packet_signer, code_output_manager, parallel_python, packet_writer):
-        """
-        Initializes the TransportManager with a logger and a packet signer.
-        """
-
-
         self.logger = router_logger
         self.parallel_python = parallel_python
         self.code_output_manager = code_output_manager
         self.sniffer = None
         self.packet_signer = packet_signer
-        self.logger.log_message("[Transport] Manager initialized.")
+        self.packet_writer = packet_writer
+
+        self.logger.log_message("[Transport] Manager initialized (safe Hyper-V mode).")
+
         self.voip_port_range = range(10000, 20001)
         self.logged_quic_streams = {}
         self.QUIC_STREAM_TIMEOUT = 300
         self.last_quic_cleanup_time = time.time()
+
+        # Safety controls
+        self._dispatch_lock = threading.RLock()
+        self._tls_lock = threading.RLock()
+        self._analysis_parallel_enabled = hasattr(self.parallel_python, "run_parallel")
 
         # TLS record manager + callbacks
         self.tls_manager = TLSRecordManager(self.logger)
         self._wire_tls_callbacks()
 
         # Minimal initiator tracker to set c2s/s2c directions reliably
-        # key -> (client_ip, client_port)
-        self._initiators: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Tuple[str,int]] = {}
+        self._initiators: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int]] = {}
 
-        # Alert/Description maps for prettier logs (optional)
         self.TLS_ALERT_LEVEL = {1: "warning", 2: "fatal"}
         self.TLS_ALERT_DESCRIPTION = {
             0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
@@ -16298,7 +16302,7 @@ class TransportManager:
             51: "decrypt_error", 70: "protocol_version", 71: "insufficient_security",
             80: "internal_error", 90: "user_canceled", 112: "unrecognized_name"
         }
-        self.packet_writer = packet_writer
+
         self.transport_dhcp = TransportDHCPManager(self.logger)
         self.transport_dhcp6 = TransportDHCP6Manager(self.logger)
         self.transport_dns = TransportDNSManager(self.logger)
@@ -16328,23 +16332,13 @@ class TransportManager:
         self.transport_scraper = TransportScraperManager(self.logger)
         self.transport_llmnr = TransportLLMNRManager(self.logger)
         self.transport_undecoded = TransportUndecodedManager(self.logger)
+
         self._MONERO_P2P_PORTS = [
-            # Standard P2P
-            18080,
-            # Common alternate/anonymity network P2P ports
-            18083, 18084, 18085, 18086, 18087, 18089,
-            # Other known P2P ports
+            18080, 18083, 18084, 18085, 18086, 18087, 18089,
             18180, 18380, 18580, 21213, 37888, 37889
         ]
+        self._MONERO_RPC_PORTS = [18081, 18082, 18088]
 
-        self._MONERO_RPC_PORTS = [
-            # Standard RPC
-            18081,
-            # Common restricted/wallet RPC
-            18082,
-            # ZMQ RPC
-            18088
-        ]
         self.transport_monero = TransportMoneroManager(
             self.logger,
             extra_p2p_ports=self._MONERO_P2P_PORTS,
@@ -16352,18 +16346,130 @@ class TransportManager:
         )
         self.transport_scada = TransportSCADAManager(self.logger)
         self.transport_rip = TransportRIPManager(self.logger)
+
+    # ------------------------------------------------------------------
+    # Safety helpers
+    # ------------------------------------------------------------------
+
+    def _freeze_packet_bytes(self, packet: Any) -> Optional[bytes]:
+        try:
+            if packet is None:
+                return None
+            if isinstance(packet, (bytes, bytearray, memoryview)):
+                raw = bytes(packet)
+            else:
+                raw = bytes(packet)
+            if not raw:
+                return None
+            return raw
+        except Exception as e:
+            self.logger.log_message(f"[Transport] ❌ failed to freeze packet: {e}")
+            return None
+
+    def _thaw_packet_bytes(self, raw_packet: bytes) -> Optional[Packet]:
+        if not raw_packet:
+            return None
+
+        for parser in (Ether, IP, IPv6):
+            try:
+                pkt = parser(raw_packet)
+                if pkt is not None:
+                    return pkt
+            except Exception:
+                continue
+        return None
+
+    def _safe_find_transport_layer(self, packet: Packet):
+        try:
+            if self.sniffer and hasattr(self.sniffer, "_find_transport_layer"):
+                return self.sniffer._find_transport_layer(packet)
+        except Exception:
+            pass
+
+        try:
+            tcp = packet.getlayer(TCP)
+            if tcp is not None:
+                return tcp
+        except Exception:
+            pass
+
+        try:
+            udp = packet.getlayer(UDP)
+            if udp is not None:
+                return udp
+        except Exception:
+            pass
+
+        return None
+
+    def _queue_analysis_from_raw(
+        self,
+        fn,
+        raw_packet: bytes,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        iface_short: str,
+        queue_name: str,
+    ) -> None:
+        if not raw_packet:
+            return
+
+        if not self._analysis_parallel_enabled:
+            try:
+                fn(raw_packet, src_ip, dst_ip, sport, dport, iface_short)
+            except Exception as e:
+                self.logger.log_message(f"[Transport] analysis fallback error ({queue_name}): {e}")
+            return
+
+        try:
+            self.parallel_python.run_parallel(
+                fn,
+                raw_packet,
+                src_ip,
+                dst_ip,
+                int(sport),
+                int(dport),
+                iface_short,
+                return_type="void",
+                queue_name=queue_name,
+            )
+        except Exception as e:
+            self.logger.log_message(
+                f"[Transport] ⚠️ parallel analysis failed for {queue_name}; running local fallback: {e}"
+            )
+            try:
+                fn(raw_packet, src_ip, dst_ip, sport, dport, iface_short)
+            except Exception as inner:
+                self.logger.log_message(f"[Transport] ❌ local fallback failed for {queue_name}: {inner}")
+
+    def _inspect_from_raw(self, raw_packet: bytes, src_ip: str, dst_ip: str, sport: int, dport: int, iface_short: str):
+        pkt = self._thaw_packet_bytes(raw_packet)
+        if pkt is None:
+            return
+        try:
+            self.transport_inspect.handle(pkt, src_ip, dst_ip, sport, dport, iface_short)
+        except Exception as e:
+            self.logger.log_message(f"[Transport] inspect error: {e}")
+
+    def _scrape_from_raw(self, raw_packet: bytes, src_ip: str, dst_ip: str, sport: int, dport: int, iface_short: str):
+        pkt = self._thaw_packet_bytes(raw_packet)
+        if pkt is None:
+            return
+        try:
+            self.transport_scraper.handle(pkt, src_ip, dst_ip, sport, dport, iface_short)
+        except Exception as e:
+            self.logger.log_message(f"[Transport] scrape error: {e}")
+
+    # ------------------------------------------------------------------
+    # TLS callbacks
+    # ------------------------------------------------------------------
+
     def _on_tls_policy_decision(self, key, rec, decision):
-        """
-        Called on EVERY TLS record after the policy engine evaluates it.
-        key: canonical 4-tuple ((src_ip,src_port),(dst_ip,dst_port))
-        rec: TLSRecord (content_type/version/length/src/dst/ports/direction)
-        decision: TLSPolicyDecision(action, reason, tags)
-        """
         flow = f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} [{rec.direction}]"
         if decision.action == "allow":
-            self.logger.log_message(
-                f"[Transport][🔐 TLS][policy] ✅ allow | {flow}"
-            )
+            self.logger.log_message(f"[Transport][🔐 TLS][policy] ✅ allow | {flow}")
             return
 
         tag_str = ",".join(decision.tags) if decision.tags else "-"
@@ -16373,7 +16479,6 @@ class TransportManager:
             )
             return
 
-        # block / quarantine -> log + enforce hook
         self.logger.log_message(
             f"[Transport][🔐 TLS][policy] ⛔ {decision.action} | {flow} | reason={decision.reason} | tags={tag_str}"
         )
@@ -16383,79 +16488,52 @@ class TransportManager:
             self.logger.log_message(f"[Transport][🔐 TLS][policy] enforcement error: {e}")
 
     def _on_tls_event(self, evt: dict):
-        """
-        High-level event feed from TLSRecordManager (client_hello/server_hello/alert/block/quarantine/policy_alert).
-        Use this to emit metrics or forward to your UI.
-        """
         kind = evt.get("kind")
         data = evt.get("data", {})
         flow = evt.get("flow")
-        # Keep it concise; expand if you want richer telemetry
+
         if kind in ("client_hello", "server_hello"):
             brief = []
-            if "sni" in data and data["sni"]:
+            if data.get("sni"):
                 brief.append(f"SNI={data['sni']}")
-            if "ja3" in data and data["ja3"]:
+            if data.get("ja3"):
                 brief.append("ja3")
-            if "ja3s" in data and data["ja3s"]:
+            if data.get("ja3s"):
                 brief.append("ja3s")
             self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {' '.join(brief) or '-'}")
         elif kind in ("alert", "policy_alert", "block", "quarantine"):
             self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {data}")
-        else:
-            # Uncomment if you want every event
-            # self.logger.log_message(f"[Transport][🔐 TLS][event] {kind} | {flow} | {data}")
-            pass
 
     def _enforce_tls_decision(self, key, rec, decision):
-        """
-        Central place to ACT on a block/quarantine decision.
-        Replace the placeholders with your real enforcement (firewall, ACL, RST, etc.)
-        """
-        # Example: mark in your signer/tagger, raise a notification, or update a banlist.
-        # self.packet_signer.tag_flow(key, decision.tags)
-        # self.notification_manager.warn(...)
-
-        # If you want to immediately terminate TCP:
-        #   - you can queue forged TCP RSTs to both directions (requires your packet writer)
-        #   - or set a table your firewall consults to drop subsequent segments
-
         action = decision.action
-        reason = decision.reason
+        _ = action
+        _ = decision.reason
 
-        # Example pseudo-enforcement toggles:
         DROP_FUTURE_APPDATA = True
-        SEND_TCP_RST        = False
+        SEND_TCP_RST = False
 
         if DROP_FUTURE_APPDATA:
-            # TLSRecordManager already suppresses on_application_data callbacks
-            # once a session is marked blocked/quarantined. Nothing else needed here.
             pass
 
         if SEND_TCP_RST:
             try:
                 sip, sport = rec.src, rec.src_port
                 dip, dport = rec.dst, rec.dst_port
-                # enqueue two RSTs (c2s and s2c) via your packet writer here...
-                # self.packet_writer.send_tcp_rst(sip, sport, dip, dport)
-                # self.packet_writer.send_tcp_rst(dip, dport, sip, sport)
                 self.logger.log_message(
                     f"[Transport][🔐 TLS][policy] injected TCP RSTs for {sip}:{sport} <-> {dip}:{dport}"
                 )
             except Exception as e:
                 self.logger.log_message(f"[Transport][🔐 TLS][policy] RST injection failed: {e}")
-    # --------------------- TLS callback wiring ------------------------
+
     def _wire_tls_callbacks(self):
         def fmt_flow(rec: TLSRecord):
             return f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} [{rec.direction}]"
 
-        # Every TLS record parsed
         self.tls_manager.on_record = lambda rec: self.logger.log_message(
             f"[Transport][🔐 TLS] Record ct={rec.content_type} v={rec.version[0]}.{rec.version[1]} "
             f"len={rec.length} on {fmt_flow(rec)}"
         )
 
-        # Handshake messages summary (ClientHello/ServerHello best-effort)
         def on_hs(rec: TLSRecord, info: Dict):
             for m in info.get("messages", []):
                 t = m.get("type") or f"type={m.get('type_id')}"
@@ -16476,13 +16554,10 @@ class TransportManager:
                     self.logger.log_message(f"[Transport][🔐 TLS] Handshake {t} on {fmt_flow(rec)}")
 
         self.tls_manager.on_handshake = on_hs
-
-        # Application Data (encrypted)
         self.tls_manager.on_application_data = lambda rec: self.logger.log_message(
             f"[Transport][🔐 TLS] Application Data {rec.length}B on {fmt_flow(rec)}"
         )
 
-        # Alerts
         def on_alert(rec: TLSRecord, alert: Dict):
             lvl = self.TLS_ALERT_LEVEL.get(alert.get("level"), str(alert.get("level")))
             desc = self.TLS_ALERT_DESCRIPTION.get(alert.get("description"), str(alert.get("description")))
@@ -16491,39 +16566,127 @@ class TransportManager:
             )
 
         self.tls_manager.on_alert = on_alert
-
-        # ChangeCipherSpec
         self.tls_manager.on_change_cipher_spec = lambda rec: self.logger.log_message(
             f"[Transport][🔐 TLS] ChangeCipherSpec on {fmt_flow(rec)}"
         )
-
-        # Legacy SSL-ish
         self.tls_manager.on_legacy_ssl = lambda rec: self.logger.log_message(
             f"[Transport][🔐 TLS] Legacy/SSLv2-like record len={rec.length} on {fmt_flow(rec)}"
         )
-
-        # 🔧 NEW: policy decisions + event feed
         self.tls_manager.on_decision = self._on_tls_policy_decision
         self.tls_manager.on_event = self._on_tls_event
 
+    # ------------------------------------------------------------------
+    # Main packet handler (rewritten safely)
+    # ------------------------------------------------------------------
+
+    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
+        """
+        Safe main transport handler.
+
+        Differences from old behavior:
+          - packet is frozen to bytes immediately
+          - main TCP/UDP dispatch happens locally
+          - only inspect/scrape are optionally parallelized, using bytes not Packet objects
+        """
+        raw_packet = self._freeze_packet_bytes(packet)
+        if not raw_packet:
+            return False
+
+        iface_short = inbound_iface.split('_')[-1] if inbound_iface else "unknown"
+
+        local_packet = self._thaw_packet_bytes(raw_packet)
+        if local_packet is None:
+            self.logger.log_message("[Transport] ❌ unable to parse frozen packet")
+            return False
+
+        ip_layer = local_packet.getlayer(IP) or local_packet.getlayer(IPv6)
+        if not ip_layer:
+            return False
+
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+
+        transport_layer = self._safe_find_transport_layer(local_packet)
+        if isinstance(transport_layer, TCP):
+            sport = int(transport_layer.sport)
+            dport = int(transport_layer.dport)
+
+            self._queue_analysis_from_raw(
+                self._inspect_from_raw,
+                raw_packet,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                iface_short,
+                queue_name="transport_inspect_tcp_packets",
+            )
+            self._queue_analysis_from_raw(
+                self._scrape_from_raw,
+                raw_packet,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                iface_short,
+                queue_name="transport_scrape_tcp_packets",
+            )
+
+            with self._dispatch_lock:
+                return bool(self._handle_tcp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
+
+        if isinstance(transport_layer, UDP):
+            sport = int(transport_layer.sport)
+            dport = int(transport_layer.dport)
+
+            self._queue_analysis_from_raw(
+                self._inspect_from_raw,
+                raw_packet,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                iface_short,
+                queue_name="transport_inspect_udp_packets",
+            )
+            self._queue_analysis_from_raw(
+                self._scrape_from_raw,
+                raw_packet,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                iface_short,
+                queue_name="transport_scrape_udp_packets",
+            )
+
+            with self._dispatch_lock:
+                return bool(self._handle_udp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
+
+        try:
+            self.transport_ipv6.handle(local_packet, inbound_iface)
+        except Exception as e:
+            self.logger.log_message(f"[Transport] IPv6 handler error: {e}")
+        return False
+
+    # ------------------------------------------------------------------
+    # Existing methods below can stay mostly the same
+    # ------------------------------------------------------------------
+
     def _canonical_flow_key(self, a_ip, a_port, b_ip, b_port):
-        """Canonical 4-tuple key ((low),(high)) so lookups are direction-agnostic."""
         t1 = (a_ip, a_port)
         t2 = (b_ip, b_port)
         return (t1, t2) if t1 <= t2 else (t2, t1)
 
     def _handle_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        """Dispatches TCP packets to the correct handler based on port."""
         tcp = packet[TCP]
         flags = tcp.sprintf("%TCP.flags%")
 
         if "S" in flags and "A" not in flags:
-            key: FlowKey = self._canonical_flow_key(src_ip, sport, dst_ip, dport)  # use self._canon_key
+            key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
             self._initiators[key] = (src_ip, int(sport))
 
-        # --- NEW: unified rules (single ports + ranges) ---
         rules = [
-            # (ports, handler)
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
             ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
@@ -16534,20 +16697,20 @@ class TransportManager:
             ([3389], self._handle_rdp_packet),
             ([*self._MONERO_P2P_PORTS, *self._MONERO_RPC_PORTS], self._handle_monero_packet),
             ([(27014, 27050)], self._handle_tcp_steam_packet),
-            ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),  # range example
-            ([(1024, 65535)], self._handle_high_server_packet),  # high server port observer
+            ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),
+            ([(1024, 65535)], self._handle_high_server_packet),
             ([445, 139, 62078], self._handle_files_packet),
         ]
 
         handler = None
         for ports, h in rules:
             for p in ports:
-                if isinstance(p, tuple):  # range
+                if isinstance(p, tuple):
                     lo, hi = p
                     if lo <= sport <= hi or lo <= dport <= hi:
                         handler = h
                         break
-                else:  # single port
+                else:
                     if p in (sport, dport):
                         handler = h
                         break
@@ -16559,99 +16722,12 @@ class TransportManager:
             self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
             return True
 
-    def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles Monero P2P traffic on port 18080."""
-        self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-
-    def _handle_dns_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, iface_short)
-    def _handle_files_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """
-        SMB/NetBIOS (445/139) and Apple Lockdown (62078).
-        Uses low-overhead peeks; logs command names for SMB2 when possible.
-        Also feeds TLS analyzer *only if* a TLS-looking record is present (rare on these ports).
-        """
-        self.transport_files.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-
-    def _handle_high_server_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_tcp_high_Level.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_tcp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Steam TCP (CM/content/friends; 27014–27050). Observation only."""
-        self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-
-    def _handle_scada_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_scada.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_http.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_https.handle(packet, inbound_iface)
-        self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
-    def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_ftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_rdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    def _handle_tcp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_tcp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-    # --------------------- Main packet handler ------------------------
-    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
-        """
-        Processes Transport Layer packets by robustly finding the L4 protocol,
-        even when IPv6 extension headers are present.
-        """
-
-        iface_short = inbound_iface.split('_')[-1]
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
-        if not ip_layer:
-            return False
-
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
-
-        # Use the robust helper to find the transport layer
-        transport_layer = self.sniffer._find_transport_layer(packet)
-        # Handle packets with extension headers that were permitted by the firewall
-        if isinstance(transport_layer, TCP):
-            yield_no_gil(0.5)
-            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
-                                              transport_layer.sport,
-                                              transport_layer.dport, iface_short,
-                                              return_type="void",
-                                              queue_name="transport_inspect_tcp_packets")
-            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
-                                              transport_layer.sport,
-                                              transport_layer.dport, iface_short,
-                                              return_type="void",
-                                              queue_name="transport_scrape_tcp_packets")
-            return self.parallel_python.run_parallel(self._handle_tcp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
-                                      return_type="bool", queue_name="transport_tcp_packets")
-        elif isinstance(transport_layer, UDP):
-            yield_no_gil(0.5)
-            self.parallel_python.run_parallel(self.transport_inspect.handle, packet, src_ip, dst_ip,
-                                              transport_layer.sport,
-                                              transport_layer.dport, iface_short,
-                                              return_type="void",
-                                              queue_name="transport_inspect_udp_packets")
-            self.parallel_python.run_parallel(self.transport_scraper.handle, packet, src_ip, dst_ip,
-                                              transport_layer.sport,
-                                              transport_layer.dport, iface_short,
-                                              return_type="void",
-                                              queue_name="transport_scrape_udp_packets")
-            return self.parallel_python.run_parallel(self._handle_udp_packet, packet, src_ip, dst_ip, transport_layer.sport, transport_layer.dport, iface_short,
-                                      return_type="bool", queue_name="transport_udp_packets")
-
-        self.transport_ipv6.handle(packet, inbound_iface)
         return False
 
     def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        """Dispatches UDP packets to the correct handler based on port (supports singles + ranges)."""
-
-
-        # Rules: list of (ports_or_ranges, handler)
-        # A "range" is a (lo, hi) tuple, inclusive.
         if sport == 500 or dport == 500:
             return False
+
         rules = [
             ([520, 521], self._handle_rip_packet),
             ([53], self._handle_dns_packet),
@@ -16679,11 +16755,11 @@ class TransportManager:
 
         def _match(ports_or_ranges, s, d):
             for p in ports_or_ranges:
-                if isinstance(p, tuple):  # range (lo, hi)
+                if isinstance(p, tuple):
                     lo, hi = p
                     if lo <= s <= hi or lo <= d <= hi:
                         return True
-                else:  # single port
+                else:
                     if p == s or p == d:
                         return True
             return False
@@ -16705,6 +16781,8 @@ class TransportManager:
                 return False
             elif handler == self._handle_dns_packet:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                if packet.haslayer(Raw) and packet.haslayer(UDP):
+                    pass
                 if packet.haslayer(DNS) and packet[DNS].qr == 1:
                     return True
                 return False
@@ -16724,14 +16802,13 @@ class TransportManager:
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
                 return True
 
-        # RTP/VoIP dynamic range as a fallback
         try:
             if sport in self.voip_port_range or dport in self.voip_port_range:
                 self._handle_rtp_packet(packet, src_ip, dst_ip, sport, dport, iface_short)
                 return True
         except Exception:
-            # If voip_port_range isn’t iterable (e.g., misconfigured), just skip
             pass
+
         self.code_output_manager.submit_packet(
             packet, inbound_iface=iface_short, phase="unhandled", component="udp"
         )
@@ -16739,77 +16816,90 @@ class TransportManager:
         self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
         return True
 
-    # ---------------------- UDP protocol handlers ---------------------
-    def _bytes_to_str(self, data: bytes) -> str:
-        """Safely decodes bytes to a string, ignoring any decoding errors."""
-        return data.decode('utf-8', errors='ignore')
+    # ---------------- existing protocol handlers ----------------
+
+    def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_dns_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, iface_short)
+
+    def _handle_files_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_files.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_high_server_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_tcp_high_Level.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_tcp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_scada_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_scada.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_http_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_http.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_https.handle(packet, inbound_iface)
+        self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+
+    def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_ftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_ftp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_rdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_rdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_tcp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_tcp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_llmnr_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        """Handles LLMNR on UDP/5355."""
         self.transport_llmnr.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
+
     def _handle_rip_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         self.transport_rip.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
+
     def _handle_udp_steam_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        """
-        Steam/Source UDP: A2S queries (usually 27015±n), SDR (27000–27100), client (4380), discovery (27036/27037).
-        Observation only.
-        """
         self.transport_steam.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
+
     def _handle_udp_ephemeral_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_udp_ephemeral.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_scada_udp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_scada.handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_dns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for DNS packets."""
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_esp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for DNS packets."""
         self.transport_esp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_mdns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
         self.transport_mdns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_nbns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
         self.transport_nbns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_nbds_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """mDNS on UDP/5353 – summarize PTR/SRV/TXT/A(AAA) with dedup + cooldown."""
         self.transport_nbds.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_dhcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for DHCP packets."""
         return self.transport_dhcp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_dhcp6_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for DHCP packets."""
         return self.transport_dhcp6.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_quic_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for QUIC packets."""
         self.transport_quic.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
-    # p2pool_router_managers.py
-
-    def _raw_payload_or_empty(self, packet) -> bytes:
-        try:
-            if packet is None:
-                return b""
-            if hasattr(packet, "haslayer") and packet.haslayer(Raw):
-                raw_layer = packet[Raw]
-                load = getattr(raw_layer, "load", b"")
-                return bytes(load) if load else b""
-        except Exception:
-            return b""
-        return b""
-
     def _handle_ntp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for NTP packets safely."""
         raw_data = self._raw_payload_or_empty(packet)
         if len(raw_data) < 48:
             return False
-
         try:
             first_byte = raw_data[0]
-            li = (first_byte >> 6) & 0x03
             vn = (first_byte >> 3) & 0x07
             mode = first_byte & 0x07
             stratum = raw_data[1]
@@ -16832,11 +16922,9 @@ class TransportManager:
             return False
 
     def _handle_tftp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for TFTP packets safely."""
         raw_data = self._raw_payload_or_empty(packet)
         if len(raw_data) < 2:
             return False
-
         try:
             opcode = struct.unpack("!H", raw_data[0:2])[0]
             opcode_str = {
@@ -16870,18 +16958,17 @@ class TransportManager:
             return False
 
     def _handle_sip_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for SIP packets."""
         if packet.haslayer(Raw):
             raw_data = bytes(packet[Raw].load)
             try:
-                if raw_data.startswith(b"INVITE") or raw_data.startswith(b"REGISTER") or raw_data.startswith(b"BYE"):
-                    first_line = raw_data.split(b"\r\n")[0].decode('utf-8', errors='ignore')
+                if raw_data.startswith((b"INVITE", b"REGISTER", b"BYE")):
+                    first_line = raw_data.split(b"\r\n")[0].decode("utf-8", errors="ignore")
                     self.logger.log_message(
                         f"[Transport][🚀 UDP][📞 SIP] Request from {src_ip}:{sport} to {dst_ip}:{dport} | "
                         f"Method: {first_line.split(' ')[0]}"
                     )
                 elif raw_data.startswith(b"SIP/2.0"):
-                    status_line = raw_data.split(b"\r\n")[0].decode('utf-8', errors='ignore')
+                    status_line = raw_data.split(b"\r\n")[0].decode("utf-8", errors="ignore")
                     self.logger.log_message(
                         f"[Transport][🚀 UDP][📞 SIP] Response from {src_ip}:{sport} to {dst_ip}:{dport} | "
                         f"Status: {status_line.split(' ', 1)[1]}"
@@ -16896,63 +16983,74 @@ class TransportManager:
         self.code_output_manager.submit_packet(
             packet, inbound_iface=inbound_iface, phase="handled", component="udp-rtp"
         )
+
     def _handle_overlay_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for ZeroTier-like packets on UDP port 9993."""
         self.transport_overlay.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_wireguard_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         self.transport_wireguard.handle(packet, src_ip, dst_ip, sport, dport, iface_short)
+
     def _handle_ssdp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for SSDP/UPnP packets on UDP port 1900."""
         self.transport_ssdp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_ws_discovery_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for WS-Discovery packets on UDP port 3702."""
         self.transport_ws_discovery.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_kerberos_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        """Handles and logs details for WS-Discovery packets on UDP port 3702."""
         self.transport_kerberos.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _raw_payload_or_empty(self, packet) -> bytes:
+        try:
+            if packet is None:
+                return b""
+            if hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                raw_layer = packet[Raw]
+                load = getattr(raw_layer, "load", b"")
+                return bytes(load) if load else b""
+        except Exception:
+            return b""
+        return b""
 
     def _feed_to_tls_manager(self, packet, src_ip, dst_ip, sport, dport, *, reason: str = "auto", log: bool = True):
         from scapy.packet import Raw
+
         if not packet.haslayer(Raw):
             return
+
         raw_bytes = bytes(packet[Raw].load or b"")
         if not raw_bytes:
             return
+
         TLS_SERVICE_PORTS = {443, 8443, 9443, 2087, 2096, 2083, 8883, 10443, 853, 993, 995, 465}
         key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
 
-        # 1) Use SYN initiator if known
         client_tuple = self._initiators.get(key)
         if client_tuple:
             is_c2s = (src_ip, sport) == client_tuple
         else:
-            # 2) Service-port heuristic (works for 8883)
             if (sport in TLS_SERVICE_PORTS) ^ (dport in TLS_SERVICE_PORTS):
-                # c->s if going *to* the service port; otherwise s->c
                 is_c2s = dport in TLS_SERVICE_PORTS
             else:
-                # 3) fallback heuristic
                 is_c2s = sport <= dport
 
-        # --- resync/preface handling (see next section) ---
         raw_bytes, skipped, tag = self._tls_preface_and_resync(raw_bytes)
         if skipped and log:
             self.logger.log_message(
                 f"[Transport][🔐 TLS] resync({tag}) +{skipped}B {src_ip}:{sport} → {dst_ip}:{dport}"
             )
         if not raw_bytes:
-            return  # nothing left to parse this segment
+            return
 
-        self.tls_manager.feed_tcp_segment(
-            canonical_key=key,
-            is_c2s=is_c2s,
-            payload=raw_bytes,
-            src_ip=src_ip, src_port=sport,
-            dst_ip=dst_ip, dst_port=dport,
-            ts=time.time()
-        )
+        with self._tls_lock:
+            self.tls_manager.feed_tcp_segment(
+                canonical_key=key,
+                is_c2s=is_c2s,
+                payload=raw_bytes,
+                src_ip=src_ip, src_port=sport,
+                dst_ip=dst_ip, dst_port=dport,
+                ts=time.time()
+            )
+
         if log:
             dir_str = "c2s" if is_c2s else "s2c"
             self.logger.log_message(
@@ -16960,40 +17058,25 @@ class TransportManager:
             )
 
     def _tls_preface_and_resync(self, payload: bytes, *, scan_window: int = 512):
-        """
-        Returns (new_payload, skipped_len, tag)
-
-        Behavior:
-          • If payload already starts with a TLS record, return as-is ("tls").
-          • Strip HAProxy PROXY v1/v2 prefaces ("proxyv1"/"proxyv2").
-          • Strip a single HTTP/CONNECT preface line if present ("http-preface").
-          • Search within 'scan_window' for the next TLS record and resync ("resync").
-          • Recognize SSLv2 ClientHello and pass it through ("sslv2").
-          • If nothing TLS-like is found, return (b"", len(payload), "notls").
-        """
         if not payload:
             return b"", 0, "empty"
 
         mv = memoryview(payload)
         plen = len(mv)
 
-        # 1) Already TLS?
         if self._looks_like_tls_record(mv):
             return payload, 0, "tls"
 
-        # 2) HAProxy PROXY v1 (ASCII line) e.g. "PROXY TCP4 1.2.3.4 5.6.7.8 12345 443\r\n"
         if mv[:6].tobytes() == b"PROXY ":
             eol = self._find_crlf(mv, 0, min(plen, 256))
             if eol != -1:
-                cut = eol + 2  # skip the CRLF
+                cut = eol + 2
                 rest = mv[cut:].tobytes()
                 if self._looks_like_tls_record(memoryview(rest)):
                     return rest, cut, "proxyv1"
-                # fall through to resync in the remaining bytes
                 mv = memoryview(rest)
                 plen = len(mv)
 
-        # 3) HAProxy PROXY v2 (binary) - signature then 2-byte len
         if plen >= 16 and mv[:12].tobytes() == b"\r\n\r\n\0\r\nQUIT\n":
             hdrlen = 16
             try:
@@ -17008,8 +17091,6 @@ class TransportManager:
                 mv = memoryview(rest)
                 plen = len(mv)
 
-        # 4) Plain HTTP/CONNECT preface? (common before TLS tunnels)
-        # Very cheap check: starts with a known HTTP method or "CONNECT"
         if self._looks_like_http_preface(mv):
             eol = self._find_crlf(mv, 0, min(plen, 512))
             if eol != -1:
@@ -17020,27 +17101,19 @@ class TransportManager:
                 mv = memoryview(rest)
                 plen = len(mv)
 
-        # 5) SSLv2 ClientHello (legacy): high bit set on first len byte, and type==0x01 at offset 2
         if plen >= 3:
             b0 = mv[0]
             if (b0 & 0x80) and mv[2] == 0x01:
                 return mv.tobytes(), 0, "sslv2"
 
-        # 6) Resync: scan early bytes for a TLS record header
         win = min(scan_window, max(0, plen - 5))
         for i in range(win):
             if self._looks_like_tls_record(mv[i:]):
                 return mv[i:].tobytes(), i, "resync"
 
-        # 7) Give up: nothing TLS-like in this segment
         return b"", plen, "notls"
 
     def _looks_like_tls_record(self, mv: memoryview) -> bool:
-        """
-        Very cheap TLS record header check on a memoryview.
-        Accept: content_type in {0x16(handshake),0x17(app),0x14(change)} and
-                version in {0x0301..0x0304}, and have at least 5 bytes.
-        """
         try:
             if len(mv) < 5:
                 return False
@@ -17050,18 +17123,12 @@ class TransportManager:
             ver = (mv[1] << 8) | mv[2]
             if ver not in (0x0301, 0x0302, 0x0303, 0x0304):
                 return False
-            # Optional: ensure declared length doesn't exceed a sane bound (avoid bogus sync)
             rec_len = (mv[3] << 8) | mv[4]
-            # TLS record length must be <= 2^14+2048 (allowing some extension wiggle)
             return 0 < rec_len <= (16384 + 2048)
         except Exception:
             return False
 
-    # --- tiny local helpers (put either inside the class as @staticmethods,
-    #     or outside; below are module-local for brevity) ---
-
     def _find_crlf(self, mv: memoryview, start: int, end: int) -> int:
-        """Return index of '\r\n' between start..end (exclusive end), or -1."""
         try:
             buf = mv[start:end].tobytes()
             pos = buf.find(b"\r\n")
@@ -17070,22 +17137,20 @@ class TransportManager:
             return -1
 
     def _looks_like_http_preface(self, mv: memoryview) -> bool:
-        """Detect a single HTTP/CONNECT request line cheaply."""
         if len(mv) < 7:
             return False
         try:
             head = mv[:8].tobytes().upper()
-            # Methods and CONNECT
             return (
-                    head.startswith(b"CONNECT ") or
-                    head.startswith(b"GET ") or
-                    head.startswith(b"POST ") or
-                    head.startswith(b"PUT ") or
-                    head.startswith(b"HEAD ") or
-                    head.startswith(b"DELETE ") or
-                    head.startswith(b"OPTIONS ") or
-                    head.startswith(b"TRACE ") or
-                    head.startswith(b"PATCH ")
+                head.startswith(b"CONNECT ") or
+                head.startswith(b"GET ") or
+                head.startswith(b"POST ") or
+                head.startswith(b"PUT ") or
+                head.startswith(b"HEAD ") or
+                head.startswith(b"DELETE ") or
+                head.startswith(b"OPTIONS ") or
+                head.startswith(b"TRACE ") or
+                head.startswith(b"PATCH ")
             )
         except Exception:
             return False

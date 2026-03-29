@@ -167,8 +167,8 @@ class PythonRouterManager:
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(self, self.code_output_manager, max_frames_per_batch=50000, max_bytes_per_batch=(1 << 120))
-        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python', max_frames_per_batch=50000, max_bytes_per_batch=(1 << 120))
+        self.windivert_manager = WinDivertManager(self, self.code_output_manager)
+        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python')
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1355,21 +1355,93 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         yield_no_gil(2.0)
         try:
             iface_short = inbound_iface.split('_')[-1]
-            if isinstance(packet, bytes):
+            if isinstance(packet, (bytes, bytearray, memoryview)):
                 try:
-                    # Check for an empty payload to prevent index errors
-                    if not packet: return
-
-                    version = packet[0] >> 4
-                    if version == 6:
-                        packet = IPv6(packet)
-                    elif version == 4:
-                        packet = IP(packet)
-                    else:
-                        packet = Ether(packet)
+                    raw_bytes = bytes(packet)
+                    if not raw_bytes:
                         return
 
+                    def _looks_like_ipv4(buf: bytes) -> bool:
+                        if len(buf) < 20:
+                            return False
+                        if (buf[0] >> 4) != 4:
+                            return False
+                        ihl = (buf[0] & 0x0F) * 4
+                        if ihl < 20 or ihl > len(buf):
+                            return False
+                        total_len = int.from_bytes(buf[2:4], "big")
+                        if total_len < ihl:
+                            return False
+                        return True
+
+                    def _looks_like_ipv6(buf: bytes) -> bool:
+                        if len(buf) < 40:
+                            return False
+                        return (buf[0] >> 4) == 6
+
+                    def _looks_like_ethernet(buf: bytes) -> bool:
+                        if len(buf) < 14:
+                            return False
+
+                        eth_type = int.from_bytes(buf[12:14], "big")
+
+                        # Standard Ethernet II EtherTypes
+                        if eth_type >= 0x0600:
+                            return True
+
+                        # 802.1Q / QinQ VLAN tags
+                        if eth_type in (0x8100, 0x88A8, 0x9100):
+                            return True
+
+                        return False
+
+                    parsed = None
+                    parse_errors = []
+
+                    # Prefer Ethernet when it really looks like Ethernet.
+                    if _looks_like_ethernet(raw_bytes):
+                        try:
+                            parsed = Ether(raw_bytes)
+                        except Exception as e:
+                            parse_errors.append(f"Ether={e}")
+
+                    # If not Ethernet, or Ethernet parse did not produce anything useful,
+                    # fall back to L3 parsing.
+                    if parsed is None:
+                        if _looks_like_ipv4(raw_bytes):
+                            try:
+                                parsed = IP(raw_bytes)
+                            except Exception as e:
+                                parse_errors.append(f"IP={e}")
+
+                        if parsed is None and _looks_like_ipv6(raw_bytes):
+                            try:
+                                parsed = IPv6(raw_bytes)
+                            except Exception as e:
+                                parse_errors.append(f"IPv6={e}")
+
+                    # Final fallback chain: try all decoders anyway before giving up.
+                    if parsed is None:
+                        for name, decoder in (("Ether", Ether), ("IP", IP), ("IPv6", IPv6)):
+                            try:
+                                parsed = decoder(raw_bytes)
+                                break
+                            except Exception as e:
+                                parse_errors.append(f"{name}={e}")
+
+                    if parsed is None:
+                        self.router_logger.log_message(
+                            f"[Router] ⚠️ Could not parse packet on {iface_short}; "
+                            f"len={len(raw_bytes)} errs={' | '.join(parse_errors[:3])}"
+                        )
+                        return
+
+                    packet = parsed
+
                 except Exception as e:
+                    self.router_logger.log_message(
+                        f"[Router] ⚠️ Packet parse failure on {iface_short}: {e}"
+                    )
                     return
             if self.uplink_manager:
                 self.uplink_manager.observe_packet(packet, inbound_iface)
@@ -1399,13 +1471,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         f"[Router] 🚫 Dropped ARP on {iface_short} (failed inspection)."
                     )
                     return
+                self.arp_manager._maybe_learn_passive_arp(packet,inbound_iface=inbound_iface)
                 self.arp_manager.learn_from_packet(packet, inbound_iface)
                 self.arp_manager.learn_arp_response(packet)
                 self.arp_manager.reply_to_arp_request(packet, inbound_iface)
                 return
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
-                self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
                 return
 
             src_ip=None
@@ -1751,8 +1823,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 phase="forwarding",
                 component="forward",
             )
-            self.parallel_python.run_parallel(self._forward_general_ip_packet, packet, inbound_iface,
-                                                  return_type="void", queue_name="forward_packets")
+            self._forward_general_ip_packet(packet, inbound_iface)
         except Exception:
             self.router_logger.log_message(
                 f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
@@ -2197,8 +2268,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
         sampling_rate = self.packet_catcher_heuristic_rates.get(proto, self.packet_catcher_heuristic_rates['DEFAULT'])
         if deterministic_value < sampling_rate:
-            self.parallel_python.run_parallel(self.packet_catcher.process_packet, packet, return_type="all",
-                                              count_to_call=10)
+            self.packet_catcher.process_packet(packet)
             self.code_output_manager.submit_packet(
                 packet,
                 inbound_iface=inbound_iface,
@@ -2254,11 +2324,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     use_dhcp_in=use_dhcp_in,
                     router_ip_out=router_ip_out,
                     router_netmask_out=netmask_out,
-                    force_wan_to_dhcp_on_start=False,
+                    force_wan_to_dhcp_on_start=bool(use_dhcp_out),
                     ensure_host_dns_from_wan=True,
                     repair_on_failure=True,
                     pin_gateway_arp=True,
-                    runtime_set_wan_to_dhcp=False,
+                    runtime_set_wan_to_dhcp=bool(use_dhcp_out),
                     disable_netroute_default_sync=True,
                     disable_netroute_metric_tuning=True,
                 )
@@ -2297,6 +2367,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             )
             self.arp_manager.router_ip_out = self.router_ip_out
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
+
             self.icmp_manager = ICMPManager(self.router_logger, self.packet_writer, self._interfaces_config)
             self.packet_writer.update_interfaces(self._interfaces_config)
             if nat_os:
@@ -2319,7 +2390,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.NOTIFICATION_TARGET_PORT,
                 self.interface_in_full_name
             )
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
+            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.outbound_load_balancer, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
@@ -2487,6 +2558,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.wintun_manager.start()
                 self.hypervrouter_manager.start()
                 self.hyperv_enabled = True
+                self.arp_manager.add_trusted_port("WinDivertBridge")
+                self.arp_manager.add_trusted_port("Nate's Tunnel")
                 self.parallel_python.increase_ram_usage(1500)
             else:
                 self.hyperv_enabled = False
@@ -2499,6 +2572,12 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
+            if use_hyperv:
+                self.hypervrouter_manager.stop()
+                self.windivert_manager.stop()
+                self.wintun_manager.stop()
+                self.hyperv_manager.teardown()
+                self.hyperv_enabled = False
             self.parallel_python.release_ram_usage()
             if use_stratum_comm:
                 if self.daemon_manager:
@@ -2560,12 +2639,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.remove_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             self.syn_scanner.stop()
             self.cleanup_all_network_changes()
-            if use_hyperv:
-                self.hypervrouter_manager.stop()
-                self.windivert_manager.stop()
-                self.wintun_manager.stop()
-                self.hyperv_manager.teardown()
-                self.hyperv_enabled = False
             self.started = False
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
@@ -4438,7 +4511,8 @@ class WiresharkManager:
                     scapy_pkt = self._build_scapy_from_tshark(layers)
                     if scapy_pkt is None:
                         # Nothing we could reconstruct; still bail gracefully
-                        self.logger.log_message("[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON.")
+                        self.logger.log_message(
+                            "[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON.")
                         return
 
                     # Hand off to your router with inbound iface set to "WireShark"
@@ -4446,7 +4520,8 @@ class WiresharkManager:
                         if self.router_manager.started and (
                                 (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
                                     src_ip)) or
-                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(dst_ip))
+                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
+                                    dst_ip))
                         ):
                             if self.router_manager.router_ip_out in str(
                                     src_ip) and self.router_manager.router_ip_out in str(dst_ip):
