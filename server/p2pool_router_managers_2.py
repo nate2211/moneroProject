@@ -19214,6 +19214,28 @@ class HyperVRouterManager:
         h.update(raw[:256])
         h.update(len(raw).to_bytes(4, "big", signed=False))
         return h.hexdigest()
+
+    def _fingerprint(
+            self,
+            raw: bytes,
+            iface_name: str,
+            protocol_tag: str,
+            *,
+            prefix: str = "pkt",
+    ) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(prefix or "pkt").encode("utf-8", "ignore"))
+        h.update(b"|")
+        h.update(str(iface_name or "").strip().lower().encode("utf-8", "ignore"))
+        h.update(b"|")
+        h.update(str(protocol_tag or "").encode("utf-8", "ignore"))
+        h.update(b"|")
+        h.update(raw[:256])
+        h.update(b"|")
+        h.update(len(raw).to_bytes(4, "big", signed=False))
+        return h.hexdigest()
+    
+    
     def _seen_recently(self, fp: str) -> bool:
         now = time.time()
         self._prune_recent(now=now)
