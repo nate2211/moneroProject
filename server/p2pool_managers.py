@@ -27,6 +27,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from scapy.arch import get_if_hwaddr
+from scapy.compat import raw
 from scapy.config import conf
 from scapy.contrib.igmp import IGMP
 from scapy.contrib.igmpv3 import IGMPv3
@@ -167,8 +168,8 @@ class PythonRouterManager:
         self.hyperv_manager = HyperVManager(self.router_logger)
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(self, self.code_output_manager)
-        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python')
+        self.windivert_manager = WinDivertManager(self, self.code_output_manager, max_frames_per_batch=256, max_bytes_per_batch=(1 << 38))
+        self.wintun_manager = WinTunManager(self, self.code_output_manager, pipe_name=r'\\.\pipe\wintun_to_python', max_frames_per_batch=256, max_bytes_per_batch=(1 << 38))
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
@@ -1355,88 +1356,238 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         yield_no_gil(2.0)
         try:
             iface_short = inbound_iface.split('_')[-1]
+
             if isinstance(packet, (bytes, bytearray, memoryview)):
                 try:
                     raw_bytes = bytes(packet)
                     if not raw_bytes:
                         return
 
-                    def _looks_like_ipv4(buf: bytes) -> bool:
-                        if len(buf) < 20:
-                            return False
-                        if (buf[0] >> 4) != 4:
-                            return False
-                        ihl = (buf[0] & 0x0F) * 4
-                        if ihl < 20 or ihl > len(buf):
-                            return False
-                        total_len = int.from_bytes(buf[2:4], "big")
-                        if total_len < ihl:
-                            return False
-                        return True
-
-                    def _looks_like_ipv6(buf: bytes) -> bool:
-                        if len(buf) < 40:
-                            return False
-                        return (buf[0] >> 4) == 6
-
-                    def _looks_like_ethernet(buf: bytes) -> bool:
-                        if len(buf) < 14:
-                            return False
-
-                        eth_type = int.from_bytes(buf[12:14], "big")
-
-                        # Standard Ethernet II EtherTypes
-                        if eth_type >= 0x0600:
-                            return True
-
-                        # 802.1Q / QinQ VLAN tags
-                        if eth_type in (0x8100, 0x88A8, 0x9100):
-                            return True
-
-                        return False
-
-                    parsed = None
                     parse_errors = []
 
-                    # Prefer Ethernet when it really looks like Ethernet.
-                    if _looks_like_ethernet(raw_bytes):
+                    def _safe_len(obj) -> int | None:
                         try:
-                            parsed = Ether(raw_bytes)
+                            return len(obj)
+                        except Exception:
+                            return None
+
+                    def _raw_len(pkt_obj) -> int | None:
+                        try:
+                            rb = raw(pkt_obj)
+                            return len(rb) if rb is not None else None
+                        except Exception:
+                            return None
+
+                    def _score_candidate(pkt_obj, buf: bytes, decoder_name: str) -> int:
+                        """
+                        Score a parsed packet by how internally consistent and protocol-rich it looks.
+                        Higher score = better candidate.
+                        """
+                        score = 0
+                        buf_len = len(buf)
+
+                        try:
+                            # Base reward if parsing produced anything at all
+                            score += 5
+
+                            # Prefer candidates that round-trip close to the original size
+                            pkt_len = _raw_len(pkt_obj)
+                            if pkt_len is not None:
+                                if pkt_len == buf_len:
+                                    score += 30
+                                elif pkt_len <= buf_len:
+                                    score += 20
+                                else:
+                                    score -= 10
+
+                            # Prefer real protocol stacks over Raw-only decodes
+                            if pkt_obj.haslayer(Raw):
+                                score += 1
+
+                            # L2 / VLAN / ARP
+                            if pkt_obj.haslayer(Ether):
+                                score += 15
+                                eth = pkt_obj.getlayer(Ether)
+                                if hasattr(eth, "type"):
+                                    score += 3
+
+                            dot1q_cls = globals().get("Dot1Q")
+                            if dot1q_cls is not None and pkt_obj.haslayer(dot1q_cls):
+                                score += 10
+
+                            arp_cls = globals().get("ARP")
+                            if arp_cls is not None and pkt_obj.haslayer(arp_cls):
+                                score += 25
+
+                            # IPv4 validation
+                            if pkt_obj.haslayer(IP):
+                                score += 20
+                                ip = pkt_obj.getlayer(IP)
+
+                                try:
+                                    ihl_words = int(getattr(ip, "ihl", 0) or 0)
+                                    ihl_bytes = ihl_words * 4
+                                    total_len = int(getattr(ip, "len", 0) or 0)
+
+                                    if ihl_bytes >= 20:
+                                        score += 4
+                                    else:
+                                        score -= 8
+
+                                    if total_len >= max(ihl_bytes, 20):
+                                        score += 8
+                                    else:
+                                        score -= 12
+
+                                    proto = int(getattr(ip, "proto", -1))
+                                    if proto in (1, 2, 6, 17, 47, 50, 58, 89):
+                                        score += 4
+                                except Exception:
+                                    score -= 2
+
+                            # IPv6 validation
+                            if pkt_obj.haslayer(IPv6):
+                                score += 20
+                                ip6 = pkt_obj.getlayer(IPv6)
+
+                                try:
+                                    plen = int(getattr(ip6, "plen", -1))
+                                    nh = int(getattr(ip6, "nh", -1))
+                                    if plen >= 0:
+                                        score += 6
+                                    if nh in (6, 17, 58, 43, 44, 47, 50, 51):
+                                        score += 4
+                                except Exception:
+                                    score -= 2
+
+                            # L4
+                            udp_cls = globals().get("UDP")
+                            tcp_cls = globals().get("TCP")
+                            icmp_cls = globals().get("ICMP")
+                            icmpv6_cls = globals().get("ICMPv6Unknown")  # generic fallback if imported
+
+                            if udp_cls is not None and pkt_obj.haslayer(udp_cls):
+                                score += 20
+                                udp = pkt_obj.getlayer(udp_cls)
+                                try:
+                                    sport = int(getattr(udp, "sport", -1))
+                                    dport = int(getattr(udp, "dport", -1))
+                                    if 0 <= sport <= 65535 and 0 <= dport <= 65535:
+                                        score += 5
+
+                                    # Strong boost for DNS and DHCP families
+                                    if sport in (53, 5353, 5355, 67, 68) or dport in (53, 5353, 5355, 67, 68):
+                                        score += 20
+                                except Exception:
+                                    score -= 1
+
+                            if tcp_cls is not None and pkt_obj.haslayer(tcp_cls):
+                                score += 20
+                                tcp = pkt_obj.getlayer(tcp_cls)
+                                try:
+                                    sport = int(getattr(tcp, "sport", -1))
+                                    dport = int(getattr(tcp, "dport", -1))
+                                    if 0 <= sport <= 65535 and 0 <= dport <= 65535:
+                                        score += 5
+                                    if sport in (53, 80, 443) or dport in (53, 80, 443):
+                                        score += 8
+                                except Exception:
+                                    score -= 1
+
+                            if icmp_cls is not None and pkt_obj.haslayer(icmp_cls):
+                                score += 12
+
+                            if icmpv6_cls is not None and pkt_obj.haslayer(icmpv6_cls):
+                                score += 12
+
+                            # App layer boosts
+                            dns_cls = globals().get("DNS")
+                            dhcp_cls = globals().get("DHCP")
+                            bootp_cls = globals().get("BOOTP")
+
+                            if dns_cls is not None and pkt_obj.haslayer(dns_cls):
+                                score += 35
+
+                            if dhcp_cls is not None and pkt_obj.haslayer(dhcp_cls):
+                                score += 30
+
+                            if bootp_cls is not None and pkt_obj.haslayer(bootp_cls):
+                                score += 15
+
+                            # Penalize obviously weak parse outcomes
+                            if decoder_name == "ARP" and not (
+                                    globals().get("ARP") and pkt_obj.haslayer(globals()["ARP"])):
+                                score -= 10
+
+                        except Exception:
+                            score -= 5
+
+                        return score
+
+                    def _candidate_decoders():
+                        """
+                        Build candidate decoder list dynamically from whatever scapy layers are available.
+                        Most likely first, but not hard-locked to one path.
+                        """
+                        names = [
+                            "Ether",  # Ethernet / VLAN / ARP / IP / IPv6
+                            "IP",  # raw IPv4 payload
+                            "IPv6",  # raw IPv6 payload
+                            "ARP",  # raw ARP payload if it arrives without Ethernet
+                        ]
+
+                        seen = set()
+                        out = []
+                        for name in names:
+                            cls = globals().get(name)
+                            if cls is not None and cls not in seen:
+                                out.append((name, cls))
+                                seen.add(cls)
+                        return out
+
+                    best_pkt = None
+                    best_score = None
+                    candidate_debug = []
+
+                    for decoder_name, decoder in _candidate_decoders():
+                        try:
+                            pkt_candidate = decoder(raw_bytes)
+                            score = _score_candidate(pkt_candidate, raw_bytes, decoder_name)
+                            candidate_debug.append(f"{decoder_name}:{score}")
+
+                            if best_pkt is None or score > best_score:
+                                best_pkt = pkt_candidate
+                                best_score = score
                         except Exception as e:
-                            parse_errors.append(f"Ether={e}")
+                            parse_errors.append(f"{decoder_name}={e}")
 
-                    # If not Ethernet, or Ethernet parse did not produce anything useful,
-                    # fall back to L3 parsing.
-                    if parsed is None:
-                        if _looks_like_ipv4(raw_bytes):
+                    # Final very loose fallback: try the same decoders again but keep the first thing
+                    # that does not explode, even if score is weak.
+                    if best_pkt is None:
+                        for decoder_name, decoder in _candidate_decoders():
                             try:
-                                parsed = IP(raw_bytes)
-                            except Exception as e:
-                                parse_errors.append(f"IP={e}")
-
-                        if parsed is None and _looks_like_ipv6(raw_bytes):
-                            try:
-                                parsed = IPv6(raw_bytes)
-                            except Exception as e:
-                                parse_errors.append(f"IPv6={e}")
-
-                    # Final fallback chain: try all decoders anyway before giving up.
-                    if parsed is None:
-                        for name, decoder in (("Ether", Ether), ("IP", IP), ("IPv6", IPv6)):
-                            try:
-                                parsed = decoder(raw_bytes)
+                                best_pkt = decoder(raw_bytes)
+                                best_score = -999
+                                candidate_debug.append(f"{decoder_name}:fallback")
                                 break
                             except Exception as e:
-                                parse_errors.append(f"{name}={e}")
+                                parse_errors.append(f"{decoder_name}={e}")
 
-                    if parsed is None:
+                    if best_pkt is None:
                         self.router_logger.log_message(
                             f"[Router] ⚠️ Could not parse packet on {iface_short}; "
-                            f"len={len(raw_bytes)} errs={' | '.join(parse_errors[:3])}"
+                            f"len={len(raw_bytes)} errs={' | '.join(parse_errors[:4])}"
                         )
                         return
 
-                    packet = parsed
+                    # Optional weak-parse warning for visibility without dropping the packet
+                    if best_score is not None and best_score < 10:
+                        self.router_logger.log_message(
+                            f"[Router] ⚠️ Weak parse on {iface_short}; "
+                            f"len={len(raw_bytes)} candidates={' | '.join(candidate_debug[:5])}"
+                        )
+
+                    packet = best_pkt
 
                 except Exception as e:
                     self.router_logger.log_message(
