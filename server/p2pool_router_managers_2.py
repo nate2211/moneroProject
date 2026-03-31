@@ -16499,6 +16499,7 @@ if ($servers) {{ $servers | ForEach-Object {{ $_ }} }}
 class UplinkCandidate:
     iface_full: str
     iface_friendly: str
+
     ip: Optional[str] = None
     netmask: Optional[str] = None
     network: Optional[Any] = None
@@ -16518,6 +16519,29 @@ class UplinkCandidate:
 
     metadata: dict = field(default_factory=dict)
 
+    # probe / health bookkeeping
+    last_gateway_probe: float = 0.0
+    last_public_probe: float = 0.0
+    last_gateway_refresh: float = 0.0
+    last_dns_refresh: float = 0.0
+    gateway_rtt_ms: Optional[float] = None
+    public_rtt_ms: Optional[float] = None
+
+    # passive signals
+    last_passive_public_at: float = 0.0
+    last_passive_arp_at: float = 0.0
+    last_passive_nat_at: float = 0.0
+    passive_public_hits: int = 0
+    passive_arp_hits: int = 0
+    passive_nat_hits: int = 0
+
+    # activation / stability
+    activation_count: int = 0
+    flap_count: int = 0
+    last_activation: float = 0.0
+    consecutive_public_failures: int = 0
+    health_state: str = "unknown"
+
 
 class UplinkManager(_SmartManagerBase):
     """
@@ -16529,6 +16553,12 @@ class UplinkManager(_SmartManagerBase):
       - keep router access to public IPs when any eligible uplink still has public connectivity
       - avoid OS default-route churn on the host
       - scrub bad public /32 host routes that break browsing
+
+    Improvements in this rewrite:
+      - much less subprocess churn through TTL caches and batched route scrubbing
+      - passive health signals from ARP/NAT/real traffic reduce unnecessary probing
+      - stickier activation logic to avoid flap storms and expensive failover loops
+      - safer exception boundaries and lock usage around shared candidate state
     """
 
     DEFAULT_PUBLIC_PROBES = [
@@ -16544,6 +16574,7 @@ class UplinkManager(_SmartManagerBase):
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._candidate_lock = threading.RLock()
 
         self._prefs = {
             "health_interval_sec": 15.0,
@@ -16558,6 +16589,18 @@ class UplinkManager(_SmartManagerBase):
             "candidate_stale_sec": 300.0,
             "minimum_public_score_to_activate": 45.0,
             "keep_current_if_public": True,
+
+            # added stability / performance guards
+            "discovery_interval_sec": 45.0,
+            "route_scrub_interval_sec": 90.0,
+            "wifi_preserve_interval_sec": 45.0,
+            "dns_cache_ttl_sec": 180.0,
+            "gateway_cache_ttl_sec": 60.0,
+            "adapter_cache_ttl_sec": 20.0,
+            "min_probe_gap_sec": 8.0,
+            "passive_signal_ttl_sec": 45.0,
+            "max_probe_candidates_per_loop": 2,
+            "activation_cooldown_sec": 20.0,
         }
 
         self.candidates: Dict[str, UplinkCandidate] = {}
@@ -16570,6 +16613,16 @@ class UplinkManager(_SmartManagerBase):
         self._last_applied_iface: Optional[str] = None
         self._last_applied_ip: Optional[str] = None
         self._last_applied_gateway: Optional[str] = None
+
+        self._adapter_cache: Dict[str, tuple[float, Optional[dict]]] = {}
+        self._gateway_cache: Dict[str, tuple[float, Optional[str]]] = {}
+        self._dns_cache: Dict[str, tuple[float, list[str]]] = {}
+
+        self._last_discovery_at: float = 0.0
+        self._last_route_scrub_at: float = 0.0
+        self._last_wifi_preserve_at: float = 0.0
+        self._last_switch_at: float = 0.0
+        self._public_probe_cursor: int = 0
 
     # ---------------------------------------------------------
     # lifecycle
@@ -16638,17 +16691,14 @@ class UplinkManager(_SmartManagerBase):
         friendly = str(cfg.get("friendly_name") or iface_full or "").strip()
         if not friendly:
             return False
-
         if self._is_virtual_or_ignored_iface_name(friendly):
             return False
-
         if not self._is_likely_real_uplink_iface(friendly):
             return False
-
         if cfg.get("disabled") is True:
             return False
-
         return True
+
     # ---------------------------------------------------------
     # packet observation
     # ---------------------------------------------------------
@@ -16658,67 +16708,111 @@ class UplinkManager(_SmartManagerBase):
         if packet is None:
             return
 
+        now = time.time()
+        saw_public = False
+
         try:
             src_ip, dst_ip = self._extract_ips(packet)
             for ip in (src_ip, dst_ip):
                 bare = str(ip).split("%")[0] if ip else None
                 if self._is_public_ipv4(bare):
                     self.learned_public_ips.add(bare)
+                    saw_public = True
         except Exception:
             pass
+
+        if not inbound_iface:
+            return
+
+        with self._candidate_lock:
+            for cand in self.candidates.values():
+                if inbound_iface not in (cand.iface_full, cand.iface_friendly):
+                    continue
+                cand.last_seen = now
+                if saw_public:
+                    cand.last_passive_public_at = now
+                    cand.passive_public_hits += 1
+                break
 
     # ---------------------------------------------------------
     # bootstrap / loop
     # ---------------------------------------------------------
 
     def _bootstrap(self) -> None:
-        self._enforce_netroute_safe_mode()
-        self._discover_candidates()
-        self._refresh_candidates_health()
-        self._preserve_wifi_link()
-        best = self._choose_best_candidate()
+        self._safe_call(self._enforce_netroute_safe_mode)
+        self._safe_call(self._discover_candidates)
+        self._safe_call(self._refresh_candidates_health)
+        self._safe_call(self._preserve_wifi_link)
+        best = self._safe_call(self._choose_best_candidate)
         if best:
-            self._activate_candidate(best)
+            self._safe_call(self._activate_candidate, best)
 
     def _health_loop(self) -> None:
         while not self._stop_event.wait(self._prefs["health_interval_sec"]):
             try:
-                self._enforce_netroute_safe_mode()
-                if self._prefs["remove_public_host_routes"]:
-                    self._scrub_public_host_routes()
+                now = time.time()
 
-                self._discover_candidates()
+                self._enforce_netroute_safe_mode()
+
+                if (now - self._last_route_scrub_at) >= float(self._prefs["route_scrub_interval_sec"]):
+                    if self._prefs["remove_public_host_routes"]:
+                        self._scrub_public_host_routes()
+                    self._last_route_scrub_at = now
+
+                if (now - self._last_discovery_at) >= float(self._prefs["discovery_interval_sec"]):
+                    self._discover_candidates()
+                    self._last_discovery_at = now
+
                 self._refresh_candidates_health()
-                self._preserve_wifi_link()
+
+                if (now - self._last_wifi_preserve_at) >= float(self._prefs["wifi_preserve_interval_sec"]):
+                    self._preserve_wifi_link()
+                    self._last_wifi_preserve_at = now
 
                 best = self._choose_best_candidate()
                 if best:
                     self._activate_candidate(best)
 
                 self._prune_stale_candidates()
+
             except Exception as e:
                 self._say("uplink_health_error", f"uplink loop hit {type(e).__name__}: {e}", ["⚠️", "🧩"])
 
     # ---------------------------------------------------------
     # discovery / probing
     # ---------------------------------------------------------
+
     def _prune_stale_candidates(self) -> None:
         now = time.time()
         stale_sec = float(self._prefs.get("candidate_stale_sec", 300.0))
 
-        for iface_full, cand in list(self.candidates.items()):
-            if self._is_virtual_or_ignored_iface_name(cand.iface_friendly):
-                self.candidates.pop(iface_full, None)
-                continue
+        with self._candidate_lock:
+            for iface_full, cand in list(self.candidates.items()):
+                if self._is_virtual_or_ignored_iface_name(cand.iface_friendly):
+                    self.candidates.pop(iface_full, None)
+                    continue
+                if (now - cand.last_seen) > stale_sec and iface_full != self.active_uplink_full:
+                    self.candidates.pop(iface_full, None)
 
-            if (now - cand.last_seen) > stale_sec and iface_full != self.active_uplink_full:
-                self.candidates.pop(iface_full, None)
     def _discover_candidates(self) -> None:
         if self._stop_event.is_set():
             return
 
         r = self.router
-        interfaces_config = getattr(r, "_interfaces_config", {}) or {}
+        interfaces_config = dict(getattr(r, "_interfaces_config", {}) or {})
+
+        # Synthesize current outbound iface if it exists but is missing from config.
+        current_out = getattr(r, "interface_out_full_name", None)
+        current_friendly = getattr(r, "interface_out_friendly_name", None)
+        if current_out and current_out not in interfaces_config:
+            interfaces_config[current_out] = {
+                "friendly_name": current_friendly or current_out,
+                "ip_addr": getattr(r, "router_ip_out", None),
+                "network": getattr(r, "router_network_out", None),
+                "gateway": getattr(r, "router_gateway_out_ip", None),
+            }
+
+        now = time.time()
 
         for iface_full, cfg in interfaces_config.items():
             if self._stop_event.is_set():
@@ -16728,76 +16822,151 @@ class UplinkManager(_SmartManagerBase):
                 continue
 
             friendly = str(cfg.get("friendly_name") or iface_full).strip()
-
-            info = self._get_ipv4_info_for_adapter(friendly)
+            info = self._get_cached_ipv4_info_for_adapter(friendly)
             if not info:
                 continue
 
             gateway_ip = cfg.get("gateway")
-            if not self._is_ipv4(gateway_ip):
-                gateway_ip = self._resolve_gateway_for_iface(friendly, info["ip"])
+            if (not self._is_ipv4(gateway_ip)) or self._is_cache_expired(now, self._gateway_cache.get(friendly), self._prefs["gateway_cache_ttl_sec"]):
+                gateway_ip = self._get_cached_gateway_for_iface(friendly, info["ip"])
 
-            cand = self.candidates.get(iface_full)
-            if cand is None:
-                cand = UplinkCandidate(iface_full=iface_full, iface_friendly=friendly)
-                self.candidates[iface_full] = cand
+            dns_servers = self._get_windows_dns_servers(friendly)
 
-            cand.iface_friendly = friendly
-            cand.ip = info["ip"]
-            cand.netmask = info["netmask"]
-            cand.network = info["network"]
-            cand.gateway_ip = gateway_ip
-            cand.last_seen = time.time()
-            cand.dns_servers = self._get_windows_dns_servers(friendly)
-            cand.link_up = self._iface_link_up(friendly)
+            with self._candidate_lock:
+                cand = self.candidates.get(iface_full)
+                if cand is None:
+                    cand = UplinkCandidate(iface_full=iface_full, iface_friendly=friendly)
+                    self.candidates[iface_full] = cand
 
-            cand.metadata["ignored_virtual"] = False
+                cand.iface_friendly = friendly
+                cand.ip = info["ip"]
+                cand.netmask = info["netmask"]
+                cand.network = info["network"]
+                cand.gateway_ip = gateway_ip
+                cand.last_seen = now
+                cand.dns_servers = dns_servers
+                cand.link_up = self._iface_link_up(friendly)
+                cand.metadata["ignored_virtual"] = False
+                cand.metadata["last_discovered_from"] = "interfaces_config"
+
     def _refresh_candidates_health(self) -> None:
-        for cand in list(self.candidates.values()):
-            ok_gateway = self._probe_gateway(cand)
-            ok_public = self._probe_public(cand)
+        now = time.time()
+        candidates = self._ordered_candidates_for_health()
+        if not candidates:
+            return
 
-            cand.gateway_ok = ok_gateway
-            cand.public_ok = ok_public
+        self._collect_manager_signals(candidates, now)
 
-            now = time.time()
-            if ok_public or ok_gateway:
-                cand.last_ok = now
-                cand.ok_count += 1
-            else:
-                cand.last_fail = now
-                cand.fail_count += 1
+        public_probe_budget = max(1, int(self._prefs["max_probe_candidates_per_loop"]))
 
-            cand.score = self._score_candidate(cand)
+        for idx, cand in enumerate(candidates):
+            do_gateway_probe = self._should_probe_gateway(cand, now, idx)
+            do_public_probe = public_probe_budget > 0 and self._should_probe_public(cand, now, idx)
+
+            gateway_ok = self._gateway_health_from_passive(cand, now, default=cand.gateway_ok)
+            public_ok = self._public_health_from_passive(cand, now, default=cand.public_ok)
+
+            if do_gateway_probe:
+                gateway_ok = self._probe_gateway(cand)
+
+            if do_public_probe:
+                public_ok = self._probe_public(cand)
+                public_probe_budget -= 1
+
+            with self._candidate_lock:
+                real = self.candidates.get(cand.iface_full)
+                if real is None:
+                    continue
+
+                real.gateway_ok = bool(gateway_ok)
+                real.public_ok = bool(public_ok)
+
+                if real.public_ok or real.gateway_ok:
+                    real.last_ok = now
+                    real.ok_count += 1
+                    real.fail_count = max(0, real.fail_count - 1)
+                    if real.public_ok:
+                        real.consecutive_public_failures = 0
+                else:
+                    real.last_fail = now
+                    real.fail_count += 1
+                    if do_public_probe:
+                        real.consecutive_public_failures += 1
+
+                real.score = self._score_candidate(real)
+                real.health_state = self._health_state_for_candidate(real)
 
     def _probe_gateway(self, cand: UplinkCandidate) -> bool:
         if not cand.link_up or not cand.ip or not cand.gateway_ip:
+            cand.last_gateway_probe = time.time()
+            cand.gateway_rtt_ms = None
             return False
 
-        for port in self._prefs["gateway_probe_ports"]:
-            if self._tcp_probe(bound_ip=cand.ip, host=cand.gateway_ip, port=port, timeout=1.0):
+        cand.last_gateway_probe = time.time()
+
+        # Fast-path: if the gateway looks sane for the adapter subnet, keep it as a soft-healthy path.
+        if self._gateway_looks_routable(cand):
+            cand.gateway_rtt_ms = 0.0
+            return True
+
+        for port in list(self._prefs["gateway_probe_ports"])[:2]:
+            ok, rtt_ms = self._timed_tcp_probe(bound_ip=cand.ip, host=cand.gateway_ip, port=port, timeout=0.8)
+            if ok:
+                cand.gateway_rtt_ms = rtt_ms
                 return True
+
+        cand.gateway_rtt_ms = None
         return False
 
     def _probe_public(self, cand: UplinkCandidate) -> bool:
         if not cand.link_up or not cand.ip:
+            cand.last_public_probe = time.time()
+            cand.public_rtt_ms = None
             return False
 
-        for host, port in self._prefs["public_probes"]:
-            if self._tcp_probe(bound_ip=cand.ip, host=host, port=port, timeout=1.2):
+        # Passive traffic is enough to skip an active check for a short window.
+        now = time.time()
+        if (now - cand.last_passive_public_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            cand.last_public_probe = now
+            cand.public_rtt_ms = 0.0
+            return True
+
+        probes = list(self._prefs["public_probes"] or self.DEFAULT_PUBLIC_PROBES)
+        if not probes:
+            probes = list(self.DEFAULT_PUBLIC_PROBES)
+
+        start = self._public_probe_cursor % len(probes)
+        ordered = probes[start:] + probes[:start]
+
+        # For candidates that were already healthy, try fewer probes to keep overhead down.
+        tries = 2 if cand.public_ok else min(3, len(ordered))
+
+        cand.last_public_probe = now
+        for host, port in ordered[:tries]:
+            ok, rtt_ms = self._timed_tcp_probe(bound_ip=cand.ip, host=host, port=port, timeout=1.0)
+            self._public_probe_cursor += 1
+            if ok:
+                cand.public_rtt_ms = rtt_ms
                 return True
+
+        cand.public_rtt_ms = None
         return False
 
     def _tcp_probe(self, *, bound_ip: str, host: str, port: int, timeout: float) -> bool:
+        ok, _rtt_ms = self._timed_tcp_probe(bound_ip=bound_ip, host=host, port=port, timeout=timeout)
+        return ok
+
+    def _timed_tcp_probe(self, *, bound_ip: str, host: str, port: int, timeout: float) -> tuple[bool, Optional[float]]:
         s = None
+        t0 = time.perf_counter()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.bind((bound_ip, 0))
             s.connect((host, port))
-            return True
+            return True, (time.perf_counter() - t0) * 1000.0
         except Exception:
-            return False
+            return False, None
         finally:
             try:
                 if s:
@@ -16810,50 +16979,69 @@ class UplinkManager(_SmartManagerBase):
         now = time.time()
 
         if cand.link_up:
-            score += 10.0
+            score += 8.0
         if cand.gateway_ok:
-            score += 20.0
+            score += 14.0
         if cand.public_ok:
-            score += 70.0
+            score += 72.0
 
-        score += min(cand.ok_count * 3.0, 18.0)
-        score -= min(cand.fail_count * 5.0, 30.0)
+        if (now - cand.last_passive_public_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            score += 12.0
+        if (now - cand.last_passive_nat_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            score += 7.0
+        if (now - cand.last_passive_arp_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            score += 5.0
+
+        score += min(cand.ok_count * 2.5, 15.0)
+        score -= min(cand.fail_count * 4.0, 28.0)
+        score -= min(cand.consecutive_public_failures * 3.0, 18.0)
+
+        if cand.public_rtt_ms is not None:
+            score -= min(cand.public_rtt_ms / 25.0, 10.0)
+        if cand.gateway_rtt_ms is not None and cand.gateway_rtt_ms > 0:
+            score -= min(cand.gateway_rtt_ms / 20.0, 6.0)
 
         if cand.iface_friendly in self._prefs["preferred_iface_names"]:
-            # prefer Wi-Fi staying around as a live candidate, but do not let that override public reachability
             score += 5.0
 
-        if self._prefs["keep_current_if_public"] and cand.iface_full == self.active_uplink_full and cand.public_ok:
-            score += 8.0
+        if self._prefs["keep_current_if_public"] and cand.iface_full == self.active_uplink_full:
+            score += 4.0
+            if cand.public_ok:
+                score += 8.0
 
         if (now - cand.last_seen) < 30.0:
-            score += 5.0
+            score += 4.0
 
         return score
 
     def _choose_best_candidate(self) -> Optional[UplinkCandidate]:
-        best = None
-        best_score = float("-inf")
+        with self._candidate_lock:
+            snapshot = list(self.candidates.values())
 
-        for cand in self.candidates.values():
-            if cand.score > best_score:
-                best = cand
-                best_score = cand.score
-
-        if best is None:
+        if not snapshot:
             return None
 
-        # Prefer candidates that can actually reach public IPs for router failover.
-        if self._prefs["allow_router_failover"]:
-            public_candidates = [c for c in self.candidates.values() if c.public_ok]
-            if public_candidates:
-                public_candidates.sort(key=lambda c: c.score, reverse=True)
-                best = public_candidates[0]
+        active = self.candidates.get(self.active_uplink_full) if self.active_uplink_full else None
+        public_candidates = [c for c in snapshot if c.public_ok]
 
-        # If nothing has public internet, keep the current/publicly-degraded Wi-Fi candidate alive as link-only.
-        if best.score < self._prefs["minimum_public_score_to_activate"]:
-            if self.active_uplink_full and self.active_uplink_full in self.candidates:
-                return self.candidates[self.active_uplink_full]
+        if self._prefs["allow_router_failover"] and public_candidates:
+            public_candidates.sort(key=lambda c: (c.score, c.ok_count, -c.fail_count), reverse=True)
+            best_public = public_candidates[0]
+
+            # Stick with the current public uplink unless the new one is meaningfully better.
+            if active and active.public_ok and (active.score + 6.0) >= best_public.score:
+                return active
+            return best_public
+
+        # No public-ready path: keep a sane current uplink if it still has link/gateway health.
+        if active and active.link_up and (active.gateway_ok or (time.time() - active.last_ok) < 60.0):
+            return active
+
+        snapshot.sort(key=lambda c: (c.score, c.ok_count, -c.fail_count), reverse=True)
+        best = snapshot[0]
+
+        if best.score < float(self._prefs["minimum_public_score_to_activate"]) and active:
+            return active
 
         return best
 
@@ -16866,6 +17054,17 @@ class UplinkManager(_SmartManagerBase):
             return False
         if not cand.ip:
             return False
+
+        now = time.time()
+        current = self.candidates.get(self.active_uplink_full) if self.active_uplink_full else None
+
+        if current and current.iface_full != cand.iface_full:
+            # Avoid rapid churn unless the current uplink lost public health and the new one has it.
+            in_cooldown = (now - self._last_switch_at) < float(self._prefs["activation_cooldown_sec"])
+            if in_cooldown and not ((not current.public_ok) and cand.public_ok):
+                return False
+            if current.public_ok and (current.score + 6.0) >= cand.score:
+                return False
 
         changed = (
             cand.iface_full != self._last_applied_iface
@@ -16881,7 +17080,6 @@ class UplinkManager(_SmartManagerBase):
             return False
 
         r = self.router
-
         old_out = getattr(r, "interface_out_full_name", None)
         if old_out and old_out in getattr(r, "_interfaces_config", {}):
             try:
@@ -16903,19 +17101,87 @@ class UplinkManager(_SmartManagerBase):
         cfg["gateway"] = cand.gateway_ip
         cfg["is_default_gateway_iface"] = True
 
-        try:
-            if getattr(r, "arp_manager", None) is not None and cand.gateway_ip:
-                r.arp_manager.set_default_gateway(r._interfaces_config, cand.gateway_ip)
-                r.arp_manager.router_ip_out = cand.ip
-        except Exception:
-            pass
+        self._apply_candidate_to_managers(cand)
 
-        try:
-            if getattr(r, "nat_manager", None) is not None:
-                r.nat_manager.router_ip_out = cand.ip
-        except Exception:
-            pass
+        self._last_applied_iface = cand.iface_full
+        self._last_applied_ip = cand.ip
+        self._last_applied_gateway = cand.gateway_ip
+        self._last_switch_at = now
 
+        with self._candidate_lock:
+            real = self.candidates.get(cand.iface_full)
+            if real:
+                real.last_activation = now
+                real.activation_count += 1
+            if current and current.iface_full != cand.iface_full:
+                current.flap_count += 1
+
+        extra = "public-ready" if cand.public_ok else "gateway-only"
+        self._say(
+            "uplink_activated",
+            f"activated uplink {cand.iface_friendly} {cand.ip} via {cand.gateway_ip} ({extra})",
+            ["🚀", "🌐", "🧭"],
+            cooldown=0.0,
+        )
+        return True
+
+    def _apply_candidate_to_managers(self, cand: UplinkCandidate) -> None:
+        r = self.router
+
+        # Generic attribute propagation so ARP / NAT / packet writer can react immediately.
+        for manager_name in ("arp_manager", "nat_manager", "packet_writer", "dns_manager"):
+            mgr = getattr(r, manager_name, None)
+            if mgr is None:
+                continue
+
+            for attr, value in (
+                ("interface_out_full_name", cand.iface_full),
+                ("interface_out_friendly_name", cand.iface_friendly),
+                ("router_ip_out", cand.ip),
+                ("router_netmask_out", cand.netmask),
+                ("router_network_out", cand.network),
+                ("router_gateway_out_ip", cand.gateway_ip),
+            ):
+                try:
+                    if hasattr(mgr, attr):
+                        setattr(mgr, attr, value)
+                except Exception:
+                    pass
+
+        # ARP: make the new uplink immediately useful to L2 resolution.
+        arp = getattr(r, "arp_manager", None)
+        if arp is not None:
+            try:
+                if cand.gateway_ip and hasattr(arp, "set_default_gateway"):
+                    arp.set_default_gateway(r._interfaces_config, cand.gateway_ip)
+            except Exception:
+                pass
+            try:
+                if cand.ip and hasattr(arp, "router_ip_out"):
+                    arp.router_ip_out = cand.ip
+            except Exception:
+                pass
+
+        # NAT: keep outbound identity in sync.
+        nat = getattr(r, "nat_manager", None)
+        if nat is not None:
+            try:
+                if hasattr(nat, "router_ip_out"):
+                    nat.router_ip_out = cand.ip
+            except Exception:
+                pass
+            try:
+                if hasattr(nat, "interface_out_full_name"):
+                    nat.interface_out_full_name = cand.iface_full
+            except Exception:
+                pass
+            try:
+                if hasattr(nat, "interface_out_friendly_name"):
+                    nat.interface_out_friendly_name = cand.iface_friendly
+            except Exception:
+                pass
+
+        # Packet writer: refresh interface snapshot once after switch.
         try:
             if getattr(r, "packet_writer", None) is not None:
                 r.packet_writer.update_interfaces(r._interfaces_config)
@@ -16925,11 +17191,13 @@ class UplinkManager(_SmartManagerBase):
         gm = self.gateway_manager or getattr(r, "gateway_manager", None)
         if gm is not None:
             try:
-                gm._learn_gateway_candidate(str(cand.gateway_ip), cand.iface_full, "uplink")
+                if cand.gateway_ip:
+                    gm._learn_gateway_candidate(str(cand.gateway_ip), cand.iface_full, "uplink")
             except Exception:
                 pass
             try:
-                gm._install_active_gateway(str(cand.gateway_ip), cand.iface_full)
+                if cand.gateway_ip:
+                    gm._install_active_gateway(str(cand.gateway_ip), cand.iface_full)
             except Exception:
                 pass
             try:
@@ -16941,19 +17209,6 @@ class UplinkManager(_SmartManagerBase):
             except Exception:
                 pass
 
-        self._last_applied_iface = cand.iface_full
-        self._last_applied_ip = cand.ip
-        self._last_applied_gateway = cand.gateway_ip
-
-        extra = "public-ready" if cand.public_ok else "gateway-only"
-        self._say(
-            "uplink_activated",
-            f"activated uplink {cand.iface_friendly} {cand.ip} via {cand.gateway_ip} ({extra})",
-            ["🚀", "🌐", "🧭"],
-            cooldown=0.0,
-        )
-        return True
-
     # ---------------------------------------------------------
     # Wi-Fi preservation / route protection
     # ---------------------------------------------------------
@@ -16963,24 +17218,24 @@ class UplinkManager(_SmartManagerBase):
             return
 
         preferred_names = set(self._prefs["preferred_iface_names"])
-        for cand in self.candidates.values():
+        for cand in self._ordered_candidates_for_health():
             if cand.iface_friendly not in preferred_names:
                 continue
+            if not (cand.link_up and cand.gateway_ip):
+                continue
 
-            if cand.link_up and cand.gateway_ip:
-                # Keep host side in upstream-preserving mode, but do not flap DHCP/address at runtime.
-                try:
-                    if hasattr(self.router, "_configure_host_preserving_upstream_mode"):
-                        self.router._configure_host_preserving_upstream_mode()
-                except Exception:
-                    pass
+            try:
+                if hasattr(self.router, "_configure_host_preserving_upstream_mode"):
+                    self.router._configure_host_preserving_upstream_mode()
+            except Exception:
+                pass
 
-                self._say(
-                    "wifi_preserved",
-                    f"keeping {cand.iface_friendly} online as a live gateway-linked candidate",
-                    ["📶", "🫶", "🔒"],
-                )
-                return
+            self._say(
+                "wifi_preserved",
+                f"keeping {cand.iface_friendly} online as a live gateway-linked candidate",
+                ["📶", "🫶", "🔒"],
+            )
+            return
 
     def _enforce_netroute_safe_mode(self) -> None:
         nr = getattr(self.router, "netroute_manager", None)
@@ -17004,26 +17259,34 @@ class UplinkManager(_SmartManagerBase):
         for host, _port in self._prefs["public_probes"]:
             targets.add(host)
 
-        for ip in sorted(targets):
-            if self._is_public_ipv4(ip):
-                self._remove_host_route_if_present(ip)
+        targets = {ip for ip in targets if self._is_public_ipv4(ip)}
+        if not targets:
+            return
+
+        self._remove_host_routes_if_present(sorted(targets))
 
     def _remove_host_route_if_present(self, ip: str) -> None:
-        ps = rf"""
-$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{ip}/32' -ErrorAction SilentlyContinue
-if ($route) {{
-  $route | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        if self._is_public_ipv4(ip):
+            self._remove_host_routes_if_present([ip])
+
+    def _remove_host_routes_if_present(self, ips: list[str]) -> None:
+        if not ips:
+            return
+
+        items = ", ".join(f"'{self._ps_quote(ip)}'" for ip in ips)
+        ps = f"""
+$targets = @({items})
+foreach ($ip in $targets) {{
+    $route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$ip/32" -ErrorAction SilentlyContinue
+    if ($route) {{
+        $route | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }}
 }}
 """
-        try:
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                capture_output=True,
-                text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception:
-            pass
+        self._run_subprocess(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            timeout=4.0,
+        )
 
     # ---------------------------------------------------------
     # candidate helpers
@@ -17053,89 +17316,81 @@ if ($route) {{
         Return IPv4 DNS servers configured on a Windows adapter.
 
         Tries PowerShell first, then falls back to parsing ipconfig.
+        Results are cached to keep the health loop light.
         """
-        servers: list[str] = []
-
         if not iface_friendly:
-            return servers
+            return []
 
-        # PowerShell path
-        try:
-            ps = rf"""
-    $servers = Get-DnsClientServerAddress -AddressFamily IPv4 -InterfaceAlias '{iface_friendly}' -ErrorAction SilentlyContinue
-    if ($servers) {{
-        $servers.ServerAddresses | ForEach-Object {{ $_ }}
-    }}
-    """
-            proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                capture_output=True,
-                text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if proc.returncode == 0:
-                for raw in (proc.stdout or "").splitlines():
-                    ip = raw.strip()
-                    if self._is_ipv4(ip) and ip not in servers:
-                        servers.append(ip)
-                if servers:
-                    return servers
-        except Exception:
-            pass
+        now = time.time()
+        cached = self._dns_cache.get(iface_friendly)
+        if cached and (now - cached[0]) <= float(self._prefs["dns_cache_ttl_sec"]):
+            return list(cached[1])
 
-        # ipconfig fallback
-        try:
-            proc = subprocess.run(
-                ["ipconfig", "/all"],
-                capture_output=True,
-                text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if proc.returncode != 0:
-                return servers
+        servers: list[str] = []
+        alias = self._ps_quote(iface_friendly)
 
-            lines = (proc.stdout or "").splitlines()
-            in_target = False
-            collecting_dns = False
+        proc = self._run_subprocess(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"""
+$servers = Get-DnsClientServerAddress -AddressFamily IPv4 -InterfaceAlias '{alias}' -ErrorAction SilentlyContinue
+if ($servers) {{
+    $servers.ServerAddresses | ForEach-Object {{ $_ }}
+}}
+""",
+            ],
+            timeout=3.0,
+        )
+        if proc and proc.returncode == 0:
+            for raw in (proc.stdout or "").splitlines():
+                ip = raw.strip()
+                if self._is_ipv4(ip) and ip not in servers:
+                    servers.append(ip)
 
-            for raw in lines:
-                line = raw.rstrip()
-                stripped = line.strip()
+        if not servers:
+            proc = self._run_subprocess(["ipconfig", "/all"], timeout=3.0)
+            if proc and proc.returncode == 0:
+                lines = (proc.stdout or "").splitlines()
+                in_target = False
+                collecting_dns = False
 
-                # New adapter section
-                if stripped and not raw.startswith((" ", "\t")) and stripped.endswith(":"):
-                    header = stripped[:-1].strip()
-                    in_target = iface_friendly.lower() in header.lower()
-                    collecting_dns = False
-                    continue
+                for raw in lines:
+                    line = raw.rstrip()
+                    stripped = line.strip()
 
-                if not in_target:
-                    continue
-
-                # DNS line start
-                if "DNS Servers" in stripped:
-                    parts = stripped.split(":", 1)
-                    if len(parts) == 2:
-                        ip = parts[1].strip()
-                        if self._is_ipv4(ip) and ip not in servers:
-                            servers.append(ip)
-                    collecting_dns = True
-                    continue
-
-                # Continuation lines for additional DNS entries
-                if collecting_dns:
-                    if not stripped:
+                    if stripped and not raw.startswith((" ", "\t")) and stripped.endswith(":"):
+                        header = stripped[:-1].strip()
+                        in_target = iface_friendly.lower() in header.lower()
                         collecting_dns = False
                         continue
-                    if ":" in stripped and not self._is_ipv4(stripped):
-                        collecting_dns = False
+
+                    if not in_target:
                         continue
-                    if self._is_ipv4(stripped) and stripped not in servers:
-                        servers.append(stripped)
 
-        except Exception:
-            pass
+                    if "DNS Servers" in stripped:
+                        parts = stripped.split(":", 1)
+                        if len(parts) == 2:
+                            ip = parts[1].strip()
+                            if self._is_ipv4(ip) and ip not in servers:
+                                servers.append(ip)
+                        collecting_dns = True
+                        continue
 
+                    if collecting_dns:
+                        if not stripped:
+                            collecting_dns = False
+                            continue
+                        if ":" in stripped and not self._is_ipv4(stripped):
+                            collecting_dns = False
+                            continue
+                        if self._is_ipv4(stripped) and stripped not in servers:
+                            servers.append(stripped)
+
+        self._dns_cache[iface_friendly] = (now, list(servers))
         return servers
 
     @staticmethod
@@ -17145,16 +17400,18 @@ if ($route) {{
             return True
         except Exception:
             return False
+
     def _iface_link_up(self, iface_friendly: str) -> bool:
         try:
-            stats = psutil.net_if_stats().get(iface_friendly)
-            if stats is not None:
-                return bool(stats.isup)
+            stats = psutil.net_if_stats()
+            if iface_friendly in stats:
+                return bool(stats[iface_friendly].isup)
+            for name, st in stats.items():
+                if iface_friendly.lower() == str(name).lower():
+                    return bool(st.isup)
         except Exception:
             pass
         return True
-
-
 
     @staticmethod
     def _is_public_ipv4(ip: Optional[str]) -> bool:
@@ -17172,6 +17429,235 @@ if ($route) {{
         except Exception:
             return False
 
+    # ---------------------------------------------------------
+    # internal helpers
+    # ---------------------------------------------------------
+
+    def _safe_call(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+
+    def _ps_quote(self, value: str) -> str:
+        return str(value).replace("'", "''")
+
+    def _run_subprocess(self, args: list[str], timeout: float = 3.0) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return None
+
+    def _is_cache_expired(self, now: float, item: Optional[tuple], ttl: float) -> bool:
+        if not item:
+            return True
+        return (now - float(item[0])) > float(ttl)
+
+    def _get_cached_ipv4_info_for_adapter(self, iface_friendly: str) -> Optional[dict]:
+        now = time.time()
+        cached = self._adapter_cache.get(iface_friendly)
+        if cached and not self._is_cache_expired(now, cached, self._prefs["adapter_cache_ttl_sec"]):
+            return cached[1]
+
+        info = None
+        try:
+            info = self._get_ipv4_info_for_adapter(iface_friendly)
+            if info and info.get("ip") and info.get("netmask") and not info.get("network"):
+                info["network"] = ipaddress.ip_network(f"{info['ip']}/{info['netmask']}", strict=False)
+        except Exception:
+            info = None
+
+        self._adapter_cache[iface_friendly] = (now, info)
+        return info
+
+    def _get_cached_gateway_for_iface(self, iface_friendly: str, local_ip: Optional[str]) -> Optional[str]:
+        now = time.time()
+        cached = self._gateway_cache.get(iface_friendly)
+        if cached and not self._is_cache_expired(now, cached, self._prefs["gateway_cache_ttl_sec"]):
+            return cached[1]
+
+        gw = self._resolve_gateway_for_iface(iface_friendly, local_ip)
+        self._gateway_cache[iface_friendly] = (now, gw)
+        return gw
+
+    def _ordered_candidates_for_health(self) -> list[UplinkCandidate]:
+        with self._candidate_lock:
+            snapshot = list(self.candidates.values())
+
+        preferred = set(self._prefs["preferred_iface_names"])
+
+        def key(c: UplinkCandidate):
+            return (
+                1 if c.iface_full == self.active_uplink_full else 0,
+                1 if c.iface_friendly in preferred else 0,
+                1 if c.link_up else 0,
+                c.last_seen,
+            )
+
+        snapshot.sort(key=key, reverse=True)
+        return snapshot
+
+    def _should_probe_gateway(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
+        base_gap = float(self._prefs["min_probe_gap_sec"])
+        if cand.iface_full == self.active_uplink_full:
+            return (now - cand.last_gateway_probe) >= base_gap
+        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
+            return (now - cand.last_gateway_probe) >= (base_gap * 1.5)
+        return idx < 2 and (now - cand.last_gateway_probe) >= (base_gap * 2.5)
+
+    def _should_probe_public(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
+        base_gap = float(self._prefs["min_probe_gap_sec"])
+        if cand.iface_full == self.active_uplink_full:
+            return (now - cand.last_public_probe) >= base_gap
+        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
+            return (now - cand.last_public_probe) >= (base_gap * 1.5)
+        return idx < int(self._prefs["max_probe_candidates_per_loop"]) and (now - cand.last_public_probe) >= (base_gap * 3.0)
+
+    def _gateway_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
+        if not cand.link_up or not cand.ip or not cand.gateway_ip:
+            return False
+        if (now - cand.last_passive_arp_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            return True
+        if self._gateway_looks_routable(cand):
+            return True
+        return bool(default)
+
+    def _public_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
+        ttl = float(self._prefs["passive_signal_ttl_sec"])
+        if (now - cand.last_passive_public_at) <= ttl:
+            return True
+        if (now - cand.last_passive_nat_at) <= ttl:
+            return True
+        if cand.iface_full == self.active_uplink_full and (now - cand.last_ok) <= ttl and cand.consecutive_public_failures <= 1:
+            return True
+        return bool(default)
+
+    def _health_state_for_candidate(self, cand: UplinkCandidate) -> str:
+        if cand.public_ok:
+            return "public"
+        if cand.gateway_ok:
+            return "gateway"
+        if cand.link_up:
+            return "link"
+        return "down"
+
+    def _gateway_looks_routable(self, cand: UplinkCandidate) -> bool:
+        if not cand.ip or not cand.gateway_ip or cand.network is None:
+            return False
+        try:
+            gw = ipaddress.IPv4Address(str(cand.gateway_ip))
+            return gw in cand.network
+        except Exception:
+            return False
+
+    def _collect_manager_signals(self, candidates: list[UplinkCandidate], now: float) -> None:
+        arp = getattr(self.router, "arp_manager", None)
+        nat = getattr(self.router, "nat_manager", None)
+
+        for cand in candidates:
+            if self._candidate_has_arp_signal(arp, cand):
+                cand.last_passive_arp_at = now
+                cand.passive_arp_hits += 1
+            if self._candidate_has_nat_signal(nat, cand):
+                cand.last_passive_nat_at = now
+                cand.passive_nat_hits += 1
+
+    def _candidate_has_arp_signal(self, arp_manager: Any, cand: UplinkCandidate) -> bool:
+        if arp_manager is None:
+            return False
+        tokens = self._candidate_tokens(cand)
+        for attr in (
+            "arp_table",
+            "arp_cache",
+            "ip_to_mac",
+            "resolved_ips",
+            "gateway_mac_cache",
+            "bindings",
+            "_bindings",
+            "_ip_cache",
+        ):
+            if self._container_contains_any(getattr(arp_manager, attr, None), tokens):
+                return True
+        return False
+
+    def _candidate_has_nat_signal(self, nat_manager: Any, cand: UplinkCandidate) -> bool:
+        if nat_manager is None:
+            return False
+        tokens = self._candidate_tokens(cand)
+        for attr in (
+            "_nat_table",
+            "nat_table",
+            "_sessions",
+            "sessions",
+            "flows",
+            "_flows",
+            "conntrack",
+            "_conntrack",
+            "translations",
+            "_translations",
+            "leases",
+            "_leases",
+        ):
+            if self._container_contains_any(getattr(nat_manager, attr, None), tokens):
+                return True
+        return False
+
+    def _candidate_tokens(self, cand: UplinkCandidate) -> set[str]:
+        tokens = {
+            str(cand.iface_full or "").lower(),
+            str(cand.iface_friendly or "").lower(),
+            str(cand.ip or "").lower(),
+            str(cand.gateway_ip or "").lower(),
+        }
+        return {t for t in tokens if t}
+
+    def _container_contains_any(self, obj: Any, tokens: set[str], depth: int = 2, max_items: int = 32) -> bool:
+        if obj is None or depth < 0 or not tokens:
+            return False
+
+        if isinstance(obj, dict):
+            for idx, (k, v) in enumerate(obj.items()):
+                if idx >= max_items:
+                    break
+                if self._container_contains_any(k, tokens, depth - 1, max_items):
+                    return True
+                if self._container_contains_any(v, tokens, depth - 1, max_items):
+                    return True
+            return False
+
+        if isinstance(obj, (list, tuple, set)):
+            for idx, item in enumerate(obj):
+                if idx >= max_items:
+                    break
+                if self._container_contains_any(item, tokens, depth - 1, max_items):
+                    return True
+            return False
+
+        if isinstance(obj, bytes):
+            try:
+                text = obj.decode("utf-8", errors="ignore").lower()
+                return any(tok in text for tok in tokens)
+            except Exception:
+                return False
+
+        if isinstance(obj, (str, int, float)):
+            text = str(obj).lower()
+            return any(tok in text for tok in tokens)
+
+        for attr in ("ip", "gateway", "iface", "interface", "ifname", "friendly_name", "ip_addr", "local_ip", "remote_ip", "src", "dst"):
+            try:
+                if hasattr(obj, attr) and self._container_contains_any(getattr(obj, attr), tokens, depth - 1, max_items):
+                    return True
+            except Exception:
+                pass
+
+        return False
 
 class LanManager(_SmartManagerBase):
     """
