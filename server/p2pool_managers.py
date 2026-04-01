@@ -1903,14 +1903,23 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             # --- Packet is NOT for the router, so it must be a transit packet. ---
             # Step 2: Perform Layer 3 and above processing for transit traffic.
             # mDNS stays separate (5353/UDP, local-scope)
-            if UDP in packet and int(packet[UDP].dport) == 5353:
-                if self.mdns_manager.handle_packet(packet):
+            if UDP in packet and (int(packet[UDP].dport) == 5353 or int(packet[UDP].sport) == 5353):
+                handled = False
+                try:
+                    handled = bool(self.mdns_manager.handle_packet(packet))
+                except Exception as e:
+                    self.router_logger.log_message(f"[mDNS] ❗ Exception while handling mDNS packet: {e}")
+                    handled = True  # consume so it does not fall through into normal DNS
+
+                if handled:
                     self.code_output_manager.submit_packet(
-                        packet, inbound_iface=inbound_iface,
+                        packet,
+                        inbound_iface=inbound_iface,
                         phase="handled",
-                        component="mdns"
+                        component="mdns",
                     )
-                    return
+                return
+
             dns = packet.getlayer(DNS)
             if dns:
                 # Upstream answers (consume when they are ours)

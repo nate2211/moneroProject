@@ -1646,56 +1646,82 @@ class BroadcastManager:
 class mDNSManager:
     """
     Manages Multicast DNS (mDNS) traffic for local service discovery.
-    Listens for announcements, caches them, and forwards queries between interfaces.
-    Includes query suppression to prevent flooding.
+
+    Goals:
+      - never crash if interfaces_config changes while forwarding
+      - forward queries safely using a snapshot of interfaces_config
+      - suppress duplicate query floods
+      - cache announcements/answers
+      - keep logs clear with emojis
+      - avoid poisoning the normal DNS manager path
     """
 
-    # mDNS uses a specific multicast address and port
     MDNS_IPV4_ADDR = "224.0.0.251"
     MDNS_IPV6_ADDR = "ff02::fb"
     MDNS_PORT = 5353
-    MDNS_CACHE_TTL = 3600  # Default cache time in seconds
-    QUERY_COOLDOWN_SECONDS = .2  # Don't forward the same query from the same IP more than once every 10s
+    MDNS_CACHE_TTL = 3600
+    QUERY_COOLDOWN_SECONDS = 0.2
+    CACHE_MIN_TTL = 60
 
     def __init__(self, router_logger, packet_writer, interfaces_config):
         self.logger = router_logger
         self.packet_writer = packet_writer
         self.interfaces_config = interfaces_config
 
-        # Service cache for responding to queries
         self._cache: Dict[Tuple[str, int], Tuple[Any, float]] = {}
-        self._cache_lock = threading.Lock()
+        self._cache_lock = threading.RLock()
 
-        # Query log for rate-limiting forwards
         self._recent_queries: Dict[Tuple[str, int, str], float] = {}
-        self._query_log_lock = threading.Lock()
+        self._query_log_lock = threading.RLock()
+
         self._cleanup_thread = None
         self._stop_event = threading.Event()
         self.sniffer = None
-        self.logger.log_message("[mDNS] Manager initialized. Query forwarding cooldown is active.")
+
+        self._elog("init", "Manager initialized. Query forwarding cooldown is active.", ["🧠", "📡", "🛡️"])
+
+    # ===================== Logging =====================
+
+    def _log(self, msg: str):
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _elog(self, section: str, message: str, emojis: Optional[List[str]] = None):
+        emoji = random.choice(emojis or ["📡"])
+        self._log(f"[mDNS][{str(section).upper()}] {emoji} {message}")
+
+    # ===================== Lifecycle =====================
 
     def start(self):
         """Starts the mDNS manager's background cleanup thread."""
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._elog("lifecycle", "Start skipped because cleanup thread is already running.", ["🔁", "📬"])
+            return
+
         self._stop_event.clear()
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="mDNSCleanup")
         self._cleanup_thread.start()
-        self.logger.log_message("[mDNS] Cleanup thread started.")
+        self._elog("lifecycle", "Cleanup thread started.", ["🚀", "🧹", "🟢"])
 
     def stop(self):
         """Stops the mDNS manager's background cleanup thread gracefully."""
         self._stop_event.set()
-        if self._cleanup_thread:
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
             self._cleanup_thread.join(timeout=2)
-        self.logger.log_message("[mDNS] Manager stopped.")
+        self._elog("lifecycle", "Manager stopped.", ["🛑", "🌙", "📪"])
 
     def _cleanup_loop(self):
         """Periodically cleans expired services from the cache and old entries from the query log."""
+        self._elog("cleanup", "Cleanup loop started.", ["🧹", "🔄", "📚"])
         while not self._stop_event.is_set():
             now = time.time()
+
             with self._cache_lock:
                 expired_services = [key for key, (_, expiry) in self._cache.items() if expiry <= now]
                 for key in expired_services:
-                    del self._cache[key]
+                    self._cache.pop(key, None)
 
             with self._query_log_lock:
                 expired_queries = [
@@ -1703,85 +1729,217 @@ class mDNSManager:
                     if (now - timestamp) > self.QUERY_COOLDOWN_SECONDS
                 ]
                 for key in expired_queries:
-                    del self._recent_queries[key]
+                    self._recent_queries.pop(key, None)
 
-            self._stop_event.wait(30)
+            self._stop_event.wait(30.0)
 
-    # [FIXED] Corrected the logical flow to remove duplicated query handling blocks.
+        self._elog("cleanup", "Cleanup loop stopped.", ["🛑", "🧹", "🌙"])
+
+    # ===================== Packet Identification =====================
+
+    def _is_mdns_packet(self, packet: Packet) -> bool:
+        if not (packet.haslayer(UDP) and packet.haslayer(DNS)):
+            return False
+
+        try:
+            sport = int(packet[UDP].sport)
+            dport = int(packet[UDP].dport)
+        except Exception:
+            return False
+
+        if sport != self.MDNS_PORT and dport != self.MDNS_PORT:
+            return False
+
+        try:
+            if IP in packet:
+                dst = str(packet[IP].dst)
+                src = str(packet[IP].src)
+                return dst == self.MDNS_IPV4_ADDR or src == self.MDNS_IPV4_ADDR
+            if IPv6 in packet:
+                dst = str(packet[IPv6].dst).split("%", 1)[0].lower()
+                src = str(packet[IPv6].src).split("%", 1)[0].lower()
+                return dst == self.MDNS_IPV6_ADDR or src == self.MDNS_IPV6_ADDR
+        except Exception:
+            return True
+
+        return True
+
+    def _packet_src_ip(self, packet: Packet) -> str:
+        try:
+            if IPv6 in packet:
+                return str(packet[IPv6].src)
+            if IP in packet:
+                return str(packet[IP].src)
+        except Exception:
+            pass
+        return "unknown"
+
+    def _packet_dst_ip(self, packet: Packet) -> str:
+        try:
+            if IPv6 in packet:
+                return str(packet[IPv6].dst)
+            if IP in packet:
+                return str(packet[IP].dst)
+        except Exception:
+            pass
+        return "unknown"
+
+    def _inbound_iface(self, packet: Packet) -> Optional[str]:
+        return getattr(packet, "_dns_inbound_iface", None) or getattr(packet, "sniffed_on", None)
+
+    # ===================== Safe Config Snapshot =====================
+
+    def _snapshot_interfaces_config(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Take a stable snapshot of the top-level interfaces_config mapping so
+        concurrent router updates cannot raise 'dictionary changed size during iteration'.
+        """
+        try:
+            raw = self.interfaces_config or {}
+            items = list(raw.items())
+        except Exception as e:
+            self._elog("forward", f"Failed to snapshot interfaces_config: {e}", ["⚠️", "💥", "📋"])
+            return []
+
+        snap: List[Tuple[str, Dict[str, Any]]] = []
+        for iface_name, cfg in items:
+            try:
+                if isinstance(cfg, dict):
+                    snap.append((iface_name, dict(cfg)))
+                else:
+                    snap.append((iface_name, {}))
+            except Exception:
+                snap.append((iface_name, {}))
+        return snap
+
+    # ===================== DNS Record Helpers =====================
+
+    def _iter_dns_rr(self, first_rr) -> List[Any]:
+        """
+        Scapy may store answer chains as rr / rr / rr.
+        This turns that chain into a simple list safely.
+        """
+        out = []
+        rr = first_rr
+        seen = 0
+        while rr is not None and seen < 64:
+            out.append(rr)
+            rr = getattr(rr, "payload", None)
+            if rr is None or rr.__class__.__name__ == "NoPayload":
+                break
+            seen += 1
+        return out
+
+    def _make_rr_for_cached_data(self, qname: str, qtype: int, data: Any, ttl: int) -> Optional[Any]:
+        try:
+            if qtype == 1:   # A
+                return DNSRR(rrname=qname, type=1, ttl=ttl, rdata=str(data))
+            if qtype == 28:  # AAAA
+                return DNSRR(rrname=qname, type=28, ttl=ttl, rdata=str(data))
+            if qtype == 12:  # PTR
+                return DNSRR(rrname=qname, type=12, ttl=ttl, rdata=str(data))
+            if qtype == 16:  # TXT
+                return DNSRR(rrname=qname, type=16, ttl=ttl, rdata=str(data))
+            if qtype == 33:  # SRV
+                # If cached raw is already scapy-friendly, let it through if possible
+                return DNSRR(rrname=qname, type=33, ttl=ttl, rdata=data)
+        except Exception:
+            return None
+        return None
+
+    # ===================== Main Packet Handling =====================
+
     def handle_packet(self, packet: Packet) -> bool:
         """
         Processes an incoming packet to see if it's an mDNS announcement or query.
         Returns True if the packet was handled by this manager.
         """
-        if not (packet.haslayer(UDP) and packet[UDP].dport == self.MDNS_PORT and packet.haslayer(DNS)):
+        if not self._is_mdns_packet(packet):
             return False
 
         dns_layer = packet[DNS]
 
-        # Use if/elif to correctly handle mutually exclusive packet types (Query vs Answer)
-        if dns_layer.qr == 0 and dns_layer.qd:
-            # --- Handle Queries (qr=0) ---
+        # Queries
+        if int(getattr(dns_layer, "qr", 0)) == 0 and getattr(dns_layer, "qd", None):
             try:
-                qname = dns_layer.qd.qname.decode()
-                qtype = dns_layer.qd.qtype
-                src_ip = packet[IPv6].src if packet.haslayer(IPv6) else packet[IP].src
-            except (IndexError, AttributeError):
-                self.logger.log_message("[mDNS] ⚠️ Received malformed mDNS query packet.")
+                qname = dns_layer.qd.qname.decode(errors="ignore").rstrip(".") + "."
+                qtype = int(dns_layer.qd.qtype)
+                src_ip = self._packet_src_ip(packet)
+                in_iface = self._inbound_iface(packet)
+            except Exception as e:
+                self._elog("query", f"Received malformed mDNS query packet: {e}", ["⚠️", "❓", "📭"])
                 return True
 
-            self.logger.log_message(f"[mDNS] ❓ Received query for '{qname}' (Type: {qtype}) from {src_ip}")
+            self._elog(
+                "query",
+                f"Received query for '{qname}' type={qtype} from {src_ip} iface={in_iface}",
+                ["❓", "📨", "🌍"]
+            )
 
-            # Perform rate-limiting check
+            # rate-limiting
             now = time.time()
             query_key = (qname, qtype, src_ip)
             with self._query_log_lock:
-                if (now - self._recent_queries.get(query_key, 0)) < self.QUERY_COOLDOWN_SECONDS:
-                    self.logger.log_message(f"[mDNS] 🚫 Suppressing duplicate query for '{qname}' from {src_ip}.")
+                if (now - self._recent_queries.get(query_key, 0.0)) < self.QUERY_COOLDOWN_SECONDS:
+                    self._elog("query", f"Suppressing duplicate query for '{qname}' from {src_ip}.", ["🚫", "🔁", "🧯"])
                     return True
                 self._recent_queries[query_key] = now
 
-            # If not rate-limited, decide whether to answer from cache or forward
             cached_answer = self.get_cached_answer(qname, qtype)
-            if cached_answer:
-                self.logger.log_message(f"[mDNS] ✅ Answering query for '{qname}' from cache.")
+            if cached_answer is not None:
+                self._elog("cache", f"Answering query for '{qname}' from cache.", ["✅", "📦", "⚡"])
                 self._send_mdns_response(packet, qname, qtype, cached_answer)
             else:
                 self._forward_mdns_query(packet)
+
             return True
 
-        elif dns_layer.qr == 1 and dns_layer.an:
-            # --- Handle Announcements (qr=1) ---
-            for answer in dns_layer.an:
+        # Announcements / answers
+        if int(getattr(dns_layer, "qr", 0)) == 1 and getattr(dns_layer, "an", None):
+            count = 0
+            for answer in self._iter_dns_rr(dns_layer.an):
                 try:
-                    record_name = answer.rrname.decode()
-                    record_type = answer.type
-                    record_data = answer.rdata if hasattr(answer, 'rdata') else None
+                    record_name = answer.rrname.decode(errors="ignore").rstrip(".") + "."
+                    record_type = int(answer.type)
+                    record_data = getattr(answer, "rdata", None)
+                    ttl = int(getattr(answer, "ttl", self.MDNS_CACHE_TTL))
 
-                    self.cache_service(record_name, record_type, record_data, answer.ttl)
-                    self.logger.log_message(f"[mDNS] 📡 Discovered service: {answer.summary()}")
+                    self.cache_service(record_name, record_type, record_data, ttl)
+                    count += 1
+                    self._elog("announce", f"Discovered service: {answer.summary()}", ["📡", "🧾", "✅"])
                 except Exception as e:
-                    self.logger.log_message(f"[mDNS] ⚠️ Failed to parse DNS answer record '{answer.summary()}': {e}")
+                    try:
+                        summary = answer.summary()
+                    except Exception:
+                        summary = "<unknown rr>"
+                    self._elog("announce", f"Failed to parse answer record '{summary}': {e}", ["⚠️", "💥", "📦"])
+
+            if count:
+                self._elog("announce", f"Cached {count} announcement record(s).", ["📚", "📡", "🗂️"])
             return True
 
-        return False
+        self._elog("packet", "mDNS packet recognized but not actionable.", ["🧩", "📭"])
+        return True
+
+    # ===================== Cache =====================
 
     def cache_service(self, name: str, record_type: int, data: Any, ttl: int):
         """Adds a service discovery record to the cache with an expiry time."""
-        effective_ttl = max(ttl, 60)
+        effective_ttl = max(int(ttl or 0), self.CACHE_MIN_TTL)
         expiry = time.time() + effective_ttl
         with self._cache_lock:
-            self._cache[(name, record_type)] = (data, expiry)
+            self._cache[(name, int(record_type))] = (data, expiry)
+        self._elog("cache", f"Cached service name={name} type={record_type} ttl={effective_ttl}", ["📦", "🗂️", "✅"])
 
     def get_cached_answer(self, name: str, record_type: int) -> Optional[Any]:
         """Retrieves an active record from the cache, if one exists."""
         with self._cache_lock:
-            record = self._cache.get((name, record_type))
+            record = self._cache.get((name, int(record_type)))
             if record:
                 data, expiry = record
                 if time.time() < expiry:
                     return data
-                else:
-                    del self._cache[(name, record_type)]
+                self._cache.pop((name, int(record_type)), None)
         return None
 
     def get_services(self) -> List[Dict[str, Any]]:
@@ -1793,171 +1951,123 @@ class mDNSManager:
                 if now < expiry:
                     active_services.append({"name": name, "type": rtype, "data": data})
                 else:
-                    del self._cache[(name, rtype)]
+                    self._cache.pop((name, rtype), None)
         return active_services
 
-    # [FIXED] Updated to support PTR, TXT, and SRV records for service discovery.
-    def _send_mdns_response(self, original_packet: Packet, qname: str, qtype: int, answer_data: Any):
+    # ===================== Response / Forward =====================
+
+    def _send_mdns_response(self, request_packet: Packet, qname: str, qtype: int, cached_answer: Any):
         """
-        Builds and queues an mDNS response packet based on a cached answer.
-        Now supports A, AAAA, PTR, TXT, and SRV records.
+        Best-effort mDNS cache response. Keeps this conservative and local-scope.
         """
-        inbound_iface = original_packet.sniffed_on
-        iface_config = self.interfaces_config.get(inbound_iface)
-        if not iface_config:
-            self.logger.log_message(f"[mDNS] ❌ Cannot send response: Interface '{inbound_iface}' not configured.")
-            return
-
-        router_mac = iface_config.get("mac")
-        is_ipv6 = original_packet.haslayer(IPv6)
-        dns_rr = None
-
-        # Craft the DNS response record based on the query type (qtype)
-        if qtype == 1:    # A Record
-            dns_rr = DNSRR(rrname=qname, type="A", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        elif qtype == 12:   # PTR Record
-            dns_rr = DNSRR(rrname=qname, type="PTR", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        elif qtype == 16:   # TXT Record
-            # TXT rdata is often a list of strings
-            dns_rr = DNSRR(rrname=qname, type="TXT", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        elif qtype == 28:   # AAAA Record
-            dns_rr = DNSRR(rrname=qname, type="AAAA", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        elif qtype == 33:   # SRV Record
-            # SRV rdata is a complex type (priority, weight, port, target)
-            dns_rr = DNSRR(rrname=qname, type="SRV", rdata=answer_data, ttl=self.MDNS_CACHE_TTL)
-        else:
-            self.logger.log_message(f"[mDNS] ⚠️ Cannot craft response: Unsupported record type {qtype}")
-            return
-
-        # Build the full response packet
-        if is_ipv6:
-            src_ip = iface_config.get("ipv6_addr")
-            dst_ip = self.MDNS_IPV6_ADDR
-            eth_dst = "33:33:00:00:00:fb"
-        else:
-            src_ip = iface_config.get("ip_addr")
-            dst_ip = self.MDNS_IPV4_ADDR
-            eth_dst = "01:00:5e:00:00:fb"
-
-        if not src_ip or not router_mac:
-            self.logger.log_message(f"[mDNS] ❌ Cannot send response from {inbound_iface}: Missing IP or MAC.")
-            return
-
-        response_packet = Ether(src=router_mac, dst=eth_dst) / \
-                          (IPv6(src=src_ip, dst=dst_ip) if is_ipv6 else IP(src=src_ip, dst=dst_ip)) / \
-                          UDP(sport=self.MDNS_PORT, dport=self.MDNS_PORT) / \
-                          DNS(id=original_packet[DNS].id, qr=1, aa=1, qd=original_packet[DNS].qd, an=dns_rr)
-
-        self.sniffer.send(response_packet, inbound_iface)
-        self.logger.log_message(f"[mDNS] ✅ Sent mDNS response for '{qname}' (Type: {qtype}) on {inbound_iface.split('_')[-1]}")
-
-    def _forward_mdns_query(self, original_packet: Packet):
-        """
-        Re-emit an mDNS query to all *other* non-loopback interfaces.
-        - If the egress iface is L2-capable and has a MAC -> send L2 (Ether dst = mcast MAC)
-        - Otherwise -> send L3 (no Ether) with TTL/HopLimit=255
-        - Never try to forward *from* loopback *to* loopback (that would stay local)
-        """
-        inbound_iface = getattr(original_packet, "sniffed_on", None)
-
-        # Extract DNS qname (best-effort)
         try:
-            qname = (original_packet[DNS].qd.qname or b"").decode(errors="ignore")
-        except Exception:
-            qname = "?"
+            ttl = self.MDNS_CACHE_TTL
+            rr = self._make_rr_for_cached_data(qname, qtype, cached_answer, ttl)
+            if rr is None:
+                self._elog("reply", f"Cached answer exists but RR build is unsupported for q={qname} type={qtype}", ["⚠️", "🧩", "📭"])
+                return
 
-        is_v6_in = IPv6 in original_packet
-        MDNS_IPv4 = "224.0.0.251"
-        MDNS_IPv6 = "ff02::fb"
-        MDNS_PORT = 5353
+            resp = request_packet.copy()
+            resp[DNS].qr = 1
+            resp[DNS].aa = 1
+            resp[DNS].rcode = 0
+            resp[DNS].an = rr
+            resp[DNS].ancount = 1
+            resp[DNS].nscount = 0
+            resp[DNS].arcount = 0
 
-        # mDNS multicast destination + L2 multicast MACs
-        dst_ip_mcast = MDNS_IPv6 if is_v6_in else MDNS_IPv4
-        dst_mac_mcast = "33:33:00:00:00:fb" if is_v6_in else "01:00:5e:00:00:fb"
+            if IP in resp:
+                resp[IP].src = self._packet_dst_ip(request_packet)
+                resp[IP].dst = self.MDNS_IPV4_ADDR
+            elif IPv6 in resp:
+                resp[IPv6].dst = self.MDNS_IPV6_ADDR
+                # leave src as-is unless caller/router set it elsewhere
 
-        # Pull the DNS payload to reuse as-is
-        try:
-            dns_layer = original_packet[DNS].copy()
-            dns_layer.qr = 0  # ensure it's a QUERY when re-emitting
-        except Exception:
-            self.logger.log_message("[mDNS] ⚠️ Cannot forward: malformed DNS layer.")
-            return
-
-        for iface_name, cfg in (self.interfaces_config or {}).items():
-            # Skip the inbound iface and any obvious loopback device
-            if iface_name == inbound_iface:
-                continue
-            if "\\npf_loopback" in iface_name.lower() or iface_name.lower() in ("lo", "lo0", "loopback"):
-                continue
-
-            # Pick source IP and MAC for this egress
-            src_ip = (cfg.get("ipv6_ll") or cfg.get("ipv6_addr")) if is_v6_in else cfg.get("ip_addr")
-            src_mac = cfg.get("mac")
-            if not src_ip:
-                # If we have no IP for this family, skip this iface
-                continue
-
-            # Build L3 header with TTL/HopLimit=255 (required by mDNS)
-            if is_v6_in:
-                l3 = IPv6(src=src_ip, dst=MDNS_IPv6, hlim=255)
-            else:
-                l3 = IP(src=src_ip, dst=MDNS_IPv4, ttl=255)
-
-            l4 = UDP(sport=MDNS_PORT, dport=MDNS_PORT)
-            l3pkt = l3 / l4 / dns_layer
-
-            # Decide if we can send L2 on this iface
-            driver_kind = str((self.interfaces_config.get(iface_name, {}) or {}).get("driver", "")).lower()
-            l2_capable = not any(x in driver_kind for x in ("windivert", "rawip", "winfw"))
-
-            # If L2-capable *and* we have a MAC, prefer proper Ethernet multicast
-            if l2_capable and src_mac:
-                ether = Ether(src=src_mac, dst=dst_mac_mcast)
+            if UDP in resp:
+                resp[UDP].sport = self.MDNS_PORT
+                resp[UDP].dport = self.MDNS_PORT
                 try:
-                    self.sniffer.sendp(ether / l3pkt, iface=iface_name, verbose=0)
-                    self.logger.log_message(
-                        f"[mDNS] 📢 L2 fwd '{qname}' → {iface_name.split('_')[-1]} "
-                        f"({src_ip} → {dst_ip_mcast}, {src_mac}→{dst_mac_mcast})"
-                    )
-                    continue
-                except Exception as e:
-                    self.logger.log_message(f"[mDNS] ⚠️ L2 send failed on {iface_name}: {e}. Falling back to L3.")
+                    del resp[UDP].chksum
+                except Exception:
+                    pass
 
-            # L3 path (no Ether): handle WinDivert/rawip/loopback-adjacent safely
+            if IP in resp:
+                try:
+                    del resp[IP].chksum
+                except Exception:
+                    pass
+
+            out_iface = self._inbound_iface(request_packet)
+            self.packet_writer._send_raw_packet(resp, out_iface)
+            self._elog("reply", f"Sent cached mDNS response for '{qname}' on iface={out_iface}", ["📬", "✅", "🏠"])
+        except Exception as e:
+            self._elog("reply", f"Failed sending cached mDNS response for '{qname}': {e}", ["❗", "💥", "📭"])
+
+    def _forward_mdns_query(self, packet: Packet):
+        """
+        Forward the mDNS query to other known interfaces using a stable snapshot of
+        interfaces_config so concurrent router updates cannot crash this loop.
+        """
+        in_iface = self._inbound_iface(packet)
+        src_ip = self._packet_src_ip(packet)
+
+        iface_items = self._snapshot_interfaces_config()
+        if not iface_items:
+            self._elog("forward", "No interface snapshot available for mDNS forwarding.", ["⚠️", "📋", "📭"])
+            return
+
+        forwarded = 0
+        for iface_name, cfg in iface_items:
             try:
-                # Use sniffer.send() with explicit iface; it will remap loopback and synthesize mcast MAC when needed
-                self.sniffer.send(l3pkt, iface=iface_name, verbose=0)
-                self.logger.log_message(
-                    f"[mDNS] 🌐 L3 fwd '{qname}' → {iface_name.split('_')[-1]} "
-                    f"({src_ip} → {dst_ip_mcast}, driver={driver_kind or 'unknown'})"
+                if not iface_name:
+                    continue
+
+                if in_iface and str(iface_name) == str(in_iface):
+                    continue
+
+                if isinstance(cfg, dict):
+                    if cfg.get("disabled") is True:
+                        continue
+
+                fwd = packet.copy()
+
+                if IP in fwd:
+                    fwd[IP].dst = self.MDNS_IPV4_ADDR
+                    fwd[UDP].dport = self.MDNS_PORT
+                    fwd[UDP].sport = self.MDNS_PORT
+                    try:
+                        del fwd[IP].chksum
+                    except Exception:
+                        pass
+                    try:
+                        del fwd[UDP].chksum
+                    except Exception:
+                        pass
+
+                elif IPv6 in fwd:
+                    fwd[IPv6].dst = self.MDNS_IPV6_ADDR
+                    fwd[UDP].dport = self.MDNS_PORT
+                    fwd[UDP].sport = self.MDNS_PORT
+                    try:
+                        del fwd[UDP].chksum
+                    except Exception:
+                        pass
+
+                self.packet_writer._send_raw_packet(fwd, iface_name)
+                forwarded += 1
+                self._elog(
+                    "forward",
+                    f"Forwarded mDNS query src={src_ip} -> iface={iface_name}",
+                    ["📤", "🌐", "🛰️"]
                 )
             except Exception as e:
-                # Final fallback: try best-effort multicast egress selection inline
-                try:
-                    chosen = None
-                    # Choose the first UP NIC with IPv4 (for v4) / any IP (for v6) and a MAC
-                    stats = psutil.net_if_stats()
-                    addrs = psutil.net_if_addrs()
-                    for nic, lst in addrs.items():
-                        if not stats.get(nic) or not stats[nic].isup:
-                            continue
-                        has_mac = any(getattr(a, "family", None) == psutil.AF_LINK and a.address for a in lst)
-                        if is_v6_in:
-                            ok_ip = any(a.family == socket.AF_INET6 for a in lst)
-                        else:
-                            ok_ip = any(a.family == socket.AF_INET for a in lst)
-                        if has_mac and ok_ip and "loopback" not in nic.lower():
-                            chosen = nic
-                            break
-                    if chosen:
-                        self.sniffer.send(l3pkt, iface=chosen, verbose=0)
-                        self.logger.log_message(
-                            f"[mDNS] 🔁 L3 fallback '{qname}' via {chosen} (from {iface_name})"
-                        )
-                    else:
-                        self.logger.log_message(f"[mDNS] ❌ No eligible NIC to forward '{qname}' from {iface_name}.")
-                except Exception as ee:
-                    self.logger.log_message(f"[mDNS] ❌ Forward failed for '{qname}' on {iface_name}: {ee}")
+                self._elog("forward", f"Failed forwarding mDNS query on iface={iface_name}: {e}", ["⚠️", "💥", "📭"])
+
+        self._elog(
+            "forward",
+            f"mDNS forwarding finished interfaces={forwarded} inbound={in_iface}",
+            ["📡", "✅", "🧭"]
+        )
 
 HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
 
@@ -7024,29 +7134,20 @@ class DNSManager:
     """
     Manages DNS proxying with high stability and optional IPv6 synthesis (DNS64).
 
-    Features (baseline from your version):
-      - Caching of DNS responses to reduce latency and upstream queries.
-      - Support for multiple upstream DNS servers with health tracking and automatic failover.
-      - Periodic active health probes to measure latency and availability of upstreams.
-      - Optional DNS64 functionality to synthesize AAAA records from A records.
-      - Blacklisting for blocking queries to unwanted domains.   (hooks provided)
-      - Conditional forwarding to designated servers.            (hooks provided)
-
-    Additions in this refactor:
-      - Helper methods for key tasks used by handle_query/handle_response/_forward_query.
-      - LRU cache behavior + smarter TTL extraction (min over records) with caps.
-      - Optional per-client rate limit (token bucket). Disabled by default.
-      - In-flight de-dup (coalesce identical qname/qtype from multiple clients).
-      - Optional hedge of a 2nd upstream (best-effort; off by default to preserve behavior).
-      - Safer checksum normalization helper.
-      - Centralized logging helper.
-      - Public-DNS-safe upstream selection for reliable remote domain access.
-      - Better response validation to prevent mismatched replies.
-      - Better support for public resolvers and remote/public-domain lookups.
-      - Retry/fallback behavior that prefers healthy public upstreams.
+    This rewrite keeps the same public signatures your router expects, and adds:
+      - bounded inflight / waiter growth
+      - stale-if-error cache fallback
+      - passive RTT scoring + optional lightweight active probes
+      - upstream quarantine/cooldown on repeated failures
+      - safer pending/secondary-index cleanup
+      - cache sweeps and rate-limit table cleanup
+      - small stats counters for observability
+      - centralized emoji logging helper
+      - fallback response matching by (ipver, txid, qname, qtype)
+      - terminal reply dedupe to suppress repeated SERVFAIL/NXDOMAIN spam
+      - more stable reply path selection back to the client
     """
 
-    # --- Tunables (kept compatible with yours; added a few) ---
     DNS_CACHE_TTL                  = 300
     DNS_CACHE_TTL_CAP              = 3600
     DNS_CACHE_TTL_NEG              = 60
@@ -7060,7 +7161,6 @@ class DNSManager:
     RL_CLIENT_BURST                = 60.0
     ENABLE_HEDGE                   = False
 
-    # additions only
     MAX_PENDING_AGE_SEC            = 15.0
     PROBE_DOMAIN                   = "example.com."
     PROBE_QTYPE                    = 1
@@ -7068,22 +7168,46 @@ class DNSManager:
     PUBLIC_RESOLVER_PREFERENCE     = True
     ALLOW_PRIVATE_FORWARDERS       = True
 
+    MAX_INFLIGHT_KEYS              = 4096
+    MAX_WAITERS_PER_KEY            = 256
+    MAX_PENDING_REQUESTS           = 8192
+    CACHE_SWEEP_BATCH              = 64
+    ENABLE_STALE_IF_ERROR          = True
+    STALE_IF_ERROR_MAX_AGE_SEC     = 30.0
+    UPSTREAM_FAIL_COOLDOWN_SEC     = 20.0
+    UPSTREAM_FAIL_OPEN_AFTER       = 2
+    UPSTREAM_PASSIVE_RTT_ALPHA     = 0.30
+    UPSTREAM_TOPN_SHUFFLE          = 2
+    RL_CLIENT_TABLE_MAX            = 8192
+    ENABLE_ACTIVE_UDP_PROBES       = True
+
+    # fallback matcher for NAT / campus DNS / transparent rewrite cases
+    ENABLE_FALLBACK_QUESTION_MATCH = True
+    FALLBACK_MATCH_MAX_AGE_SEC     = 12.0
+
+    # terminal reply dedupe to stop repeated SERVFAIL spam
+    TERMINAL_REPLY_DEDUP_SEC       = 2.5
+    TERMINAL_REPLY_TABLE_MAX       = 8192
+
     def __init__(self, router_logger, packet_writer, router_ipv6_ll):
-        # ---- Your existing state ----
         self.logger = router_logger
         self.pw = packet_writer
         self._lock = threading.RLock()
         self.router_ipv6_ll = router_ipv6_ll
 
-        # Cache: LRU qkey -> (packet, expiry_ts, is_negative)
-        self._dns_cache: "OrderedDict[str, Tuple[Packet, float, bool]]" = OrderedDict()
+        # Cache: qkey -> (packet, expiry_ts, is_negative, inserted_ts)
+        self._dns_cache: "OrderedDict[str, Tuple[Packet, float, bool, float]]" = OrderedDict()
 
         # Pending forward maps
-        self._pending_requests: Dict[Tuple, Dict] = {}
+        self._pending_requests: Dict[Tuple, Dict[str, Any]] = {}
         self._pending_by_txid: Dict[Tuple, Tuple] = {}
 
+        # Fallback index:
+        #   (ipver, dns_id, qname, qtype) -> [primary_pending_keys...]
+        self._pending_by_question: Dict[Tuple[str, int, str, int], List[Tuple]] = {}
+
         # Upstreams + DNS64 settings
-        self.upstreams: List[Dict] = []
+        self.upstreams: List[Dict[str, Any]] = []
         self._dns64_enabled = False
         self._dns64_prefix = "64:ff9b::/96"
 
@@ -7091,9 +7215,10 @@ class DNSManager:
         self._stop_event = threading.Event()
         self._probe_thread: Optional[threading.Thread] = None
 
-        # Router addresses (v4/v6)
+        # Router addresses
         self.router_ipv4_out = None
         self.router_ip_out = None
+        self.router_ipv6_out = None
         self.router_ipv6_link_local_out = router_ipv6_ll
 
         # Optional hooks
@@ -7106,11 +7231,48 @@ class DNSManager:
         # Client rate-limit buckets
         self._rl_clients: Dict[str, Dict[str, float]] = {}
 
-        # additions only
-        self._last_health_summary = 0.0
+        # recently-sent terminal replies
+        self._recent_terminal_replies: "OrderedDict[Tuple, float]" = OrderedDict()
 
-        self._log("[DNS] 🧠 Manager initialized with stability features.")
+        # Stats
+        self._stats = {
+            "queries_total": 0,
+            "responses_total": 0,
+            "cache_hit": 0,
+            "cache_hit_stale": 0,
+            "cache_miss": 0,
+            "blacklist_block": 0,
+            "forwarded": 0,
+            "coalesced": 0,
+            "servfail_sent": 0,
+            "nxdomain_sent": 0,
+            "overload_drop": 0,
+            "stale_pending_cleaned": 0,
+            "upstream_probe_ok": 0,
+            "upstream_probe_fail": 0,
+            "fallback_question_match": 0,
+            "terminal_reply_suppressed": 0,
+        }
+
+        self._last_health_summary = 0.0
+        self._last_cache_sweep = 0.0
+        self._last_rl_sweep = 0.0
+        self._last_terminal_reply_sweep = 0.0
+
+        self._elog("init", "Manager initialized with stability features.", ["🧠", "📡", "🛡️"])
         self.configure_upstreams()
+
+    # ===================== Logging =====================
+
+    def _log(self, msg: str):
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _elog(self, section: str, message: str, emojis: Optional[List[str]] = None):
+        emoji = random.choice(emojis or ["🧠"])
+        self._log(f"[DNS][{str(section).upper()}] {emoji} {message}")
 
     # ===================== Public Config =====================
 
@@ -7124,12 +7286,14 @@ class DNSManager:
         if servers is None:
             servers = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 
-        cleaned = []
+        cleaned: List[str] = []
+        seen = set()
         for ip in servers:
             try:
                 s = str(ip).strip()
-                if not s:
+                if not s or s in seen:
                     continue
+                seen.add(s)
                 cleaned.append(s)
             except Exception:
                 continue
@@ -7142,29 +7306,39 @@ class DNSManager:
                     "healthy": False,
                     "last_probe": 0.0,
                     "failures": 0,
+                    "successes": 0,
                     "public": self._is_public_dns_ip(ip),
+                    "cooldown_until": 0.0,
+                    "last_rtt_ms": None,
                 }
                 for ip in cleaned
             ]
             self._dns64_enabled = bool(enable_dns64)
             self._dns64_prefix = str(dns64_prefix)
 
-        self._log(f"[DNS] 🌐 Upstreams set: {cleaned}. {'DNS64 ON' if enable_dns64 else 'DNS64 OFF'} (prefix {dns64_prefix}).")
+        self._sort_upstreams()
+        self._elog(
+            "config",
+            f"Upstreams set: {cleaned} | DNS64={'ON' if enable_dns64 else 'OFF'} prefix={dns64_prefix}",
+            ["🌐", "🛰️", "🧭"]
+        )
 
     def set_blacklist(self, rules: List[Dict[str, Any]]):
         with self._lock:
             self.blacklist_rules = list(rules or [])
-        self._log(f"[DNS] ⛔ Blacklist updated: {len(self.blacklist_rules)} rule(s).")
+        self._elog("policy", f"Blacklist updated: {len(self.blacklist_rules)} rule(s).", ["⛔", "🚫", "🧱"])
 
     def set_forward_rules(self, rules: List[Dict[str, Any]]):
         with self._lock:
             self.forward_rules = list(rules or [])
-        self._log(f"[DNS] ➿ Forwarding rules updated: {len(self.forward_rules)} rule(s).")
+        self._elog("policy", f"Forwarding rules updated: {len(self.forward_rules)} rule(s).", ["➿", "🧭", "📨"])
 
     def start(self):
         """Starts the background health probe thread."""
         if self._probe_thread and self._probe_thread.is_alive():
+            self._elog("lifecycle", "Start skipped because probe thread is already running.", ["🔁", "📬"])
             return
+
         self._stop_event.clear()
         self._probe_thread = threading.Thread(
             target=self._health_probe_loop,
@@ -7172,75 +7346,124 @@ class DNSManager:
             name="DNSHealthProber"
         )
         self._probe_thread.start()
+        self._elog("lifecycle", "DNS manager started.", ["🚀", "📬", "🟢"])
 
     def stop(self):
         """Stops the background thread."""
         if not self._probe_thread or not self._probe_thread.is_alive():
+            self._elog("lifecycle", "Stop skipped because probe thread is not running.", ["🌙", "📭"])
             return
+
         self._stop_event.set()
-        self._probe_thread.join(timeout=2)
+        self._probe_thread.join(timeout=2.0)
+        self._elog("lifecycle", "DNS manager stopped.", ["🛑", "🌙", "📪"])
+
+    def snapshot_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "stats": dict(self._stats),
+                "pending_requests": len(self._pending_requests),
+                "pending_by_txid": len(self._pending_by_txid),
+                "pending_by_question": {str(k): len(v) for k, v in self._pending_by_question.items()},
+                "inflight_keys": len(self._inflight),
+                "cache_entries": len(self._dns_cache),
+                "recent_terminal_replies": len(self._recent_terminal_replies),
+                "upstreams": [
+                    {
+                        "ip": u.get("ip"),
+                        "healthy": bool(u.get("healthy")),
+                        "latency_ms": float(u.get("latency_ms", 9999.0)),
+                        "failures": int(u.get("failures", 0)),
+                        "successes": int(u.get("successes", 0)),
+                        "cooldown_until": float(u.get("cooldown_until", 0.0)),
+                    }
+                    for u in self.upstreams
+                ],
+            }
 
     # ===================== Health Probes =====================
 
     def _health_probe_loop(self):
+        self._elog("health", "Health probe loop started.", ["🩺", "🔄", "🧪"])
         while not self._stop_event.is_set():
             self._run_health_probes()
             self._cleanup_stale_pending()
+            self._cache_sweep_expired()
+            self._cleanup_rl_clients()
+            self._cleanup_terminal_replies()
             self._stop_event.wait(self.UPSTREAM_HEALTH_PROBE_INTERVAL)
-        self._log("[DNS] 🩺 Health probe thread stopped.")
+        self._elog("health", "Health probe thread stopped.", ["🩺", "🛑", "🌙"])
 
     def _run_health_probes(self):
-        """
-        Active-ish probes with safer ordering.
-        Still lightweight, but no longer purely random in final ordering.
-        """
         now = time.time()
 
         with self._lock:
             targets = list(self.upstreams)
 
         for u in targets:
-            ip = u["ip"]
-            healthy = True
-            latency = 9999.0
+            ip = u.get("ip")
+            if not ip:
+                continue
+
+            healthy = False
+            latency = float(u.get("latency_ms", 9999.0))
 
             try:
-                # lightweight simulated timing fallback compatible with your environment
-                # without changing your architecture
-                start = time.time()
-
-                # Prefer marking valid public DNS servers healthy.
-                if self._is_ipv4(ip) or self._is_v6_ll(ip) or self._is_ipv6_global(ip):
-                    healthy = True
-                    latency = max(1.0, (time.time() - start) * 1000.0 + random.uniform(8.0, 35.0))
-                else:
+                cooldown_until = float(u.get("cooldown_until", 0.0))
+                if cooldown_until > now:
                     healthy = False
-                    latency = 9999.0
-            except Exception:
+                    self._elog("health", f"Skipping probe for {ip}; cooldown active.", ["⏳", "🧊"])
+                elif self.ENABLE_ACTIVE_UDP_PROBES and self._is_ipv4(ip):
+                    probe_ms = self._probe_upstream_udp53(ip)
+                    if probe_ms is not None:
+                        healthy = True
+                        latency = probe_ms
+                        self._stat_inc("upstream_probe_ok")
+                        self._elog("health", f"Probe OK {ip} {probe_ms:.2f} ms", ["🩺", "✅", "📶"])
+                    else:
+                        healthy = False
+                        self._stat_inc("upstream_probe_fail")
+                        self._elog("health", f"Probe failed for {ip}", ["❌", "📉", "🩺"])
+                else:
+                    if self._is_ipv4(ip) or self._is_v6_ll(ip) or self._is_ipv6_global(ip):
+                        healthy = True
+                        latency = float(u.get("latency_ms", 35.0))
+                    else:
+                        healthy = False
+            except Exception as e:
                 healthy = False
-                latency = 9999.0
+                self._elog("health", f"Probe exception for {ip}: {e}", ["⚠️", "💥", "🩺"])
 
             with self._lock:
                 for cur in self.upstreams:
-                    if cur["ip"] == ip:
-                        cur["healthy"] = healthy
-                        cur["latency_ms"] = latency
+                    if cur.get("ip") == ip:
+                        cur["healthy"] = bool(healthy)
+                        cur["latency_ms"] = float(max(1.0, latency))
                         cur["last_probe"] = now
-                        cur["failures"] = 0 if healthy else int(cur.get("failures", 0)) + 1
+                        if healthy:
+                            cur["failures"] = 0
+                        else:
+                            cur["failures"] = int(cur.get("failures", 0)) + 1
+                            if int(cur["failures"]) >= self.UPSTREAM_FAIL_OPEN_AFTER:
+                                cur["cooldown_until"] = now + self.UPSTREAM_FAIL_COOLDOWN_SEC
+                                self._elog(
+                                    "health",
+                                    f"Upstream {ip} entered cooldown for {self.UPSTREAM_FAIL_COOLDOWN_SEC}s",
+                                    ["🧊", "🚧", "⛔"]
+                                )
                         break
 
-        with self._lock:
-            self.upstreams.sort(key=lambda x: (
-                not bool(x.get("healthy")),
-                0 if (self.PUBLIC_RESOLVER_PREFERENCE and x.get("public")) else 1,
-                float(x.get("latency_ms", 9999.0)),
-                int(x.get("failures", 0)),
-            ))
+        self._sort_upstreams()
 
+        with self._lock:
             if self.upstreams and (now - self._last_health_summary) > 30.0:
                 best = self.upstreams[0]
                 self._last_health_summary = now
-                self._log(f"[DNS] 🩺 Best upstream: {best['ip']} ({best['latency_ms']:.2f} ms) healthy={best['healthy']}")
+                self._elog(
+                    "health",
+                    f"Best upstream: {best['ip']} latency={float(best.get('latency_ms', 9999.0)):.2f} ms healthy={best.get('healthy')}",
+                    ["🏆", "🩺", "📡"]
+                )
 
     # ===================== Query Handling =====================
 
@@ -7249,53 +7472,144 @@ class DNSManager:
         if DNS is None or not (packet.haslayer(DNS) and packet[DNS].qr == 0):
             return False
 
+        self._stat_inc("queries_total")
+
+        try:
+            setattr(packet, "_dns_inbound_iface", inbound_iface)
+        except Exception:
+            pass
+
+        qname, qtype, qkey = self._qname_qtype_key(packet)
+        client_ip = self._client_ip(packet)
+
+        self._elog(
+            "query",
+            f"Incoming query q={qname} type={qtype} client={client_ip} iface={inbound_iface}",
+            ["📨", "🔎", "🌍"]
+        )
+
         if self.ENABLE_CLIENT_RATELIMIT:
             cip = self._client_ip(packet)
             if cip and not self._rl_take(cip):
                 self._send_servfail(packet)
-                self._log(f"[DNS] 🚦 RL applied to {cip}; SERVFAIL sent.")
+                self._elog("ratelimit", f"Rate limit applied to {cip}; SERVFAIL sent.", ["🚦", "🛑", "⏱️"])
                 return True
 
-        qname, qtype, qkey = self._qname_qtype_key(packet)
-
-        # Let direct-IP traffic pass untouched: DNS only for actual DNS questions.
         if not qname or qname == "<unknown>":
+            self._elog("query", "Query had unknown/empty qname; SERVFAIL sent.", ["❓", "⚠️", "📭"])
             self._send_servfail(packet)
             return True
 
         if self._is_blacklisted(qname):
-            self._log(f"[DNS] ⛔ Blocked {qname}")
+            self._stat_inc("blacklist_block")
+            self._elog("policy", f"Blocked blacklisted domain {qname}", ["⛔", "🧱", "🚫"])
             self._send_nxdomain(packet)
             return True
-
-        with self._lock:
-            infl = self._inflight.get(qkey)
-            if infl:
-                infl["waiters"].append((packet, inbound_iface))
-                self._log(f"[DNS] 🔁 Coalesced waiter for {qkey} (now {len(infl['waiters'])})")
-                return True
 
         cached = self._cache_get(qkey)
         if cached:
             resp, negative = cached
+            self._stat_inc("cache_hit")
             self._send_response_to_client(resp, packet)
-            self._log(f"[DNS] 📦 {'NEG-' if negative else ''}CACHE HIT {qkey}")
+            self._elog(
+                "cache",
+                f"{'NEG-' if negative else ''}CACHE HIT qkey={qkey}",
+                ["📦", "⚡", "🗃️"]
+            )
             return True
+
+        self._stat_inc("cache_miss")
+        self._elog("cache", f"CACHE MISS qkey={qkey}", ["📭", "🔍", "🗃️"])
+
+        with self._lock:
+            infl = self._inflight.get(qkey)
+            if infl:
+                waiters = infl.setdefault("waiters", [])
+                if len(waiters) >= self.MAX_WAITERS_PER_KEY:
+                    self._stat_inc("overload_drop")
+                    self._elog(
+                        "overload",
+                        f"Waiter cap hit for {qkey}; sending SERVFAIL to newest waiter.",
+                        ["⚠️", "🚧", "📛"]
+                    )
+                    self._send_servfail(packet)
+                    return True
+
+                waiters.append((packet, inbound_iface))
+                self._stat_inc("coalesced")
+                self._elog(
+                    "dedupe",
+                    f"Coalesced waiter for {qkey}; waiters={len(waiters)}",
+                    ["🔁", "🧲", "📚"]
+                )
+                return True
+
+            if len(self._inflight) >= self.MAX_INFLIGHT_KEYS or len(self._pending_requests) >= self.MAX_PENDING_REQUESTS:
+                stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+                if stale:
+                    resp, negative = stale
+                    self._stat_inc("cache_hit_stale")
+                    self._elog(
+                        "cache",
+                        f"Serving stale cache during overload q={qkey} negative={negative}",
+                        ["🧊", "📦", "🚧"]
+                    )
+                    self._send_response_to_client(resp, packet)
+                    return True
+
+                self._stat_inc("overload_drop")
+                self._elog("overload", "DNS overload guard hit; sending SERVFAIL.", ["🚧", "🔥", "📛"])
+                self._send_servfail(packet)
+                return True
 
         upstream_list = self._upstream_candidates(qname)
         if not upstream_list:
-            self._log("[DNS] ❌ No healthy upstream servers available. Sending SERVFAIL.")
+            stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+            if stale:
+                resp, negative = stale
+                self._stat_inc("cache_hit_stale")
+                self._send_response_to_client(resp, packet)
+                self._elog("cache", f"Serving stale cache fallback q={qkey}", ["🧊", "📦", "🛟"])
+                return True
+
+            self._elog("upstream", "No healthy upstream servers available; sending SERVFAIL.", ["❌", "🌐", "📭"])
             self._send_servfail(packet)
             return True
 
         with self._lock:
-            self._inflight[qkey] = {"waiters": [(packet, inbound_iface)], "outstanding": []}
+            self._inflight[qkey] = {
+                "waiters": [(packet, inbound_iface)],
+                "outstanding": [],
+                "created": time.time(),
+            }
 
         chosen = upstream_list[: (2 if self.ENABLE_HEDGE and len(upstream_list) > 1 else 1)]
-        self._log(f"[DNS] ➡️ Forward {qname} type={qtype} to {chosen}{' (hedge)' if len(chosen) > 1 else ''}")
+        self._elog(
+            "forward",
+            f"Forward q={qname} type={qtype} chosen={chosen}{' hedge' if len(chosen) > 1 else ''}",
+            ["➡️", "🌐", "📤"]
+        )
 
+        sent_any = False
         for idx, ip in enumerate(chosen):
-            self._forward_query(packet, ip, inbound_iface, qkey=qkey, hedge_idx=idx)
+            if self._forward_query(packet, ip, inbound_iface, qkey=qkey, hedge_idx=idx):
+                sent_any = True
+
+        if not sent_any:
+            with self._lock:
+                self._inflight.pop(qkey, None)
+
+            stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+            if stale:
+                resp, negative = stale
+                self._stat_inc("cache_hit_stale")
+                self._send_response_to_client(resp, packet)
+                self._elog("cache", f"Forward failed, served stale cache q={qkey}", ["🧊", "🛟", "📦"])
+                return True
+
+            self._elog("forward", f"Forward failed for q={qkey}; SERVFAIL sent.", ["❗", "📭", "💥"])
+            self._send_servfail(packet)
+            return True
 
         return True
 
@@ -7303,70 +7617,107 @@ class DNSManager:
         """
         Process an incoming DNS response from an upstream.
 
-        Works with the indexes set in _forward_query():
-          - primary key: ("4|6", router_src_ip, router_src_port, txid)
-          - secondary:   ("4|6", upstream_ip, txid)
+        Matching order:
+          1) exact primary tuple
+          2) exact secondary tuple
+          3) fallback by (ipver, txid, qname, qtype) within short age window
 
         Returns True if consumed/forwarded, False to let other handlers see it.
         """
         if DNS is None or not (packet.haslayer(DNS) and packet[DNS].qr == 1 and packet.haslayer(UDP)):
             return False
 
+        self._stat_inc("responses_total")
+
         pk_primary, pk_secondary = self._resolve_keys_from_resp(packet)
-        if not pk_primary:
+
+        try:
+            src_ip = packet[IP].src if IP in packet else packet[IPv6].src
+            dst_ip = packet[IP].dst if IP in packet else packet[IPv6].dst
+            qtype = int(packet[DNS].qd.qtype) if packet[DNS].qd else -1
+            self._elog(
+                "response",
+                f"Incoming upstream response src={src_ip}:{int(packet[UDP].sport)} dst={dst_ip}:{int(packet[UDP].dport)} "
+                f"id={int(packet[DNS].id)} q={self._safe_qname(packet)} type={qtype}",
+                ["⬅️", "📨", "🔎"]
+            )
+        except Exception:
+            pass
+
+        matched_primary, info, matched_via = self._find_pending_match(packet, pk_primary, pk_secondary)
+        if not matched_primary or not info:
+            self._elog(
+                "response",
+                f"Unmatched upstream response primary={pk_primary} secondary={pk_secondary} "
+                f"q={self._safe_qname(packet)} id={int(packet[DNS].id)}",
+                ["❔", "📭", "🧩"]
+            )
             return False
 
-        matched_via = "primary"
-        info = None
+        if self.REQUIRE_QUESTION_MATCH and not self._question_match_info_vs_packet(info, packet):
+            self._elog(
+                "response",
+                f"Dropped matched response due to question mismatch via={matched_via}",
+                ["⚠️", "🧬", "📛"]
+            )
+            return False
 
-        with self._lock:
-            info = self._pending_requests.pop(pk_primary, None)
-            if info is None and pk_secondary:
-                fwd_key = self._pending_by_txid.pop(pk_secondary, None)
-                if fwd_key is not None:
-                    info = self._pending_requests.pop(fwd_key, None)
-                    matched_via = "secondary"
-
+        info = self._consume_pending_entry(matched_primary)
         if not info:
+            self._elog(
+                "response",
+                f"Pending entry disappeared before consume via={matched_via}",
+                ["⚠️", "🕳️", "📭"]
+            )
             return False
 
-        # extra validation for safer public-DNS use
-        if self.REQUIRE_QUESTION_MATCH:
-            try:
-                oq = info["original_packet"][DNS]
-                rq = packet[DNS]
-                if not oq.qd or not rq.qd:
-                    return False
-                if int(oq.qd.qtype) != int(rq.qd.qtype):
-                    self._log("[DNS] ⚠️ Dropped response with mismatched qtype")
-                    return False
-                if bytes(oq.qd.qname).rstrip(b".").lower() != bytes(rq.qd.qname).rstrip(b".").lower():
-                    self._log("[DNS] ⚠️ Dropped response with mismatched qname")
-                    return False
-            except Exception:
-                pass
+        if matched_via == "question-fallback":
+            self._stat_inc("fallback_question_match")
+            self._elog(
+                "response",
+                f"Recovered response via question-fallback q={self._safe_qname(packet)} id={int(packet[DNS].id)}",
+                ["🧭", "🪄", "🎯"]
+            )
 
         self._normalize_checksums(packet)
 
         qkey = info.get("qkey")
-        self._cancel_hedge_siblings(qkey, pk_primary, packet)
+        self._cancel_hedge_siblings(qkey, matched_primary)
+
+        try:
+            rtt_ms = max(0.0, (time.time() - float(info.get("timestamp", time.time()))) * 1000.0)
+            upstream_ip = str(info.get("upstream_ip", ""))
+            self._mark_upstream_success(upstream_ip, rtt_ms)
+            self._elog("health", f"Marked upstream success ip={upstream_ip} rtt={rtt_ms:.2f} ms", ["✅", "📈", "🩺"])
+        except Exception as e:
+            self._elog("health", f"Failed passive RTT update: {e}", ["⚠️", "📉", "🩺"])
 
         final_resp = self._apply_dns64_if_needed(packet)
 
         try:
-            is_negative = final_resp[DNS].rcode in (2, 3)
+            dns = final_resp[DNS]
+            is_negative = (int(dns.rcode) in (2, 3)) or (int(dns.rcode) == 0 and int(getattr(dns, "ancount", 0)) == 0)
             self._cache_put_from_response(final_resp, negative=is_negative)
-        except Exception:
-            pass
+            self._elog(
+                "cache",
+                f"Cached upstream response negative={is_negative} ancount={int(getattr(dns, 'ancount', 0))}",
+                ["🗃️", "📦", "✅"]
+            )
+        except Exception as e:
+            self._elog("cache", f"Failed caching upstream response: {e}", ["⚠️", "📦", "💥"])
 
         waiters = self._pop_waiters(qkey)
-        for client_pkt, in_iface in waiters:
+        for client_pkt, _in_iface in waiters:
             self._send_response_to_client(final_resp, client_pkt)
 
         try:
-            qname = final_resp[DNS].qd.qname.decode().lower()
+            qname = final_resp[DNS].qd.qname.decode().rstrip(".").lower()
             qtype = int(final_resp[DNS].qd.qtype)
-            self._log(f"[DNS] ⬅️ Matched ({matched_via}) q={qname} t={qtype}")
+            self._elog(
+                "response",
+                f"Matched via={matched_via} q={qname} type={qtype} fanout={len(waiters)}",
+                ["⬅️", "📬", "🎯"]
+            )
         except Exception:
             pass
 
@@ -7393,25 +7744,31 @@ class DNSManager:
             dns.ancount += 1
             dns.an = synth if dns.an is None else (dns.an / synth)
             dns.rcode = 0
-            self._log(f"[DNS64] 🧪 Synthesized AAAA {v4} → {v6}")
-        except Exception:
-            pass
+            self._elog("dns64", f"Synthesized AAAA {v4} -> {v6}", ["🧪", "🧬", "🌉"])
+        except Exception as e:
+            self._elog("dns64", f"DNS64 synthesis failed: {e}", ["⚠️", "💥", "🧪"])
         return response_packet
 
     # ===================== Forwarding / Reply =====================
 
     def _forward_query(self, original_packet: Packet, target_ip: str, inbound_iface: str, *, qkey: str, hedge_idx: int):
-        """Shared forwarder for IPv4 and IPv6-LL upstreams; registers pending maps."""
+        """Shared forwarder for IPv4 and IPv6 upstreams; registers pending maps."""
         fwd = original_packet.copy()
         qname = self._safe_qname(fwd)
+        try:
+            qtype = int(fwd[DNS].qd.qtype)
+        except Exception:
+            qtype = 1
 
         use_ipv4 = self._is_ipv4(target_ip)
         use_v6_global = self._is_ipv6_global(target_ip)
         use_v6_ll = self._is_v6_ll(target_ip)
 
         if use_ipv4:
-            if IP not in fwd:
-                return
+            if IP not in fwd or UDP not in fwd or DNS not in fwd:
+                self._elog("forward", f"Skipped IPv4 forward due to missing layers q={qname}", ["⚠️", "📛", "🌐"])
+                return False
+
             fwd[IP].dst = target_ip
             fwd[UDP].dport = 53
             if self.router_ip_out:
@@ -7419,67 +7776,128 @@ class DNSManager:
             sport = self._alloc_udp_ephemeral_port()
             fwd[UDP].sport = sport
             self._normalize_checksums(fwd)
+
             fwd_key = ("4", fwd[IP].src, int(sport), int(fwd[DNS].id))
             sec_key = ("4", target_ip, int(fwd[DNS].id))
+            question_key = ("4", int(fwd[DNS].id), qname, int(qtype))
             mode = "IPv4"
 
         elif use_v6_global:
-            if IPv6 not in fwd:
-                return
+            if IPv6 not in fwd or UDP not in fwd or DNS not in fwd:
+                self._elog("forward", f"Skipped IPv6 forward due to missing layers q={qname}", ["⚠️", "📛", "🌐"])
+                return False
+
             fwd[IPv6].dst = target_ip
             fwd[UDP].dport = 53
-            if self.router_ipv6_link_local_out:
-                # preserve signature, but only strip scope from local LL if needed
-                fwd[IPv6].src = str(self.router_ipv6_link_local_out).split("%", 1)[0]
+            src_v6 = self.router_ipv6_out or self.router_ipv6_link_local_out
+            if src_v6:
+                fwd[IPv6].src = str(src_v6).split("%", 1)[0]
             sport = self._alloc_udp_ephemeral_port()
             fwd[UDP].sport = sport
             self._normalize_checksums(fwd)
-            fwd_key = ("6", fwd[IPv6].src, int(sport), int(fwd[DNS].id))
-            sec_key = ("6", target_ip, int(fwd[DNS].id))
+
+            fwd_key = ("6", str(fwd[IPv6].src), int(sport), int(fwd[DNS].id))
+            sec_key = ("6", target_ip.split("%", 1)[0], int(fwd[DNS].id))
+            question_key = ("6", int(fwd[DNS].id), qname, int(qtype))
             mode = "IPv6"
 
         elif use_v6_ll:
-            if IPv6 not in fwd:
-                return
+            if IPv6 not in fwd or UDP not in fwd or DNS not in fwd:
+                self._elog("forward", f"Skipped IPv6-LL forward due to missing layers q={qname}", ["⚠️", "📛", "🌐"])
+                return False
+
             v6_dst = target_ip.split("%", 1)[0]
             fwd[IPv6].dst = v6_dst
             fwd[UDP].dport = 53
-            if self.router_ipv6_link_local_out:
-                fwd[IPv6].src = str(self.router_ipv6_link_local_out).split("%", 1)[0]
+            src_v6 = self.router_ipv6_link_local_out or self.router_ipv6_out
+            if src_v6:
+                fwd[IPv6].src = str(src_v6).split("%", 1)[0]
             sport = self._alloc_udp_ephemeral_port()
             fwd[UDP].sport = sport
             self._normalize_checksums(fwd)
-            fwd_key = ("6", fwd[IPv6].src, int(sport), int(fwd[DNS].id))
+
+            fwd_key = ("6", str(fwd[IPv6].src), int(sport), int(fwd[DNS].id))
             sec_key = ("6", v6_dst, int(fwd[DNS].id))
+            question_key = ("6", int(fwd[DNS].id), qname, int(qtype))
             mode = "IPv6-LL"
 
         else:
-            self._log(f"[DNS] ⚠️ Skip unsupported upstream {target_ip}")
-            return
+            self._elog("forward", f"Skip unsupported upstream {target_ip}", ["⚠️", "🚫", "🌐"])
+            return False
 
         sent_ts = time.time()
+
         with self._lock:
+            if len(self._pending_requests) >= self.MAX_PENDING_REQUESTS:
+                self._elog("overload", "Pending request cap reached; refusing new upstream send.", ["🚧", "📛", "📨"])
+                return False
+
             self._pending_requests[fwd_key] = {
                 "original_packet": original_packet,
                 "timestamp": sent_ts,
                 "upstream_ip": target_ip,
                 "qkey": qkey,
+                "sec_key": sec_key,
+                "hedge_idx": hedge_idx,
+                "dns_id": int(fwd[DNS].id),
+                "qname": qname,
+                "qtype": int(qtype),
+                "question_key": question_key,
             }
             self._pending_by_txid[sec_key] = fwd_key
+            self._register_pending_question_key(question_key, fwd_key)
+
             infl = self._inflight.get(qkey)
             if infl:
-                infl["outstanding"].append(fwd_key)
+                infl.setdefault("outstanding", []).append(fwd_key)
 
         hedgetxt = " (hedge)" if hedge_idx > 0 else ""
-        self._log(f"[DNS] ➡️ TX {mode} q={qname} id={int(fwd[DNS].id)} {fwd_key[1]}:{fwd_key[2]} → {target_ip}:53 via {inbound_iface}{hedgetxt}")
-        self.pw._send_raw_packet(fwd, inbound_iface)
+        self._elog(
+            "forward",
+            f"TX {mode} q={qname} type={qtype} id={int(fwd[DNS].id)} "
+            f"{fwd_key[1]}:{fwd_key[2]} -> {target_ip}:53 via {inbound_iface}{hedgetxt}",
+            ["➡️", "📤", "🚚"]
+        )
 
-    def _send_response_to_client(self, response_packet: Packet, original_request: Packet):
+        try:
+            self.pw._send_raw_packet(fwd, inbound_iface)
+            self._stat_inc("forwarded")
+            self._elog("forward", f"Sent upstream query q={qname} to {target_ip}", ["✅", "📨", "🌐"])
+            return True
+        except Exception as e:
+            self._elog("forward", f"Upstream send failed to {target_ip}: {e}", ["❗", "💥", "📭"])
+            with self._lock:
+                info = self._pending_requests.pop(fwd_key, None)
+                self._pending_by_txid.pop(sec_key, None)
+                if info is not None:
+                    self._unregister_pending_question_key(info.get("question_key"), fwd_key)
+
+                infl = self._inflight.get(qkey)
+                if infl:
+                    try:
+                        infl["outstanding"].remove(fwd_key)
+                    except Exception:
+                        pass
+            self._mark_upstream_failure(target_ip)
+            return False
+
+    def _send_response_to_client(
+        self,
+        response_packet: Packet,
+        original_request: Packet,
+        *,
+        log_message: Optional[str] = None,
+        log_emojis: Optional[List[str]] = None,
+    ):
         """
         Send the DNS reply back to the original client.
 
         IPv4: source = router_ip_out (if set), UDP sport = 53.
-        IPv6: source = router_ipv6_ll ONLY (link-local).
+        IPv6: source = router_ipv6_ll ONLY (link-local) unless router_ipv6_out exists.
+
+        Reply path preference:
+          1) explicit _dns_inbound_iface
+          2) sniffed_on
         """
         resp = response_packet.copy()
 
@@ -7496,21 +7914,222 @@ class DNSManager:
             resp[IPv6].dst = original_request[IPv6].src
             resp[UDP].dport = int(original_request[UDP].sport)
             resp[DNS].id = original_request[DNS].id
-            if self.router_ipv6_ll:
-                resp[IPv6].src = str(self.router_ipv6_ll).split("%", 1)[0]
+            src_v6 = self.router_ipv6_link_local_out or self.router_ipv6_out or self.router_ipv6_ll
+            if src_v6:
+                resp[IPv6].src = str(src_v6).split("%", 1)[0]
             resp[UDP].sport = 53
             self._normalize_checksums(resp)
 
-        out_iface = getattr(original_request, "sniffed_on", None)
-        self.pw._send_raw_packet(resp, out_iface)
+        out_iface = (
+            getattr(original_request, "_dns_inbound_iface", None)
+            or getattr(original_request, "sniffed_on", None)
+        )
 
-    # ===================== Helpers (NEW) =====================
-
-    def _log(self, msg: str):
         try:
-            self.logger.log_message(msg)
+            self.pw._send_raw_packet(resp, out_iface)
+            msg = log_message or f"Sent reply to client={self._client_ip(original_request)} iface={out_iface}"
+            self._elog("reply", msg, log_emojis or ["📬", "✅", "🏠"])
+        except Exception as e:
+            self._elog("reply", f"Failed sending reply to client: {e}", ["❗", "💥", "📭"])
+
+    # ===================== Pending Match Helpers =====================
+
+    def _dns_question_key_from_packet(self, pkt: Packet) -> Optional[Tuple[str, int, str, int]]:
+        try:
+            if DNS not in pkt or not pkt[DNS].qd:
+                return None
+            ipver = "6" if IPv6 in pkt else "4" if IP in pkt else None
+            if not ipver:
+                return None
+            dns_id = int(pkt[DNS].id)
+            qname = self._safe_qname(pkt)
+            qtype = int(pkt[DNS].qd.qtype)
+            return (ipver, dns_id, qname, qtype)
         except Exception:
+            return None
+
+    def _question_match_info_vs_packet(self, info: Dict[str, Any], pkt: Packet) -> bool:
+        try:
+            oq = info["original_packet"][DNS]
+            rq = pkt[DNS]
+            if not oq.qd or not rq.qd:
+                return False
+            if int(oq.qd.qtype) != int(rq.qd.qtype):
+                return False
+            if bytes(oq.qd.qname).rstrip(b".").lower() != bytes(rq.qd.qname).rstrip(b".").lower():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _register_pending_question_key(self, question_key: Optional[Tuple[str, int, str, int]], primary_key: Tuple):
+        if not question_key:
+            return
+        bucket = self._pending_by_question.setdefault(question_key, [])
+        if primary_key not in bucket:
+            bucket.append(primary_key)
+
+    def _unregister_pending_question_key(self, question_key: Optional[Tuple[str, int, str, int]], primary_key: Tuple):
+        if not question_key:
+            return
+        bucket = self._pending_by_question.get(question_key)
+        if not bucket:
+            return
+        try:
+            bucket.remove(primary_key)
+        except ValueError:
             pass
+        if not bucket:
+            self._pending_by_question.pop(question_key, None)
+
+    def _consume_pending_entry(self, primary_key: Tuple) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            info = self._pending_requests.pop(primary_key, None)
+            if not info:
+                return None
+
+            sec_key = info.get("sec_key")
+            if sec_key is not None:
+                self._pending_by_txid.pop(sec_key, None)
+
+            qk = info.get("question_key")
+            self._unregister_pending_question_key(qk, primary_key)
+
+            return info
+
+    def _find_pending_match(self, packet: Packet, pk_primary: Optional[Tuple], pk_secondary: Optional[Tuple]):
+        """
+        Returns: (matched_primary_key, info, matched_via)
+          matched_via in {"primary", "secondary", "question-fallback"}
+        """
+        now = time.time()
+
+        with self._lock:
+            if pk_primary is not None:
+                info = self._pending_requests.get(pk_primary)
+                if info is not None:
+                    return pk_primary, info, "primary"
+
+            if pk_secondary is not None:
+                fwd_key = self._pending_by_txid.get(pk_secondary)
+                if fwd_key is not None:
+                    info = self._pending_requests.get(fwd_key)
+                    if info is not None:
+                        return fwd_key, info, "secondary"
+
+            if self.ENABLE_FALLBACK_QUESTION_MATCH:
+                qk = self._dns_question_key_from_packet(packet)
+                if qk is not None:
+                    bucket = list(self._pending_by_question.get(qk, []))
+                    best_key = None
+                    best_info = None
+                    best_ts = -1.0
+
+                    for fwd_key in bucket:
+                        info = self._pending_requests.get(fwd_key)
+                        if not info:
+                            continue
+
+                        age = now - float(info.get("timestamp", 0.0))
+                        if age > float(self.FALLBACK_MATCH_MAX_AGE_SEC):
+                            continue
+
+                        ts = float(info.get("timestamp", 0.0))
+                        if ts > best_ts:
+                            best_ts = ts
+                            best_key = fwd_key
+                            best_info = info
+
+                    if best_key is not None and best_info is not None:
+                        return best_key, best_info, "question-fallback"
+
+        return None, None, None
+
+    # ===================== Terminal Reply Helpers =====================
+
+    def _make_terminal_reply_key(self, req: Packet, rcode: int) -> Optional[Tuple]:
+        try:
+            if DNS not in req or not req[DNS].qd:
+                return None
+            client_ip = self._client_ip(req)
+            client_port = int(req[UDP].sport) if UDP in req else -1
+            dns_id = int(req[DNS].id)
+            qname = self._safe_qname(req)
+            qtype = int(req[DNS].qd.qtype)
+            return (client_ip, client_port, dns_id, qname, qtype, int(rcode))
+        except Exception:
+            return None
+
+    def _remember_or_suppress_terminal_reply(self, key: Optional[Tuple]) -> bool:
+        if key is None:
+            return False
+
+        now = time.time()
+        with self._lock:
+            ts = self._recent_terminal_replies.get(key)
+            if ts is not None and (now - float(ts)) <= float(self.TERMINAL_REPLY_DEDUP_SEC):
+                self._stats["terminal_reply_suppressed"] = int(self._stats.get("terminal_reply_suppressed", 0)) + 1
+                return True
+
+            self._recent_terminal_replies[key] = now
+            self._trim_terminal_reply_table_locked()
+            return False
+
+    def _trim_terminal_reply_table_locked(self):
+        while len(self._recent_terminal_replies) > int(self.TERMINAL_REPLY_TABLE_MAX):
+            self._recent_terminal_replies.popitem(last=False)
+
+    def _cleanup_terminal_replies(self):
+        now = time.time()
+        if (now - self._last_terminal_reply_sweep) < 30.0:
+            return
+        self._last_terminal_reply_sweep = now
+
+        removed = 0
+        with self._lock:
+            for k in list(self._recent_terminal_replies.keys()):
+                ts = self._recent_terminal_replies.get(k)
+                if ts is None:
+                    continue
+                if (now - float(ts)) > float(self.TERMINAL_REPLY_DEDUP_SEC):
+                    self._recent_terminal_replies.pop(k, None)
+                    removed += 1
+
+        if removed:
+            self._elog("cleanup", f"Cleaned {removed} recent terminal reply entr{'y' if removed == 1 else 'ies'}", ["🧹", "📭", "🪵"])
+
+    def _send_terminal_response(self, req: Packet, rcode: int, label: str, emojis: List[str], stat_key: str):
+        if DNS is None:
+            return
+
+        dedupe_key = self._make_terminal_reply_key(req, rcode)
+        if self._remember_or_suppress_terminal_reply(dedupe_key):
+            self._elog("reply", f"Suppressed duplicate {label} to client={self._client_ip(req)} q={self._safe_qname(req)}", ["🧯", "🛑", "📭"])
+            return
+
+        try:
+            r = req.copy()
+            r[DNS].qr = 1
+            r[DNS].rcode = int(rcode)
+            r[DNS].ancount = 0
+            r[DNS].nscount = 0
+            r[DNS].arcount = 0
+            self._normalize_checksums(r)
+            self._send_response_to_client(
+                r,
+                req,
+                log_message=f"{label} sent to client={self._client_ip(req)} iface={getattr(req, '_dns_inbound_iface', None) or getattr(req, 'sniffed_on', None)} q={self._safe_qname(req)}",
+                log_emojis=emojis,
+            )
+            self._stat_inc(stat_key)
+        except Exception as e:
+            self._elog("reply", f"Failed to send {label}: {e}", ["❗", "💥", "📭"])
+
+    # ===================== Helpers =====================
+
+    def _stat_inc(self, key: str, amount: int = 1):
+        with self._lock:
+            self._stats[key] = int(self._stats.get(key, 0)) + int(amount)
 
     def _normalize_checksums(self, pkt: Packet):
         try:
@@ -7526,7 +8145,7 @@ class DNSManager:
 
     def _safe_qname(self, pkt: Packet) -> str:
         try:
-            return pkt[DNS].qd.qname.decode().rstrip(".").lower()
+            return bytes(pkt[DNS].qd.qname).decode(errors="ignore").rstrip(".").lower()
         except Exception:
             return "<unknown>"
 
@@ -7558,20 +8177,22 @@ class DNSManager:
                 primary = (ipver, str(pkt[IPv6].dst), int(pkt[UDP].dport), dns_id)
                 secondary = (ipver, str(pkt[IPv6].src), dns_id)
                 return primary, secondary
-        except Exception:
-            pass
+        except Exception as e:
+            self._elog("response", f"Key resolution failed: {e}", ["⚠️", "🧩", "💥"])
         return None, None
 
     def _extract_any_A_from_sections(self, dns) -> Optional[str]:
         try:
             for sect in ("an", "ns", "ar"):
-                rr = getattr(dns, sect)
-                while rr is not None:
+                rr = getattr(dns, sect, None)
+                seen = 0
+                while rr is not None and seen < 64:
                     if getattr(rr, "type", None) == 1:
                         v4 = getattr(rr, "rdata", None)
                         if v4:
-                            return v4
+                            return str(v4)
                     rr = getattr(rr, "payload", None)
+                    seen += 1
         except Exception:
             pass
         return None
@@ -7581,12 +8202,14 @@ class DNSManager:
         try:
             ttls = []
             for sect in ("an", "ns", "ar"):
-                rr = getattr(dns, sect)
-                while rr is not None:
+                rr = getattr(dns, sect, None)
+                seen = 0
+                while rr is not None and seen < 128:
                     t = getattr(rr, "ttl", None)
                     if isinstance(t, int):
                         ttls.append(t)
                     rr = getattr(rr, "payload", None)
+                    seen += 1
             ttl = min(ttls) if ttls else int(fb)
             ttl = max(1, min(int(ttl), self.DNS_CACHE_TTL_CAP))
             return ttl
@@ -7596,24 +8219,27 @@ class DNSManager:
     def _cache_put_from_response(self, resp: Packet, *, negative: bool):
         try:
             dns = resp[DNS]
-            qname = dns.qd.qname.decode().rstrip(".").lower()
+            if not getattr(dns, "qd", None):
+                return
+            qname = bytes(dns.qd.qname).decode(errors="ignore").rstrip(".").lower()
             qtype = int(dns.qd.qtype)
             qkey = f"{qname}:{qtype}"
             ttl = self._ttl_from_response(dns)
             if negative:
                 ttl = min(ttl, self.DNS_CACHE_TTL_NEG)
             self._cache_put(qkey, resp, ttl, negative=negative)
-        except Exception:
-            pass
+        except Exception as e:
+            self._elog("cache", f"Cache put from response failed: {e}", ["⚠️", "📦", "💥"])
 
     def _cache_put(self, qkey: str, pkt: Packet, ttl: int, *, negative: bool = False):
-        expiry = time.time() + max(1, int(ttl))
+        now = time.time()
+        expiry = now + max(1, int(ttl))
+        store_pkt = pkt.copy()
         with self._lock:
-            if qkey in self._dns_cache:
-                self._dns_cache.pop(qkey, None)
-            self._dns_cache[qkey] = (pkt, expiry, negative)
-            while len(self._dns_cache) > self.DNS_CACHE_MAX_ENTRIES:
-                self._dns_cache.popitem(last=False)
+            self._dns_cache.pop(qkey, None)
+            self._dns_cache[qkey] = (store_pkt, expiry, bool(negative), now)
+            self._cache_trim_locked()
+        self._elog("cache", f"Stored qkey={qkey} ttl={ttl} negative={negative}", ["🗃️", "📥", "📦"])
 
     def _cache_get(self, qkey: str) -> Optional[Tuple[Packet, bool]]:
         now = time.time()
@@ -7621,60 +8247,156 @@ class DNSManager:
             ent = self._dns_cache.get(qkey)
             if not ent:
                 return None
-            pkt, expiry, negative = ent
-            if now >= expiry:
+            pkt, expiry, negative, inserted = ent
+            if now >= float(expiry):
                 self._dns_cache.pop(qkey, None)
+                self._elog("cache", f"Expired entry removed qkey={qkey}", ["⌛", "🧹", "📦"])
                 return None
             self._dns_cache.pop(qkey, None)
-            self._dns_cache[qkey] = (pkt, expiry, negative)
-            return pkt, negative
+            self._dns_cache[qkey] = (pkt, expiry, negative, inserted)
+            return pkt.copy(), bool(negative)
+
+    def _cache_get_stale(self, qkey: str, *, max_age: float) -> Optional[Tuple[Packet, bool]]:
+        now = time.time()
+        with self._lock:
+            ent = self._dns_cache.get(qkey)
+            if not ent:
+                return None
+            pkt, expiry, negative, inserted = ent
+            age_since_expire = now - float(expiry)
+            if age_since_expire < 0:
+                return pkt.copy(), bool(negative)
+            if age_since_expire <= float(max_age):
+                return pkt.copy(), bool(negative)
+            return None
+
+    def _cache_trim_locked(self):
+        removed = 0
+        while len(self._dns_cache) > self.DNS_CACHE_MAX_ENTRIES:
+            self._dns_cache.popitem(last=False)
+            removed += 1
+        if removed:
+            self._elog("cache", f"Trimmed {removed} cache entr{'y' if removed == 1 else 'ies'}", ["🧹", "📦", "✂️"])
+
+    def _cache_sweep_expired(self):
+        now = time.time()
+        if (now - self._last_cache_sweep) < 15.0:
+            return
+        self._last_cache_sweep = now
+
+        removed = 0
+        with self._lock:
+            for qkey in list(self._dns_cache.keys())[: max(self.CACHE_SWEEP_BATCH, 1)]:
+                ent = self._dns_cache.get(qkey)
+                if not ent:
+                    continue
+                _, expiry, _, _ = ent
+                if now >= float(expiry) + float(self.STALE_IF_ERROR_MAX_AGE_SEC):
+                    self._dns_cache.pop(qkey, None)
+                    removed += 1
+        if removed:
+            self._elog("cache", f"Swept {removed} expired/stale cache entr{'y' if removed == 1 else 'ies'}", ["🧹", "🗃️", "⌛"])
 
     def _pop_waiters(self, qkey: Optional[str]) -> List[Tuple[Packet, str]]:
         if not qkey:
             return []
         with self._lock:
             infl = self._inflight.pop(qkey, None)
-            return list(infl.get("waiters", [])) if infl else []
+            if not infl:
+                return []
+            waiters = list(infl.get("waiters", []))
+        self._elog("dedupe", f"Popped {len(waiters)} waiter(s) for qkey={qkey}", ["📚", "🎯", "🔁"])
+        return waiters
 
-    def _cancel_hedge_siblings(self, qkey: Optional[str], winner_primary: Tuple, resp_pkt: Packet):
+    def _cancel_hedge_siblings(self, qkey: Optional[str], winner_primary: Tuple):
         if not qkey:
             return
+        canceled = 0
         with self._lock:
             infl = self._inflight.get(qkey)
             if not infl:
                 return
             keep = []
-            for pk in infl.get("outstanding", []):
+            for pk in list(infl.get("outstanding", [])):
                 if pk == winner_primary:
                     keep.append(pk)
-                else:
-                    self._pending_requests.pop(pk, None)
+                    continue
+                info = self._pending_requests.pop(pk, None)
+                if info is not None:
+                    sec_key = info.get("sec_key")
+                    if sec_key is not None:
+                        self._pending_by_txid.pop(sec_key, None)
+                    self._unregister_pending_question_key(info.get("question_key"), pk)
+                    canceled += 1
             infl["outstanding"] = keep
+        if canceled:
+            self._elog("hedge", f"Canceled {canceled} hedge sibling request(s) for qkey={qkey}", ["✂️", "🪃", "⚡"])
+
+    def _sort_upstreams(self):
+        with self._lock:
+            now = time.time()
+            self.upstreams.sort(
+                key=lambda x: (
+                    0 if (float(x.get("cooldown_until", 0.0)) <= now) else 1,
+                    0 if bool(x.get("healthy")) else 1,
+                    0 if (self.PUBLIC_RESOLVER_PREFERENCE and x.get("public")) else 1,
+                    float(x.get("latency_ms", 9999.0)),
+                    int(x.get("failures", 0)),
+                    -int(x.get("successes", 0)),
+                )
+            )
 
     def _upstream_candidates(self, qname: str) -> List[str]:
         """
-        Resolve conditional forwarding first; else return healthy upstreams by latency.
-        Added:
-          - prefer public resolvers for public domains
-          - allow private forwarders only when configured or explicitly matched
+        Resolve conditional forwarding first; else return healthy upstreams by score.
         """
         dst = self._match_forward(qname)
         if dst:
-            return [ip for ip in dst if self._upstream_allowed(ip)]
+            out = [ip for ip in dst if self._upstream_allowed(ip)]
+            self._elog("policy", f"Conditional forward match q={qname} -> {out}", ["🧭", "➿", "📨"])
+            return out
 
         with self._lock:
-            healthy = [u["ip"] for u in self.upstreams if u.get("healthy") and self._upstream_allowed(u["ip"])]
-            if healthy:
-                return healthy
+            ranked = [dict(u) for u in self.upstreams if self._upstream_allowed(str(u.get("ip", "")))]
 
-            # fallback to all configured if no healthy marked yet
-            return [u["ip"] for u in self.upstreams if self._upstream_allowed(u["ip"])]
+        if not ranked:
+            self._elog("upstream", f"No allowed upstream candidates for q={qname}", ["❌", "🌐", "📭"])
+            return []
+
+        now = time.time()
+        active = [u for u in ranked if float(u.get("cooldown_until", 0.0)) <= now]
+        if not active:
+            active = ranked
+
+        healthy = [u for u in active if bool(u.get("healthy"))]
+        if not healthy:
+            healthy = active
+
+        healthy.sort(
+            key=lambda u: (
+                0 if (self.PUBLIC_RESOLVER_PREFERENCE and u.get("public")) else 1,
+                float(u.get("latency_ms", 9999.0)),
+                int(u.get("failures", 0)),
+                -int(u.get("successes", 0)),
+            )
+        )
+
+        ips = [str(u["ip"]) for u in healthy]
+        if len(ips) > 1 and self.UPSTREAM_TOPN_SHUFFLE > 1:
+            topn = min(len(ips), int(self.UPSTREAM_TOPN_SHUFFLE))
+            head = ips[:topn]
+            tail = ips[topn:]
+            random.shuffle(head)
+            ips = head + tail
+
+        self._elog("upstream", f"Candidate upstreams for q={qname}: {ips}", ["🌐", "📋", "🛰️"])
+        return ips
 
     def _match_forward(self, qname: str) -> Optional[List[str]]:
         with self._lock:
             for rule in self.forward_rules:
-                pat = rule.get("match", "")
-                typ = rule.get("type", "suffix")
+                pat = str(rule.get("match", "")).strip().lower()
+                typ = str(rule.get("type", "suffix")).strip().lower()
                 try:
                     if typ == "exact" and qname == pat:
                         return list(rule.get("to", []))
@@ -7691,8 +8413,8 @@ class DNSManager:
     def _is_blacklisted(self, qname: str) -> bool:
         with self._lock:
             for rule in self.blacklist_rules:
-                pat = rule.get("match", "")
-                typ = rule.get("type", "suffix")
+                pat = str(rule.get("match", "")).strip().lower()
+                typ = str(rule.get("type", "suffix")).strip().lower()
                 try:
                     if typ == "exact" and qname == pat:
                         return True
@@ -7707,120 +8429,238 @@ class DNSManager:
         return False
 
     def _send_servfail(self, req: Packet):
-        if DNS is None:
-            return
-        try:
-            r = req.copy()
-            r[DNS].qr = 1
-            r[DNS].rcode = 2
-            r[DNS].ancount = r[DNS].nscount = r[DNS].arcount = 0
-            self._normalize_checksums(r)
-            self._send_response_to_client(r, req)
-        except Exception:
-            pass
+        self._send_terminal_response(req, 2, "SERVFAIL", ["⚠️", "📭", "🧯"], "servfail_sent")
 
     def _send_nxdomain(self, req: Packet):
-        if DNS is None:
-            return
-        try:
-            r = req.copy()
-            r[DNS].qr = 1
-            r[DNS].rcode = 3
-            r[DNS].ancount = r[DNS].nscount = r[DNS].arcount = 0
-            self._normalize_checksums(r)
-            self._send_response_to_client(r, req)
-        except Exception:
-            pass
+        self._send_terminal_response(req, 3, "NXDOMAIN", ["🚫", "📭", "🧾"], "nxdomain_sent")
 
     def _alloc_udp_ephemeral_port(self) -> int:
+        for _ in range(16):
+            p = random.randint(49152, 65535)
+            with self._lock:
+                used = any(
+                    isinstance(k, tuple) and len(k) >= 3 and int(k[2]) == p
+                    for k in self._pending_requests.keys()
+                )
+            if not used:
+                return p
         return random.randint(49152, 65535)
 
     def _is_v6_ll(self, addr: str) -> bool:
         try:
-            return ipaddress.IPv6Address(addr).is_link_local
+            return ipaddress.IPv6Address(str(addr).split("%", 1)[0]).is_link_local
         except Exception:
             return str(addr).lower().startswith("fe80:")
 
     def _is_ipv4(self, addr: str) -> bool:
         try:
-            ipaddress.IPv4Address(addr)
+            ipaddress.IPv4Address(str(addr).split("%", 1)[0])
             return True
         except Exception:
             return False
 
     def _is_ipv6_global(self, addr: str) -> bool:
         try:
-            ip = ipaddress.IPv6Address(addr)
+            ip = ipaddress.IPv6Address(str(addr).split("%", 1)[0])
             return not ip.is_link_local and not ip.is_loopback and not ip.is_unspecified
         except Exception:
             return False
 
     def _is_public_dns_ip(self, addr: str) -> bool:
         try:
-            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+            ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
             return ip.is_global
         except Exception:
             return False
 
     def _upstream_allowed(self, addr: str) -> bool:
-        """
-        Allow public upstreams always.
-        Allow private forwarders only if explicitly enabled.
-        """
         try:
-            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+            ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
             if ip.is_global:
                 return True
             return bool(self.ALLOW_PRIVATE_FORWARDERS)
         except Exception:
             return False
 
+    def _mark_upstream_success(self, addr: str, rtt_ms: float):
+        if not addr:
+            return
+        with self._lock:
+            for u in self.upstreams:
+                if str(u.get("ip")) != str(addr):
+                    continue
+                prev = float(u.get("latency_ms", 9999.0))
+                if prev >= 9999.0:
+                    ewma = float(rtt_ms)
+                else:
+                    ewma = (prev * (1.0 - self.UPSTREAM_PASSIVE_RTT_ALPHA)) + (float(rtt_ms) * self.UPSTREAM_PASSIVE_RTT_ALPHA)
+                u["latency_ms"] = max(1.0, ewma)
+                u["last_rtt_ms"] = float(rtt_ms)
+                u["healthy"] = True
+                u["successes"] = int(u.get("successes", 0)) + 1
+                u["failures"] = 0
+                u["cooldown_until"] = 0.0
+                break
+        self._sort_upstreams()
+
+    def _mark_upstream_failure(self, addr: str):
+        if not addr:
+            return
+        now = time.time()
+        cooled = False
+        with self._lock:
+            for u in self.upstreams:
+                if str(u.get("ip")) != str(addr):
+                    continue
+                u["failures"] = int(u.get("failures", 0)) + 1
+                if int(u["failures"]) >= self.UPSTREAM_FAIL_OPEN_AFTER:
+                    u["cooldown_until"] = now + self.UPSTREAM_FAIL_COOLDOWN_SEC
+                    u["healthy"] = False
+                    cooled = True
+                break
+        self._sort_upstreams()
+        self._elog(
+            "health",
+            f"Marked upstream failure ip={addr}{' cooldown applied' if cooled else ''}",
+            ["📉", "⚠️", "🧊"]
+        )
+
     def _cleanup_stale_pending(self):
         now = time.time()
-        stale_keys = []
-        stale_txid = []
+        stale_keys: List[Tuple] = []
+        stale_qkeys: List[str] = []
 
         with self._lock:
-            for pk, info in self._pending_requests.items():
+            for pk, info in list(self._pending_requests.items()):
                 if (now - float(info.get("timestamp", 0.0))) > self.MAX_PENDING_AGE_SEC:
                     stale_keys.append(pk)
 
-            if stale_keys:
-                stale_set = set(stale_keys)
-                for sk in stale_keys:
-                    info = self._pending_requests.pop(sk, None)
-                    qkey = info.get("qkey") if info else None
-                    if qkey:
-                        infl = self._inflight.pop(qkey, None)
-                        if infl:
-                            for client_pkt, _iface in infl.get("waiters", []):
-                                try:
-                                    self._send_servfail(client_pkt)
-                                except Exception:
-                                    pass
+            stale_key_set = set(stale_keys)
 
-                for sec, pk in list(self._pending_by_txid.items()):
-                    if pk in stale_set:
-                        stale_txid.append(sec)
-                for sec in stale_txid:
+            for sk in stale_keys:
+                info = self._pending_requests.pop(sk, None)
+                if not info:
+                    continue
+
+                sec_key = info.get("sec_key")
+                if sec_key is not None:
+                    self._pending_by_txid.pop(sec_key, None)
+
+                self._unregister_pending_question_key(info.get("question_key"), sk)
+
+                qkey = info.get("qkey")
+                if qkey:
+                    stale_qkeys.append(qkey)
+
+            for sec, pk in list(self._pending_by_txid.items()):
+                if pk in stale_key_set:
                     self._pending_by_txid.pop(sec, None)
 
-            if stale_keys:
-                self._log(f"[DNS] 🧹 Cleaned {len(stale_keys)} stale pending request(s)")
+            for qkey in set(stale_qkeys):
+                infl = self._inflight.pop(qkey, None)
+                if not infl:
+                    continue
+
+                stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+                for client_pkt, _iface in infl.get("waiters", []):
+                    try:
+                        if stale:
+                            resp, negative = stale
+                            self._send_response_to_client(resp, client_pkt)
+                            self._stat_inc("cache_hit_stale")
+                            self._elog("cache", f"Served stale cache to waiter q={qkey}", ["🧊", "📦", "🛟"])
+                        else:
+                            self._send_servfail(client_pkt)
+                    except Exception:
+                        pass
+
+        if stale_keys:
+            self._stat_inc("stale_pending_cleaned", len(stale_keys))
+            self._elog("cleanup", f"Cleaned {len(stale_keys)} stale pending request(s)", ["🧹", "⌛", "🗂️"])
 
     def _rl_take(self, client_ip: str) -> bool:
         now = time.time()
-        rl = self._rl_clients.get(client_ip)
-        if not rl:
-            rl = {"tokens": float(self.RL_CLIENT_BURST), "last": now}
-            self._rl_clients[client_ip] = rl
-        dt = max(0.0, now - rl["last"])
-        rl["tokens"] = min(self.RL_CLIENT_BURST, rl["tokens"] + dt * self.RL_CLIENT_RPS)
-        rl["last"] = now
-        if rl["tokens"] >= 1.0:
-            rl["tokens"] -= 1.0
-            return True
-        return False
+
+        with self._lock:
+            rl = self._rl_clients.get(client_ip)
+            if not rl:
+                if len(self._rl_clients) >= self.RL_CLIENT_TABLE_MAX:
+                    self._cleanup_rl_clients(force=True)
+                rl = {"tokens": float(self.RL_CLIENT_BURST), "last": now}
+                self._rl_clients[client_ip] = rl
+                self._elog("ratelimit", f"Created RL bucket for {client_ip}", ["🚦", "🪣", "🧮"])
+
+            dt = max(0.0, now - float(rl["last"]))
+            rl["tokens"] = min(float(self.RL_CLIENT_BURST), float(rl["tokens"]) + dt * float(self.RL_CLIENT_RPS))
+            rl["last"] = now
+
+            if float(rl["tokens"]) >= 1.0:
+                rl["tokens"] -= 1.0
+                return True
+
+            return False
+
+    def _cleanup_rl_clients(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_rl_sweep) < 60.0:
+            return
+        self._last_rl_sweep = now
+
+        removed = 0
+        with self._lock:
+            for ip in list(self._rl_clients.keys()):
+                rl = self._rl_clients.get(ip)
+                if not rl:
+                    continue
+                if (now - float(rl.get("last", 0.0))) > 300.0:
+                    self._rl_clients.pop(ip, None)
+                    removed += 1
+
+        if removed:
+            self._elog("cleanup", f"Cleaned {removed} idle client RL bucket(s)", ["🧹", "🚦", "🪣"])
+
+    def _probe_upstream_udp53(self, ip: str) -> Optional[float]:
+        """
+        Very small active UDP probe for IPv4 resolvers.
+        Sends a minimal DNS query to measure responsiveness.
+        """
+        try:
+            txid = random.randint(0, 65535)
+            qname = self.PROBE_DOMAIN.rstrip(".")
+            labels = qname.split(".")
+            qwire = b"".join(len(x).to_bytes(1, "big") + x.encode("ascii", "ignore") for x in labels if x) + b"\x00"
+            header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+            question = qwire + struct.pack("!HH", int(self.PROBE_QTYPE), 1)
+            payload = header + question
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.settimeout(float(self.UPSTREAM_TIMEOUT_SEC))
+                start = time.time()
+                s.sendto(payload, (ip, 53))
+                data, _ = s.recvfrom(2048)
+                end = time.time()
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+            if len(data) < 12:
+                self._elog("health", f"Probe reply too short from {ip}", ["⚠️", "📏", "🩺"])
+                return None
+
+            rxid = struct.unpack("!H", data[:2])[0]
+            flags = struct.unpack("!H", data[2:4])[0]
+            is_resp = bool(flags & 0x8000)
+            if rxid != txid or not is_resp:
+                self._elog("health", f"Probe reply invalid from {ip}", ["⚠️", "🧩", "🩺"])
+                return None
+
+            return max(1.0, (end - start) * 1000.0)
+        except Exception as e:
+            self._elog("health", f"Probe exception for {ip}: {e}", ["⚠️", "💥", "🩺"])
+            return None
 
 
 
@@ -16508,6 +17348,7 @@ class UplinkCandidate:
 
     link_up: bool = False
     gateway_ok: bool = False
+    dns_ok: bool = False
     public_ok: bool = False
 
     last_seen: float = field(default_factory=time.time)
@@ -16521,10 +17362,13 @@ class UplinkCandidate:
 
     # probe / health bookkeeping
     last_gateway_probe: float = 0.0
+    last_dns_probe: float = 0.0
     last_public_probe: float = 0.0
     last_gateway_refresh: float = 0.0
     last_dns_refresh: float = 0.0
+
     gateway_rtt_ms: Optional[float] = None
+    dns_rtt_ms: Optional[float] = None
     public_rtt_ms: Optional[float] = None
 
     # passive signals
@@ -16539,26 +17383,26 @@ class UplinkCandidate:
     activation_count: int = 0
     flap_count: int = 0
     last_activation: float = 0.0
+
+    consecutive_gateway_failures: int = 0
+    consecutive_dns_failures: int = 0
     consecutive_public_failures: int = 0
+
+    repair_count: int = 0
+    last_repair_at: float = 0.0
     health_state: str = "unknown"
 
 
 class UplinkManager(_SmartManagerBase):
     """
-    Multi-uplink manager.
+    Self-healing multi-uplink manager.
 
-    Goals:
-      - keep the host Wi-Fi association/gateway path alive without flapping it
-      - let the router fail over outbound/public traffic to another interface when Wi-Fi loses internet
-      - keep router access to public IPs when any eligible uplink still has public connectivity
-      - avoid OS default-route churn on the host
-      - scrub bad public /32 host routes that break browsing
-
-    Improvements in this rewrite:
-      - much less subprocess churn through TTL caches and batched route scrubbing
-      - passive health signals from ARP/NAT/real traffic reduce unnecessary probing
-      - stickier activation logic to avoid flap storms and expensive failover loops
-      - safer exception boundaries and lock usage around shared candidate state
+    Main goals:
+      - keep the host/router online on Wi-Fi for long-running sessions
+      - detect the Windows "connected but no internet" state fast
+      - repair route / DNS / DHCP / adapter drift without waiting for a manual restart
+      - keep ARP / NAT / packet writer / gateway manager in sync after repair or failover
+      - avoid constant route flapping while still recovering aggressively when needed
     """
 
     DEFAULT_PUBLIC_PROBES = [
@@ -16566,6 +17410,11 @@ class UplinkManager(_SmartManagerBase):
         ("8.8.8.8", 53),
         ("9.9.9.9", 53),
         ("208.67.222.222", 53),
+    ]
+
+    DEFAULT_FALLBACK_DNS = [
+        "1.1.1.1",
+        "8.8.8.8",
     ]
 
     def __init__(self, router: Any, gateway_manager: Optional[Any] = None):
@@ -16577,7 +17426,7 @@ class UplinkManager(_SmartManagerBase):
         self._candidate_lock = threading.RLock()
 
         self._prefs = {
-            "health_interval_sec": 15.0,
+            "health_interval_sec": 10.0,
             "preferred_iface_names": ["Wi-Fi"],
             "allow_router_failover": True,
             "preserve_wifi_link": True,
@@ -16590,17 +17439,31 @@ class UplinkManager(_SmartManagerBase):
             "minimum_public_score_to_activate": 45.0,
             "keep_current_if_public": True,
 
-            # added stability / performance guards
-            "discovery_interval_sec": 45.0,
-            "route_scrub_interval_sec": 90.0,
-            "wifi_preserve_interval_sec": 45.0,
-            "dns_cache_ttl_sec": 180.0,
-            "gateway_cache_ttl_sec": 60.0,
-            "adapter_cache_ttl_sec": 20.0,
-            "min_probe_gap_sec": 8.0,
-            "passive_signal_ttl_sec": 45.0,
+            # pacing / cache
+            "discovery_interval_sec": 30.0,
+            "route_scrub_interval_sec": 60.0,
+            "wifi_preserve_interval_sec": 20.0,
+            "dns_cache_ttl_sec": 90.0,
+            "gateway_cache_ttl_sec": 45.0,
+            "adapter_cache_ttl_sec": 15.0,
+            "min_probe_gap_sec": 6.0,
+            "dns_probe_interval_sec": 18.0,
+            "passive_signal_ttl_sec": 35.0,
             "max_probe_candidates_per_loop": 2,
             "activation_cooldown_sec": 20.0,
+
+            # repair escalation
+            "repair_failure_threshold": 2,
+            "dhcp_repair_failure_threshold": 4,
+            "adapter_reset_failure_threshold": 7,
+            "repair_cooldown_sec": 20.0,
+            "dns_reset_cooldown_sec": 45.0,
+            "dhcp_renew_cooldown_sec": 90.0,
+            "adapter_bounce_cooldown_sec": 240.0,
+
+            # DNS behavior
+            "fallback_dns_servers": list(self.DEFAULT_FALLBACK_DNS),
+            "dns_probe_name": "www.msftconnecttest.com",
         }
 
         self.candidates: Dict[str, UplinkCandidate] = {}
@@ -16668,7 +17531,11 @@ class UplinkManager(_SmartManagerBase):
             self._stop_event.clear()
 
         self._bootstrap()
-        self._thread = threading.Thread(target=self._health_loop, name="UplinkManagerHealth", daemon=True)
+        self._thread = threading.Thread(
+            target=self._health_loop,
+            name="UplinkManagerHealth",
+            daemon=True,
+        )
         self._thread.start()
         self._say("uplink_started", "uplink manager is active", ["🛰️", "🌍"], cooldown=0.0)
 
@@ -16686,6 +17553,10 @@ class UplinkManager(_SmartManagerBase):
 
         self._gc_flows()
         self._say("uplink_stopped", "uplink manager stopped", ["🛑", "🌙"], cooldown=0.0)
+
+    # ---------------------------------------------------------
+    # candidate filtering
+    # ---------------------------------------------------------
 
     def _is_candidate_iface(self, iface_full: str, cfg: dict) -> bool:
         friendly = str(cfg.get("friendly_name") or iface_full or "").strip()
@@ -16764,6 +17635,7 @@ class UplinkManager(_SmartManagerBase):
                     self._last_discovery_at = now
 
                 self._refresh_candidates_health()
+                self._maybe_repair_active_uplink()
 
                 if (now - self._last_wifi_preserve_at) >= float(self._prefs["wifi_preserve_interval_sec"]):
                     self._preserve_wifi_link()
@@ -16776,7 +17648,11 @@ class UplinkManager(_SmartManagerBase):
                 self._prune_stale_candidates()
 
             except Exception as e:
-                self._say("uplink_health_error", f"uplink loop hit {type(e).__name__}: {e}", ["⚠️", "🧩"])
+                self._say(
+                    "uplink_health_error",
+                    f"uplink loop hit {type(e).__name__}: {e}",
+                    ["⚠️", "🧩"],
+                )
 
     # ---------------------------------------------------------
     # discovery / probing
@@ -16801,7 +17677,6 @@ class UplinkManager(_SmartManagerBase):
         r = self.router
         interfaces_config = dict(getattr(r, "_interfaces_config", {}) or {})
 
-        # Synthesize current outbound iface if it exists but is missing from config.
         current_out = getattr(r, "interface_out_full_name", None)
         current_friendly = getattr(r, "interface_out_friendly_name", None)
         if current_out and current_out not in interfaces_config:
@@ -16827,7 +17702,11 @@ class UplinkManager(_SmartManagerBase):
                 continue
 
             gateway_ip = cfg.get("gateway")
-            if (not self._is_ipv4(gateway_ip)) or self._is_cache_expired(now, self._gateway_cache.get(friendly), self._prefs["gateway_cache_ttl_sec"]):
+            if (not self._is_ipv4(gateway_ip)) or self._is_cache_expired(
+                now,
+                self._gateway_cache.get(friendly),
+                self._prefs["gateway_cache_ttl_sec"],
+            ):
                 gateway_ip = self._get_cached_gateway_for_iface(friendly, info["ip"])
 
             dns_servers = self._get_windows_dns_servers(friendly)
@@ -16843,9 +17722,9 @@ class UplinkManager(_SmartManagerBase):
                 cand.netmask = info["netmask"]
                 cand.network = info["network"]
                 cand.gateway_ip = gateway_ip
-                cand.last_seen = now
                 cand.dns_servers = dns_servers
                 cand.link_up = self._iface_link_up(friendly)
+                cand.last_seen = now
                 cand.metadata["ignored_virtual"] = False
                 cand.metadata["last_discovered_from"] = "interfaces_config"
 
@@ -16861,16 +17740,23 @@ class UplinkManager(_SmartManagerBase):
 
         for idx, cand in enumerate(candidates):
             do_gateway_probe = self._should_probe_gateway(cand, now, idx)
+            do_dns_probe = self._should_probe_dns(cand, now, idx)
             do_public_probe = public_probe_budget > 0 and self._should_probe_public(cand, now, idx)
 
             gateway_ok = self._gateway_health_from_passive(cand, now, default=cand.gateway_ok)
+            dns_ok = self._dns_health_from_recent(cand, now, default=cand.dns_ok)
             public_ok = self._public_health_from_passive(cand, now, default=cand.public_ok)
 
             if do_gateway_probe:
                 gateway_ok = self._probe_gateway(cand)
 
+            if gateway_ok and do_dns_probe:
+                dns_ok = self._probe_dns(cand)
+            elif not gateway_ok:
+                dns_ok = False
+
             if do_public_probe:
-                public_ok = self._probe_public(cand)
+                public_ok = self._probe_public(cand, dns_ok=dns_ok)
                 public_probe_budget -= 1
 
             with self._candidate_lock:
@@ -16879,22 +17765,88 @@ class UplinkManager(_SmartManagerBase):
                     continue
 
                 real.gateway_ok = bool(gateway_ok)
+                real.dns_ok = bool(dns_ok)
                 real.public_ok = bool(public_ok)
 
-                if real.public_ok or real.gateway_ok:
+                if real.gateway_ok:
+                    real.consecutive_gateway_failures = 0
+                elif do_gateway_probe:
+                    real.consecutive_gateway_failures += 1
+
+                if real.dns_ok:
+                    real.consecutive_dns_failures = 0
+                elif do_dns_probe:
+                    real.consecutive_dns_failures += 1
+
+                if real.public_ok:
+                    real.consecutive_public_failures = 0
+                elif do_public_probe:
+                    real.consecutive_public_failures += 1
+
+                if real.public_ok or real.dns_ok or real.gateway_ok:
                     real.last_ok = now
                     real.ok_count += 1
                     real.fail_count = max(0, real.fail_count - 1)
-                    if real.public_ok:
-                        real.consecutive_public_failures = 0
                 else:
                     real.last_fail = now
                     real.fail_count += 1
-                    if do_public_probe:
-                        real.consecutive_public_failures += 1
 
                 real.score = self._score_candidate(real)
                 real.health_state = self._health_state_for_candidate(real)
+
+                if real.public_ok:
+                    real.metadata["repair_stage"] = 0
+
+    def _should_probe_gateway(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
+        base_gap = float(self._prefs["min_probe_gap_sec"])
+        if cand.iface_full == self.active_uplink_full:
+            return (now - cand.last_gateway_probe) >= base_gap
+        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
+            return (now - cand.last_gateway_probe) >= (base_gap * 1.5)
+        return idx < 2 and (now - cand.last_gateway_probe) >= (base_gap * 2.5)
+
+    def _should_probe_dns(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
+        base_gap = float(self._prefs["dns_probe_interval_sec"])
+        if cand.iface_full == self.active_uplink_full:
+            return (now - cand.last_dns_probe) >= base_gap
+        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
+            return (now - cand.last_dns_probe) >= (base_gap * 1.25)
+        return idx < 2 and (now - cand.last_dns_probe) >= (base_gap * 1.75)
+
+    def _should_probe_public(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
+        base_gap = float(self._prefs["min_probe_gap_sec"])
+        if cand.iface_full == self.active_uplink_full:
+            return (now - cand.last_public_probe) >= base_gap
+        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
+            return (now - cand.last_public_probe) >= (base_gap * 1.5)
+        return idx < int(self._prefs["max_probe_candidates_per_loop"]) and (
+            (now - cand.last_public_probe) >= (base_gap * 3.0)
+        )
+
+    def _gateway_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
+        if not cand.link_up or not cand.ip or not cand.gateway_ip:
+            return False
+        if (now - cand.last_passive_arp_at) <= float(self._prefs["passive_signal_ttl_sec"]):
+            return True
+        return bool(default)
+
+    def _dns_health_from_recent(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
+        ttl = float(self._prefs["passive_signal_ttl_sec"])
+        if (now - cand.last_passive_public_at) <= ttl:
+            return True
+        if cand.dns_ok and (now - cand.last_dns_probe) <= max(ttl, float(self._prefs["dns_probe_interval_sec"]) * 2.0):
+            return True
+        return bool(default)
+
+    def _public_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
+        ttl = float(self._prefs["passive_signal_ttl_sec"])
+        if (now - cand.last_passive_public_at) <= ttl:
+            return True
+        if (now - cand.last_passive_nat_at) <= ttl:
+            return True
+        if cand.iface_full == self.active_uplink_full and (now - cand.last_ok) <= ttl and cand.consecutive_public_failures <= 1:
+            return True
+        return bool(default)
 
     def _probe_gateway(self, cand: UplinkCandidate) -> bool:
         if not cand.link_up or not cand.ip or not cand.gateway_ip:
@@ -16904,13 +17856,31 @@ class UplinkManager(_SmartManagerBase):
 
         cand.last_gateway_probe = time.time()
 
-        # Fast-path: if the gateway looks sane for the adapter subnet, keep it as a soft-healthy path.
-        if self._gateway_looks_routable(cand):
-            cand.gateway_rtt_ms = 0.0
+        # We no longer trust "gateway is in the same subnet" by itself.
+        # It is only a weak hint, not proof of internet health.
+        if not self._gateway_looks_routable(cand):
+            cand.gateway_rtt_ms = None
+            return False
+
+        # Prefer a DNS-style probe against the gateway first if it acts like a resolver.
+        ok, rtt_ms = self._timed_udp_dns_probe(
+            bound_ip=cand.ip,
+            dns_server=cand.gateway_ip,
+            hostname=self._prefs["dns_probe_name"],
+            timeout=1.0,
+        )
+        if ok:
+            cand.gateway_rtt_ms = rtt_ms
             return True
 
-        for port in list(self._prefs["gateway_probe_ports"])[:2]:
-            ok, rtt_ms = self._timed_tcp_probe(bound_ip=cand.ip, host=cand.gateway_ip, port=port, timeout=0.8)
+        # Fallback to quick TCP connect attempts.
+        for port in list(self._prefs["gateway_probe_ports"])[:3]:
+            ok, rtt_ms = self._timed_tcp_probe(
+                bound_ip=cand.ip,
+                host=cand.gateway_ip,
+                port=port,
+                timeout=0.9,
+            )
             if ok:
                 cand.gateway_rtt_ms = rtt_ms
                 return True
@@ -16918,16 +17888,51 @@ class UplinkManager(_SmartManagerBase):
         cand.gateway_rtt_ms = None
         return False
 
-    def _probe_public(self, cand: UplinkCandidate) -> bool:
+    def _probe_dns(self, cand: UplinkCandidate) -> bool:
+        cand.last_dns_probe = time.time()
+        cand.dns_rtt_ms = None
+
+        if not cand.link_up or not cand.ip:
+            return False
+
+        servers: list[str] = []
+        for item in list(cand.dns_servers or []):
+            if self._is_ipv4(item) and item not in servers:
+                servers.append(item)
+
+        if self._is_ipv4(cand.gateway_ip) and cand.gateway_ip not in servers:
+            servers.append(cand.gateway_ip)
+
+        for item in list(self._prefs.get("fallback_dns_servers") or []):
+            if self._is_ipv4(item) and item not in servers:
+                servers.append(item)
+
+        if not servers:
+            return False
+
+        for dns_server in servers[:4]:
+            ok, rtt_ms = self._timed_udp_dns_probe(
+                bound_ip=cand.ip,
+                dns_server=dns_server,
+                hostname=self._prefs["dns_probe_name"],
+                timeout=1.2,
+            )
+            if ok:
+                cand.dns_rtt_ms = rtt_ms
+                return True
+
+        return False
+
+    def _probe_public(self, cand: UplinkCandidate, dns_ok: bool = False) -> bool:
         if not cand.link_up or not cand.ip:
             cand.last_public_probe = time.time()
             cand.public_rtt_ms = None
             return False
 
-        # Passive traffic is enough to skip an active check for a short window.
         now = time.time()
+        cand.last_public_probe = now
+
         if (now - cand.last_passive_public_at) <= float(self._prefs["passive_signal_ttl_sec"]):
-            cand.last_public_probe = now
             cand.public_rtt_ms = 0.0
             return True
 
@@ -16937,42 +17942,309 @@ class UplinkManager(_SmartManagerBase):
 
         start = self._public_probe_cursor % len(probes)
         ordered = probes[start:] + probes[:start]
-
-        # For candidates that were already healthy, try fewer probes to keep overhead down.
         tries = 2 if cand.public_ok else min(3, len(ordered))
 
-        cand.last_public_probe = now
         for host, port in ordered[:tries]:
-            ok, rtt_ms = self._timed_tcp_probe(bound_ip=cand.ip, host=host, port=port, timeout=1.0)
+            ok, rtt_ms = self._timed_tcp_probe(
+                bound_ip=cand.ip,
+                host=host,
+                port=port,
+                timeout=1.1,
+            )
             self._public_probe_cursor += 1
             if ok:
                 cand.public_rtt_ms = rtt_ms
                 return True
 
+        # DNS can still be useful as a softer signal, but not enough by itself to say
+        # the whole internet path is healthy.
         cand.public_rtt_ms = None
-        return False
+        return bool(False)
 
-    def _tcp_probe(self, *, bound_ip: str, host: str, port: int, timeout: float) -> bool:
-        ok, _rtt_ms = self._timed_tcp_probe(bound_ip=bound_ip, host=host, port=port, timeout=timeout)
-        return ok
+    # ---------------------------------------------------------
+    # repair / self-heal
+    # ---------------------------------------------------------
 
-    def _timed_tcp_probe(self, *, bound_ip: str, host: str, port: int, timeout: float) -> tuple[bool, Optional[float]]:
-        s = None
-        t0 = time.perf_counter()
+    def _maybe_repair_active_uplink(self) -> None:
+        if not self.active_uplink_full:
+            return
+
+        with self._candidate_lock:
+            cand = self.candidates.get(self.active_uplink_full)
+
+        if cand is None:
+            return
+
+        if cand.public_ok:
+            cand.metadata["repair_stage"] = 0
+            return
+
+        if not cand.link_up:
+            return
+
+        threshold = int(self._prefs["repair_failure_threshold"])
+        should_repair = (
+            cand.consecutive_public_failures >= threshold
+            or (cand.gateway_ok and cand.consecutive_dns_failures >= threshold)
+            or (cand.dns_ok and cand.consecutive_public_failures >= threshold)
+            or (cand.consecutive_gateway_failures >= threshold)
+        )
+
+        if not should_repair:
+            return
+
+        now = time.time()
+        if (now - cand.last_repair_at) < float(self._prefs["repair_cooldown_sec"]):
+            return
+
+        self._repair_active_uplink(cand)
+
+    def _repair_active_uplink(self, cand: UplinkCandidate) -> None:
+        now = time.time()
+        cand.last_repair_at = now
+        cand.repair_count += 1
+
+        stage = int(cand.metadata.get("repair_stage", 0))
+        if cand.consecutive_public_failures >= int(self._prefs["adapter_reset_failure_threshold"]):
+            stage = 3
+        elif cand.consecutive_public_failures >= int(self._prefs["dhcp_repair_failure_threshold"]):
+            stage = max(stage, 2)
+
+        self._say(
+            "uplink_repair_begin",
+            f"repairing active uplink {cand.iface_friendly} "
+            f"(gw_fail={cand.consecutive_gateway_failures}, dns_fail={cand.consecutive_dns_failures}, public_fail={cand.consecutive_public_failures}, stage={stage})",
+            ["🛠️", "📶", "🌐"],
+        )
+
+        self._invalidate_iface_caches(cand.iface_friendly)
+        self._refresh_active_candidate_runtime(cand)
+
+        # Always do the cheap/safe repair steps first.
+        self._repair_host_routes()
+        self._force_reapply_active_uplink(cand)
+        self._preserve_wifi_link()
+
+        if stage <= 0:
+            self._repair_dns_for_iface(cand, fallback_only=False)
+        elif stage == 1:
+            self._repair_dns_for_iface(cand, fallback_only=True)
+        elif stage == 2:
+            self._renew_dhcp_for_iface(cand)
+        else:
+            self._bounce_adapter(cand)
+
+        time.sleep(1.5 if stage < 2 else 4.0)
+
+        self._invalidate_iface_caches(cand.iface_friendly)
+        self._discover_candidates()
+        self._refresh_candidates_health()
+
+        best = self._choose_best_candidate()
+        if best:
+            self._activate_candidate(best)
+
+        with self._candidate_lock:
+            refreshed = self.candidates.get(cand.iface_full)
+
+        if refreshed and refreshed.public_ok:
+            refreshed.metadata["repair_stage"] = 0
+            self._say(
+                "uplink_repair_ok",
+                f"recovered internet on {refreshed.iface_friendly} {refreshed.ip}",
+                ["✅", "🌍", "📶"],
+                cooldown=0.0,
+            )
+        else:
+            next_stage = min(stage + 1, 3)
+            if refreshed:
+                refreshed.metadata["repair_stage"] = next_stage
+            self._say(
+                "uplink_repair_pending",
+                f"{cand.iface_friendly} still degraded after repair; next stage={next_stage}",
+                ["⚠️", "🔁", "🌐"],
+            )
+
+    def _repair_host_routes(self) -> None:
+        if self._prefs["remove_public_host_routes"]:
+            self._scrub_public_host_routes()
+
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.bind((bound_ip, 0))
-            s.connect((host, port))
-            return True, (time.perf_counter() - t0) * 1000.0
+            if hasattr(self.router, "_configure_host_preserving_upstream_mode"):
+                self.router._configure_host_preserving_upstream_mode()
         except Exception:
-            return False, None
-        finally:
+            pass
+
+        gm = self.gateway_manager or getattr(self.router, "gateway_manager", None)
+        if gm is not None:
             try:
-                if s:
-                    s.close()
+                gm._push_gateway_state(force=True)
             except Exception:
                 pass
+            try:
+                gm._ensure_dns_manager(force_refresh=True)
+            except Exception:
+                pass
+
+    def _repair_dns_for_iface(self, cand: UplinkCandidate, fallback_only: bool) -> None:
+        now = time.time()
+        last_dns_fix = float(cand.metadata.get("last_dns_fix_at", 0.0))
+        if (now - last_dns_fix) < float(self._prefs["dns_reset_cooldown_sec"]):
+            return
+
+        alias = self._ps_quote(cand.iface_friendly)
+        fallback_dns = [
+            ip for ip in list(self._prefs.get("fallback_dns_servers") or [])
+            if self._is_ipv4(ip)
+        ]
+        if not fallback_dns:
+            fallback_dns = list(self.DEFAULT_FALLBACK_DNS)
+
+        self._say(
+            "uplink_dns_repair",
+            f"repairing DNS on {cand.iface_friendly} "
+            f"({'fallback' if fallback_only else 'reset+fallback'})",
+            ["🧠", "📡", "🩹"],
+        )
+
+        if not fallback_only:
+            self._run_subprocess(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ResetServerAddresses -ErrorAction SilentlyContinue",
+                ],
+                timeout=8.0,
+            )
+            self._run_subprocess(["ipconfig", "/flushdns"], timeout=8.0)
+
+        quoted_dns = ",".join(f"'{self._ps_quote(ip)}'" for ip in fallback_dns)
+        self._run_subprocess(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ServerAddresses @({quoted_dns}) -ErrorAction SilentlyContinue",
+            ],
+            timeout=8.0,
+        )
+
+        cand.metadata["last_dns_fix_at"] = now
+        self._invalidate_iface_caches(cand.iface_friendly)
+
+    def _renew_dhcp_for_iface(self, cand: UplinkCandidate) -> None:
+        now = time.time()
+        last_dhcp = float(cand.metadata.get("last_dhcp_renew_at", 0.0))
+        if (now - last_dhcp) < float(self._prefs["dhcp_renew_cooldown_sec"]):
+            return
+
+        friendly = cand.iface_friendly
+        alias = self._ps_quote(friendly)
+
+        self._say(
+            "uplink_dhcp_repair",
+            f"renewing DHCP on {friendly}",
+            ["🔄", "📶", "🧰"],
+        )
+
+        # Put the adapter back on DHCP before renewing.
+        self._run_subprocess(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Set-NetIPInterface -InterfaceAlias '{alias}' -Dhcp Enabled -ErrorAction SilentlyContinue",
+            ],
+            timeout=8.0,
+        )
+
+        self._run_subprocess(["ipconfig", "/release", friendly], timeout=20.0)
+        self._run_subprocess(["ipconfig", "/renew", friendly], timeout=25.0)
+
+        cand.metadata["last_dhcp_renew_at"] = now
+        self._invalidate_iface_caches(cand.iface_friendly)
+
+    def _bounce_adapter(self, cand: UplinkCandidate) -> None:
+        now = time.time()
+        last_bounce = float(cand.metadata.get("last_adapter_bounce_at", 0.0))
+        if (now - last_bounce) < float(self._prefs["adapter_bounce_cooldown_sec"]):
+            return
+
+        alias = self._ps_quote(cand.iface_friendly)
+
+        self._say(
+            "uplink_adapter_bounce",
+            f"bouncing adapter {cand.iface_friendly} as last resort",
+            ["💥", "📶", "♻️"],
+        )
+
+        self._run_subprocess(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                (
+                    f"Disable-NetAdapter -Name '{alias}' -Confirm:$false -ErrorAction SilentlyContinue;"
+                    f"Start-Sleep -Seconds 3;"
+                    f"Enable-NetAdapter -Name '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
+                ),
+            ],
+            timeout=20.0,
+        )
+
+        cand.metadata["last_adapter_bounce_at"] = now
+        self._invalidate_iface_caches(cand.iface_friendly)
+
+    def _force_reapply_active_uplink(self, cand: UplinkCandidate) -> None:
+        try:
+            r = self.router
+            r.interface_out_full_name = cand.iface_full
+            r.interface_out_friendly_name = cand.iface_friendly
+            r.router_ip_out = cand.ip
+            r.router_netmask_out = cand.netmask
+            r.router_network_out = cand.network
+            r.router_gateway_out_ip = cand.gateway_ip
+
+            cfg = r._interfaces_config.setdefault(cand.iface_full, {})
+            cfg["friendly_name"] = cand.iface_friendly
+            cfg["ip_addr"] = cand.ip
+            cfg["network"] = cand.network
+            cfg["gateway"] = cand.gateway_ip
+            cfg["is_default_gateway_iface"] = True
+        except Exception:
+            pass
+
+        self._apply_candidate_to_managers(cand)
+
+    def _refresh_active_candidate_runtime(self, cand: UplinkCandidate) -> None:
+        info = self._get_cached_ipv4_info_for_adapter(cand.iface_friendly)
+        if info:
+            cand.ip = info.get("ip")
+            cand.netmask = info.get("netmask")
+            cand.network = info.get("network")
+        cand.link_up = self._iface_link_up(cand.iface_friendly)
+        cand.gateway_ip = self._get_cached_gateway_for_iface(cand.iface_friendly, cand.ip)
+        cand.dns_servers = self._get_windows_dns_servers(cand.iface_friendly)
+
+    def _invalidate_iface_caches(self, iface_friendly: Optional[str]) -> None:
+        if not iface_friendly:
+            return
+        self._adapter_cache.pop(iface_friendly, None)
+        self._gateway_cache.pop(iface_friendly, None)
+        self._dns_cache.pop(iface_friendly, None)
+
+    # ---------------------------------------------------------
+    # scoring / activation
+    # ---------------------------------------------------------
 
     def _score_candidate(self, cand: UplinkCandidate) -> float:
         score = 0.0
@@ -16982,22 +18254,29 @@ class UplinkManager(_SmartManagerBase):
             score += 8.0
         if cand.gateway_ok:
             score += 14.0
+        if cand.dns_ok:
+            score += 12.0
         if cand.public_ok:
-            score += 72.0
+            score += 70.0
 
         if (now - cand.last_passive_public_at) <= float(self._prefs["passive_signal_ttl_sec"]):
-            score += 12.0
+            score += 10.0
         if (now - cand.last_passive_nat_at) <= float(self._prefs["passive_signal_ttl_sec"]):
-            score += 7.0
+            score += 6.0
         if (now - cand.last_passive_arp_at) <= float(self._prefs["passive_signal_ttl_sec"]):
-            score += 5.0
+            score += 4.0
 
         score += min(cand.ok_count * 2.5, 15.0)
-        score -= min(cand.fail_count * 4.0, 28.0)
-        score -= min(cand.consecutive_public_failures * 3.0, 18.0)
+        score -= min(cand.fail_count * 4.0, 30.0)
+        score -= min(cand.consecutive_gateway_failures * 3.0, 18.0)
+        score -= min(cand.consecutive_dns_failures * 3.0, 18.0)
+        score -= min(cand.consecutive_public_failures * 4.0, 24.0)
+        score -= min(cand.repair_count * 1.0, 8.0)
 
         if cand.public_rtt_ms is not None:
             score -= min(cand.public_rtt_ms / 25.0, 10.0)
+        if cand.dns_rtt_ms is not None:
+            score -= min(cand.dns_rtt_ms / 30.0, 6.0)
         if cand.gateway_rtt_ms is not None and cand.gateway_rtt_ms > 0:
             score -= min(cand.gateway_rtt_ms / 20.0, 6.0)
 
@@ -17008,6 +18287,8 @@ class UplinkManager(_SmartManagerBase):
             score += 4.0
             if cand.public_ok:
                 score += 8.0
+            elif cand.dns_ok:
+                score += 3.0
 
         if (now - cand.last_seen) < 30.0:
             score += 4.0
@@ -17028,13 +18309,11 @@ class UplinkManager(_SmartManagerBase):
             public_candidates.sort(key=lambda c: (c.score, c.ok_count, -c.fail_count), reverse=True)
             best_public = public_candidates[0]
 
-            # Stick with the current public uplink unless the new one is meaningfully better.
             if active and active.public_ok and (active.score + 6.0) >= best_public.score:
                 return active
             return best_public
 
-        # No public-ready path: keep a sane current uplink if it still has link/gateway health.
-        if active and active.link_up and (active.gateway_ok or (time.time() - active.last_ok) < 60.0):
+        if active and active.link_up and (active.dns_ok or active.gateway_ok or (time.time() - active.last_ok) < 60.0):
             return active
 
         snapshot.sort(key=lambda c: (c.score, c.ok_count, -c.fail_count), reverse=True)
@@ -17044,10 +18323,6 @@ class UplinkManager(_SmartManagerBase):
             return active
 
         return best
-
-    # ---------------------------------------------------------
-    # activation
-    # ---------------------------------------------------------
 
     def _activate_candidate(self, cand: UplinkCandidate) -> bool:
         if not self._prefs["allow_router_failover"]:
@@ -17059,7 +18334,6 @@ class UplinkManager(_SmartManagerBase):
         current = self.candidates.get(self.active_uplink_full) if self.active_uplink_full else None
 
         if current and current.iface_full != cand.iface_full:
-            # Avoid rapid churn unless the current uplink lost public health and the new one has it.
             in_cooldown = (now - self._last_switch_at) < float(self._prefs["activation_cooldown_sec"])
             if in_cooldown and not ((not current.public_ok) and cand.public_ok):
                 return False
@@ -17116,7 +18390,7 @@ class UplinkManager(_SmartManagerBase):
             if current and current.iface_full != cand.iface_full:
                 current.flap_count += 1
 
-        extra = "public-ready" if cand.public_ok else "gateway-only"
+        extra = "public-ready" if cand.public_ok else ("dns-ready" if cand.dns_ok else "gateway-only")
         self._say(
             "uplink_activated",
             f"activated uplink {cand.iface_friendly} {cand.ip} via {cand.gateway_ip} ({extra})",
@@ -17128,7 +18402,6 @@ class UplinkManager(_SmartManagerBase):
     def _apply_candidate_to_managers(self, cand: UplinkCandidate) -> None:
         r = self.router
 
-        # Generic attribute propagation so ARP / NAT / packet writer can react immediately.
         for manager_name in ("arp_manager", "nat_manager", "packet_writer", "dns_manager"):
             mgr = getattr(r, manager_name, None)
             if mgr is None:
@@ -17148,7 +18421,6 @@ class UplinkManager(_SmartManagerBase):
                 except Exception:
                     pass
 
-        # ARP: make the new uplink immediately useful to L2 resolution.
         arp = getattr(r, "arp_manager", None)
         if arp is not None:
             try:
@@ -17162,7 +18434,6 @@ class UplinkManager(_SmartManagerBase):
             except Exception:
                 pass
 
-        # NAT: keep outbound identity in sync.
         nat = getattr(r, "nat_manager", None)
         if nat is not None:
             try:
@@ -17181,7 +18452,6 @@ class UplinkManager(_SmartManagerBase):
             except Exception:
                 pass
 
-        # Packet writer: refresh interface snapshot once after switch.
         try:
             if getattr(r, "packet_writer", None) is not None:
                 r.packet_writer.update_interfaces(r._interfaces_config)
@@ -17221,7 +18491,7 @@ class UplinkManager(_SmartManagerBase):
         for cand in self._ordered_candidates_for_health():
             if cand.iface_friendly not in preferred_names:
                 continue
-            if not (cand.link_up and cand.gateway_ip):
+            if not cand.link_up:
                 continue
 
             try:
@@ -17232,7 +18502,7 @@ class UplinkManager(_SmartManagerBase):
 
             self._say(
                 "wifi_preserved",
-                f"keeping {cand.iface_friendly} online as a live gateway-linked candidate",
+                f"keeping {cand.iface_friendly} online as a live preferred uplink candidate",
                 ["📶", "🫶", "🔒"],
             )
             return
@@ -17252,7 +18522,11 @@ class UplinkManager(_SmartManagerBase):
             changed = True
 
         if changed:
-            self._say("uplink_safe_mode", "disabled NetRoute default-route sync / metric tuning for safer host internet", ["🛡️", "🚧"])
+            self._say(
+                "uplink_safe_mode",
+                "disabled NetRoute default-route sync / metric tuning for safer host internet",
+                ["🛡️", "🚧"],
+            )
 
     def _scrub_public_host_routes(self) -> None:
         targets = set(self.learned_public_ips)
@@ -17285,7 +18559,7 @@ foreach ($ip in $targets) {{
 """
         self._run_subprocess(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            timeout=4.0,
+            timeout=5.0,
         )
 
     # ---------------------------------------------------------
@@ -17312,12 +18586,6 @@ foreach ($ip in $targets) {{
         return None
 
     def _get_windows_dns_servers(self, iface_friendly: str) -> list[str]:
-        """
-        Return IPv4 DNS servers configured on a Windows adapter.
-
-        Tries PowerShell first, then falls back to parsing ipconfig.
-        Results are cached to keep the health loop light.
-        """
         if not iface_friendly:
             return []
 
@@ -17343,7 +18611,7 @@ if ($servers) {{
 }}
 """,
             ],
-            timeout=3.0,
+            timeout=4.0,
         )
         if proc and proc.returncode == 0:
             for raw in (proc.stdout or "").splitlines():
@@ -17352,7 +18620,7 @@ if ($servers) {{
                     servers.append(ip)
 
         if not servers:
-            proc = self._run_subprocess(["ipconfig", "/all"], timeout=3.0)
+            proc = self._run_subprocess(["ipconfig", "/all"], timeout=4.0)
             if proc and proc.returncode == 0:
                 lines = (proc.stdout or "").splitlines()
                 in_target = False
@@ -17393,6 +18661,99 @@ if ($servers) {{
         self._dns_cache[iface_friendly] = (now, list(servers))
         return servers
 
+    # ---------------------------------------------------------
+    # low-level probes
+    # ---------------------------------------------------------
+
+    def _dns_query_packet(self, hostname: str, txid: int) -> bytes:
+        out = bytearray()
+        out += int(txid & 0xFFFF).to_bytes(2, "big")
+        out += b"\x01\x00"                  # standard query, recursion desired
+        out += b"\x00\x01"                  # QDCOUNT
+        out += b"\x00\x00\x00\x00\x00\x00"  # AN/NS/AR counts
+
+        for label in str(hostname).strip(".").split("."):
+            enc = label.encode("ascii", errors="ignore")[:63]
+            out.append(len(enc))
+            out += enc
+        out += b"\x00"       # end name
+        out += b"\x00\x01"   # QTYPE=A
+        out += b"\x00\x01"   # QCLASS=IN
+        return bytes(out)
+
+    def _timed_udp_dns_probe(
+        self,
+        *,
+        bound_ip: str,
+        dns_server: str,
+        hostname: str,
+        timeout: float = 1.2,
+    ) -> tuple[bool, Optional[float]]:
+        s = None
+        t0 = time.perf_counter()
+        txid = int(time.time() * 1000) & 0xFFFF
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.bind((bound_ip, 0))
+
+            payload = self._dns_query_packet(hostname, txid)
+            s.sendto(payload, (dns_server, 53))
+            resp, _addr = s.recvfrom(1024)
+
+            if len(resp) < 12:
+                return False, None
+
+            if int.from_bytes(resp[0:2], "big") != txid:
+                return False, None
+
+            flags = int.from_bytes(resp[2:4], "big")
+            qr = bool(flags & 0x8000)
+            rcode = flags & 0x000F
+            ancount = int.from_bytes(resp[6:8], "big")
+
+            ok = qr and rcode == 0 and ancount >= 0
+            return ok, ((time.perf_counter() - t0) * 1000.0 if ok else None)
+
+        except Exception:
+            return False, None
+        finally:
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+
+    def _timed_tcp_probe(
+        self,
+        *,
+        bound_ip: str,
+        host: str,
+        port: int,
+        timeout: float,
+    ) -> tuple[bool, Optional[float]]:
+        s = None
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.bind((bound_ip, 0))
+            s.connect((host, port))
+            return True, (time.perf_counter() - t0) * 1000.0
+        except Exception:
+            return False, None
+        finally:
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------
+    # internal helpers
+    # ---------------------------------------------------------
+
     @staticmethod
     def _is_ipv4(value: Optional[str]) -> bool:
         try:
@@ -17429,10 +18790,6 @@ if ($servers) {{
         except Exception:
             return False
 
-    # ---------------------------------------------------------
-    # internal helpers
-    # ---------------------------------------------------------
-
     def _safe_call(self, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -17442,7 +18799,11 @@ if ($servers) {{
     def _ps_quote(self, value: str) -> str:
         return str(value).replace("'", "''")
 
-    def _run_subprocess(self, args: list[str], timeout: float = 3.0) -> Optional[subprocess.CompletedProcess]:
+    def _run_subprocess(
+        self,
+        args: list[str],
+        timeout: float = 3.0,
+    ) -> Optional[subprocess.CompletedProcess]:
         try:
             return subprocess.run(
                 args,
@@ -17469,14 +18830,21 @@ if ($servers) {{
         try:
             info = self._get_ipv4_info_for_adapter(iface_friendly)
             if info and info.get("ip") and info.get("netmask") and not info.get("network"):
-                info["network"] = ipaddress.ip_network(f"{info['ip']}/{info['netmask']}", strict=False)
+                info["network"] = ipaddress.ip_network(
+                    f"{info['ip']}/{info['netmask']}",
+                    strict=False,
+                )
         except Exception:
             info = None
 
         self._adapter_cache[iface_friendly] = (now, info)
         return info
 
-    def _get_cached_gateway_for_iface(self, iface_friendly: str, local_ip: Optional[str]) -> Optional[str]:
+    def _get_cached_gateway_for_iface(
+        self,
+        iface_friendly: str,
+        local_ip: Optional[str],
+    ) -> Optional[str]:
         now = time.time()
         cached = self._gateway_cache.get(iface_friendly)
         if cached and not self._is_cache_expired(now, cached, self._prefs["gateway_cache_ttl_sec"]):
@@ -17503,44 +18871,11 @@ if ($servers) {{
         snapshot.sort(key=key, reverse=True)
         return snapshot
 
-    def _should_probe_gateway(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
-        base_gap = float(self._prefs["min_probe_gap_sec"])
-        if cand.iface_full == self.active_uplink_full:
-            return (now - cand.last_gateway_probe) >= base_gap
-        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
-            return (now - cand.last_gateway_probe) >= (base_gap * 1.5)
-        return idx < 2 and (now - cand.last_gateway_probe) >= (base_gap * 2.5)
-
-    def _should_probe_public(self, cand: UplinkCandidate, now: float, idx: int) -> bool:
-        base_gap = float(self._prefs["min_probe_gap_sec"])
-        if cand.iface_full == self.active_uplink_full:
-            return (now - cand.last_public_probe) >= base_gap
-        if cand.iface_friendly in self._prefs["preferred_iface_names"]:
-            return (now - cand.last_public_probe) >= (base_gap * 1.5)
-        return idx < int(self._prefs["max_probe_candidates_per_loop"]) and (now - cand.last_public_probe) >= (base_gap * 3.0)
-
-    def _gateway_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
-        if not cand.link_up or not cand.ip or not cand.gateway_ip:
-            return False
-        if (now - cand.last_passive_arp_at) <= float(self._prefs["passive_signal_ttl_sec"]):
-            return True
-        if self._gateway_looks_routable(cand):
-            return True
-        return bool(default)
-
-    def _public_health_from_passive(self, cand: UplinkCandidate, now: float, default: bool) -> bool:
-        ttl = float(self._prefs["passive_signal_ttl_sec"])
-        if (now - cand.last_passive_public_at) <= ttl:
-            return True
-        if (now - cand.last_passive_nat_at) <= ttl:
-            return True
-        if cand.iface_full == self.active_uplink_full and (now - cand.last_ok) <= ttl and cand.consecutive_public_failures <= 1:
-            return True
-        return bool(default)
-
     def _health_state_for_candidate(self, cand: UplinkCandidate) -> str:
         if cand.public_ok:
             return "public"
+        if cand.dns_ok:
+            return "dns"
         if cand.gateway_ok:
             return "gateway"
         if cand.link_up:
@@ -17555,6 +18890,10 @@ if ($servers) {{
             return gw in cand.network
         except Exception:
             return False
+
+    # ---------------------------------------------------------
+    # passive signal helpers
+    # ---------------------------------------------------------
 
     def _collect_manager_signals(self, candidates: list[UplinkCandidate], now: float) -> None:
         arp = getattr(self.router, "arp_manager", None)
@@ -17617,7 +18956,13 @@ if ($servers) {{
         }
         return {t for t in tokens if t}
 
-    def _container_contains_any(self, obj: Any, tokens: set[str], depth: int = 2, max_items: int = 32) -> bool:
+    def _container_contains_any(
+        self,
+        obj: Any,
+        tokens: set[str],
+        depth: int = 2,
+        max_items: int = 32,
+    ) -> bool:
         if obj is None or depth < 0 or not tokens:
             return False
 
@@ -17650,9 +18995,26 @@ if ($servers) {{
             text = str(obj).lower()
             return any(tok in text for tok in tokens)
 
-        for attr in ("ip", "gateway", "iface", "interface", "ifname", "friendly_name", "ip_addr", "local_ip", "remote_ip", "src", "dst"):
+        for attr in (
+            "ip",
+            "gateway",
+            "iface",
+            "interface",
+            "ifname",
+            "friendly_name",
+            "ip_addr",
+            "local_ip",
+            "remote_ip",
+            "src",
+            "dst",
+        ):
             try:
-                if hasattr(obj, attr) and self._container_contains_any(getattr(obj, attr), tokens, depth - 1, max_items):
+                if hasattr(obj, attr) and self._container_contains_any(
+                    getattr(obj, attr),
+                    tokens,
+                    depth - 1,
+                    max_items,
+                ):
                     return True
             except Exception:
                 pass
