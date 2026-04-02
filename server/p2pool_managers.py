@@ -2519,12 +2519,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     remove_public_host_routes=True,
                 )
                 self.uplink_manager.start()
-            self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
-            self.stratum_connection_manager = StratumConnectionManager(
-                self.code_output_manager,
-                self.router_logger,
-                self.stratum_manager,
-            )
+            # NEW
+            self.stratum_manager = None
+            self.stratum_connection_manager = None
+
+            if use_stratum_comm:
+                self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
+                self.stratum_connection_manager = StratumConnectionManager(
+                    self.code_output_manager,
+                    self.router_logger,
+                    self.stratum_manager,
+                )
             self.arp_manager.router_ip_out = self.router_ip_out
             self.arp_manager.set_default_gateway(self._interfaces_config, self.router_gateway_out_ip)
 
@@ -2943,6 +2948,123 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         except Exception:
             pass  # Suppress all errors
 
+    # --- add this helper inside PythonRouterManager ---
+
+    def _get_windows_dns_servers(self, iface_friendly_name: Optional[str]) -> list[str]:
+        if not iface_friendly_name:
+            return []
+
+        quoted = str(iface_friendly_name).replace("'", "''")
+        ps_cmd = rf"""
+    $servers = Get-DnsClientServerAddress -InterfaceAlias '{quoted}' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty ServerAddresses -ErrorAction SilentlyContinue
+    if ($servers) {{ $servers | ForEach-Object {{ $_ }} }}
+    """
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode == 0:
+                out = []
+                for line in (proc.stdout or "").splitlines():
+                    line = line.strip()
+                    try:
+                        ipaddress.IPv4Address(line)
+                        out.append(line)
+                    except Exception:
+                        pass
+                if out:
+                    return out
+        except Exception:
+            pass
+
+        try:
+            proc = subprocess.run(
+                ["netsh", "interface", "ipv4", "show", "dnsservers", f"name={iface_friendly_name}"],
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode == 0:
+                found = re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", proc.stdout or "")
+                out = []
+                for x in found:
+                    try:
+                        ipaddress.IPv4Address(x)
+                        out.append(x)
+                    except Exception:
+                        pass
+                if out:
+                    return out
+        except Exception:
+            pass
+
+        return []
+
+    # -----------------------------
+    # Add these helpers to PythonRouterManager
+    # -----------------------------
+
+    def _should_skip_managed_iface_config(self, iface_full_name: str, iface_friendly_name: str) -> bool:
+        """
+        Skip only true internal/virtual helper interfaces.
+        Never skip the currently active IN or OUT interface just because its name is 'Ethernet'.
+        """
+        full = str(iface_full_name or "").strip()
+        friendly = str(iface_friendly_name or "").strip().lower()
+
+        # Never skip the live IN/OUT interfaces.
+        if full and full in {
+            getattr(self, "interface_in_full_name", None),
+            getattr(self, "interface_out_full_name", None),
+        }:
+            return False
+
+        # Loopback / synthetic capture only.
+        if full and full == getattr(self, "interface_loopback_full_name", None):
+            return True
+        if friendly in {"adapter for loopback traffic capture", "lo", "loopback"}:
+            return True
+
+        # Keep your LAC helper adapters skipped unless they are explicitly the live WAN/LAN.
+        if "local area connection*" in friendly:
+            return True
+
+        return False
+
+    def _mark_default_gateway_iface(self, outbound_iface_name: str | None, gateway_ip: str | None = None) -> bool:
+        """
+        Make exactly one interface the default-gateway interface.
+        Clears stale flags everywhere else.
+        """
+        if not outbound_iface_name:
+            self.router_logger.log_message(
+                "[Router] ERROR: No outbound interface provided for default-gateway marking.")
+            return False
+
+        if outbound_iface_name not in self._interfaces_config:
+            self.router_logger.log_message(
+                f"[Router] ERROR: Outbound interface '{outbound_iface_name}' not configured for default gateway."
+            )
+            return False
+
+        # Clear stale flags first.
+        for iface_name, cfg in self._interfaces_config.items():
+            if isinstance(cfg, dict):
+                cfg["is_default_gateway_iface"] = (iface_name == outbound_iface_name)
+
+        self.default_gateway_ip = gateway_ip
+        if gateway_ip:
+            self._interfaces_config[outbound_iface_name]["gateway"] = gateway_ip
+
+        self.router_logger.log_message(
+            f"[Router] Set default gateway owner: {outbound_iface_name.split('_')[-1]} "
+            f"(gateway={gateway_ip or 'unchanged'})"
+        )
+        return True
     def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, use_hyperv: bool, router_ip_in: str = None,
                                       router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
                                       router_netmask_out: str = "255.255.255.0") -> bool:
@@ -2967,13 +3089,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         for iface_full_name, config in self._interfaces_config.items():
             iface_friendly_name = self._get_friendly_name_from_full(iface_full_name)
             # Skip loopback and other specific internal interfaces if they are not meant for dynamic config
-            if iface_friendly_name == "Ethernet" or iface_friendly_name == "Adapter for loopback traffic capture" or \
-                    iface_friendly_name.lower() == "lo" or \
-                    "local area connection*" in iface_friendly_name.lower():  # Catch LAC interfaces
+            if self._should_skip_managed_iface_config(iface_full_name, iface_friendly_name):
                 self.router_logger.log_message(
-                    f"[Router] ⏭️ Skipping configuration for internal/virtual interface: '{iface_friendly_name}'.")
+                    f"[Router] ⏭️ Skipping configuration for internal/virtual interface: '{iface_friendly_name}'."
+                )
                 continue
-
             ip_address_config = config.get('ip_addr')
             network_config = config.get('network')
 
@@ -3019,18 +3139,31 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 ip_to_assign = router_ip_out if router_ip_out else ip_address_config
                 netmask_to_assign = router_netmask_out if router_netmask_out else str(network_config.netmask)
                 gateway_to_assign = self.router_gateway_out_ip  # Use the discovered/configured gateway for OUT
-                dns_server_to_assign = self.router_ip_in
+
+                # FIX:
+                # Do NOT point the desktop/WAN adapter at self.router_ip_in for DNS.
+                # Preserve/use the real upstream DNS already known on this adapter.
+                upstream_dns = self._get_windows_dns_servers(iface_friendly_name)
+                if upstream_dns:
+                    dns_server_to_assign = upstream_dns[0]
+                elif self.router_gateway_out_ip:
+                    # Last-resort fallback: many home routers are also the DNS forwarder
+                    dns_server_to_assign = self.router_gateway_out_ip
+                else:
+                    dns_server_to_assign = ""
+
             elif is_in_iface:
                 ip_to_assign = router_ip_in if router_ip_in else ip_address_config
                 netmask_to_assign = router_netmask_in if router_netmask_in else str(network_config.netmask)
                 # IN interface typically doesn't have a gateway configured on itself, it *is* the gateway
                 gateway_to_assign = ""
-                dns_server_to_assign = ip_to_assign  # Router itself is DNS for IN
-            else:  # For other interfaces not explicitly IN/OUT (e.g., Ethernet 2, LAC)
+                dns_server_to_assign = ip_to_assign  # Router itself is DNS for IN clients
+
+            else:  # For other interfaces not explicitly IN/OUT (e.g. Ethernet 2, LAC)
                 ip_to_assign = ip_address_config
                 netmask_to_assign = str(network_config.netmask) if network_config else "255.255.255.0"
-                gateway_to_assign = ""  # No gateway for these
-                dns_server_to_assign = ""  # No DNS for these
+                gateway_to_assign = ""
+                dns_server_to_assign = ""
 
             if not ip_to_assign or not netmask_to_assign:
                 self.router_logger.log_message(
@@ -3147,9 +3280,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             iface_friendly_name = self._get_real_adapter_name(partial_name) or partial_name
 
             # Skip the "Ethernet" interface as requested
-            if iface_friendly_name == "Ethernet" or iface_friendly_name == "Adapter for loopback traffic capture" or iface_friendly_name == "Local Area Connection* 12" or iface_friendly_name == "Local Area Connection* 1"or iface_friendly_name == "Local Area Connection* 2":
+            if self._should_skip_managed_iface_config(iface_full_name, iface_friendly_name):
                 self.router_logger.log_message(
-                    f"[Router] ⏭️ Skipping deconfiguration for '{iface_friendly_name}' as requested.")
+                    f"[Router] ⏭️ Skipping deconfiguration for internal/virtual interface: '{iface_friendly_name}'."
+                )
                 continue
 
             self.router_logger.log_message(f"[Router] 🧹 Deconfiguring '{iface_friendly_name}' to DHCP...")
@@ -3474,15 +3608,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         Sets the default gateway IP and the interface through which to reach it.
         outbound_iface_name here is the full Scapy interface name.
         """
-        if outbound_iface_name not in self._interfaces_config:
-            self.router_logger.log_message(
-                f"[Router] ERROR: Outbound interface '{outbound_iface_name}' not configured for default gateway.")
+        ok = self._mark_default_gateway_iface(outbound_iface_name, gateway_ip)
+        if not ok:
             return False
 
-        self.default_gateway_ip = gateway_ip
-        self._interfaces_config[outbound_iface_name]['is_default_gateway_iface'] = True
+        # Keep router-facing state in sync with the flag owner.
+        if outbound_iface_name == self.interface_out_full_name:
+            self.router_gateway_out_ip = gateway_ip
+
         self.router_logger.log_message(
-            f"[Router] Set default gateway: {gateway_ip} via {outbound_iface_name.split('_')[-1]}")
+            f"[Router] Set default gateway: {gateway_ip} via {outbound_iface_name.split('_')[-1]}"
+        )
         return True
     def cleanup_all_network_changes(self):
         """

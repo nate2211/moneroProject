@@ -16887,8 +16887,12 @@ class GatewayManager(_SmartManagerBase):
             "ip_addr": r.router_ip_out,
             "network": r.router_network_out,
             "broadcast": str(r.router_network_out.broadcast_address),
-            "is_default_gateway_iface": True,
         })
+
+        if hasattr(r, "_mark_default_gateway_iface"):
+            r._mark_default_gateway_iface(wan_full, getattr(r, "router_gateway_out_ip", None))
+        else:
+            cfg["is_default_gateway_iface"] = True
 
         if not cfg.get("mac") and hasattr(r, "get_interface_mac"):
             try:
@@ -18453,7 +18457,11 @@ class UplinkManager(_SmartManagerBase):
             cfg["ip_addr"] = cand.ip
             cfg["network"] = cand.network
             cfg["gateway"] = cand.gateway_ip
-            cfg["is_default_gateway_iface"] = True
+
+            if hasattr(r, "_mark_default_gateway_iface"):
+                r._mark_default_gateway_iface(cand.iface_full, cand.gateway_ip)
+            else:
+                cfg["is_default_gateway_iface"] = True
         except Exception:
             pass
 
