@@ -5891,9 +5891,6 @@ class TransportMoneroManager:
         self._last_gc = time.time()
 
         self.logger.log_message("[Transport][🪙 Monero] Manager ready.")
-        self.logger.log_message(
-            f"[Transport][🪙 Monero] P2Pool-aware ports active: {sorted(self._p2pool_ports)}"
-        )
 
     # ========== Public entrypoint ==========
     def handle(self, pkt, src, dst, sport, dport, inbound_iface) -> str:
@@ -10683,25 +10680,25 @@ class TransportDHCPActiveAgent:
     # ---------------- Client mode ----------------
 
     def client_discover(self, iface: str, *, prl: Optional[List[int]] = None) -> int:
-        """
-        Send DHCPDISCOVER on 'iface'. Returns xid used.
-        """
-        mac = get_if_hwaddr(iface)
+        mac = self._safe_iface_mac(iface)
+        if mac == "00:00:00:00:00:00":
+            raise RuntimeError(f"Could not resolve a usable MAC for DHCP discover on iface '{iface}'")
+
         xid = random.getrandbits(32)
         if prl is None:
-            prl = [1, 3, 6, 15, 51, 54, 58, 59, 119, 121, 249, 252, 44]  # mask, router, dns, domain, lease, server id, T1,T2,...
+            prl = [1, 3, 6, 15, 51, 54, 58, 59, 119, 121, 249, 252, 44]
 
         pkt = (
-            Ether(dst="ff:ff:ff:ff:ff:ff", src=mac) /
-            IP(src="0.0.0.0", dst="255.255.255.255") /
-            UDP(sport=68, dport=67) /
-            BOOTP(op=1, chaddr=self._chaddr(mac), xid=xid, flags=0x8000, htype=1, hlen=6) /
-            DHCP(options=[
-                ("message-type", "discover"),
-                ("client_id", b"\x01" + self._mac_bytes(mac)),
-                ("param_req_list", prl),
-                "end"
-            ])
+                Ether(dst="ff:ff:ff:ff:ff:ff", src=mac) /
+                IP(src="0.0.0.0", dst="255.255.255.255") /
+                UDP(sport=68, dport=67) /
+                BOOTP(op=1, chaddr=self._chaddr(mac), xid=xid, flags=0x8000, htype=1, hlen=6) /
+                DHCP(options=[
+                    ("message-type", "discover"),
+                    ("client_id", b"\x01" + self._mac_bytes(mac)),
+                    ("param_req_list", prl),
+                    "end"
+                ])
         )
 
         self.sniffer.sendp(pkt, iface=iface)
@@ -10902,6 +10899,43 @@ class TransportDHCPManager:
         self._client_mode = False
         self._server_mode = False
 
+    def _safe_iface_mac(self, iface: str, fallback: str = "00:00:00:00:00:00") -> str:
+        iface = str(iface or "").strip()
+
+        # 1) direct Scapy lookup
+        try:
+            mac = get_if_hwaddr(iface)
+            if mac and mac.lower() != "00:00:00:00:00:00":
+                return mac.lower()
+        except Exception:
+            pass
+
+        # 2) Windows GUID/name/friendly-name lookup
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            guid = iface.strip("{}").upper()
+
+            for rec in get_windows_if_list():
+                candidates = [
+                    rec.get("name"),
+                    rec.get("win_name"),
+                    rec.get("friendly_name"),
+                    rec.get("friendlyname"),
+                    rec.get("description"),
+                    rec.get("guid"),
+                ]
+                for cand in candidates:
+                    cand = str(cand or "").strip()
+                    if not cand:
+                        continue
+                    if iface == cand or guid == cand.strip("{}").upper():
+                        mac = (rec.get("mac") or "").lower()
+                        if mac and mac != "00:00:00:00:00:00":
+                            return mac
+        except Exception:
+            pass
+
+        return (fallback or "00:00:00:00:00:00").lower()
     # -------- enable active modes --------
     def enable_client(self, sniffer) -> None:
         self._active = TransportDHCPActiveAgent(sniffer=sniffer, logger=self.logger)
@@ -10968,9 +11002,14 @@ class TransportDHCPManager:
             # Client reactions
             if self._client_mode:
                 if msg_name == "OFFER":
+                    offer_mac = self._safe_iface_mac(iface, fallback=mac)
+
                     self._active.on_offer(
-                        iface=iface, xid=xid, server_ip=server_id or siaddr,
-                        yiaddr=yiaddr if yiaddr != "0.0.0.0" else req_ip, mac=get_if_hwaddr(iface)
+                        iface=iface,
+                        xid=xid,
+                        server_ip=server_id or siaddr,
+                        yiaddr=yiaddr if yiaddr != "0.0.0.0" else req_ip,
+                        mac=offer_mac,
                     )
                 elif msg_name == "ACK":
                     self._active.on_ack(xid=xid, yiaddr=yiaddr, lease_time=lease_time)

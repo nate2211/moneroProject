@@ -212,15 +212,17 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
-    def __init__(self, arp_manager, rip_manager, lag_manager, outbound_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None):
+    def __init__(self, arp_manager, rip_manager, lag_manager, outbound_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None, use_hyperv = False):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
         self.lag_manager = lag_manager
         self.outbound_manager = outbound_manager
+        self.use_hyperv = use_hyperv
         self._interfaces_config = _interfaces_config
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
+
         self.supported_ethertypes = {
             0x888E,  # EAPOL (802.1X)
             0x88CC,  # LLDP
@@ -1691,14 +1693,34 @@ class SnifferSoftware:
             )
 
             if result != 0:
-                error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                if "device attached" in error_msg.lower() or "not functioning" in error_msg.lower():
+                error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8", errors="ignore")
+
+                if self.use_hyperv:
+                    self.hyperv_manager.send_packet(bytes(packet))
+                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out}; sent via PYPIPE")
+                    return None
+
+                # non-Hyper-V fallback 1: local/loopback traffic -> OS loopback
+                try:
+                    dst_ip = str(packet.dst)
+                except Exception:
+                    dst_ip = None
+
+                if dst_ip and self._dst_is_private_or_local(dst_ip):
                     self.logger.log_message(
-                        f"[Sniffer] 🪈 sr1 send failed on {iface_out}: Device not functioning (likely Win32 error 31) sending down PYPIPE.")
-                    self.hyperv_manager.send_packet(bytes(packet))
-                else:
-                    self.hyperv_manager.send_packet(bytes(packet))
-                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out} sending down PYPIPE")
+                        f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; trying OS loopback/local fallback"
+                    )
+                    return self._send_l3_loopback(packet, expect_reply=True, timeout=timeout, iface=iface_out)
+
+                # non-Hyper-V fallback 2: loopback pcap -> real egress NIC
+                retry_iface = self._ensure_egress_iface_for_dst(iface_out, dst_ip) if dst_ip else None
+                if retry_iface and retry_iface != iface_out:
+                    self.logger.log_message(
+                        f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; retrying on {retry_iface}"
+                    )
+                    return self.sr1(packet, iface=retry_iface, timeout=timeout, verbose=verbose, route_info=route_info)
+
+                self.logger.log_message(f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}")
                 return None
 
             if verbose >= 1:

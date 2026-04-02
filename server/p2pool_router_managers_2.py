@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import psutil
 import requests
+import select
 import zmq
 from scapy.arch import get_windows_if_list
 from scapy.arch import get_if_hwaddr
@@ -6578,6 +6579,12 @@ class NATManager:
                 self._bump_gray_score(src_ip, external_ip, int(external_port), reason="dynamic")
                 self._log(f"[NAT] ⬅️ DNAT dynamic {external_ip}:{external_port} → {dyn[0]}:{dyn[1]} (from {src_ip})")
                 return dyn
+            # FIRST: honor existing temp lease before probe-ban logic
+            li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
+            if li:
+                lease = self._maybe_grant_temp_lease(src_ip, external_ip, int(external_port))
+                if lease:
+                    return lease
 
             self._port_probe_counts[src_ip] += 1
             count = self._port_probe_counts[src_ip]
@@ -6689,8 +6696,24 @@ class NATManager:
         if mode == "deny":
             self._log(f"[NAT][LEASE] ⛔ Service policy denies port {external_port}")
             return None
-
         now = time.time()
+        li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
+        if li:
+            state = li.get("state", "gray")
+            if now < float(li["lease_end"]):
+                self._log_debug(
+                    f"Active lease {src_ip}@{external_ip}:{external_port} → {li['internal_ip']}:{li['internal_port']}"
+                )
+                self._bump_gray_score(src_ip, external_ip, external_port, reason="active")
+                return str(li["internal_ip"]), int(li["internal_port"])
+            if now < float(li["cooldown_end"]):
+                backoff = self._calc_backoff(li.get("failures", 0))
+                li["cooldown_end"] = now + backoff
+                self._log(
+                    f"[NAT][LEASE] 🧯 Cooldown extended ({int(backoff)}s) for {src_ip}@{external_ip}:{external_port} (state={state})")
+                return None
+
+
         ip_active = self._active_lease_count_for_ip(src_ip, now)
         ip_cap = int(pol.get("max_per_ip", self.MAX_TEMP_LEASES_PER_IP))
         if ip_active >= ip_cap:
@@ -6704,20 +6727,6 @@ class NATManager:
             self._log(f"[NAT][LEASE] ❌ Prefix {prefix} reached cap ({pre_active}/{pre_cap})")
             return None
 
-        li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
-        if li:
-            state = li.get("state", "gray")
-            if now < float(li["lease_end"]):
-                self._log_debug(
-                    f"Active lease {src_ip}@{external_ip}:{external_port} → {li['internal_ip']}:{li['internal_port']}"
-                )
-                self._bump_gray_score(src_ip, external_ip, external_port, reason="active")
-                return str(li["internal_ip"]), int(li["internal_port"])
-            if now < float(li["cooldown_end"]):
-                backoff = self._calc_backoff(li.get("failures", 0))
-                li["cooldown_end"] = now + backoff
-                self._log(f"[NAT][LEASE] 🧯 Cooldown extended ({int(backoff)}s) for {src_ip}@{external_ip}:{external_port} (state={state})")
-                return None
 
         if mode == "throttle" and random.random() > 0.5:
             self._log(f"[NAT][LEASE] ⛔ Throttled {src_ip}@{external_ip}:{external_port}")
@@ -6742,6 +6751,7 @@ class NATManager:
         self._log(
             f"[NAT][LEASE] 🆕 {src_ip}@{external_ip}:{external_port} → {temp_ip}:{temp_port} for {int(lease_secs)}s (+{int(cooldown_secs)}s)"
         )
+        self._port_probe_counts.pop(src_ip, None)
         return temp_ip, temp_port
 
     def _bump_gray_score(self, src_ip: str, external_ip: str, external_port: int, *, reason: str):
@@ -8703,7 +8713,73 @@ class NDPManager:
         self._last_iface_by_ip = {}           # IPv6 -> iface
         self._negative_cache = {}             # IPv6 -> ts
         self._negative_cache_ttl = 5.0
+        # passive per-interface learning cache
+        self._ndp_if_cache = {}              # (iface, ipv6) -> (mac, ts, source)
+        self._ndp_if_cache_lock = threading.Lock()
+        self._ndp_if_cache_ttl = self.CACHE_TIMEOUT
+        self._ndp_if_cache_max = 16384
 
+        # suppress repeated "same mapping again" logs
+        self._passive_same_log = {}          # (iface, ip, mac) -> until_ts
+        self._passive_same_log_ttl = 60.0
+
+        # optional: only trust passive learns on trusted ports if any are configured
+        self.ndp_passive_require_trusted_port = False
+    def _iface_ip_key(self, iface: str, ipv6_address: str) -> tuple[str, str]:
+        return (str(iface or "").strip(), str(ipv6_address or "").strip())
+
+    def _iface_cache_get(self, iface: str, ipv6_address: str) -> Optional[str]:
+        key = self._iface_ip_key(iface, ipv6_address)
+        now = time.time()
+        with self._ndp_if_cache_lock:
+            entry = self._ndp_if_cache.get(key)
+            if not entry:
+                return None
+            mac, ts, _source = entry
+            if (now - ts) >= self._ndp_if_cache_ttl:
+                self._ndp_if_cache.pop(key, None)
+                return None
+            return mac
+
+    def _iface_cache_set(self, iface: str, ipv6_address: str, mac_address: str, source: str = "passive"):
+        iface_s = str(iface or "").strip()
+        ip_s = str(ipv6_address or "").strip()
+        mac = self._normalize_mac(mac_address)
+        if not iface_s or not ip_s or not mac:
+            return
+
+        with self._ndp_if_cache_lock:
+            self._ndp_if_cache[(iface_s, ip_s)] = (mac, time.time(), str(source or "passive"))
+
+            if len(self._ndp_if_cache) > self._ndp_if_cache_max:
+                oldest = sorted(self._ndp_if_cache.items(), key=lambda kv: kv[1][1])[
+                    : max(1, len(self._ndp_if_cache) // 8)
+                ]
+                for k, _ in oldest:
+                    self._ndp_if_cache.pop(k, None)
+
+    def _should_log_same_passive(self, iface: str, ipv6_address: str, mac_address: str) -> bool:
+        key = (str(iface or "").strip(), str(ipv6_address or "").strip(), str(mac_address or "").strip())
+        now = time.time()
+        until = self._passive_same_log.get(key, 0.0)
+        if now < until:
+            return False
+        self._passive_same_log[key] = now + float(self._passive_same_log_ttl)
+        return True
+
+    def _allow_passive_learning(self, iface: str) -> bool:
+        iface_s = str(iface or "").strip()
+        if not iface_s:
+            return False
+        if not self.ndp_passive_require_trusted_port:
+            return True
+        return iface_s in self._trusted_ports
+
+    def _purge_iface_cache_locked(self):
+        now = time.time()
+        stale = [k for k, (_, ts, _) in self._ndp_if_cache.items() if (now - ts) >= self._ndp_if_cache_ttl]
+        for k in stale:
+            self._ndp_if_cache.pop(k, None)
     def add_static_ndp_entry(self, ipv6_address: str, mac_address: str):
         """Adds a static entry to the neighbor cache."""
         try:
@@ -8863,6 +8939,8 @@ class NDPManager:
         """
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
             return
+        if not self._allow_passive_learning(iface):
+            return
 
         src_mac = self._normalize_mac(pkt[Ether].src)
         src_ip = pkt[IPv6].src
@@ -8876,17 +8954,49 @@ class NDPManager:
             return
 
         now = time.time()
+
+        # 1) per-interface cache first
+        prev_iface_mac = self._iface_cache_get(iface, src_ip)
+        self._iface_cache_set(iface, src_ip, src_mac, source="passive")
+
+        # 2) global cache update policy
         with self._ndp_cache_lock:
             existing_entry = self._ndp_cache.get(src_ip)
-            if not existing_entry or existing_entry[0] != src_mac:
+            existing_mac = existing_entry[0] if existing_entry else None
+
+            if existing_mac is None:
+                self._store_cache_entry(src_ip, src_mac, now, iface=iface, log_replace=False)
                 self.router_logger.log_message(
                     f"[NDP] 🧠 Passively learned: {src_ip} is-at {src_mac} on {str(iface).split('_')[-1]}"
                 )
-                self._store_cache_entry(src_ip, src_mac, now, iface=iface)
-            else:
-                # Refresh timestamp quietly on matching observation
+                return
+
+            if existing_mac == src_mac:
+                # same mapping: just refresh quietly
                 self._store_cache_entry(src_ip, src_mac, now, iface=iface, log_replace=False)
 
+                if prev_iface_mac == src_mac:
+                    if self._should_log_same_passive(iface, src_ip, src_mac):
+                        self.router_logger.log_message(
+                            f"[NDP] 💤 Passive refresh: {src_ip} is-at {src_mac} on {str(iface).split('_')[-1]}"
+                        )
+                else:
+                    self.router_logger.log_message(
+                        f"[NDP] 🧠 Passively learned: {src_ip} is-at {src_mac} on {str(iface).split('_')[-1]}"
+                    )
+                return
+
+            # 3) mapping changed
+            if prev_iface_mac and prev_iface_mac != src_mac:
+                self.router_logger.log_message(
+                    f"[NDP][CONFLICT] ⚠️ Per-iface mapping changed on {str(iface).split('_')[-1]}: "
+                    f"{src_ip} {prev_iface_mac} -> {src_mac}"
+                )
+
+            self._store_cache_entry(src_ip, src_mac, now, iface=iface, log_replace=True)
+            self.router_logger.log_message(
+                f"[NDP] 🧠 Passively learned: {src_ip} is-at {src_mac} on {str(iface).split('_')[-1]}"
+            )
     # --- Added helpers only ---
 
     def _normalize_mac(self, mac_address: str) -> Optional[str]:
@@ -9208,6 +9318,12 @@ class ARPManager:
         self.ARP_IF_CACHE_MAX = 2048
         self.ARP_IF_CACHE_STRICT_FOR_HYPERV = True
 
+        # --- add in __init__ ---
+        self.PASSIVE_SAME_LOG_TTL = 60.0
+        self._passive_same_log: dict[tuple[str, str, str], float] = {}
+        # --- add in __init__ ---
+        self._os_gateway_cache: dict[str, tuple[str, float]] = {}
+        self.OS_GATEWAY_TTL = 5.0
     # --- new helpers ---
     def _if_ip_key(self, iface: str, ip: str) -> tuple[str, str]:
         return (str(iface or "").strip(), str(ip or "").strip())
@@ -9256,6 +9372,36 @@ class ARPManager:
             return iface in self._trusted_ports
         return False
 
+    # --- new helper ---
+    def _should_log_same_passive(self, iface: str, ip: str, mac: str) -> bool:
+        key = (str(iface or "").strip(), str(ip or "").strip(), str(mac or "").strip())
+        now = time.time()
+        until = self._passive_same_log.get(key, 0.0)
+        if now < until:
+            return False
+        self._passive_same_log[key] = now + float(self.PASSIVE_SAME_LOG_TTL)
+        return True
+
+    def _maybe_promote_passive_gateway(self, inbound_iface: str, src_ip: str, src_mac: str) -> None:
+        if not getattr(self, "PREFER_PASSIVE_GATEWAY_LEARN", True):
+            return
+
+        gw = self._normalize_ip(self._get_iface_gateway(inbound_iface))
+        src_ip = self._normalize_ip(src_ip)
+        src_mac = self._normalize_mac(src_mac)
+
+        if not gw or not src_ip or not src_mac:
+            return
+
+        if src_ip == gw:
+            self._gateway_cache_set(inbound_iface, src_ip, src_mac)
+            self._known_gateway_macs[src_ip] = src_mac
+            self._log_rl(
+                f"gw_passive_promote:{inbound_iface}:{src_ip}",
+                15.0,
+                f"[ARP][GW] 🧠 Passive gateway learn ({inbound_iface.split('_')[-1]}): {src_ip} -> {src_mac}",
+            )
+
     def _maybe_learn_passive_arp(self, pkt, inbound_iface: str) -> None:
         try:
             if not pkt or not pkt.haslayer(ARP):
@@ -9270,7 +9416,6 @@ class ARPManager:
             if not src_ip or not src_mac:
                 return
 
-            # reject obvious junk
             try:
                 ip_obj = ipaddress.ip_address(src_ip)
                 if not isinstance(ip_obj, ipaddress.IPv4Address):
@@ -9280,12 +9425,31 @@ class ARPManager:
             except Exception:
                 return
 
-            # store per-interface always
+            prev_mac = self._iface_cache_get(inbound_iface, src_ip)
+            same_mapping = (prev_mac == src_mac)
+
+            # refresh cache entry either way
             self._iface_cache_set(inbound_iface, src_ip, src_mac, source="passive")
 
-            # store globally only for non-Hyper-V-ish interfaces
             if not self._is_hyperv_iface(inbound_iface):
                 self._cache_set(src_ip, src_mac, kind="passive")
+
+            # promote gateway mapping from passive traffic
+            self._maybe_promote_passive_gateway(inbound_iface, src_ip, src_mac)
+
+            if prev_mac and prev_mac != src_mac:
+                self._safe_log(
+                    f"[ARP][CONFLICT] ⚠️ Passive mapping changed on {inbound_iface.split('_')[-1]}: "
+                    f"{src_ip} {prev_mac} -> {src_mac}"
+                )
+                return
+
+            if same_mapping:
+                if self._should_log_same_passive(inbound_iface, src_ip, src_mac):
+                    self._safe_log(
+                        f"[ARP] 💤 Passive refresh ({inbound_iface.split('_')[-1]}): {src_ip} -> {src_mac}"
+                    )
+                return
 
             self._log_rl(
                 f"passive_arp:{inbound_iface}:{src_ip}",
@@ -9339,6 +9503,120 @@ class ARPManager:
         if ip_address in self._static_arp_entries:
             del self._static_arp_entries[ip_address]
             self._safe_log(f"[ARP] Removed static ARP entry for: {ip_address}")
+
+
+
+    def _get_os_gateway_for_iface(self, iface: str) -> str | None:
+        iface_name = self._resolve_os_iface_name(iface)
+        now = time.time()
+
+        cached = self._os_gateway_cache.get(iface_name)
+        if cached and (now - cached[1]) <= self.OS_GATEWAY_TTL:
+            return cached[0]
+
+        # 1) PowerShell: per-interface IPv4 default gateway
+        try:
+            with self._subprocess_lock:
+                cmd = [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "$alias = %r; "
+                        "Get-NetIPConfiguration -InterfaceAlias $alias -ErrorAction SilentlyContinue | "
+                        "Select-Object -ExpandProperty IPv4DefaultGateway | "
+                        "Select-Object -ExpandProperty NextHop"
+                    ) % iface_name
+                ]
+                out = subprocess.check_output(
+                    cmd,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                    encoding="utf-8",
+                    errors="ignore",
+                ).strip()
+            gw = self._normalize_ip(out)
+            if gw:
+                self._os_gateway_cache[iface_name] = (gw, time.time())
+                return gw
+        except Exception:
+            pass
+
+        # 2) Fallback: parse route print for 0.0.0.0/0
+        try:
+            with self._subprocess_lock:
+                out = subprocess.check_output(
+                    ["route", "print", "-4"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+
+            best_gw = None
+            best_metric = None
+            for line in out.splitlines():
+                parts = line.split()
+                # Expected-ish: Network Destination Netmask Gateway Interface Metric
+                if len(parts) < 5:
+                    continue
+                if parts[0] != "0.0.0.0" or parts[1] != "0.0.0.0":
+                    continue
+
+                gw = self._normalize_ip(parts[2])
+                route_iface_ip = self._normalize_ip(parts[3])
+                try:
+                    metric = int(parts[4])
+                except Exception:
+                    metric = 999999
+
+                # match this default route to the interface's local IPv4
+                local_ip = self.get_interface_ipv4(iface)
+                if gw and local_ip and route_iface_ip == local_ip:
+                    if best_metric is None or metric < best_metric:
+                        best_metric = metric
+                        best_gw = gw
+
+            if best_gw:
+                self._os_gateway_cache[iface_name] = (best_gw, time.time())
+                return best_gw
+        except Exception:
+            pass
+
+        return None
+
+    def _get_iface_gateway(self, iface: str) -> str | None:
+        self._ensure_dynamic_iface_config(iface)
+        cfgs = getattr(self, "_interfaces_config", None) or getattr(self, "interfaces_config", {}) or {}
+        iface_cfg = (cfgs.get(iface) or {}) if isinstance(cfgs, dict) else {}
+
+        # 1) configured per-interface gateway
+        for key in ("gateway", "gateway_ip"):
+            gw = self._normalize_ip(iface_cfg.get(key))
+            if gw:
+                # if OS has a different real gateway for this iface, prefer the OS value
+                os_gw = self._get_os_gateway_for_iface(iface)
+                if os_gw and os_gw != gw:
+                    self._log_rl(
+                        f"gw_canonicalize:{iface}",
+                        5.0,
+                        f"[ARP][GW] 🔄 Canonicalized gateway for {iface}: cfg={gw} os={os_gw}",
+                    )
+                    return os_gw
+                return gw
+
+        # 2) OS route view
+        os_gw = self._get_os_gateway_for_iface(iface)
+        if os_gw:
+            return os_gw
+
+        # 3) fallback default
+        if self.default_gateway_ip and not self._is_hyperv_iface(iface):
+            return str(self.default_gateway_ip)
+
+        return None
 
     def set_default_gateway(self, interfaces_config, gateway_ip: str) -> bool:
         gateway_ip = str(gateway_ip or "").strip()
@@ -10452,78 +10730,7 @@ class ARPManager:
 
         return None
 
-    def get_mac(
-        self,
-        target_ip: str,
-        iface: str | None = None,
-        timeout: int = 2,
-        prefer_cache: bool = True,
-        allow_active_probe: bool = True,
-    ) -> str | None:
-        ip = self._normalize_ip(target_ip)
-        if not ip:
-            return None
 
-        if prefer_cache:
-            entry = self._cache_get(ip)
-            if entry:
-                mac, ts = entry[:2]
-                if time.time() - ts < self.CACHE_TIMEOUT:
-                    return mac
-
-        use_iface = self._pick_iface_for_ip(ip, iface)
-        if not use_iface:
-            return None
-
-        if self._is_hyperv_iface(use_iface):
-            ip_obj = ipaddress.ip_address(ip)
-            if isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj.is_link_local:
-                hyperv_mac = self._resolve_hyperv_special(ip, use_iface)
-                if hyperv_mac:
-                    self._cache_set(ip, hyperv_mac, time.time())
-                    return hyperv_mac
-
-        arp_target, mode = self._remote_or_gateway_target(ip, use_iface)
-        if not arp_target:
-            return None
-
-        if mode == "via_gateway":
-            mac = self._gateway_cache_get(use_iface, arp_target)
-            if mac:
-                return mac
-
-            mac = self.fallback_mac_from_os_cache(arp_target)
-            if mac:
-                self._gateway_cache_set(use_iface, arp_target, mac)
-                return mac
-
-            if allow_active_probe and not self._gateway_fail_hit(use_iface, arp_target):
-                net_obj = self._get_iface_network(use_iface)
-                mac = self.resolve_gateway_mac(
-                    arp_target,
-                    use_iface,
-                    str(net_obj) if net_obj else None,
-                    timeout=float(timeout),
-                    retries=max(1, self.arp_probe_retries),
-                )
-                if mac:
-                    self._gateway_cache_set(use_iface, arp_target, mac)
-                    return mac
-                self._gateway_fail_set(use_iface, arp_target)
-            return None
-
-        mac = self.fallback_mac_from_os_cache(ip)
-        if mac:
-            self._cache_set(ip, mac, time.time())
-            return mac
-
-        if allow_active_probe:
-            mac = self.send_custom_arp_request(ip, iface=use_iface, timeout=timeout)
-            if mac:
-                self._cache_set(ip, mac, time.time())
-                return mac
-
-        return None
 
     # ------------------------------------------------------------------
     # Active ARP / gateway resolution
@@ -10685,6 +10892,11 @@ class ARPManager:
         cached = self._gateway_cache_get(use_iface, gw_ip)
         if cached:
             return cached
+        iface_seen = self._iface_cache_get(use_iface, gw_ip)
+        if iface_seen:
+            self._gateway_cache_set(use_iface, gw_ip, iface_seen)
+            self._known_gateway_macs[gw_ip] = iface_seen
+            return iface_seen
 
         # 1) first try OS cache snapshot
         if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
@@ -10733,7 +10945,29 @@ class ARPManager:
                 self._known_gateway_macs[gw_ip] = mac
                 self._safe_log(f"[ARP][GW] 🧭 Recovered {gw_ip} from fresh OS ARP cache -> {mac}")
                 return mac
+        # 3) if the configured gateway was stale, try the OS-selected gateway once
+        real_gw = self._get_os_gateway_for_iface(use_iface)
+        if real_gw and real_gw != gw_ip:
+            self._safe_log(
+                f"[ARP][GW] 🔄 Retrying with OS-selected gateway {real_gw} instead of {gw_ip} on {use_iface}"
+            )
 
+            mac = self.fallback_mac_from_os_cache(real_gw, force_refresh=True)
+            if mac:
+                self._cache_set(real_gw, mac, time.time())
+                self._gateway_cache_set(use_iface, real_gw, mac)
+                self._known_gateway_macs[real_gw] = mac
+                return mac
+
+            for _ in range(max(1, int(retries))):
+                mac = self._arp_resolve_ipv4(use_iface, real_gw)
+                mac = self._normalize_mac(mac)
+                if mac:
+                    self._cache_set(real_gw, mac, time.time())
+                    self._gateway_cache_set(use_iface, real_gw, mac)
+                    self._known_gateway_macs[real_gw] = mac
+                    self._safe_log(f"[ARP][GW] 🎯 Resolved OS-selected gateway {real_gw} -> {mac} on {use_iface}")
+                    return mac
         self._gateway_fail_set(use_iface, gw_ip)
         self._safe_log(f"[ARP] ❌ resolve_gateway_mac: failed for {gw_ip}")
         return None
@@ -19747,6 +19981,22 @@ class LanManager(_SmartManagerBase):
 
 
 @dataclass
+class _QueuedLocalFrame:
+    raw: bytes
+    trace_id: str = ""
+    protocol_tag: str = ""
+    inbound_iface: str = ""
+    from_remote: bool = False
+    src_node_id: str = ""
+    src_host_name: str = ""
+    src_sender_id: str = ""
+    frame_id: str = ""
+    reply_ip: str = ""
+    reply_port: int = 0
+    enqueued_ts: float = field(default_factory=time.time)
+
+
+@dataclass
 class _LocalSender:
     sender_id: str
     kind: str  # "hyperv" | "wintun" | "windivert"
@@ -19783,6 +20033,16 @@ class _Peer:
     gateway_ok: bool = False
     online: bool = True
     last_seen: float = field(default_factory=time.time)
+    first_seen: float = field(default_factory=time.time)
+
+    hello_count: int = 0
+    rx_frames: int = 0
+    tx_frames: int = 0
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+    last_frame_rx_ts: float = 0.0
+    last_frame_tx_ts: float = 0.0
+    last_ack_ts: float = 0.0
 
 
 @dataclass
@@ -19802,14 +20062,15 @@ class HyperVRouterManager:
     """
     Distributed transport manager for Hyper-V / WinTun / WinDivert.
 
-    Changes in this rewrite:
-      - sockets are opened under a lock
-      - stale sockets are always closed before rebinding
-      - discovery socket failure no longer crashes the manager
-      - data socket falls back safely instead of raising 10048
-      - start() rolls forward in degraded mode instead of exploding
-      - stop() is idempotent and clears thread refs
-      - hello advertises the actual bound data port if a fallback happened
+    This rewrite keeps the public API/signatures the same, while improving:
+      - frame compatibility with older HVRM3 peers
+      - remote frame receive/processing logs on BOTH machines
+      - explicit peer discovered / peer changed / peer offline logs
+      - ack flow so sender machine knows whether remote queued/processed the frame
+      - hello reply over data socket for better direct peer awareness
+      - select()-based socket receive loop
+      - send-only discovery socket so one local bind problem does not kill discovery adverts
+      - safer network queue metadata and per-peer stats
     """
 
     MAGIC = "HVRM3"
@@ -19852,8 +20113,9 @@ class HyperVRouterManager:
         self._started = False
         self._stop_event = threading.Event()
 
-        self._discovery_sock: Optional[socket.socket] = None
-        self._data_sock: Optional[socket.socket] = None
+        self._discovery_sock: Optional[socket.socket] = None           # recv multicast hello
+        self._discovery_tx_sock: Optional[socket.socket] = None        # send-only hello
+        self._data_sock: Optional[socket.socket] = None                # recv/send frames/acks/replies
         self._bound_discovery_port: int = self.discovery_port
         self._bound_data_port: int = self.data_port
 
@@ -19863,10 +20125,15 @@ class HyperVRouterManager:
 
         self._senders: Dict[str, _LocalSender] = {}
         self._peers: Dict[str, _Peer] = {}
+
         self._net_tx_q: queue.Queue = queue.Queue(maxsize=self.max_network_queue)
 
         self._recent: Dict[str, float] = {}
         self._recent_order: List[Tuple[str, float]] = []
+
+        self._pending_frames: Dict[str, Dict[str, Any]] = {}
+        self._pending_lock = threading.RLock()
+        self._frame_ack_timeout_sec = max(6.0, self.peer_timeout_sec + 3.0)
 
         # optional manager references
         self._hyperv_managers: Dict[str, Any] = {}
@@ -19940,7 +20207,10 @@ class HyperVRouterManager:
         if started:
             self._start_sender_worker(state)
 
-        self._log(f"registered Hyper-V backend '{state.sender_id}'", ["🧩", "📦"])
+        self._log(
+            f"registered Hyper-V backend '{state.sender_id}' protocols={sorted(state.allow_protocols)}",
+            ["🧩", "📦"],
+        )
 
     def attach_wintun_manager(
         self,
@@ -20066,7 +20336,6 @@ class HyperVRouterManager:
             except Exception as e:
                 self._log(f"failed to start WinDivertManager: {type(e).__name__}: {e}", ["⚠️", "🧯"])
 
-        # Never let socket bind errors crash the whole manager.
         self._open_sockets()
 
         with self._lock:
@@ -20086,6 +20355,11 @@ class HyperVRouterManager:
                 "started in local-only mode (data socket unavailable); remote transport disabled",
                 ["🧯", "🏠"],
             )
+        elif self._discovery_sock is None and self._discovery_tx_sock is not None:
+            self._log(
+                "started with discovery receive disabled but discovery send active; peer replies may still arrive over data socket",
+                ["⚠️", "📡", "↪️"],
+            )
         elif self._discovery_sock is None:
             self._log(
                 "started with discovery disabled (discovery port unavailable); direct peers only",
@@ -20101,10 +20375,8 @@ class HyperVRouterManager:
             self._started = False
             self._stop_event.set()
 
-        # 1. stop network ingress first
         self._close_sockets()
 
-        # 2. stop tunnel/capture managers before sender teardown
         if self._windivert_manager is not None and self._manage_windivert_lifecycle:
             try:
                 self._windivert_manager.stop()
@@ -20119,7 +20391,6 @@ class HyperVRouterManager:
             except Exception as e:
                 self._log(f"failed to stop WinTunManager: {type(e).__name__}: {e}", ["⚠️", "🧯"])
 
-        # 3. then join manager threads
         for t in (self._hello_thread, self._recv_thread, self._health_thread):
             if t and t.is_alive():
                 t.join(timeout=3.0)
@@ -20128,7 +20399,6 @@ class HyperVRouterManager:
         self._recv_thread = None
         self._health_thread = None
 
-        # 4. then drain sender workers
         with self._lock:
             senders = list(self._senders.values())
 
@@ -20143,9 +20413,11 @@ class HyperVRouterManager:
                 state.worker.join(timeout=3.0)
             state.worker = None
 
-        # 5. only now stop owned backends
         for state in senders:
             self._maybe_stop_sender(state)
+
+        with self._pending_lock:
+            self._pending_frames.clear()
 
         self._log("HyperVRouterManager stopped", ["🌙", "🛑"])
 
@@ -20366,10 +20638,24 @@ class HyperVRouterManager:
                 state.drop_count += 1
                 continue
 
+            qf = self._coerce_send_item(item)
+            if qf is None:
+                state.drop_count += 1
+                continue
+
             try:
-                pkt = self._decode_packet(item)
+                pkt = self._decode_packet(qf.raw)
                 if pkt is None:
                     state.drop_count += 1
+                    if qf.from_remote and qf.reply_ip and qf.reply_port:
+                        self._send_frame_ack(
+                            dst_ip=qf.reply_ip,
+                            dst_port=qf.reply_port,
+                            dst_node_id=qf.src_node_id,
+                            frame_id=qf.frame_id,
+                            status="decode_failed",
+                            detail=f"local sender={state.sender_id} could not decode raw frame",
+                        )
                     continue
 
                 ok = state.send_callable(pkt)
@@ -20380,15 +20666,43 @@ class HyperVRouterManager:
                 state.consecutive_failures = 0
 
                 send_fp = self._fingerprint(
-                    item,
+                    qf.raw,
                     f"sender:{state.sender_id}",
                     "egress",
                     prefix=f"tx:{state.kind}",
                 )
                 self._seen_recently(send_fp)
 
+                if qf.from_remote:
+                    self._log(
+                        f"processed remote frame frame_id={qf.frame_id} trace={qf.trace_id or '-'} "
+                        f"src_node={qf.src_node_id or '?'} src_host={qf.src_host_name or '?'} "
+                        f"via sender={state.sender_id} sender_kind={state.kind} "
+                        f"protocol={qf.protocol_tag or '?'} len={len(qf.raw)}",
+                        ["📥", "✅", "🏠", "🧵"],
+                    )
+                    if qf.reply_ip and qf.reply_port:
+                        self._send_frame_ack(
+                            dst_ip=qf.reply_ip,
+                            dst_port=qf.reply_port,
+                            dst_node_id=qf.src_node_id,
+                            frame_id=qf.frame_id,
+                            status="processed",
+                            detail=f"local sender={state.sender_id} kind={state.kind} processed frame",
+                        )
+
             except Exception as e:
                 state.consecutive_failures += 1
+                if qf.from_remote and qf.reply_ip and qf.reply_port:
+                    self._send_frame_ack(
+                        dst_ip=qf.reply_ip,
+                        dst_port=qf.reply_port,
+                        dst_node_id=qf.src_node_id,
+                        frame_id=qf.frame_id,
+                        status="send_failed",
+                        detail=f"local sender={state.sender_id} failed: {type(e).__name__}: {e}",
+                    )
+
                 if state.consecutive_failures >= 3:
                     state.cooldown_until = time.time() + self.sender_failure_cooldown_sec
                     self._log(
@@ -20428,7 +20742,7 @@ class HyperVRouterManager:
 
     def _enqueue_local(self, state: _LocalSender, raw: bytes) -> bool:
         try:
-            state.send_q.put_nowait(raw)
+            state.send_q.put_nowait(_QueuedLocalFrame(raw=raw))
             return True
         except queue.Full:
             try:
@@ -20437,11 +20751,82 @@ class HyperVRouterManager:
             except Exception:
                 pass
             try:
-                state.send_q.put_nowait(raw)
+                state.send_q.put_nowait(_QueuedLocalFrame(raw=raw))
                 return True
             except Exception:
                 state.drop_count += 1
                 return False
+
+    def _enqueue_local_remote_frame(
+        self,
+        state: _LocalSender,
+        *,
+        raw: bytes,
+        protocol_tag: str,
+        frame_id: str,
+        trace_id: str,
+        src_node_id: str,
+        src_host_name: str,
+        src_sender_id: str,
+        inbound_iface: str,
+        reply_ip: str,
+        reply_port: int,
+    ) -> bool:
+        qf = _QueuedLocalFrame(
+            raw=raw,
+            trace_id=trace_id,
+            protocol_tag=protocol_tag,
+            inbound_iface=inbound_iface,
+            from_remote=True,
+            src_node_id=src_node_id,
+            src_host_name=src_host_name,
+            src_sender_id=src_sender_id,
+            frame_id=frame_id,
+            reply_ip=reply_ip,
+            reply_port=int(reply_port or 0),
+        )
+
+        try:
+            state.send_q.put_nowait(qf)
+            return True
+        except queue.Full:
+            try:
+                _ = state.send_q.get_nowait()
+                state.drop_count += 1
+            except Exception:
+                pass
+            try:
+                state.send_q.put_nowait(qf)
+                return True
+            except Exception:
+                state.drop_count += 1
+                return False
+
+    def _coerce_send_item(self, item: Any) -> Optional[_QueuedLocalFrame]:
+        if item is None:
+            return None
+        if isinstance(item, _QueuedLocalFrame):
+            return item
+        if isinstance(item, (bytes, bytearray)):
+            return _QueuedLocalFrame(raw=bytes(item))
+        if isinstance(item, dict) and "raw" in item:
+            try:
+                return _QueuedLocalFrame(
+                    raw=bytes(item["raw"]),
+                    trace_id=str(item.get("trace_id") or ""),
+                    protocol_tag=str(item.get("protocol_tag") or ""),
+                    inbound_iface=str(item.get("inbound_iface") or ""),
+                    from_remote=bool(item.get("from_remote", False)),
+                    src_node_id=str(item.get("src_node_id") or ""),
+                    src_host_name=str(item.get("src_host_name") or ""),
+                    src_sender_id=str(item.get("src_sender_id") or ""),
+                    frame_id=str(item.get("frame_id") or ""),
+                    reply_ip=str(item.get("reply_ip") or ""),
+                    reply_port=int(item.get("reply_port") or 0),
+                )
+            except Exception:
+                return None
+        return None
 
     # ---------------------------------------------------------
     # endpoint collection / selection
@@ -20467,6 +20852,8 @@ class HyperVRouterManager:
                 if peer.segment_id != self.segment_id:
                     continue
                 if (now - peer.last_seen) > self.peer_timeout_sec:
+                    continue
+                if not peer.online:
                     continue
 
                 for sender_id in sorted(peer.sender_ids):
@@ -20496,8 +20883,12 @@ class HyperVRouterManager:
         if not endpoints:
             return None
 
+        ingress_kind = self._infer_ingress_kind(inbound_iface)
+        has_remote = any(kind == "remote" for kind, _ in endpoints)
+
         def _score(item):
             kind, obj = item
+
             if kind == "local":
                 score = 5
                 if obj.kind == "hyperv":
@@ -20506,29 +20897,45 @@ class HyperVRouterManager:
                     score += 2
                 elif obj.kind == "windivert":
                     score += 1
+
+                # If there are live remote peers, bias away from staying fully local
+                # so cross-host forwarding actually happens.
+                if has_remote:
+                    score -= 2
                 return score
 
-            score = 0
+            score = 8
             if obj.public_ok:
                 score += 10
             if obj.gateway_ok:
                 score += 4
             if obj.sender_kind == "hyperv":
-                score += 3
+                score += 5
             elif obj.sender_kind == "wintun":
-                score += 2
+                score += 3
             elif obj.sender_kind == "windivert":
-                score += 1
+                score += 2
+
+            if ingress_kind == "hyperv":
+                score += 8
+            elif ingress_kind in {"wintun", "windivert"} and obj.sender_kind == "hyperv":
+                score += 6
+
             return score
 
         endpoints = sorted(endpoints, key=_score, reverse=True)
 
         flow_key = self._stable_flow_key(packet, inbound_iface, protocol_tag, raw)
+
+        # Top-score first, but still stable across flows among similarly-ranked endpoints.
+        top_score = _score(endpoints[0])
+        top = [ep for ep in endpoints if _score(ep) == top_score]
+
         idx = int.from_bytes(
             hashlib.blake2b(flow_key.encode("utf-8"), digest_size=8).digest(),
             "big",
-        ) % len(endpoints)
-        return endpoints[idx]
+        ) % len(top)
+        return top[idx]
 
     # ---------------------------------------------------------
     # discovery / transport
@@ -20538,12 +20945,30 @@ class HyperVRouterManager:
         with self._sock_lock:
             self._close_sockets_locked()
 
-            # Discovery socket: fixed multicast port. If it is taken, degrade gracefully.
+            self._discovery_tx_sock = self._open_discovery_sender_socket()
             self._discovery_sock = self._open_discovery_socket()
             self._bound_discovery_port = self.discovery_port
-
-            # Data socket: try configured port, then safe fallbacks instead of raising 10048.
             self._data_sock, self._bound_data_port = self._open_data_socket_with_fallback()
+
+    def _open_discovery_sender_socket(self) -> Optional[socket.socket]:
+        try:
+            ds = self._make_udp_socket()
+            try:
+                ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            except Exception:
+                pass
+            try:
+                ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+            except Exception:
+                pass
+            ds.settimeout(1.0)
+            return ds
+        except Exception as e:
+            self._log(
+                f"discovery sender socket open failed: {type(e).__name__}: {e}",
+                ["⚠️", "📡", "🧯"],
+            )
+            return None
 
     def _open_discovery_socket(self) -> Optional[socket.socket]:
         try:
@@ -20559,7 +20984,7 @@ class HyperVRouterManager:
         except OSError as e:
             if self._is_addr_in_use_error(e):
                 self._log(
-                    f"discovery bind in use on *:{self.discovery_port}; discovery disabled for this instance",
+                    f"discovery bind in use on *:{self.discovery_port}; receive disabled for this instance but send-only discovery remains active",
                     ["⚠️", "📡", "🧯"],
                 )
                 if not self._allow_discovery_degraded_mode:
@@ -20600,8 +21025,9 @@ class HyperVRouterManager:
             try:
                 sock_obj = self._make_udp_socket()
                 sock_obj.bind((host, port))
-                sock_obj.settimeout(1.0)
+                sock_obj.settimeout(0.25)
                 actual_port = int(sock_obj.getsockname()[1])
+
                 if actual_port != self.data_port:
                     self._log(
                         f"data socket fallback active: requested {bind_ip}:{self.data_port}, bound {host}:{actual_port} ({label})",
@@ -20635,8 +21061,7 @@ class HyperVRouterManager:
             finally:
                 if sock_obj is not None:
                     try:
-                        if sock_obj.fileno() != -1 and sock_obj.gettimeout() is None:
-                            sock_obj.close()
+                        sock_obj.close()
                     except Exception:
                         pass
 
@@ -20651,7 +21076,7 @@ class HyperVRouterManager:
             self._close_sockets_locked()
 
     def _close_sockets_locked(self) -> None:
-        for attr in ("_discovery_sock", "_data_sock"):
+        for attr in ("_discovery_sock", "_discovery_tx_sock", "_data_sock"):
             s = getattr(self, attr, None)
             if s is not None:
                 self._safe_socket_close(s)
@@ -20674,12 +21099,20 @@ class HyperVRouterManager:
     def _recv_loop(self) -> None:
         while not self._stop_event.is_set():
             with self._sock_lock:
-                d_sock = self._discovery_sock
-                t_sock = self._data_sock
+                socks = [s for s in (self._discovery_sock, self._data_sock) if s is not None]
 
-            for which, sock_obj in (("discovery", d_sock), ("data", t_sock)):
-                if sock_obj is None:
-                    continue
+            if not socks:
+                self._stop_event.wait(0.25)
+                continue
+
+            try:
+                ready, _, _ = select.select(socks, [], [], 0.25)
+            except Exception:
+                self._stop_event.wait(0.10)
+                continue
+
+            for sock_obj in ready:
+                which = "discovery" if sock_obj is self._discovery_sock else "data"
                 try:
                     data, addr = sock_obj.recvfrom(1024 * 1024)
                 except socket.timeout:
@@ -20699,15 +21132,16 @@ class HyperVRouterManager:
             try:
                 self._prune_peers()
                 self._prune_recent()
+                self._prune_pending_frames()
             except Exception:
                 pass
 
     def _send_hello(self) -> None:
         with self._sock_lock:
-            d_sock = self._discovery_sock
+            tx_sock = self._discovery_tx_sock or self._discovery_sock
             advertised_data_port = self._bound_data_port or self.data_port
 
-        if d_sock is None:
+        if tx_sock is None:
             return
 
         with self._lock:
@@ -20720,8 +21154,8 @@ class HyperVRouterManager:
         msg = {
             "magic": self.MAGIC,
             "type": "hello",
-            "segment_id": self.segment_id,
             "node_id": self.node_id,
+            "segment_id": self.segment_id,
             "host_name": self.host_name,
             "listen_ip": self._advertise_ip(),
             "data_port": advertised_data_port,
@@ -20735,7 +21169,7 @@ class HyperVRouterManager:
 
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         try:
-            d_sock.sendto(raw, (self.discovery_group, self.discovery_port))
+            tx_sock.sendto(raw, (self.discovery_group, self.discovery_port))
         except Exception:
             pass
 
@@ -20759,6 +21193,33 @@ class HyperVRouterManager:
 
             try:
                 data_sock.sendto(item["raw"], (item["ip"], item["port"]))
+
+                mtype = str(item.get("mtype") or "")
+                peer_node_id = str(item.get("peer_node_id") or "")
+                frame_id = str(item.get("frame_id") or "")
+                trace_id = str(item.get("trace_id") or "")
+                status = str(item.get("status") or "")
+
+                if mtype == "frame":
+                    self._note_peer_frame_tx(peer_node_id, len(item["raw"]))
+                    self._log(
+                        f"sent remote frame frame_id={frame_id} trace={trace_id or '-'} "
+                        f"to peer={peer_node_id or '?'} ip={item['ip']}:{item['port']} "
+                        f"protocol={item.get('protocol_tag') or '?'} dst_sender={item.get('dst_sender_id') or '?'}",
+                        ["📤", "🌐", "✅"],
+                    )
+                elif mtype == "ack":
+                    self._log(
+                        f"sent ack frame_id={frame_id} to peer={peer_node_id or '?'} "
+                        f"ip={item['ip']}:{item['port']} status={status or '?'}",
+                        ["↩️", "📨", "✅"],
+                    )
+                elif mtype == "hello_reply":
+                    self._log(
+                        f"sent direct hello-reply to peer={peer_node_id or '?'} ip={item['ip']}:{item['port']}",
+                        ["🤝", "📡", "↪️"],
+                    )
+
             except Exception as e:
                 self._log(
                     f"network send failed to {item['ip']}:{item['port']}: {type(e).__name__}: {e}",
@@ -20776,20 +21237,36 @@ class HyperVRouterManager:
         if msg.get("segment_id") != self.segment_id:
             return
 
-        node_id = str(msg.get("node_id") or "")
-        if not node_id or node_id == self.node_id:
+        # IMPORTANT:
+        # older code only looked at node_id, but frame messages commonly carry src_node_id.
+        node_like = str(msg.get("node_id") or msg.get("src_node_id") or "")
+        if not node_like or node_like == self.node_id:
             return
 
-        mtype = msg.get("type")
-        if mtype == "hello":
+        mtype = str(msg.get("type") or "")
+        if mtype in {"hello", "hello_ack"}:
             self._update_peer_from_hello(msg, from_ip)
+            if mtype == "hello" and which == "discovery":
+                self._send_hello_reply(msg, from_ip)
             return
 
         if mtype == "frame":
-            self._handle_remote_frame(msg, from_ip)
+            self._handle_remote_frame(msg, from_ip, from_port)
+            return
+
+        if mtype == "ack":
+            self._handle_frame_ack(msg, from_ip, from_port)
+            return
 
     def _update_peer_from_hello(self, msg: dict, from_ip: str) -> None:
-        node_id = str(msg.get("node_id"))
+        node_id = str(msg.get("node_id") or msg.get("src_node_id") or "")
+        if not node_id or node_id == self.node_id:
+            return
+
+        changed = False
+        is_new = False
+        now = time.time()
+
         with self._lock:
             peer = self._peers.get(node_id)
             if peer is None:
@@ -20801,6 +21278,12 @@ class HyperVRouterManager:
                     segment_id=str(msg.get("segment_id") or self.segment_id),
                 )
                 self._peers[node_id] = peer
+                is_new = True
+
+            old_ip = peer.listen_ip
+            old_port = peer.data_port
+            old_host = peer.host_name
+            old_senders = set(peer.sender_ids)
 
             peer.host_name = str(msg.get("host_name") or peer.host_name)
             peer.listen_ip = str(msg.get("listen_ip") or from_ip)
@@ -20811,28 +21294,136 @@ class HyperVRouterManager:
             peer.allow_protocols = set(str(x) for x in (msg.get("allow_protocols") or []))
             peer.public_ok = bool(msg.get("public_ok", False))
             peer.gateway_ok = bool(msg.get("gateway_ok", False))
-            peer.last_seen = time.time()
+            peer.last_seen = now
             peer.online = True
+            peer.hello_count += 1
 
-    def _handle_remote_frame(self, msg: dict, from_ip: str) -> None:
+            if (
+                peer.listen_ip != old_ip
+                or peer.data_port != old_port
+                or peer.host_name != old_host
+                or peer.sender_ids != old_senders
+            ):
+                changed = True
+
+        if is_new:
+            self._log(
+                f"peer discovered node={node_id} host={peer.host_name} "
+                f"listen={peer.listen_ip}:{peer.data_port} senders={sorted(peer.sender_ids)} "
+                f"protocols={sorted(peer.allow_protocols)}",
+                ["🤝", "🌐", "✅"],
+            )
+        elif changed:
+            self._log(
+                f"peer updated node={node_id} host={peer.host_name} "
+                f"listen={peer.listen_ip}:{peer.data_port} senders={sorted(peer.sender_ids)}",
+                ["🔄", "🌐", "📝"],
+            )
+
+    def _send_hello_reply(self, hello_msg: dict, from_ip: str) -> None:
+        with self._sock_lock:
+            has_data = self._data_sock is not None
+
+        if not has_data:
+            return
+
+        reply_port = int(hello_msg.get("data_port") or 0)
+        if reply_port <= 0:
+            return
+
+        with self._lock:
+            sender_ids = sorted(self._senders.keys())
+            sender_kinds = {sid: self._senders[sid].kind for sid in self._senders}
+            allow_protocols = sorted(
+                set().union(*(s.allow_protocols for s in self._senders.values())) if self._senders else set()
+            )
+
+        msg = {
+            "magic": self.MAGIC,
+            "type": "hello_ack",
+            "node_id": self.node_id,
+            "segment_id": self.segment_id,
+            "host_name": self.host_name,
+            "listen_ip": self._advertise_ip(),
+            "data_port": self._bound_data_port or self.data_port,
+            "sender_ids": sender_ids,
+            "sender_kinds": sender_kinds,
+            "allow_protocols": allow_protocols,
+            "public_ok": False,
+            "gateway_ok": True,
+            "ts": time.time(),
+        }
+
+        self._enqueue_network_wire(
+            raw=json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            ip=from_ip,
+            port=reply_port,
+            mtype="hello_reply",
+            peer_node_id=str(hello_msg.get("node_id") or ""),
+        )
+
+    def _handle_remote_frame(self, msg: dict, from_ip: str, from_port: int) -> None:
         frame_id = str(msg.get("frame_id") or "")
-        src_node_id = str(msg.get("src_node_id") or "")
+        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or "")
+        src_host_name = str(msg.get("host_name") or src_node_id or "")
+        src_sender_id = str(msg.get("src_sender_id") or "")
         dst_sender_id = str(msg.get("dst_sender_id") or "")
         protocol_tag = str(msg.get("protocol_tag") or "")
+        inbound_iface = str(msg.get("inbound_iface") or "")
+        trace_id = str(msg.get("trace_id") or frame_id or "")
 
         if not frame_id or not src_node_id:
             return
+
         if self._seen_recently(f"remote:{src_node_id}:{frame_id}"):
+            self._log(
+                f"received duplicate remote frame frame_id={frame_id} trace={trace_id or '-'} "
+                f"from node={src_node_id} ip={from_ip}:{from_port}; ignoring",
+                ["♻️", "📥", "🧱"],
+            )
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="duplicate",
+                detail="duplicate remote frame ignored",
+            )
             return
 
         payload_b64 = msg.get("payload_b64")
         if not payload_b64:
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="bad_payload",
+                detail="missing payload_b64",
+            )
             return
 
         try:
             raw = base64.b64decode(payload_b64.encode("ascii"), validate=True)
         except Exception:
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="bad_payload",
+                detail="base64 decode failed",
+            )
             return
+
+        self._note_peer_frame_rx(src_node_id, len(raw))
+        self._log(
+            f"received remote frame frame_id={frame_id} trace={trace_id or '-'} "
+            f"from node={src_node_id} host={src_host_name or '?'} "
+            f"ip={from_ip}:{from_port} protocol={protocol_tag or '?'} "
+            f"dst_sender={dst_sender_id or '-'} len={len(raw)}",
+            ["📥", "🌐", "✅"],
+        )
 
         sender = self._choose_local_sender_for_remote(
             dst_sender_id=dst_sender_id,
@@ -20840,9 +21431,97 @@ class HyperVRouterManager:
             raw=raw,
         )
         if sender is None:
+            self._log(
+                f"remote frame has no eligible local sender frame_id={frame_id} "
+                f"src_node={src_node_id} protocol={protocol_tag or '?'}",
+                ["⚠️", "📥", "🕳️"],
+            )
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="dropped_no_sender",
+                detail=f"no eligible sender for protocol={protocol_tag or '?'}",
+            )
             return
 
-        self._enqueue_local(sender, raw)
+        ok = self._enqueue_local_remote_frame(
+            sender,
+            raw=raw,
+            protocol_tag=protocol_tag,
+            frame_id=frame_id,
+            trace_id=trace_id,
+            src_node_id=src_node_id,
+            src_host_name=src_host_name,
+            src_sender_id=src_sender_id,
+            inbound_iface=inbound_iface,
+            reply_ip=from_ip,
+            reply_port=from_port,
+        )
+        if not ok:
+            self._log(
+                f"remote frame queue full frame_id={frame_id} src_node={src_node_id} "
+                f"dst_sender={sender.sender_id}",
+                ["⚠️", "📥", "📬", "🧯"],
+            )
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="queue_full",
+                detail=f"sender={sender.sender_id} queue full",
+            )
+            return
+
+        self._log(
+            f"accepted remote frame frame_id={frame_id} trace={trace_id or '-'} "
+            f"src_node={src_node_id} queued_to={sender.sender_id} kind={sender.kind}",
+            ["📥", "📬", "✅"],
+        )
+        self._send_frame_ack(
+            dst_ip=from_ip,
+            dst_port=from_port,
+            dst_node_id=src_node_id,
+            frame_id=frame_id,
+            status="accepted",
+            detail=f"queued to sender={sender.sender_id} kind={sender.kind}",
+        )
+
+    def _handle_frame_ack(self, msg: dict, from_ip: str, from_port: int) -> None:
+        frame_id = str(msg.get("frame_id") or "")
+        ack_from = str(msg.get("src_node_id") or msg.get("node_id") or "")
+        status = str(msg.get("status") or "")
+        detail = str(msg.get("detail") or "")
+
+        if not frame_id:
+            return
+
+        self._note_peer_ack(ack_from)
+
+        with self._pending_lock:
+            pending = self._pending_frames.get(frame_id)
+            if pending is not None:
+                pending["last_ack_status"] = status
+                pending["last_ack_ts"] = time.time()
+
+                if status in {
+                    "processed",
+                    "send_failed",
+                    "decode_failed",
+                    "dropped_no_sender",
+                    "queue_full",
+                    "bad_payload",
+                    "duplicate",
+                }:
+                    self._pending_frames.pop(frame_id, None)
+
+        self._log(
+            f"received ack frame_id={frame_id} from node={ack_from or '?'} "
+            f"ip={from_ip}:{from_port} status={status or '?'} detail={detail or '-'}",
+            ["↩️", "📨", "🌐"],
+        )
 
     def _choose_local_sender_for_remote(self, *, dst_sender_id: str, protocol_tag: str, raw: bytes) -> Optional[_LocalSender]:
         now = time.time()
@@ -20850,7 +21529,7 @@ class HyperVRouterManager:
         with self._lock:
             if dst_sender_id and dst_sender_id in self._senders:
                 state = self._senders[dst_sender_id]
-                if state.enabled and now >= state.cooldown_until:
+                if state.enabled and now >= state.cooldown_until and (not protocol_tag or protocol_tag in state.allow_protocols):
                     return state
 
             candidates = []
@@ -20890,25 +21569,134 @@ class HyperVRouterManager:
             digest_size=16,
         ).hexdigest()
 
+        trace_id = hashlib.blake2b(
+            (frame_id + "|" + protocol_tag + "|" + inbound_iface).encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+
         msg = {
             "magic": self.MAGIC,
             "type": "frame",
-            "segment_id": self.segment_id,
+            # keep node_id for backward compatibility with older HVRM3 receivers
+            "node_id": self.node_id,
             "src_node_id": self.node_id,
+            "segment_id": self.segment_id,
+            "host_name": self.host_name,
+            "src_sender_id": "",
             "dst_node_id": dst_node_id,
             "dst_sender_id": dst_sender_id,
             "protocol_tag": protocol_tag,
             "inbound_iface": str(inbound_iface),
             "frame_id": frame_id,
+            "trace_id": trace_id,
+            "reply_port": self._bound_data_port or self.data_port,
             "payload_b64": base64.b64encode(raw).decode("ascii"),
+            "ts": time.time(),
         }
 
         wire = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        with self._pending_lock:
+            self._pending_frames[frame_id] = {
+                "frame_id": frame_id,
+                "trace_id": trace_id,
+                "peer_node_id": dst_node_id,
+                "peer_ip": peer.listen_ip,
+                "peer_port": peer.data_port,
+                "protocol_tag": protocol_tag,
+                "dst_sender_id": dst_sender_id,
+                "created_ts": time.time(),
+                "last_ack_status": "",
+                "last_ack_ts": 0.0,
+            }
+
+        return self._enqueue_network_wire(
+            raw=wire,
+            ip=peer.listen_ip,
+            port=peer.data_port,
+            mtype="frame",
+            peer_node_id=dst_node_id,
+            frame_id=frame_id,
+            trace_id=trace_id,
+            protocol_tag=protocol_tag,
+            dst_sender_id=dst_sender_id,
+        )
+
+    # ---------------------------------------------------------
+    # network queue helpers
+    # ---------------------------------------------------------
+
+    def _enqueue_network_wire(
+        self,
+        *,
+        raw: bytes,
+        ip: str,
+        port: int,
+        mtype: str,
+        peer_node_id: str = "",
+        frame_id: str = "",
+        trace_id: str = "",
+        status: str = "",
+        protocol_tag: str = "",
+        dst_sender_id: str = "",
+    ) -> bool:
         try:
-            self._net_tx_q.put_nowait({"raw": wire, "ip": peer.listen_ip, "port": peer.data_port})
+            self._net_tx_q.put_nowait({
+                "raw": raw,
+                "ip": str(ip),
+                "port": int(port),
+                "mtype": str(mtype),
+                "peer_node_id": str(peer_node_id or ""),
+                "frame_id": str(frame_id or ""),
+                "trace_id": str(trace_id or ""),
+                "status": str(status or ""),
+                "protocol_tag": str(protocol_tag or ""),
+                "dst_sender_id": str(dst_sender_id or ""),
+            })
             return True
         except queue.Full:
+            self._log(
+                f"network queue full mtype={mtype} peer={peer_node_id or '?'} ip={ip}:{port}",
+                ["⚠️", "📡", "🧯"],
+            )
             return False
+
+    def _send_frame_ack(
+        self,
+        *,
+        dst_ip: str,
+        dst_port: int,
+        dst_node_id: str,
+        frame_id: str,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        if not dst_ip or int(dst_port or 0) <= 0:
+            return
+
+        msg = {
+            "magic": self.MAGIC,
+            "type": "ack",
+            # keep node_id for compatibility with old parsers that only read node_id
+            "node_id": self.node_id,
+            "src_node_id": self.node_id,
+            "segment_id": self.segment_id,
+            "host_name": self.host_name,
+            "frame_id": frame_id,
+            "status": status,
+            "detail": detail,
+            "ts": time.time(),
+        }
+
+        self._enqueue_network_wire(
+            raw=json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            ip=dst_ip,
+            port=int(dst_port),
+            mtype="ack",
+            peer_node_id=dst_node_id,
+            frame_id=frame_id,
+            status=status,
+        )
 
     # ---------------------------------------------------------
     # helpers
@@ -20917,6 +21705,15 @@ class HyperVRouterManager:
     def _make_udp_socket(self) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except Exception:
+            pass
+        try:
+            if hasattr(socket, "SO_REUSEPORT"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except Exception:
+            pass
         return s
 
     def _join_multicast_group(self, s: socket.socket) -> None:
@@ -21000,19 +21797,16 @@ class HyperVRouterManager:
             from scapy.layers.inet import IP, UDP
             from scapy.layers.inet6 import IPv6
 
-            # -------- IPv4 --------
             if packet.haslayer(IP):
                 ip = packet[IP]
                 src = str(getattr(ip, "src", "") or "")
                 dst = str(getattr(ip, "dst", "") or "")
 
-                # limited broadcast / multicast / 169.254 broadcast space
                 if dst == "255.255.255.255":
                     return True
                 if dst.startswith("224."):
                     return True
                 if dst.startswith("169.254."):
-                    # especially bad: 169.254.255.255 discovery chatter
                     return True
                 if src.startswith("169.254.") and dst.startswith("169.254."):
                     return True
@@ -21022,23 +21816,16 @@ class HyperVRouterManager:
                     sp = int(getattr(udp, "sport", 0) or 0)
                     dp = int(getattr(udp, "dport", 0) or 0)
 
-                    # SSDP / mDNS / LLMNR
                     if sp in (1900, 5353, 5355) or dp in (1900, 5353, 5355):
                         return True
-
-                    # NBNS broadcast
                     if dp == 137 and dst in ("255.255.255.255", "169.254.255.255"):
                         return True
-
-                    # Steam LAN beacons
                     if dp == 27036 and dst in ("255.255.255.255", "169.254.255.255"):
                         return True
 
-            # -------- IPv6 --------
             if packet.haslayer(IPv6):
                 ip6 = packet[IPv6]
                 dst6 = str(getattr(ip6, "dst", "") or "").lower()
-                # multicast discovery chatter
                 if dst6.startswith("ff02:") or dst6.startswith("ff05:"):
                     return True
 
@@ -21064,12 +21851,12 @@ class HyperVRouterManager:
         return h.hexdigest()
 
     def _fingerprint(
-            self,
-            raw: bytes,
-            iface_name: str,
-            protocol_tag: str,
-            *,
-            prefix: str = "pkt",
+        self,
+        raw: bytes,
+        iface_name: str,
+        protocol_tag: str,
+        *,
+        prefix: str = "pkt",
     ) -> str:
         h = hashlib.blake2b(digest_size=16)
         h.update(str(prefix or "pkt").encode("utf-8", "ignore"))
@@ -21082,8 +21869,7 @@ class HyperVRouterManager:
         h.update(b"|")
         h.update(len(raw).to_bytes(4, "big", signed=False))
         return h.hexdigest()
-    
-    
+
     def _seen_recently(self, fp: str) -> bool:
         now = time.time()
         self._prune_recent(now=now)
@@ -21109,9 +21895,70 @@ class HyperVRouterManager:
 
     def _prune_peers(self) -> None:
         now = time.time()
+        offline_logs: List[Tuple[str, str, str, int]] = []
+
         with self._lock:
             for peer in self._peers.values():
+                was_online = peer.online
                 peer.online = (now - peer.last_seen) <= self.peer_timeout_sec
+                if was_online and not peer.online:
+                    offline_logs.append((peer.node_id, peer.host_name, peer.listen_ip, peer.data_port))
+
+        for node_id, host_name, ip, port in offline_logs:
+            self._log(
+                f"peer offline node={node_id} host={host_name} listen={ip}:{port}",
+                ["⚠️", "🌐", "💤"],
+            )
+
+    def _prune_pending_frames(self) -> None:
+        now = time.time()
+        expired: List[Dict[str, Any]] = []
+
+        with self._pending_lock:
+            for frame_id, info in list(self._pending_frames.items()):
+                age = now - float(info.get("created_ts", now))
+                if age > self._frame_ack_timeout_sec:
+                    expired.append(info)
+                    self._pending_frames.pop(frame_id, None)
+
+        for info in expired:
+            self._log(
+                f"frame ack timeout frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} "
+                f"peer={info.get('peer_node_id') or '?'} ip={info.get('peer_ip')}:{info.get('peer_port')} "
+                f"last_ack={info.get('last_ack_status') or '-'}",
+                ["⌛", "📡", "⚠️"],
+            )
+
+    def _note_peer_frame_rx(self, node_id: str, size_bytes: int) -> None:
+        if not node_id:
+            return
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is None:
+                return
+            peer.rx_frames += 1
+            peer.rx_bytes += int(size_bytes or 0)
+            peer.last_frame_rx_ts = time.time()
+
+    def _note_peer_frame_tx(self, node_id: str, size_bytes: int) -> None:
+        if not node_id:
+            return
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is None:
+                return
+            peer.tx_frames += 1
+            peer.tx_bytes += int(size_bytes or 0)
+            peer.last_frame_tx_ts = time.time()
+
+    def _note_peer_ack(self, node_id: str) -> None:
+        if not node_id:
+            return
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is None:
+                return
+            peer.last_ack_ts = time.time()
 
     def _advertise_ip(self) -> str:
         if self.bind_ip and self.bind_ip != "0.0.0.0":

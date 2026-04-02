@@ -2550,7 +2550,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.NOTIFICATION_TARGET_PORT,
                 self.interface_in_full_name
             )
-            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.outbound_load_balancer, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager)
+            self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.outbound_load_balancer, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager, use_hyperv)
             self._inject_dependencies()
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
@@ -4193,7 +4193,7 @@ class WiresharkManager:
             for iface_id in interfaces_to_capture:
                 funcs.append((capture_helper, (iface_id,)))
                 started_count +=1
-            self.router_manager.parallel_python.increase_ram_usage(5000)
+            self.router_manager.parallel_python.increase_ram_usage(2500)
             self.router_manager.parallel_python.run_all_parallel(funcs,
                                                              return_type="void")
             return started_count
@@ -4227,7 +4227,6 @@ class WiresharkManager:
         self.logger.log_message("[Wireshark] All capture processes stopped.")
         self.tshark_procs.clear()
         self.redirect_threads.clear()
-
     def _as_int(self, x: Any, default: Optional[int] = None) -> Optional[int]:
         try:
             return int(str(x))
