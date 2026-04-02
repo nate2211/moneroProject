@@ -5688,10 +5688,16 @@ class TransportHTTPSManager:
             return None
 class TransportMoneroManager:
     """
-    Unified Monero transport observer + policy engine (low overhead).
+    Unified Monero + P2Pool transport observer + policy engine.
 
     Public API:
       handle(pkt, src, dst, sport, dport, inbound_iface) -> 'allow' | 'deny'
+
+    This rewrite keeps the old Monero logs but adds:
+      - P2Pool-aware flow prefixes on 37888/37889
+      - Levin-specific logs under the Monero prefix
+      - Mining-relevant logs under the Monero prefix
+      - Heuristic P2Pool raw-payload classification when Levin framing is absent/incomplete
     """
 
     _HTTP_EOL = b"\r\n"
@@ -5699,20 +5705,23 @@ class TransportMoneroManager:
     _HDR_DELIM_2 = b"\n\n"  # tolerate LF-only peers
 
     # -------- Ports --------
-    DEFAULT_P2P_PORTS = {18080, 28080, 38080}
-    DEFAULT_RPC_PORTS = {18081, 28081, 38081}
+    DEFAULT_P2P_PORTS    = {18080, 28080, 38080}
+    DEFAULT_RPC_PORTS    = {18081, 28081, 38081}
+    DEFAULT_P2POOL_PORTS = {37888, 37889}
 
     # -------- Tunables / Budgets --------
     FLOW_TTL_SEC        = 15 * 60
     FLOW_SOFT_MAX       = 50_000
     RL_WINDOW_SEC       = 3.0
     GC_PERIOD_SEC       = 60
-    RPC_BUF_MAX         = 256 * 1024     # per-direction buffer cap
-    RPC_HDR_MAX         = 4096           # max header bytes to scan
-    RPC_JSON_MAX        = 32 * 1024      # limit JSON body parse
-    PROGRESS_PKT_STEP   = 50             # progress log every N pkts
+    RPC_BUF_MAX         = 256 * 1024
+    RPC_HDR_MAX         = 4096
+    RPC_JSON_MAX        = 32 * 1024
+    PROGRESS_PKT_STEP   = 50
     PROGRESS_BYTES_SET  = {1024, 4096, 16384, 65536, 262144}
-    LEVIN_LOG_BURST_MAX = 8              # max frames to log per feed
+    LEVIN_LOG_BURST_MAX = 8
+    P2POOL_BUF_MAX      = 512 * 1024
+    P2POOL_FRAME_BURST  = 8
 
     # -------- Levin constants --------
     _LEVIN_SIG   = 0x0101010101010101
@@ -5723,31 +5732,55 @@ class TransportMoneroManager:
     _LEVIN_OK    = 1
     _CMD_PING    = 1000
 
+    # Mining-beneficial Monero commands
+    _MINING_BENEFIT_MONERO_CMDS = {
+        1001,  # handshake
+        1002,  # timed sync
+        2001,  # new block
+        2002,  # new tx relay
+        2003,  # request get objects
+        2004,  # response get objects
+        2006,  # request chain
+        2007,  # response chain entry
+        2008,  # new fluffy block
+        2009,  # missing tx request
+        2010,  # txpool complement
+    }
+
     # -------- HTTP detection --------
     _HTTP_START_RE = re.compile(
         rb"^(OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/\d\.\d\r?\n", re.I
     )
 
     class _LevinMessage:
-        __slots__ = ("cmd", "flags", "ret", "pv", "cb", "payload",
-                     "begin", "end", "req", "rsp")
+        __slots__ = (
+            "cmd", "flags", "ret", "pv", "cb", "payload",
+            "begin", "end", "req", "rsp"
+        )
 
         def __init__(self, cmd: int, flags: int, ret: int, pv: int, cb: int, payload: bytes):
-            self.cmd, self.flags, self.ret, self.pv, self.cb, self.payload = cmd, flags, ret, pv, cb, payload
-            self.begin = bool(flags & TransportMoneroManager._LEVIN_BEGIN)
-            self.end   = bool(flags & TransportMoneroManager._LEVIN_END)
-            self.req   = bool(flags & TransportMoneroManager._LEVIN_REQ)
-            self.rsp   = bool(flags & TransportMoneroManager._LEVIN_RSP)
+            self.cmd     = cmd
+            self.flags   = flags
+            self.ret     = ret
+            self.pv      = pv
+            self.cb      = cb
+            self.payload = payload
+            self.begin   = bool(flags & TransportMoneroManager._LEVIN_BEGIN)
+            self.end     = bool(flags & TransportMoneroManager._LEVIN_END)
+            self.req     = bool(flags & TransportMoneroManager._LEVIN_REQ)
+            self.rsp     = bool(flags & TransportMoneroManager._LEVIN_RSP)
 
         def kind(self) -> str:
             return "REQ" if self.req else ("RSP" if self.rsp else "DATA")
 
     class _LevinParser:
-        """Minimal Levin bucket_head2 parser (little-endian, 33-byte header)."""
+        """
+        Minimal Levin bucket_head2 parser (little-endian, 33-byte header).
+        """
         SIG  = 0x0101010101010101
         HLEN = 33
-        HFMT = "<QQBIiII"          # (Q sig, Q cb, B not_used, I cmd, i ret, I flags, I pv)
-        CB_MAX = 16 * 1024 * 1024  # 16 MiB
+        HFMT = "<QQBIiII"          # sig, cb, unused, cmd, ret, flags, pv
+        CB_MAX = 16 * 1024 * 1024
 
         CMD_NAMES = {
             1000: "COMMAND_PING",
@@ -5759,6 +5792,9 @@ class TransportMoneroManager:
             2004: "NOTIFY_RESPONSE_GET_OBJECTS",
             2006: "NOTIFY_REQUEST_CHAIN",
             2007: "NOTIFY_RESPONSE_CHAIN_ENTRY",
+            2008: "NOTIFY_NEW_FLUFFY_BLOCK",
+            2009: "NOTIFY_REQUEST_FLUFFY_MISSING_TX",
+            2010: "NOTIFY_GET_TXPOOL_COMPLEMENT",
         }
 
         def __init__(self):
@@ -5768,32 +5804,52 @@ class TransportMoneroManager:
         def cmd_name(cls, cmd: int) -> str:
             return cls.CMD_NAMES.get(cmd, f"CMD({cmd})")
 
-        def feed(self, data: bytes) -> List["TransportMoneroManager._LevinMessage"]:
+        def feed(self, data: bytes):
             if not data:
                 return []
+
             self._buf += data
-            out: List[TransportMoneroManager._LevinMessage] = []
+            out = []
             mv = memoryview(self._buf)
             off = 0
+
             while True:
                 if len(mv) - off < self.HLEN:
                     break
+
                 try:
                     sig, cb, _unused, cmd, ret, flags, pv = struct.unpack_from(self.HFMT, mv, off)
                 except struct.error:
                     break
+
                 if sig != self.SIG:
-                    off += 1; continue
+                    off += 1
+                    continue
+
                 if cb < 0 or cb > self.CB_MAX:
-                    off += 1; continue
+                    off += 1
+                    continue
+
                 need = self.HLEN + cb
                 if len(mv) - off < need:
                     break
+
                 payload = bytes(mv[off + self.HLEN: off + need])
-                out.append(TransportMoneroManager._LevinMessage(cmd, flags, ret, pv, cb, payload))
+                out.append(
+                    TransportMoneroManager._LevinMessage(
+                        cmd=cmd,
+                        flags=flags,
+                        ret=ret,
+                        pv=pv,
+                        cb=cb,
+                        payload=payload,
+                    )
+                )
                 off += need
+
             if off:
                 self._buf = bytearray(mv[off:].tobytes())
+
             return out
 
     def __init__(
@@ -5814,81 +5870,106 @@ class TransportMoneroManager:
 
         self._p2p_ports = set(self.DEFAULT_P2P_PORTS)
         self._rpc_ports = set(self.DEFAULT_RPC_PORTS)
+        self._p2pool_ports = set(self.DEFAULT_P2POOL_PORTS)
+
         if extra_p2p_ports:
-            self._p2p_ports.update(int(p) for p in extra_p2p_ports if self._is_valid_port(p))
+            clean = {int(p) for p in extra_p2p_ports if self._is_valid_port(p)}
+            self._p2p_ports.update(clean)
+            for p in clean:
+                if p in self.DEFAULT_P2POOL_PORTS:
+                    self._p2pool_ports.add(p)
+
         if extra_rpc_ports:
             self._rpc_ports.update(int(p) for p in extra_rpc_ports if self._is_valid_port(p))
 
-        self._flows: dict = {}  # key -> flow dict
+        self._flows: dict = {}
         self._recent_msgs = defaultdict(float)
         self._recent_msg_window = float(msg_rate_window)
 
         self.p2p_auto_reply_ping = bool(p2p_auto_reply_ping)
         self._tx_cb = tx_cb
-
         self._last_gc = time.time()
 
         self.logger.log_message("[Transport][🪙 Monero] Manager ready.")
+        self.logger.log_message(
+            f"[Transport][🪙 Monero] P2Pool-aware ports active: {sorted(self._p2pool_ports)}"
+        )
 
     # ========== Public entrypoint ==========
     def handle(self, pkt, src, dst, sport, dport, inbound_iface) -> str:
         try:
             if not self._is_tcp(pkt):
-                return 'allow'
+                return "allow"
 
-            sport = int(sport); dport = int(dport)
+            sport = int(sport)
+            dport = int(dport)
             now = time.time()
             key = self._flow_key(src, sport, dst, dport)
 
             flow = self._flows.get(key)
             if not flow:
                 ftype = self._classify_flow_type(sport, dport)
+
                 if not ftype:
                     payload = self._get_payload_bytes(pkt)
                     ftype = self._dynamic_classify_from_payload(payload)
+
                 if not ftype:
                     self._cleanup_idle(now)
-                    return 'allow'
+                    return "allow"
+
                 flow = self._new_flow(src, sport, dst, dport, inbound_iface, now, ftype)
                 self._flows[key] = flow
 
             self._update_flow_state(flow, pkt, now, inbound_iface)
 
-            # Fast path after first classification
             if flow.get("noinspect", False):
                 self._maybe_progress_log(flow)
                 self._cleanup_idle(now)
-                return 'allow'
+                return "allow"
 
-            # Detailed logging + parsers
             self._perform_detailed_logging(flow, pkt, inbound_iface)
 
-            # Throttle future inspection for this flow
-            if flow.get("first_sample") is not None or flow.get("p2p_frames_logged", 0) > 0:
-                flow["noinspect"] = True
+            # Keep old low-overhead behavior for standard flows.
+            # Keep inspecting longer for P2Pool flows so the extra labels/logs can still appear.
+            if flow["type"] == "rpc":
+                if flow.get("first_sample") is not None:
+                    flow["noinspect"] = True
+            elif flow["type"] == "p2p":
+                if not self._is_p2pool_flow(flow):
+                    if flow.get("p2p_frames_logged", 0) > 0 or flow.get("first_sample") is not None:
+                        flow["noinspect"] = True
 
-            # Policy
             decision, reason = self._apply_policy(flow, pkt)
-            if decision == 'deny':
+            if decision == "deny":
                 self._rl_log(
-                    f"[Transport][🪙 Monero] ⛔ DENY {flow['type'].upper()} "
+                    f"{self._transport_prefix(flow)} ⛔ DENY {flow['type'].upper()} "
                     f"{src}:{sport} -> {dst}:{dport} | {reason}"
                 )
+
             self._cleanup_idle(now)
             return decision
         except Exception:
-            return 'allow'
+            return "allow"
 
     # ========== Policy ==========
     def _apply_policy(self, flow: dict, pkt) -> Tuple[str, str]:
         payload_len = len(self._get_payload_bytes(pkt))
-        if flow['type'] == 'p2p':
-            if flow.get('state') == 'ESTABLISHED' and not flow.get('synack_seen') and payload_len > 0:
-                return 'deny', "P2P data before handshake completion"
-        if flow['type'] == 'rpc':
-            if flow.get('rpc_last_method') == 'get_block_template':
-                self._rl_log("[Transport][🪙 Monero][POLICY] ℹ️ Mining activity detected on flow.")
-        return 'allow', "default"
+
+        if flow["type"] == "p2p":
+            if flow.get("state") == "ESTABLISHED" and not flow.get("synack_seen") and payload_len > 0:
+                return "deny", "P2P data before handshake completion"
+
+        if flow["type"] == "rpc":
+            meth = (flow.get("rpc_last_method") or "").lower()
+            if meth in {"get_block_template", "get_miner_data", "submit_block"}:
+                self._log_mining_message(
+                    flow,
+                    f"RPC method={meth} seen on local Monero path; this is mining-relevant control traffic",
+                    emoji="⛏️",
+                )
+
+        return "allow", "default"
 
     # ========== Flow state ==========
     def _update_flow_state(self, f: dict, pkt, now: float, iface: str):
@@ -5903,27 +5984,34 @@ class TransportMoneroManager:
         f["last_pkt"]   = pkt
 
         d = self._pkt_dir(f, pkt)
-        if d: f["last_dir"] = d
+        if d:
+            f["last_dir"] = d
 
         st = f.get("state", "INIT")
-        if 'S' in flags and 'A' not in flags:
-            f['state'] = 'SYN_SENT'; f['syn_seen'] = True
+
+        if "S" in flags and "A" not in flags:
+            f["state"] = "SYN_SENT"
+            f["syn_seen"] = True
             self._on_syn(f, flags, iface)
-        elif 'S' in flags and 'A' in flags:
-            if st == 'SYN_SENT':
-                f['state'] = 'ESTABLISHED'
-            f['synack_seen'] = True
+
+        elif "S" in flags and "A" in flags:
+            if st == "SYN_SENT":
+                f["state"] = "ESTABLISHED"
+            f["synack_seen"] = True
             self._on_syn_ack(f, flags, iface)
-        elif st == 'SYN_SENT' and 'A' in flags and payload_len == 0:
-            f['state'] = 'ESTABLISHED'
-        elif 'F' in flags or 'R' in flags:
-            f['state'] = 'CLOSED'; f['fin_or_rst'] = True
+
+        elif st == "SYN_SENT" and "A" in flags and payload_len == 0:
+            f["state"] = "ESTABLISHED"
+
+        elif "F" in flags or "R" in flags:
+            f["state"] = "CLOSED"
+            f["fin_or_rst"] = True
             self._on_fin_rst(f, flags, iface)
 
     @staticmethod
     def _new_flow(src, sport, dst, dport, iface, now_ts, ftype: str):
         return {
-            "type": ftype,                     # "p2p" or "rpc"
+            "type": ftype,  # "p2p" or "rpc"
             "state": "INIT",
             "endpoints": ((src, int(sport)), (dst, int(dport))),
             "created": now_ts,
@@ -5938,10 +6026,10 @@ class TransportMoneroManager:
             "entropy": None,
             "last_flags": "",
             "last_pkt": None,
-            "last_dir": None,          # "a2b" or "b2a"
+            "last_dir": None,
             "noinspect": False,
 
-            # RPC rolling state (budgeted)
+            # RPC rolling state
             "rpc_buf_c2s": bytearray(),
             "rpc_buf_s2c": bytearray(),
             "rpc_seen_req": 0,
@@ -5951,9 +6039,24 @@ class TransportMoneroManager:
             "rpc_last_path": None,
             "rpc_last_host": None,
 
-            # P2P rolling state
+            # P2P / Levin
             "p2p_parser": None,
             "p2p_frames_logged": 0,
+            "levin_frames_seen": 0,
+            "levin_last_cmd": None,
+            "levin_last_name": None,
+
+            # P2Pool-specific rolling state
+            "p2pool_buf_a2b": bytearray(),
+            "p2pool_buf_b2a": bytearray(),
+            "p2pool_frames_logged": 0,
+            "p2pool_last_label": None,
+            "p2pool_last_preview": None,
+            "p2pool_last_detail": None,
+            "p2pool_seen_handshake": False,
+            "p2pool_seen_peerlist": False,
+            "p2pool_seen_share": False,
+            "p2pool_seen_block": False,
 
             # Optional TX sockets
             "client_sock": None,
@@ -5963,15 +6066,20 @@ class TransportMoneroManager:
     def _cleanup_idle(self, now_ts):
         if now_ts - self._last_gc < self.GC_PERIOD_SEC:
             return
-        dead = [k for k, f in self._flows.items()
-                if now_ts - f.get("last_seen", now_ts) > self.flow_idle_timeout]
+
+        dead = [
+            k for k, f in self._flows.items()
+            if now_ts - f.get("last_seen", now_ts) > self.flow_idle_timeout
+        ]
         for k in dead:
             self._flows.pop(k, None)
+
         if len(self._flows) > self.FLOW_SOFT_MAX:
             excess = len(self._flows) - self.FLOW_SOFT_MAX
             victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last_seen", 0.0))[:excess]
             for k, _ in victims:
                 self._flows.pop(k, None)
+
         self._last_gc = now_ts
 
     # ========== Logging + parsers ==========
@@ -5990,37 +6098,70 @@ class TransportMoneroManager:
 
         if f["type"] == "p2p" and plen > 0:
             direction = self._pkt_dir(f, pkt) or f.get("last_dir")
-            if direction: f["last_dir"] = direction
+            if direction:
+                f["last_dir"] = direction
             self._p2p_feed_and_log(f, payload, iface, direction)
 
         self._maybe_progress_log(f)
 
+    # ---- Prefix helpers ----
+    def _is_p2pool_port(self, port: int) -> bool:
+        try:
+            return int(port) in self._p2pool_ports
+        except Exception:
+            return False
+
+    def _is_p2pool_flow(self, f: dict) -> bool:
+        try:
+            (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
+            return self._is_p2pool_port(a_port) or self._is_p2pool_port(b_port)
+        except Exception:
+            return False
+
+    def _transport_prefix(self, f: dict) -> str:
+        if f["type"] == "rpc":
+            return "[Transport][🧵 TCP][🪙 Monero][RPC]"
+        if self._is_p2pool_flow(f):
+            return "[Transport][🧵 TCP][🪙 Monero][P2Pool]"
+        return "[Transport][🧵 TCP][🪙 Monero][P2P]"
+
+    def _levin_prefix(self, f: dict) -> str:
+        if self._is_p2pool_flow(f):
+            return "[Transport][🧵 TCP][🪙 Monero][P2Pool][Levin]"
+        return "[Transport][🧵 TCP][🪙 Monero][P2P][Levin]"
+
+    def _mining_prefix(self) -> str:
+        return "[Transport][🧵 TCP][🪙 Monero][Mining]"
+
     # ---- TCP lifecycle logs ----
     def _on_syn(self, f, flags, iface):
-        a, b = f["endpoints"]; t = "P2P" if f["type"] == "p2p" else "RPC"
-        self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][{t}] SYN {a[0]}:{a[1]} → {b[0]}:{b[1]} on {iface} (flags={flags})")
+        a, b = f["endpoints"]
+        self._rl_log(
+            f"{self._transport_prefix(f)} SYN {a[0]}:{a[1]} → {b[0]}:{b[1]} on {iface} (flags={flags})"
+        )
 
     def _on_syn_ack(self, f, flags, iface):
-        a, b = f["endpoints"]; t = "P2P" if f["type"] == "p2p" else "RPC"
+        a, b = f["endpoints"]
         dur_ms = (time.time() - f.get("created", time.time())) * 1000.0
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][{t}] SYN/ACK {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
+            f"{self._transport_prefix(f)} SYN/ACK {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
             f"(flags={flags} rtt~{self._fmt_ms(dur_ms)})"
         )
 
     def _on_fin_rst(self, f, flags, iface):
-        a, b = f["endpoints"]; t = "P2P" if f["type"] == "p2p" else "RPC"
+        a, b = f["endpoints"]
         dur = time.time() - f.get("created", time.time())
         reason = "RST" if ("R" in flags and "F" not in flags) else "FIN"
         who = f.get("last_dir", "peer?")
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][{t}] {reason} ✂ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
+            f"{self._transport_prefix(f)} {reason} ✂ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
             f"(flags={flags}, by={who}, dur={dur:.1f}s, bytes={f.get('bytes', 0)}, pkts={f.get('pkts', 0)})"
         )
 
     def _log_first_data(self, f, sample: bytes, iface: str):
-        a, b = f["endpoints"]; t = "P2P" if f["type"] == "p2p" else "RPC"
-        ent = f.get("entropy", 0.0); hint = self._summarize_payload(sample)
+        a, b = f["endpoints"]
+        ent = f.get("entropy", 0.0)
+        hint = self._summarize_payload(sample)
 
         f["rolling_sha"] = hashlib.sha256()
         f["rolling_sha"].update(sample)
@@ -6035,7 +6176,7 @@ class TransportMoneroManager:
         pv = f" preview='{pv}'" if pv else ""
 
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][{t}] DATA ▶ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
+            f"{self._transport_prefix(f)} DATA ▶ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
             f"first={len(sample)}B ent={ent:.2f} {hint}{pv}"
         )
 
@@ -6045,109 +6186,351 @@ class TransportMoneroManager:
         if roll:
             roll.update(b"\x00")
 
-        pkts = f.get("pkts", 0); total = f.get("bytes", 0)
+        pkts = f.get("pkts", 0)
+        total = f.get("bytes", 0)
         if (pkts % self.PROGRESS_PKT_STEP != 0) and (total not in self.PROGRESS_BYTES_SET):
             return
 
         rate = total / max(1e-3, (now - f.get("created", now)))
         rate_str = f"{rate / 1024:.1f}KB/s" if rate >= 1024 else f"{rate:.0f}B/s"
         roll8 = (roll.hexdigest()[:8] if roll else "na")
-        a, b = f["endpoints"]; t = "P2P" if f["type"] == "p2p" else "RPC"
+        a, b = f["endpoints"]
+
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][{t}] DATA ⏩ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} "
+            f"{self._transport_prefix(f)} DATA ⏩ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} "
             f"bytes={total} pkts={pkts} rate~{rate_str} roll8={roll8}"
         )
 
-    # ---- RPC: budgeted split + JSON hints (no RandomX hooks) ----
+    # ---- RPC parsing ----
     def _rpc_parse_and_log(self, f, pkt, iface_or_tag: str):
         (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
         payload = self._get_payload_bytes(pkt)
 
-        # Server direction (default RPC ports)
         c2s = "a2b" if b_port in self._rpc_ports else ("b2a" if a_port in self._rpc_ports else None)
+
         if c2s == "a2b":
-            buf = f["rpc_buf_c2s"]; buf += payload
-            if len(buf) > self.RPC_BUF_MAX: del buf[:len(buf) - self.RPC_BUF_MAX]
-            msgs, remain = self._split_http_messages(buf); f["rpc_buf_c2s"] = remain
+            buf = f["rpc_buf_c2s"]
+            buf += payload
+            if len(buf) > self.RPC_BUF_MAX:
+                del buf[:len(buf) - self.RPC_BUF_MAX]
+
+            msgs, remain = self._split_http_messages(buf)
+            f["rpc_buf_c2s"] = remain
+
             for hdrs, body, _raw in msgs:
                 f["rpc_seen_req"] += 1
                 start = hdrs.get(":start", "")
-                host  = hdrs.get("host")
-                path  = self._extract_path_from_start(start)
+                host = hdrs.get("host")
+                path = self._extract_path_from_start(start)
                 method_http = (start.split(" ", 1)[0] if start else "?")
                 json_method = self._json_method_name(body) if self._looks_like_json(body) else None
+
                 f["rpc_last_method"] = json_method or method_http
                 f["rpc_last_path"] = path
                 f["rpc_last_host"] = host
+
                 self._rl_log(
-                    f"[Transport][🧵 TCP][🪙 Monero][RPC] ▶REQ {method_http} {path or ''} host={host or '-'} "
-                    f"json_method={json_method or '-'} body={len(body)}B"
+                    f"[Transport][🧵 TCP][🪙 Monero][RPC] ▶REQ {method_http} {path or ''} "
+                    f"host={host or '-'} json_method={json_method or '-'} body={len(body)}B"
                 )
+
+                meth = (json_method or "").lower()
+                if meth in {"get_block_template", "get_miner_data", "submit_block"}:
+                    self._log_mining_message(
+                        f,
+                        f"RPC {meth} request observed on {iface_or_tag} "
+                        f"(path={path or '-'} host={host or '-'})",
+                        emoji="🏗️" if meth == "get_block_template" else "📡",
+                    )
+
         elif c2s == "b2a":
-            buf = f["rpc_buf_s2c"]; buf += payload
-            if len(buf) > self.RPC_BUF_MAX: del buf[:len(buf) - self.RPC_BUF_MAX]
-            msgs, remain = self._split_http_messages(buf); f["rpc_buf_s2c"] = remain
+            buf = f["rpc_buf_s2c"]
+            buf += payload
+            if len(buf) > self.RPC_BUF_MAX:
+                del buf[:len(buf) - self.RPC_BUF_MAX]
+
+            msgs, remain = self._split_http_messages(buf)
+            f["rpc_buf_s2c"] = remain
+
             for hdrs, body, _raw in msgs:
                 f["rpc_seen_rsp"] += 1
                 start = hdrs.get(":start", "")
                 status = self._extract_status_from_start(start)
                 jhint = "json" if self._looks_like_json(body) else "-"
                 f["rpc_last_status"] = status
+
                 self._rl_log(
-                    f"[Transport][🧵 TCP][🪙 Monero][RPC] ◀RSP status={status or '?'} body={len(body)}B type={jhint}"
+                    f"[Transport][🧵 TCP][🪙 Monero][RPC] ◀RSP status={status or '?'} "
+                    f"body={len(body)}B type={jhint}"
                 )
 
-    # ---- P2P (Levin) ----
+                if f.get("rpc_last_method") in {"get_block_template", "get_miner_data"} and status == "200":
+                    self._log_mining_message(
+                        f,
+                        f"RPC response for {f.get('rpc_last_method')} returned HTTP 200 on {iface_or_tag}; "
+                        f"fresh mining metadata/template path looks healthy",
+                        emoji="✅",
+                    )
+
+    # ---- P2P + Levin + P2Pool parsing ----
     def _p2p_feed_and_log(self, f: dict, payload: bytes, iface: str, direction: Optional[str]) -> None:
         try:
             if direction:
                 f["last_dir"] = direction
+
             if f.get("p2p_parser") is None:
                 f["p2p_parser"] = TransportMoneroManager._LevinParser()
+
             frames = f["p2p_parser"].feed(payload)
-            if not frames:
+            is_p2pool = self._is_p2pool_flow(f)
+
+            # 1) Levin-decoded path
+            if frames:
+                burst = 0
+                a, b = f["endpoints"]
+
+                for m in frames:
+                    if burst >= self.LEVIN_LOG_BURST_MAX:
+                        self._rl_log(
+                            f"{self._transport_prefix(f)} … {len(frames) - burst} more frames suppressed"
+                        )
+                        break
+
+                    name = TransportMoneroManager._LevinParser.cmd_name(m.cmd)
+                    bits = []
+                    if m.begin:
+                        bits.append("BEGIN")
+                    if m.end:
+                        bits.append("END")
+                    if m.req:
+                        bits.append("REQ")
+                    if m.rsp:
+                        bits.append("RSP")
+                    flags_txt = ",".join(bits) if bits else "-"
+                    preview = (m.payload[:24].hex() + ("…" if m.cb > 24 else "")) if m.cb else "-"
+
+                    # Preserve old Monero flow log style
+                    self._rl_log(
+                        f"{self._transport_prefix(f)} {m.kind()} {name} flags={flags_txt} "
+                        f"ret={m.ret} pv={m.pv} len={m.cb} preview={preview} "
+                        f"{a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
+                    )
+
+                    # Add Levin-specific log after Monero prefix
+                    self._rl_log(
+                        f"{self._levin_prefix(f)} {m.kind()} cmd={m.cmd} name={name} "
+                        f"flags={flags_txt} ret={m.ret} pv={m.pv} len={m.cb} preview={preview}"
+                    )
+
+                    f["p2p_frames_logged"] = f.get("p2p_frames_logged", 0) + 1
+                    f["levin_frames_seen"] = f.get("levin_frames_seen", 0) + 1
+                    f["levin_last_cmd"] = m.cmd
+                    f["levin_last_name"] = name
+                    burst += 1
+
+                    if is_p2pool:
+                        label = self._p2pool_label_from_levin(m)
+                        self._log_p2pool_levin_event(
+                            f=f,
+                            m=m,
+                            label=label,
+                            name=name,
+                            flags_txt=flags_txt,
+                            preview=preview,
+                            iface=iface,
+                        )
+
+                    self._maybe_reply_ping(f, m, iface)
+                    self._maybe_log_mining_from_monero_levin(f, m, iface)
                 return
-            # Log at most LEVIN_LOG_BURST_MAX frames per call
-            burst = 0
-            a, b = f["endpoints"]
-            for m in frames:
-                if burst >= self.LEVIN_LOG_BURST_MAX:
-                    self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2P] … {len(frames)-burst} more frames suppressed")
-                    break
-                name = TransportMoneroManager._LevinParser.cmd_name(m.cmd)
-                bits = []
-                if m.begin: bits.append("BEGIN")
-                if m.end:   bits.append("END")
-                if m.req:   bits.append("REQ")
-                if m.rsp:   bits.append("RSP")
-                flags_txt = ",".join(bits) if bits else "-"
-                preview = (m.payload[:24].hex() + ("…" if m.cb > 24 else "")) if m.cb else "-"
-                self._rl_log(
-                    f"[Transport][🧵 TCP][🪙 Monero][P2P] {m.kind()} {name} flags={flags_txt} "
-                    f"ret={m.ret} pv={m.pv} len={m.cb} preview={preview} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
-                )
-                f["p2p_frames_logged"] = f.get("p2p_frames_logged", 0) + 1
-                burst += 1
-                self._maybe_reply_ping(f, m, iface)
+
+            # 2) Non-Levin P2Pool classifier path
+            if is_p2pool:
+                self._p2pool_feed_non_levin_and_log(f, payload, iface, direction)
+
         except Exception:
             pass
+
+    def _p2pool_label_from_levin(self, m: "_LevinMessage") -> str:
+        cmd = int(m.cmd)
+        if cmd == 1001:
+            return "handshake"
+        if cmd == 1002:
+            return "timed_sync"
+        if cmd == 2002:
+            return "share"
+        if cmd in (2003, 2004):
+            return "chain_object"
+        if cmd in (2006, 2007):
+            return "chain"
+        if cmd in (2001, 2008):
+            return "block"
+        if cmd == 2009:
+            return "missing_tx"
+        if cmd == 1000:
+            return "ping"
+        return "unknown"
+
+    def _log_p2pool_levin_event(self, f: dict, m: "_LevinMessage", label: str, name: str,
+                                flags_txt: str, preview: str, iface: str) -> None:
+        a, b = f["endpoints"]
+        self._rl_log(
+            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} {m.kind()} name={name} flags={flags_txt} "
+            f"ret={m.ret} pv={m.pv} len={m.cb} preview={preview} "
+            f"{a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
+        )
+
+        f["p2pool_frames_logged"] = f.get("p2pool_frames_logged", 0) + 1
+        f["p2pool_last_label"] = label
+        f["p2pool_last_preview"] = preview
+        f["p2pool_last_detail"] = name
+
+        if label == "handshake":
+            f["p2pool_seen_handshake"] = True
+        elif label == "peerlist":
+            f["p2pool_seen_peerlist"] = True
+        elif label == "share":
+            f["p2pool_seen_share"] = True
+        elif label == "block":
+            f["p2pool_seen_block"] = True
+
+    def _p2pool_feed_non_levin_and_log(self, f: dict, payload: bytes, iface: str,
+                                       direction: Optional[str]) -> None:
+        dir_key = "p2pool_buf_a2b" if (direction or f.get("last_dir")) == "a2b" else "p2pool_buf_b2a"
+        buf = f.get(dir_key)
+        if buf is None:
+            buf = bytearray()
+            f[dir_key] = buf
+
+        buf += payload
+        if len(buf) > self.P2POOL_BUF_MAX:
+            del buf[:len(buf) - self.P2POOL_BUF_MAX]
+
+        label, detail = self._classify_p2pool_payload(bytes(buf))
+        preview = self._short_hex(bytes(buf[:48]), 48)
+        a, b = f["endpoints"]
+
+        self._rl_log(
+            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} RAW len={len(buf)} detail={detail} "
+            f"preview={preview or '-'} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
+        )
+
+        f["p2pool_frames_logged"] = f.get("p2pool_frames_logged", 0) + 1
+        f["p2pool_last_label"] = label
+        f["p2pool_last_preview"] = preview
+        f["p2pool_last_detail"] = detail
+
+        if label == "handshake":
+            f["p2pool_seen_handshake"] = True
+        elif label == "peerlist":
+            f["p2pool_seen_peerlist"] = True
+        elif label == "share":
+            f["p2pool_seen_share"] = True
+        elif label == "block":
+            f["p2pool_seen_block"] = True
+
+        if label in {"handshake", "peerlist", "share", "block"}:
+            self._log_mining_message(
+                f,
+                f"P2Pool {label} traffic seen on {iface}; this can help keep local share/block awareness fresher",
+                emoji="🧠" if label == "peerlist" else "⛏️",
+            )
+
+    def _classify_p2pool_payload(self, payload: bytes) -> Tuple[str, str]:
+        if not payload:
+            return "unknown", "empty"
+
+        n = len(payload)
+        ascii_ratio = self._ascii_ratio(payload)
+
+        # Levin signature found but parser did not yield full frame yet
+        if len(payload) >= 8:
+            try:
+                if struct.unpack_from("<Q", payload, 0)[0] == self._LEVIN_SIG:
+                    return "handshake", "levin_header_incomplete"
+            except Exception:
+                pass
+
+        if ascii_ratio > 0.75:
+            low = payload[:256].lower()
+            if b"peer" in low:
+                return "peerlist", "text_peer_hint"
+            if b"share" in low:
+                return "share", "text_share_hint"
+            if b"block" in low:
+                return "block", "text_block_hint"
+            if b"hello" in low or b"handshake" in low:
+                return "handshake", "text_handshake_hint"
+            return "unknown", "textual"
+
+        if n <= 256:
+            zero_runs = payload.count(0)
+            if zero_runs >= max(4, n // 12):
+                return "peerlist", f"compact_binary zeros={zero_runs}"
+            return "unknown", f"short_binary len={n}"
+
+        if 256 < n < 4096:
+            return "share", f"mid_binary len={n}"
+
+        if n >= 4096:
+            return "block", f"large_binary len={n}"
+
+        return "unknown", f"len={n}"
+
+    def _ascii_ratio(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        printable = 0
+        for b in data:
+            if 32 <= b <= 126 or b in (9, 10, 13):
+                printable += 1
+        return printable / max(1, len(data))
+
+    def _maybe_log_mining_from_monero_levin(self, f: dict, m: "_LevinMessage", iface: str) -> None:
+        if int(m.cmd) not in self._MINING_BENEFIT_MONERO_CMDS:
+            return
+
+        label = self._p2pool_label_from_levin(m)
+        if label == "unknown":
+            label = TransportMoneroManager._LevinParser.cmd_name(m.cmd)
+
+        self._log_mining_message(
+            f,
+            f"Monero Levin event {label} cmd={m.cmd} pv={m.pv} len={m.cb} on {iface}; "
+            f"this can improve freshness / reduce stale work windows",
+            emoji="⚡",
+        )
 
     def _maybe_reply_ping(self, f: dict, m: "_LevinMessage", iface: str):
         if not self.p2p_auto_reply_ping:
             return
+
         if not (m.cmd == self._CMD_PING and m.req and not m.rsp):
             return
+
         req_dir = f.get("last_dir") or "a2b"
         rsp_dir = "b2a" if req_dir == "a2b" else "a2b"
         pkt_bytes = self._levin_ping_rsp(m.pv)
+
         if self._send_bytes(f, pkt_bytes, rsp_dir):
-            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2P] ◀ sent PING RSP (OK) pv={m.pv} on {iface}")
+            self._rl_log(f"{self._transport_prefix(f)} ◀ sent PING RSP (OK) pv={m.pv} on {iface}")
+            if self._is_p2pool_flow(f):
+                self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🏓 PING response sent pv={m.pv} on {iface}")
         else:
-            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2P] (no-tx) would reply PING pv={m.pv} on {iface}")
+            self._rl_log(f"{self._transport_prefix(f)} (no-tx) would reply PING pv={m.pv} on {iface}")
 
     def _levin_build(self, cmd: int, *, flags: int, pv: int, payload: bytes = b"", ret: int = 0) -> bytes:
         cb = len(payload)
-        return struct.pack("<QQBIiII", self._LEVIN_SIG, cb, 0, cmd, int(ret), int(flags), int(pv)) + payload
+        return struct.pack(
+            "<QQBIiII",
+            self._LEVIN_SIG,
+            cb,
+            0,
+            cmd,
+            int(ret),
+            int(flags),
+            int(pv),
+        ) + payload
 
     def _levin_ping_rsp(self, pv: int) -> bytes:
         return self._levin_build(
@@ -6158,6 +6541,48 @@ class TransportMoneroManager:
             ret=self._LEVIN_OK,
         )
 
+    # ========== Mining log helpers ==========
+    def _is_private_like_ip(self, ip_str: str) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+        except Exception:
+            return False
+
+    def _pick_localish_endpoint(self, f: dict) -> Optional[Tuple[str, int]]:
+        try:
+            (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
+
+            a_private = self._is_private_like_ip(a_ip)
+            b_private = self._is_private_like_ip(b_ip)
+            a_service = self._is_p2pool_port(a_port) or a_port in self._rpc_ports or a_port in self._p2p_ports
+            b_service = self._is_p2pool_port(b_port) or b_port in self._rpc_ports or b_port in self._p2p_ports
+
+            if a_private and not b_private:
+                return (a_ip, a_port)
+            if b_private and not a_private:
+                return (b_ip, b_port)
+
+            if a_private and not a_service and b_service:
+                return (a_ip, a_port)
+            if b_private and not b_service and a_service:
+                return (b_ip, b_port)
+
+            if a_private:
+                return (a_ip, a_port)
+            if b_private:
+                return (b_ip, b_port)
+        except Exception:
+            pass
+        return None
+
+    def _log_mining_message(self, f: dict, message: str, emoji: str = "⛏️") -> None:
+        ep = self._pick_localish_endpoint(f)
+        if ep:
+            self._rl_log(f"{self._mining_prefix()} {emoji} {message} local={ep[0]}:{ep[1]}")
+        else:
+            self._rl_log(f"{self._mining_prefix()} {emoji} {message}")
+
     # ========== Built-in TX ==========
     def _send_bytes(self, f: dict, data: bytes, direction: str) -> bool:
         if callable(self._tx_cb):
@@ -6165,6 +6590,7 @@ class TransportMoneroManager:
                 return bool(self._tx_cb(f, data, direction))
             except Exception:
                 pass
+
         try:
             sock = f.get("server_sock") if direction == "a2b" else f.get("client_sock")
             if not sock:
@@ -6178,14 +6604,19 @@ class TransportMoneroManager:
                        client_sock=None, server_sock=None) -> bool:
         key = self._flow_key(src, int(sport), dst, int(dport))
         f = self._flows.get(key)
+
         if not f:
             now = time.time()
             f = self._new_flow(src, sport, dst, dport, "sock_attach", now, "p2p")
             self._flows[key] = f
-        if client_sock: f["client_sock"] = client_sock
-        if server_sock: f["server_sock"] = server_sock
+
+        if client_sock:
+            f["client_sock"] = client_sock
+        if server_sock:
+            f["server_sock"] = server_sock
+
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][P2P] sockets attached for {src}:{sport} ⇄ {dst}:{dport} "
+            f"{self._transport_prefix(f)} sockets attached for {src}:{sport} ⇄ {dst}:{dport} "
             f"(client={'yes' if client_sock else 'no'}, server={'yes' if server_sock else 'no'})"
         )
         return True
@@ -6196,20 +6627,25 @@ class TransportMoneroManager:
         if f:
             f["client_sock"] = None
             f["server_sock"] = None
-            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2P] sockets detached for {src}:{sport} ⇄ {dst}:{dport}")
+            self._rl_log(f"{self._transport_prefix(f)} sockets detached for {src}:{sport} ⇄ {dst}:{dport}")
 
     # ========== Port / payload classification ==========
     def _classify_flow_type(self, sport: int, dport: int) -> Optional[str]:
         if (sport in self._rpc_ports) or (dport in self._rpc_ports):
             return "rpc"
-        if (sport in self._p2p_ports) or (dport in self._p2p_ports):
+        if (
+            (sport in self._p2p_ports)
+            or (dport in self._p2p_ports)
+            or self._is_p2pool_port(sport)
+            or self._is_p2pool_port(dport)
+        ):
             return "p2p"
         return None
 
     def _dynamic_classify_from_payload(self, payload: bytes) -> Optional[str]:
         if not payload:
             return None
-        if payload.startswith(b'\x01\x01\x01\x01\x01\x01\x01\x01'):
+        if payload.startswith(b"\x01\x01\x01\x01\x01\x01\x01\x01"):
             return "p2p"
         if self._is_http_head(payload):
             return "rpc"
@@ -6254,8 +6690,10 @@ class TransportMoneroManager:
     @staticmethod
     def _pkt_dir(f: dict, pkt) -> Optional[str]:
         try:
-            sport = int(pkt[TCP].sport); dport = int(pkt[TCP].dport)
-            a_port = f["endpoints"][0][1]; b_port = f["endpoints"][1][1]
+            sport = int(pkt[TCP].sport)
+            dport = int(pkt[TCP].dport)
+            a_port = f["endpoints"][0][1]
+            b_port = f["endpoints"][1][1]
             if sport == a_port and dport == b_port:
                 return "a2b"
             if sport == b_port and dport == a_port:
@@ -6279,11 +6717,6 @@ class TransportMoneroManager:
     # ========== Small utils ==========
     @staticmethod
     def _summarize_payload(sample: bytes) -> str:
-        """
-        Classify a TCP payload sample and return a short summary string.
-          • Detects HTTP vs TLS record vs ASCII/mixed/binary
-          • Adds sha8 fingerprint (first 8 hex chars of SHA256)
-        """
         if not sample:
             return "empty"
 
@@ -6304,13 +6737,12 @@ class TransportMoneroManager:
                 or head.startswith(b"PUT ")
                 or head.startswith(b"HEAD ")
                 or head.startswith(b"HTTP/")
-                or head.startswith(b"OPTI")   # OPTIONS
-                or head.startswith(b"DELET")  # DELETE
+                or head.startswith(b"OPTI")
+                or head.startswith(b"DELET")
                 or head.startswith(b"PATCH ")
             )
 
         def is_tls_record(b: bytes) -> bool:
-            # TLS ContentType (0x14..0x17), Version = 0x03 0x0x
             return (
                 len(b) >= 3
                 and b[0] in (0x14, 0x15, 0x16, 0x17)
@@ -6336,30 +6768,25 @@ class TransportMoneroManager:
         return ",".join(hints)
 
     def _decode_chunked(self, body: memoryview) -> Tuple[bytes, int]:
-        """
-        Minimal chunked decoder.
-        Returns (decoded_bytes, total_bytes_consumed_from_input).
-        If incomplete, returns (b"", 0).
-        """
         pos = 0
         out = bytearray()
         mv = body
-        # chunk-size [;ext] CRLF ... data ... CRLF ... 0 CRLF CRLF
+
         while True:
-            # find CRLF after size line
             nl = mv[pos:].tobytes().find(self._HTTP_EOL)
             if nl < 0:
-                return b"", 0  # incomplete
+                return b"", 0
+
             size_line = mv[pos:pos + nl].tobytes()
             pos += nl + 2
-            # size can have extensions (";")
             semi = size_line.split(b";", 1)[0]
+
             try:
                 sz = int(semi.strip(), 16)
             except Exception:
                 return b"", 0
+
             if sz == 0:
-                # optional trailer section: read CRLF
                 if len(mv) < pos + 2:
                     return b"", 0
                 if mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
@@ -6367,59 +6794,54 @@ class TransportMoneroManager:
                 if len(mv) >= pos + 2 and mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
                     pos += 2
                 return bytes(out), pos
-            # need sz bytes + CRLF
+
             if len(mv) < pos + sz + 2:
                 return b"", 0
+
             out += mv[pos:pos + sz].tobytes()
             pos += sz
-            # consume CRLF after data
+
             if mv[pos:pos + 2].tobytes() != self._HTTP_EOL:
                 return b"", 0
             pos += 2
 
     def _parse_headers(self, raw_headers: bytes) -> dict:
-        headers = {":start": raw_headers.split(self._HTTP_EOL, 1)[0].decode("utf-8", "replace")}
+        headers = {
+            ":start": raw_headers.split(self._HTTP_EOL, 1)[0].decode("utf-8", "replace")
+        }
         for line in raw_headers.split(self._HTTP_EOL):
             if not line:
                 continue
             if b":" not in line:
-                # start-line (REQUEST/STATUS) or malformed; skip here
                 continue
             k, v = line.split(b":", 1)
             headers[k.strip().lower().decode("utf-8", "replace")] = v.strip().decode("utf-8", "replace")
         return headers
 
     def _split_http_messages(self, buf: bytearray) -> Tuple[List[Tuple[dict, bytes, bytes]], bytearray]:
-        """
-        Splits a TCP reassembly buffer into complete HTTP messages.
-        Supports:
-          • Content-Length framing
-          • Transfer-Encoding: chunked (minimal)
-        Returns: ([(headers_dict, body_bytes, raw_bytes), ...], remaining_buf)
-        """
-        msgs: List[Tuple[dict, bytes, bytes]] = []
+        msgs = []
         mv = memoryview(buf)
         start = 0
         total = len(mv)
 
         while True:
             if total - start < 4:
-                break  # not enough for headers
+                break
 
-            # Find header delimiter (tolerate CRLFCRLF or LFLF)
             head_slice = mv[start:].tobytes()
             h_end_rel = head_slice.find(self._HDR_DELIM_1)
             delim_len = 4
+
             if h_end_rel < 0:
                 h_end_rel = head_slice.find(self._HDR_DELIM_2)
                 if h_end_rel < 0:
-                    break  # no full headers yet
+                    break
                 delim_len = 2
+
             h_end_abs = start + h_end_rel
             headers_blob = mv[start:h_end_abs].tobytes()
             headers = self._parse_headers(headers_blob)
 
-            # Determine body framing
             body_start = h_end_abs + delim_len
             cl = headers.get("content-length")
             te = headers.get("transfer-encoding")
@@ -6427,10 +6849,10 @@ class TransportMoneroManager:
             if cl is not None:
                 want = self._parse_int_safe(cl.encode(), -1)
                 if want < 0:
-                    break  # malformed; wait for more
+                    break
                 end = body_start + want
                 if total < end:
-                    break  # incomplete body
+                    break
                 raw = mv[start:end].tobytes()
                 body = mv[body_start:end].tobytes()
                 msgs.append((headers, body, raw))
@@ -6440,7 +6862,7 @@ class TransportMoneroManager:
             if te and ("chunked" in te.lower()):
                 decoded, consumed = self._decode_chunked(mv[body_start:])
                 if consumed == 0:
-                    break  # incomplete
+                    break
                 end = body_start + consumed
                 raw = mv[start:end].tobytes()
                 body = decoded
@@ -6448,7 +6870,6 @@ class TransportMoneroManager:
                 start = end
                 continue
 
-            # No body (headers only)
             raw = mv[start:body_start].tobytes()
             msgs.append((headers, b"", raw))
             start = body_start
@@ -6476,9 +6897,11 @@ class TransportMoneroManager:
     def _byte_entropy(b: bytes) -> float:
         if not b:
             return 0.0
+
         counts = [0] * 256
         for x in b:
             counts[x] += 1
+
         n = len(b)
         ent = 0.0
         for c in counts:
@@ -6490,9 +6913,11 @@ class TransportMoneroManager:
     @staticmethod
     def _fmt_ms(v) -> str:
         try:
-            if v is None: return "-"
+            if v is None:
+                return "-"
             v = float(v)
-            if v != v: return "-"
+            if v != v:
+                return "-"
             return f"{int(round(v))}ms"
         except Exception:
             return "-"
@@ -6500,11 +6925,15 @@ class TransportMoneroManager:
     @staticmethod
     def _looks_like_json(b: bytes) -> bool:
         bb = b.strip()
-        return (bb.startswith(b"{") and bb.endswith(b"}")) or (bb.startswith(b"[") and bb.endswith(b"]"))
+        return (
+            (bb.startswith(b"{") and bb.endswith(b"}"))
+            or
+            (bb.startswith(b"[") and bb.endswith(b"]"))
+        )
 
     def _json_method_name(self, b: bytes):
         try:
-            bb = b[: self.RPC_JSON_MAX]
+            bb = b[:self.RPC_JSON_MAX]
             data = json.loads(bb.decode("utf-8", errors="replace"))
             if isinstance(data, dict) and isinstance(data.get("method"), str):
                 return data["method"]
@@ -6538,11 +6967,17 @@ class TransportMoneroManager:
         if self._is_valid_port(port):
             self._p2p_ports.add(int(port))
             self._rl_log(f"[Transport][🪙 Monero] Added P2P port {int(port)}")
+            if int(port) in self.DEFAULT_P2POOL_PORTS:
+                self._p2pool_ports.add(int(port))
+                self._rl_log(f"[Transport][🪙 Monero][P2Pool] Added P2Pool port {int(port)}")
 
     def remove_candidate_p2p_port(self, port: int):
         try:
             self._p2p_ports.discard(int(port))
             self._rl_log(f"[Transport][🪙 Monero] Removed P2P port {int(port)}")
+            if int(port) in self._p2pool_ports and int(port) not in self.DEFAULT_P2POOL_PORTS:
+                self._p2pool_ports.discard(int(port))
+                self._rl_log(f"[Transport][🪙 Monero][P2Pool] Removed P2Pool port {int(port)}")
         except Exception:
             pass
 
@@ -6555,6 +6990,19 @@ class TransportMoneroManager:
         try:
             self._rpc_ports.discard(int(port))
             self._rl_log(f"[Transport][🪙 Monero] Removed RPC port {int(port)}")
+        except Exception:
+            pass
+
+    def add_candidate_p2pool_port(self, port: int):
+        if self._is_valid_port(port):
+            self._p2pool_ports.add(int(port))
+            self._p2p_ports.add(int(port))
+            self._rl_log(f"[Transport][🪙 Monero][P2Pool] Added candidate P2Pool port {int(port)}")
+
+    def remove_candidate_p2pool_port(self, port: int):
+        try:
+            self._p2pool_ports.discard(int(port))
+            self._rl_log(f"[Transport][🪙 Monero][P2Pool] Removed candidate P2Pool port {int(port)}")
         except Exception:
             pass
 
