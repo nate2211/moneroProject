@@ -2581,7 +2581,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     port=8844,
                     dashboard_title="Router Dashboard",
                     store_raw_packets=True,
-                    max_raw_packet_bytes=0,  # 0 = keep full raw bytes
+                    max_raw_packet_bytes=0,
+                    client_stream_max_packets=12000,
+                    client_stream_max_bytes=512 * 1024 * 1024,
+                    client_stream_ttl_sec=900.0,
                 )
                 self.router_logger.log_message = self.python_server_manager.wrap_log_call(
                     self.router_logger.log_message,
@@ -2873,6 +2876,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.lan_manager.stop()
                 self.lan_manager = None
             if self.python_server_manager:
+                self.python_server_manager.unwrap_logger_method(self.router_logger, "log_message")
                 self.python_server_manager.stop()
                 self.python_server_manager = None
             if self.gateway_manager:

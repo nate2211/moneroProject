@@ -6987,12 +6987,16 @@ class TransportMoneroManager:
         if "S" in flags and "A" not in flags:
             f["state"] = "SYN_SENT"
             f["syn_seen"] = True
+            if not f.get("flow_initiator") and d in ("a2b", "b2a"):
+                f["flow_initiator"] = d
             self._on_syn(f, flags, iface)
 
         elif "S" in flags and "A" in flags:
             if st == "SYN_SENT":
                 f["state"] = "ESTABLISHED"
             f["synack_seen"] = True
+            if not f.get("flow_initiator") and d in ("a2b", "b2a"):
+                f["flow_initiator"] = "b2a" if d == "a2b" else "a2b"
             self._on_syn_ack(f, flags, iface)
 
         elif st == "SYN_SENT" and "A" in flags and payload_len == 0:
@@ -7022,6 +7026,7 @@ class TransportMoneroManager:
             "last_flags": "",
             "last_pkt": None,
             "last_dir": None,
+            "flow_initiator": None,
             "noinspect": False,
 
             # RPC rolling state
@@ -7033,6 +7038,10 @@ class TransportMoneroManager:
             "rpc_last_method": None,
             "rpc_last_path": None,
             "rpc_last_host": None,
+            "rpc_last_json_id": None,
+            "rpc_last_content_type": None,
+            "rpc_last_server": None,
+            "rpc_event_ts": {},
 
             # P2P / Levin
             "p2p_parser": None,
@@ -7040,6 +7049,9 @@ class TransportMoneroManager:
             "levin_frames_seen": 0,
             "levin_last_cmd": None,
             "levin_last_name": None,
+            "levin_cmd_counts": defaultdict(int),
+            "levin_last_pv": None,
+            "levin_last_ret": None,
 
             # P2Pool-specific rolling state
             "p2pool_buf_a2b": bytearray(),
@@ -7207,6 +7219,192 @@ class TransportMoneroManager:
             f"bytes={total} pkts={pkts} rate~{rate_str} roll8={roll8}"
         )
 
+    def _p2pool_share_direction(self, f: dict) -> Optional[str]:
+        initiator = f.get("flow_initiator")
+        if initiator in ("a2b", "b2a"):
+            return initiator
+
+        local = self._pick_localish_endpoint(f)
+        if not local:
+            return None
+
+        try:
+            (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
+            if (a_ip, a_port) == local:
+                return "a2b"
+            if (b_ip, b_port) == local:
+                return "b2a"
+        except Exception:
+            pass
+        return None
+
+    def _safe_json_loads(self, body: bytes):
+        try:
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8", "ignore"))
+        except Exception:
+            return None
+
+    def _rpc_json_summary(self, obj: Any) -> str:
+        try:
+            if isinstance(obj, dict):
+                keys = list(obj.keys())[:8]
+                return "keys=" + ",".join(str(k) for k in keys)
+            if isinstance(obj, list):
+                return f"list[{len(obj)}]"
+            return type(obj).__name__
+        except Exception:
+            return "-"
+
+    def _rpc_result_summary(self, obj: Any) -> str:
+        try:
+            if not isinstance(obj, dict):
+                return self._rpc_json_summary(obj)
+
+            if "result" in obj:
+                res = obj.get("result")
+                if isinstance(res, dict):
+                    keys = list(res.keys())[:10]
+                    bits = [f"result_keys={','.join(str(k) for k in keys)}"]
+                    if "height" in res:
+                        bits.append(f"height={res.get('height')}")
+                    if "difficulty" in res:
+                        bits.append(f"difficulty={res.get('difficulty')}")
+                    if "status" in res:
+                        bits.append(f"status={res.get('status')}")
+                    if "untrusted" in res:
+                        bits.append(f"untrusted={res.get('untrusted')}")
+                    if "blocktemplate_blob" in res:
+                        bits.append("template=yes")
+                    if "seed_hash" in res:
+                        bits.append("seed_hash=yes")
+                    if "tx_hashes" in res and isinstance(res.get("tx_hashes"), list):
+                        bits.append(f"tx_hashes={len(res.get('tx_hashes') or [])}")
+                    return " ".join(bits)
+                return f"result_type={type(res).__name__}"
+
+            if "error" in obj:
+                err = obj.get("error")
+                if isinstance(err, dict):
+                    return f"error_code={err.get('code')} error_msg={err.get('message')}"
+                return "error=present"
+
+            return self._rpc_json_summary(obj)
+        except Exception:
+            return "-"
+
+    def _p2p_payload_profile(self, payload: bytes) -> str:
+        if not payload:
+            return "empty"
+
+        sample = payload[: min(len(payload), 96)]
+        ent = self._byte_entropy(sample)
+        ascii_ratio = self._ascii_ratio(sample)
+        zeroes = sample.count(0)
+        high = sum(1 for b in sample if b >= 0x80)
+        return (
+            f"ent={ent:.2f} ascii={ascii_ratio:.2f} zeroes={zeroes} "
+            f"high={high} sha8={hashlib.sha1(sample).hexdigest()[:8]}"
+        )
+
+    def _summarize_monero_levin_payload(self, m: "_LevinMessage") -> str:
+        try:
+            p = m.payload or b""
+            n = len(p)
+            if n == 0:
+                return "empty"
+
+            low = p[: min(n, 128)].lower()
+            hints = []
+
+            if b"txs" in low:
+                hints.append("txs")
+            if b"block" in low:
+                hints.append("block")
+            if b"peer" in low:
+                hints.append("peer")
+            if b"chain" in low:
+                hints.append("chain")
+
+            ent = self._byte_entropy(p[: min(n, 96)])
+            ascii_ratio = self._ascii_ratio(p[: min(n, 96)])
+            tag = ",".join(hints) if hints else "-"
+            return f"len={n} ent={ent:.2f} ascii={ascii_ratio:.2f} hints={tag}"
+        except Exception:
+            return "summary_err"
+
+    def _log_rpc_semantic(self, f: dict, direction: str, hdrs: dict, body: bytes, iface: str) -> None:
+        content_type = hdrs.get("content-type") or "-"
+        server = hdrs.get("server") or "-"
+        host = hdrs.get("host") or f.get("rpc_last_host") or "-"
+        obj = self._safe_json_loads(body)
+
+        if direction == "req":
+            meth = f.get("rpc_last_method") or "?"
+            path = f.get("rpc_last_path") or "-"
+            summary = self._rpc_json_summary(obj) if obj is not None else "-"
+            key = f"rpc:req:{meth}:{path}"
+            now = time.time()
+            last = float(f.setdefault("rpc_event_ts", {}).get(key, 0.0) or 0.0)
+            if now - last >= 8.0:
+                f["rpc_event_ts"][key] = now
+                self._rl_log(
+                    f"[Transport][🧵 TCP][🪙 Monero][RPC][Deep] ▶REQ "
+                    f"method={meth} path={path} host={host} ctype={content_type} "
+                    f"body={len(body)}B json={summary} on {iface}"
+                )
+
+            if isinstance(obj, dict):
+                f["rpc_last_json_id"] = obj.get("id")
+
+        else:
+            status = f.get("rpc_last_status") or "?"
+            meth = f.get("rpc_last_method") or "?"
+            summary = self._rpc_result_summary(obj) if obj is not None else "-"
+            key = f"rpc:rsp:{meth}:{status}"
+            now = time.time()
+            last = float(f.setdefault("rpc_event_ts", {}).get(key, 0.0) or 0.0)
+            if now - last >= 8.0:
+                f["rpc_event_ts"][key] = now
+                self._rl_log(
+                    f"[Transport][🧵 TCP][🪙 Monero][RPC][Deep] ◀RSP "
+                    f"method={meth} status={status} ctype={content_type} server={server} "
+                    f"body={len(body)}B {summary} on {iface}"
+                )
+
+    def _log_monero_p2p_semantic(
+        self,
+        f: dict,
+        m: "_LevinMessage",
+        iface: str,
+        direction: Optional[str],
+        name: str,
+        flags_txt: str,
+    ) -> None:
+        cmd = int(m.cmd)
+        counts = f.setdefault("levin_cmd_counts", defaultdict(int))
+        counts[cmd] += 1
+        f["levin_last_pv"] = m.pv
+        f["levin_last_ret"] = m.ret
+
+        summary = self._summarize_monero_levin_payload(m)
+        dir_txt = direction or f.get("last_dir") or "?"
+
+        key = f"levin:{cmd}:{dir_txt}"
+        if self._flow_event_ok(f, key, 6.0):
+            self._rl_log(
+                f"{self._levin_prefix(f)} 🛰️ semantic "
+                f"cmd={cmd} name={name} dir={dir_txt} flags={flags_txt} "
+                f"ret={m.ret} pv={m.pv} seen={counts[cmd]} {summary} on {iface}"
+            )
+
+        if cmd in {1001, 1002, 2001, 2002, 2003, 2004, 2006, 2007, 2008, 2009, 2010}:
+            self._rl_log(
+                f"[Transport][🧵 TCP][🪙 Monero][P2P][Deep] "
+                f"cmd={cmd} name={name} dir={dir_txt} {summary} on {iface}"
+            )
+
     # ---- RPC parsing ----
     def _rpc_parse_and_log(self, f, pkt, iface_or_tag: str):
         (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
@@ -7229,19 +7427,26 @@ class TransportMoneroManager:
                 host = hdrs.get("host")
                 path = self._extract_path_from_start(start)
                 method_http = (start.split(" ", 1)[0] if start else "?")
-                json_method = self._json_method_name(body) if self._looks_like_json(body) else None
+                json_obj = self._safe_json_loads(body) if self._looks_like_json(body) else None
+                json_method = None
+                if isinstance(json_obj, dict):
+                    json_method = json_obj.get("method")
 
                 f["rpc_last_method"] = json_method or method_http
                 f["rpc_last_path"] = path
                 f["rpc_last_host"] = host
+                f["rpc_last_content_type"] = hdrs.get("content-type")
 
                 self._rl_log(
                     f"[Transport][🧵 TCP][🪙 Monero][RPC] ▶REQ {method_http} {path or ''} "
-                    f"host={host or '-'} json_method={json_method or '-'} body={len(body)}B"
+                    f"host={host or '-'} json_method={json_method or '-'} "
+                    f"ctype={hdrs.get('content-type') or '-'} body={len(body)}B"
                 )
 
-                meth = (json_method or "").lower()
-                if meth in {"get_block_template", "get_miner_data", "submit_block"}:
+                self._log_rpc_semantic(f, "req", hdrs, body, iface_or_tag)
+
+                meth = str(json_method or "").lower()
+                if meth in {"get_block_template", "get_miner_data", "submit_block", "get_last_block_header", "get_block_header_by_hash"}:
                     self._log_mining_message(
                         f,
                         f"RPC {meth} request observed on {iface_or_tag} "
@@ -7264,11 +7469,16 @@ class TransportMoneroManager:
                 status = self._extract_status_from_start(start)
                 jhint = "json" if self._looks_like_json(body) else "-"
                 f["rpc_last_status"] = status
+                f["rpc_last_content_type"] = hdrs.get("content-type")
+                f["rpc_last_server"] = hdrs.get("server")
 
                 self._rl_log(
                     f"[Transport][🧵 TCP][🪙 Monero][RPC] ◀RSP status={status or '?'} "
+                    f"ctype={hdrs.get('content-type') or '-'} server={hdrs.get('server') or '-'} "
                     f"body={len(body)}B type={jhint}"
                 )
+
+                self._log_rpc_semantic(f, "rsp", hdrs, body, iface_or_tag)
 
                 if f.get("rpc_last_method") in {"get_block_template", "get_miner_data"} and status == "200":
                     self._log_mining_message(
@@ -7291,7 +7501,6 @@ class TransportMoneroManager:
             frames = f["p2p_parser"].feed(payload)
             is_p2pool = self._is_p2pool_flow(f)
 
-            # 1) Levin-decoded path
             if frames:
                 burst = 0
                 a, b = f["endpoints"]
@@ -7333,32 +7542,55 @@ class TransportMoneroManager:
                     f["levin_last_name"] = name
                     burst += 1
 
+                    self._log_monero_p2p_semantic(
+                        f=f,
+                        m=m,
+                        iface=iface,
+                        direction=direction or f.get("last_dir"),
+                        name=name,
+                        flags_txt=flags_txt,
+                    )
+
                     if is_p2pool:
                         label = self._p2pool_label_from_levin(m)
+                        raw_detail = name
+                        raw_meta = {}
+
+                        if label == "unknown" and m.payload:
+                            raw_label, raw_detail, raw_meta = self._classify_p2pool_payload_richer(
+                                f, m.payload, direction or f.get("last_dir")
+                            )
+                            if raw_label != "unknown":
+                                label = raw_label
+
                         self._log_p2pool_levin_event(
                             f=f,
                             m=m,
                             label=label,
-                            name=name,
+                            name=raw_detail,
                             flags_txt=flags_txt,
                             preview=preview,
                             iface=iface,
                         )
+
+                        meta = {
+                            "flags": flags_txt,
+                            "pv": m.pv,
+                            "ret": m.ret,
+                            "cmd": m.cmd,
+                            "preview": preview,
+                            "direction": direction or f.get("last_dir"),
+                        }
+                        meta.update(raw_meta)
+
                         self._pm_dispatch(
                             label,
                             flow=f,
                             iface=iface,
                             source="levin",
                             payload_len=m.cb,
-                            detail=name,
-                            meta={
-                                "flags": flags_txt,
-                                "pv": m.pv,
-                                "ret": m.ret,
-                                "cmd": m.cmd,
-                                "preview": preview,
-                                "direction": direction or f.get("last_dir"),
-                            },
+                            detail=raw_detail,
+                            meta=meta,
                             levin_msg=m,
                         )
 
@@ -7366,7 +7598,6 @@ class TransportMoneroManager:
                     self._maybe_log_mining_from_monero_levin(f, m, iface)
                 return
 
-            # 2) Non-Levin P2Pool classifier path
             if is_p2pool:
                 self._p2pool_feed_non_levin_and_log(f, payload, iface, direction)
 
@@ -7404,9 +7635,13 @@ class TransportMoneroManager:
         iface: str,
     ) -> None:
         a, b = f["endpoints"]
+        dir_txt = f.get("p2pool_last_direction") or f.get("last_dir") or "?"
+        payload_hint = self._summarize_monero_levin_payload(m)
+
         self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} {m.kind()} name={name} flags={flags_txt} "
-            f"ret={m.ret} pv={m.pv} len={m.cb} preview={preview} "
+            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} {m.kind()} "
+            f"name={name} flags={flags_txt} dir={dir_txt} ret={m.ret} pv={m.pv} "
+            f"len={m.cb} preview={preview} {payload_hint} "
             f"{a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
         )
 
@@ -7549,7 +7784,6 @@ class TransportMoneroManager:
         meta["entropy"] = ent
         meta["ascii_ratio"] = ascii_ratio
 
-        # Levin signature found but parser did not yield full frame yet.
         if len(payload) >= 8:
             try:
                 if struct.unpack_from("<Q", payload, 0)[0] == self._LEVIN_SIG:
@@ -7557,14 +7791,11 @@ class TransportMoneroManager:
             except Exception:
                 pass
 
-        # Compact peer candidates from repeated IPv4-mapped IPv6 tuples.
         peers = self._extract_compact_peer_candidates(payload)
         if peers:
             meta["peers"] = peers
-            if len(peers) >= 2:
-                return "peerlist", f"compact_peer_tuples={len(peers)}", meta
+            return "peerlist", f"compact_peer_tuples={len(peers)}", meta
 
-        # Small binary very early in a new P2Pool flow looks like open/handshake.
         if (
             n <= self.P2POOL_SMALL_OPEN_MAX
             and f.get("pkts", 0) <= 4
@@ -7573,7 +7804,6 @@ class TransportMoneroManager:
         ):
             return "handshake", f"small_open_binary len={n}", meta
 
-        # Medium binary after session establishment becomes share/sync-ish.
         if (
             self.P2POOL_SHARE_MIN <= n < self.P2POOL_BLOCK_MIN
             and (
@@ -7583,11 +7813,13 @@ class TransportMoneroManager:
             )
             and ascii_ratio < 0.60
         ):
-            if direction == "b2a":
-                return "share", f"relay_candidate len={n}", meta
-            return "chain", f"sync_candidate len={n}", meta
+            share_dir = self._p2pool_share_direction(f)
+            if share_dir:
+                if direction == share_dir:
+                    return "share", f"relay_candidate len={n}", meta
+                return "chain", f"sync_candidate len={n}", meta
+            return "share", f"mid_binary_post_open len={n}", meta
 
-        # Large binary after session establishment becomes block-ish.
         if (
             n >= self.P2POOL_BLOCK_MIN
             and (
@@ -7812,7 +8044,7 @@ class TransportMoneroManager:
                 "rtt_hint_ms": None,
             }
             rt["peer_cache"][peer_key] = p
-        p["last_seen"] = _tm_now()
+        p["last_seen"] = time.time()
         p["iface"] = iface
         return p
 
@@ -7821,7 +8053,7 @@ class TransportMoneroManager:
         rt["counts"][kind] += 1
         rt["recent_events"].append(
             {
-                "ts": _tm_now(),
+                "ts": time.time(),
                 "kind": kind,
                 "peer": peer,
                 "detail": detail,
@@ -7831,7 +8063,7 @@ class TransportMoneroManager:
     def _pm_on_flow_close(self, *, flow: dict, iface: str, reason: str) -> None:
         p = self._pm_touch_peer(flow, iface)
         p["alive"] = False
-        p["last_close_ts"] = _tm_now()
+        p["last_close_ts"] = time.time()
         p["last_close_reason"] = reason
         p["events"]["close"] += 1
         p["score"] -= 1.5
@@ -7842,7 +8074,7 @@ class TransportMoneroManager:
         p = self._pm_touch_peer(flow, iface)
         p["alive"] = True
         p["events"]["handshake"] += 1
-        p["last_handshake_ts"] = _tm_now()
+        p["last_handshake_ts"] = time.time()
         p["score"] += 2.0
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 2.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 1.0)
@@ -7852,9 +8084,9 @@ class TransportMoneroManager:
         rt = self.p2pool_mining_runtime
         p = self._pm_touch_peer(flow, iface)
         p["events"]["timed_sync"] += 1
-        p["last_sync_ts"] = _tm_now()
+        p["last_sync_ts"] = time.time()
         p["score"] += 1.5
-        rt["last_sync_ts"] = _tm_now()
+        rt["last_sync_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 3.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 2.0)
         self._pm_event("timed_sync", p["peer"], detail)
@@ -7863,16 +8095,16 @@ class TransportMoneroManager:
         rt = self.p2pool_mining_runtime
         p = self._pm_touch_peer(flow, iface)
         p["events"]["peerlist"] += 1
-        p["last_peerlist_ts"] = _tm_now()
+        p["last_peerlist_ts"] = time.time()
         p["score"] += 2.5
-        rt["last_peerlist_ts"] = _tm_now()
+        rt["last_peerlist_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 4.0)
 
         peers = meta.get("peers") or []
         for one in peers[:64]:
             key = f"{one[0]}:{one[1]}"
             rt["peer_candidates"][key] = {
-                "discovered_ts": _tm_now(),
+                "discovered_ts": time.time(),
                 "via": p["peer"],
                 "iface": iface,
             }
@@ -7883,9 +8115,9 @@ class TransportMoneroManager:
         rt = self.p2pool_mining_runtime
         p = self._pm_touch_peer(flow, iface)
         p["events"]["share"] += 1
-        p["last_share_ts"] = _tm_now()
+        p["last_share_ts"] = time.time()
         p["score"] += 3.0
-        rt["last_share_ts"] = _tm_now()
+        rt["last_share_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 5.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 3.0)
         self._pm_event("share", p["peer"], detail)
@@ -7894,9 +8126,9 @@ class TransportMoneroManager:
         rt = self.p2pool_mining_runtime
         p = self._pm_touch_peer(flow, iface)
         p["events"]["chain"] += 1
-        p["last_sync_ts"] = _tm_now()
+        p["last_sync_ts"] = time.time()
         p["score"] += 1.0
-        rt["last_sync_ts"] = _tm_now()
+        rt["last_sync_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 2.0)
         self._pm_event("chain", p["peer"], detail)
 
@@ -7912,9 +8144,9 @@ class TransportMoneroManager:
         rt = self.p2pool_mining_runtime
         p = self._pm_touch_peer(flow, iface)
         p["events"]["block"] += 1
-        p["last_block_ts"] = _tm_now()
+        p["last_block_ts"] = time.time()
         p["score"] += 6.0
-        rt["last_block_ts"] = _tm_now()
+        rt["last_block_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 8.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 5.0)
         self._pm_event("block", p["peer"], detail)
