@@ -11,21 +11,24 @@ import re
 import ssl
 import subprocess
 import tempfile
+import traceback
 import uuid
 import zlib
-from collections import defaultdict, deque, OrderedDict
+from collections import defaultdict, deque, OrderedDict, Counter
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from functools import reduce
-from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set, Iterable
+from typing import Optional, List, Any, Dict, Tuple, Literal, Callable, Set, Iterable, Deque
 import ipaddress
 import time
 from urllib.parse import urlparse
+from wsgiref.simple_server import make_server, WSGIRequestHandler
 
 import psutil
 import requests
 import select
 import zmq
+from flask import Flask, render_template_string, Response, jsonify, request
 from scapy.arch import get_windows_if_list
 from scapy.arch import get_if_hwaddr
 from scapy.config import conf
@@ -21988,5 +21991,2241 @@ class HyperVRouterManager:
         except Exception:
             pass
 
+
+
+@dataclass
+class PacketRecord:
+    id: int
+    ts: float
+    ts_ns: int
+    kind: str = "packet"
+    source: str = "router"
+
+    iface: Optional[str] = None
+    component: Optional[str] = None
+    phase: Optional[str] = None
+    direction: Optional[str] = None
+
+    topic: str = "unknown"
+    proto: str = "unknown"
+    l3: str = "unknown"
+    l4: str = "unknown"
+
+    src_ip: Optional[str] = None
+    dst_ip: Optional[str] = None
+    src_mac: Optional[str] = None
+    dst_mac: Optional[str] = None
+
+    sport: Optional[int] = None
+    dport: Optional[int] = None
+    flags: Optional[str] = None
+
+    wire_len: int = 0
+    captured_len: int = 0
+    capture_quality: str = "unknown"
+    has_raw: bool = False
+
+    summary: str = ""
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "ts": self.ts,
+            "ts_ns": self.ts_ns,
+            "kind": self.kind,
+            "source": self.source,
+            "iface": self.iface,
+            "component": self.component,
+            "phase": self.phase,
+            "direction": self.direction,
+            "topic": self.topic,
+            "proto": self.proto,
+            "l3": self.l3,
+            "l4": self.l4,
+            "src_ip": self.src_ip,
+            "dst_ip": self.dst_ip,
+            "src_mac": self.src_mac,
+            "dst_mac": self.dst_mac,
+            "sport": self.sport,
+            "dport": self.dport,
+            "flags": self.flags,
+            "wire_len": self.wire_len,
+            "captured_len": self.captured_len,
+            "capture_quality": self.capture_quality,
+            "has_raw": self.has_raw,
+            "summary": self.summary,
+            "extra": self.extra,
+        }
+
+
+@dataclass
+class LogRecord:
+    id: int
+    ts: float
+    ts_ns: int
+    kind: str = "log"
+    source: str = "router"
+    level: str = "info"
+    message: str = ""
+    prefix: str = "General"
+    prefix_chain: List[str] = field(default_factory=list)
+    repeat_count: int = 1
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "ts": self.ts,
+            "ts_ns": self.ts_ns,
+            "kind": self.kind,
+            "source": self.source,
+            "level": self.level,
+            "message": self.message,
+            "prefix": self.prefix,
+            "prefix_chain": list(self.prefix_chain),
+            "repeat_count": self.repeat_count,
+            "extra": self.extra,
+        }
+
+
+@dataclass
+class _FlowRecord:
+    key: str
+    first_seen: float
+    last_seen: float
+    packets: int = 0
+    bytes_seen: int = 0
+    topic_counts: Counter = field(default_factory=Counter)
+    proto_counts: Counter = field(default_factory=Counter)
+    iface_counts: Counter = field(default_factory=Counter)
+    component_counts: Counter = field(default_factory=Counter)
+    phase_counts: Counter = field(default_factory=Counter)
+    direction_counts: Counter = field(default_factory=Counter)
+
+    def touch(self, rec: Dict[str, Any]) -> None:
+        self.last_seen = float(rec.get("ts") or time.time())
+        self.packets += 1
+        self.bytes_seen += int(rec.get("wire_len") or 0)
+        for name, store in (
+            (str(rec.get("topic") or "unknown"), self.topic_counts),
+            (str(rec.get("proto") or "unknown"), self.proto_counts),
+            (str(rec.get("iface") or ""), self.iface_counts),
+            (str(rec.get("component") or ""), self.component_counts),
+            (str(rec.get("phase") or ""), self.phase_counts),
+            (str(rec.get("direction") or ""), self.direction_counts),
+        ):
+            if name:
+                store[name] += 1
+
+    def as_dict(self) -> Dict[str, Any]:
+        def top(counter: Counter, n: int = 4) -> List[Dict[str, Any]]:
+            return [{"key": k, "count": v} for k, v in counter.most_common(n)]
+
+        return {
+            "key": self.key,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "packets": self.packets,
+            "bytes_seen": self.bytes_seen,
+            "topics": top(self.topic_counts, 5),
+            "protos": top(self.proto_counts, 3),
+            "ifaces": top(self.iface_counts, 3),
+            "components": top(self.component_counts, 3),
+            "phases": top(self.phase_counts, 3),
+            "directions": top(self.direction_counts, 3),
+        }
+
+
+class QuietWSGIRequestHandler(WSGIRequestHandler):
+    """Silence default request/access logging from wsgiref."""
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+class _FlaskServerThread(threading.Thread):
+    def __init__(self, app: Flask, host: str, port: int) -> None:
+        super().__init__(daemon=True, name="PythonServerManager-Flask")
+        self._server = make_server(host, port, app, handler_class=QuietWSGIRequestHandler)
+        self._ctx = app.app_context()
+        self._ctx.push()
+
+    def run(self) -> None:
+        self._server.serve_forever()
+
+    def shutdown(self) -> None:
+        try:
+            self._server.shutdown()
+        except Exception:
+            pass
+
+
+class PythonServerManager:
+    """
+    Rewritten Flask server + dashboard focused on log scale and usability.
+
+    Highlights
+    ----------
+    - silences wsgiref access logs
+    - stores logs globally and per-prefix for prefix-focused history
+    - optional colored log rendering in dashboard
+    - router snapshot rendered as cards instead of raw JSON only
+    - per-prefix cursors and local cache friendly API payloads
+    - keeps the main public entrypoints from the older manager
+    """
+
+    SPECIAL_PORT_TOPICS: Dict[int, str] = {
+        20: "ftp", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+        67: "dhcp", 68: "dhcp", 69: "tftp", 80: "http", 110: "pop3", 123: "ntp",
+        143: "imap", 161: "snmp", 389: "ldap", 443: "https", 500: "isakmp",
+        514: "syslog", 993: "imap", 995: "pop3", 1433: "mssql", 1521: "oracle",
+        1900: "ssdp", 3306: "mysql", 3389: "rdp", 5353: "mdns", 5432: "postgres",
+        8080: "http", 8443: "https", 1812: "radius", 1813: "radius", 3333: "stratum",
+        4444: "stratum", 5555: "stratum", 7777: "stratum", 37888: "p2pool", 37889: "p2pool",
+        18080: "monero", 18081: "monero", 18083: "monero",
+    }
+
+    IMPORTANT_TOPICS: Set[str] = {
+        "arp", "ndp", "dhcp", "dns", "icmp", "icmpv6", "tls", "stratum",
+        "p2pool", "monero", "http", "https", "mdns", "ssdp",
+    }
+
+    PREFIX_RE = re.compile(r"\[([^\[\]]+)\]")
+    SAFE_JS_INT_MAX = 9_000_000_000_000_000
+    ID_REBASE_WATERMARK = 8_000_000_000_000_000
+
+    def __init__(
+        self,
+        router: Any = None,
+        router_logger: Any = None,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8844,
+        dashboard_title: str = "Python Router Dashboard",
+        max_packets: int = 4000,
+        max_logs: int = 12000,
+        max_events: int = 16000,
+        packet_window_sec: float = 60.0,
+        store_raw_packets: bool = True,
+        max_raw_packet_bytes: int = 0,
+        raw_hex_preview_bytes: int = 64,
+        max_logs_per_prefix: int = 25000,
+        max_prefix_buckets: int = 1024,
+    ) -> None:
+        self.router = router
+        self.router_logger = router_logger or getattr(router, "router_logger", None)
+
+        self.host = str(host)
+        self.port = int(port)
+        self.dashboard_title = str(dashboard_title)
+        self.max_packets = max(100, int(max_packets))
+        self.max_logs = max(100, int(max_logs))
+        self.max_events = max(200, int(max_events))
+        self.max_logs_per_prefix = max(500, int(max_logs_per_prefix))
+        self.max_prefix_buckets = max(64, int(max_prefix_buckets))
+        self.packet_window_sec = max(5.0, float(packet_window_sec))
+        self.store_raw_packets = bool(store_raw_packets)
+        self.max_raw_packet_bytes = int(max_raw_packet_bytes)
+        self.raw_hex_preview_bytes = max(8, int(raw_hex_preview_bytes))
+
+        self.started_at = time.time()
+        self._app: Optional[Flask] = None
+        self._server_thread: Optional[_FlaskServerThread] = None
+        self._stop_event = threading.Event()
+
+        self._lock = threading.RLock()
+        self._event_cv = threading.Condition(self._lock)
+
+        self._next_packet_id = 1
+        self._next_log_id = 1
+        self._next_event_id = 1
+        self._id_epoch = 1
+        self._id_rebase_runs = 0
+
+        self._packets: Deque[Dict[str, Any]] = deque(maxlen=self.max_packets)
+        self._logs: Deque[Dict[str, Any]] = deque(maxlen=self.max_logs)
+        self._logs_by_prefix: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=self.max_logs_per_prefix)
+        )
+        self._prefix_last_seen: Dict[str, float] = {}
+        self._events: Deque[Dict[str, Any]] = deque(maxlen=self.max_events)
+        self._rate_window: Deque[Tuple[float, int]] = deque(maxlen=max(self.max_packets * 8, 2000))
+
+        self._raw_packets: Dict[int, Tuple[bytes, float]] = {}
+        self._raw_packet_order: Deque[int] = deque(maxlen=max(self.max_packets * 2, 512))
+        self._raw_packet_total_bytes = 0
+        self._raw_packet_count_limit = max(64, min(self.max_packets, 512))
+        if self.max_raw_packet_bytes > 0:
+            self._raw_packet_budget_bytes = max(
+                self.max_raw_packet_bytes * min(self._raw_packet_count_limit, 64),
+                self.max_raw_packet_bytes,
+            )
+        else:
+            self._raw_packet_budget_bytes = 256 * 1024 * 1024
+
+        self._flows: Dict[str, _FlowRecord] = {}
+        self._wrapped_methods: Dict[Tuple[int, str], Callable[..., Any]] = {}
+
+        self._last_housekeeping_at = 0.0
+        self._housekeeping_interval_sec = 1.0
+        self._packet_record_ttl_sec = max(120.0, self.packet_window_sec * 5.0)
+        self._log_record_ttl_sec = max(3600.0, self.packet_window_sec * 60.0)
+        self._event_ttl_sec = max(300.0, self.packet_window_sec * 10.0)
+        self._raw_packet_ttl_sec = max(45.0, min(300.0, self.packet_window_sec * 2.0))
+        self._flow_idle_ttl_sec = max(600.0, self.packet_window_sec * 20.0)
+
+        self._recent_log_dupes: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._log_coalesce_window_sec = 2.0
+
+        self._packet_counters = {
+            "total_packets": 0,
+            "total_bytes": 0,
+            "kept_packet_records": 0,
+            "sampled_out_packets": 0,
+            "dropped_raw_packets": 0,
+            "dropped_raw_bytes": 0,
+            "raw_packet_count": 0,
+            "raw_packet_bytes": 0,
+            "by_topic": Counter(),
+            "by_proto": Counter(),
+            "by_l3": Counter(),
+            "by_l4": Counter(),
+            "by_iface": Counter(),
+            "by_phase": Counter(),
+            "by_component": Counter(),
+            "by_direction": Counter(),
+            "by_src_ip": Counter(),
+            "by_dst_ip": Counter(),
+            "by_port": Counter(),
+            "by_flow": Counter(),
+            "by_source": Counter(),
+            "by_capture_quality": Counter(),
+        }
+        self._log_counters = {
+            "total_logs": 0,
+            "coalesced_logs": 0,
+            "by_level": Counter(),
+            "by_source": Counter(),
+        }
+
+    # ---------------------------------------------------------------
+    # lifecycle
+    # ---------------------------------------------------------------
+
+    def start(self) -> None:
+        with self._lock:
+            if self._server_thread is not None:
+                return
+            self._stop_event.clear()
+            self._app = self._create_flask_app()
+            self._server_thread = _FlaskServerThread(self._app, self.host, self.port)
+            self._server_thread.start()
+        self.display_log(
+            f"[PythonServer] Flask server started at http://{self.host}:{self.port}",
+            source="PythonServer",
+            level="info",
+        )
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_event.set()
+            if self._server_thread is not None:
+                try:
+                    self._server_thread.shutdown()
+                finally:
+                    self._server_thread = None
+        self.display_log("[PythonServer] Flask server stopped.", source="PythonServer", level="info")
+
+    # ---------------------------------------------------------------
+    # logs
+    # ---------------------------------------------------------------
+
+    def display_log(
+        self,
+        message: Any,
+        *,
+        source: str = "router",
+        level: str = "info",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        msg = self._stringify_message(message)
+        src = str(source or "router")
+        lvl = str(level or "info").lower()
+        prefixes = self._extract_prefix_chain(msg)
+        primary_prefix = prefixes[0] if prefixes else src or "General"
+        ex = dict(extra or {})
+        full_prefix = " › ".join(prefixes) if prefixes else primary_prefix
+        ex.setdefault("full_prefix", full_prefix)
+
+        with self._event_cv:
+            self._run_housekeeping_locked(now)
+            dupe_key = (src, lvl, msg)
+            dupe = self._recent_log_dupes.get(dupe_key)
+            if dupe is not None and (now - float(dupe.get("ts") or 0.0)) <= self._log_coalesce_window_sec:
+                dupe["repeat_count"] = int(dupe.get("repeat_count") or 1) + 1
+                dupe["ts"] = now
+                dupe["ts_ns"] = time.time_ns()
+                self._log_counters["total_logs"] += 1
+                self._log_counters["coalesced_logs"] += 1
+                self._log_counters["by_level"][lvl] += 1
+                self._log_counters["by_source"][src] += 1
+                self._prefix_last_seen[primary_prefix] = now
+                self._event_cv.notify_all()
+                return dupe
+
+            rec = LogRecord(
+                id=self._reserve_log_id(),
+                ts=now,
+                ts_ns=time.time_ns(),
+                source=src,
+                level=lvl,
+                message=msg,
+                prefix=primary_prefix,
+                prefix_chain=prefixes,
+                extra=ex,
+            ).as_dict()
+
+            self._logs.append(rec)
+            self._logs_by_prefix[primary_prefix].append(rec)
+            self._prefix_last_seen[primary_prefix] = now
+            self._trim_prefix_buckets_locked(now)
+            self._recent_log_dupes[dupe_key] = rec
+            self._push_event_locked(rec)
+            self._log_counters["total_logs"] += 1
+            self._log_counters["by_level"][lvl] += 1
+            self._log_counters["by_source"][src] += 1
+            self._event_cv.notify_all()
+            return rec
+
+    def wrap_log_call(
+        self,
+        fn: Callable[..., Any],
+        *,
+        source: str = "router",
+        level: str = "info",
+        message_getter: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], Any, Optional[BaseException]], str]] = None,
+        extra_getter: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], Any, Optional[BaseException]], Dict[str, Any]]] = None,
+    ) -> Callable[..., Any]:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result: Any = None
+            error: Optional[BaseException] = None
+            try:
+                result = fn(*args, **kwargs)
+                return result
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                try:
+                    message = (
+                        message_getter(args, kwargs, result, error)
+                        if message_getter is not None
+                        else self._default_log_message_from_call(args, kwargs, result, error)
+                    )
+                    extra = (
+                        extra_getter(args, kwargs, result, error)
+                        if extra_getter is not None
+                        else {}
+                    )
+                    if error is not None:
+                        extra = dict(extra or {})
+                        extra["wrapped_exception"] = f"{type(error).__name__}: {error}"
+                    self.display_log(message, source=source, level=level if error is None else "error", extra=extra)
+                except Exception:
+                    pass
+
+        return wrapped
+
+    def wrap_logger_method(
+        self,
+        logger_obj: Any,
+        method_name: str = "log_message",
+        *,
+        source: str = "router",
+        level: str = "info",
+        message_getter: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], Any, Optional[BaseException]], str]] = None,
+        extra_getter: Optional[Callable[[Tuple[Any, ...], Dict[str, Any], Any, Optional[BaseException]], Dict[str, Any]]] = None,
+    ) -> Callable[..., Any]:
+        if logger_obj is None:
+            raise ValueError("logger_obj cannot be None")
+        original = getattr(logger_obj, method_name)
+        wrapped = self.wrap_log_call(
+            original,
+            source=source,
+            level=level,
+            message_getter=message_getter,
+            extra_getter=extra_getter,
+        )
+        setattr(logger_obj, method_name, wrapped)
+        self._wrapped_methods[(id(logger_obj), method_name)] = original
+        return original
+
+    def unwrap_logger_method(self, logger_obj: Any, method_name: str = "log_message") -> bool:
+        key = (id(logger_obj), method_name)
+        original = self._wrapped_methods.get(key)
+        if original is None:
+            return False
+        setattr(logger_obj, method_name, original)
+        self._wrapped_methods.pop(key, None)
+        return True
+
+    def get_logs(
+        self,
+        *,
+        limit: int = 100,
+        after_id: int = 0,
+        source: Optional[str] = None,
+        level: Optional[str] = None,
+        prefix: Optional[str] = None,
+        sort_by: str = "time_desc",
+        contains: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(5000, int(limit)))
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            if prefix:
+                items = list(self._logs_by_prefix.get(str(prefix), []))
+                if not items:
+                    items = [x for x in self._logs if str(x.get("prefix") or "") == str(prefix)]
+            else:
+                items = list(self._logs)
+
+        contains_l = (contains or "").strip().lower()
+
+        def keep(item: Dict[str, Any]) -> bool:
+            if int(item.get("id") or 0) <= int(after_id):
+                return False
+            if source and str(item.get("source") or "") != str(source):
+                return False
+            if level and str(item.get("level") or "") != str(level).lower():
+                return False
+            if prefix and str(item.get("prefix") or "") != str(prefix):
+                return False
+            if contains_l and contains_l not in str(item.get("message") or "").lower():
+                return False
+            return True
+
+        picked = [x for x in items if keep(x)]
+        if sort_by == "time_asc":
+            picked.sort(key=lambda x: int(x.get("id") or 0))
+        elif sort_by == "prefix":
+            picked.sort(key=lambda x: (str(x.get("prefix") or ""), -int(x.get("id") or 0)))
+        else:
+            picked.sort(key=lambda x: int(x.get("id") or 0), reverse=True)
+        return picked[:limit] if sort_by != "time_asc" else picked[-limit:]
+
+    def get_log_prefixes(self, *, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            rows: List[Dict[str, Any]] = []
+            for prefix, dq in self._logs_by_prefix.items():
+                if not dq:
+                    continue
+                newest_id = int(dq[-1]["id"]) if dq else 0
+                oldest_id = int(dq[0]["id"]) if dq else 0
+                rows.append({
+                    "prefix": prefix,
+                    "count": int(len(dq)),
+                    "oldest_id": oldest_id,
+                    "newest_id": newest_id,
+                    "last_seen": float(self._prefix_last_seen.get(prefix, dq[-1].get("ts") or 0.0)),
+                })
+            rows.sort(key=lambda x: (x["count"], x["last_seen"], x["newest_id"]), reverse=True)
+            return rows[: max(1, int(limit))]
+
+    # ---------------------------------------------------------------
+    # packets
+    # ---------------------------------------------------------------
+
+    def handle_packet(
+        self,
+        packet: Any,
+        *,
+        inbound_iface: Optional[str] = None,
+        component: Optional[str] = None,
+        phase: Optional[str] = None,
+        direction: Optional[str] = None,
+        source: str = "router",
+        raw_bytes: Optional[bytes] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        rec, raw = self._classify_packet(
+            packet,
+            inbound_iface=inbound_iface,
+            component=component,
+            phase=phase,
+            direction=direction,
+            source=source,
+            raw_bytes=raw_bytes,
+            extra=extra,
+        )
+        now = float(rec.get("ts") or time.time())
+
+        with self._event_cv:
+            self._run_housekeeping_locked(now)
+            p = self._packet_counters
+            p["total_packets"] += 1
+            p["total_bytes"] += int(rec.get("wire_len") or 0)
+            p["by_topic"][rec["topic"]] += 1
+            p["by_proto"][rec["proto"]] += 1
+            p["by_l3"][rec["l3"]] += 1
+            p["by_l4"][rec["l4"]] += 1
+            p["by_source"][rec["source"]] += 1
+            p["by_capture_quality"][rec["capture_quality"]] += 1
+            for k, counter_name in (
+                ("iface", "by_iface"),
+                ("phase", "by_phase"),
+                ("component", "by_component"),
+                ("direction", "by_direction"),
+                ("src_ip", "by_src_ip"),
+                ("dst_ip", "by_dst_ip"),
+            ):
+                value = rec.get(k)
+                if value:
+                    p[counter_name][str(value)] += 1
+            if rec.get("sport") is not None:
+                p["by_port"][f"src:{rec['sport']}"] += 1
+            if rec.get("dport") is not None:
+                p["by_port"][f"dst:{rec['dport']}"] += 1
+
+            flow_key = self._flow_key_from_record(rec)
+            p["by_flow"][flow_key] += 1
+            self._touch_flow_locked(flow_key, rec)
+            self._rate_window.append((now, int(rec.get("wire_len") or 0)))
+
+            self._packets.append(rec)
+            p["kept_packet_records"] += 1
+            self._push_event_locked(dict(rec))
+            self._store_raw_packet_locked(rec, raw)
+            self._event_cv.notify_all()
+        return rec
+
+    def get_packets(
+        self,
+        *,
+        limit: int = 100,
+        after_id: int = 0,
+        topic: Optional[str] = None,
+        iface: Optional[str] = None,
+        component: Optional[str] = None,
+        phase: Optional[str] = None,
+        include_raw: bool = False,
+        include_hex_preview: bool = True,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(2000, int(limit)))
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            items = list(self._packets)
+
+        def keep(item: Dict[str, Any]) -> bool:
+            if int(item.get("id") or 0) <= int(after_id):
+                return False
+            if topic and str(item.get("topic") or "") != str(topic):
+                return False
+            if iface and str(item.get("iface") or "") != str(iface):
+                return False
+            if component and str(item.get("component") or "") != str(component):
+                return False
+            if phase and str(item.get("phase") or "") != str(phase):
+                return False
+            return True
+
+        picked = [x for x in items if keep(x)][-limit:]
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for item in picked:
+                raw_entry = self._raw_packets.get(int(item["id"]))
+                raw = raw_entry[0] if raw_entry is not None else None
+                enriched = dict(item)
+                enriched["raw_b64"] = base64.b64encode(raw).decode("ascii") if (include_raw and raw is not None) else None
+                enriched["raw_hex_preview"] = raw[: self.raw_hex_preview_bytes].hex() if (include_hex_preview and raw is not None) else None
+                enriched["raw_url"] = f"/api/packets/raw/{item['id']}" if item.get("has_raw") else None
+                out.append(enriched)
+        return out
+
+    def get_raw_packet(self, packet_id: int) -> Optional[bytes]:
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            entry = self._raw_packets.get(int(packet_id))
+            return None if entry is None else entry[0]
+
+    # ---------------------------------------------------------------
+    # stats / snapshot
+    # ---------------------------------------------------------------
+
+    def get_dashboard_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            self._prune_rate_window_locked()
+            recent_packets = len(self._rate_window)
+            recent_bytes = sum(item[1] for item in self._rate_window)
+            p = self._packet_counters
+            l = self._log_counters
+            oldest_packet_id = int(self._packets[0]["id"]) if self._packets else 0
+            newest_packet_id = int(self._packets[-1]["id"]) if self._packets else 0
+            packet_fill_ratio = len(self._packets) / max(1, self.max_packets)
+            raw_fill_ratio = self._raw_packet_total_bytes / max(1, self._raw_packet_budget_bytes)
+            prefixes = self.get_log_prefixes(limit=100)
+
+            return {
+                "server": {
+                    "host": self.host,
+                    "port": self.port,
+                    "uptime_sec": round(time.time() - self.started_at, 2),
+                    "started_at": self.started_at,
+                    "packet_record_ttl_sec": self._packet_record_ttl_sec,
+                    "log_record_ttl_sec": self._log_record_ttl_sec,
+                    "raw_packet_ttl_sec": self._raw_packet_ttl_sec,
+                    "flow_idle_ttl_sec": self._flow_idle_ttl_sec,
+                    "access_logs_silenced": True,
+                    "id_epoch": self._id_epoch,
+                    "id_rebase_runs": self._id_rebase_runs,
+                    "id_rebase_watermark": self.ID_REBASE_WATERMARK,
+                    "safe_js_int_max": self.SAFE_JS_INT_MAX,
+                    "active_prefix_buckets": len(self._logs_by_prefix),
+                    "max_prefix_buckets": self.max_prefix_buckets,
+                },
+                "packets": {
+                    "total_packets": p["total_packets"],
+                    "total_bytes": p["total_bytes"],
+                    "kept_packet_records": p["kept_packet_records"],
+                    "sampled_out_packets": p["sampled_out_packets"],
+                    "dropped_raw_packets": p["dropped_raw_packets"],
+                    "dropped_raw_bytes": p["dropped_raw_bytes"],
+                    "raw_packet_count": p["raw_packet_count"],
+                    "raw_packet_bytes": p["raw_packet_bytes"],
+                    "packet_ring_fill_ratio": round(packet_fill_ratio, 4),
+                    "raw_store_fill_ratio": round(raw_fill_ratio, 4),
+                    "oldest_available_id": oldest_packet_id,
+                    "newest_available_id": newest_packet_id,
+                    "recent_packets_window_sec": self.packet_window_sec,
+                    "recent_packets": recent_packets,
+                    "recent_bytes": recent_bytes,
+                    "recent_packets_per_sec": round(recent_packets / self.packet_window_sec, 3),
+                    "recent_bytes_per_sec": round(recent_bytes / self.packet_window_sec, 3),
+                    "by_topic": self._counter_to_common(p["by_topic"], 20),
+                    "by_proto": self._counter_to_common(p["by_proto"], 20),
+                    "by_l3": self._counter_to_common(p["by_l3"], 10),
+                    "by_l4": self._counter_to_common(p["by_l4"], 10),
+                    "by_iface": self._counter_to_common(p["by_iface"], 20),
+                    "by_phase": self._counter_to_common(p["by_phase"], 20),
+                    "by_component": self._counter_to_common(p["by_component"], 20),
+                    "by_direction": self._counter_to_common(p["by_direction"], 20),
+                    "by_capture_quality": self._counter_to_common(p["by_capture_quality"], 10),
+                    "top_src_ips": self._counter_to_common(p["by_src_ip"], 15),
+                    "top_dst_ips": self._counter_to_common(p["by_dst_ip"], 15),
+                    "top_ports": self._counter_to_common(p["by_port"], 20),
+                    "top_flows": self._counter_to_common(p["by_flow"], 20),
+                    "by_source": self._counter_to_common(p["by_source"], 10),
+                },
+                "logs": {
+                    "total_logs": l["total_logs"],
+                    "coalesced_logs": l["coalesced_logs"],
+                    "live_log_records": len(self._logs),
+                    "log_ring_fill_ratio": round(len(self._logs) / max(1, self.max_logs), 4),
+                    "live_event_records": len(self._events),
+                    "event_ring_fill_ratio": round(len(self._events) / max(1, self.max_events), 4),
+                    "active_prefix_buckets": len(self._logs_by_prefix),
+                    "max_logs_per_prefix": self.max_logs_per_prefix,
+                    "by_level": self._counter_to_common(l["by_level"], 10),
+                    "by_source": self._counter_to_common(l["by_source"], 20),
+                    "by_prefix": prefixes,
+                },
+                "flows": self._top_flows_snapshot_locked(20),
+                "router": self._router_snapshot(),
+                "code_output": self._code_output_snapshot(),
+            }
+
+    def get_events(self, *, limit: int = 200, after_id: int = 0) -> List[Dict[str, Any]]:
+        limit = max(1, min(4000, int(limit)))
+        with self._lock:
+            self._run_housekeeping_locked(time.time())
+            items = [x for x in self._events if int(x.get("event_id", 0)) > int(after_id)]
+        return items[-limit:]
+
+    # ---------------------------------------------------------------
+    # flask app
+    # ---------------------------------------------------------------
+
+    def _create_flask_app(self) -> Flask:
+        app = Flask(__name__)
+
+        @app.get("/")
+        def dashboard() -> str:
+            return render_template_string(self._dashboard_html())
+
+        @app.get("/api/health")
+        def api_health() -> Response:
+            snap = self.get_dashboard_snapshot()
+            return jsonify({
+                "ok": True,
+                "uptime_sec": snap["server"]["uptime_sec"],
+                "host": self.host,
+                "port": self.port,
+                "packet_ring_fill_ratio": snap["packets"]["packet_ring_fill_ratio"],
+                "raw_store_fill_ratio": snap["packets"]["raw_store_fill_ratio"],
+                "access_logs_silenced": True,
+            })
+
+        @app.get("/api/stats")
+        def api_stats() -> Response:
+            return jsonify(self.get_dashboard_snapshot())
+
+        @app.get("/api/log-prefixes")
+        def api_log_prefixes() -> Response:
+            return jsonify({"items": self.get_log_prefixes(limit=self._int_arg("limit", 200, 1, 1000))})
+
+        @app.get("/api/logs")
+        def api_logs() -> Response:
+            prefix = request.args.get("prefix") or None
+            items = self.get_logs(
+                limit=self._int_arg("limit", 200, 1, 5000),
+                after_id=self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX),
+                source=request.args.get("source"),
+                level=request.args.get("level"),
+                prefix=prefix,
+                sort_by=request.args.get("sort_by") or "time_desc",
+                contains=request.args.get("contains"),
+            )
+            with self._lock:
+                bucket = self._logs_by_prefix.get(prefix) if prefix else self._logs
+                oldest_id = int(bucket[0]["id"]) if bucket else 0
+                newest_id = int(bucket[-1]["id"]) if bucket else 0
+            return jsonify({
+                "items": items,
+                "prefix": prefix,
+                "oldest_available_id": oldest_id,
+                "newest_available_id": newest_id,
+                "available_prefixes": self.get_log_prefixes(limit=200),
+                "id_epoch": self._id_epoch,
+            })
+
+        @app.get("/api/packets")
+        def api_packets() -> Response:
+            include_raw = self._bool_arg("include_raw", False)
+            include_hex_preview = self._bool_arg("include_hex_preview", True)
+            after_id = self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX)
+            items = self.get_packets(
+                limit=self._int_arg("limit", 100, 1, 2000),
+                after_id=after_id,
+                topic=request.args.get("topic"),
+                iface=request.args.get("iface"),
+                component=request.args.get("component"),
+                phase=request.args.get("phase"),
+                include_raw=include_raw,
+                include_hex_preview=include_hex_preview,
+            )
+            with self._lock:
+                oldest_available_id = int(self._packets[0]["id"]) if self._packets else 0
+                newest_available_id = int(self._packets[-1]["id"]) if self._packets else 0
+            cursor_reset = bool(after_id and oldest_available_id and after_id < oldest_available_id and not items)
+            return jsonify({
+                "items": items,
+                "cursor_reset": cursor_reset,
+                "oldest_available_id": oldest_available_id,
+                "newest_available_id": newest_available_id,
+            })
+
+        @app.get("/api/packets/raw/<int:packet_id>")
+        def api_packet_raw(packet_id: int) -> Response:
+            raw = self.get_raw_packet(packet_id)
+            if raw is None:
+                return Response("packet not found", status=404, mimetype="text/plain")
+            return Response(raw, mimetype="application/octet-stream")
+
+        @app.get("/api/events")
+        def api_events() -> Response:
+            return jsonify({
+                "items": self.get_events(
+                    limit=self._int_arg("limit", 200, 1, 4000),
+                    after_id=self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX),
+                )
+            })
+
+        @app.get("/api/events/stream")
+        def api_events_stream() -> Response:
+            def generate() -> Iterable[str]:
+                last_id = self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX)
+                heartbeat_sec = 10.0
+                last_beat = time.time()
+                while not self._stop_event.is_set():
+                    with self._event_cv:
+                        items = [x for x in self._events if int(x.get("event_id", 0)) > int(last_id)]
+                        if not items:
+                            self._event_cv.wait(timeout=1.0)
+                            items = [x for x in self._events if int(x.get("event_id", 0)) > int(last_id)]
+                    if items:
+                        for item in items:
+                            last_id = max(last_id, int(item.get("event_id", 0)))
+                            yield f"data: {json.dumps(item, separators=(',', ':'))}\n\n"
+                        last_beat = time.time()
+                    elif (time.time() - last_beat) >= heartbeat_sec:
+                        yield ": keepalive\n\n"
+                        last_beat = time.time()
+            return Response(generate(), mimetype="text/event-stream")
+
+        @app.post("/api/test/log")
+        def api_test_log() -> Response:
+            payload = request.get_json(silent=True) or {}
+            item = self.display_log(
+                payload.get("message") or "[PythonServer] test log",
+                source=payload.get("source") or "api",
+                level=payload.get("level") or "info",
+            )
+            return jsonify({"ok": True, "item": item})
+
+        return app
+
+    # ---------------------------------------------------------------
+    # packet classification
+    # ---------------------------------------------------------------
+
+    def _classify_packet(
+        self,
+        packet: Any,
+        *,
+        inbound_iface: Optional[str],
+        component: Optional[str],
+        phase: Optional[str],
+        direction: Optional[str],
+        source: str,
+        raw_bytes: Optional[bytes],
+        extra: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Optional[bytes]]:
+        pkt_id = self._reserve_packet_id()
+        now = time.time()
+
+        if isinstance(packet, dict):
+            raw = bytes(raw_bytes) if raw_bytes is not None else None
+            src_ip = packet.get("src_ip") or packet.get("src")
+            dst_ip = packet.get("dst_ip") or packet.get("dst")
+            sport = self._safe_int(packet.get("sport") or packet.get("src_port"))
+            dport = self._safe_int(packet.get("dport") or packet.get("dst_port"))
+            proto = str(packet.get("proto") or packet.get("protocol") or "unknown").lower()
+            rec = PacketRecord(
+                id=pkt_id,
+                ts=now,
+                ts_ns=time.time_ns(),
+                source=str(source or "router"),
+                iface=inbound_iface or packet.get("iface"),
+                component=component or packet.get("component"),
+                phase=phase or packet.get("phase"),
+                direction=direction or packet.get("direction"),
+                topic=str(packet.get("topic") or self._infer_topic_from_ports_and_proto(sport, dport, proto)),
+                proto=proto,
+                l3=str(packet.get("l3") or "unknown").lower(),
+                l4=str(packet.get("l4") or ("tcp" if proto == "tcp" else "udp" if proto == "udp" else "unknown")).lower(),
+                src_ip=str(src_ip) if src_ip is not None else None,
+                dst_ip=str(dst_ip) if dst_ip is not None else None,
+                src_mac=packet.get("src_mac"),
+                dst_mac=packet.get("dst_mac"),
+                sport=sport,
+                dport=dport,
+                flags=str(packet.get("flags")) if packet.get("flags") is not None else None,
+                wire_len=self._safe_int(packet.get("wire_len")) or (len(raw) if raw else 0),
+                captured_len=self._safe_int(packet.get("captured_len")) or (len(raw) if raw else 0),
+                capture_quality="native_raw" if raw else "mapping",
+                has_raw=bool(raw),
+                summary=str(packet.get("summary") or f"{proto} {src_ip}:{sport} -> {dst_ip}:{dport}"),
+                extra=dict(extra or {}),
+            )
+            return rec.as_dict(), raw
+
+        parsed_pkt, raw, quality = self._coerce_packet(packet, raw_bytes=raw_bytes)
+        if parsed_pkt is None:
+            rec = PacketRecord(
+                id=pkt_id,
+                ts=now,
+                ts_ns=time.time_ns(),
+                source=str(source or "router"),
+                iface=inbound_iface,
+                component=component,
+                phase=phase,
+                direction=direction,
+                topic=self._infer_topic_from_unknown(packet, raw),
+                proto=type(packet).__name__.lower(),
+                wire_len=len(raw) if raw else self._approx_len(packet),
+                captured_len=len(raw) if raw else self._approx_len(packet),
+                capture_quality=quality,
+                has_raw=bool(raw),
+                summary=self._summary_of_unknown(packet, raw),
+                extra=dict(extra or {}),
+            )
+            return rec.as_dict(), raw
+
+        rec = PacketRecord(
+            id=pkt_id,
+            ts=now,
+            ts_ns=time.time_ns(),
+            source=str(source or "router"),
+            iface=inbound_iface,
+            component=component,
+            phase=phase,
+            direction=direction,
+            wire_len=len(raw or b""),
+            captured_len=len(raw or b""),
+            capture_quality=quality,
+            has_raw=bool(raw),
+            summary=self._safe_summary(parsed_pkt),
+            extra=dict(extra or {}),
+        )
+        try:
+            if hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(Ether):
+                eth = parsed_pkt[Ether]
+                rec.src_mac = getattr(eth, "src", None)
+                rec.dst_mac = getattr(eth, "dst", None)
+            if hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(ARP):
+                arp = parsed_pkt[ARP]
+                rec.topic = "arp"
+                rec.proto = "arp"
+                rec.l3 = "arp"
+                rec.l4 = "none"
+                rec.src_ip = getattr(arp, "psrc", None)
+                rec.dst_ip = getattr(arp, "pdst", None)
+                return rec.as_dict(), raw
+            if hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(IP):
+                ip = parsed_pkt[IP]
+                rec.l3 = "ipv4"
+                rec.src_ip = getattr(ip, "src", None)
+                rec.dst_ip = getattr(ip, "dst", None)
+            elif hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(IPv6):
+                ip6 = parsed_pkt[IPv6]
+                rec.l3 = "ipv6"
+                rec.src_ip = getattr(ip6, "src", None)
+                rec.dst_ip = getattr(ip6, "dst", None)
+
+            if hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(TCP):
+                tcp = parsed_pkt[TCP]
+                rec.l4 = "tcp"
+                rec.proto = "tcp"
+                rec.sport = self._safe_int(getattr(tcp, "sport", None))
+                rec.dport = self._safe_int(getattr(tcp, "dport", None))
+                try:
+                    rec.flags = str(tcp.flags)
+                except Exception:
+                    rec.flags = None
+            elif hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(UDP):
+                udp = parsed_pkt[UDP]
+                rec.l4 = "udp"
+                rec.proto = "udp"
+                rec.sport = self._safe_int(getattr(udp, "sport", None))
+                rec.dport = self._safe_int(getattr(udp, "dport", None))
+            elif hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(ICMP):
+                rec.l4 = "icmp"
+                rec.proto = "icmp"
+                rec.topic = "icmp"
+            elif hasattr(parsed_pkt, "haslayer") and (
+                parsed_pkt.haslayer(ICMPv6EchoRequest) or
+                parsed_pkt.haslayer(ICMPv6EchoReply) or
+                parsed_pkt.haslayer(ICMPv6ND_NS) or
+                parsed_pkt.haslayer(ICMPv6ND_NA) or
+                parsed_pkt.haslayer(ICMPv6ND_RA) or
+                parsed_pkt.haslayer(ICMPv6ND_RS)
+            ):
+                rec.l4 = "icmpv6"
+                rec.proto = "icmpv6"
+                rec.topic = "icmpv6"
+
+            if hasattr(parsed_pkt, "haslayer") and parsed_pkt.haslayer(DNS):
+                rec.topic = "dns"
+            elif hasattr(parsed_pkt, "haslayer") and (parsed_pkt.haslayer(DHCP) or parsed_pkt.haslayer(BOOTP)):
+                rec.topic = "dhcp"
+            elif rec.topic == "unknown":
+                rec.topic = self._infer_topic_from_ports_and_proto(rec.sport, rec.dport, rec.proto)
+
+            if rec.topic == "unknown":
+                if rec.l3 in ("ipv4", "ipv6") and rec.l4 in ("tcp", "udp"):
+                    rec.topic = "transport"
+                elif rec.l3 in ("ipv4", "ipv6"):
+                    rec.topic = "ip"
+                else:
+                    rec.topic = "ethernet"
+
+            if raw:
+                rec.extra["hex_preview"] = raw[: self.raw_hex_preview_bytes].hex()
+            return rec.as_dict(), raw
+        except Exception as exc:
+            rec.extra["classification_error"] = f"{type(exc).__name__}: {exc}"
+            rec.extra["traceback"] = traceback.format_exc(limit=2)
+            return rec.as_dict(), raw
+
+    # ---------------------------------------------------------------
+    # dashboard html
+    # ---------------------------------------------------------------
+
+
+
+    def _dashboard_html(self) -> str:
+        html = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>__DASHBOARD_TITLE__</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#08101b;
+      --panel:#10192d;
+      --panel2:#15213a;
+      --line:#263656;
+      --text:#eaf1ff;
+      --muted:#9bb0d9;
+      --good:#39d98a;
+      --warn:#ffbe55;
+      --bad:#ff718c;
+      --shadow:0 16px 34px rgba(0,0,0,.24);
+      --chip:rgba(255,255,255,.05);
+    }
+    * { box-sizing:border-box; }
+    html, body { height:100%; }
+    body {
+      margin:0;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: radial-gradient(circle at top, #112142 0%, #0b1324 24%, var(--bg) 100%);
+      color:var(--text);
+    }
+    .wrap { max-width:1760px; margin:0 auto; padding:18px; }
+    .header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:16px; }
+    .title { font-size:30px; font-weight:900; letter-spacing:.01em; }
+    .sub { color:var(--muted); font-size:14px; margin-top:6px; }
+    .status-chip {
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.04);
+      border-radius:14px;
+      padding:10px 12px;
+      font-size:12px;
+      min-width:280px;
+      text-align:right;
+      box-shadow:var(--shadow);
+    }
+    .grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:16px; }
+    .card {
+      min-width:0;
+      border:1px solid var(--line);
+      border-radius:20px;
+      padding:16px;
+      background:linear-gradient(180deg, var(--panel), var(--panel2));
+      box-shadow:var(--shadow);
+    }
+    .span-12{grid-column:span 12;}
+    .span-8{grid-column:span 8;}
+    .span-6{grid-column:span 6;}
+    .span-4{grid-column:span 4;}
+    .kpis { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; }
+    .kpi {
+      border:1px solid var(--line);
+      border-radius:16px;
+      padding:14px;
+      background:rgba(255,255,255,.035);
+    }
+    .label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+    .value { font-size:24px; font-weight:900; }
+    .small { color:var(--muted); font-size:12px; }
+    h2 { margin:0 0 12px 0; font-size:16px; font-weight:800; }
+    .mono { font-family:Consolas,Menlo,monospace; font-size:12px; white-space:pre-wrap; word-break:break-word; }
+    .toolbar {
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      gap:10px;
+      margin-bottom:12px;
+    }
+    input, select, button {
+      background:#0b1427;
+      color:var(--text);
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:9px 11px;
+    }
+    input, select { min-height:40px; }
+    button { cursor:pointer; }
+    button:hover { border-color:#44689f; }
+    .table-wrap {
+      max-height:340px;
+      overflow:auto;
+      border:1px solid var(--line);
+      border-radius:14px;
+      background:rgba(0,0,0,.14);
+    }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,.06); vertical-align:top; }
+    th { position:sticky; top:0; background:#0f1830; z-index:1; color:var(--muted); font-size:12px; }
+    .chip-row { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip {
+      border-radius:999px;
+      padding:5px 10px;
+      border:1px solid var(--line);
+      background:var(--chip);
+      font-size:12px;
+    }
+
+    .router-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+    .router-item, .mini-tile, .flow-metric, .flow-card, .stat-box, .prefix-item {
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:14px;
+      background:rgba(255,255,255,.03);
+    }
+    .router-item { padding:10px; }
+    .router-key, .mini-key, .flow-label {
+      font-size:11px;
+      color:var(--muted);
+      text-transform:uppercase;
+      letter-spacing:.04em;
+      margin-bottom:4px;
+    }
+    .router-val, .mini-val, .flow-value { font-size:14px; font-weight:800; word-break:break-word; }
+
+    .stat-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .stat-box { padding:12px; }
+    .stat-value { font-size:20px; font-weight:900; margin-top:2px; }
+    .bar-block { margin-top:10px; }
+    .bar-head { display:flex; justify-content:space-between; gap:10px; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    .bar-track {
+      width:100%;
+      height:11px;
+      border-radius:999px;
+      overflow:hidden;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.08);
+    }
+    .bar-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,#4ea2ff,#6ed8ff); }
+    .bar-fill.good { background:linear-gradient(90deg,#39c782,#6ce5ac); }
+    .bar-fill.warn { background:linear-gradient(90deg,#ffb45a,#ffd56f); }
+    .bar-fill.bad { background:linear-gradient(90deg,#ff6f89,#ff99ae); }
+    .mini-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:10px; }
+    .mini-tile { padding:10px; }
+
+    .flow-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .flow-card { padding:12px; }
+    .flow-top { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
+    .flow-key { font-family:Consolas,Menlo,monospace; font-size:12px; word-break:break-word; color:#d8e7ff; }
+    .flow-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:10px 0; }
+    .flow-metric { padding:8px; background:rgba(0,0,0,.16); }
+    .flow-tags { display:flex; flex-wrap:wrap; gap:6px; }
+    .flow-tag {
+      border-radius:999px;
+      padding:4px 8px;
+      background:rgba(255,255,255,.05);
+      border:1px solid rgba(255,255,255,.08);
+      font-size:11px;
+      color:#dce7ff;
+    }
+
+    .split { display:grid; grid-template-columns:1.55fr .95fr; gap:16px; }
+    .logs {
+      height:640px;
+      overflow:auto;
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:rgba(1,6,16,.5);
+      padding:10px;
+    }
+    .log-line {
+      margin-bottom:8px;
+      padding:10px 12px;
+      border-radius:14px;
+      border:1px solid rgba(255,255,255,.1);
+      border-left-width:6px;
+      font-family:Consolas,Menlo,monospace;
+      font-size:12px;
+      line-height:1.45;
+      color:#f5f8ff;
+      background:linear-gradient(180deg, rgba(127,142,168,.22), rgba(127,142,168,.10));
+      box-shadow:inset 0 0 0 1px rgba(255,255,255,.03), 0 6px 20px rgba(0,0,0,.18);
+    }
+    .log-head { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px; }
+    .log-pill {
+      display:inline-flex;
+      align-items:center;
+      border-radius:999px;
+      padding:3px 8px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.18);
+      color:inherit;
+      font-size:11px;
+      white-space:nowrap;
+    }
+    .log-msg { white-space:pre-wrap; word-break:break-word; color:inherit; }
+    .prefix-list {
+      height:640px;
+      overflow:auto;
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:rgba(0,0,0,.14);
+      padding:10px;
+    }
+    .prefix-item {
+      width:100%;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:8px;
+      padding:10px 12px;
+      margin-bottom:8px;
+      cursor:pointer;
+      color:var(--text);
+    }
+    .prefix-item.active {
+      background:rgba(102,194,255,.12);
+      border-color:rgba(102,194,255,.35);
+      box-shadow:0 0 0 1px rgba(102,194,255,.08) inset;
+    }
+    .muted { color:var(--muted); }
+
+    @media (max-width: 1280px) {
+      .span-8,.span-6,.span-4 { grid-column:span 12; }
+      .split { grid-template-columns:1fr; }
+      .kpis { grid-template-columns:repeat(3,minmax(0,1fr)); }
+      .router-grid,.flow-grid,.stat-grid,.mini-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    }
+    @media (max-width: 760px) {
+      .kpis,.router-grid,.flow-grid,.stat-grid,.mini-grid { grid-template-columns:1fr; }
+      .header { flex-direction:column; }
+      .status-chip { min-width:0; width:100%; text-align:left; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div>
+        <div class="title">__DASHBOARD_TITLE__</div>
+        <div class="sub">Live router dashboard with direct log coloring, prefix filtering, retention health, and flow snapshots.</div>
+      </div>
+      <div id="serverStatus" class="status-chip">Connecting…</div>
+    </div>
+
+    <div class="grid">
+      <div class="card span-12">
+        <div class="kpis">
+          <div class="kpi"><div class="label">Total packets</div><div class="value" id="kpiPackets">0</div></div>
+          <div class="kpi"><div class="label">Recent pps</div><div class="value" id="kpiPps">0</div></div>
+          <div class="kpi"><div class="label">Recent bps</div><div class="value" id="kpiBps">0</div></div>
+          <div class="kpi"><div class="label">Total logs</div><div class="value" id="kpiLogs">0</div></div>
+          <div class="kpi"><div class="label">Coalesced logs</div><div class="value" id="kpiCoalesced">0</div></div>
+          <div class="kpi"><div class="label">Access logs</div><div class="value" id="kpiAccess">off</div></div>
+        </div>
+      </div>
+
+      <div class="card span-4">
+        <h2>Router snapshot</h2>
+        <div id="routerInfo" class="router-grid"></div>
+      </div>
+
+      <div class="card span-4">
+        <h2>Top topics</h2>
+        <div class="table-wrap"><table id="topicsTable"></table></div>
+      </div>
+
+      <div class="card span-4">
+        <h2>Interfaces</h2>
+        <div class="table-wrap"><table id="ifacesTable"></table></div>
+      </div>
+
+      <div class="card span-6">
+        <h2>Top ports</h2>
+        <div class="table-wrap"><table id="portsTable"></table></div>
+      </div>
+
+      <div class="card span-6">
+        <h2>Hot prefixes</h2>
+        <div id="prefixSummary" class="chip-row"></div>
+      </div>
+
+      <div class="card span-6">
+        <h2>Retention and storage</h2>
+        <div id="retentionInfo"></div>
+      </div>
+
+      <div class="card span-6">
+        <h2>Flow snapshot</h2>
+        <div id="flowsInfo" class="flow-grid"></div>
+      </div>
+
+      <div class="card span-12">
+        <div class="split">
+          <div>
+            <h2>Logs</h2>
+            <div class="toolbar">
+              <select id="prefixFilter"></select>
+              <select id="sortBy">
+                <option value="time_desc">Newest first</option>
+                <option value="time_asc">Oldest first</option>
+                <option value="prefix">Sort by prefix</option>
+              </select>
+              <select id="logLevel">
+                <option value="">All levels</option>
+                <option value="info">info</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+                <option value="debug">debug</option>
+              </select>
+              <input id="logSource" placeholder="source filter" />
+              <input id="containsText" placeholder="text contains" />
+              <label class="chip"><input id="colorizedLogs" type="checkbox" checked style="margin-right:8px;">Color logs</label>
+              <button id="reloadLogsBtn" type="button">Reload logs</button>
+              <button id="clearUiBtn" type="button">Reset UI</button>
+            </div>
+            <div id="logHint" class="small" style="margin-bottom:8px;">No logs loaded yet.</div>
+            <div id="logsBox" class="logs"></div>
+          </div>
+          <div>
+            <h2>Prefix list</h2>
+            <div id="prefixList" class="prefix-list"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      stats: null,
+      prefixMeta: [],
+      activePrefix: '',
+      logs: [],
+      idEpoch: 1,
+      polling: { stats: 2200, logs: 1800 },
+      uiKey: 'routerdash.v6.ui',
+    };
+
+    function esc(s) {
+      return String(s ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function fmtNum(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return String(v ?? 0);
+      return n.toLocaleString();
+    }
+
+    function humanBytes(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n) || n <= 0) return '0 B';
+      const units = ['B','KB','MB','GB','TB'];
+      let cur = n;
+      let idx = 0;
+      while (cur >= 1024 && idx < units.length - 1) { cur /= 1024; idx += 1; }
+      return `${cur >= 100 ? cur.toFixed(0) : cur >= 10 ? cur.toFixed(1) : cur.toFixed(2)} ${units[idx]}`;
+    }
+
+    function fmtPercent(v) {
+      const n = Math.max(0, Math.min(1, Number(v || 0)));
+      return `${(n * 100).toFixed(1)}%`;
+    }
+
+    function toneClass(ratio) {
+      const n = Number(ratio || 0);
+      if (n >= 0.9) return 'bad';
+      if (n >= 0.7) return 'warn';
+      return 'good';
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    }
+
+    function setStatus(text, ok=true) {
+      const el = document.getElementById('serverStatus');
+      el.textContent = text;
+      el.style.borderColor = ok ? 'rgba(57,217,138,.32)' : 'rgba(255,113,140,.34)';
+      el.style.color = ok ? '#e9fff5' : '#fff0f3';
+      el.style.background = ok ? 'rgba(57,217,138,.08)' : 'rgba(255,113,140,.08)';
+    }
+
+    function tableRows(items) {
+      if (!items || !items.length) return '<tr><td class="mono">No data</td></tr>';
+      let html = '<tr><th>Key</th><th>Count</th></tr>';
+      for (const row of items) {
+        html += `<tr><td class="mono">${esc(row.key)}</td><td>${fmtNum(row.count)}</td></tr>`;
+      }
+      return html;
+    }
+
+    function saveUiState() {
+      try {
+        const payload = {
+          activePrefix: state.activePrefix || '',
+          sortBy: document.getElementById('sortBy').value || 'time_desc',
+          level: document.getElementById('logLevel').value || '',
+          source: document.getElementById('logSource').value || '',
+          contains: document.getElementById('containsText').value || '',
+          colorized: !!document.getElementById('colorizedLogs').checked,
+        };
+        localStorage.setItem(state.uiKey, JSON.stringify(payload));
+      } catch (e) {}
+    }
+
+    function restoreUiState() {
+      try {
+        const raw = localStorage.getItem(state.uiKey);
+        if (!raw) return;
+        const payload = JSON.parse(raw);
+        state.activePrefix = String(payload.activePrefix || '');
+        document.getElementById('sortBy').value = payload.sortBy || 'time_desc';
+        document.getElementById('logLevel').value = payload.level || '';
+        document.getElementById('logSource').value = payload.source || '';
+        document.getElementById('containsText').value = payload.contains || '';
+        document.getElementById('colorizedLogs').checked = payload.colorized !== false;
+      } catch (e) {}
+    }
+
+    function resetUiState() {
+      try { localStorage.removeItem(state.uiKey); } catch (e) {}
+      state.activePrefix = '';
+      document.getElementById('sortBy').value = 'time_desc';
+      document.getElementById('logLevel').value = '';
+      document.getElementById('logSource').value = '';
+      document.getElementById('containsText').value = '';
+      document.getElementById('colorizedLogs').checked = true;
+      renderPrefixControls(state.prefixMeta || []);
+      renderLogs(state.logs || []);
+      reloadLogs(true).catch(() => {});
+    }
+
+    function renderRouterSnapshot(router) {
+      const el = document.getElementById('routerInfo');
+      const entries = Object.entries(router || {});
+      if (!entries.length) {
+        el.innerHTML = '<div class="small">No router attached.</div>';
+        return;
+      }
+      el.innerHTML = entries.map(([k,v]) => `
+        <div class="router-item">
+          <div class="router-key">${esc(k)}</div>
+          <div class="router-val">${esc(v === null || v === undefined ? '-' : String(v))}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderPrefixSummary(prefixes) {
+      const el = document.getElementById('prefixSummary');
+      const rows = (prefixes || []).slice(0, 18);
+      el.innerHTML = rows.length
+        ? rows.map(row => `<span class="chip">${esc(row.prefix)} · ${fmtNum(row.count)}</span>`).join('')
+        : '<span class="small">No prefixes yet.</span>';
+    }
+
+    function renderPrefixControls(prefixes) {
+      const active = state.activePrefix || '';
+      const select = document.getElementById('prefixFilter');
+      const list = document.getElementById('prefixList');
+      const options = ['<option value="">All prefixes</option>'].concat(
+        (prefixes || []).map(row => `<option value="${esc(row.prefix)}">${esc(row.prefix)} (${fmtNum(row.count)})</option>`)
+      );
+      select.innerHTML = options.join('');
+      select.value = active;
+      list.innerHTML =
+        `<div class="prefix-item ${active === '' ? 'active' : ''}" data-prefix="">
+           <span>All prefixes</span><span class="small">global</span>
+         </div>` +
+        (prefixes || []).map(row => `
+          <div class="prefix-item ${row.prefix === active ? 'active' : ''}" data-prefix="${esc(row.prefix)}">
+            <span>${esc(row.prefix)}</span><span class="small">${fmtNum(row.count)} logs</span>
+          </div>
+        `).join('');
+
+      for (const el of list.querySelectorAll('[data-prefix]')) {
+        el.onclick = () => {
+          state.activePrefix = el.getAttribute('data-prefix') || '';
+          saveUiState();
+          renderPrefixControls(state.prefixMeta || []);
+          reloadLogs(true).catch(() => {});
+        };
+      }
+      select.onchange = () => {
+        state.activePrefix = select.value || '';
+        saveUiState();
+        renderPrefixControls(state.prefixMeta || []);
+        reloadLogs(true).catch(() => {});
+      };
+    }
+
+    function renderRetention(data) {
+      const packets = data.packets || {};
+      const logs = data.logs || {};
+      const server = data.server || {};
+      const rows = [
+        {
+          name: 'Packet ring',
+          ratio: Number(packets.packet_ring_fill_ratio || 0),
+          value: fmtPercent(packets.packet_ring_fill_ratio || 0),
+          small: `oldest id ${fmtNum(packets.oldest_available_id || 0)} · newest id ${fmtNum(packets.newest_available_id || 0)}`
+        },
+        {
+          name: 'Raw store',
+          ratio: Number(packets.raw_store_fill_ratio || 0),
+          value: fmtPercent(packets.raw_store_fill_ratio || 0),
+          small: `${fmtNum(packets.raw_packet_count || 0)} packets · ${humanBytes(packets.raw_packet_bytes || 0)}`
+        },
+        {
+          name: 'Log ring',
+          ratio: Number(logs.log_ring_fill_ratio || 0),
+          value: fmtPercent(logs.log_ring_fill_ratio || 0),
+          small: `${fmtNum(logs.live_log_records || 0)} live logs · ${fmtNum(logs.active_prefix_buckets || 0)} prefixes`
+        },
+        {
+          name: 'Event ring',
+          ratio: Number(logs.event_ring_fill_ratio || 0),
+          value: fmtPercent(logs.event_ring_fill_ratio || 0),
+          small: `${fmtNum(logs.live_event_records || 0)} live events · epoch ${fmtNum(server.id_epoch || 1)}`
+        }
+      ];
+      const top = rows.map(row => `
+        <div class="stat-box">
+          <div class="label">${esc(row.name)}</div>
+          <div class="stat-value">${esc(row.value)}</div>
+          <div class="small">${esc(row.small)}</div>
+          <div class="bar-block">
+            <div class="bar-head"><span>occupancy</span><span>${esc(row.value)}</span></div>
+            <div class="bar-track"><div class="bar-fill ${toneClass(row.ratio)}" style="width:${Math.max(1, Math.min(100, row.ratio * 100))}%"></div></div>
+          </div>
+        </div>
+      `).join('');
+
+      const bottom = `
+        <div class="mini-grid">
+          <div class="mini-tile"><div class="mini-key">Dropped raw packets</div><div class="mini-val">${fmtNum(packets.dropped_raw_packets || 0)}</div></div>
+          <div class="mini-tile"><div class="mini-key">Dropped raw bytes</div><div class="mini-val">${humanBytes(packets.dropped_raw_bytes || 0)}</div></div>
+          <div class="mini-tile"><div class="mini-key">Sampled out packets</div><div class="mini-val">${fmtNum(packets.sampled_out_packets || 0)}</div></div>
+          <div class="mini-tile"><div class="mini-key">Prefix buckets</div><div class="mini-val">${fmtNum(logs.active_prefix_buckets || 0)} / ${fmtNum(server.max_prefix_buckets || 0)}</div></div>
+          <div class="mini-tile"><div class="mini-key">ID rebases</div><div class="mini-val">${fmtNum(server.id_rebase_runs || 0)}</div></div>
+          <div class="mini-tile"><div class="mini-key">Server uptime</div><div class="mini-val">${fmtNum(Math.round(server.uptime_sec || 0))}s</div></div>
+        </div>
+      `;
+      document.getElementById('retentionInfo').innerHTML = `<div class="stat-grid">${top}</div>${bottom}`;
+    }
+
+    function ageText(ts) {
+      const now = Date.now() / 1000;
+      const s = Math.max(0, Math.round(now - Number(ts || 0)));
+      if (s < 60) return `${s}s ago`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 48) return `${h}h ago`;
+      const d = Math.floor(h / 24);
+      return `${d}d ago`;
+    }
+
+    function flowTags(title, items) {
+      const rows = (items || []).slice(0, 4);
+      if (!rows.length) return '';
+      return rows.map(row => `<span class="flow-tag">${esc(title)}: ${esc(row.key)} · ${fmtNum(row.count)}</span>`).join('');
+    }
+
+    function renderFlows(flows) {
+      const el = document.getElementById('flowsInfo');
+      const rows = (flows || []).slice(0, 20);
+      if (!rows.length) {
+        el.innerHTML = '<div class="small">No flows yet.</div>';
+        return;
+      }
+      el.innerHTML = rows.map(row => `
+        <div class="flow-card">
+          <div class="flow-top">
+            <div class="flow-key">${esc(row.key || 'unknown')}</div>
+            <span class="chip">${fmtNum(row.packets || 0)} packets</span>
+          </div>
+          <div class="flow-metrics">
+            <div class="flow-metric"><div class="flow-label">Bytes</div><div class="flow-value">${humanBytes(row.bytes_seen || 0)}</div></div>
+            <div class="flow-metric"><div class="flow-label">Last seen</div><div class="flow-value">${esc(ageText(row.last_seen))}</div></div>
+            <div class="flow-metric"><div class="flow-label">First seen</div><div class="flow-value">${esc(ageText(row.first_seen))}</div></div>
+            <div class="flow-metric"><div class="flow-label">Topics</div><div class="flow-value">${fmtNum((row.topics || []).length)}</div></div>
+          </div>
+          <div class="flow-tags">
+            ${flowTags('topic', row.topics)}
+            ${flowTags('proto', row.protos)}
+            ${flowTags('iface', row.ifaces)}
+            ${flowTags('comp', row.components)}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function hashHue(input) {
+      const s = String(input || 'general');
+      let h = 2166136261;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return Math.abs(h >>> 0) % 360;
+    }
+
+    function toneForLevel(level, hue) {
+      const lvl = String(level || 'info').toLowerCase();
+      if (lvl === 'error') return { hue: 355, sat: 88, light: 54, bg1: .42, bg2: .18, border: .48, pill: .30 };
+      if (lvl === 'warning') return { hue: 36, sat: 96, light: 56, bg1: .40, bg2: .17, border: .46, pill: .28 };
+      if (lvl === 'debug') return { hue, sat: 52, light: 56, bg1: .26, bg2: .11, border: .32, pill: .20 };
+      return { hue, sat: 78, light: 60, bg1: .36, bg2: .15, border: .42, pill: .24 };
+    }
+
+    function logPalette(row) {
+      const chain = Array.isArray(row.prefix_chain) && row.prefix_chain.length
+        ? row.prefix_chain.join(' | ')
+        : (row.prefix || row.source || 'General');
+      const hue = hashHue(chain);
+      const t = toneForLevel(row.level, hue);
+      return {
+        rowBg: `linear-gradient(180deg, hsla(${t.hue}, ${t.sat}%, ${Math.min(76, t.light + 8)}%, ${t.bg1}), hsla(${t.hue}, ${t.sat}%, 18%, ${t.bg2}))`,
+        rowBorder: `hsla(${t.hue}, ${t.sat}%, 68%, ${t.border})`,
+        rowLeft: `hsla(${t.hue}, ${t.sat}%, 72%, .98)`,
+        rowText: `hsla(${t.hue}, 100%, 97%, .99)`,
+        pillBg: `hsla(${t.hue}, ${Math.max(36, t.sat - 18)}%, 13%, ${t.pill})`,
+        pillBorder: `hsla(${t.hue}, ${t.sat}%, 72%, .42)`,
+      };
+    }
+
+    function applyLogPalette(lineEl, row, enabled) {
+      const pills = lineEl.querySelectorAll('.log-pill');
+      if (!enabled) {
+        lineEl.style.background = 'linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.03))';
+        lineEl.style.borderColor = 'rgba(255,255,255,.10)';
+        lineEl.style.borderLeftColor = 'rgba(120,170,255,.95)';
+        lineEl.style.color = '#eef3ff';
+        lineEl.style.boxShadow = 'inset 0 0 0 1px rgba(255,255,255,.03), 0 6px 20px rgba(0,0,0,.18)';
+        for (const pill of pills) {
+          pill.style.background = 'rgba(255,255,255,.06)';
+          pill.style.borderColor = 'rgba(255,255,255,.12)';
+          pill.style.color = '#eef3ff';
+        }
+        return;
+      }
+      const p = logPalette(row);
+      lineEl.style.background = p.rowBg;
+      lineEl.style.borderColor = p.rowBorder;
+      lineEl.style.borderLeftColor = p.rowLeft;
+      lineEl.style.color = p.rowText;
+      lineEl.style.boxShadow = `inset 0 0 0 1px rgba(255,255,255,.03), 0 6px 20px rgba(0,0,0,.18), 0 0 0 1px ${p.rowBorder}`;
+      for (const pill of pills) {
+        pill.style.background = p.pillBg;
+        pill.style.borderColor = p.pillBorder;
+        pill.style.color = p.rowText;
+      }
+    }
+
+    function makeLogPill(text) {
+      const span = document.createElement('span');
+      span.className = 'log-pill';
+      span.textContent = text;
+      return span;
+    }
+
+    function renderLogs(items) {
+      const box = document.getElementById('logsBox');
+      const logs = items || [];
+      const atBottom = Math.abs(box.scrollHeight - box.clientHeight - box.scrollTop) < 24;
+      const colorEnabled = !!document.getElementById('colorizedLogs').checked;
+      box.innerHTML = '';
+      if (!logs.length) {
+        const line = document.createElement('div');
+        line.className = 'log-line';
+        const msg = document.createElement('div');
+        msg.className = 'log-msg';
+        msg.textContent = 'No logs for this filter.';
+        line.appendChild(msg);
+        applyLogPalette(line, { prefix:'General', source:'router', level:'info', prefix_chain:[] }, colorEnabled);
+        box.appendChild(line);
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const row of logs) {
+        const line = document.createElement('div');
+        line.className = 'log-line';
+
+        const head = document.createElement('div');
+        head.className = 'log-head';
+        head.appendChild(makeLogPill(String(row.prefix || 'General')));
+        head.appendChild(makeLogPill(String(row.level || 'info')));
+        head.appendChild(makeLogPill(String(row.source || 'router')));
+        head.appendChild(makeLogPill(`id ${fmtNum(row.id || 0)}`));
+        if (Array.isArray(row.prefix_chain) && row.prefix_chain.length > 1) {
+          head.appendChild(makeLogPill(row.prefix_chain.join(' › ')));
+        }
+        if (Number(row.repeat_count || 1) > 1) {
+          head.appendChild(makeLogPill(`×${fmtNum(row.repeat_count)}`));
+        }
+
+        const msg = document.createElement('div');
+        msg.className = 'log-msg';
+        msg.textContent = String(row.message || '');
+
+        line.appendChild(head);
+        line.appendChild(msg);
+        applyLogPalette(line, row, colorEnabled);
+        frag.appendChild(line);
+      }
+      box.appendChild(frag);
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    function applyClientFilters() {
+      renderLogs(state.logs || []);
+    }
+
+    async function reloadStats() {
+      const data = await fetchJson('/api/stats');
+      state.stats = data;
+      state.idEpoch = Number((data.server || {}).id_epoch || 1);
+      document.getElementById('kpiPackets').textContent = fmtNum(data.packets.total_packets || 0);
+      document.getElementById('kpiPps').textContent = fmtNum(data.packets.recent_packets_per_sec || 0);
+      document.getElementById('kpiBps').textContent = `${humanBytes(data.packets.recent_bytes_per_sec || 0)}/s`;
+      document.getElementById('kpiLogs').textContent = fmtNum(data.logs.total_logs || 0);
+      document.getElementById('kpiCoalesced').textContent = fmtNum(data.logs.coalesced_logs || 0);
+      document.getElementById('kpiAccess').textContent = data.server.access_logs_silenced ? 'off' : 'on';
+      renderRouterSnapshot(data.router || {});
+      renderRetention(data);
+      renderFlows(data.flows || []);
+      document.getElementById('topicsTable').innerHTML = tableRows(data.packets.by_topic || []);
+      document.getElementById('ifacesTable').innerHTML = tableRows(data.packets.by_iface || []);
+      document.getElementById('portsTable').innerHTML = tableRows(data.packets.top_ports || []);
+      state.prefixMeta = data.logs.by_prefix || [];
+      renderPrefixSummary(state.prefixMeta);
+      renderPrefixControls(state.prefixMeta);
+      setStatus(`Connected • ${data.server.host}:${data.server.port} • uptime ${fmtNum(Math.round(data.server.uptime_sec || 0))}s • epoch ${fmtNum(state.idEpoch)}`, true);
+    }
+
+    async function reloadLogs(forceFresh=false) {
+      saveUiState();
+      const url = new URL('/api/logs', window.location.origin);
+      url.searchParams.set('limit', forceFresh ? '500' : '280');
+      url.searchParams.set('sort_by', document.getElementById('sortBy').value || 'time_desc');
+      const prefix = state.activePrefix || '';
+      const level = document.getElementById('logLevel').value || '';
+      const source = document.getElementById('logSource').value || '';
+      const contains = document.getElementById('containsText').value || '';
+      if (prefix) url.searchParams.set('prefix', prefix);
+      if (level) url.searchParams.set('level', level);
+      if (source) url.searchParams.set('source', source);
+      if (contains) url.searchParams.set('contains', contains);
+
+      const data = await fetchJson(url.toString());
+      state.logs = Array.isArray(data.items) ? data.items : [];
+      if (Number(data.id_epoch || state.idEpoch) !== state.idEpoch) {
+        state.idEpoch = Number(data.id_epoch || state.idEpoch);
+      }
+      state.prefixMeta = data.available_prefixes || state.prefixMeta || [];
+      renderPrefixControls(state.prefixMeta);
+      renderPrefixSummary(state.prefixMeta);
+      document.getElementById('logHint').textContent =
+        `prefix=${prefix || 'ALL'} • rows=${fmtNum(state.logs.length)} • newest_id=${fmtNum(data.newest_available_id || 0)} • epoch=${fmtNum(state.idEpoch)}`;
+      applyClientFilters();
+    }
+
+    async function boot() {
+      restoreUiState();
+
+      document.getElementById('reloadLogsBtn').onclick = () => reloadLogs(true).catch(err => {
+        setStatus(`Log reload failed: ${err.message || err}`, false);
+      });
+      document.getElementById('clearUiBtn').onclick = resetUiState;
+      document.getElementById('colorizedLogs').onchange = () => { saveUiState(); applyClientFilters(); };
+      document.getElementById('sortBy').onchange = () => reloadLogs(true).catch(()=>{});
+      document.getElementById('logLevel').onchange = () => reloadLogs(true).catch(()=>{});
+      document.getElementById('logSource').onchange = () => reloadLogs(true).catch(()=>{});
+      document.getElementById('containsText').onchange = () => reloadLogs(true).catch(()=>{});
+      document.getElementById('containsText').addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') reloadLogs(true).catch(()=>{});
+      });
+
+      try {
+        await reloadStats();
+        await reloadLogs(true);
+      } catch (err) {
+        setStatus(`Startup failed: ${err.message || err}`, false);
+      }
+
+      setInterval(async () => {
+        try { await reloadStats(); }
+        catch (err) { setStatus(`Stats reconnecting: ${err.message || err}`, false); }
+      }, state.polling.stats);
+
+      setInterval(async () => {
+        try { await reloadLogs(false); }
+        catch (err) { setStatus(`Logs reconnecting: ${err.message || err}`, false); }
+      }, state.polling.logs);
+    }
+
+    boot();
+  </script>
+</body>
+</html>
+"""
+        return html.replace("__DASHBOARD_TITLE__", str(self.dashboard_title))
+
+
+    # ---------------------------------------------------------------
+    # helpers
+    # ---------------------------------------------------------------
+
+    def _router_snapshot(self) -> Dict[str, Any]:
+        r = self.router
+        if r is None:
+            return {}
+        keys = [
+            "started", "interface_in_full_name", "interface_in_friendly_name",
+            "interface_out_full_name", "interface_out_friendly_name",
+            "interface_loopback_full_name", "interface_ethernet_2_full_name",
+            "interface_ethernet_2_friendly_name", "router_ip_in", "router_ip_out",
+            "router_ipv6_out", "router_ipv6_link_local_out", "router_gateway_out_ip",
+            "hyperv_enabled",
+        ]
+        out: Dict[str, Any] = {}
+        for key in keys:
+            try:
+                out[key] = getattr(r, key, None)
+            except Exception:
+                out[key] = None
+        return out
+
+    def _code_output_snapshot(self) -> Dict[str, Any]:
+        co = getattr(self.router, "code_output_manager", None) if self.router is not None else None
+        if co is None:
+            return {}
+        out: Dict[str, Any] = {}
+        try:
+            if hasattr(co, "get_stats"):
+                out["stats"] = co.get_stats()
+        except Exception:
+            pass
+        try:
+            if hasattr(co, "health_snapshot"):
+                out["health"] = co.health_snapshot()
+        except Exception:
+            pass
+        try:
+            if hasattr(co, "correlation_snapshot"):
+                out["correlations"] = co.correlation_snapshot()
+        except Exception:
+            pass
+        try:
+            if hasattr(co, "export_knowledge"):
+                knowledge = co.export_knowledge()
+                if isinstance(knowledge, dict):
+                    out["knowledge_topics"] = list(knowledge.keys())[:50]
+        except Exception:
+            pass
+        return out
+
+    def _reserve_packet_id(self) -> int:
+        v = self._next_packet_id
+        self._next_packet_id += 1
+        return v
+
+    def _reserve_log_id(self) -> int:
+        v = self._next_log_id
+        self._next_log_id += 1
+        return v
+
+    def _reserve_event_id(self) -> int:
+        v = self._next_event_id
+        self._next_event_id += 1
+        return v
+
+    def _push_event_locked(self, item: Dict[str, Any]) -> None:
+        event = dict(item)
+        event["event_id"] = self._reserve_event_id()
+        self._events.append(event)
+
+    def _run_housekeeping_locked(self, now: float) -> None:
+        if (now - self._last_housekeeping_at) < self._housekeeping_interval_sec:
+            return
+        self._last_housekeeping_at = now
+        self._prune_rate_window_locked()
+        self._prune_packets_locked(now)
+        self._prune_logs_locked(now)
+        self._prune_events_locked(now)
+        self._prune_raw_packets_locked(now)
+        self._prune_flows_locked(now)
+        self._prune_recent_log_dupes_locked(now)
+        self._trim_prefix_buckets_locked(now)
+        self._maybe_compact_ids_locked()
+
+    def _trim_prefix_buckets_locked(self, now: float) -> None:
+        if len(self._logs_by_prefix) <= self.max_prefix_buckets:
+            return
+        removable = [
+            (float(self._prefix_last_seen.get(prefix, now)), prefix)
+            for prefix, dq in self._logs_by_prefix.items()
+            if not dq or float(self._prefix_last_seen.get(prefix, now)) <= now
+        ]
+        removable.sort(key=lambda x: x[0])
+        while len(self._logs_by_prefix) > self.max_prefix_buckets and removable:
+            _, prefix = removable.pop(0)
+            self._logs_by_prefix.pop(prefix, None)
+            self._prefix_last_seen.pop(prefix, None)
+
+    def _maybe_compact_ids_locked(self) -> None:
+        top_id = max(self._next_packet_id, self._next_log_id, self._next_event_id)
+        if top_id < self.ID_REBASE_WATERMARK:
+            return
+
+        packet_map: Dict[int, int] = {}
+        for idx, rec in enumerate(self._packets, start=1):
+            old_id = int(rec.get("id") or idx)
+            rec["id"] = idx
+            packet_map[old_id] = idx
+        self._next_packet_id = len(self._packets) + 1
+
+        log_map: Dict[int, int] = {}
+        for idx, rec in enumerate(self._logs, start=1):
+            old_id = int(rec.get("id") or idx)
+            rec["id"] = idx
+            log_map[old_id] = idx
+        self._next_log_id = len(self._logs) + 1
+
+        remapped_raw: Dict[int, Tuple[bytes, float]] = {}
+        remapped_order: Deque[int] = deque(maxlen=self._raw_packet_order.maxlen)
+        for old_id in list(self._raw_packet_order):
+            new_id = packet_map.get(int(old_id))
+            if new_id is None:
+                continue
+            entry = self._raw_packets.get(int(old_id))
+            if entry is None:
+                continue
+            remapped_raw[new_id] = entry
+            remapped_order.append(new_id)
+        self._raw_packets = remapped_raw
+        self._raw_packet_order = remapped_order
+
+        for idx, item in enumerate(self._events, start=1):
+            item["event_id"] = idx
+            if "id" in item:
+                kind = str(item.get("kind") or "")
+                old_id = int(item.get("id") or 0)
+                if kind == "packet" and old_id in packet_map:
+                    item["id"] = packet_map[old_id]
+                elif kind == "log" and old_id in log_map:
+                    item["id"] = log_map[old_id]
+        self._next_event_id = len(self._events) + 1
+
+        self._id_epoch += 1
+        self._id_rebase_runs += 1
+
+    def _prune_packets_locked(self, now: float) -> None:
+        cutoff = now - self._packet_record_ttl_sec
+        while self._packets and float(self._packets[0].get("ts") or 0.0) < cutoff:
+            self._packets.popleft()
+
+    def _prune_logs_locked(self, now: float) -> None:
+        cutoff = now - self._log_record_ttl_sec
+        while self._logs and float(self._logs[0].get("ts") or 0.0) < cutoff:
+            self._logs.popleft()
+        dead_prefixes = []
+        for prefix, dq in self._logs_by_prefix.items():
+            while dq and float(dq[0].get("ts") or 0.0) < cutoff:
+                dq.popleft()
+            if dq:
+                self._prefix_last_seen[prefix] = float(dq[-1].get("ts") or now)
+            else:
+                dead_prefixes.append(prefix)
+        for prefix in dead_prefixes:
+            self._logs_by_prefix.pop(prefix, None)
+            self._prefix_last_seen.pop(prefix, None)
+
+    def _prune_events_locked(self, now: float) -> None:
+        cutoff = now - self._event_ttl_sec
+        while self._events and float(self._events[0].get("ts") or 0.0) < cutoff:
+            self._events.popleft()
+
+    def _prune_raw_packets_locked(self, now: float) -> None:
+        cutoff = now - self._raw_packet_ttl_sec
+        while self._raw_packet_order:
+            oldest_id = self._raw_packet_order[0]
+            entry = self._raw_packets.get(oldest_id)
+            if entry is None:
+                self._raw_packet_order.popleft()
+                continue
+            raw, ts = entry
+            if (ts < cutoff) or (len(self._raw_packets) > self._raw_packet_count_limit) or (self._raw_packet_total_bytes > self._raw_packet_budget_bytes):
+                self._raw_packet_order.popleft()
+                self._raw_packets.pop(oldest_id, None)
+                self._raw_packet_total_bytes -= len(raw)
+                self._packet_counters["dropped_raw_packets"] += 1
+                self._packet_counters["dropped_raw_bytes"] += len(raw)
+            else:
+                break
+        self._packet_counters["raw_packet_count"] = len(self._raw_packets)
+        self._packet_counters["raw_packet_bytes"] = self._raw_packet_total_bytes
+
+    def _prune_flows_locked(self, now: float) -> None:
+        cutoff = now - self._flow_idle_ttl_sec
+        stale = [k for k, v in self._flows.items() if v.last_seen < cutoff]
+        for k in stale:
+            self._flows.pop(k, None)
+
+    def _prune_recent_log_dupes_locked(self, now: float) -> None:
+        stale = [k for k, v in self._recent_log_dupes.items() if (now - float(v.get("ts") or 0.0)) > self._log_coalesce_window_sec]
+        for k in stale:
+            self._recent_log_dupes.pop(k, None)
+
+    def _prune_rate_window_locked(self) -> None:
+        cutoff = time.time() - self.packet_window_sec
+        while self._rate_window and self._rate_window[0][0] < cutoff:
+            self._rate_window.popleft()
+
+    def _store_raw_packet_locked(self, rec: Dict[str, Any], raw: Optional[bytes]) -> None:
+        if not self.store_raw_packets or not raw:
+            return
+        b = bytes(raw)
+        if self.max_raw_packet_bytes > 0:
+            b = b[: self.max_raw_packet_bytes]
+        pid = int(rec["id"])
+        self._raw_packets[pid] = (b, float(rec.get("ts") or time.time()))
+        self._raw_packet_order.append(pid)
+        self._raw_packet_total_bytes += len(b)
+        self._packet_counters["raw_packet_count"] = len(self._raw_packets)
+        self._packet_counters["raw_packet_bytes"] = self._raw_packet_total_bytes
+
+    def _touch_flow_locked(self, flow_key: str, rec: Dict[str, Any]) -> None:
+        fr = self._flows.get(flow_key)
+        if fr is None:
+            fr = _FlowRecord(key=flow_key, first_seen=float(rec.get("ts") or time.time()), last_seen=float(rec.get("ts") or time.time()))
+            self._flows[flow_key] = fr
+        fr.touch(rec)
+
+    def _top_flows_snapshot_locked(self, n: int = 20) -> List[Dict[str, Any]]:
+        vals = sorted(self._flows.values(), key=lambda x: (x.packets, x.bytes_seen, x.last_seen), reverse=True)
+        return [x.as_dict() for x in vals[:n]]
+
+    def _flow_key_from_record(self, rec: Dict[str, Any]) -> str:
+        src = f"{rec.get('src_ip') or '-'}:{rec.get('sport') if rec.get('sport') is not None else '-'}"
+        dst = f"{rec.get('dst_ip') or '-'}:{rec.get('dport') if rec.get('dport') is not None else '-'}"
+        proto = str(rec.get("proto") or "unknown")
+        ends = sorted([src, dst])
+        return f"{proto}|{ends[0]}|{ends[1]}"
+
+    def _extract_prefix_chain(self, message: str) -> List[str]:
+        parts = [p.strip() for p in self.PREFIX_RE.findall(message or "") if p.strip()]
+        if not parts:
+            return []
+        deduped: List[str] = []
+        seen = set()
+        for part in parts:
+            if part not in seen:
+                deduped.append(part)
+                seen.add(part)
+        return deduped
+
+    def _coerce_packet(self, packet: Any, *, raw_bytes: Optional[bytes]) -> Tuple[Any, Optional[bytes], str]:
+        if raw_bytes is not None:
+            raw = bytes(raw_bytes)
+            if packet is not None and hasattr(packet, "summary"):
+                return packet, raw, "native_raw"
+        if packet is None:
+            return None, bytes(raw_bytes) if raw_bytes else None, "unknown"
+        if raw_bytes is not None:
+            return packet, bytes(raw_bytes), "native_raw"
+        try:
+            if isinstance(packet, (bytes, bytearray)):
+                return None, bytes(packet), "bytes"
+        except Exception:
+            pass
+        if hasattr(packet, "summary"):
+            try:
+                raw = bytes(packet)
+                return packet, raw, "scapy_bytes"
+            except Exception:
+                return packet, None, "scapy"
+        return None, None, "unknown"
+
+    def _infer_topic_from_ports_and_proto(self, sport: Optional[int], dport: Optional[int], proto: str) -> str:
+        for p in (sport, dport):
+            if p is not None and int(p) in self.SPECIAL_PORT_TOPICS:
+                return self.SPECIAL_PORT_TOPICS[int(p)]
+        if proto in ("tcp", "udp"):
+            return "transport"
+        if proto in ("icmp", "icmpv6"):
+            return proto
+        return "unknown"
+
+    def _infer_topic_from_unknown(self, packet: Any, raw: Optional[bytes]) -> str:
+        if raw:
+            if b"HTTP/" in raw or raw.startswith((b"GET ", b"POST ", b"HEAD ", b"PUT ")):
+                return "http"
+            if raw[:1] == b"{":
+                return "json"
+        return type(packet).__name__.lower() if packet is not None else "unknown"
+
+    def _summary_of_unknown(self, packet: Any, raw: Optional[bytes]) -> str:
+        if raw:
+            preview = raw[: self.raw_hex_preview_bytes].hex()
+            return f"raw[{len(raw)}] {preview}"
+        return repr(packet)[:300]
+
+    def _safe_summary(self, pkt: Any) -> str:
+        try:
+            return str(pkt.summary())
+        except Exception:
+            return repr(pkt)[:300]
+
+    def _approx_len(self, packet: Any) -> int:
+        try:
+            return len(bytes(packet))
+        except Exception:
+            try:
+                return len(packet)
+            except Exception:
+                return 0
+
+    def _counter_to_common(self, counter: Counter, n: int) -> List[Dict[str, Any]]:
+        return [{"key": k, "count": int(v)} for k, v in counter.most_common(n)]
+
+    def _default_log_message_from_call(
+        self,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        result: Any,
+        error: Optional[BaseException],
+    ) -> str:
+        if args:
+            return self._stringify_message(args[0])
+        if "message" in kwargs:
+            return self._stringify_message(kwargs["message"])
+        if error is not None:
+            return f"{type(error).__name__}: {error}"
+        return self._stringify_message(result)
+
+    def _stringify_message(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    def _safe_int(self, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _bool_arg(self, name: str, default: bool) -> bool:
+        value = request.args.get(name)
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _int_arg(self, name: str, default: int, minimum: int, maximum: int) -> int:
+        value = request.args.get(name)
+        try:
+            iv = int(value) if value is not None else int(default)
+        except Exception:
+            iv = int(default)
+        return max(int(minimum), min(int(maximum), iv))
 
 
