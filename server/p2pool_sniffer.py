@@ -259,6 +259,123 @@ class SnifferSoftware:
         self.hyperv_manager = hyperv_manager
         self.banned_ips = ["89.222.103.1"]
 
+    # Add these helpers inside SnifferSoftware
+
+    def _looks_like_removed_iface_error(self, err: str) -> bool:
+        s = (err or "").strip().lower()
+        if not s:
+            return False
+        needles = (
+            "error_device_removed",
+            "status_device_removed",
+            "device removed",
+            "the interface disappeared",
+            "interface disappeared",
+            "adapter was removed",
+            "network adapter has been removed",
+            "the handle is invalid",  # sometimes what Windows/Npcap surfaces after a rebind
+            "invalid handle",
+        )
+        return any(n in s for n in needles)
+
+    def _iter_reopen_candidates(self, iface: str):
+        """
+        Yield likely names for reopening the capture.
+        Starts with the original name, then tries Windows interface aliases.
+        """
+        seen = set()
+
+        def add(x):
+            if isinstance(x, str):
+                x = x.strip()
+                if x and x not in seen:
+                    seen.add(x)
+                    yield x
+
+        # 1) original requested iface first
+        yield from add(iface)
+
+        # 2) anything we can infer from current Windows interface list
+        try:
+            for row in get_windows_if_list():
+                vals = [
+                    row.get("name"),
+                    row.get("win_name"),
+                    row.get("friendlyname"),
+                    row.get("description"),
+                    row.get("guid"),
+                ]
+                vals_clean = [v for v in vals if isinstance(v, str) and v.strip()]
+                if iface in vals_clean:
+                    for v in vals_clean:
+                        yield from add(v)
+        except Exception:
+            pass
+
+        # 3) consult router-side interface config if present
+        try:
+            cfg = getattr(self, "_interfaces_config", None) or {}
+            for sys_name, meta in cfg.items():
+                vals = [
+                    sys_name,
+                    meta.get("friendly_name"),
+                    meta.get("name"),
+                    meta.get("description"),
+                    meta.get("guid"),
+                    meta.get("full_name"),
+                ]
+                vals_clean = [v for v in vals if isinstance(v, str) and v.strip()]
+                if iface in vals_clean:
+                    for v in vals_clean:
+                        yield from add(v)
+        except Exception:
+            pass
+
+    def _open_pcap_handle(self, iface: str, promisc: bool, timeout: int, bpf_filter: str | None):
+        """
+        Opens a fresh pcap handle and applies filter if provided.
+        Returns: (handle, err_string)
+        """
+        errbuf = ctypes.create_string_buffer(256)
+        handle = self.libpcap.pcap_open_live(
+            iface.encode("utf-8"),
+            65535,
+            1 if promisc else 0,
+            int(timeout),
+            errbuf,
+        )
+        if not handle:
+            return None, errbuf.value.decode(errors="ignore")
+
+        if bpf_filter:
+            bpf = bpf_program()
+            if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), bpf_filter.encode(), 1, 0) == -1:
+                err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors="ignore")
+                try:
+                    self.libpcap.pcap_close(handle)
+                except Exception:
+                    pass
+                return None, f"filter compile failed: {err}"
+
+            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == -1:
+                err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors="ignore")
+                try:
+                    self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                except Exception:
+                    pass
+                try:
+                    self.libpcap.pcap_close(handle)
+                except Exception:
+                    pass
+                return None, f"filter set failed: {err}"
+
+            try:
+                self.libpcap.pcap_freecode(ctypes.byref(bpf))
+            except Exception:
+                pass
+
+        return handle, ""
+
     def iface_is_l2_capable(self, iface_name: str) -> bool:
         kind = (self._interfaces_config.get(iface_name, {}) or {}).get("driver", "").lower()
         return not ("windivert" in kind or "rawip" in kind or "winfw" in kind)
@@ -1298,6 +1415,21 @@ class SnifferSoftware:
         pkthdr_ptr = ctypes.POINTER(pcap_pkthdr)()
         packet_data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
 
+        def _open_on_candidates(target_iface: str):
+            last_err = ""
+            for candidate in self._iter_reopen_candidates(target_iface):
+                h, err = self._open_pcap_handle(
+                    iface=candidate,
+                    promisc=promisc,
+                    timeout=int(timeout),
+                    bpf_filter=filter,
+                )
+                if h:
+                    return h, candidate, ""
+                last_err = err
+            return None, target_iface, last_err
+
+        handle, active_iface, open_err = _open_on_candidates(iface)
         try:
             while True:
                 if stop_filter and stop_filter(None): # Pass None since we don't have a packet yet
@@ -1308,10 +1440,36 @@ class SnifferSoftware:
                     # read timeout; loop again
                     continue
                 elif ret == -1:
-                    err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors='ignore')
-                    sys.stderr.write(f"[-] Error reading packet: {err}\n")
-                    time.sleep(0.05)
-                    continue
+                    err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors="ignore")
+
+                    if self._looks_like_removed_iface_error(err):
+                        self.logger.log_message(
+                            f"[Sniffer] Interface removed on '{active_iface}'. Closing stale handle and attempting reopen."
+                        )
+
+                        try:
+                            self.libpcap.pcap_close(handle)
+                        except Exception:
+                            pass
+                        handle = None
+
+                        time.sleep(0.15)
+
+                        reopened_handle, reopened_iface, reopen_err = _open_on_candidates(active_iface)
+                        if not reopened_handle:
+                            self.logger.log_message(
+                                f"[Sniffer] Reopen failed after device removal on '{active_iface}': {reopen_err}. Closing sniffer."
+                            )
+                            return
+
+                        handle = reopened_handle
+                        active_iface = reopened_iface
+                        dlt = self.libpcap.pcap_datalink(handle)
+
+                        self.logger.log_message(
+                            f"[Sniffer] Reopened capture on '{active_iface}' datalink={dlt} ({self._dlt_name(dlt)})"
+                        )
+                        continue
                 elif ret == -2:
                     # breakloop() or EOF - for live capture, just retry after a small pause
                     time.sleep(0.05)
@@ -1335,6 +1493,14 @@ class SnifferSoftware:
                         if packet.summary() not in self.logged_packets:
                             self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | {packet.summary()}")
                             self.logged_packets.append(packet.summary())
+                            if "Loopback" in iface:
+                                processed_packet = session().process(pkt=packet, cls=None) if session else packet
+                                try:
+                                    if prn and processed_packet is not None:
+                                        prn(session().process(pkt=packet, cls=None) if session else packet)
+                                        continue
+                                except Exception:
+                                    pass
                     except Exception:
                         self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | <decode error>")
 

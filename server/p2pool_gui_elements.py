@@ -1803,7 +1803,8 @@ class RouterTab(QWidget):
         self.use_uplink_checkbox.setChecked(False)
         self.nat_os_checkbox = QCheckBox("Use OS Nat")
         self.nat_os_checkbox.setChecked(False)
-
+        self.python_server_checkbox = QCheckBox("Use Python Server")
+        self.python_server_checkbox.setChecked(False)
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
 
@@ -1866,6 +1867,7 @@ class RouterTab(QWidget):
 
         routing_grid.addWidget(self.use_uplink_checkbox, 2, 0)
         routing_grid.addWidget(self.nat_os_checkbox, 2, 1)
+        routing_grid.addWidget(self.python_server_checkbox, 2, 2)
 
         ip_row = QWidget()
         ip_layout = QHBoxLayout(ip_row)

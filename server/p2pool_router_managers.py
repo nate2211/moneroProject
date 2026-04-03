@@ -5686,6 +5686,954 @@ class TransportHTTPSManager:
             return meta
         except Exception:
             return None
+
+class TransportStratumManager:
+    """
+    Lightweight Stratum observer/logger for LAN and pool traffic.
+
+    Designed to fit the same style as your other transport managers.
+
+    Public API:
+        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+        snapshot_metrics() -> dict
+
+    Notes
+    -----
+    - Focuses on JSON-RPC / line-delimited Stratum messages.
+    - Handles common methods like:
+        mining.subscribe
+        mining.authorize
+        mining.notify
+        mining.set_difficulty
+        mining.set_extranonce
+        mining.submit
+        login
+        submit
+        job
+        keepalived
+    - Works well for Monero/XMRig-ish Stratum and Bitcoin-style Stratum.
+    - Keeps per-flow buffers so partial TCP segments still decode cleanly.
+    """
+
+    # ---- Tunables ----
+    LOG_RPS              = 1.0
+    LOG_BURST            = 80
+    FLOW_COOLDOWN_S      = 2.0
+    COOLDOWN_JITTER_S    = 0.35
+
+    FLOW_TTL_SEC         = 15 * 60
+    FLOW_SOFT_MAX        = 50_000
+    GC_PERIOD_SEC        = 60.0
+
+    MAX_BUF_PER_DIR      = 256 * 1024
+    MAX_LINE_BYTES       = 32 * 1024
+    MAX_MESSAGES_PER_PKT = 8
+    ASCII_PREVIEW_MAX    = 140
+
+    DEFAULT_PORTS        = {3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444}
+
+    class _TokenBucket:
+        __slots__ = ("capacity", "refill", "tokens", "last")
+
+        def __init__(self, capacity: int, refill_rate_per_s: float):
+            self.capacity = float(max(1, capacity))
+            self.refill = float(max(0.05, refill_rate_per_s))
+            self.tokens = float(self.capacity)
+            self.last = time.time()
+
+        def _refill(self):
+            now = time.time()
+            delta = now - self.last
+            if delta > 0:
+                self.tokens = min(self.capacity, self.tokens + delta * self.refill)
+                self.last = now
+
+        def allow(self, cost: float = 1.0) -> bool:
+            self._refill()
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
+
+    def __init__(
+        self,
+        logger,
+        *,
+        ports: Optional[set] = None,
+        log_rps: float = LOG_RPS,
+        log_burst: int = LOG_BURST,
+        flow_cooldown_s: float = FLOW_COOLDOWN_S,
+    ):
+        self.log = logger
+        self.ports = set(int(p) for p in (ports or self.DEFAULT_PORTS))
+        self._tb = self._TokenBucket(capacity=int(log_burst), refill_rate_per_s=float(log_rps))
+        self._flow_cool = float(flow_cooldown_s)
+
+        # canonical flow key -> state
+        self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._last_gc = time.time()
+
+        self._metrics = {
+            "seen": 0,
+            "flows": 0,
+            "json_msgs": 0,
+            "subscribe": 0,
+            "authorize": 0,
+            "notify": 0,
+            "set_difficulty": 0,
+            "set_extranonce": 0,
+            "submit": 0,
+            "login": 0,
+            "job": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+            "unknown": 0,
+        }
+
+        self._emit(f"[Transport][⛏️ Stratum] Manager ready. ports={sorted(self.ports)}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        try:
+            if TCP is None or not packet or not packet.haslayer(TCP):
+                return False
+
+            sport = int(sport)
+            dport = int(dport)
+
+            if not self._is_service_port(sport, dport):
+                return False
+
+            now = time.time()
+            iface = self._iface_suffix(inbound_iface)
+            fkey = self._flow_key(src_ip, sport, dst_ip, dport)
+            st = self._flows.get(fkey)
+            if st is None:
+                st = self._new_flow_state(src_ip, sport, dst_ip, dport, iface, now)
+                self._flows[fkey] = st
+                self._metrics["flows"] = len(self._flows)
+            else:
+                st["last"] = now
+
+            direction = self._direction_for_flow(st, src_ip, sport, dst_ip, dport)
+            payload = self._payload_sample(packet, cap=self.MAX_BUF_PER_DIR)
+
+            # Even if there is no payload, a connect event on a stratum port is still interesting.
+            if not payload:
+                if self._tcp_syn(packet) and self._should_log(st, importance="med"):
+                    self._emit(
+                        f"{self._prefix(st)} SYN {src_ip}:{sport} → {dst_ip}:{dport} on {iface}"
+                    )
+                self._maybe_gc(now)
+                self._metrics["seen"] += 1
+                return True
+
+            # Feed buffer and process complete lines.
+            buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
+            st[buf_key] = self._append_buf(st.get(buf_key, b""), payload)
+
+            lines, remain = self._split_lines(st[buf_key])
+            st[buf_key] = remain
+
+            processed = 0
+            for raw_line in lines:
+                if processed >= self.MAX_MESSAGES_PER_PKT:
+                    break
+
+                line = raw_line.strip(b"\r\n\t \x00")
+                if not line:
+                    continue
+                if len(line) > self.MAX_LINE_BYTES:
+                    line = line[: self.MAX_LINE_BYTES]
+
+                event = self._parse_line(line, st=st, direction=direction)
+                if event is None:
+                    # Only log unknown text occasionally.
+                    if self._should_log(st, importance="low"):
+                        preview = self._safe_ascii(line, self.ASCII_PREVIEW_MAX) or "-"
+                        self._emit(
+                            f"{self._prefix(st)} ? unknown dir={direction} "
+                            f"{src_ip}:{sport} ⇄ {dst_ip}:{dport} on {iface} preview={preview}"
+                        )
+                    self._metrics["unknown"] += 1
+                    processed += 1
+                    continue
+
+                self._update_state_from_event(st, event)
+                self._bump_metrics(event)
+
+                importance = event.get("importance", "med")
+                if self._should_log(st, importance=importance):
+                    self._log_event(st, event, src_ip, sport, dst_ip, dport, iface, direction)
+
+                processed += 1
+
+            self._maybe_gc(now)
+            self._metrics["seen"] += 1
+            return True
+
+        except Exception:
+            self._metrics["errors"] += 1
+            return False
+
+    def snapshot_metrics(self) -> dict:
+        snap = dict(self._metrics)
+        snap["flows"] = len(self._flows)
+        return snap
+
+    # ------------------------------------------------------------------
+    # Flow state
+    # ------------------------------------------------------------------
+    def _new_flow_state(self, src_ip: str, sport: int, dst_ip: str, dport: int, iface: str, now: float) -> Dict[str, Any]:
+        # If destination port is a known stratum port, assume src->dst is client->server.
+        if dport in self.ports:
+            client = (src_ip, int(sport))
+            server = (dst_ip, int(dport))
+        elif sport in self.ports:
+            client = (dst_ip, int(dport))
+            server = (src_ip, int(sport))
+        else:
+            # Fallback; deterministic but not perfect.
+            client = (src_ip, int(sport))
+            server = (dst_ip, int(dport))
+
+        return {
+            "first": now,
+            "last": now,
+            "last_log": 0.0,
+            "iface": iface,
+            "client": client,
+            "server": server,
+            "buf_c2s": b"",
+            "buf_s2c": b"",
+            "last_worker": None,
+            "last_job_id": None,
+            "last_height": None,
+            "last_diff": None,
+            "accepted": 0,
+            "rejected": 0,
+        }
+
+    def _direction_for_flow(self, st: Dict[str, Any], src_ip: str, sport: int, dst_ip: str, dport: int) -> str:
+        if st.get("client") == (src_ip, int(sport)):
+            return "c2s"
+        if st.get("server") == (src_ip, int(sport)):
+            return "s2c"
+
+        # Re-learn if needed.
+        if dport in self.ports:
+            st["client"] = (src_ip, int(sport))
+            st["server"] = (dst_ip, int(dport))
+            return "c2s"
+
+        if sport in self.ports:
+            st["client"] = (dst_ip, int(dport))
+            st["server"] = (src_ip, int(sport))
+            return "s2c"
+
+        return "c2s"
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+    def _parse_line(self, line: bytes, *, st: Dict[str, Any], direction: str) -> Optional[Dict[str, Any]]:
+        # Primary path: JSON object per line
+        obj = self._try_json(line)
+        if isinstance(obj, dict):
+            return self._parse_json_rpc(obj, line, st=st, direction=direction)
+
+        # Secondary path: loose text detection
+        text = self._safe_ascii(line, self.ASCII_PREVIEW_MAX) or ""
+        low = text.lower()
+
+        for needle in (
+            "mining.subscribe",
+            "mining.authorize",
+            "mining.notify",
+            "mining.set_difficulty",
+            "mining.set_extranonce",
+            "mining.submit",
+            "\"login\"",
+            "\"submit\"",
+            "\"job\"",
+            "\"keepalived\"",
+        ):
+            if needle in low:
+                return {
+                    "kind": "text",
+                    "label": needle.replace('"', ""),
+                    "preview": text,
+                    "importance": "med",
+                }
+
+        return None
+
+    def _parse_json_rpc(
+        self,
+        obj: Dict[str, Any],
+        raw_line: bytes,
+        *,
+        st: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        method = self._safe_text(obj.get("method"))
+        ident = obj.get("id")
+        params = obj.get("params")
+        result = obj.get("result")
+        error = obj.get("error")
+
+        # ---- Explicit method path ----
+        if method:
+            m = method.lower()
+
+            if m == "mining.subscribe":
+                worker = self._extract_worker(params)
+                return {
+                    "kind": "subscribe",
+                    "method": method,
+                    "id": ident,
+                    "worker": worker,
+                    "importance": "med",
+                }
+
+            if m == "mining.authorize":
+                worker = self._extract_worker(params)
+                return {
+                    "kind": "authorize",
+                    "method": method,
+                    "id": ident,
+                    "worker": worker,
+                    "importance": "med",
+                }
+
+            if m == "mining.submit":
+                worker, job_id, nonce = self._extract_submit_fields(params)
+                return {
+                    "kind": "submit",
+                    "method": method,
+                    "id": ident,
+                    "worker": worker,
+                    "job_id": job_id,
+                    "nonce": nonce,
+                    "importance": "high",
+                }
+
+            if m == "mining.notify":
+                job_id, clean_jobs, height = self._extract_notify_fields(params)
+                return {
+                    "kind": "notify",
+                    "method": method,
+                    "job_id": job_id,
+                    "clean_jobs": clean_jobs,
+                    "height": height,
+                    "importance": "high",
+                }
+
+            if m == "mining.set_difficulty":
+                diff = self._extract_first_scalar(params)
+                return {
+                    "kind": "set_difficulty",
+                    "method": method,
+                    "difficulty": diff,
+                    "importance": "med",
+                }
+
+            if m == "mining.set_extranonce":
+                extra = self._extract_first_scalar(params)
+                return {
+                    "kind": "set_extranonce",
+                    "method": method,
+                    "extranonce": extra,
+                    "importance": "med",
+                }
+
+            if m == "login":
+                worker = self._extract_login_name(params)
+                agent = self._extract_agent(params)
+                return {
+                    "kind": "login",
+                    "method": method,
+                    "worker": worker,
+                    "agent": agent,
+                    "id": ident,
+                    "importance": "med",
+                }
+
+            if m == "submit":
+                worker, job_id, nonce = self._extract_monero_submit(params)
+                return {
+                    "kind": "submit",
+                    "method": method,
+                    "worker": worker,
+                    "job_id": job_id,
+                    "nonce": nonce,
+                    "id": ident,
+                    "importance": "high",
+                }
+
+            if m == "keepalived":
+                return {
+                    "kind": "keepalive",
+                    "method": method,
+                    "id": ident,
+                    "importance": "low",
+                }
+
+            if m == "job":
+                job_id, height = self._extract_job_result(result or params)
+                return {
+                    "kind": "job",
+                    "method": method,
+                    "job_id": job_id,
+                    "height": height,
+                    "importance": "high",
+                }
+
+            return {
+                "kind": "rpc",
+                "method": method,
+                "id": ident,
+                "preview": self._safe_ascii(raw_line, self.ASCII_PREVIEW_MAX),
+                "importance": "low",
+            }
+
+        # ---- Response / result path ----
+        if error:
+            code, msg = self._extract_error(error)
+            return {
+                "kind": "error",
+                "code": code,
+                "message": msg,
+                "id": ident,
+                "importance": "high",
+            }
+
+        if isinstance(result, bool):
+            return {
+                "kind": "result_bool",
+                "accepted": bool(result),
+                "id": ident,
+                "importance": "high" if not result else "med",
+            }
+
+        if isinstance(result, dict):
+            # Monero-ish login/job result
+            if any(k in result for k in ("job", "job_id", "blob", "target", "height")):
+                job_id, height = self._extract_job_result(result)
+                return {
+                    "kind": "job",
+                    "job_id": job_id,
+                    "height": height,
+                    "id": ident,
+                    "importance": "high",
+                }
+
+            # subscribe authorize-ish reply
+            if "status" in result or "id" in result:
+                return {
+                    "kind": "result_obj",
+                    "id": ident,
+                    "status": self._safe_text(result.get("status")),
+                    "preview": self._safe_ascii(raw_line, self.ASCII_PREVIEW_MAX),
+                    "importance": "med",
+                }
+
+        return {
+            "kind": "json",
+            "id": ident,
+            "preview": self._safe_ascii(raw_line, self.ASCII_PREVIEW_MAX),
+            "importance": "low",
+        }
+
+    # ------------------------------------------------------------------
+    # Event/state
+    # ------------------------------------------------------------------
+    def _update_state_from_event(self, st: Dict[str, Any], event: Dict[str, Any]) -> None:
+        kind = event.get("kind")
+
+        worker = event.get("worker")
+        if worker:
+            st["last_worker"] = worker
+
+        job_id = event.get("job_id")
+        if job_id:
+            st["last_job_id"] = job_id
+
+        height = event.get("height")
+        if height is not None:
+            st["last_height"] = height
+
+        diff = event.get("difficulty")
+        if diff is not None:
+            st["last_diff"] = diff
+
+        if kind == "result_bool":
+            if event.get("accepted"):
+                st["accepted"] = int(st.get("accepted", 0)) + 1
+            else:
+                st["rejected"] = int(st.get("rejected", 0)) + 1
+
+        if kind == "error":
+            st["rejected"] = int(st.get("rejected", 0)) + 1
+
+    def _bump_metrics(self, event: Dict[str, Any]) -> None:
+        self._metrics["json_msgs"] += 1
+        kind = event.get("kind")
+
+        if kind == "subscribe":
+            self._metrics["subscribe"] += 1
+        elif kind == "authorize":
+            self._metrics["authorize"] += 1
+        elif kind == "notify":
+            self._metrics["notify"] += 1
+        elif kind == "set_difficulty":
+            self._metrics["set_difficulty"] += 1
+        elif kind == "set_extranonce":
+            self._metrics["set_extranonce"] += 1
+        elif kind == "submit":
+            self._metrics["submit"] += 1
+        elif kind == "login":
+            self._metrics["login"] += 1
+        elif kind == "job":
+            self._metrics["job"] += 1
+        elif kind == "result_bool":
+            if event.get("accepted"):
+                self._metrics["accepted"] += 1
+            else:
+                self._metrics["rejected"] += 1
+        elif kind == "error":
+            self._metrics["rejected"] += 1
+        elif kind in ("json", "rpc", "text", "result_obj", "keepalive"):
+            pass
+        else:
+            self._metrics["unknown"] += 1
+
+    def _log_event(
+        self,
+        st: Dict[str, Any],
+        event: Dict[str, Any],
+        src_ip: str,
+        sport: int,
+        dst_ip: str,
+        dport: int,
+        iface: str,
+        direction: str,
+    ) -> None:
+        base = (
+            f"{self._prefix(st)} {src_ip}:{sport} ⇄ {dst_ip}:{dport} on {iface}"
+        )
+
+        kind = event.get("kind")
+
+        if kind == "subscribe":
+            self._emit(
+                f"{base} | 👋 SUBSCRIBE worker={event.get('worker') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        if kind == "authorize":
+            self._emit(
+                f"{base} | 🔐 AUTHORIZE worker={event.get('worker') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        if kind == "login":
+            self._emit(
+                f"{base} | 🪪 LOGIN worker={event.get('worker') or '-'} "
+                f"agent={event.get('agent') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        if kind == "submit":
+            self._emit(
+                f"{base} | 📤 SUBMIT worker={event.get('worker') or st.get('last_worker') or '-'} "
+                f"job={event.get('job_id') or st.get('last_job_id') or '-'} "
+                f"nonce={event.get('nonce') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        if kind == "notify":
+            self._emit(
+                f"{base} | 🧱 JOB-NOTIFY job={event.get('job_id') or '-'} "
+                f"height={event.get('height') if event.get('height') is not None else '-'} "
+                f"clean={event.get('clean_jobs') if event.get('clean_jobs') is not None else '-'}"
+            )
+            return
+
+        if kind == "job":
+            self._emit(
+                f"{base} | ⛏️ JOB job={event.get('job_id') or '-'} "
+                f"height={event.get('height') if event.get('height') is not None else '-'}"
+            )
+            return
+
+        if kind == "set_difficulty":
+            self._emit(
+                f"{base} | ⚖ DIFFICULTY diff={event.get('difficulty') or '-'}"
+            )
+            return
+
+        if kind == "set_extranonce":
+            self._emit(
+                f"{base} | 🧬 EXTRANONCE value={event.get('extranonce') or '-'}"
+            )
+            return
+
+        if kind == "result_bool":
+            if event.get("accepted"):
+                self._emit(
+                    f"{base} | ✅ ACCEPT id={event.get('id')!r} "
+                    f"accepted={st.get('accepted', 0)} rejected={st.get('rejected', 0)}"
+                )
+            else:
+                self._emit(
+                    f"{base} | ❌ REJECT id={event.get('id')!r} "
+                    f"accepted={st.get('accepted', 0)} rejected={st.get('rejected', 0)}"
+                )
+            return
+
+        if kind == "error":
+            self._emit(
+                f"{base} | ⛔ ERROR id={event.get('id')!r} "
+                f"code={event.get('code')!r} msg={event.get('message') or '-'}"
+            )
+            return
+
+        if kind == "keepalive":
+            self._emit(f"{base} | 💓 KEEPALIVE id={event.get('id')!r}")
+            return
+
+        if kind == "result_obj":
+            self._emit(
+                f"{base} | 📦 RESULT status={event.get('status') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        if kind == "rpc":
+            self._emit(
+                f"{base} | 📡 RPC method={event.get('method') or '-'} id={event.get('id')!r}"
+            )
+            return
+
+        preview = event.get("preview") or "-"
+        label = event.get("label") or kind or "unknown"
+        self._emit(f"{base} | ? {label} dir={direction} preview={preview}")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _is_service_port(self, sport: int, dport: int) -> bool:
+        return int(sport) in self.ports or int(dport) in self.ports
+
+    def _payload_sample(self, packet, cap: int = 8192) -> bytes:
+        try:
+            if Raw is not None and packet.haslayer(Raw):
+                return bytes(packet[Raw].load or b"")[:cap]
+        except Exception:
+            pass
+
+        try:
+            l4 = packet.getlayer(TCP)
+            if l4 is not None:
+                pl = getattr(l4, "payload", None)
+                if pl:
+                    return bytes(pl)[:cap]
+        except Exception:
+            pass
+
+        return b""
+
+    def _split_lines(self, buf: bytes) -> Tuple[List[bytes], bytes]:
+        if not buf:
+            return [], b""
+
+        # Stratum is normally line-delimited JSON.
+        parts = buf.split(b"\n")
+        if len(parts) == 1:
+            return [], buf[-self.MAX_BUF_PER_DIR:]
+
+        complete = parts[:-1]
+        remain = parts[-1]
+        return complete[-self.MAX_MESSAGES_PER_PKT :], remain[-self.MAX_BUF_PER_DIR :]
+
+    def _append_buf(self, cur: bytes, new: bytes) -> bytes:
+        data = (cur or b"") + (new or b"")
+        if len(data) > self.MAX_BUF_PER_DIR:
+            data = data[-self.MAX_BUF_PER_DIR :]
+        return data
+
+    def _try_json(self, line: bytes) -> Optional[Any]:
+        try:
+            if not line:
+                return None
+            if line[:1] not in (b"{", b"["):
+                return None
+            return json.loads(line.decode("utf-8", "ignore"))
+        except Exception:
+            return None
+
+    def _extract_worker(self, params: Any) -> Optional[str]:
+        if isinstance(params, list) and params:
+            for item in params:
+                if isinstance(item, str) and item:
+                    return item
+        if isinstance(params, dict):
+            for key in ("login", "worker", "user", "username", "address"):
+                val = params.get(key)
+                if isinstance(val, str) and val:
+                    return val
+        return None
+
+    def _extract_login_name(self, params: Any) -> Optional[str]:
+        if isinstance(params, dict):
+            for key in ("login", "worker", "user", "username", "address"):
+                val = params.get(key)
+                if isinstance(val, str) and val:
+                    return val
+        return self._extract_worker(params)
+
+    def _extract_agent(self, params: Any) -> Optional[str]:
+        if isinstance(params, dict):
+            for key in ("agent", "rigid", "rig_id", "client"):
+                val = params.get(key)
+                if isinstance(val, str) and val:
+                    return val
+        return None
+
+    def _extract_submit_fields(self, params: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        worker = None
+        job_id = None
+        nonce = None
+
+        if isinstance(params, list):
+            if len(params) >= 1 and isinstance(params[0], str):
+                worker = params[0]
+            if len(params) >= 2:
+                job_id = self._safe_text(params[1])
+            if len(params) >= 3:
+                nonce = self._safe_text(params[2])
+
+        elif isinstance(params, dict):
+            worker = self._extract_worker(params)
+            for k in ("job_id", "job", "id"):
+                if params.get(k) is not None:
+                    job_id = self._safe_text(params.get(k))
+                    break
+            for k in ("nonce", "extra_nonce", "extranonce2"):
+                if params.get(k) is not None:
+                    nonce = self._safe_text(params.get(k))
+                    break
+
+        return worker, job_id, nonce
+
+    def _extract_monero_submit(self, params: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        worker = None
+        job_id = None
+        nonce = None
+
+        if isinstance(params, dict):
+            worker = self._extract_worker(params)
+            for k in ("job_id", "job", "id"):
+                if params.get(k) is not None:
+                    job_id = self._safe_text(params.get(k))
+                    break
+            for k in ("nonce",):
+                if params.get(k) is not None:
+                    nonce = self._safe_text(params.get(k))
+                    break
+
+        elif isinstance(params, list):
+            worker, job_id, nonce = self._extract_submit_fields(params)
+
+        return worker, job_id, nonce
+
+    def _extract_notify_fields(self, params: Any) -> Tuple[Optional[str], Optional[bool], Optional[int]]:
+        job_id = None
+        clean_jobs = None
+        height = None
+
+        if isinstance(params, list):
+            if len(params) >= 1:
+                job_id = self._safe_text(params[0])
+            if len(params) >= 9:
+                try:
+                    clean_jobs = bool(params[8])
+                except Exception:
+                    clean_jobs = None
+
+        elif isinstance(params, dict):
+            for k in ("job_id", "job", "id"):
+                if params.get(k) is not None:
+                    job_id = self._safe_text(params.get(k))
+                    break
+            if "clean_jobs" in params:
+                try:
+                    clean_jobs = bool(params.get("clean_jobs"))
+                except Exception:
+                    clean_jobs = None
+            if "height" in params:
+                try:
+                    height = int(params.get("height"))
+                except Exception:
+                    height = None
+
+        return job_id, clean_jobs, height
+
+    def _extract_job_result(self, result: Any) -> Tuple[Optional[str], Optional[int]]:
+        job_id = None
+        height = None
+
+        src = result
+        if isinstance(result, dict) and isinstance(result.get("job"), dict):
+            src = result["job"]
+
+        if isinstance(src, dict):
+            for k in ("job_id", "job", "id"):
+                if src.get(k) is not None and not isinstance(src.get(k), dict):
+                    job_id = self._safe_text(src.get(k))
+                    break
+            if "height" in src:
+                try:
+                    height = int(src.get("height"))
+                except Exception:
+                    height = None
+
+        return job_id, height
+
+    def _extract_error(self, error: Any) -> Tuple[Optional[Any], Optional[str]]:
+        if isinstance(error, dict):
+            return error.get("code"), self._safe_text(error.get("message"))
+        if isinstance(error, list) and error:
+            code = error[0] if len(error) >= 1 else None
+            msg = self._safe_text(error[1]) if len(error) >= 2 else None
+            return code, msg
+        return None, self._safe_text(error)
+
+    def _extract_first_scalar(self, params: Any) -> Optional[str]:
+        if isinstance(params, list) and params:
+            return self._safe_text(params[0])
+        if isinstance(params, dict):
+            for v in params.values():
+                return self._safe_text(v)
+        return None
+
+    def _should_log(self, st: Dict[str, Any], importance: str) -> bool:
+        now = time.time()
+        last_ok = float(st.get("last_log", 0.0) or 0.0)
+        if now < last_ok:
+            return False
+
+        cost = 1.0 if importance == "high" else (1.5 if importance == "med" else 3.0)
+        allowed = self._tb.allow(cost=cost)
+        if not allowed:
+            return False
+
+        jitter = (random.random() - 0.5) * 2.0 * self.COOLDOWN_JITTER_S
+        st["last_log"] = now + self._flow_cool + jitter
+        return True
+
+    def _maybe_gc(self, now: float) -> None:
+        if (now - self._last_gc) < self.GC_PERIOD_SEC:
+            return
+
+        ttl = self.FLOW_TTL_SEC
+        stale = [k for k, v in self._flows.items() if (now - float(v.get("last", now))) > ttl]
+        for k in stale:
+            self._flows.pop(k, None)
+
+        if len(self._flows) > self.FLOW_SOFT_MAX:
+            excess = len(self._flows) - self.FLOW_SOFT_MAX
+            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:excess]
+            for k, _ in victims:
+                self._flows.pop(k, None)
+
+        self._metrics["flows"] = len(self._flows)
+        self._last_gc = now
+
+    def _prefix(self, st: Dict[str, Any]) -> str:
+        client = st.get("client")
+        server = st.get("server")
+
+        client_txt = f"{client[0]}:{client[1]}" if client else "?:?"
+        server_txt = f"{server[0]}:{server[1]}" if server else "?:?"
+
+        lane = "LAN" if self._is_private_pair(client, server) else "WAN"
+        return f"[Transport][🧵 TCP][⛏️ Stratum][{lane}] {client_txt} ⇄ {server_txt}"
+
+    def _is_private_pair(self, a: Any, b: Any) -> bool:
+        try:
+            if not a or not b:
+                return False
+            return self._is_private_ip(a[0]) and self._is_private_ip(b[0])
+        except Exception:
+            return False
+
+    def _is_private_ip(self, ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(str(ip)).is_private
+        except Exception:
+            return False
+
+    def _tcp_syn(self, packet) -> bool:
+        try:
+            l4 = packet.getlayer(TCP)
+            if l4 is None:
+                return False
+            flags = getattr(l4, "flags", 0)
+            if hasattr(flags, "value"):
+                fv = int(flags.value)
+                return bool(fv & 0x02) and not bool(fv & 0x10)
+            s = str(flags)
+            return ("S" in s) and ("A" not in s)
+        except Exception:
+            return False
+
+    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple[str, str, str, str]:
+        a = (str(src_ip), str(int(sport)))
+        b = (str(dst_ip), str(int(dport)))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second
+
+    def _iface_suffix(self, inbound_iface: Optional[str]) -> str:
+        try:
+            return (inbound_iface or "?").split("_")[-1]
+        except Exception:
+            return inbound_iface or "?"
+
+    def _safe_text(self, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        try:
+            s = str(v)
+        except Exception:
+            return None
+        return s if s else None
+
+    def _safe_ascii(self, b: Any, maxlen: int = 120) -> Optional[str]:
+        if b is None:
+            return None
+
+        if isinstance(b, bytes):
+            s = b.decode("utf-8", "ignore")
+        else:
+            try:
+                s = str(b)
+            except Exception:
+                return None
+
+        s = "".join(ch for ch in s if ch >= " " or ch == "\t")
+        if len(s) > maxlen:
+            s = s[:maxlen] + "…"
+        return s or None
+
+    def _emit(self, msg: str) -> None:
+        try:
+            self.log.log_message(msg)
+        except Exception:
+            pass
 class TransportMoneroManager:
     """
     Unified Monero + P2Pool transport observer + policy engine.
@@ -5693,11 +6641,13 @@ class TransportMoneroManager:
     Public API:
       handle(pkt, src, dst, sport, dport, inbound_iface) -> 'allow' | 'deny'
 
-    This rewrite keeps the old Monero logs but adds:
-      - P2Pool-aware flow prefixes on 37888/37889
-      - Levin-specific logs under the Monero prefix
-      - Mining-relevant logs under the Monero prefix
-      - Heuristic P2Pool raw-payload classification when Levin framing is absent/incomplete
+    This rewrite keeps the existing transport/RPC/Levin behavior but also adds:
+      - richer raw P2Pool classification for non-Levin frames
+      - semantic P2Pool mining events instead of only one-off log strings
+      - p2pool_mining_runtime peer/session state
+      - p2pool_mining dispatch dictionary for packet-driven mining intelligence
+      - conservative active participation only where already supported
+        (for example Levin ping responses when TX is available)
     """
 
     _HTTP_EOL = b"\r\n"
@@ -5705,32 +6655,41 @@ class TransportMoneroManager:
     _HDR_DELIM_2 = b"\n\n"  # tolerate LF-only peers
 
     # -------- Ports --------
-    DEFAULT_P2P_PORTS    = {18080, 28080, 38080}
-    DEFAULT_RPC_PORTS    = {18081, 28081, 38081}
+    DEFAULT_P2P_PORTS = {18080, 28080, 38080}
+    DEFAULT_RPC_PORTS = {18081, 28081, 38081}
     DEFAULT_P2POOL_PORTS = {37888, 37889}
 
     # -------- Tunables / Budgets --------
-    FLOW_TTL_SEC        = 15 * 60
-    FLOW_SOFT_MAX       = 50_000
-    RL_WINDOW_SEC       = 3.0
-    GC_PERIOD_SEC       = 60
-    RPC_BUF_MAX         = 256 * 1024
-    RPC_HDR_MAX         = 4096
-    RPC_JSON_MAX        = 32 * 1024
-    PROGRESS_PKT_STEP   = 50
-    PROGRESS_BYTES_SET  = {1024, 4096, 16384, 65536, 262144}
+    FLOW_TTL_SEC = 15 * 60
+    FLOW_SOFT_MAX = 50_000
+    RL_WINDOW_SEC = 3.0
+    GC_PERIOD_SEC = 60
+    RPC_BUF_MAX = 256 * 1024
+    RPC_HDR_MAX = 4096
+    RPC_JSON_MAX = 32 * 1024
+    PROGRESS_PKT_STEP = 50
+    PROGRESS_BYTES_SET = {1024, 4096, 16384, 65536, 262144}
     LEVIN_LOG_BURST_MAX = 8
-    P2POOL_BUF_MAX      = 512 * 1024
-    P2POOL_FRAME_BURST  = 8
+    P2POOL_BUF_MAX = 512 * 1024
+    P2POOL_FRAME_BURST = 8
+
+    # -------- Richer raw P2Pool classification --------
+    P2POOL_EVENT_COOLDOWN_SEC = 8.0
+    P2POOL_MINING_EVENT_COOLDOWN_SEC = 20.0
+    P2POOL_COMPACT_PEER_MARKER = b"\x00" * 10 + b"\xff\xff"
+    P2POOL_SMALL_OPEN_MAX = 96
+    P2POOL_SHARE_MIN = 96
+    P2POOL_BLOCK_MIN = 2048
+    P2POOL_BLOCK_HUGE = 8192
 
     # -------- Levin constants --------
-    _LEVIN_SIG   = 0x0101010101010101
+    _LEVIN_SIG = 0x0101010101010101
     _LEVIN_BEGIN = 0x01
-    _LEVIN_END   = 0x02
-    _LEVIN_REQ   = 0x04
-    _LEVIN_RSP   = 0x08
-    _LEVIN_OK    = 1
-    _CMD_PING    = 1000
+    _LEVIN_END = 0x02
+    _LEVIN_REQ = 0x04
+    _LEVIN_RSP = 0x08
+    _LEVIN_OK = 1
+    _CMD_PING = 1000
 
     # Mining-beneficial Monero commands
     _MINING_BENEFIT_MONERO_CMDS = {
@@ -5749,26 +6708,35 @@ class TransportMoneroManager:
 
     # -------- HTTP detection --------
     _HTTP_START_RE = re.compile(
-        rb"^(OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/\d\.\d\r?\n", re.I
+        rb"^(OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/\d\.\d\r?\n",
+        re.I,
     )
 
     class _LevinMessage:
         __slots__ = (
-            "cmd", "flags", "ret", "pv", "cb", "payload",
-            "begin", "end", "req", "rsp"
+            "cmd",
+            "flags",
+            "ret",
+            "pv",
+            "cb",
+            "payload",
+            "begin",
+            "end",
+            "req",
+            "rsp",
         )
 
         def __init__(self, cmd: int, flags: int, ret: int, pv: int, cb: int, payload: bytes):
-            self.cmd     = cmd
-            self.flags   = flags
-            self.ret     = ret
-            self.pv      = pv
-            self.cb      = cb
+            self.cmd = cmd
+            self.flags = flags
+            self.ret = ret
+            self.pv = pv
+            self.cb = cb
             self.payload = payload
-            self.begin   = bool(flags & TransportMoneroManager._LEVIN_BEGIN)
-            self.end     = bool(flags & TransportMoneroManager._LEVIN_END)
-            self.req     = bool(flags & TransportMoneroManager._LEVIN_REQ)
-            self.rsp     = bool(flags & TransportMoneroManager._LEVIN_RSP)
+            self.begin = bool(flags & TransportMoneroManager._LEVIN_BEGIN)
+            self.end = bool(flags & TransportMoneroManager._LEVIN_END)
+            self.req = bool(flags & TransportMoneroManager._LEVIN_REQ)
+            self.rsp = bool(flags & TransportMoneroManager._LEVIN_RSP)
 
         def kind(self) -> str:
             return "REQ" if self.req else ("RSP" if self.rsp else "DATA")
@@ -5777,9 +6745,10 @@ class TransportMoneroManager:
         """
         Minimal Levin bucket_head2 parser (little-endian, 33-byte header).
         """
-        SIG  = 0x0101010101010101
+
+        SIG = 0x0101010101010101
         HLEN = 33
-        HFMT = "<QQBIiII"          # sig, cb, unused, cmd, ret, flags, pv
+        HFMT = "<QQBIiII"  # sig, cb, unused, cmd, ret, flags, pv
         CB_MAX = 16 * 1024 * 1024
 
         CMD_NAMES = {
@@ -5834,7 +6803,7 @@ class TransportMoneroManager:
                 if len(mv) - off < need:
                     break
 
-                payload = bytes(mv[off + self.HLEN: off + need])
+                payload = bytes(mv[off + self.HLEN : off + need])
                 out.append(
                     TransportMoneroManager._LevinMessage(
                         cmd=cmd,
@@ -5862,7 +6831,7 @@ class TransportMoneroManager:
         flow_idle_timeout: int = FLOW_TTL_SEC,
         msg_rate_window: float = RL_WINDOW_SEC,
         p2p_auto_reply_ping: bool = True,
-        tx_cb: Optional[callable] = None,
+        tx_cb: Optional[Callable[..., Any]] = None,
     ):
         self.logger = logger
         self.max_payload_sample = int(max_payload_sample)
@@ -5882,7 +6851,7 @@ class TransportMoneroManager:
         if extra_rpc_ports:
             self._rpc_ports.update(int(p) for p in extra_rpc_ports if self._is_valid_port(p))
 
-        self._flows: dict = {}
+        self._flows: Dict[Any, dict] = {}
         self._recent_msgs = defaultdict(float)
         self._recent_msg_window = float(msg_rate_window)
 
@@ -5890,7 +6859,35 @@ class TransportMoneroManager:
         self._tx_cb = tx_cb
         self._last_gc = time.time()
 
-        self.logger.log_message("[Transport][🪙 Monero] Manager ready.")
+        # -------- packet-driven P2Pool mining intelligence --------
+        self.p2pool_mining_runtime: Dict[str, Any] = {
+            "peer_cache": {},
+            "peer_candidates": {},
+            "sessions": {},
+            "last_peerlist_ts": 0.0,
+            "last_share_ts": 0.0,
+            "last_block_ts": 0.0,
+            "last_sync_ts": 0.0,
+            "freshness_score": 0.0,
+            "stale_risk": 0.0,
+            "counts": defaultdict(int),
+            "recent_events": deque(maxlen=256),
+        }
+
+        self.p2pool_mining: Dict[str, Callable[..., None]] = {
+            "handshake": self._pm_on_handshake,
+            "timed_sync": self._pm_on_timed_sync,
+            "peerlist": self._pm_on_peerlist,
+            "share": self._pm_on_share,
+            "chain": self._pm_on_chain,
+            "chain_object": self._pm_on_chain_object,
+            "block": self._pm_on_block,
+            "ping": self._pm_on_ping,
+            "missing_tx": self._pm_on_missing_tx,
+            "unknown": self._pm_on_unknown,
+        }
+
+        self._emit_log("[Transport][🪙 Monero] Manager ready.")
 
     # ========== Public entrypoint ==========
     def handle(self, pkt, src, dst, sport, dport, inbound_iface) -> str:
@@ -5973,16 +6970,17 @@ class TransportMoneroManager:
         flags = self._tcp_flags(pkt)
         payload_len = len(self._get_payload_bytes(pkt))
 
-        f["last_seen"]  = now
+        f["last_seen"] = now
         f["last_iface"] = iface
-        f["pkts"]       = f.get("pkts", 0) + 1
-        f["bytes"]      = f.get("bytes", 0) + payload_len
+        f["pkts"] = f.get("pkts", 0) + 1
+        f["bytes"] = f.get("bytes", 0) + payload_len
         f["last_flags"] = flags
-        f["last_pkt"]   = pkt
+        f["last_pkt"] = pkt
 
         d = self._pkt_dir(f, pkt)
         if d:
             f["last_dir"] = d
+            f["p2pool_last_direction"] = d
 
         st = f.get("state", "INIT")
 
@@ -6054,6 +7052,15 @@ class TransportMoneroManager:
             "p2pool_seen_peerlist": False,
             "p2pool_seen_share": False,
             "p2pool_seen_block": False,
+            "p2pool_seen_timed_sync": False,
+            "p2pool_seen_chain": False,
+            "p2pool_seen_ping": False,
+            "p2pool_peer_candidates": [],
+            "p2pool_last_remote": None,
+            "p2pool_last_len_bucket": None,
+            "p2pool_event_ts": {},
+            "p2pool_mining_last_key": None,
+            "p2pool_last_direction": None,
 
             # Optional TX sockets
             "client_sock": None,
@@ -6085,7 +7092,7 @@ class TransportMoneroManager:
         plen = len(payload)
 
         if plen > 0 and f["first_sample"] is None:
-            sample = payload[:self.max_payload_sample]
+            sample = payload[: self.max_payload_sample]
             f["first_sample"] = sample
             f["entropy"] = self._byte_entropy(sample)
             self._log_first_data(f, sample, iface)
@@ -6097,6 +7104,7 @@ class TransportMoneroManager:
             direction = self._pkt_dir(f, pkt) or f.get("last_dir")
             if direction:
                 f["last_dir"] = direction
+                f["p2pool_last_direction"] = direction
             self._p2p_feed_and_log(f, payload, iface, direction)
 
         self._maybe_progress_log(f)
@@ -6154,6 +7162,7 @@ class TransportMoneroManager:
             f"{self._transport_prefix(f)} {reason} ✂ {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface} "
             f"(flags={flags}, by={who}, dur={dur:.1f}s, bytes={f.get('bytes', 0)}, pkts={f.get('pkts', 0)})"
         )
+        self._pm_on_flow_close(flow=f, iface=iface, reason=reason)
 
     def _log_first_data(self, f, sample: bytes, iface: str):
         a, b = f["endpoints"]
@@ -6209,7 +7218,7 @@ class TransportMoneroManager:
             buf = f["rpc_buf_c2s"]
             buf += payload
             if len(buf) > self.RPC_BUF_MAX:
-                del buf[:len(buf) - self.RPC_BUF_MAX]
+                del buf[: len(buf) - self.RPC_BUF_MAX]
 
             msgs, remain = self._split_http_messages(buf)
             f["rpc_buf_c2s"] = remain
@@ -6244,7 +7253,7 @@ class TransportMoneroManager:
             buf = f["rpc_buf_s2c"]
             buf += payload
             if len(buf) > self.RPC_BUF_MAX:
-                del buf[:len(buf) - self.RPC_BUF_MAX]
+                del buf[: len(buf) - self.RPC_BUF_MAX]
 
             msgs, remain = self._split_http_messages(buf)
             f["rpc_buf_s2c"] = remain
@@ -6274,6 +7283,7 @@ class TransportMoneroManager:
         try:
             if direction:
                 f["last_dir"] = direction
+                f["p2pool_last_direction"] = direction
 
             if f.get("p2p_parser") is None:
                 f["p2p_parser"] = TransportMoneroManager._LevinParser()
@@ -6306,14 +7316,12 @@ class TransportMoneroManager:
                     flags_txt = ",".join(bits) if bits else "-"
                     preview = (m.payload[:24].hex() + ("…" if m.cb > 24 else "")) if m.cb else "-"
 
-                    # Preserve old Monero flow log style
                     self._rl_log(
                         f"{self._transport_prefix(f)} {m.kind()} {name} flags={flags_txt} "
                         f"ret={m.ret} pv={m.pv} len={m.cb} preview={preview} "
                         f"{a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
                     )
 
-                    # Add Levin-specific log after Monero prefix
                     self._rl_log(
                         f"{self._levin_prefix(f)} {m.kind()} cmd={m.cmd} name={name} "
                         f"flags={flags_txt} ret={m.ret} pv={m.pv} len={m.cb} preview={preview}"
@@ -6335,6 +7343,23 @@ class TransportMoneroManager:
                             flags_txt=flags_txt,
                             preview=preview,
                             iface=iface,
+                        )
+                        self._pm_dispatch(
+                            label,
+                            flow=f,
+                            iface=iface,
+                            source="levin",
+                            payload_len=m.cb,
+                            detail=name,
+                            meta={
+                                "flags": flags_txt,
+                                "pv": m.pv,
+                                "ret": m.ret,
+                                "cmd": m.cmd,
+                                "preview": preview,
+                                "direction": direction or f.get("last_dir"),
+                            },
+                            levin_msg=m,
                         )
 
                     self._maybe_reply_ping(f, m, iface)
@@ -6368,8 +7393,16 @@ class TransportMoneroManager:
             return "ping"
         return "unknown"
 
-    def _log_p2pool_levin_event(self, f: dict, m: "_LevinMessage", label: str, name: str,
-                                flags_txt: str, preview: str, iface: str) -> None:
+    def _log_p2pool_levin_event(
+        self,
+        f: dict,
+        m: "_LevinMessage",
+        label: str,
+        name: str,
+        flags_txt: str,
+        preview: str,
+        iface: str,
+    ) -> None:
         a, b = f["endpoints"]
         self._rl_log(
             f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} {m.kind()} name={name} flags={flags_txt} "
@@ -6381,19 +7414,11 @@ class TransportMoneroManager:
         f["p2pool_last_label"] = label
         f["p2pool_last_preview"] = preview
         f["p2pool_last_detail"] = name
+        self._update_p2pool_seen_flags(f, label)
 
-        if label == "handshake":
-            f["p2pool_seen_handshake"] = True
-        elif label == "peerlist":
-            f["p2pool_seen_peerlist"] = True
-        elif label == "share":
-            f["p2pool_seen_share"] = True
-        elif label == "block":
-            f["p2pool_seen_block"] = True
-
-    def _p2pool_feed_non_levin_and_log(self, f: dict, payload: bytes, iface: str,
-                                       direction: Optional[str]) -> None:
-        dir_key = "p2pool_buf_a2b" if (direction or f.get("last_dir")) == "a2b" else "p2pool_buf_b2a"
+    def _p2pool_feed_non_levin_and_log(self, f: dict, payload: bytes, iface: str, direction: Optional[str]) -> None:
+        dir_name = direction or f.get("last_dir") or "a2b"
+        dir_key = "p2pool_buf_a2b" if dir_name == "a2b" else "p2pool_buf_b2a"
         buf = f.get(dir_key)
         if buf is None:
             buf = bytearray()
@@ -6401,37 +7426,69 @@ class TransportMoneroManager:
 
         buf += payload
         if len(buf) > self.P2POOL_BUF_MAX:
-            del buf[:len(buf) - self.P2POOL_BUF_MAX]
+            del buf[: len(buf) - self.P2POOL_BUF_MAX]
 
-        label, detail = self._classify_p2pool_payload(bytes(buf))
-        preview = self._short_hex(bytes(buf[:48]), 48)
+        snap = bytes(buf)
+        label, detail, meta = self._classify_p2pool_payload_richer(f, snap, dir_name)
+        preview = self._short_hex(snap[:48], 48)
+        bucket = meta.get("len_bucket") or self._len_bucket(len(snap))
+        peers = meta.get("peers") or []
         a, b = f["endpoints"]
 
-        self._rl_log(
-            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} RAW len={len(buf)} detail={detail} "
-            f"preview={preview or '-'} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
-        )
+        remote = self._remote_endpoint_for_flow(f)
+        if remote:
+            f["p2pool_last_remote"] = remote
 
-        f["p2pool_frames_logged"] = f.get("p2pool_frames_logged", 0) + 1
+        f["p2pool_last_direction"] = dir_name
+        f["p2pool_last_len_bucket"] = bucket
         f["p2pool_last_label"] = label
         f["p2pool_last_preview"] = preview
         f["p2pool_last_detail"] = detail
+        f["p2pool_frames_logged"] = f.get("p2pool_frames_logged", 0) + 1
+        f["p2pool_peer_candidates"] = peers[:16]
+        self._update_p2pool_seen_flags(f, label)
 
-        if label == "handshake":
-            f["p2pool_seen_handshake"] = True
-        elif label == "peerlist":
-            f["p2pool_seen_peerlist"] = True
-        elif label == "share":
-            f["p2pool_seen_share"] = True
-        elif label == "block":
-            f["p2pool_seen_block"] = True
+        peer_txt = ""
+        if peers:
+            head = ", ".join(f"{ip}:{port}" for ip, port in peers[:4])
+            more = "" if len(peers) <= 4 else f" +{len(peers) - 4} more"
+            peer_txt = f" peers={len(peers)} [{head}{more}]"
 
-        if label in {"handshake", "peerlist", "share", "block"}:
-            self._log_mining_message(
-                f,
-                f"P2Pool {label} traffic seen on {iface}; this can help keep local share/block awareness fresher",
-                emoji="🧠" if label == "peerlist" else "⛏️",
-            )
+        msg = (
+            f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} RAW "
+            f"dir={dir_name} len={len(snap)} bucket={bucket} detail={detail}{peer_txt} "
+            f"preview={preview or '-'} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
+        )
+
+        event_key = f"raw:{label}:{detail}:{bucket}:{dir_name}:{len(peers)}"
+        if self._flow_event_ok(f, event_key, self.P2POOL_EVENT_COOLDOWN_SEC):
+            self._rl_log(msg)
+
+        self._pm_dispatch(
+            label,
+            flow=f,
+            iface=iface,
+            source="raw",
+            payload_len=len(snap),
+            detail=detail,
+            meta={
+                "preview": preview,
+                "direction": dir_name,
+                "peers": peers,
+                "bucket": bucket,
+            },
+            levin_msg=None,
+        )
+
+        self._maybe_log_mining_from_p2pool_raw(
+            f=f,
+            label=label,
+            detail=detail,
+            iface=iface,
+            direction=dir_name,
+            payload_len=len(snap),
+            peers=peers,
+        )
 
     def _classify_p2pool_payload(self, payload: bytes) -> Tuple[str, str]:
         if not payload:
@@ -6474,14 +7531,134 @@ class TransportMoneroManager:
 
         return "unknown", f"len={n}"
 
-    def _ascii_ratio(self, data: bytes) -> float:
-        if not data:
-            return 0.0
-        printable = 0
-        for b in data:
-            if 32 <= b <= 126 or b in (9, 10, 13):
-                printable += 1
-        return printable / max(1, len(data))
+    def _classify_p2pool_payload_richer(
+        self,
+        f: dict,
+        payload: bytes,
+        direction: Optional[str],
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        meta: Dict[str, Any] = {}
+        if not payload:
+            return "unknown", "empty", meta
+
+        n = len(payload)
+        ent = self._byte_entropy(payload[: min(len(payload), 128)])
+        ascii_ratio = self._ascii_ratio(payload[: min(len(payload), 256)])
+        bucket = self._len_bucket(n)
+        meta["len_bucket"] = bucket
+        meta["entropy"] = ent
+        meta["ascii_ratio"] = ascii_ratio
+
+        # Levin signature found but parser did not yield full frame yet.
+        if len(payload) >= 8:
+            try:
+                if struct.unpack_from("<Q", payload, 0)[0] == self._LEVIN_SIG:
+                    return "handshake", "levin_header_incomplete", meta
+            except Exception:
+                pass
+
+        # Compact peer candidates from repeated IPv4-mapped IPv6 tuples.
+        peers = self._extract_compact_peer_candidates(payload)
+        if peers:
+            meta["peers"] = peers
+            if len(peers) >= 2:
+                return "peerlist", f"compact_peer_tuples={len(peers)}", meta
+
+        # Small binary very early in a new P2Pool flow looks like open/handshake.
+        if (
+            n <= self.P2POOL_SMALL_OPEN_MAX
+            and f.get("pkts", 0) <= 4
+            and not f.get("p2pool_seen_handshake")
+            and ascii_ratio < 0.45
+        ):
+            return "handshake", f"small_open_binary len={n}", meta
+
+        # Medium binary after session establishment becomes share/sync-ish.
+        if (
+            self.P2POOL_SHARE_MIN <= n < self.P2POOL_BLOCK_MIN
+            and (
+                f.get("p2pool_seen_handshake")
+                or f.get("p2pool_seen_timed_sync")
+                or f.get("p2pool_seen_peerlist")
+            )
+            and ascii_ratio < 0.60
+        ):
+            if direction == "b2a":
+                return "share", f"relay_candidate len={n}", meta
+            return "chain", f"sync_candidate len={n}", meta
+
+        # Large binary after session establishment becomes block-ish.
+        if (
+            n >= self.P2POOL_BLOCK_MIN
+            and (
+                f.get("p2pool_seen_handshake")
+                or f.get("p2pool_seen_peerlist")
+                or f.get("p2pool_seen_share")
+            )
+            and ascii_ratio < 0.50
+        ):
+            label = "block" if n >= self.P2POOL_BLOCK_HUGE else "chain_object"
+            return label, f"bulk_binary len={n}", meta
+
+        label, detail = self._classify_p2pool_payload(payload)
+        return label, detail, meta
+
+    def _update_p2pool_seen_flags(self, f: dict, label: str) -> None:
+        if label == "handshake":
+            f["p2pool_seen_handshake"] = True
+        elif label == "peerlist":
+            f["p2pool_seen_peerlist"] = True
+        elif label == "share":
+            f["p2pool_seen_share"] = True
+        elif label == "block":
+            f["p2pool_seen_block"] = True
+        elif label == "timed_sync":
+            f["p2pool_seen_timed_sync"] = True
+        elif label in {"chain", "chain_object"}:
+            f["p2pool_seen_chain"] = True
+        elif label == "ping":
+            f["p2pool_seen_ping"] = True
+
+    def _extract_compact_peer_candidates(self, payload: bytes) -> List[Tuple[str, int]]:
+        out: List[Tuple[str, int]] = []
+        if not payload:
+            return out
+
+        marker = self.P2POOL_COMPACT_PEER_MARKER
+        i = 0
+        seen = set()
+
+        while True:
+            j = payload.find(marker, i)
+            if j < 0:
+                break
+
+            # marker(12) + ipv4(4) + port(2)
+            if j + 18 > len(payload):
+                break
+
+            ipv4 = payload[j + 12 : j + 16]
+            port_raw = payload[j + 16 : j + 18]
+            ip = ".".join(str(x) for x in ipv4)
+
+            port_be = int.from_bytes(port_raw, "big", signed=False)
+            port_le = int.from_bytes(port_raw, "little", signed=False)
+
+            if port_be in self._p2pool_ports or port_be in self._p2p_ports:
+                port = port_be
+            elif port_le in self._p2pool_ports or port_le in self._p2p_ports:
+                port = port_le
+            else:
+                port = port_be if 0 < port_be <= 65535 else port_le
+
+            key = (ip, int(port))
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+
+            i = j + 18
+
+        return out
 
     def _maybe_log_mining_from_monero_levin(self, f: dict, m: "_LevinMessage", iface: str) -> None:
         if int(m.cmd) not in self._MINING_BENEFIT_MONERO_CMDS:
@@ -6498,6 +7675,292 @@ class TransportMoneroManager:
             emoji="⚡",
         )
 
+    def _maybe_log_mining_from_p2pool_raw(
+        self,
+        *,
+        f: dict,
+        label: str,
+        detail: str,
+        iface: str,
+        direction: str,
+        payload_len: int,
+        peers: List[Tuple[str, int]],
+    ) -> None:
+        if label not in {"handshake", "peerlist", "share", "block", "timed_sync", "chain", "chain_object"}:
+            return
+
+        remote = f.get("p2pool_last_remote")
+        remote_txt = f" remote={remote[0]}:{remote[1]}" if remote else ""
+        local = self._pick_localish_endpoint(f)
+        local_txt = f" local={local[0]}:{local[1]}" if local else ""
+
+        if label == "handshake":
+            key = "mining:session_open"
+            msg = (
+                f"[Transport][🧵 TCP][🪙 Monero][Mining] 🔌 P2Pool session opened via packet data "
+                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+            )
+        elif label == "peerlist":
+            key = "mining:peerlist_refresh"
+            msg = (
+                f"[Transport][🧵 TCP][🪙 Monero][Mining] 🧠 Peer map refreshed from packet structure "
+                f"(peers={len(peers)}, detail={detail}) on {iface}{local_txt}{remote_txt}"
+            )
+        elif label == "share":
+            key = "mining:share_relay"
+            msg = (
+                f"[Transport][🧵 TCP][🪙 Monero][Mining] ⛏️ Share-like relay traffic detected "
+                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+            )
+        elif label == "block":
+            key = "mining:block_relay"
+            msg = (
+                f"[Transport][🧵 TCP][🪙 Monero][Mining] 🧱 Block-like relay traffic detected "
+                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+            )
+        else:
+            key = f"mining:{label}"
+            msg = (
+                f"[Transport][🧵 TCP][🪙 Monero][Mining] ⚡ P2Pool sync-path traffic detected "
+                f"(kind={label}, detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+            )
+
+        last_key = f.get("p2pool_mining_last_key")
+        if last_key != key or self._flow_event_ok(f, key, self.P2POOL_MINING_EVENT_COOLDOWN_SEC):
+            f["p2pool_mining_last_key"] = key
+            self._rl_log(msg)
+
+    def _flow_event_ok(self, f: dict, key: str, cooldown: float) -> bool:
+        now = time.time()
+        ts = f.setdefault("p2pool_event_ts", {})
+        last = float(ts.get(key, 0.0) or 0.0)
+        if now - last < cooldown:
+            return False
+        ts[key] = now
+        return True
+
+    @staticmethod
+    def _len_bucket(n: int) -> str:
+        if n < 64:
+            return "tiny"
+        if n < 256:
+            return "small"
+        if n < 1024:
+            return "mid"
+        if n < 4096:
+            return "large"
+        return "huge"
+
+    # ========== Mining runtime / dispatch ==========
+    def _pm_dispatch(
+        self,
+        label: str,
+        *,
+        flow: dict,
+        iface: str,
+        source: str,
+        payload_len: int,
+        detail: str = "",
+        meta: Optional[dict] = None,
+        levin_msg: Optional[Any] = None,
+    ) -> None:
+        fn = self.p2pool_mining.get(label) or self.p2pool_mining["unknown"]
+        try:
+            fn(
+                flow=flow,
+                iface=iface,
+                source=source,
+                payload_len=int(payload_len),
+                detail=str(detail or ""),
+                meta=meta or {},
+                levin_msg=levin_msg,
+            )
+        except Exception:
+            pass
+
+    def _pm_peer_key(self, flow: dict) -> str:
+        try:
+            (a_ip, a_port), (b_ip, b_port) = flow["endpoints"]
+            if self._is_private_like_ip(a_ip) and not self._is_private_like_ip(b_ip):
+                return f"{b_ip}:{b_port}"
+            if self._is_private_like_ip(b_ip) and not self._is_private_like_ip(a_ip):
+                return f"{a_ip}:{a_port}"
+            return f"{b_ip}:{b_port}"
+        except Exception:
+            return "unknown:0"
+
+    def _pm_touch_peer(self, flow: dict, iface: str) -> dict:
+        rt = self.p2pool_mining_runtime
+        peer_key = self._pm_peer_key(flow)
+        p = rt["peer_cache"].get(peer_key)
+        if p is None:
+            p = {
+                "peer": peer_key,
+                "first_seen": time.time(),
+                "last_seen": time.time(),
+                "iface": iface,
+                "score": 0.0,
+                "events": defaultdict(int),
+                "last_handshake_ts": 0.0,
+                "last_peerlist_ts": 0.0,
+                "last_share_ts": 0.0,
+                "last_block_ts": 0.0,
+                "last_sync_ts": 0.0,
+                "last_close_ts": 0.0,
+                "last_close_reason": None,
+                "alive": True,
+                "rtt_hint_ms": None,
+            }
+            rt["peer_cache"][peer_key] = p
+        p["last_seen"] = _tm_now()
+        p["iface"] = iface
+        return p
+
+    def _pm_event(self, kind: str, peer: str, detail: str = "") -> None:
+        rt = self.p2pool_mining_runtime
+        rt["counts"][kind] += 1
+        rt["recent_events"].append(
+            {
+                "ts": _tm_now(),
+                "kind": kind,
+                "peer": peer,
+                "detail": detail,
+            }
+        )
+
+    def _pm_on_flow_close(self, *, flow: dict, iface: str, reason: str) -> None:
+        p = self._pm_touch_peer(flow, iface)
+        p["alive"] = False
+        p["last_close_ts"] = _tm_now()
+        p["last_close_reason"] = reason
+        p["events"]["close"] += 1
+        p["score"] -= 1.5
+        self._pm_event("close", p["peer"], reason)
+
+    def _pm_on_handshake(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["alive"] = True
+        p["events"]["handshake"] += 1
+        p["last_handshake_ts"] = _tm_now()
+        p["score"] += 2.0
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 2.0)
+        rt["stale_risk"] = max(0.0, rt["stale_risk"] - 1.0)
+        self._pm_event("handshake", p["peer"], detail)
+
+    def _pm_on_timed_sync(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["timed_sync"] += 1
+        p["last_sync_ts"] = _tm_now()
+        p["score"] += 1.5
+        rt["last_sync_ts"] = _tm_now()
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 3.0)
+        rt["stale_risk"] = max(0.0, rt["stale_risk"] - 2.0)
+        self._pm_event("timed_sync", p["peer"], detail)
+
+    def _pm_on_peerlist(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["peerlist"] += 1
+        p["last_peerlist_ts"] = _tm_now()
+        p["score"] += 2.5
+        rt["last_peerlist_ts"] = _tm_now()
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 4.0)
+
+        peers = meta.get("peers") or []
+        for one in peers[:64]:
+            key = f"{one[0]}:{one[1]}"
+            rt["peer_candidates"][key] = {
+                "discovered_ts": _tm_now(),
+                "via": p["peer"],
+                "iface": iface,
+            }
+
+        self._pm_event("peerlist", p["peer"], f"{detail} peers={len(peers)}")
+
+    def _pm_on_share(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["share"] += 1
+        p["last_share_ts"] = _tm_now()
+        p["score"] += 3.0
+        rt["last_share_ts"] = _tm_now()
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 5.0)
+        rt["stale_risk"] = max(0.0, rt["stale_risk"] - 3.0)
+        self._pm_event("share", p["peer"], detail)
+
+    def _pm_on_chain(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["chain"] += 1
+        p["last_sync_ts"] = _tm_now()
+        p["score"] += 1.0
+        rt["last_sync_ts"] = _tm_now()
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 2.0)
+        self._pm_event("chain", p["peer"], detail)
+
+    def _pm_on_chain_object(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["chain_object"] += 1
+        p["score"] += 1.0
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 1.5)
+        self._pm_event("chain_object", p["peer"], detail)
+
+    def _pm_on_block(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        rt = self.p2pool_mining_runtime
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["block"] += 1
+        p["last_block_ts"] = _tm_now()
+        p["score"] += 6.0
+        rt["last_block_ts"] = _tm_now()
+        rt["freshness_score"] = min(100.0, rt["freshness_score"] + 8.0)
+        rt["stale_risk"] = max(0.0, rt["stale_risk"] - 5.0)
+        self._pm_event("block", p["peer"], detail)
+
+    def _pm_on_ping(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["ping"] += 1
+        p["score"] += 0.2
+        self._pm_event("ping", p["peer"], detail)
+
+    def _pm_on_missing_tx(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["missing_tx"] += 1
+        p["score"] += 0.5
+        self._pm_event("missing_tx", p["peer"], detail)
+
+    def _pm_on_unknown(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
+        p = self._pm_touch_peer(flow, iface)
+        p["events"]["unknown"] += 1
+        self._pm_event("unknown", p["peer"], detail)
+
+    def get_p2pool_mining_snapshot(self) -> dict:
+        rt = self.p2pool_mining_runtime
+        peers = list(rt["peer_cache"].values())
+        peers.sort(key=lambda x: (x.get("score", 0.0), x.get("last_seen", 0.0)), reverse=True)
+        return {
+            "freshness_score": round(rt["freshness_score"], 2),
+            "stale_risk": round(rt["stale_risk"], 2),
+            "last_peerlist_ts": rt["last_peerlist_ts"],
+            "last_share_ts": rt["last_share_ts"],
+            "last_block_ts": rt["last_block_ts"],
+            "last_sync_ts": rt["last_sync_ts"],
+            "counts": dict(rt["counts"]),
+            "top_peers": [
+                {
+                    "peer": p["peer"],
+                    "score": round(float(p["score"]), 2),
+                    "last_seen": p["last_seen"],
+                    "events": dict(p["events"]),
+                    "alive": bool(p.get("alive", False)),
+                }
+                for p in peers[:8]
+            ],
+        }
+
+    # ========== Active ping response ==========
     def _maybe_reply_ping(self, f: dict, m: "_LevinMessage", iface: str):
         if not self.p2p_auto_reply_ping:
             return
@@ -6573,6 +8036,20 @@ class TransportMoneroManager:
             pass
         return None
 
+    def _remote_endpoint_for_flow(self, f: dict) -> Optional[Tuple[str, int]]:
+        try:
+            (a_ip, a_port), (b_ip, b_port) = f["endpoints"]
+            a_private = self._is_private_like_ip(a_ip)
+            b_private = self._is_private_like_ip(b_ip)
+
+            if a_private and not b_private:
+                return (b_ip, b_port)
+            if b_private and not a_private:
+                return (a_ip, a_port)
+            return (b_ip, b_port)
+        except Exception:
+            return None
+
     def _log_mining_message(self, f: dict, message: str, emoji: str = "⛏️") -> None:
         ep = self._pick_localish_endpoint(f)
         if ep:
@@ -6597,8 +8074,7 @@ class TransportMoneroManager:
         except Exception:
             return False
 
-    def attach_sockets(self, src: str, sport: int, dst: str, dport: int, *,
-                       client_sock=None, server_sock=None) -> bool:
+    def attach_sockets(self, src: str, sport: int, dst: str, dport: int, *, client_sock=None, server_sock=None) -> bool:
         key = self._flow_key(src, int(sport), dst, int(dport))
         f = self._flows.get(key)
 
@@ -6700,16 +8176,22 @@ class TransportMoneroManager:
         return None
 
     # ========== Rate-limited logging ==========
+    def _emit_log(self, msg: str) -> None:
+        try:
+            if hasattr(self.logger, "log_message"):
+                self.logger.log_message(msg)
+            else:
+                self.logger(msg)
+        except Exception:
+            pass
+
     def _rl_log(self, msg: str):
         key = hash(msg)
         t = time.time()
         last = self._recent_msgs.get(key, 0.0)
         if t - last >= self._recent_msg_window:
             self._recent_msgs[key] = t
-            try:
-                self.logger.log_message(msg)
-            except Exception:
-                pass
+            self._emit_log(msg)
 
     # ========== Small utils ==========
     @staticmethod
@@ -6740,12 +8222,7 @@ class TransportMoneroManager:
             )
 
         def is_tls_record(b: bytes) -> bool:
-            return (
-                len(b) >= 3
-                and b[0] in (0x14, 0x15, 0x16, 0x17)
-                and b[1] == 0x03
-                and 0x00 <= b[2] <= 0x05
-            )
+            return len(b) >= 3 and b[0] in (0x14, 0x15, 0x16, 0x17) and b[1] == 0x03 and 0x00 <= b[2] <= 0x05
 
         hints = []
         if is_http_head(sample):
@@ -6774,7 +8251,7 @@ class TransportMoneroManager:
             if nl < 0:
                 return b"", 0
 
-            size_line = mv[pos:pos + nl].tobytes()
+            size_line = mv[pos : pos + nl].tobytes()
             pos += nl + 2
             semi = size_line.split(b";", 1)[0]
 
@@ -6786,26 +8263,24 @@ class TransportMoneroManager:
             if sz == 0:
                 if len(mv) < pos + 2:
                     return b"", 0
-                if mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
+                if mv[pos : pos + 2].tobytes() == self._HTTP_EOL:
                     pos += 2
-                if len(mv) >= pos + 2 and mv[pos:pos + 2].tobytes() == self._HTTP_EOL:
+                if len(mv) >= pos + 2 and mv[pos : pos + 2].tobytes() == self._HTTP_EOL:
                     pos += 2
                 return bytes(out), pos
 
             if len(mv) < pos + sz + 2:
                 return b"", 0
 
-            out += mv[pos:pos + sz].tobytes()
+            out += mv[pos : pos + sz].tobytes()
             pos += sz
 
-            if mv[pos:pos + 2].tobytes() != self._HTTP_EOL:
+            if mv[pos : pos + 2].tobytes() != self._HTTP_EOL:
                 return b"", 0
             pos += 2
 
     def _parse_headers(self, raw_headers: bytes) -> dict:
-        headers = {
-            ":start": raw_headers.split(self._HTTP_EOL, 1)[0].decode("utf-8", "replace")
-        }
+        headers = {":start": raw_headers.split(self._HTTP_EOL, 1)[0].decode("utf-8", "replace")}
         for line in raw_headers.split(self._HTTP_EOL):
             if not line:
                 continue
@@ -6922,15 +8397,11 @@ class TransportMoneroManager:
     @staticmethod
     def _looks_like_json(b: bytes) -> bool:
         bb = b.strip()
-        return (
-            (bb.startswith(b"{") and bb.endswith(b"}"))
-            or
-            (bb.startswith(b"[") and bb.endswith(b"]"))
-        )
+        return (bb.startswith(b"{") and bb.endswith(b"}")) or (bb.startswith(b"[") and bb.endswith(b"]"))
 
     def _json_method_name(self, b: bytes):
         try:
-            bb = b[:self.RPC_JSON_MAX]
+            bb = b[: self.RPC_JSON_MAX]
             data = json.loads(bb.decode("utf-8", errors="replace"))
             if isinstance(data, dict) and isinstance(data.get("method"), str):
                 return data["method"]
@@ -16819,7 +18290,10 @@ class TransportManager:
         self.transport_scraper = TransportScraperManager(self.logger)
         self.transport_llmnr = TransportLLMNRManager(self.logger)
         self.transport_undecoded = TransportUndecodedManager(self.logger)
-
+        self.transport_stratum = TransportStratumManager(
+            self.logger,
+            ports={3333, 4444, 5555, 7777, 9999},
+        )
         self._MONERO_P2P_PORTS = [
             18080, 18083, 18084, 18085, 18086, 18087, 18089,
             18180, 18380, 18580, 21213, 37888, 37889
@@ -17176,6 +18650,7 @@ class TransportManager:
         rules = [
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
+            ([3333, 4444, 5555, 7777, 9999], self._handle_stratum_packet),
             ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
             ([53], self._handle_dns_tcp_packet),
             ([22], self._handle_ssh_packet),
@@ -17304,6 +18779,9 @@ class TransportManager:
         return True
 
     # ---------------- existing protocol handlers ----------------
+
+    def _handle_stratum_packet(self,packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

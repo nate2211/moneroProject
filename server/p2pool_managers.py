@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import ctypes
+import hashlib
 import logging
 import os
 import platform
@@ -55,7 +56,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
     P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, \
-    HyperVRouterManager
+    HyperVRouterManager, PythonServerManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -136,7 +137,10 @@ class PythonRouterManager:
 
         self.sniffer = None
         # Instantiate all specialized managers
-
+        self._byte_parse_dedupe_lock = threading.Lock()
+        self._byte_parse_dedupe_cache = {}  # fp -> timestamp
+        self._byte_parse_dedupe_ttl = 0.50  # seconds; short on purpose
+        self._byte_parse_dedupe_max = 8192
 
         self.lag_manager = LinkAggregationManager(router_logger)
         self.packet_signer = PacketSigningManager(router_logger)
@@ -186,6 +190,7 @@ class PythonRouterManager:
         self.lan_manager = None
         self.uplink_manager = None
         self.hypervrouter_manager = None
+        self.python_server_manager = None
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
@@ -1248,6 +1253,81 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     self.router_logger.log_message(
                         f"[Router] ✅ Synthesized EUI-64 link-local address: {self.router_ipv6_link_local_out}")
             self.ndp_manager.router_ipv6_link_local_out = self.router_ipv6_link_local_out
+
+    def _coerce_ingress_packet(self, pkt):
+        """
+        Accept either:
+          - real Ether frames
+          - L3-only Scapy packets (IP/IPv6/ARP), common on Npcap loopback
+          - raw bytes that can be parsed safely
+
+        Returns a Scapy packet or None.
+        """
+        try:
+            if pkt is None:
+                return None
+
+            # 1) Already a good Ether frame
+            if hasattr(pkt, "haslayer") and pkt.haslayer(Ether):
+                try:
+                    plen = len(pkt)
+                    if plen < 14 or plen > 65535:
+                        return None
+                except Exception:
+                    pass
+                return pkt
+
+            # 2) Already a good L3 packet
+            if hasattr(pkt, "haslayer") and (pkt.haslayer(IP) or pkt.haslayer(IPv6) or pkt.haslayer(ARP)):
+                try:
+                    plen = len(pkt)
+                    if plen <= 0 or plen > 65535:
+                        return None
+                except Exception:
+                    pass
+                return pkt
+
+            # 3) Convert to raw bytes and parse
+            try:
+                raw_buf = bytes(pkt)
+            except Exception:
+                return None
+
+            if not raw_buf or len(raw_buf) > 65535:
+                return None
+
+            # Prefer L3 parse first for loopback/raw captures
+            b0 = raw_buf[0]
+            ver = (b0 >> 4) & 0xF
+
+            if ver == 4:
+                if len(raw_buf) < 20:
+                    return None
+                try:
+                    return IP(raw_buf)
+                except Exception:
+                    return None
+
+            if ver == 6:
+                if len(raw_buf) < 40:
+                    return None
+                try:
+                    return IPv6(raw_buf)
+                except Exception:
+                    return None
+
+            # Final fallback: only try Ether if frame is big enough
+            if len(raw_buf) >= 14:
+                try:
+                    eth = Ether(raw_buf)
+                    return eth
+                except Exception:
+                    return None
+
+            return None
+
+        except Exception:
+            return None
     def _start_single_sniffer(self, iface_name: str):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
@@ -1264,11 +1344,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             def direct_process(pkt):
                 try:
-                    if not pkt.haslayer(Ether):
+                    pkt2 = self._coerce_ingress_packet(pkt)
+                    if pkt2 is None:
                         return
-                    if len(pkt) < 14 or len(pkt) > 65535:
-                        return
-                    self.process_packet(pkt, iface_name)
+                    self.process_packet(pkt2, iface_name)
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
@@ -1363,6 +1442,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     if not raw_bytes:
                         return
 
+                    # NEW: ultra-early dedupe for loopback / WinDivertBridge echoes
+                    if self._should_skip_raw_packet_parse(raw_bytes, inbound_iface):
+                        return
+
                     parse_errors = []
 
                     def _safe_len(obj) -> int | None:
@@ -1379,18 +1462,12 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                             return None
 
                     def _score_candidate(pkt_obj, buf: bytes, decoder_name: str) -> int:
-                        """
-                        Score a parsed packet by how internally consistent and protocol-rich it looks.
-                        Higher score = better candidate.
-                        """
                         score = 0
                         buf_len = len(buf)
 
                         try:
-                            # Base reward if parsing produced anything at all
                             score += 5
 
-                            # Prefer candidates that round-trip close to the original size
                             pkt_len = _raw_len(pkt_obj)
                             if pkt_len is not None:
                                 if pkt_len == buf_len:
@@ -1400,11 +1477,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                                 else:
                                     score -= 10
 
-                            # Prefer real protocol stacks over Raw-only decodes
                             if pkt_obj.haslayer(Raw):
                                 score += 1
 
-                            # L2 / VLAN / ARP
                             if pkt_obj.haslayer(Ether):
                                 score += 15
                                 eth = pkt_obj.getlayer(Ether)
@@ -1419,7 +1494,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                             if arp_cls is not None and pkt_obj.haslayer(arp_cls):
                                 score += 25
 
-                            # IPv4 validation
                             if pkt_obj.haslayer(IP):
                                 score += 20
                                 ip = pkt_obj.getlayer(IP)
@@ -1445,7 +1519,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                                 except Exception:
                                     score -= 2
 
-                            # IPv6 validation
                             if pkt_obj.haslayer(IPv6):
                                 score += 20
                                 ip6 = pkt_obj.getlayer(IPv6)
@@ -1460,11 +1533,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                                 except Exception:
                                     score -= 2
 
-                            # L4
                             udp_cls = globals().get("UDP")
                             tcp_cls = globals().get("TCP")
                             icmp_cls = globals().get("ICMP")
-                            icmpv6_cls = globals().get("ICMPv6Unknown")  # generic fallback if imported
+                            icmpv6_cls = globals().get("ICMPv6Unknown")
 
                             if udp_cls is not None and pkt_obj.haslayer(udp_cls):
                                 score += 20
@@ -1474,8 +1546,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                                     dport = int(getattr(udp, "dport", -1))
                                     if 0 <= sport <= 65535 and 0 <= dport <= 65535:
                                         score += 5
-
-                                    # Strong boost for DNS and DHCP families
                                     if sport in (53, 5353, 5355, 67, 68) or dport in (53, 5353, 5355, 67, 68):
                                         score += 20
                                 except Exception:
@@ -1500,7 +1570,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                             if icmpv6_cls is not None and pkt_obj.haslayer(icmpv6_cls):
                                 score += 12
 
-                            # App layer boosts
                             dns_cls = globals().get("DNS")
                             dhcp_cls = globals().get("DHCP")
                             bootp_cls = globals().get("BOOTP")
@@ -1514,7 +1583,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                             if bootp_cls is not None and pkt_obj.haslayer(bootp_cls):
                                 score += 15
 
-                            # Penalize obviously weak parse outcomes
                             if decoder_name == "ARP" and not (
                                     globals().get("ARP") and pkt_obj.haslayer(globals()["ARP"])):
                                 score -= 10
@@ -1525,15 +1593,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         return score
 
                     def _candidate_decoders():
-                        """
-                        Build candidate decoder list dynamically from whatever scapy layers are available.
-                        Most likely first, but not hard-locked to one path.
-                        """
                         names = [
-                            "Ether",  # Ethernet / VLAN / ARP / IP / IPv6
-                            "IP",  # raw IPv4 payload
-                            "IPv6",  # raw IPv6 payload
-                            "ARP",  # raw ARP payload if it arrives without Ethernet
+                            "Ether",
+                            "IP",
+                            "IPv6",
+                            "ARP",
                         ]
 
                         seen = set()
@@ -1561,8 +1625,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         except Exception as e:
                             parse_errors.append(f"{decoder_name}={e}")
 
-                    # Final very loose fallback: try the same decoders again but keep the first thing
-                    # that does not explode, even if score is weak.
                     if best_pkt is None:
                         for decoder_name, decoder in _candidate_decoders():
                             try:
@@ -1580,7 +1642,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         )
                         return
 
-                    # Optional weak-parse warning for visibility without dropping the packet
                     if best_score is not None and best_score < 10:
                         self.router_logger.log_message(
                             f"[Router] ⚠️ Weak parse on {iface_short}; "
@@ -1613,6 +1674,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 return
             if self.netroute_manager:
                 self.netroute_manager.observe_packet(packet, inbound_iface)
+            if self.python_server_manager:
+                self.python_server_manager.handle_packet(
+                    packet,
+                    inbound_iface=inbound_iface,
+                    component="router",
+                    phase="processing",
+                    direction="inbound",
+                    source="router",
+                    raw_bytes=bytes(packet)  # best fidelity
+                )
             # ==========================================================
             # ✅ ARP HANDLING BLOCK (reply/learn) BEFORE "no IP layer" drop
             # ==========================================================
@@ -1698,7 +1769,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         install_host_route=True,
                         host_route_cost=1,
                     )
-
+                if self.python_server_manager:
+                    self.python_server_manager.handle_packet(
+                        packet,
+                        inbound_iface=inbound_iface,
+                        component="transport",
+                        phase="processing",
+                        direction="inbound",
+                        source="router",
+                        raw_bytes=bytes(packet)  # best fidelity
+                    )
                 self.code_output_manager.submit_packet(
                     packet,
                     inbound_iface=inbound_iface,
@@ -2443,7 +2523,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2493,6 +2573,22 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     disable_netroute_metric_tuning=True,
                 )
                 self.gateway_manager.start()
+            if python_server:
+                self.python_server_manager = PythonServerManager(
+                    router=self,
+                    router_logger=self.router_logger,
+                    host="0.0.0.0",
+                    port=8844,
+                    dashboard_title="Router Dashboard",
+                    store_raw_packets=True,
+                    max_raw_packet_bytes=0,  # 0 = keep full raw bytes
+                )
+                self.router_logger.log_message = self.python_server_manager.wrap_log_call(
+                    self.router_logger.log_message,
+                    source="Router",
+                    level="info",
+                )
+                self.python_server_manager.start()
             if use_lan:
                 self.lan_manager = LanManager(self, DHCPServer, gateway_manager=self.gateway_manager)
                 self.lan_manager.configure(
@@ -2681,7 +2777,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
-                sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
+                if iface_name not in ["WireShark", "Nate's Tunnel", "WinDivertBridge"]:
+                    sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
             self.parallel_python.increase_ram_usage(1000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
@@ -2775,7 +2872,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if self.lan_manager:
                 self.lan_manager.stop()
                 self.lan_manager = None
-
+            if self.python_server_manager:
+                self.python_server_manager.stop()
+                self.python_server_manager = None
             if self.gateway_manager:
                 self.gateway_manager.stop()
                 self.gateway_manager = None
@@ -2809,6 +2908,95 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
+    # -----------------------------
+    # add inside PythonRouterManager
+    # -----------------------------
+    def _byte_parse_scope(self, inbound_iface: str | None) -> str:
+        """
+        Group interfaces into dedupe scopes.
+        Loopback + WinDivertBridge share one scope so the same host-local packet
+        seen from both paths can be dropped early.
+        """
+        s = str(inbound_iface or "").strip().lower()
+
+        if "loopback" in s:
+            return "host-local"
+        if "windivertbridge" in s or "windivert" in s:
+            return "host-local"
+
+        return s or "unknown"
+
+    def _prune_byte_parse_dedupe_cache(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        ttl = float(getattr(self, "_byte_parse_dedupe_ttl", 0.50) or 0.50)
+
+        cache = self._byte_parse_dedupe_cache
+        if not cache:
+            return
+
+        expired = [fp for fp, ts in cache.items() if (now - ts) > ttl]
+        for fp in expired:
+            cache.pop(fp, None)
+
+        max_items = int(getattr(self, "_byte_parse_dedupe_max", 8192) or 8192)
+        while len(cache) > max_items:
+            try:
+                oldest_key = next(iter(cache))
+                cache.pop(oldest_key, None)
+            except Exception:
+                break
+
+    def _fingerprint_raw_packet_for_parse(self, raw_bytes: bytes, inbound_iface: str | None) -> str:
+        """
+        Fast, stable fingerprint for pre-parse dedupe.
+
+        We intentionally do NOT hash the entire packet for big frames.
+        Prefix + suffix + length is enough for a short TTL dedupe cache.
+        """
+        scope = self._byte_parse_scope(inbound_iface)
+
+        h = hashlib.blake2b(digest_size=16)
+        h.update(scope.encode("utf-8", errors="ignore"))
+        h.update(len(raw_bytes).to_bytes(4, "big", signed=False))
+
+        if len(raw_bytes) <= 192:
+            h.update(raw_bytes)
+        else:
+            h.update(raw_bytes[:128])
+            h.update(raw_bytes[-32:])
+
+        return h.hexdigest()
+
+    def _should_skip_raw_packet_parse(self, raw_bytes: bytes, inbound_iface: str | None) -> bool:
+        """
+        Returns True if this raw packet was seen recently enough that we should
+        skip Scapy parsing work for it.
+        """
+        if not raw_bytes:
+            return True
+
+        now = time.monotonic()
+        fp = self._fingerprint_raw_packet_for_parse(raw_bytes, inbound_iface)
+
+        with self._byte_parse_dedupe_lock:
+            self._prune_byte_parse_dedupe_cache(now)
+
+            last_seen = self._byte_parse_dedupe_cache.get(fp)
+            if last_seen is not None:
+                ttl = float(getattr(self, "_byte_parse_dedupe_ttl", 0.50) or 0.50)
+                if (now - last_seen) <= ttl:
+                    return True
+
+            self._byte_parse_dedupe_cache[fp] = now
+            max_items = int(getattr(self, "_byte_parse_dedupe_max", 8192) or 8192)
+            while len(self._byte_parse_dedupe_cache) > max_items:
+                try:
+                    oldest_key = next(iter(self._byte_parse_dedupe_cache))
+                    self._byte_parse_dedupe_cache.pop(oldest_key, None)
+                except Exception:
+                    break
+
+        return False
     def _probe_host_internet_health(self) -> bool:
         targets = [("1.1.1.1", 443), ("8.8.8.8", 443), ("208.67.222.222", 443)]
         for host, port in targets:
