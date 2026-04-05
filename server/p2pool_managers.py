@@ -191,7 +191,152 @@ class PythonRouterManager:
         self.uplink_manager = None
         self.hypervrouter_manager = None
         self.python_server_manager = None
+
+        # WAN/public-IP observation state
+        self.public_ip_observed: Optional[str] = None
+        self._public_ip_last_refresh: float = 0.0
+        self._public_ip_refresh_ttl: float = 60.0
+        self._public_ip_probe_timeout: float = 2.5
+        self._public_ip_probe_urls: tuple[str, ...] = (
+            "https://api.ipify.org",
+            "https://ipv4.icanhazip.com",
+            "https://ifconfig.me/ip",
+        )
+
+        # Tracks the extra on-link WAN address we may publish to NAT in double-NAT cases
+        self._nat_last_marked_public_on_lan: Optional[str] = None
+
+
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
+
+    def _is_public_ipv4_text(self, ip: Optional[str]) -> bool:
+        try:
+            x = ipaddress.IPv4Address(str(ip or "").strip())
+            return not (
+                x.is_private
+                or x.is_loopback
+                or x.is_link_local
+                or x.is_multicast
+                or x.is_reserved
+                or x.is_unspecified
+            )
+        except Exception:
+            return False
+
+    def _discover_router_public_ipv4(self, *, force: bool = False) -> Optional[str]:
+        now = time.time()
+        cached = str(self.public_ip_observed or "").strip()
+
+        if (not force) and cached and ((now - self._public_ip_last_refresh) < self._public_ip_refresh_ttl):
+            return cached
+
+        headers = {
+            "User-Agent": f"PythonRouter/{socket.gethostname()}",
+            "Accept": "text/plain",
+        }
+
+        for url in self._public_ip_probe_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=self._public_ip_probe_timeout)
+                text = str(resp.text or "").strip()
+                if "\n" in text:
+                    text = text.splitlines()[0].strip()
+
+                if resp.ok and self._is_public_ipv4_text(text):
+                    self.public_ip_observed = text
+                    self._public_ip_last_refresh = now
+                    self.router_logger.log_message(
+                        f"[Router][WAN] 🌐 Observed public IPv4 {text} via {url}"
+                    )
+                    return text
+            except Exception:
+                continue
+
+        self._public_ip_last_refresh = now
+        if self._is_public_ipv4_text(cached):
+            return cached
+        return None
+
+    def _sync_nat_public_identity(self, *, reason: str = "manual", force: bool = False) -> Optional[str]:
+        nm = getattr(self, "nat_manager", None)
+        if nm is None:
+            return None
+
+        wan_full = str(self.interface_out_full_name or "").strip()
+        wan_friendly = str(self.interface_out_friendly_name or "").strip()
+        local_wan_ip = str(self.router_ip_out or "").strip()
+        gateway_ip = str(self.router_gateway_out_ip or "").strip() or None
+
+        dns_servers: list[str] = []
+        try:
+            if wan_friendly:
+                dns_servers = self._get_windows_dns_servers(wan_friendly)
+        except Exception:
+            dns_servers = []
+
+        observed_public = self._discover_router_public_ipv4(force=force)
+        chosen_public = observed_public or (local_wan_ip if local_wan_ip else None)
+
+        if not chosen_public:
+            self.router_logger.log_message(
+                f"[Router][WAN] ⚠️ NAT public identity sync skipped ({reason}): no WAN/public IP available"
+            )
+            return None
+
+        try:
+            nm.set_router_internal_ip(self.router_ip_in)
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT set_router_internal_ip failed: {e}")
+
+        try:
+            nm.set_public_ips(chosen_public, resync=False)
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT set_public_ips failed: {e}")
+
+        try:
+            if wan_full:
+                nm.set_uplink_public_ip(wan_full, chosen_public, resync=False)
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT set_uplink_public_ip failed: {e}")
+
+        try:
+            old_marked = self._nat_last_marked_public_on_lan
+            if local_wan_ip and local_wan_ip != chosen_public:
+                if old_marked and old_marked != local_wan_ip:
+                    nm.unmark_public_ip_on_lan(old_marked, resync=False)
+                nm.mark_public_ip_on_lan(local_wan_ip, resync=False)
+                self._nat_last_marked_public_on_lan = local_wan_ip
+            else:
+                if old_marked:
+                    nm.unmark_public_ip_on_lan(old_marked, resync=False)
+                self._nat_last_marked_public_on_lan = None
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT mark/unmark_public_ip_on_lan failed: {e}")
+
+        try:
+            nm.on_wan_recovered(
+                iface_name=wan_full or None,
+                public_ip=chosen_public,
+                gateway_ip=gateway_ip,
+                dns_servers=dns_servers,
+                force_flush=bool(force),
+                resync=False,
+            )
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT on_wan_recovered failed: {e}")
+
+        try:
+            nm._resync_router_self_service_port_forwards()
+        except Exception as e:
+            self.router_logger.log_message(f"[Router][WAN] ⚠️ NAT final PFWD resync failed: {e}")
+
+        self.router_logger.log_message(
+            f"[Router][WAN] ✅ NAT public identity synced ({reason}): "
+            f"public={chosen_public} onlink={local_wan_ip or '-'} "
+            f"gw={gateway_ip or '-'} iface={wan_friendly or wan_full or '-'} dns={dns_servers}"
+        )
+        return chosen_public
+
     def _get_tshark_path(self) -> str | None:
         """Discover the path to tshark.exe (copied from your WiresharkManager)."""
         if getattr(sys, "frozen", False):
@@ -2637,14 +2782,14 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.nat_manager = NATManager(
                 router_logger=self.router_logger,
                 sendback_manager=self.sendback_manager,
-                router_public_ip=self.router_ip_out,  # OUT/WAN-side IP
+                router_public_ip=self.router_ip_out,  # initial OUT/WAN-side IP
                 packet_writer=self.packet_writer,
-                interfaces_config=self._interfaces_config,  # full interface map built in _auto_configure_interfaces
+                interfaces_config=self._interfaces_config,
                 rip_manager_find_route=self.rip_manager.find_route,
                 arp_manager_resolve=self.arp_manager.resolve,
                 function_call_tracker=self.function_call_tracker,
             )
-            self.nat_manager.set_router_internal_ip(self.router_ip_in)
+            self._sync_nat_public_identity(reason="startup", force=True)
             self.notification_manager = NotificationManager(
                 self.router_logger,
                 self.NOTIFICATION_TARGET_IP,

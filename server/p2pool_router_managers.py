@@ -2102,16 +2102,19 @@ class TransportSCADAManager:
 
     def __init__(self, logger):
         self.logger = logger
-        self._peek_cap = self.BYTES_BUDGET
+        self._peek_cap = int(self.BYTES_BUDGET)
         self.logging_enabled = True
-        self.flow_cache_ttl = self.FLOW_TTL_SEC
-        self.flow_cache_max = self.FLOW_SOFT_MAX
+        self.flow_cache_ttl = int(self.FLOW_TTL_SEC)
+        self.flow_cache_max = int(self.FLOW_SOFT_MAX)
 
-        # flow_key -> {first,last,last_log, proto, extras}
-        self._flows: Dict[Tuple[str,str,str,str], Dict[str, Any]] = {}
+        # flow_key -> {first,last,last_log,proto,extras,hits}
+        self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._lock = threading.RLock()
 
         self._metrics = {
             "seen": 0,
+            "matched_tcp": 0,
+            "matched_udp": 0,
             "modbus": 0,
             "dnp3": 0,
             "iec104": 0,
@@ -2120,6 +2123,7 @@ class TransportSCADAManager:
             "bacnet": 0,
             "errors": 0,
             "flow_cache_evictions": 0,
+            "active_flows": 0,
         }
 
         self._safe_log("[Transport][🏭 SCADA] Manager ready")
@@ -2130,133 +2134,244 @@ class TransportSCADAManager:
     def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
         """TCP observer."""
         try:
-            if not self._pre_checks(packet, want_udp=False):
+            sport_i = self._safe_port(sport)
+            dport_i = self._safe_port(dport)
+            if sport_i is None or dport_i is None:
                 return False
 
-            proto, info = self._classify_tcp(packet, sport, dport)
+            payload = self._extract_payload(packet, want_udp=False)
+            if payload is None:
+                return False
+
+            proto, info = self._classify_tcp(payload, sport_i, dport_i)
             if not proto:
                 return False
 
             now = time.time()
-            key = self._flow_key(src_ip, sport, dst_ip, dport)
-            st = self._flows.get(key)
-            if st is None:
-                st = {"first": now, "last": now, "last_log": 0.0, "proto": proto, "extras": info}
-                self._flows[key] = st
-            else:
-                st["last"] = now
-                st["proto"] = st.get("proto") or proto
-                if info: st["extras"] = info
+            key = self._flow_key(src_ip, sport_i, dst_ip, dport_i)
 
-            if self._should_log(st, now):
-                self._log_tcp(proto, src_ip, sport, dst_ip, dport, inbound_iface, info)
+            with self._lock:
+                st = self._flows.get(key)
+                if st is None:
+                    st = {
+                        "first": now,
+                        "last": now,
+                        "last_log": 0.0,
+                        "proto": proto,
+                        "extras": dict(info or {}),
+                        "hits": 1,
+                    }
+                    self._flows[key] = st
+                else:
+                    st["last"] = now
+                    st["hits"] = int(st.get("hits", 0)) + 1
+                    if not st.get("proto"):
+                        st["proto"] = proto
+                    if info:
+                        st["extras"] = dict(info)
 
-            self._metrics["seen"] += 1
-            self._clean_if_needed(now)
+                do_log = self._should_log_locked(st, now)
+                self._metrics["seen"] += 1
+                self._metrics["matched_tcp"] += 1
+                self._metrics["active_flows"] = len(self._flows)
+
+                self._clean_if_needed_locked(now)
+
+            if do_log:
+                self._log_tcp(proto, src_ip, sport_i, dst_ip, dport_i, inbound_iface, info)
+
             return True
 
         except Exception:
-            self._metrics["errors"] += 1
+            with self._lock:
+                self._metrics["errors"] += 1
             return False
 
     def handle_udp(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
         """UDP observer (DNP3/BACnet)."""
         try:
-            if not self._pre_checks(packet, want_udp=True):
+            sport_i = self._safe_port(sport)
+            dport_i = self._safe_port(dport)
+            if sport_i is None or dport_i is None:
                 return False
 
-            proto, info = self._classify_udp(packet, sport, dport)
+            payload = self._extract_payload(packet, want_udp=True)
+            if payload is None:
+                return False
+
+            proto, info = self._classify_udp(payload, sport_i, dport_i)
             if not proto:
                 return False
 
             now = time.time()
-            key = self._flow_key(src_ip, sport, dst_ip, dport)
-            st = self._flows.get(key)
-            if st is None:
-                st = {"first": now, "last": now, "last_log": 0.0, "proto": proto, "extras": info}
-                self._flows[key] = st
-            else:
-                st["last"] = now
-                st["proto"] = st.get("proto") or proto
-                if info: st["extras"] = info
+            key = self._flow_key(src_ip, sport_i, dst_ip, dport_i)
 
-            if self._should_log(st, now):
-                self._log_udp(proto, src_ip, sport, dst_ip, dport, inbound_iface, info)
+            with self._lock:
+                st = self._flows.get(key)
+                if st is None:
+                    st = {
+                        "first": now,
+                        "last": now,
+                        "last_log": 0.0,
+                        "proto": proto,
+                        "extras": dict(info or {}),
+                        "hits": 1,
+                    }
+                    self._flows[key] = st
+                else:
+                    st["last"] = now
+                    st["hits"] = int(st.get("hits", 0)) + 1
+                    if not st.get("proto"):
+                        st["proto"] = proto
+                    if info:
+                        st["extras"] = dict(info)
 
-            self._metrics["seen"] += 1
-            self._clean_if_needed(now)
+                do_log = self._should_log_locked(st, now)
+                self._metrics["seen"] += 1
+                self._metrics["matched_udp"] += 1
+                self._metrics["active_flows"] = len(self._flows)
+
+                self._clean_if_needed_locked(now)
+
+            if do_log:
+                self._log_udp(proto, src_ip, sport_i, dst_ip, dport_i, inbound_iface, info)
+
             return True
 
         except Exception:
-            self._metrics["errors"] += 1
+            with self._lock:
+                self._metrics["errors"] += 1
             return False
 
     def snapshot_metrics(self) -> dict:
-        return dict(self._metrics)
+        with self._lock:
+            out = dict(self._metrics)
+            out["active_flows"] = len(self._flows)
+            return out
 
     # ---------------------------
     # Classifiers (cheap peeks)
     # ---------------------------
-    def _classify_tcp(self, pkt, sport, dport) -> Tuple[Optional[str], Dict[str, Any]]:
-        raw = self._raw(pkt)
+    def _classify_tcp(self, raw: bytes, sport: int, dport: int) -> Tuple[Optional[str], Dict[str, Any]]:
         ports = (sport, dport)
 
-        # Modbus/TCP (502): MBAP header 7 bytes, then func code
+        # Modbus/TCP
+        # MBAP: transaction(2), protocol(2=0), length(2), unit(1), then PDU(func code...)
         if self._port_hit(self.PORT_MODBUS, ports) and len(raw) >= 8:
-            # MBAP: trans(2) proto(2=0) len(2) unit(1) + PDU
-            p_proto = int.from_bytes(raw[2:4], "big", signed=False)
-            if p_proto == 0:
-                func = raw[7]
-                self._metrics["modbus"] += 1
-                return "Modbus/TCP", {"fc": func}
+            proto_id = int.from_bytes(raw[2:4], "big", signed=False)
+            mbap_len = int.from_bytes(raw[4:6], "big", signed=False)
+            unit_id = raw[6]
+            func = raw[7]
+            if proto_id == 0 and mbap_len >= 2:
+                with self._lock:
+                    self._metrics["modbus"] += 1
+                return "Modbus/TCP", {
+                    "fc": func,
+                    "unit": unit_id,
+                    "mbap_len": mbap_len,
+                }
 
-        # DNP3 over TCP (20000): start 0x05 0x64, then length/control/addr (little-endian CRCs follow later)
-        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 2:
+        # DNP3/TCP
+        # Start bytes: 0x05 0x64
+        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 10:
             if raw[0] == 0x05 and raw[1] == 0x64:
-                self._metrics["dnp3"] += 1
-                return "DNP3/TCP", {}
+                length = raw[2]
+                control = raw[3]
+                dst = int.from_bytes(raw[4:6], "little", signed=False)
+                src = int.from_bytes(raw[6:8], "little", signed=False)
+                with self._lock:
+                    self._metrics["dnp3"] += 1
+                return "DNP3/TCP", {
+                    "len": length,
+                    "ctrl": control,
+                    "dst": dst,
+                    "src": src,
+                }
 
-        # IEC-104 (2404): start 0x68, length field next, then 4 control bytes
+        # IEC-104
+        # APDU: 0x68, length, then 4 control bytes
         if self._port_hit(self.PORT_IEC104, ports) and len(raw) >= 6:
             if raw[0] == 0x68:
                 apdu_len = raw[1]
-                self._metrics["iec104"] += 1
-                return "IEC-104", {"len": apdu_len}
+                if 4 <= apdu_len <= 253:
+                    ctrl = raw[2:6].hex()
+                    with self._lock:
+                        self._metrics["iec104"] += 1
+                    return "IEC-104", {
+                        "len": apdu_len,
+                        "ctrl": ctrl,
+                    }
 
-        # S7comm (102): often starts with COTP (0x03 0x00 ...), then S7 header (0x32)
+        # S7comm
+        # Usually TPKT 0x03 0x00, then COTP, then S7 header 0x32
         if self._port_hit(self.PORT_S7COMM, ports) and len(raw) >= 7:
-            # Quick/loose: look for COTP TPDU (0x03 0x00) and later 0x32
             if raw[0] == 0x03 and raw[1] == 0x00:
-                # seek 0x32 within first 32 bytes
-                if 0x32 in raw[:32]:
-                    self._metrics["s7"] += 1
-                    return "S7comm", {}
+                total_len = int.from_bytes(raw[2:4], "big", signed=False) if len(raw) >= 4 else 0
+                s7_index = raw.find(b"\x32", 4, min(len(raw), 64))
+                if s7_index != -1:
+                    rosctr = raw[s7_index + 1] if (s7_index + 1) < len(raw) else None
+                    with self._lock:
+                        self._metrics["s7"] += 1
+                    return "S7comm", {
+                        "tpkt_len": total_len,
+                        "rosctr": rosctr,
+                    }
 
-        # OPC UA (4840): hello/ack with ASCII "HEL"/"ACK" in UA binary header; also often contains "opc.tcp://"
+        # OPC UA Binary
+        # Message type is ASCII 3 bytes: HEL / ACK / ERR / RHE / MSG / OPN / CLO
         if self._port_hit(self.PORT_OPCUA, ports) and len(raw) >= 8:
-            head = raw[:8]
-            if b"opc.tcp" in raw or head[:3] in (b"HEL", b"ACK"):
-                self._metrics["opcua"] += 1
-                return "OPC-UA", {}
+            msg_type = raw[:3]
+            chunk_type = raw[3:4]
+            if msg_type in (b"HEL", b"ACK", b"ERR", b"RHE", b"MSG", b"OPN", b"CLO"):
+                msg_size = int.from_bytes(raw[4:8], "little", signed=False)
+                with self._lock:
+                    self._metrics["opcua"] += 1
+                return "OPC-UA", {
+                    "msg": msg_type.decode("ascii", errors="ignore"),
+                    "chunk": chunk_type.decode("ascii", errors="ignore"),
+                    "size": msg_size,
+                }
+
+            if b"opc.tcp://" in raw[: min(len(raw), 128)]:
+                with self._lock:
+                    self._metrics["opcua"] += 1
+                return "OPC-UA", {
+                    "msg": "opc.tcp",
+                }
 
         return None, {}
 
-    def _classify_udp(self, pkt, sport, dport) -> Tuple[Optional[str], Dict[str, Any]]:
-        raw = self._raw(pkt)
+    def _classify_udp(self, raw: bytes, sport: int, dport: int) -> Tuple[Optional[str], Dict[str, Any]]:
         ports = (sport, dport)
 
-        # DNP3/UDP (same framing)
-        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 2:
+        # DNP3/UDP
+        if self._port_hit(self.PORT_DNP3, ports) and len(raw) >= 10:
             if raw[0] == 0x05 and raw[1] == 0x64:
-                self._metrics["dnp3"] += 1
-                return "DNP3/UDP", {}
+                length = raw[2]
+                control = raw[3]
+                dst = int.from_bytes(raw[4:6], "little", signed=False)
+                src = int.from_bytes(raw[6:8], "little", signed=False)
+                with self._lock:
+                    self._metrics["dnp3"] += 1
+                return "DNP3/UDP", {
+                    "len": length,
+                    "ctrl": control,
+                    "dst": dst,
+                    "src": src,
+                }
 
-        # BACnet/IP (47808/udp): BVLC type=0x81 then function
+        # BACnet/IP
+        # BVLC: type(0x81), function, length(2)
         if self._port_hit(self.PORT_BACNET_UDP, ports) and len(raw) >= 4:
             if raw[0] == 0x81:
                 func = raw[1]
-                self._metrics["bacnet"] += 1
-                return "BACnet/IP", {"fn": func}
+                bvlc_len = int.from_bytes(raw[2:4], "big", signed=False)
+                with self._lock:
+                    self._metrics["bacnet"] += 1
+                return "BACnet/IP", {
+                    "fn": func,
+                    "bvlc_len": bvlc_len,
+                }
 
         return None, {}
 
@@ -2279,17 +2394,33 @@ class TransportSCADAManager:
         if not info:
             return ""
         try:
-            if proto.startswith("Modbus") and "fc" in info:
-                return f" fc={info['fc']}"
-            if proto.startswith("IEC-104") and "len" in info:
-                return f" apdu_len={info['len']}"
-            if proto.startswith("BACnet") and "fn" in info:
-                return f" fn={info['fn']}"
-        except Exception:
-            pass
-        # generic
-        try:
-            kv = ",".join(f"{k}={v}" for k, v in info.items())
+            if proto.startswith("Modbus"):
+                out = []
+                if "fc" in info:
+                    out.append(f"fc={info['fc']}")
+                if "unit" in info:
+                    out.append(f"unit={info['unit']}")
+                if "mbap_len" in info:
+                    out.append(f"mbap_len={info['mbap_len']}")
+                return f" {' '.join(out)}" if out else ""
+
+            if proto.startswith("IEC-104"):
+                out = []
+                if "len" in info:
+                    out.append(f"apdu_len={info['len']}")
+                if "ctrl" in info:
+                    out.append(f"ctrl={info['ctrl']}")
+                return f" {' '.join(out)}" if out else ""
+
+            if proto.startswith("BACnet"):
+                out = []
+                if "fn" in info:
+                    out.append(f"fn={info['fn']}")
+                if "bvlc_len" in info:
+                    out.append(f"bvlc_len={info['bvlc_len']}")
+                return f" {' '.join(out)}" if out else ""
+
+            kv = " ".join(f"{k}={v}" for k, v in info.items())
             return f" {kv}" if kv else ""
         except Exception:
             return ""
@@ -2297,29 +2428,61 @@ class TransportSCADAManager:
     # ---------------------------
     # Utilities
     # ---------------------------
-    def _pre_checks(self, pkt, *, want_udp: bool) -> bool:
-        if (TCP is None) or (UDP is None):
-            return False
-        if not pkt:
-            return False
-        if not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
-            return False
-        if want_udp:
-            return pkt.haslayer(UDP)
-        return pkt.haslayer(TCP)
+    def _extract_payload(self, pkt, *, want_udp: bool) -> Optional[bytes]:
+        """
+        Returns transport payload bytes, not just Raw.load.
 
-    def _raw(self, pkt) -> bytes:
-        if Raw is None or not pkt.haslayer(Raw):
-            return b""
+        Accepts:
+          - a Scapy packet
+          - raw bytes / bytearray / memoryview payload
+        """
+        if pkt is None:
+            return None
+
+        # Already raw payload bytes
+        if isinstance(pkt, (bytes, bytearray, memoryview)):
+            try:
+                raw = bytes(pkt)
+                return raw[: self._peek_cap] if raw else b""
+            except Exception:
+                return None
+
+        layer = UDP if want_udp else TCP
+
+        # Preferred: direct transport payload bytes
         try:
-            return bytes(pkt[Raw].load)[: self._peek_cap] or b""
+            if layer is not None and hasattr(pkt, "haslayer") and pkt.haslayer(layer):
+                trans = pkt[layer]
+                if hasattr(trans, "payload"):
+                    raw = bytes(trans.payload)
+                    return raw[: self._peek_cap] if raw else b""
         except Exception:
-            return b""
+            pass
+
+        # Fallback: Raw layer
+        try:
+            if Raw is not None and hasattr(pkt, "haslayer") and pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load)
+                return raw[: self._peek_cap] if raw else b""
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _safe_port(port_val) -> Optional[int]:
+        try:
+            p = int(port_val)
+            if 0 <= p <= 65535:
+                return p
+            return None
+        except Exception:
+            return None
 
     @staticmethod
     def _port_hit(port: int, ports: Tuple[int, int]) -> bool:
         s, d = ports
-        return (s == port) or (d == port)
+        return s == port or d == port
 
     def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int):
         a = (str(src_ip), str(int(sport)))
@@ -2327,8 +2490,8 @@ class TransportSCADAManager:
         first, second = (a, b) if a <= b else (b, a)
         return first + second
 
-    def _should_log(self, st: Dict[str, Any], now: float) -> bool:
-        last = st.get("last_log", 0.0)
+    def _should_log_locked(self, st: Dict[str, Any], now: float) -> bool:
+        last = float(st.get("last_log", 0.0) or 0.0)
         if (now - last) >= self.RL_INTERVAL_SEC:
             st["last_log"] = now
             return True
@@ -2336,9 +2499,10 @@ class TransportSCADAManager:
 
     def _iface_suffix(self, inbound_iface: str) -> str:
         try:
-            return inbound_iface.split("_")[-1]
+            s = str(inbound_iface or "")
+            return s.split("_")[-1] if "_" in s else s
         except Exception:
-            return inbound_iface or ""
+            return str(inbound_iface or "")
 
     def _safe_log(self, msg: str):
         if not self.logging_enabled:
@@ -2346,23 +2510,40 @@ class TransportSCADAManager:
         try:
             self.logger.log_message(msg)
         except Exception:
-            pass
+            try:
+                self.logger(msg)
+            except Exception:
+                pass
 
-    def _clean_if_needed(self, now_ts: float):
-        # TTL cleanup (every ~2k events)
-        if self._metrics["seen"] % 2048 == 0:
-            ttl = self.flow_cache_ttl
-            if ttl > 0:
-                stale = [k for k, v in self._flows.items() if now_ts - v.get("last", now_ts) > ttl]
+    def _clean_if_needed_locked(self, now_ts: float):
+        seen = int(self._metrics.get("seen", 0) or 0)
+
+        # TTL cleanup every ~2k seen packets
+        if seen > 0 and (seen % 2048 == 0):
+            ttl = int(self.flow_cache_ttl or 0)
+            if ttl > 0 and self._flows:
+                stale = [
+                    k for k, v in self._flows.items()
+                    if (now_ts - float(v.get("last", now_ts) or now_ts)) > ttl
+                ]
                 for k in stale:
                     self._flows.pop(k, None)
+
         # Soft cap cleanup
         if len(self._flows) > self.flow_cache_max:
             excess = len(self._flows) - self.flow_cache_max
-            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:excess]
+            victims = sorted(
+                self._flows.items(),
+                key=lambda kv: float(kv[1].get("last", 0.0) or 0.0)
+            )[:excess]
+
             for k, _ in victims:
                 self._flows.pop(k, None)
+
             self._metrics["flow_cache_evictions"] += excess
+
+        self._metrics["active_flows"] = len(self._flows)
+
 class TransportSSHManager:
     """
     Lightweight SSH detector/logger with global token-bucket and per-flow cooldown.
@@ -2521,32 +2702,60 @@ class TransportSSHManager:
             pass
 class TransportFTPManager:
     """
-    Lightweight FTP (control, port 21) detector/logger with global token-bucket and per-flow cooldown.
+    Self-contained FTP detector/logger.
+
+    What it catches:
+      - FTP control traffic on TCP/21
+      - FTP active-mode data flows via PORT / EPRT
+      - FTP passive-mode data flows via PASV / EPSV
+      - Traditional FTP-DATA on TCP/20
+      - Raw bytes, Scapy packets, or packet-like objects
+
     Public API:
-        handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+      - handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
+
+    Notes:
+      - This keeps the same main signature as your original class.
+      - It no longer depends on Scapy Raw being present to find payload.
+      - It tracks FTP session negotiation so it can catch data channels too.
     """
 
-    # ---- Tunables ----
-    LOG_RPS           = 0.5
-    LOG_BURST         = 60
-    FLOW_COOLDOWN_S   = 20.0
-    COOLDOWN_JITTER_S = 0.50
+    # ---------------- Tunables ----------------
+    LOG_RPS = 2.0
+    LOG_BURST = 100
+    FLOW_COOLDOWN_S = 8.0
+    COOLDOWN_JITTER_S = 0.35
     BIG_PAYLOAD_BYTES = 1200
-    PORTS             = {21}
 
+    CONTROL_PORTS = {21}
+    LEGACY_DATA_PORTS = {20}
+
+    CONTROL_SESSION_TTL_S = 15 * 60
+    DATA_HINT_TTL_S = 5 * 60
+    DATA_FLOW_TTL_S = 10 * 60
+
+    MAX_CONTROL_SESSIONS = 4096
+    MAX_DATA_HINTS = 8192
+    MAX_DATA_FLOWS = 8192
+    MAX_COOLDOWNS = 20000
+
+    # ---------------- Token bucket ----------------
     class _TokenBucket:
         __slots__ = ("capacity", "refill", "tokens", "last")
+
         def __init__(self, capacity: int, refill_rate_per_s: float):
             self.capacity = float(max(1, capacity))
             self.refill = float(max(0.05, refill_rate_per_s))
             self.tokens = float(self.capacity)
             self.last = time.time()
+
         def _refill(self):
             now = time.time()
             delta = now - self.last
             if delta > 0:
-                self.tokens = min(self.capacity, self.tokens + delta * self.refill)
+                self.tokens = min(self.capacity, self.tokens + (delta * self.refill))
                 self.last = now
+
         def allow(self, cost: float = 1.0) -> bool:
             self._refill()
             if self.tokens >= cost:
@@ -2554,131 +2763,733 @@ class TransportFTPManager:
                 return True
             return False
 
-    def __init__(self, logger,
-                 *,
-                 log_rps: float = None,
-                 log_burst: int = None,
-                 flow_cooldown_s: float = None):
+    # ---------------- Init ----------------
+    def __init__(
+        self,
+        logger,
+        *,
+        log_rps: float = None,
+        log_burst: int = None,
+        flow_cooldown_s: float = None,
+        control_session_ttl_s: float = None,
+        data_hint_ttl_s: float = None,
+        data_flow_ttl_s: float = None,
+    ):
         self.log = logger
+        self._lock = threading.RLock()
+
         self._tb = self._TokenBucket(
             capacity=int(log_burst or self.LOG_BURST),
             refill_rate_per_s=float(log_rps or self.LOG_RPS),
         )
-        self._cooldown_until: dict[tuple, float] = {}
+
         self._flow_cool = float(flow_cooldown_s or self.FLOW_COOLDOWN_S)
+        self._control_ttl = float(control_session_ttl_s or self.CONTROL_SESSION_TTL_S)
+        self._hint_ttl = float(data_hint_ttl_s or self.DATA_HINT_TTL_S)
+        self._data_flow_ttl = float(data_flow_ttl_s or self.DATA_FLOW_TTL_S)
+
+        self._cooldown_until = {}
+        self._control_sessions = OrderedDict()
+        self._data_hints = OrderedDict()   # (ip, port) -> dict(...)
+        self._data_flows = OrderedDict()   # canonical 4-tuple -> dict(...)
+
         self._emit("[Transport][📁 FTP] Manager ready.")
 
-    # ---- Public API ----
+    # ---------------- Public API ----------------
     def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
-        if not self._is_service_port(sport, dport):
-            return False
-        iface = (inbound_iface or "?").split("_")[-1]
-        payload = self._payload_sample(packet, cap=1024)
-        importance = self._importance(packet, payload)
-        fkey = self._flow_key(src_ip, sport, dst_ip, dport, iface)
-        if not self._should_log(fkey, importance):
-            return True
-        l7 = self._l7_hint(payload) if payload else "none"
-        size = len(payload)
-        direction = f"{src_ip}:{sport} → {dst_ip}:{dport}" if dport in self.PORTS else f"{dst_ip}:{dport} ← {src_ip}:{sport}"
-        self._emit(f"[Transport][🧵 TCP]📁 FTP if={iface} {direction} | payload={size}B l7={l7}")
-        return True
-
-    # ---- Helpers ----
-    def _is_service_port(self, sport: int, dport: int) -> bool:
+        """
+        Returns True if this packet appears to belong to FTP control or FTP data.
+        """
         try:
-            return int(sport) in self.PORTS or int(dport) in self.PORTS
+            sport = int(sport)
+            dport = int(dport)
         except Exception:
             return False
 
-    def _payload_sample(self, packet, cap: int = 1024) -> bytes:
-        try:
-            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
-                return bytes(getattr(packet[Raw], "load", b"") or b"")[:cap]
-        except Exception:
-            pass
-        try:
-            l4 = packet.getlayer(TCP) if hasattr(packet, "getlayer") else None
-            if l4 is not None:
-                pl = getattr(l4, "payload", None)
-                if pl and not isinstance(pl, NoPayload):
-                    return bytes(pl)[:cap]
-        except Exception:
-            pass
-        try:
-            return bytes(packet)[:cap]
-        except Exception:
-            return b""
+        iface = self._iface_name(inbound_iface)
+        now = time.time()
 
-    def _importance(self, packet, payload: bytes) -> str:
-        try:
-            if TCP is not None and hasattr(packet, "getlayer"):
-                l4 = packet.getlayer(TCP)
-                if l4 is not None:
-                    flags = getattr(l4, "flags", 0)
-                    if hasattr(flags, "value"):
-                        fv = int(flags.value)
-                        if fv & 0x04 or fv & 0x01:  # RST or FIN
-                            return "high"
-                        if fv & 0x02:               # SYN
-                            return "med"
-                    else:
-                        s = str(flags)
-                        if "R" in s or "F" in s:
-                            return "high"
-                        if "S" in s:
-                            return "med"
-        except Exception:
-            pass
+        with self._lock:
+            self._prune_locked(now)
+
+            meta = self._extract_packet_meta(packet)
+            payload = meta["payload"]
+            flags_text = meta["flags_text"]
+            wire_len = meta["wire_len"]
+
+            # 1) FTP control channel
+            if self._is_control_port(sport, dport):
+                session_key, direction = self._control_session_key_and_dir(src_ip, sport, dst_ip, dport)
+                session = self._get_or_create_control_session_locked(session_key, now)
+                session["last_seen"] = now
+                session["iface"] = iface
+
+                l7 = self._classify_control_payload(payload, direction)
+
+                if payload:
+                    self._update_control_session_from_payload_locked(
+                        session_key=session_key,
+                        session=session,
+                        payload=payload,
+                        direction=direction,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        sport=sport,
+                        dport=dport,
+                        now=now,
+                    )
+
+                importance = self._importance(flags_text, payload, l7, is_control=True)
+                fkey = ("ftp-ctrl",) + self._flow_key(src_ip, sport, dst_ip, dport, iface)
+
+                if self._should_log_locked(fkey, importance, now):
+                    arrow = "→" if dport in self.CONTROL_PORTS else "←"
+                    self._emit(
+                        f"[Transport][🧵 TCP][📁 FTP-CTRL] "
+                        f"if={iface} {src_ip}:{sport} {arrow} {dst_ip}:{dport} "
+                        f"| flags={flags_text or '-'} wire={wire_len}B payload={len(payload)}B l7={l7}"
+                    )
+                return True
+
+            # 2) Traditional FTP-DATA on port 20
+            if sport in self.LEGACY_DATA_PORTS or dport in self.LEGACY_DATA_PORTS:
+                mode = "legacy-port20"
+                data_kind = self._classify_data_payload(payload)
+                importance = self._importance(flags_text, payload, data_kind, is_control=False)
+                fkey = ("ftp-data20",) + self._flow_key(src_ip, sport, dst_ip, dport, iface)
+
+                if self._should_log_locked(fkey, importance, now):
+                    self._emit(
+                        f"[Transport][📦 FTP-DATA] "
+                        f"if={iface} {src_ip}:{sport} ↔ {dst_ip}:{dport} "
+                        f"| mode={mode} flags={flags_text or '-'} wire={wire_len}B payload={len(payload)}B kind={data_kind}"
+                    )
+                return True
+
+            # 3) Existing remembered FTP data flow
+            flow_info = self._lookup_data_flow_locked(src_ip, sport, dst_ip, dport, now)
+            if flow_info is not None:
+                data_kind = self._classify_data_payload(payload)
+                importance = self._importance(flags_text, payload, data_kind, is_control=False)
+                fkey = ("ftp-data-flow",) + self._flow_key(src_ip, sport, dst_ip, dport, iface)
+
+                if self._should_log_locked(fkey, importance, now):
+                    self._emit(
+                        f"[Transport][📦 FTP-DATA] "
+                        f"if={iface} {src_ip}:{sport} ↔ {dst_ip}:{dport} "
+                        f"| mode={flow_info.get('mode', 'unknown')} flags={flags_text or '-'} "
+                        f"wire={wire_len}B payload={len(payload)}B kind={data_kind}"
+                    )
+                return True
+
+            # 4) Packet matches an endpoint hinted by PORT/PASV/EPRT/EPSV
+            hint_info = self._lookup_data_hint_locked(src_ip, sport, dst_ip, dport, now)
+            if hint_info is not None:
+                self._remember_data_flow_locked(
+                    src_ip, sport, dst_ip, dport,
+                    session_key=hint_info.get("session_key"),
+                    mode=hint_info.get("mode", "hinted"),
+                    now=now,
+                )
+
+                data_kind = self._classify_data_payload(payload)
+                importance = self._importance(flags_text, payload, data_kind, is_control=False)
+                fkey = ("ftp-data-hint",) + self._flow_key(src_ip, sport, dst_ip, dport, iface)
+
+                if self._should_log_locked(fkey, importance, now):
+                    self._emit(
+                        f"[Transport][📦 FTP-DATA] "
+                        f"if={iface} {src_ip}:{sport} ↔ {dst_ip}:{dport} "
+                        f"| mode={hint_info.get('mode', 'hinted')} flags={flags_text or '-'} "
+                        f"wire={wire_len}B payload={len(payload)}B kind={data_kind}"
+                    )
+                return True
+
+            return False
+
+    # ---------------- Core detection ----------------
+    def _is_control_port(self, sport: int, dport: int) -> bool:
+        return sport in self.CONTROL_PORTS or dport in self.CONTROL_PORTS
+
+    def _control_session_key_and_dir(self, src_ip, sport, dst_ip, dport):
+        """
+        Returns:
+          session_key = (client_ip, client_port, server_ip, server_port)
+          direction   = 'c2s' or 's2c'
+        """
+        if dport in self.CONTROL_PORTS and sport not in self.CONTROL_PORTS:
+            return (str(src_ip), int(sport), str(dst_ip), int(dport)), "c2s"
+        if sport in self.CONTROL_PORTS and dport not in self.CONTROL_PORTS:
+            return (str(dst_ip), int(dport), str(src_ip), int(sport)), "s2c"
+
+        # Fallback if caller handed something weird but one side still looks like FTP
+        if dport in self.CONTROL_PORTS:
+            return (str(src_ip), int(sport), str(dst_ip), int(dport)), "c2s"
+        return (str(dst_ip), int(dport), str(src_ip), int(sport)), "s2c"
+
+    def _get_or_create_control_session_locked(self, session_key, now: float):
+        sess = self._control_sessions.get(session_key)
+        if sess is not None:
+            self._control_sessions.move_to_end(session_key)
+            return sess
+
+        if len(self._control_sessions) >= self.MAX_CONTROL_SESSIONS:
+            self._control_sessions.popitem(last=False)
+
+        sess = {
+            "created_at": now,
+            "last_seen": now,
+            "iface": "?",
+            "client_ip": session_key[0],
+            "client_port": session_key[1],
+            "server_ip": session_key[2],
+            "server_port": session_key[3],
+        }
+        self._control_sessions[session_key] = sess
+        return sess
+
+    def _update_control_session_from_payload_locked(
+        self,
+        session_key,
+        session,
+        payload: bytes,
+        direction: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        now: float,
+    ):
+        if not payload:
+            return
+
+        head = payload[:512]
+
+        # Client -> Server: PORT / EPRT
+        if direction == "c2s":
+            port_result = self._parse_port_command(head)
+            if port_result is not None:
+                ip, port = port_result
+                self._register_data_hint_locked(
+                    ip=ip,
+                    port=port,
+                    session_key=session_key,
+                    mode="active-port",
+                    peer_ip=session["server_ip"],
+                    now=now,
+                )
+                return
+
+            eprt_result = self._parse_eprt_command(head)
+            if eprt_result is not None:
+                ip, port = eprt_result
+                self._register_data_hint_locked(
+                    ip=ip,
+                    port=port,
+                    session_key=session_key,
+                    mode="active-eprt",
+                    peer_ip=session["server_ip"],
+                    now=now,
+                )
+                return
+
+        # Server -> Client: PASV / EPSV replies
+        if direction == "s2c":
+            pasv_result = self._parse_pasv_reply(head)
+            if pasv_result is not None:
+                ip, port = pasv_result
+                self._register_data_hint_locked(
+                    ip=ip,
+                    port=port,
+                    session_key=session_key,
+                    mode="passive-pasv",
+                    peer_ip=session["client_ip"],
+                    now=now,
+                )
+                return
+
+            epsv_result = self._parse_epsv_reply(head)
+            if epsv_result is not None:
+                self._register_data_hint_locked(
+                    ip=session["server_ip"],
+                    port=epsv_result,
+                    session_key=session_key,
+                    mode="passive-epsv",
+                    peer_ip=session["client_ip"],
+                    now=now,
+                )
+                return
+
+    # ---------------- Hint / flow tracking ----------------
+    def _register_data_hint_locked(self, ip: str, port: int, session_key, mode: str, peer_ip: str, now: float):
+        key = (str(ip), int(port))
+        if len(self._data_hints) >= self.MAX_DATA_HINTS:
+            self._data_hints.popitem(last=False)
+        self._data_hints[key] = {
+            "expires": now + self._hint_ttl,
+            "session_key": session_key,
+            "mode": mode,
+            "peer_ip": str(peer_ip),
+        }
+        self._data_hints.move_to_end(key)
+
+    def _lookup_data_hint_locked(self, src_ip: str, sport: int, dst_ip: str, dport: int, now: float):
+        src_key = (str(src_ip), int(sport))
+        dst_key = (str(dst_ip), int(dport))
+
+        for key in (src_key, dst_key):
+            info = self._data_hints.get(key)
+            if info is None:
+                continue
+            if now > float(info.get("expires", 0)):
+                self._data_hints.pop(key, None)
+                continue
+            self._data_hints.move_to_end(key)
+            return info
+        return None
+
+    def _remember_data_flow_locked(self, src_ip: str, sport: int, dst_ip: str, dport: int, session_key, mode: str, now: float):
+        flow_key = self._canonical_four_tuple(src_ip, sport, dst_ip, dport)
+        if len(self._data_flows) >= self.MAX_DATA_FLOWS:
+            self._data_flows.popitem(last=False)
+        self._data_flows[flow_key] = {
+            "expires": now + self._data_flow_ttl,
+            "session_key": session_key,
+            "mode": mode,
+        }
+        self._data_flows.move_to_end(flow_key)
+
+    def _lookup_data_flow_locked(self, src_ip: str, sport: int, dst_ip: str, dport: int, now: float):
+        flow_key = self._canonical_four_tuple(src_ip, sport, dst_ip, dport)
+        info = self._data_flows.get(flow_key)
+        if info is None:
+            return None
+        if now > float(info.get("expires", 0)):
+            self._data_flows.pop(flow_key, None)
+            return None
+        self._data_flows.move_to_end(flow_key)
+        return info
+
+    # ---------------- Logging / rate limiting ----------------
+    def _importance(self, flags_text: str, payload: bytes, l7: str, is_control: bool) -> str:
+        ft = flags_text or ""
+        if "R" in ft or "F" in ft:
+            return "high"
+        if "S" in ft:
+            return "med"
+        if is_control and l7 not in ("unknown", "none", "control-cleartext"):
+            return "med"
         if len(payload) >= self.BIG_PAYLOAD_BYTES:
             return "med"
         return "low"
 
-    def _flow_key(self, src, sport, dst, dport, iface) -> tuple[str, ...]:
-        def _nh(x): return "" if x is None else str(x)
-        def _np(p):
-            try: return str(int(p))
-            except Exception: return "" if p is None else str(p)
-        sa = (_nh(src), _np(sport))
-        sb = (_nh(dst), _np(dport))
-        first, second = (sa, sb) if (sa < sb) else (sb, sa)
-        return first + second + (_nh(iface),)
+    def _should_log_locked(self, fkey: tuple, importance: str, now: float) -> bool:
+        if len(self._cooldown_until) > self.MAX_COOLDOWNS:
+            self._prune_cooldowns_locked(now)
 
-    def _should_log(self, fkey: tuple, importance: str) -> bool:
-        now = time.time()
-        last_ok = self._cooldown_until.get(fkey, 0.0)
+        last_ok = float(self._cooldown_until.get(fkey, 0.0))
         if now < last_ok:
             return False
+
         cost = 1.0 if importance == "high" else (1.5 if importance == "med" else 3.0)
-        allowed = self._tb.allow(cost=1.0 if importance == "high" else cost)
-        if not allowed and importance == "high" and (now - self._tb.last) > 0.5:
-            allowed = True
+        allowed = self._tb.allow(cost=cost)
+
+        # Let a rare high-priority event through even when starved
+        if not allowed and importance == "high":
+            if (now - self._tb.last) > 0.5:
+                allowed = True
+
         if not allowed:
             return False
-        jitter = (random.random() - 0.5) * 2 * self.COOLDOWN_JITTER_S
-        self._cooldown_until[fkey] = now + self._flow_cool + jitter
+
+        jitter = (random.random() - 0.5) * 2.0 * self.COOLDOWN_JITTER_S
+        until = now + max(0.5, self._flow_cool + jitter)
+        self._cooldown_until[fkey] = until
         return True
 
-    def _l7_hint(self, payload: bytes) -> str:
+    def _prune_cooldowns_locked(self, now: float):
+        stale = [k for k, v in self._cooldown_until.items() if float(v) <= now]
+        for k in stale:
+            self._cooldown_until.pop(k, None)
+
+        if len(self._cooldown_until) <= self.MAX_COOLDOWNS:
+            return
+
+        # If still too large, drop oldest-ish by expiry
+        items = sorted(self._cooldown_until.items(), key=lambda kv: kv[1])
+        drop_n = len(self._cooldown_until) - self.MAX_COOLDOWNS
+        for k, _ in items[:drop_n]:
+            self._cooldown_until.pop(k, None)
+
+    # ---------------- Control parsing ----------------
+    def _classify_control_payload(self, payload: bytes, direction: str) -> str:
         if not payload:
             return "none"
+
         head = payload[:256]
-        for cmd in (b"USER ", b"PASS ", b"RETR ", b"STOR ", b"LIST", b"PASV", b"PORT ", b"PWD", b"CWD "):
-            if head.startswith(cmd):
-                return cmd.decode("ascii", "ignore").strip()
-        if b"227 " in head and b"Passive Mode" in head:
-            return "227-PASV"
-        for code in (b"220 ", b"221 ", b"230 ", b"331 ", b"530 "):
-            if head.startswith(code):
-                return code.decode("ascii", "ignore").strip()
-        asciiish = sum(1 for x in head if 9 <= x <= 13 or 32 <= x <= 126)
-        if asciiish >= max(1, int(0.9 * len(head))):
+        line = head.split(b"\n", 1)[0].strip(b"\r")
+
+        if direction == "c2s":
+            for cmd in (
+                b"USER", b"PASS", b"ACCT", b"CWD", b"CDUP", b"QUIT",
+                b"PORT", b"PASV", b"TYPE", b"STRU", b"MODE", b"RETR",
+                b"STOR", b"STOU", b"APPE", b"ALLO", b"REST", b"RNFR",
+                b"RNTO", b"ABOR", b"DELE", b"RMD", b"MKD", b"PWD", b"LIST",
+                b"NLST", b"SYST", b"NOOP", b"FEAT", b"OPTS", b"AUTH",
+                b"PBSZ", b"PROT", b"EPSV", b"EPRT",
+            ):
+                if line.upper().startswith(cmd):
+                    return cmd.decode("ascii", "ignore")
+        else:
+            m = re.match(rb"^(\d{3})\b", line)
+            if m:
+                code = m.group(1).decode("ascii", "ignore")
+                if code == "227":
+                    return "227-PASV"
+                if code == "229":
+                    return "229-EPSV"
+                return code
+
+        asciiish = sum(1 for b in head if 9 <= b <= 13 or 32 <= b <= 126)
+        if asciiish >= max(1, int(0.90 * len(head))):
             return "control-cleartext"
+
         return "unknown"
+
+    def _classify_data_payload(self, payload: bytes) -> str:
+        if not payload:
+            return "none"
+
+        head = payload[:256]
+        asciiish = sum(1 for b in head if 9 <= b <= 13 or 32 <= b <= 126)
+        ratio = (asciiish / max(1, len(head)))
+
+        # Directory listings and text transfers often look very ASCII
+        if ratio >= 0.95:
+            return "ascii-data"
+        if ratio >= 0.70:
+            return "mixed-data"
+        return "binary-data"
+
+    def _parse_port_command(self, head: bytes):
+        # PORT h1,h2,h3,h4,p1,p2
+        m = re.search(
+            rb"(?im)^\s*PORT\s+(\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3})\s*$",
+            head,
+        )
+        if not m:
+            return None
+
+        nums = [int(x) for x in m.groups()]
+        if any(n < 0 or n > 255 for n in nums):
+            return None
+
+        ip = ".".join(str(n) for n in nums[:4])
+        port = (nums[4] << 8) | nums[5]
+        if not (1 <= port <= 65535):
+            return None
+        return ip, port
+
+    def _parse_eprt_command(self, head: bytes):
+        # EPRT |<af>|<addr>|<port>|
+        try:
+            text = head.decode("ascii", "ignore")
+        except Exception:
+            return None
+
+        m = re.search(r"(?im)^\s*EPRT\s+(.)([12])\1([^|]+)\1(\d{1,5})\1\s*$", text)
+        if not m:
+            return None
+
+        af = m.group(2)
+        addr = m.group(3).strip()
+        port = int(m.group(4))
+
+        if not (1 <= port <= 65535):
+            return None
+
+        # We accept either v4 or v6 string here.
+        if af == "1":
+            return addr, port
+        if af == "2":
+            return addr, port
+        return None
+
+    def _parse_pasv_reply(self, head: bytes):
+        # 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+        m = re.search(
+            rb"227\b.*?\((\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3}),(\d{1,3})\)",
+            head,
+            flags=re.I | re.S,
+        )
+        if not m:
+            return None
+
+        nums = [int(x) for x in m.groups()]
+        if any(n < 0 or n > 255 for n in nums):
+            return None
+
+        ip = ".".join(str(n) for n in nums[:4])
+        port = (nums[4] << 8) | nums[5]
+        if not (1 <= port <= 65535):
+            return None
+        return ip, port
+
+    def _parse_epsv_reply(self, head: bytes):
+        # 229 Entering Extended Passive Mode (|||6446|)
+        try:
+            text = head.decode("ascii", "ignore")
+        except Exception:
+            return None
+
+        m = re.search(r"229\b.*?\((.)(?:\1){2}(\d{1,5})\1\)", text, flags=re.I | re.S)
+        if not m:
+            return None
+
+        port = int(m.group(2))
+        if not (1 <= port <= 65535):
+            return None
+        return port
+
+    # ---------------- Packet extraction ----------------
+    def _extract_packet_meta(self, packet):
+        """
+        Tries hard to get:
+          - TCP payload bytes
+          - TCP flag text
+          - total wire length
+        """
+        payload = b""
+        flags_text = ""
+        raw_bytes = b""
+
+        # Scapy happy path
+        try:
+            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                payload = bytes(getattr(packet[Raw], "load", b"") or b"")
+        except Exception:
+            pass
+
+        try:
+            raw_bytes = bytes(packet)
+        except Exception:
+            raw_bytes = b""
+
+        wire_len = len(raw_bytes)
+
+        # Scapy TCP flags
+        try:
+            if TCP is not None and hasattr(packet, "getlayer"):
+                t = packet.getlayer(TCP)
+                if t is not None:
+                    flags_text = self._normalize_flags(getattr(t, "flags", ""))
+                    if not payload:
+                        pl = getattr(t, "payload", None)
+                        if pl is not None:
+                            if NoPayload is None or not isinstance(pl, NoPayload):
+                                try:
+                                    payload = bytes(pl)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+
+        # Raw parse fallback if payload still looks like full frame or missing
+        if raw_bytes:
+            parsed = self._extract_tcp_payload_and_flags_from_raw(raw_bytes)
+            if parsed is not None:
+                raw_payload, raw_flags = parsed
+                if not payload:
+                    payload = raw_payload
+                if not flags_text:
+                    flags_text = raw_flags
+
+        # Final fallback: if payload is still empty and packet is already bytes-like,
+        # we do not blindly use full packet bytes as payload because that causes false positives.
+        return {
+            "payload": payload or b"",
+            "flags_text": flags_text or "",
+            "wire_len": int(wire_len),
+        }
+
+    def _extract_tcp_payload_and_flags_from_raw(self, raw: bytes):
+        """
+        Minimal parser for Ethernet/IP/TCP to get TCP payload and flags from raw bytes.
+        Returns (payload_bytes, flags_text) or None.
+        """
+        try:
+            offset = 0
+            if len(raw) >= 14:
+                eth_type = int.from_bytes(raw[12:14], "big")
+                if eth_type in (0x0800, 0x86DD):
+                    offset = 14
+
+            if len(raw) <= offset:
+                return None
+
+            version = (raw[offset] >> 4) & 0x0F
+
+            if version == 4:
+                if len(raw) < offset + 20:
+                    return None
+                ihl = (raw[offset] & 0x0F) * 4
+                if ihl < 20 or len(raw) < offset + ihl:
+                    return None
+                proto = raw[offset + 9]
+                if proto != 6:
+                    return None
+                total_len = int.from_bytes(raw[offset + 2:offset + 4], "big")
+                tcp_off = offset + ihl
+                if len(raw) < tcp_off + 20:
+                    return None
+                data_off = ((raw[tcp_off + 12] >> 4) & 0x0F) * 4
+                if data_off < 20 or len(raw) < tcp_off + data_off:
+                    return None
+                flags_byte = raw[tcp_off + 13]
+                end = offset + total_len if total_len > 0 else len(raw)
+                end = min(end, len(raw))
+                payload_off = tcp_off + data_off
+                if payload_off > end:
+                    return b"", self._flags_byte_to_text(flags_byte)
+                return raw[payload_off:end], self._flags_byte_to_text(flags_byte)
+
+            if version == 6:
+                if len(raw) < offset + 40:
+                    return None
+
+                next_header = raw[offset + 6]
+                payload_len = int.from_bytes(raw[offset + 4:offset + 6], "big")
+                cursor = offset + 40
+                end = min(len(raw), offset + 40 + payload_len)
+
+                # Walk a few common extension headers
+                # Hop-by-Hop(0), Routing(43), Fragment(44), AH(51), DestOpts(60)
+                for _ in range(6):
+                    if next_header == 6:
+                        break
+                    if next_header in (0, 43, 60):
+                        if cursor + 2 > len(raw):
+                            return None
+                        nh = raw[cursor]
+                        hdr_len = (raw[cursor + 1] + 1) * 8
+                        next_header = nh
+                        cursor += hdr_len
+                        continue
+                    if next_header == 44:
+                        if cursor + 8 > len(raw):
+                            return None
+                        nh = raw[cursor]
+                        next_header = nh
+                        cursor += 8
+                        continue
+                    if next_header == 51:
+                        if cursor + 2 > len(raw):
+                            return None
+                        nh = raw[cursor]
+                        hdr_len = (raw[cursor + 1] + 2) * 4
+                        next_header = nh
+                        cursor += hdr_len
+                        continue
+                    return None
+
+                if next_header != 6:
+                    return None
+
+                tcp_off = cursor
+                if len(raw) < tcp_off + 20:
+                    return None
+                data_off = ((raw[tcp_off + 12] >> 4) & 0x0F) * 4
+                if data_off < 20 or len(raw) < tcp_off + data_off:
+                    return None
+                flags_byte = raw[tcp_off + 13]
+                payload_off = tcp_off + data_off
+                if payload_off > end:
+                    return b"", self._flags_byte_to_text(flags_byte)
+                return raw[payload_off:end], self._flags_byte_to_text(flags_byte)
+
+            return None
+        except Exception:
+            return None
+
+    # ---------------- Utilities ----------------
+    def _iface_name(self, inbound_iface: str) -> str:
+        try:
+            text = str(inbound_iface or "?")
+            return text.split("_")[-1] if "_" in text else text
+        except Exception:
+            return "?"
+
+    def _canonical_four_tuple(self, src_ip, sport, dst_ip, dport):
+        a = (str(src_ip), int(sport))
+        b = (str(dst_ip), int(dport))
+        return (a, b) if a <= b else (b, a)
+
+    def _flow_key(self, src, sport, dst, dport, iface):
+        a = (str(src), str(int(sport)))
+        b = (str(dst), str(int(dport)))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second + (str(iface or ""),)
+
+    def _normalize_flags(self, flags_obj) -> str:
+        try:
+            if hasattr(flags_obj, "value"):
+                return self._flags_byte_to_text(int(flags_obj.value))
+            if isinstance(flags_obj, int):
+                return self._flags_byte_to_text(flags_obj)
+            s = str(flags_obj)
+            # Keep only sane TCP flag letters
+            out = "".join(ch for ch in s if ch in "FSRPAUECN")
+            return out or s
+        except Exception:
+            return ""
+
+    def _flags_byte_to_text(self, flags_byte: int) -> str:
+        names = (
+            (0x01, "F"),
+            (0x02, "S"),
+            (0x04, "R"),
+            (0x08, "P"),
+            (0x10, "A"),
+            (0x20, "U"),
+            (0x40, "E"),
+            (0x80, "C"),
+        )
+        return "".join(letter for bit, letter in names if flags_byte & bit)
+
+    def _prune_locked(self, now: float):
+        # Control sessions
+        expired = [k for k, v in self._control_sessions.items() if now - float(v.get("last_seen", 0)) > self._control_ttl]
+        for k in expired:
+            self._control_sessions.pop(k, None)
+
+        while len(self._control_sessions) > self.MAX_CONTROL_SESSIONS:
+            self._control_sessions.popitem(last=False)
+
+        # Data hints
+        expired = [k for k, v in self._data_hints.items() if now > float(v.get("expires", 0))]
+        for k in expired:
+            self._data_hints.pop(k, None)
+
+        while len(self._data_hints) > self.MAX_DATA_HINTS:
+            self._data_hints.popitem(last=False)
+
+        # Data flows
+        expired = [k for k, v in self._data_flows.items() if now > float(v.get("expires", 0))]
+        for k in expired:
+            self._data_flows.pop(k, None)
+
+        while len(self._data_flows) > self.MAX_DATA_FLOWS:
+            self._data_flows.popitem(last=False)
+
+        # Cooldowns
+        self._prune_cooldowns_locked(now)
 
     def _emit(self, msg: str):
         try:
-            self.log.log_message(msg)
+            if hasattr(self.log, "log_message"):
+                self.log.log_message(msg)
+            else:
+                self.log(msg)
         except Exception:
             pass
 class TransportRDPManager:
@@ -6681,6 +7492,10 @@ class TransportMoneroManager:
     P2POOL_SHARE_MIN = 96
     P2POOL_BLOCK_MIN = 2048
     P2POOL_BLOCK_HUGE = 8192
+    P2POOL_BRANCH_PROMOTE_MIN = 2.4
+    P2POOL_BRANCH_PROMOTE_MIN_HITS = 2
+    P2POOL_BRANCH_DECAY_SEC = 35.0
+    P2POOL_BRANCH_LOG_COOLDOWN_SEC = 6.0
 
     # -------- Levin constants --------
     _LEVIN_SIG = 0x0101010101010101
@@ -6859,6 +7674,14 @@ class TransportMoneroManager:
         self._tx_cb = tx_cb
         self._last_gc = time.time()
 
+        # Stronger raw branch detection so split / partial P2Pool streams still classify
+        # as peerlist/share/chain/block without relying only on a single packet length.
+        self._raw_scan_window = 64 * 1024
+        self._raw_event_confidence_floor = 55.0
+        self._raw_share_confidence_floor = 62.0
+        self._raw_block_confidence_floor = 60.0
+        self._raw_peerlist_confidence_floor = 60.0
+
         # -------- packet-driven P2Pool mining intelligence --------
         self.p2pool_mining_runtime: Dict[str, Any] = {
             "peer_cache": {},
@@ -6889,7 +7712,6 @@ class TransportMoneroManager:
 
         self._emit_log("[Transport][🪙 Monero] Manager ready.")
 
-    # ========== Public entrypoint ==========
     def handle(self, pkt, src, dst, sport, dport, inbound_iface) -> str:
         try:
             if not self._is_tcp(pkt):
@@ -7010,7 +7832,7 @@ class TransportMoneroManager:
     @staticmethod
     def _new_flow(src, sport, dst, dport, iface, now_ts, ftype: str):
         return {
-            "type": ftype,  # "p2p" or "rpc"
+            "type": ftype,
             "state": "INIT",
             "endpoints": ((src, int(sport)), (dst, int(dport))),
             "created": now_ts,
@@ -7060,6 +7882,7 @@ class TransportMoneroManager:
             "p2pool_last_label": None,
             "p2pool_last_preview": None,
             "p2pool_last_detail": None,
+            "p2pool_last_confidence": 0.0,
             "p2pool_seen_handshake": False,
             "p2pool_seen_peerlist": False,
             "p2pool_seen_share": False,
@@ -7073,6 +7896,14 @@ class TransportMoneroManager:
             "p2pool_event_ts": {},
             "p2pool_mining_last_key": None,
             "p2pool_last_direction": None,
+            "p2pool_raw_stage": "cold",
+            "p2pool_raw_hits": defaultdict(int),
+            "p2pool_branch_scores": defaultdict(float),
+            "p2pool_branch_hits": defaultdict(int),
+            "p2pool_branch_scores_ts": 0.0,
+            "p2pool_branch_best": "unknown",
+            "p2pool_last_peer_count": 0,
+            "p2pool_last_branch_reason": None,
 
             # Optional TX sockets
             "client_sock": None,
@@ -7663,8 +8494,31 @@ class TransportMoneroManager:
         if len(buf) > self.P2POOL_BUF_MAX:
             del buf[: len(buf) - self.P2POOL_BUF_MAX]
 
-        snap = bytes(buf)
-        label, detail, meta = self._classify_p2pool_payload_richer(f, snap, dir_name)
+        snap = self._tail_window(bytes(buf), self._raw_scan_window)
+        raw_label, raw_detail, meta = self._classify_p2pool_payload_richer(f, snap, dir_name)
+        raw_confidence = float(meta.get("confidence", 0.0) or 0.0)
+        label = raw_label
+        detail = raw_detail
+        confidence = raw_confidence
+
+        if label in {"share", "block"} and confidence < self._raw_share_confidence_floor:
+            label = "unknown"
+            detail = f"low_confidence_{detail}"
+        elif label == "peerlist" and confidence < self._raw_peerlist_confidence_floor:
+            label = "unknown"
+            detail = f"low_confidence_{detail}"
+        elif label not in {"unknown", "handshake", "timed_sync", "ping"} and confidence < self._raw_event_confidence_floor:
+            label = "unknown"
+            detail = f"low_confidence_{detail}"
+
+        label, detail, confidence, meta = self._promote_p2pool_branch_from_candidates(
+            f,
+            label=label,
+            detail=detail,
+            meta=meta,
+            direction=dir_name,
+        )
+
         preview = self._short_hex(snap[:48], 48)
         bucket = meta.get("len_bucket") or self._len_bucket(len(snap))
         peers = meta.get("peers") or []
@@ -7679,8 +8533,10 @@ class TransportMoneroManager:
         f["p2pool_last_label"] = label
         f["p2pool_last_preview"] = preview
         f["p2pool_last_detail"] = detail
+        f["p2pool_last_confidence"] = round(confidence, 2)
         f["p2pool_frames_logged"] = f.get("p2pool_frames_logged", 0) + 1
         f["p2pool_peer_candidates"] = peers[:16]
+        f["p2pool_last_peer_count"] = len(peers)
         self._update_p2pool_seen_flags(f, label)
 
         peer_txt = ""
@@ -7689,41 +8545,48 @@ class TransportMoneroManager:
             more = "" if len(peers) <= 4 else f" +{len(peers) - 4} more"
             peer_txt = f" peers={len(peers)} [{head}{more}]"
 
+        cand_txt = self._p2pool_candidate_summary(meta)
+        cand_part = f" cand={cand_txt}" if cand_txt else ""
         msg = (
             f"[Transport][🧵 TCP][🪙 Monero][P2Pool] 🧩 {label.upper()} RAW "
-            f"dir={dir_name} len={len(snap)} bucket={bucket} detail={detail}{peer_txt} "
+            f"dir={dir_name} len={len(snap)} bucket={bucket} conf={confidence:.1f} detail={detail}{peer_txt}{cand_part} "
             f"preview={preview or '-'} {a[0]}:{a[1]} ⇄ {b[0]}:{b[1]} on {iface}"
         )
 
-        event_key = f"raw:{label}:{detail}:{bucket}:{dir_name}:{len(peers)}"
+        event_key = f"raw:{label}:{bucket}:{dir_name}:{len(peers)}:{int(confidence // 5)}"
         if self._flow_event_ok(f, event_key, self.P2POOL_EVENT_COOLDOWN_SEC):
             self._rl_log(msg)
 
-        self._pm_dispatch(
-            label,
-            flow=f,
-            iface=iface,
-            source="raw",
-            payload_len=len(snap),
-            detail=detail,
-            meta={
-                "preview": preview,
-                "direction": dir_name,
-                "peers": peers,
-                "bucket": bucket,
-            },
-            levin_msg=None,
-        )
+        if label != "unknown":
+            self._pm_dispatch(
+                label,
+                flow=f,
+                iface=iface,
+                source="raw",
+                payload_len=len(snap),
+                detail=detail,
+                meta={
+                    "preview": preview,
+                    "direction": dir_name,
+                    "peers": peers,
+                    "bucket": bucket,
+                    "confidence": confidence,
+                    "candidate_summary": cand_txt,
+                    "branch_scores": meta.get("branch_scores") or [],
+                    "sha8": meta.get("sha8"),
+                },
+                levin_msg=None,
+            )
 
-        self._maybe_log_mining_from_p2pool_raw(
-            f=f,
-            label=label,
-            detail=detail,
-            iface=iface,
-            direction=dir_name,
-            payload_len=len(snap),
-            peers=peers,
-        )
+            self._maybe_log_mining_from_p2pool_raw(
+                f=f,
+                label=label,
+                detail=detail,
+                iface=iface,
+                direction=dir_name,
+                payload_len=len(snap),
+                peers=peers,
+            )
 
     def _classify_p2pool_payload(self, payload: bytes) -> Tuple[str, str]:
         if not payload:
@@ -7732,13 +8595,12 @@ class TransportMoneroManager:
         n = len(payload)
         ascii_ratio = self._ascii_ratio(payload)
 
-        # Levin signature found but parser did not yield full frame yet
-        if len(payload) >= 8:
-            try:
-                if struct.unpack_from("<Q", payload, 0)[0] == self._LEVIN_SIG:
-                    return "handshake", "levin_header_incomplete"
-            except Exception:
-                pass
+        if self._contains_levin_signature(payload):
+            return "handshake", "levin_header_incomplete"
+
+        peers = self._extract_compact_peer_candidates(payload)
+        if peers:
+            return "peerlist", f"peer_tuples={len(peers)}"
 
         if ascii_ratio > 0.75:
             low = payload[:256].lower()
@@ -7776,64 +8638,154 @@ class TransportMoneroManager:
         if not payload:
             return "unknown", "empty", meta
 
+        payload = self._tail_window(payload, self._raw_scan_window)
         n = len(payload)
-        ent = self._byte_entropy(payload[: min(len(payload), 128)])
-        ascii_ratio = self._ascii_ratio(payload[: min(len(payload), 256)])
+        sample = payload[: min(n, 256)]
+        ent = self._byte_entropy(sample[: min(len(sample), 128)])
+        ascii_ratio = self._ascii_ratio(sample)
         bucket = self._len_bucket(n)
+        stage = self._infer_p2pool_stage(f)
+        sha8 = hashlib.sha1(sample[: min(len(sample), 128)]).hexdigest()[:8] if sample else "na"
+        share_dir = self._p2pool_share_direction(f)
+        outbound_like = share_dir is not None and direction == share_dir
+        inbound_like = share_dir is not None and direction != share_dir
+        peers = self._extract_compact_peer_candidates(payload)
+
         meta["len_bucket"] = bucket
         meta["entropy"] = ent
         meta["ascii_ratio"] = ascii_ratio
+        meta["stage"] = stage
+        meta["sha8"] = sha8
+        meta["direction"] = direction or "?"
+        meta["peers"] = peers[:64]
 
-        if len(payload) >= 8:
-            try:
-                if struct.unpack_from("<Q", payload, 0)[0] == self._LEVIN_SIG:
-                    return "handshake", "levin_header_incomplete", meta
-            except Exception:
-                pass
+        scores: Dict[str, float] = defaultdict(float)
+        reasons: Dict[str, List[str]] = defaultdict(list)
 
-        peers = self._extract_compact_peer_candidates(payload)
+        def add(label: str, amount: float, reason: str) -> None:
+            if amount <= 0.0:
+                return
+            scores[label] += float(amount)
+            if len(reasons[label]) < 6:
+                reasons[label].append(str(reason))
+
+        sig_off = self._find_levin_signature(payload)
+        if sig_off >= 0:
+            add("handshake", 65.0 if sig_off == 0 else 58.0, f"levin_header_incomplete@{sig_off}")
+            meta["levin_offset"] = sig_off
+
         if peers:
-            meta["peers"] = peers
-            return "peerlist", f"compact_peer_tuples={len(peers)}", meta
+            peer_score = 74.0 + min(18.0, float(max(0, len(peers) - 1)) * 3.5)
+            add("peerlist", peer_score, f"peer_tuples={len(peers)}")
+
+        low = payload[: min(n, 256)].lower()
+        if ascii_ratio > 0.72:
+            if b"peer" in low:
+                add("peerlist", 61.0, "text_peer_hint")
+            if b"block" in low:
+                add("block", 58.0, "text_block_hint")
+                add("chain_object", 49.0, "text_block_hint")
+            if b"share" in low:
+                add("share", 58.0, "text_share_hint")
+            if b"chain" in low or b"sync" in low:
+                add("chain", 56.0, "text_chain_hint")
+            if b"hello" in low or b"handshake" in low:
+                add("handshake", 57.0, "text_handshake_hint")
 
         if (
             n <= self.P2POOL_SMALL_OPEN_MAX
-            and f.get("pkts", 0) <= 4
+            and f.get("pkts", 0) <= 5
             and not f.get("p2pool_seen_handshake")
             and ascii_ratio < 0.45
         ):
-            return "handshake", f"small_open_binary len={n}", meta
+            add("handshake", 57.0, f"small_open_binary len={n}")
 
-        if (
-            self.P2POOL_SHARE_MIN <= n < self.P2POOL_BLOCK_MIN
-            and (
-                f.get("p2pool_seen_handshake")
-                or f.get("p2pool_seen_timed_sync")
-                or f.get("p2pool_seen_peerlist")
-            )
-            and ascii_ratio < 0.60
-        ):
-            share_dir = self._p2pool_share_direction(f)
-            if share_dir:
-                if direction == share_dir:
-                    return "share", f"relay_candidate len={n}", meta
-                return "chain", f"sync_candidate len={n}", meta
-            return "share", f"mid_binary_post_open len={n}", meta
+        if self.P2POOL_SHARE_MIN <= n < self.P2POOL_BLOCK_MIN and ascii_ratio < 0.60:
+            base_share = 28.0
+            base_chain = 26.0
+            if stage in {"warming", "active"}:
+                base_share += 10.0
+                base_chain += 10.0
+            if f.get("p2pool_seen_handshake"):
+                base_share += 8.0
+                base_chain += 6.0
+            if f.get("p2pool_seen_timed_sync") or f.get("p2pool_seen_peerlist"):
+                base_share += 7.0
+                base_chain += 9.0
+            if outbound_like:
+                base_share += 12.0
+                base_chain += 2.0
+            elif inbound_like:
+                base_share += 3.0
+                base_chain += 11.0
+            else:
+                base_share += 6.0
+                base_chain += 6.0
+            if 4.0 <= ent <= 7.95:
+                base_share += 6.0
+                base_chain += 5.0
+            if 128 <= n <= 2048:
+                base_share += 5.0
+                base_chain += 4.0
+            if peers:
+                base_chain += 4.0
+            add("share", base_share, f"mid_binary_share len={n}")
+            add("chain", base_chain, f"mid_binary_chain len={n}")
 
-        if (
-            n >= self.P2POOL_BLOCK_MIN
-            and (
-                f.get("p2pool_seen_handshake")
-                or f.get("p2pool_seen_peerlist")
-                or f.get("p2pool_seen_share")
-            )
-            and ascii_ratio < 0.50
-        ):
-            label = "block" if n >= self.P2POOL_BLOCK_HUGE else "chain_object"
-            return label, f"bulk_binary len={n}", meta
+        if n >= self.P2POOL_BLOCK_MIN and ascii_ratio < 0.50:
+            base_block = 34.0
+            base_chain_obj = 31.0
+            if stage == "active":
+                base_block += 12.0
+                base_chain_obj += 8.0
+            if f.get("p2pool_seen_handshake"):
+                base_block += 7.0
+                base_chain_obj += 6.0
+            if f.get("p2pool_seen_share") or f.get("p2pool_seen_peerlist"):
+                base_block += 10.0
+                base_chain_obj += 9.0
+            if ent >= 5.0:
+                base_block += 6.0
+                base_chain_obj += 5.0
+            if n >= self.P2POOL_BLOCK_HUGE:
+                base_block += 9.0
+                base_chain_obj += 5.0
+            if inbound_like:
+                base_block += 4.0
+                base_chain_obj += 4.0
+            add("block", base_block, f"bulk_binary_block len={n}")
+            add("chain_object", base_chain_obj, f"bulk_binary_chain_object len={n}")
 
-        label, detail = self._classify_p2pool_payload(payload)
-        return label, detail, meta
+        label_basic, detail_basic = self._classify_p2pool_payload(payload)
+        if label_basic != "unknown":
+            add(label_basic, 46.0 + (6.0 if stage in {"warming", "active"} else 0.0), detail_basic)
+
+        # Prefer stronger peerlist/share/block classifications when repeated state already exists.
+        if f.get("p2pool_seen_peerlist") and peers:
+            add("peerlist", 8.0, "peerlist_state_confirm")
+        if f.get("p2pool_seen_share") and n >= self.P2POOL_SHARE_MIN:
+            add("share", 7.0, "share_state_confirm")
+        if f.get("p2pool_seen_block") and n >= self.P2POOL_BLOCK_MIN:
+            add("block", 8.0, "block_state_confirm")
+        if f.get("p2pool_seen_chain") and n >= self.P2POOL_SHARE_MIN:
+            add("chain", 6.0, "chain_state_confirm")
+            add("chain_object", 5.0, "chain_state_confirm")
+
+        if not scores:
+            meta["confidence"] = 0.0
+            meta["candidates"] = []
+            meta["candidate_map"] = {}
+            return "unknown", f"len={n}", meta
+
+        ordered = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+        best_label, best_score = ordered[0]
+        best_reasons = reasons.get(best_label) or [f"len={n}"]
+        detail = "|".join(best_reasons[:3])
+        meta["confidence"] = float(best_score)
+        meta["candidates"] = [{"label": k, "score": round(float(v), 2)} for k, v in ordered[:6]]
+        meta["candidate_map"] = {k: round(float(v), 2) for k, v in ordered[:6]}
+        meta["reason_map"] = {k: list(v[:4]) for k, v in reasons.items() if v}
+        return best_label, detail, meta
 
     def _update_p2pool_seen_flags(self, f: dict, label: str) -> None:
         if label == "handshake":
@@ -7851,46 +8803,209 @@ class TransportMoneroManager:
         elif label == "ping":
             f["p2pool_seen_ping"] = True
 
+    def _p2pool_branch_floor(self, label: str) -> float:
+        label = str(label or "unknown")
+        if label == "peerlist":
+            return 1.8
+        if label in {"share", "block"}:
+            return 2.4
+        if label in {"chain", "chain_object"}:
+            return 2.0
+        if label in {"handshake", "timed_sync", "ping"}:
+            return 1.2
+        return 99.0
+
+    def _decay_p2pool_branch_scores(self, f: dict, now_ts: float) -> None:
+        scores = f.setdefault("p2pool_branch_scores", defaultdict(float))
+        last_ts = float(f.get("p2pool_branch_scores_ts", 0.0) or 0.0)
+        if last_ts <= 0.0:
+            f["p2pool_branch_scores_ts"] = now_ts
+            return
+        dt = max(0.0, now_ts - last_ts)
+        if dt <= 0.0:
+            return
+        decay = min(0.82, dt / max(1.0, float(self.P2POOL_BRANCH_DECAY_SEC)))
+        if decay > 0.0:
+            for key in list(scores.keys()):
+                scores[key] = max(0.0, float(scores.get(key, 0.0)) * (1.0 - decay))
+                if scores[key] <= 0.01:
+                    scores.pop(key, None)
+        f["p2pool_branch_scores_ts"] = now_ts
+
+    def _promote_p2pool_branch_from_candidates(
+        self,
+        f: dict,
+        *,
+        label: str,
+        detail: str,
+        meta: Dict[str, Any],
+        direction: Optional[str],
+    ) -> Tuple[str, str, float, Dict[str, Any]]:
+        now_ts = time.time()
+        self._decay_p2pool_branch_scores(f, now_ts)
+        scores = f.setdefault("p2pool_branch_scores", defaultdict(float))
+        hits = f.setdefault("p2pool_branch_hits", defaultdict(int))
+        candidate_map = dict(meta.get("candidate_map") or {})
+        if label != "unknown" and float(meta.get("confidence", 0.0) or 0.0) > 0.0:
+            candidate_map.setdefault(label, float(meta.get("confidence", 0.0) or 0.0))
+
+        for cand, raw_score in list(candidate_map.items())[:6]:
+            cand = str(cand or "unknown")
+            if cand == "unknown":
+                continue
+            boost = max(0.18, min(3.25, float(raw_score) / 28.0))
+            if cand in {"peerlist", "share", "block"}:
+                boost += 0.18
+            if cand == "peerlist" and meta.get("peers"):
+                boost += 0.45
+            if cand == "share" and (direction == self._p2pool_share_direction(f) or self._p2pool_share_direction(f) is None):
+                boost += 0.15
+            scores[cand] = float(scores.get(cand, 0.0)) + boost
+            hits[cand] = int(hits.get(cand, 0)) + 1
+
+        ordered = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+        meta["branch_scores"] = [{"label": k, "score": round(float(v), 2), "hits": int(hits.get(k, 0))} for k, v in ordered[:6]]
+        if not ordered:
+            return label, detail, float(meta.get("confidence", 0.0) or 0.0), meta
+
+        best_label, best_score = ordered[0]
+        best_hits = int(hits.get(best_label, 0))
+        chosen_label = label
+        chosen_detail = detail
+        chosen_conf = float(meta.get("confidence", 0.0) or 0.0)
+
+        if best_score >= self._p2pool_branch_floor(best_label) and best_hits >= self.P2POOL_BRANCH_PROMOTE_MIN_HITS:
+            chosen_label = best_label
+            chosen_conf = max(chosen_conf, min(99.0, best_score * 24.0))
+            chosen_detail = f"{detail}|promoted={best_label}|hits={best_hits}|score={best_score:.2f}"
+        elif label == "unknown" and best_score >= self.P2POOL_BRANCH_PROMOTE_MIN and best_hits >= self.P2POOL_BRANCH_PROMOTE_MIN_HITS:
+            chosen_label = best_label
+            chosen_conf = max(chosen_conf, min(99.0, best_score * 22.0))
+            chosen_detail = f"promoted={best_label}|hits={best_hits}|score={best_score:.2f}"
+
+        f["p2pool_branch_best"] = chosen_label
+        f["p2pool_last_branch_reason"] = chosen_detail
+        return chosen_label, chosen_detail, chosen_conf, meta
+
+    def _p2pool_candidate_summary(self, meta: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for row in list(meta.get("branch_scores") or meta.get("candidates") or [])[:3]:
+            if isinstance(row, dict):
+                label = str(row.get("label") or "?")
+                score = row.get("score")
+                hits = row.get("hits")
+                if hits is None:
+                    parts.append(f"{label}:{float(score or 0.0):.1f}")
+                else:
+                    parts.append(f"{label}:{float(score or 0.0):.1f}/{int(hits)}")
+        return ",".join(parts)
+
     def _extract_compact_peer_candidates(self, payload: bytes) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
         if not payload:
             return out
 
-        marker = self.P2POOL_COMPACT_PEER_MARKER
-        i = 0
         seen = set()
 
+        def _push(ip: str, port: int):
+            if not self._looks_like_peer_ip(ip):
+                return
+            if port not in self._p2pool_ports and port not in self._p2p_ports:
+                return
+            key = (ip, int(port))
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+
+        marker = self.P2POOL_COMPACT_PEER_MARKER
+        i = 0
         while True:
             j = payload.find(marker, i)
             if j < 0:
                 break
-
-            # marker(12) + ipv4(4) + port(2)
             if j + 18 > len(payload):
                 break
 
             ipv4 = payload[j + 12 : j + 16]
             port_raw = payload[j + 16 : j + 18]
             ip = ".".join(str(x) for x in ipv4)
-
             port_be = int.from_bytes(port_raw, "big", signed=False)
             port_le = int.from_bytes(port_raw, "little", signed=False)
 
             if port_be in self._p2pool_ports or port_be in self._p2p_ports:
-                port = port_be
-            elif port_le in self._p2pool_ports or port_le in self._p2p_ports:
-                port = port_le
-            else:
-                port = port_be if 0 < port_be <= 65535 else port_le
-
-            key = (ip, int(port))
-            if key not in seen:
-                seen.add(key)
-                out.append(key)
+                _push(ip, port_be)
+            if port_le in self._p2pool_ports or port_le in self._p2p_ports:
+                _push(ip, port_le)
 
             i = j + 18
 
-        return out
+        # Generic scan fallback: look for repeated ip:service-port tuples even without the exact compact marker.
+        scan = payload[: min(len(payload), 16384)]
+        for i in range(0, max(0, len(scan) - 6)):
+            ip_b = scan[i : i + 4]
+            if len(ip_b) < 4:
+                break
+            ip = ".".join(str(x) for x in ip_b)
+            if not self._looks_like_peer_ip(ip):
+                continue
+
+            port_b = scan[i + 4 : i + 6]
+            port_be = int.from_bytes(port_b, "big", signed=False)
+            port_le = int.from_bytes(port_b, "little", signed=False)
+            if port_be in self._p2pool_ports or port_be in self._p2p_ports:
+                _push(ip, port_be)
+            elif port_le in self._p2pool_ports or port_le in self._p2p_ports:
+                _push(ip, port_le)
+
+        return out[:64]
+
+    def _infer_p2pool_stage(self, f: dict) -> str:
+        if f.get("p2pool_seen_share") or f.get("p2pool_seen_block"):
+            return "active"
+        if f.get("p2pool_seen_timed_sync") or f.get("p2pool_seen_peerlist") or f.get("p2pool_seen_chain"):
+            return "warming"
+        if f.get("p2pool_seen_handshake"):
+            return "open"
+        return "cold"
+
+    def _contains_levin_signature(self, payload: bytes) -> bool:
+        return self._find_levin_signature(payload) >= 0
+
+    def _find_levin_signature(self, payload: bytes) -> int:
+        if not payload:
+            return -1
+        sig = struct.pack("<Q", self._LEVIN_SIG)
+        return payload[: min(len(payload), 512)].find(sig)
+
+    def _looks_like_binary_monero_stream(self, payload: bytes) -> bool:
+        if not payload:
+            return False
+        sample = payload[: min(len(payload), 96)]
+        ar = self._ascii_ratio(sample)
+        ent = self._byte_entropy(sample)
+        if ar < 0.35 and 4.0 <= ent <= 8.0:
+            return True
+        if self._extract_compact_peer_candidates(sample):
+            return True
+        return False
+
+    def _tail_window(self, payload: bytes, limit: int) -> bytes:
+        if not payload:
+            return b""
+        if len(payload) <= limit:
+            return payload
+        return payload[-limit:]
+
+    def _looks_like_peer_ip(self, ip: str) -> bool:
+        try:
+            obj = ipaddress.ip_address(ip)
+            if obj.is_multicast or obj.is_unspecified:
+                return False
+            if str(obj) == "255.255.255.255":
+                return False
+            return True
+        except Exception:
+            return False
 
     def _maybe_log_mining_from_monero_levin(self, f: dict, m: "_LevinMessage", iface: str) -> None:
         if int(m.cmd) not in self._MINING_BENEFIT_MONERO_CMDS:
@@ -7925,36 +9040,37 @@ class TransportMoneroManager:
         remote_txt = f" remote={remote[0]}:{remote[1]}" if remote else ""
         local = self._pick_localish_endpoint(f)
         local_txt = f" local={local[0]}:{local[1]}" if local else ""
+        conf_txt = f" conf={float(f.get('p2pool_last_confidence', 0.0) or 0.0):.1f}"
 
         if label == "handshake":
             key = "mining:session_open"
             msg = (
                 f"[Transport][🧵 TCP][🪙 Monero][Mining] 🔌 P2Pool session opened via packet data "
-                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+                f"(detail={detail}, dir={direction}, len={payload_len},{conf_txt.strip()}) on {iface}{local_txt}{remote_txt}"
             )
         elif label == "peerlist":
             key = "mining:peerlist_refresh"
             msg = (
                 f"[Transport][🧵 TCP][🪙 Monero][Mining] 🧠 Peer map refreshed from packet structure "
-                f"(peers={len(peers)}, detail={detail}) on {iface}{local_txt}{remote_txt}"
+                f"(peers={len(peers)}, detail={detail},{conf_txt.strip()}) on {iface}{local_txt}{remote_txt}"
             )
         elif label == "share":
             key = "mining:share_relay"
             msg = (
                 f"[Transport][🧵 TCP][🪙 Monero][Mining] ⛏️ Share-like relay traffic detected "
-                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+                f"(detail={detail}, dir={direction}, len={payload_len},{conf_txt.strip()}) on {iface}{local_txt}{remote_txt}"
             )
         elif label == "block":
             key = "mining:block_relay"
             msg = (
                 f"[Transport][🧵 TCP][🪙 Monero][Mining] 🧱 Block-like relay traffic detected "
-                f"(detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+                f"(detail={detail}, dir={direction}, len={payload_len},{conf_txt.strip()}) on {iface}{local_txt}{remote_txt}"
             )
         else:
             key = f"mining:{label}"
             msg = (
                 f"[Transport][🧵 TCP][🪙 Monero][Mining] ⚡ P2Pool sync-path traffic detected "
-                f"(kind={label}, detail={detail}, dir={direction}, len={payload_len}) on {iface}{local_txt}{remote_txt}"
+                f"(kind={label}, detail={detail}, dir={direction}, len={payload_len},{conf_txt.strip()}) on {iface}{local_txt}{remote_txt}"
             )
 
         last_key = f.get("p2pool_mining_last_key")
@@ -8110,6 +9226,9 @@ class TransportMoneroManager:
             }
 
         self._pm_event("peerlist", p["peer"], f"{detail} peers={len(peers)}")
+        if self._flow_event_ok(flow, "pm:peerlist", self.P2POOL_BRANCH_LOG_COOLDOWN_SEC):
+            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool][Branch] 🧠 PEERLIST peer={p['peer']} peers={len(peers)} detail={detail} conf={float(meta.get('confidence', 0.0) or 0.0):.1f} source={source} on {iface}")
+
 
     def _pm_on_share(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
         rt = self.p2pool_mining_runtime
@@ -8121,6 +9240,9 @@ class TransportMoneroManager:
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 5.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 3.0)
         self._pm_event("share", p["peer"], detail)
+        if self._flow_event_ok(flow, "pm:share", self.P2POOL_BRANCH_LOG_COOLDOWN_SEC):
+            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool][Branch] ⛏️ SHARE peer={p['peer']} detail={detail} conf={float(meta.get('confidence', 0.0) or 0.0):.1f} len={payload_len} source={source} on {iface}")
+
 
     def _pm_on_chain(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
         rt = self.p2pool_mining_runtime
@@ -8131,6 +9253,9 @@ class TransportMoneroManager:
         rt["last_sync_ts"] = time.time()
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 2.0)
         self._pm_event("chain", p["peer"], detail)
+        if self._flow_event_ok(flow, "pm:chain", self.P2POOL_BRANCH_LOG_COOLDOWN_SEC):
+            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool][Branch] 🔗 CHAIN peer={p['peer']} detail={detail} conf={float(meta.get('confidence', 0.0) or 0.0):.1f} len={payload_len} source={source} on {iface}")
+
 
     def _pm_on_chain_object(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
         rt = self.p2pool_mining_runtime
@@ -8139,6 +9264,9 @@ class TransportMoneroManager:
         p["score"] += 1.0
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 1.5)
         self._pm_event("chain_object", p["peer"], detail)
+        if self._flow_event_ok(flow, "pm:chain_object", self.P2POOL_BRANCH_LOG_COOLDOWN_SEC):
+            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool][Branch] 📦 CHAIN_OBJECT peer={p['peer']} detail={detail} conf={float(meta.get('confidence', 0.0) or 0.0):.1f} len={payload_len} source={source} on {iface}")
+
 
     def _pm_on_block(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
         rt = self.p2pool_mining_runtime
@@ -8150,6 +9278,9 @@ class TransportMoneroManager:
         rt["freshness_score"] = min(100.0, rt["freshness_score"] + 8.0)
         rt["stale_risk"] = max(0.0, rt["stale_risk"] - 5.0)
         self._pm_event("block", p["peer"], detail)
+        if self._flow_event_ok(flow, "pm:block", self.P2POOL_BRANCH_LOG_COOLDOWN_SEC):
+            self._rl_log(f"[Transport][🧵 TCP][🪙 Monero][P2Pool][Branch] 🧱 BLOCK peer={p['peer']} detail={detail} conf={float(meta.get('confidence', 0.0) or 0.0):.1f} len={payload_len} source={source} on {iface}")
+
 
     def _pm_on_ping(self, *, flow, iface, source, payload_len, detail, meta, levin_msg):
         p = self._pm_touch_peer(flow, iface)
@@ -8190,9 +9321,9 @@ class TransportMoneroManager:
                 }
                 for p in peers[:8]
             ],
+            "active_flows": len(self._flows),
         }
 
-    # ========== Active ping response ==========
     def _maybe_reply_ping(self, f: dict, m: "_LevinMessage", iface: str):
         if not self.p2p_auto_reply_ping:
             return
@@ -8350,10 +9481,14 @@ class TransportMoneroManager:
     def _dynamic_classify_from_payload(self, payload: bytes) -> Optional[str]:
         if not payload:
             return None
-        if payload.startswith(b"\x01\x01\x01\x01\x01\x01\x01\x01"):
-            return "p2p"
         if self._is_http_head(payload):
             return "rpc"
+        if self._contains_levin_signature(payload):
+            return "p2p"
+        if self._extract_compact_peer_candidates(payload):
+            return "p2p"
+        if self._looks_like_binary_monero_stream(payload):
+            return "p2p"
         return None
 
     def _is_http_head(self, payload: bytes) -> bool:
@@ -16954,119 +18089,476 @@ class TransportEphemeralUDPManager:
         self.voip_lo, self.voip_hi = int(lo), int(hi)
 class TransportHighServerTCPManager:
     """
-    Observes client→server flows where the server uses a nonstandard high port (>=1024)
-    and the client uses an ephemeral port. Purely observational; never blocks/changes packets.
+    Observes nonstandard high-port TCP services and actually catches them
+    without assuming the larger port is the server.
+
+    Public API:
+        handle(pkt, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
     """
-    MIN_SERVER = 1024
-    MIN_EPHEMERAL = 49152
-    FALLBACK_EMIT_AFTER = 0.4  # s
+
+    FLOW_TTL_SEC = 15 * 60
+    FLOW_SOFT_MAX = 50_000
+    RL_INTERVAL_SEC = 1.0
+
+    # treat these as "high server" candidates
+    MIN_SERVER_PORT = 1024
+
+    # do not require modern 49152+ only; many real clients use lower ephemeral ranges
+    MIN_CLIENT_PORT = 1024
+
+    # small per-direction rolling buffer for cheap protocol peeks
+    BUF_CAP = 2048
+
+    # if we still cannot identify the app, emit generic high-port app-data after a short delay
+    FALLBACK_EMIT_AFTER = 0.35
+
+    _HTTP_METHODS = (
+        b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ",
+        b"OPTIONS ", b"PATCH ", b"CONNECT ", b"TRACE "
+    )
+    _TLS_VERSIONS = {0x0301, 0x0302, 0x0303, 0x0304}
 
     def __init__(self, router_logger):
         self.log = router_logger
-        self._flows = {}  # key -> {created,last_seen,label,extra,buf_c2s,buf_s2c,first_ts,emitted}
+        self._flows = {}  # canonical_key -> state
+        self._last_gc = time.time()
         self.log.log_message("[Transport][🧵 TCP][📦 HighServer] Manager ready.")
 
     def handle(self, pkt, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
-        if not getattr(pkt, "haslayer", lambda *_: False)("TCP"):
-            return False
-        # server: high non-ephemeral port; client: ephemeral
-        server_port, client_port = (sport, dport) if sport >= dport else (dport, sport)
-        if server_port < self.MIN_SERVER:
-            return False
-        if client_port < self.MIN_EPHEMERAL:
+        try:
+            if TCP is None or not pkt or not pkt.haslayer(TCP):
+                return False
+
+            sport = int(sport)
+            dport = int(dport)
+
+            # must be a likely high-port service flow candidate
+            if not self._is_high_server_candidate(sport, dport):
+                return False
+
+            now = time.time()
+            key = self._flow_key(src_ip, sport, dst_ip, dport)
+            st = self._flows.get(key)
+            if st is None:
+                st = self._new_flow(src_ip, sport, dst_ip, dport, now)
+                self._flows[key] = st
+            else:
+                st["last_seen"] = now
+
+            self._learn_roles(st, pkt, src_ip, sport, dst_ip, dport)
+
+            data = self._payload(pkt)
+            if data:
+                direction = self._direction(st, src_ip, sport, dst_ip, dport)
+                if direction == "c2s":
+                    self._append(st["buf_c2s"], data)
+                else:
+                    self._append(st["buf_s2c"], data)
+
+                st["bytes"] += len(data)
+                st["pkts"] += 1
+                if st["first_payload_ts"] is None:
+                    st["first_payload_ts"] = now
+
+            if not st["emitted"]:
+                label, extra = self._classify(st)
+                if label:
+                    self._emit(st, label, extra, inbound_iface)
+                    st["label"] = label
+                    st["extra"] = extra
+                    st["emitted"] = True
+                elif st["first_payload_ts"] is not None and (now - st["first_payload_ts"]) >= self.FALLBACK_EMIT_AFTER:
+                    role = self._server_endpoint_str(st)
+                    self._emit(st, "App-Data", f"high-port service on {role}", inbound_iface)
+                    st["label"] = "App-Data"
+                    st["extra"] = f"high-port service on {role}"
+                    st["emitted"] = True
+
+            self._maybe_gc(now)
+            return True
+
+        except Exception:
             return False
 
-        key = self._key(src_ip, sport, dst_ip, dport)
-        f = self._flows.get(key)
-        now = time.time()
-        if f is None:
-            f = self._flows[key] = {
-                "created": now, "last_seen": now, "label": None, "extra": None,
-                "buf_c2s": bytearray(), "buf_s2c": bytearray(), "first_ts": None, "emitted": False,
-                "a": (src_ip, int(sport)), "b": (dst_ip, int(dport))
-            }
-        f["last_seen"] = now
+    # ------------------------------------------------------------------
+    # Flow + role logic
+    # ------------------------------------------------------------------
 
+    def _new_flow(self, src_ip, sport, dst_ip, dport, now):
+        return {
+            "created": now,
+            "last_seen": now,
+            "last_log": 0.0,
+            "pkts": 0,
+            "bytes": 0,
+            "buf_c2s": bytearray(),
+            "buf_s2c": bytearray(),
+            "first_payload_ts": None,
+            "emitted": False,
+            "label": None,
+            "extra": None,
+
+            # learned roles
+            "client": None,   # (ip, port)
+            "server": None,   # (ip, port)
+
+            # endpoint memory
+            "ep_a": (str(src_ip), int(sport)),
+            "ep_b": (str(dst_ip), int(dport)),
+        }
+
+    def _flow_key(self, src_ip, sport, dst_ip, dport):
+        a = (str(src_ip), int(sport))
+        b = (str(dst_ip), int(dport))
+        return (a, b) if a <= b else (b, a)
+
+    def _learn_roles(self, st, pkt, src_ip, sport, dst_ip, dport):
+        src_ep = (str(src_ip), int(sport))
+        dst_ep = (str(dst_ip), int(dport))
+
+        if st["client"] is not None and st["server"] is not None:
+            return
+
+        flags = self._tcp_flags_string(pkt)
+
+        # SYN without ACK is the best signal for initiator/client
+        if "S" in flags and "A" not in flags:
+            st["client"] = src_ep
+            st["server"] = dst_ep
+            return
+
+        # if one side is clearly low and the other high, low side is usually client
+        if self._looks_client_port(sport) and self._looks_server_port(dport):
+            st["client"] = src_ep
+            st["server"] = dst_ep
+            return
+        if self._looks_client_port(dport) and self._looks_server_port(sport):
+            st["client"] = dst_ep
+            st["server"] = src_ep
+            return
+
+        # otherwise prefer the side whose payload looks like a request
         data = self._payload(pkt)
         if data:
-            if self._is_c2s(f, src_ip, sport): self._append(f["buf_c2s"], data)
-            else:                               self._append(f["buf_s2c"], data)
-            if f["first_ts"] is None: f["first_ts"] = now
+            if self._looks_requestish(data):
+                st["client"] = src_ep
+                st["server"] = dst_ep
+                return
+            if self._looks_responseish(data):
+                st["client"] = dst_ep
+                st["server"] = src_ep
+                return
 
-            if not f["emitted"]:
-                label, extra = self._classify(f, server_port)
-                if label:
-                    self._emit(src_ip, sport, dst_ip, dport, label, extra)
-                    f["label"], f["extra"], f["emitted"] = label, extra, True
-                elif (now - f["first_ts"]) >= self.FALLBACK_EMIT_AFTER:
-                    self._emit(src_ip, sport, dst_ip, dport, "App-Data", "nonstandard server port")
-                    f["label"], f["extra"], f["emitted"] = "App-Data", "nonstandard server port", True
+        # final fallback: lower port is more likely server
+        if sport < dport:
+            st["server"] = src_ep
+            st["client"] = dst_ep
+        elif dport < sport:
+            st["server"] = dst_ep
+            st["client"] = src_ep
+        else:
+            st["client"] = src_ep
+            st["server"] = dst_ep
 
-        self._gc()
-        return bool(f and f["emitted"])
+    def _direction(self, st, src_ip, sport, dst_ip, dport):
+        src_ep = (str(src_ip), int(sport))
+        dst_ep = (str(dst_ip), int(dport))
 
-    # ---------- helpers ----------
-    @staticmethod
-    def _key(a_ip, a_p, b_ip, b_p):
-        A, B = (a_ip, int(a_p)), (b_ip, int(b_p))
-        return (A, B) if A <= B else (B, A)
+        if st["client"] is not None and src_ep == st["client"]:
+            return "c2s"
+        if st["server"] is not None and src_ep == st["server"]:
+            return "s2c"
 
-    @staticmethod
-    def _payload(pkt):
-        try:
-            tcp = pkt["TCP"]
-            if bytes(tcp.payload): return bytes(tcp.payload)
-            if pkt.haslayer("Raw"): return bytes(pkt["Raw"].load or b"")
-        except Exception:
-            pass
-        return b""
+        # fallback if roles somehow missing
+        if self._looks_request_side(src_ep, dst_ep):
+            return "c2s"
+        return "s2c"
 
-    @staticmethod
-    def _is_c2s(f, sip, sport):
-        return f["a"] == (sip, int(sport))
+    def _looks_client_port(self, port: int) -> bool:
+        return int(port) >= self.MIN_CLIENT_PORT
 
-    @staticmethod
-    def _append(buf: bytearray, b: bytes, maxlen: int = 512):
-        if len(buf) + len(b) > maxlen:
-            del buf[: (len(buf) + len(b) - maxlen)]
-        buf += b
+    def _looks_server_port(self, port: int) -> bool:
+        return int(port) >= self.MIN_SERVER_PORT
 
-    def _classify(self, f, server_port: int):
-        b = bytes(f["buf_c2s"] or f["buf_s2c"])
-        if len(b) >= 3 and b[0] in (0x14,0x15,0x16,0x17) and b[1] == 0x03 and 0x00 <= b[2] <= 0x05:
-            return "Alt-TLS?", "TLS record bytes"
-        # HTTP/1.x
-        for m in (b"GET ", b"POST ", b"PUT ", b"HEAD ", b"HTTP/1.", b"OPTIONS ", b"DELETE ", b"PATCH "):
-            if b.startswith(m) or b.find(b"\r\nHost:") != -1:
-                return "HTTP?", "HTTP-like start/Host hdr"
+    def _is_high_server_candidate(self, sport: int, dport: int) -> bool:
+        sport = int(sport)
+        dport = int(dport)
+
+        # both must be non-well-known/highish
+        if sport < self.MIN_SERVER_PORT and dport < self.MIN_SERVER_PORT:
+            return False
+
+        # reject exact equality noise
+        if sport == dport:
+            return False
+
+        return True
+
+    def _looks_request_side(self, src_ep, dst_ep) -> bool:
+        # higher port is often client, but this is only a weak fallback
+        return int(src_ep[1]) >= int(dst_ep[1])
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
+
+    def _classify(self, st):
+        c2s = bytes(st["buf_c2s"])
+        s2c = bytes(st["buf_s2c"])
+
+        # HTTP
+        if self._looks_http_request(c2s):
+            host = self._extract_http_host(c2s)
+            path = self._extract_http_path(c2s)
+            extra = f"HTTP request path={path}"
+            if host:
+                extra += f" host={host}"
+            return "HTTP", extra
+
+        if self._looks_http_response(s2c):
+            code = self._extract_http_status(s2c)
+            return "HTTP", f"HTTP response status={code or '-'}"
+
+        # TLS
+        if self._looks_tls_clienthello(c2s):
+            sni = self._extract_sni(c2s)
+            return "TLS", f"ClientHello sni={sni}" if sni else "ClientHello"
+
+        if self._looks_tls_record(s2c):
+            return "TLS", "TLS server record"
+
         # SSH
-        if b.startswith(b"SSH-"): return "SSH?", "SSH banner"
-        # RFB/VNC
-        if b.startswith(b"RFB "): return "RFB/VNC?", "RFB banner"
-        # Redis (RESP)
-        if b and b[:1] in b"+-:$*": return "Redis/RESP?", "RESP framing"
-        # MySQL greeting (length+seq + 0x0a version)
-        if len(b) >= 5 and b[4] == 0x0a: return "MySQL?", "greeting 0x0a"
-        # MQTT
-        if len(b) >= 2 and b[0] == 0x10: return "MQTT?", "CONNECT packet"
-        # Generic binary handshake (length prefix)
-        if len(b) >= 4 and (b[0] == 0x00 or b[0] == 0x01):
-            return "Binary-Proto?", "length-prefixed"
-        # Port-specific hint (your 18480 case)
-        if server_port == 18480:
-            return "Custom-Service?", "server port 18480"
+        if c2s.startswith(b"SSH-") or s2c.startswith(b"SSH-"):
+            banner = self._safe_ascii(c2s if c2s.startswith(b"SSH-") else s2c, 120)
+            return "SSH", banner or "banner"
+
+        # FTP control
+        ftp_hint = self._ftp_hint(c2s) or self._ftp_hint(s2c)
+        if ftp_hint:
+            return "FTP", ftp_hint
+
+        # RDP
+        if self._looks_rdp(c2s) or self._looks_rdp(s2c):
+            return "RDP", "x224/tpkt or mstshash"
+
         return None, None
 
-    def _emit(self, sip, sport, dip, dport, label, extra):
-        msg = f"[Transport][🧵 TCP][📦 HighServer] {label} {sip}:{sport} ↔ {dip}:{dport}"
-        if extra: msg += f" | {extra}"
-        self.log.log_message(msg)
+    def _looks_http_request(self, buf: bytes) -> bool:
+        if not buf:
+            return False
+        head = buf[:16]
+        return any(head.startswith(m) for m in self._HTTP_METHODS)
 
-    def _gc(self, ttl=120):
+    def _looks_http_response(self, buf: bytes) -> bool:
+        return bool(buf.startswith(b"HTTP/1."))
+
+    def _looks_tls_record(self, buf: bytes) -> bool:
+        if len(buf) < 5:
+            return False
+        if buf[0] not in (0x14, 0x15, 0x16, 0x17):
+            return False
+        ver = (buf[1] << 8) | buf[2]
+        return ver in self._TLS_VERSIONS
+
+    def _looks_tls_clienthello(self, buf: bytes) -> bool:
+        if not self._looks_tls_record(buf):
+            return False
+        if len(buf) < 6:
+            return False
+        return buf[0] == 0x16 and buf[5:6] == b"\x01"
+
+    def _looks_rdp(self, buf: bytes) -> bool:
+        if not buf:
+            return False
+        if len(buf) >= 4 and buf[0] == 0x03 and buf[1] == 0x00:
+            return True
+        if b"Cookie: mstshash=" in buf[:512]:
+            return True
+        return False
+
+    def _looks_requestish(self, data: bytes) -> bool:
+        head = data[:32]
+        if any(head.startswith(m) for m in self._HTTP_METHODS):
+            return True
+        if head.startswith(b"SSH-"):
+            return True
+        if head.startswith((b"USER ", b"PASS ", b"RETR ", b"STOR ", b"LIST", b"PWD", b"CWD ")):
+            return True
+        if self._looks_tls_clienthello(data):
+            return True
+        return False
+
+    def _looks_responseish(self, data: bytes) -> bool:
+        head = data[:32]
+        if head.startswith(b"HTTP/1."):
+            return True
+        if head.startswith((b"220 ", b"221 ", b"230 ", b"331 ", b"530 ")):
+            return True
+        if self._looks_tls_record(data) and not self._looks_tls_clienthello(data):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Small extractors
+    # ------------------------------------------------------------------
+
+    def _extract_http_host(self, buf: bytes):
+        try:
+            for line in buf[:1024].split(b"\r\n"):
+                if line.lower().startswith(b"host:"):
+                    return self._safe_ascii(line.split(b":", 1)[1].strip(), 120)
+        except Exception:
+            pass
+        return None
+
+    def _extract_http_path(self, buf: bytes):
+        try:
+            line = buf.split(b"\r\n", 1)[0]
+            parts = line.split(b" ")
+            if len(parts) >= 2:
+                return self._safe_ascii(parts[1], 180) or "/"
+        except Exception:
+            pass
+        return "/"
+
+    def _extract_http_status(self, buf: bytes):
+        try:
+            line = buf.split(b"\r\n", 1)[0]
+            parts = line.split(b" ")
+            if len(parts) >= 2:
+                return self._safe_ascii(parts[1], 8)
+        except Exception:
+            pass
+        return None
+
+    def _extract_sni(self, buf: bytes):
+        # cheap best-effort SNI scan, not full TLS parsing
+        try:
+            blob = bytes(buf[:1024])
+            for i in range(0, max(0, len(blob) - 5)):
+                ln = int.from_bytes(blob[i:i+2], "big", signed=False)
+                if 3 <= ln <= 253 and i + 2 + ln <= len(blob):
+                    cand = blob[i+2:i+2+ln]
+                    if b"." in cand and all(32 <= b <= 126 for b in cand):
+                        s = cand.decode("ascii", "ignore")
+                        if "." in s and " " not in s and "/" not in s:
+                            return s[:160]
+        except Exception:
+            pass
+        return None
+
+    def _ftp_hint(self, buf: bytes):
+        if not buf:
+            return None
+        head = buf[:256]
+        for token in (b"USER ", b"PASS ", b"RETR ", b"STOR ", b"LIST", b"PASV", b"PORT ", b"PWD", b"CWD "):
+            if head.startswith(token):
+                return token.decode("ascii", "ignore").strip()
+        for code in (b"220 ", b"221 ", b"230 ", b"331 ", b"530 "):
+            if head.startswith(code):
+                return code.decode("ascii", "ignore").strip()
+        return None
+
+    # ------------------------------------------------------------------
+    # Logging / utils
+    # ------------------------------------------------------------------
+
+    def _emit(self, st, label, extra, inbound_iface):
         now = time.time()
-        for k, f in list(self._flows.items()):
-            if now - f.get("last_seen", now) > ttl:
+        if (now - float(st.get("last_log", 0.0) or 0.0)) < self.RL_INTERVAL_SEC:
+            return
+        st["last_log"] = now
+
+        client = st["client"] or st["ep_a"]
+        server = st["server"] or st["ep_b"]
+        iface = self._iface_suffix(inbound_iface)
+
+        msg = (
+            f"[Transport][🧵 TCP][📦 HighServer] "
+            f"{client[0]}:{client[1]} -> {server[0]}:{server[1]} "
+            f"on {iface} | {label}"
+        )
+        if extra:
+            msg += f" | {extra}"
+
+        try:
+            self.log.log_message(msg)
+        except Exception:
+            pass
+
+    def _server_endpoint_str(self, st):
+        server = st["server"]
+        if not server:
+            return "unknown-high-port"
+        return f"{server[0]}:{server[1]}"
+
+    def _payload(self, pkt):
+        try:
+            if Raw is not None and pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load or b"")
+                if raw:
+                    return raw
+        except Exception:
+            pass
+        try:
+            tcp = pkt[TCP]
+            payload = bytes(tcp.payload or b"")
+            return payload or b""
+        except Exception:
+            return b""
+
+    def _append(self, buf: bytearray, data: bytes):
+        if not data:
+            return
+        buf += data
+        if len(buf) > self.BUF_CAP:
+            del buf[: len(buf) - self.BUF_CAP]
+
+    def _tcp_flags_string(self, pkt):
+        try:
+            return pkt[TCP].sprintf("%TCP.flags%")
+        except Exception:
+            return ""
+
+    def _iface_suffix(self, inbound_iface):
+        try:
+            return inbound_iface.split("_")[-1] if inbound_iface else "-"
+        except Exception:
+            return inbound_iface or "-"
+
+    def _safe_ascii(self, b, maxlen=128):
+        try:
+            if not b:
+                return None
+            s = b.decode("latin-1", "ignore") if isinstance(b, (bytes, bytearray)) else str(b)
+            s = "".join(ch for ch in s if ch >= " " or ch == "\t")
+            if len(s) > maxlen:
+                s = s[:maxlen] + "…"
+            return s
+        except Exception:
+            return None
+
+    def _maybe_gc(self, now):
+        if (now - self._last_gc) < 60:
+            return
+
+        stale = []
+        for k, v in self._flows.items():
+            if (now - float(v.get("last_seen", now))) > self.FLOW_TTL_SEC:
+                stale.append(k)
+
+        for k in stale:
+            self._flows.pop(k, None)
+
+        if len(self._flows) > self.FLOW_SOFT_MAX:
+            victims = sorted(
+                self._flows.items(),
+                key=lambda kv: float(kv[1].get("last_seen", 0.0))
+            )[: len(self._flows) - self.FLOW_SOFT_MAX]
+            for k, _ in victims:
                 self._flows.pop(k, None)
+
+        self._last_gc = now
 class TransportRIPManager:
     """
     Handles Routing Information Protocol:
@@ -18513,7 +20005,7 @@ class TransportManager:
         self.transport_tcp_ephemeral = TransportEphemeralTCPManager(self.logger)
         self.transport_udp_ephemeral = TransportEphemeralUDPManager(self.logger)
         self.transport_steam = TransportSteamManager(self.logger)
-        self.transport_tcp_high_Level = TransportHighServerTCPManager
+        self.transport_tcp_high_Level = TransportHighServerTCPManager(self.logger)
         self.transport_files = TransportFileManager(self.logger)
         self.transport_https = TransportHTTPSManager(self.logger)
         self.transport_ws_discovery = TransportWSDiscoveryManager(self.logger)
