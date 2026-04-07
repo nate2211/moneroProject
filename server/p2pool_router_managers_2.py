@@ -5525,9 +5525,9 @@ class NATManager:
     }
 
     TEMP_LEASES_POLICY = {
-        "deny_gateways": {"192.168.1.254"},
-        "deny_cidrs": ["192.168.1.0/24"],
-        "deny_ifaces": {"wan_att", "eth_att"},
+        "deny_gateways": {""}, #192.168.1.254
+        "deny_cidrs": [""],#192.168.1.0/24
+        "deny_ifaces": {""}, #"wan_att", "eth_att"
     }
 
     BYPASS_DST_CIDRS = [
