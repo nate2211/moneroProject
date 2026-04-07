@@ -14,7 +14,7 @@ import traceback
 import urllib
 from collections import defaultdict, deque
 from collections.abc import Set
-from typing import Optional, List, Any, Callable, Union, OrderedDict, DefaultDict, Deque
+from typing import Optional, List, Any, Callable, Union, DefaultDict, Deque
 import ipaddress
 import threading
 import json
@@ -2789,9 +2789,9 @@ class TransportFTPManager:
         self._data_flow_ttl = float(data_flow_ttl_s or self.DATA_FLOW_TTL_S)
 
         self._cooldown_until = {}
-        self._control_sessions = OrderedDict()
-        self._data_hints = OrderedDict()   # (ip, port) -> dict(...)
-        self._data_flows = OrderedDict()   # canonical 4-tuple -> dict(...)
+        self._control_sessions = collections.OrderedDict()
+        self._data_hints = collections.OrderedDict()   # (ip, port) -> dict(...)
+        self._data_flows = collections.OrderedDict()   # canonical 4-tuple -> dict(...)
 
         self._emit("[Transport][📁 FTP] Manager ready.")
 
@@ -8348,8 +8348,8 @@ class TransportMoneroManager:
     MAX_PENDING_IDS = 256
 
     # Monero main ports
-    MONERO_P2P_PORTS = {18080, 28080, 38080}
-    MONERO_RPC_PORTS = {18081, 28081, 38081, 18089}
+    MONERO_P2P_PORTS = {18080, 28080, 38080, 41257}
+    MONERO_RPC_PORTS = {18081, 18083, 18089, 28081, 38081}
     P2POOL_PORTS = {37888, 37889}
     DEFAULT_PORTS = MONERO_P2P_PORTS | MONERO_RPC_PORTS | P2POOL_PORTS
 
@@ -8757,7 +8757,7 @@ class TransportMoneroManager:
             "service_family": family,
             "proto_confidence": 0.0,
             "proto_reason": None,
-            "pending_ids": OrderedDict(),
+            "pending_ids": collections.OrderedDict(),
             "packets_c2s": 0,
             "packets_s2c": 0,
             "bytes_c2s": 0,
