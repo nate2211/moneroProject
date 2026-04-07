@@ -21289,7 +21289,7 @@ class TransportManager:
             ([21], self._handle_ftp_packet),
             ([88], self._handle_kerberos_packet),
             ([3389], self._handle_rdp_packet),
-            ([*self._MONERO_P2P_PORTS, *self._MONERO_RPC_PORTS], self._handle_monero_packet),
+            ([18080, 28080, 38080, 41257, 18081, 18083, 18089, 28081, 38081, 37888, 37889], self._handle_monero_packet),
             ([(27014, 27050)], self._handle_tcp_steam_packet),
             ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),
             ([(1024, 65535)], self._handle_high_server_packet),
