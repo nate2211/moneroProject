@@ -76,7 +76,7 @@ class PythonRouterManager:
     """
 
     # --- Configuration Defaults (used if dynamic assignment fails or as starting points) ---
-    DEFAULT_IN_IFACE_FRIENDLY_NAME = "Ethernet 2"
+    DEFAULT_IN_IFACE_FRIENDLY_NAME = "Ethernet"
     DEFAULT_OUT_IFACE_FRIENDLY_NAME = "Wi-Fi"
     DEFAULT_LOOPBACK_IFACE_FRIENDLY_NAME = "Loopback"
     NOTIFICATION_TARGET_IP = "127.0.0.1"  # IP of the machine to receive alerts
