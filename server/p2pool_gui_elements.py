@@ -1732,7 +1732,7 @@ class RouterTab(QWidget):
                 "General", "Router", "DHCP", "Transport", "HostBoundary", "TLS", "Python", "C++", "Signing",
                 "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
                 "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher",
-                "Notifier", "NAT/RIP/ARP/NDP/Bridge", "mDNS", "Firewall", "Packet", "Analysis"
+                "Notifier", "NAT/RIP/ARP/NDP","Bridge/L2", "Wintun/WinDivert", "mDNS", "Firewall", "Packet", "Analysis"
             ],
             "Minimal": ["General"],
         }
@@ -2011,6 +2011,12 @@ class RouterTab(QWidget):
 
     def _route_message_to_pane(self, message: str) -> str:
         prefixes = self._extract_prefixes_fast(message)
+        try:
+            if prefixes[0] == self._norm("Transport"):
+                return "Transport"
+        except Exception:
+            if prefixes and prefixes[0] == "transport":
+                return "Transport"
 
         for sprefix in reversed(prefixes):
             pane = self._hot_prefix_to_pane.get(sprefix)

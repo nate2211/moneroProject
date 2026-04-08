@@ -76,7 +76,7 @@ class PythonRouterManager:
     """
 
     # --- Configuration Defaults (used if dynamic assignment fails or as starting points) ---
-    DEFAULT_IN_IFACE_FRIENDLY_NAME = "Ethernet"
+    DEFAULT_IN_IFACE_FRIENDLY_NAME = "Ethernet 2"
     DEFAULT_OUT_IFACE_FRIENDLY_NAME = "Wi-Fi"
     DEFAULT_LOOPBACK_IFACE_FRIENDLY_NAME = "Loopback"
     NOTIFICATION_TARGET_IP = "127.0.0.1"  # IP of the machine to receive alerts
@@ -126,6 +126,9 @@ class PythonRouterManager:
         self.router_ipv6_link_local_out = None
         self.router_gateway_out_ip = None
         self.router_macs = None
+        self.mac_in = None
+        self.mac_out = None
+        self.interface_macs = {}
         self._sniff_threads = {}
         self._worker_threads = {}
         self._stop_sniffing_event = threading.Event()
@@ -1174,7 +1177,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     }
                     self.router_logger.log_message(
                         f"[Router] Added LAC interface to config: {self.interface_lac_full_name} (No IP found), MAC: {lac_mac}")
-
+                bridge_members.append(lac_2_info["full_name"])
             except Exception as e:
                 self.router_logger.log_message(
                     f"[Router] ⚠️ Failed to configure LAC interface {self.interface_lac_full_name}: {e}")
@@ -1212,7 +1215,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     }
                     self.router_logger.log_message(
                         f"[Router] Added LAC 2 interface to config: {self.interface_lac_2_full_name} (No IP found), MAC: {lac_2_mac}")
-
+                bridge_members.append(lac_2_info_2["full_name"])
             except Exception as e:
                 self.router_logger.log_message(
                     f"[Router] ⚠️ Failed to configure LAC 2 interface {self.interface_lac_2_full_name}: {e}")
@@ -1281,10 +1284,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         self.add_outbound_load_balancing_interface(self.interface_out_full_name)
         link_group = [self.interface_out_full_name]
         if self.interface_lac_full_name:
-            self.add_outbound_load_balancing_interface(self.interface_lac_full_name)
             link_group.append(self.interface_lac_full_name)
         if self.interface_lac_2_full_name:
-            self.add_outbound_load_balancing_interface(self.interface_lac_2_full_name)
             link_group.append(self.interface_lac_2_full_name)
 
         self.broadcast_manager.ensure_broadcast_for_pcap(self.interface_out_full_name)
@@ -1502,7 +1503,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.sniffer.sniff(
                     iface=name,
                     prn=direct_process,
-                    promisc=False,
+                    promisc=True,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
                     mac_filter_only=True,
@@ -1843,6 +1844,20 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.arp_manager.learn_arp_response(packet)
                 self.arp_manager.reply_to_arp_request(packet, inbound_iface)
                 return
+            # 1) Bridge real Ethernet frames on bridge-member ports first
+            if packet.haslayer(Ether):
+                try:
+                    if self.ethernet_manager.is_bridge_member(inbound_iface):
+                        self.ethernet_l2_manager.handle_packet(packet, inbound_iface)
+
+                        bridged = self.ethernet_manager.handle_frame(packet, inbound_iface)
+                        if bridged:
+                            return
+
+                        # not actually sent by bridge, so fall through and let the rest
+                        # of process_packet decide whether router logic should handle it
+                except Exception as e:
+                    self.router_logger.log_message(f"[L2][Bridge] ❌ ingress bridge error on {inbound_iface}: {e}")
             ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
             if not ip_layer:
                 return
@@ -1947,55 +1962,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if eth_type is None:
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
-            if packet.haslayer(UDP):
-                try:
-                    _udp = packet[UDP]
-                    _sp = int(getattr(_udp, "sport", 0) or 0)
-                    _dp = int(getattr(_udp, "dport", 0) or 0)
-                except Exception:
-                    _sp = _dp = 0
-
-                if (_sp in (137, 138)) or (_dp in (137, 138)):  # 137=NBNS, 138=NetBIOS-DGM
-                    # only drop when this packet is NOT meant for the router itself (transit only)
-                    try:
-                        dst_ip = (packet.getlayer(IP) or packet.getlayer(IPv6)).dst
-                    except Exception:
-                        dst_ip = None
-                    try:
-                        is_for_router = bool(dst_ip and (dst_ip in self._get_all_local_ips()))
-                    except Exception:
-                        is_for_router = False
-
-                    if not is_for_router:
-                        self.function_call_tracker.track(
-                            identifier="DroppedNBNSAnyTransit",
-                            threshold=50,
-                            final_message=f"[Router] 🧹 Dropped transit NBNS/NetBIOS (UDP/137,138). Count: {{}}.",
-                            count_message=None,
-                        )
-                        return
-
-            if self.ethernet_l2_manager.handle_packet(packet, inbound_iface):
-                return
-
-
-            if ip_layer.version == 6 and ip_layer.nh == 0:
-                original_summary = packet.summary()
-                p = packet.copy()
-                new_ip_layer = p.getlayer(IPv6)
-
-                stripped_count = 0
-                while new_ip_layer and new_ip_layer.nh == 0 and hasattr(new_ip_layer.payload, 'nh'):
-                    hbh_header = new_ip_layer.payload
-                    new_ip_layer.nh = hbh_header.nh
-                    new_ip_layer.payload = hbh_header.payload
-                    stripped_count += 1
-
-                if stripped_count > 0:
-                    new_ip_layer.plen = len(new_ip_layer.payload)
-                    packet = p
-                    ip_layer = new_ip_layer
-
 
             if IP in packet:
                 if packet.haslayer(ESP):
@@ -2049,60 +2015,128 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             is_for_router = dst_ip in self._get_all_local_ips()
 
-            if is_for_router:
-                # mDNS stays separate (5353/UDP, local-scope)
-                if UDP in packet and int(packet[UDP].dport) == 5353:
-                    if self.mdns_manager.handle_packet(packet):
-                        self.code_output_manager.submit_packet(
-                            packet, inbound_iface=inbound_iface,
-                            phase="handled",
-                            component="mdns"
-                        )
-                        return
-                if packet.haslayer(DNS):
+
+            if UDP in packet and int(packet[UDP].dport) == 5353:
+                if self.mdns_manager.handle_packet(packet):
+                    self.code_output_manager.submit_packet(
+                        packet, inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="mdns"
+                    )
+                    return
+            if packet.haslayer(DNS):
+                try:
                     dns = packet[DNS]
 
-                    # qr=0 means it's a query from a client
-                    if dns.qr == 0:
-                        self.router_logger.log_message("[DNS] 🗺️ Intercepting DNS query for router.")
-                        if self.dns_manager.handle_query(packet, inbound_iface):
-                            return  # Packet was handled (forwarded upstream or served from cache)
+                    udp = packet.getlayer(UDP)
+                    tcp = packet.getlayer(TCP)
 
-                    # qr=1 means it's a response from an upstream server
+                    if udp is not None:
+                        try:
+                            sport = getattr(udp, "sport", 0)
+                            sport = getattr(sport, "value", sport)
+                            sport = sport if isinstance(sport, int) else int(str(sport))
+                        except Exception:
+                            sport = 0
+
+                        try:
+                            dport = getattr(udp, "dport", 0)
+                            dport = getattr(dport, "value", dport)
+                            dport = dport if isinstance(dport, int) else int(str(dport))
+                        except Exception:
+                            dport = 0
+
+                    elif tcp is not None:
+                        try:
+                            sport = getattr(tcp, "sport", 0)
+                            sport = getattr(sport, "value", sport)
+                            sport = sport if isinstance(sport, int) else int(str(sport))
+                        except Exception:
+                            sport = 0
+
+                        try:
+                            dport = getattr(tcp, "dport", 0)
+                            dport = getattr(dport, "value", dport)
+                            dport = dport if isinstance(dport, int) else int(str(dport))
+                        except Exception:
+                            dport = 0
                     else:
-                        self.router_logger.log_message("[DNS] ⬅️ Processing DNS response for router.")
-                        if self.dns_manager.handle_response(packet):
-                            return  # Packet was handled (forwarded back to client)
+                        sport = 0
+                        dport = 0
 
-                if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest):
-                    self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
-                    if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
-                                                                                 self.rip_manager.find_route):
-                        self.code_output_manager.submit_packet(
-                            packet,
-                            inbound_iface=inbound_iface,
-                            phase="handled",
-                            component="dhcp-in-router",
-                        )
-                        return
-                    if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
-                                                                                   self.rip_manager.find_route):
-                        self.code_output_manager.submit_packet(
-                            packet,
-                            inbound_iface=inbound_iface,
-                            phase="handled",
-                            component="dhcp-out-router",
-                        )
-                        return
+                    is_mdns = (sport == 5353 or dport == 5353)
+                    is_llmnr = (sport == 5355 or dport == 5355)
+                    is_nbns = (sport in (137, 138) or dport in (137, 138))
+
+                    if not is_mdns and not is_llmnr and not is_nbns:
+                        try:
+                            qr = getattr(dns, "qr", 0)
+                            qr = getattr(qr, "value", qr)
+                            qr = qr if isinstance(qr, int) else int(str(qr))
+                        except Exception:
+                            qr = 0
+
+                        if qr == 0:
+                            self.router_logger.log_message(
+                                f"[DNS] 🗺️ Early DNS query intercept on {iface_short} "
+                                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                            )
+
+                            if self.dns_manager.handle_query(packet, inbound_iface):
+                                self.code_output_manager.submit_packet(
+                                    packet,
+                                    inbound_iface=inbound_iface,
+                                    phase="handled",
+                                    component="dns-query",
+                                )
+                                return
+                            else:
+                                self.router_logger.log_message(
+                                    f"[DNS] ⚠️ Early DNS query not handled on {iface_short}: {packet.summary()}"
+                                )
+
+                        else:
+                            self.router_logger.log_message(
+                                f"[DNS] ⬅️ Early DNS response intercept on {iface_short} "
+                                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                            )
+
+                            if self.dns_manager.handle_response(packet):
+                                self.code_output_manager.submit_packet(
+                                    packet,
+                                    inbound_iface=inbound_iface,
+                                    phase="handled",
+                                    component="dns-response",
+                                )
+                                return
+                            else:
+                                self.router_logger.log_message(
+                                    f"[DNS] ⚠️ Early DNS response not handled on {iface_short}: {packet.summary()}"
+                                )
+
+                except Exception as e:
+                    self.router_logger.log_message(
+                        f"[DNS] ❗ Early DNS intercept exception on {iface_short}: {e}"
+                    )
+
             if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest) or packet.haslayer(DHCP6_Reply):
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} not for router Packet: {packet.summary()}")
+                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
+                if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
+                                                                             self.rip_manager.find_route):
+                    self.code_output_manager.submit_packet(
+                        packet,
+                        inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="dhcp-in-router",
+                    )
+                    return
                 if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
                                                                                self.rip_manager.find_route):
                     self.code_output_manager.submit_packet(
                         packet,
                         inbound_iface=inbound_iface,
                         phase="handled",
-                        component="dhcp-out",
+                        component="dhcp-out-router",
                     )
                     return
             if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
@@ -2125,48 +2159,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         component="igmp",
                     )
                 return
-            # --- Packet is NOT for the router, so it must be a transit packet. ---
-            # Step 2: Perform Layer 3 and above processing for transit traffic.
-            # mDNS stays separate (5353/UDP, local-scope)
-            if UDP in packet and (int(packet[UDP].dport) == 5353 or int(packet[UDP].sport) == 5353):
-                handled = False
-                try:
-                    handled = bool(self.mdns_manager.handle_packet(packet))
-                except Exception as e:
-                    self.router_logger.log_message(f"[mDNS] ❗ Exception while handling mDNS packet: {e}")
-                    handled = True  # consume so it does not fall through into normal DNS
-
-                if handled:
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="mdns",
-                    )
-                return
-
-            dns = packet.getlayer(DNS)
-            if dns:
-                # Upstream answers (consume when they are ours)
-                if dns.qr == 1:
-                    self.router_logger.log_message("[DNS] ⬅️ Processing DNS response for router.")
-                    if self.dns_manager.handle_response(packet):
-                        self.code_output_manager.submit_packet(
-                            packet, inbound_iface=inbound_iface,
-                            phase="handled",
-                            component="dns-answer"
-                        )
-                        return
-                else:
-                    # Client queries (only intercept real DNS queries to 53)
-                    if UDP in packet and int(packet[UDP].dport) == 53:
-                        if self.dns_manager.handle_query(packet, inbound_iface):
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface,
-                                phase="handled",
-                                component="dns-query"
-                            )
-                            return
 
 
             if (
@@ -4016,50 +4008,136 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
     def get_interface_mac(self, iface_full_name: str) -> str:
         """
         Always returns a usable MAC address for the given interface.
-        - Prefers Scapy's get_if_hwaddr()
-        - Falls back to OS interface lists (Windows / netifaces)
-        - Final fallback: generates a deterministic synthetic MAC
-          (locally administered, unicast, stable per interface name)
-        """
-        mac = None
 
-        # --- Try Scapy ---
+        Resolution order:
+        - cached value from self.interface_macs
+        - Scapy's get_if_hwaddr()
+        - Windows interface list
+        - netifaces
+        - deterministic synthetic MAC fallback
+
+        Notes:
+        - Normalizes to lowercase
+        - Caches all successful results, including synthetic MACs
+        - Logs synthetic MAC generation only once per interface
+        """
+        try:
+            if not hasattr(self, "interface_macs") or self.interface_macs is None:
+                self.interface_macs = {}
+        except Exception:
+            self.interface_macs = {}
+
+        iface_key = str(iface_full_name or "").strip()
+        if not iface_key:
+            iface_key = "<unknown-iface>"
+
+        # -----------------------------
+        # Cache hit
+        # -----------------------------
+        try:
+            cached = self.interface_macs.get(iface_key)
+            if cached:
+                cached = str(cached).strip().lower()
+                if cached and cached != "00:00:00:00:00:00":
+                    return cached
+        except Exception:
+            pass
+
+        def _is_valid_mac(value) -> bool:
+            try:
+                s = str(value or "").strip().lower()
+                if not s or s == "00:00:00:00:00:00":
+                    return False
+                parts = s.split(":")
+                if len(parts) != 6:
+                    return False
+                for part in parts:
+                    if len(part) != 2:
+                        return False
+                    int(part, 16)
+                return True
+            except Exception:
+                return False
+
+        def _store(mac_value: str) -> str:
+            mac_value = str(mac_value).strip().lower()
+            try:
+                self.interface_macs[iface_key] = mac_value
+            except Exception:
+                pass
+            return mac_value
+
+        # -----------------------------
+        # Try Scapy
+        # -----------------------------
         try:
             from scapy.all import get_if_hwaddr
-            mac = get_if_hwaddr(iface_full_name)
-            if mac and mac.lower() != "00:00:00:00:00:00":
-                return mac.lower()
+            mac = get_if_hwaddr(iface_key)
+            if _is_valid_mac(mac):
+                return _store(mac)
         except Exception:
             pass
 
-        # --- Try Windows API ---
+        # -----------------------------
+        # Try Windows API
+        # -----------------------------
         try:
             from scapy.arch.windows import get_windows_if_list
+
+            iface_key_lower = iface_key.lower()
             for iface in get_windows_if_list():
-                if iface_full_name in (
-                        iface.get("name"), iface.get("win_name"), iface.get("friendlyname"),
-                        iface.get("description"), iface.get("guid")
-                ):
-                    mac = (iface.get("mac") or "").lower()
-                    if mac and mac != "00:00:00:00:00:00":
-                        return mac
+                candidates = [
+                    iface.get("name"),
+                    iface.get("win_name"),
+                    iface.get("friendlyname"),
+                    iface.get("description"),
+                    iface.get("guid"),
+                ]
+
+                matched = False
+                for candidate in candidates:
+                    try:
+                        if candidate and str(candidate).strip().lower() == iface_key_lower:
+                            matched = True
+                            break
+                    except Exception:
+                        continue
+
+                if not matched:
+                    continue
+
+                mac = iface.get("mac")
+                if _is_valid_mac(mac):
+                    return _store(mac)
         except Exception:
             pass
 
-        # --- Try netifaces ---
+        # -----------------------------
+        # Try netifaces
+        # -----------------------------
         try:
             import netifaces as ni
-            if iface_full_name in ni.interfaces():
-                addrs = ni.ifaddresses(iface_full_name).get(ni.AF_LINK, [{}])
-                if addrs and "addr" in addrs[0]:
-                    mac = addrs[0]["addr"].lower()
-                    if mac and mac != "00:00:00:00:00:00":
-                        return mac
+
+            iface_key_lower = iface_key.lower()
+            for name in ni.interfaces():
+                try:
+                    if str(name).strip().lower() != iface_key_lower:
+                        continue
+
+                    addrs = ni.ifaddresses(name).get(ni.AF_LINK, [])
+                    for addr_info in addrs:
+                        mac = addr_info.get("addr")
+                        if _is_valid_mac(mac):
+                            return _store(mac)
+                except Exception:
+                    continue
         except Exception:
             pass
 
-        # --- Last resort: generate a synthetic MAC ---
-        h = abs(hash(iface_full_name)) & 0xFFFFFFFFFFFF
+        # -----------------------------
+        # Final fallback: stable synthetic MAC
+        # -----------------------------
+        h = abs(hash(iface_key)) & 0xFFFFFFFFFFFF
         fake_mac = "02:%02x:%02x:%02x:%02x:%02x" % (
             (h >> 32) & 0xFF,
             (h >> 24) & 0xFF,
@@ -4067,11 +4145,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             (h >> 8) & 0xFF,
             h & 0xFF,
         )
+
+        try:
+            self.interface_macs[iface_key] = fake_mac
+        except Exception:
+            pass
+
         self.router_logger.log_message(
             RouterRandomMessages(
                 name="Router",
-                message=f"Synthesized MAC {fake_mac} for iface '{iface_full_name}",
-                emoticons=["️⚠️️️", "🧪", "🧨", "🧧", "🌡️", "⚗️"]
+                message=f"Synthesized MAC {fake_mac} for iface '{iface_key}'",
+                emoticons=["⚠️", "🧪", "🧨", "🧧", "🌡️", "⚗️"],
             )
         )
         return fake_mac

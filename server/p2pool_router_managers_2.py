@@ -7363,6 +7363,13 @@ class DNSManager:
       - fallback response matching by (ipver, txid, qname, qtype)
       - terminal reply dedupe to suppress repeated SERVFAIL/NXDOMAIN spam
       - more stable reply path selection back to the client
+
+    Small patch additions:
+      - strips stale Layer-2 headers before sending upstream or client replies
+      - avoids answering obviously non-local DNS queries when enough local context exists
+      - learns likely local upstream resolvers from observed client query destinations
+      - tags common Windows/Microsoft connectivity-check domains in logs
+      - includes reply L2 mode in terminal-reply logging
     """
 
     DNS_CACHE_TTL                  = 300
@@ -7405,6 +7412,18 @@ class DNSManager:
     # terminal reply dedupe to stop repeated SERVFAIL spam
     TERMINAL_REPLY_DEDUP_SEC       = 2.5
     TERMINAL_REPLY_TABLE_MAX       = 8192
+
+    # patch additions
+    PREFER_LEARNED_LOCAL_UPSTREAMS = True
+    MAX_LEARNED_LOCAL_UPSTREAMS    = 16
+    ENFORCE_LOCAL_LISTENER_SCOPE   = True
+    CONNECTIVITY_PROBE_DOMAINS     = {
+        "ipv6.msftconnecttest.com",
+        "www.msftconnecttest.com",
+        "msftconnecttest.com",
+        "dns.msftncsi.com",
+        "www.msftncsi.com",
+    }
 
     def __init__(self, router_logger, packet_writer, router_ipv6_ll):
         self.logger = router_logger
@@ -7450,6 +7469,9 @@ class DNSManager:
 
         # recently-sent terminal replies
         self._recent_terminal_replies: "OrderedDict[Tuple, float]" = OrderedDict()
+
+        # learned local/private resolvers observed from client traffic
+        self._learned_local_upstreams: "OrderedDict[str, float]" = OrderedDict()
 
         # Stats
         self._stats = {
@@ -7514,6 +7536,19 @@ class DNSManager:
                 cleaned.append(s)
             except Exception:
                 continue
+
+        # preserve any learned local upstreams near the front if they were not explicitly included
+        with self._lock:
+            learned = list(self._learned_local_upstreams.keys()) if self.PREFER_LEARNED_LOCAL_UPSTREAMS else []
+
+        if learned:
+            merged = []
+            seen2 = set()
+            for ip in learned + cleaned:
+                if ip not in seen2:
+                    seen2.add(ip)
+                    merged.append(ip)
+            cleaned = merged
 
         with self._lock:
             self.upstreams = [
@@ -7686,8 +7721,117 @@ class DNSManager:
 
     def handle_query(self, packet: Packet, inbound_iface: str) -> bool:
         """Handles a client's DNS query."""
+
         if DNS is None or not (packet.haslayer(DNS) and packet[DNS].qr == 0):
             return False
+
+        # Only process real unicast DNS here.
+        # Keep mDNS / LLMNR / NBNS out of the normal DNS proxy path.
+        if UDP not in packet:
+            return False
+
+        try:
+            dport = getattr(packet[UDP], "dport", 0)
+            dport = getattr(dport, "value", dport)
+            dport = dport if isinstance(dport, int) else int(str(dport))
+        except Exception:
+            dport = 0
+
+        try:
+            sport = getattr(packet[UDP], "sport", 0)
+            sport = getattr(sport, "value", sport)
+            sport = sport if isinstance(sport, int) else int(str(sport))
+        except Exception:
+            sport = 0
+
+        if dport != 53:
+            return False
+
+        if sport in (5353, 5355, 137, 138) or dport in (5353, 5355, 137, 138):
+            return False
+        # Do not treat our own forwarded upstream DNS packets as new client queries.
+        try:
+            if IP in packet:
+                pkt_src_ip = str(packet[IP].src)
+                pkt_dst_ip = str(packet[IP].dst)
+            elif IPv6 in packet:
+                pkt_src_ip = str(packet[IPv6].src).split("%", 1)[0]
+                pkt_dst_ip = str(packet[IPv6].dst).split("%", 1)[0]
+            else:
+                pkt_src_ip = ""
+                pkt_dst_ip = ""
+
+            # Skip queries sourced from router-owned IPs going to external resolvers.
+            router_ips = set()
+            for x in (self.router_ip_out, self.router_ipv4_out, self.router_ipv6_out, self.router_ipv6_link_local_out):
+                if x:
+                    router_ips.add(str(x).split("%", 1)[0])
+
+            # Router-originated DNS is allowed unless it matches a known forwarded in-flight query.
+            if IP in packet:
+                maybe_key = ("4", pkt_src_ip, int(sport), int(packet[DNS].id))
+            elif IPv6 in packet:
+                maybe_key = ("6", pkt_src_ip, int(sport), int(packet[DNS].id))
+            else:
+                maybe_key = None
+
+            if pkt_src_ip in router_ips and dport == 53:
+                self._elog(
+                    "query",
+                    f"Observed self-originated DNS query q={self._safe_qname(packet)} "
+                    f"{pkt_src_ip}:{sport} -> {pkt_dst_ip}:{dport}",
+                    ["🪞", "👀", "📡"]
+                )
+
+                if maybe_key is not None:
+                    with self._lock:
+                        if maybe_key in self._pending_requests:
+                            self._elog(
+                                "query",
+                                f"Skipping recaptured forwarded DNS query q={self._safe_qname(packet)} key={maybe_key}",
+                                ["🧲", "🪞", "🚫"]
+                            )
+                            return True
+
+            # Also skip if this exact src/port/txid already exists in pending_requests.
+            if IP in packet:
+                maybe_key = ("4", pkt_src_ip, int(sport), int(packet[DNS].id))
+            elif IPv6 in packet:
+                maybe_key = ("6", pkt_src_ip, int(sport), int(packet[DNS].id))
+            else:
+                maybe_key = None
+
+            if maybe_key is not None:
+                with self._lock:
+                    if maybe_key in self._pending_requests:
+                        self._elog(
+                            "query",
+                            f"Skipping recaptured forwarded DNS query q={self._safe_qname(packet)} key={maybe_key}",
+                            ["🧲", "🪞", "🚫"]
+                        )
+                        return True
+        except Exception as e:
+            self._elog("query", f"Self-query suppression check failed: {e}", ["⚠️", "🧩"])
+        # Relax listener scoping for real transit DNS queries.
+        # Keep the old scope check only for packets that look router-directed/local.
+        scoped_local = False
+        try:
+            scoped_local = bool(self._packet_targets_local_listener(packet))
+        except Exception:
+            scoped_local = False
+
+        if self.ENFORCE_LOCAL_LISTENER_SCOPE and not scoped_local:
+            try:
+                dst_ip = packet[IP].dst if IP in packet else str(packet[IPv6].dst).split("%", 1)[0]
+            except Exception:
+                dst_ip = "<unknown>"
+
+            self._elog(
+                "query",
+                f"Allowing transit DNS query despite listener scope q={self._safe_qname(packet)} "
+                f"dst={dst_ip}:{dport} iface={inbound_iface}",
+                ["🧭", "🌐", "📨"]
+            )
 
         self._stat_inc("queries_total")
 
@@ -7696,12 +7840,16 @@ class DNSManager:
         except Exception:
             pass
 
+        self._learn_possible_local_upstream(packet)
+
         qname, qtype, qkey = self._qname_qtype_key(packet)
         client_ip = self._client_ip(packet)
+        probe_tag = self._connectivity_probe_tag(qname)
 
         self._elog(
             "query",
-            f"Incoming query q={qname} type={qtype} client={client_ip} iface={inbound_iface}",
+            f"Incoming query q={qname} type={qtype} client={client_ip} iface={inbound_iface}"
+            f"{' probe=' + probe_tag if probe_tag else ''}",
             ["📨", "🔎", "🌍"]
         )
 
@@ -7761,8 +7909,10 @@ class DNSManager:
                 )
                 return True
 
-            if len(self._inflight) >= self.MAX_INFLIGHT_KEYS or len(self._pending_requests) >= self.MAX_PENDING_REQUESTS:
-                stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+            if len(self._inflight) >= self.MAX_INFLIGHT_KEYS or len(
+                    self._pending_requests) >= self.MAX_PENDING_REQUESTS:
+                stale = self._cache_get_stale(qkey,
+                                              max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
                 if stale:
                     resp, negative = stale
                     self._stat_inc("cache_hit_stale")
@@ -7781,7 +7931,8 @@ class DNSManager:
 
         upstream_list = self._upstream_candidates(qname)
         if not upstream_list:
-            stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+            stale = self._cache_get_stale(qkey,
+                                          max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
             if stale:
                 resp, negative = stale
                 self._stat_inc("cache_hit_stale")
@@ -7816,7 +7967,8 @@ class DNSManager:
             with self._lock:
                 self._inflight.pop(qkey, None)
 
-            stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+            stale = self._cache_get_stale(qkey,
+                                          max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
             if stale:
                 resp, negative = stale
                 self._stat_inc("cache_hit_stale")
@@ -7862,15 +8014,39 @@ class DNSManager:
             pass
 
         matched_primary, info, matched_via = self._find_pending_match(packet, pk_primary, pk_secondary)
+        # Only trust passive RTT updates for exact primary/secondary matches.
+        try:
+            if matched_via in ("primary", "secondary"):
+                rtt_ms = max(0.0, (time.time() - float(info.get("timestamp", time.time()))) * 1000.0)
+                upstream_ip = str(info.get("upstream_ip", ""))
+                self._mark_upstream_success(upstream_ip, rtt_ms)
+                self._elog("health", f"Marked upstream success ip={upstream_ip} rtt={rtt_ms:.2f} ms", ["✅", "📈", "🩺"])
+            else:
+                self._elog(
+                    "health",
+                    f"Skipping passive RTT update for fallback-matched response q={self._safe_qname(packet)}",
+                    ["🧭", "⏭️", "🩺"]
+                )
+        except Exception as e:
+            self._elog("health", f"Failed passive RTT update: {e}", ["⚠️", "📉", "🩺"])
         if not matched_primary or not info:
+            try:
+                dns = packet[DNS]
+                is_negative = (
+                        int(dns.rcode) in (2, 3)
+                        or (int(dns.rcode) == 0 and int(getattr(dns, "ancount", 0)) == 0)
+                )
+                self._cache_put_from_response(packet, negative=is_negative)
+            except Exception:
+                pass
+
             self._elog(
                 "response",
-                f"Unmatched upstream response primary={pk_primary} secondary={pk_secondary} "
+                f"Accepted non-proxied upstream response primary={pk_primary} secondary={pk_secondary} "
                 f"q={self._safe_qname(packet)} id={int(packet[DNS].id)}",
-                ["❔", "📭", "🧩"]
+                ["📬", "🌐", "✅"]
             )
-            return False
-
+            return True
         if self.REQUIRE_QUESTION_MATCH and not self._question_match_info_vs_packet(info, packet):
             self._elog(
                 "response",
@@ -7990,6 +8166,8 @@ class DNSManager:
             fwd[UDP].dport = 53
             if self.router_ip_out:
                 fwd[IP].src = self.router_ip_out
+            elif self.router_ipv4_out:
+                fwd[IP].src = self.router_ipv4_out
             sport = self._alloc_udp_ephemeral_port()
             fwd[UDP].sport = sport
             self._normalize_checksums(fwd)
@@ -8077,6 +8255,7 @@ class DNSManager:
         )
 
         try:
+            self._drop_l2_header_for_send(fwd)
             self.pw._send_raw_packet(fwd, inbound_iface)
             self._stat_inc("forwarded")
             self._elog("forward", f"Sent upstream query q={qname} to {target_ip}", ["✅", "📨", "🌐"])
@@ -8118,12 +8297,17 @@ class DNSManager:
         """
         resp = response_packet.copy()
 
+        l2_mode = self._packet_l2_mode(resp)
+        self._drop_l2_header_for_send(resp)
+
         if IP in original_request and IP in resp:
             resp[IP].dst = original_request[IP].src
             resp[UDP].dport = int(original_request[UDP].sport)
             resp[DNS].id = original_request[DNS].id
             if self.router_ip_out:
                 resp[IP].src = self.router_ip_out
+            elif self.router_ipv4_out:
+                resp[IP].src = self.router_ipv4_out
             resp[UDP].sport = 53
             self._normalize_checksums(resp)
 
@@ -8144,7 +8328,7 @@ class DNSManager:
 
         try:
             self.pw._send_raw_packet(resp, out_iface)
-            msg = log_message or f"Sent reply to client={self._client_ip(original_request)} iface={out_iface}"
+            msg = log_message or f"Sent reply to client={self._client_ip(original_request)} iface={out_iface} l2_before={l2_mode}"
             self._elog("reply", msg, log_emojis or ["📬", "✅", "🏠"])
         except Exception as e:
             self._elog("reply", f"Failed sending reply to client: {e}", ["❗", "💥", "📭"])
@@ -8332,10 +8516,15 @@ class DNSManager:
             r[DNS].nscount = 0
             r[DNS].arcount = 0
             self._normalize_checksums(r)
+            l2_mode = self._packet_l2_mode(r)
             self._send_response_to_client(
                 r,
                 req,
-                log_message=f"{label} sent to client={self._client_ip(req)} iface={getattr(req, '_dns_inbound_iface', None) or getattr(req, 'sniffed_on', None)} q={self._safe_qname(req)}",
+                log_message=(
+                    f"{label} sent to client={self._client_ip(req)} "
+                    f"iface={getattr(req, '_dns_inbound_iface', None) or getattr(req, 'sniffed_on', None)} "
+                    f"q={self._safe_qname(req)} rcode={int(rcode)} l2_before={l2_mode}"
+                ),
                 log_emojis=emojis,
             )
             self._stat_inc(stat_key)
@@ -8357,6 +8546,11 @@ class DNSManager:
         try:
             if UDP in pkt and hasattr(pkt[UDP], "chksum"):
                 del pkt[UDP].chksum
+        except Exception:
+            pass
+        try:
+            if IPv6 in pkt and hasattr(pkt[IPv6], "plen"):
+                del pkt[IPv6].plen
         except Exception:
             pass
 
@@ -8552,8 +8746,11 @@ class DNSManager:
     def _sort_upstreams(self):
         with self._lock:
             now = time.time()
+            learned = set(self._learned_local_upstreams.keys()) if self.PREFER_LEARNED_LOCAL_UPSTREAMS else set()
+
             self.upstreams.sort(
                 key=lambda x: (
+                    0 if str(x.get("ip", "")) in learned else 1,
                     0 if (float(x.get("cooldown_until", 0.0)) <= now) else 1,
                     0 if bool(x.get("healthy")) else 1,
                     0 if (self.PUBLIC_RESOLVER_PREFERENCE and x.get("public")) else 1,
@@ -8575,6 +8772,7 @@ class DNSManager:
 
         with self._lock:
             ranked = [dict(u) for u in self.upstreams if self._upstream_allowed(str(u.get("ip", "")))]
+            learned = list(self._learned_local_upstreams.keys())
 
         if not ranked:
             self._elog("upstream", f"No allowed upstream candidates for q={qname}", ["❌", "🌐", "📭"])
@@ -8591,6 +8789,7 @@ class DNSManager:
 
         healthy.sort(
             key=lambda u: (
+                0 if (self.PREFER_LEARNED_LOCAL_UPSTREAMS and str(u.get("ip", "")) in learned) else 1,
                 0 if (self.PUBLIC_RESOLVER_PREFERENCE and u.get("public")) else 1,
                 float(u.get("latency_ms", 9999.0)),
                 int(u.get("failures", 0)),
@@ -8744,60 +8943,58 @@ class DNSManager:
 
     def _cleanup_stale_pending(self):
         now = time.time()
-        stale_keys: List[Tuple] = []
-        stale_qkeys: List[str] = []
+        stale_primary_keys: List[Tuple] = []
+        stale_qkeys: Dict[str, int] = {}
 
         with self._lock:
             for pk, info in list(self._pending_requests.items()):
-                if (now - float(info.get("timestamp", 0.0))) > self.MAX_PENDING_AGE_SEC:
-                    stale_keys.append(pk)
+                ts = float(info.get("timestamp", 0.0))
+                if (now - ts) > float(self.MAX_PENDING_AGE_SEC):
+                    stale_primary_keys.append(pk)
+                    qkey = info.get("qkey")
+                    if qkey:
+                        stale_qkeys[qkey] = int(stale_qkeys.get(qkey, 0)) + 1
 
-            stale_key_set = set(stale_keys)
-
-            for sk in stale_keys:
-                info = self._pending_requests.pop(sk, None)
+            for pk in stale_primary_keys:
+                info = self._pending_requests.pop(pk, None)
                 if not info:
                     continue
-
                 sec_key = info.get("sec_key")
                 if sec_key is not None:
                     self._pending_by_txid.pop(sec_key, None)
+                self._unregister_pending_question_key(info.get("question_key"), pk)
 
-                self._unregister_pending_question_key(info.get("question_key"), sk)
-
-                qkey = info.get("qkey")
-                if qkey:
-                    stale_qkeys.append(qkey)
-
-            for sec, pk in list(self._pending_by_txid.items()):
-                if pk in stale_key_set:
-                    self._pending_by_txid.pop(sec, None)
-
-            for qkey in set(stale_qkeys):
-                infl = self._inflight.pop(qkey, None)
+            for qkey in stale_qkeys.keys():
+                infl = self._inflight.get(qkey)
                 if not infl:
                     continue
+                outstanding = []
+                for pk in infl.get("outstanding", []):
+                    if pk not in stale_primary_keys:
+                        outstanding.append(pk)
+                infl["outstanding"] = outstanding
 
-                stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
-                for client_pkt, _iface in infl.get("waiters", []):
-                    try:
-                        if stale:
-                            resp, negative = stale
+                # if all outstanding requests died, fail or serve stale to waiters
+                if not outstanding:
+                    waiters = list(infl.get("waiters", []))
+                    self._inflight.pop(qkey, None)
+
+                    stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+                    if stale:
+                        resp, negative = stale
+                        for client_pkt, _in_iface in waiters:
                             self._send_response_to_client(resp, client_pkt)
                             self._stat_inc("cache_hit_stale")
-                            self._elog("cache", f"Served stale cache to waiter q={qkey}", ["🧊", "📦", "🛟"])
-                        else:
+                    else:
+                        for client_pkt, _in_iface in waiters:
                             self._send_servfail(client_pkt)
-                    except Exception:
-                        pass
 
-        if stale_keys:
-            self._stat_inc("stale_pending_cleaned", len(stale_keys))
-            self._elog("cleanup", f"Cleaned {len(stale_keys)} stale pending request(s)", ["🧹", "⌛", "🗂️"])
+        if stale_primary_keys:
+            self._stat_inc("stale_pending_cleaned", len(stale_primary_keys))
+            self._elog("cleanup", f"Cleaned {len(stale_primary_keys)} stale pending DNS request(s)", ["🧹", "⏳", "📭"])
 
     def _rl_take(self, client_ip: str) -> bool:
         now = time.time()
-
         with self._lock:
             rl = self._rl_clients.get(client_ip)
             if not rl:
@@ -8874,10 +9071,170 @@ class DNSManager:
                 self._elog("health", f"Probe reply invalid from {ip}", ["⚠️", "🧩", "🩺"])
                 return None
 
-            return max(1.0, (end - start) * 1000.0)
+            return max(0.1, (end - start) * 1000.0)
         except Exception as e:
             self._elog("health", f"Probe exception for {ip}: {e}", ["⚠️", "💥", "🩺"])
             return None
+
+    # ===================== Patch Helpers =====================
+
+    def _packet_targets_local_listener(self, pkt: Packet) -> bool:
+        """
+        Conservative scoping:
+          - if we don't know any local listener IPs, allow
+          - if packet isn't to UDP/53, reject
+          - if destination matches a configured local/router IP, allow
+          - if destination is broadcast/multicast, allow
+          - otherwise allow private RFC1918/ULA traffic as transparent/local-proxy traffic
+        """
+        try:
+            if UDP not in pkt or int(pkt[UDP].dport) != 53:
+                return False
+        except Exception:
+            return False
+
+        local_targets = set()
+        for cand in (
+            self.router_ip_out,
+            self.router_ipv4_out,
+            self.router_ipv6_out,
+            self.router_ipv6_ll,
+            self.router_ipv6_link_local_out,
+        ):
+            if cand:
+                local_targets.add(str(cand).split("%", 1)[0])
+
+        if not local_targets:
+            return True
+
+        try:
+            if IP in pkt:
+                dst = str(pkt[IP].dst)
+                if dst in local_targets:
+                    return True
+                if dst == "255.255.255.255":
+                    return True
+                try:
+                    ip = ipaddress.IPv4Address(dst)
+                    if ip.is_private or ip.is_link_local or ip.is_multicast:
+                        return True
+                except Exception:
+                    pass
+
+            if IPv6 in pkt:
+                dst6 = str(pkt[IPv6].dst).split("%", 1)[0]
+                if dst6 in local_targets:
+                    return True
+                try:
+                    ip6 = ipaddress.IPv6Address(dst6)
+                    if ip6.is_link_local or ip6.is_multicast or ip6.is_private:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            return True
+
+        return False
+
+    def _learn_possible_local_upstream(self, pkt: Packet):
+        """
+        If clients are sending DNS queries to a private/local resolver, remember it.
+        This helps environments where the real resolver is local/campus/router-side
+        rather than 1.1.1.1/8.8.8.8/9.9.9.9.
+        """
+        try:
+            if UDP not in pkt or int(pkt[UDP].dport) != 53:
+                return
+
+            addr = None
+            if IP in pkt:
+                dst = str(pkt[IP].dst)
+                try:
+                    ip = ipaddress.IPv4Address(dst)
+                    if ip.is_private or ip.is_link_local:
+                        addr = dst
+                except Exception:
+                    pass
+            elif IPv6 in pkt:
+                dst = str(pkt[IPv6].dst).split("%", 1)[0]
+                try:
+                    ip6 = ipaddress.IPv6Address(dst)
+                    if ip6.is_private or ip6.is_link_local:
+                        addr = dst
+                except Exception:
+                    pass
+
+            if not addr:
+                return
+
+            with self._lock:
+                self._learned_local_upstreams.pop(addr, None)
+                self._learned_local_upstreams[addr] = time.time()
+                while len(self._learned_local_upstreams) > self.MAX_LEARNED_LOCAL_UPSTREAMS:
+                    self._learned_local_upstreams.popitem(last=False)
+
+                already = any(str(u.get("ip")) == addr for u in self.upstreams)
+                if not already:
+                    self.upstreams.insert(0, {
+                        "ip": addr,
+                        "latency_ms": 25.0,
+                        "healthy": True,
+                        "last_probe": 0.0,
+                        "failures": 0,
+                        "successes": 0,
+                        "public": self._is_public_dns_ip(addr),
+                        "cooldown_until": 0.0,
+                        "last_rtt_ms": None,
+                    })
+
+            self._sort_upstreams()
+        except Exception:
+            pass
+
+    def _connectivity_probe_tag(self, qname: str) -> Optional[str]:
+        q = str(qname or "").rstrip(".").lower()
+        if q in self.CONNECTIVITY_PROBE_DOMAINS:
+            return "windows-connectivity"
+        if q.endswith(".msftconnecttest.com") or q.endswith(".msftncsi.com"):
+            return "microsoft-connectivity"
+        return None
+
+    def _packet_l2_mode(self, pkt: Packet) -> str:
+        try:
+            ether_cls = globals().get("Ether")
+            if ether_cls is None or ether_cls not in pkt:
+                return "none"
+            dst = str(pkt[ether_cls].dst).lower()
+            if dst == "ff:ff:ff:ff:ff:ff":
+                return "broadcast"
+            try:
+                first_octet = int(dst.split(":")[0], 16)
+                if (first_octet & 1) == 1:
+                    return "multicast"
+            except Exception:
+                pass
+            return "unicast"
+        except Exception:
+            return "unknown"
+
+    def _drop_l2_header_for_send(self, pkt: Packet):
+        """
+        Prevent inherited client/server Ethernet headers from leaking into rewritten
+        DNS packets. Let the packet writer rebuild L2 for the chosen interface.
+        """
+        try:
+            ether_cls = globals().get("Ether")
+            if ether_cls is not None and ether_cls in pkt:
+                try:
+                    pkt = pkt[ether_cls].payload
+                except Exception:
+                    try:
+                        del pkt[ether_cls]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return pkt
 
 
 
@@ -9531,6 +9888,601 @@ class ARPManager:
         # --- add in __init__ ---
         self._os_gateway_cache: dict[str, tuple[str, float]] = {}
         self.OS_GATEWAY_TTL = 5.0
+        self.ALLOW_SELF_GATEWAY_RESOLVE = False
+        self.SELF_GATEWAY_REQUIRE_FOREIGN_MAC = True
+        self._gw_decision_lock = threading.RLock()
+
+        # gw_ip -> (chosen_iface, expiry_ts)
+        self._gw_repick_cache: dict[str, tuple[str, float]] = {}
+        self.GW_REPICK_CACHE_TTL = 60
+
+        # target_ip -> (mac, expiry_ts, reason)
+        # this intentionally allows ff:ff:ff:ff:ff:ff, unlike normal gateway caches
+        self._gw_special_result_cache: dict[str, tuple[str, float, str]] = {}
+        self.GW_SPECIAL_RESULT_TTL = 60
+        # --- add in __init__ ---
+        self._gw_soft_mismatch_cache: dict[tuple[str, str], float] = {}
+        self.GW_SOFT_MISMATCH_TTL = 30.0
+        # --- add in __init__ ---
+        self.K8S_SERVICE_CIDRS = [
+            "10.96.0.0/12",  # common kubeadm default
+        ]
+        self.K8S_POD_CIDRS = [
+            # examples only; set these to your real pod networks if known
+            # "10.244.0.0/16",
+            # "10.42.0.0/16",
+            # "192.168.0.0/16",
+        ]
+        self.K8S_SERVICE_VIP_TTL = 60.0
+        self._k8s_virtual_cache: dict[str, float] = {}
+
+    def _resolve_gateway_mac_from_os(self, iface: str, gw_ip: str) -> str | None:
+        """
+        Resolve a gateway MAC using OS-visible state first, without forcing active ARP.
+        Safe helper for resolve_gateway_mac().
+
+        Resolution order:
+          1) interface-local ARP cache
+          2) gateway cache
+          3) generic ARP cache
+          4) OS ARP cache snapshot / refresh
+          5) passive learned gateway owner on this iface
+        """
+        try:
+            iface = str(iface or "").strip()
+            gw_ip = self._normalize_ip(gw_ip)
+            if not iface or not gw_ip:
+                return None
+
+            # 1) interface-local cache
+            mac = self._normalize_mac(self._iface_cache_get(iface, gw_ip))
+            if mac and not self._is_bad_gateway_mac(mac):
+                self._log_rl(
+                    self._gw_log_key("gw_os_iface_cache", gw_ip, iface),
+                    10.0,
+                    f"[ARP][GW] 🧠 OS-helper iface cache hit for {gw_ip} on {iface}: {mac}",
+                )
+                return mac
+
+            # 2) gateway cache
+            mac = self._normalize_mac(self._gateway_cache_get(iface, gw_ip))
+            if mac and not self._is_bad_gateway_mac(mac):
+                self._log_rl(
+                    self._gw_log_key("gw_os_gateway_cache", gw_ip, iface),
+                    10.0,
+                    f"[ARP][GW] 🗂️ OS-helper gateway cache hit for {gw_ip} on {iface}: {mac}",
+                )
+                return mac
+
+            # 3) generic ARP cache
+            ent = self._cache_get(gw_ip)
+            if ent:
+                try:
+                    if isinstance(ent, tuple) and len(ent) >= 1:
+                        mac = self._normalize_mac(ent[0])
+                    else:
+                        mac = self._normalize_mac(ent)
+                except Exception:
+                    mac = None
+                if mac and not self._is_bad_gateway_mac(mac):
+                    self._log_rl(
+                        self._gw_log_key("gw_os_global_cache", gw_ip),
+                        10.0,
+                        f"[ARP][GW] 🧷 OS-helper global cache hit for {gw_ip}: {mac}",
+                    )
+                    return mac
+
+            # 4) OS ARP cache
+            mac = self._normalize_mac(self.fallback_mac_from_os_cache(gw_ip, force_refresh=False))
+            if mac and not self._is_bad_gateway_mac(mac):
+                self._cache_set(gw_ip, mac, time.time())
+                self._gateway_cache_set(iface, gw_ip, mac)
+                self._known_gateway_macs[gw_ip] = mac
+                self._log_rl(
+                    self._gw_log_key("gw_os_arp_cache", gw_ip),
+                    10.0,
+                    f"[ARP][GW] 🧭 OS-helper recovered {gw_ip} from OS ARP cache: {mac}",
+                )
+                return mac
+
+            # 5) passive learned gateway owner on this iface
+            mac = self._normalize_mac(self._known_gateway_macs.get(gw_ip))
+            if mac and not self._is_bad_gateway_mac(mac):
+                self._gateway_cache_set(iface, gw_ip, mac)
+                self._log_rl(
+                    self._gw_log_key("gw_os_known_gateway", gw_ip, iface),
+                    10.0,
+                    f"[ARP][GW] 🧠 OS-helper known-gateway hit for {gw_ip} on {iface}: {mac}",
+                )
+                return mac
+
+            return None
+        except Exception as e:
+            self._log_rl(
+                self._gw_log_key("gw_os_helper_err", iface, gw_ip),
+                5.0,
+                f"[ARP][GW] ❌ _resolve_gateway_mac_from_os failed for {gw_ip} on {iface}: {e}",
+            )
+            return None
+    def _resolve_k8s_next_hop_mac(self, ip_str: str, iface: str) -> str | None:
+        # 1) ask routing for the next hop / route iface
+        route_iface = self._safe_find_route_iface(ip_str)
+        if route_iface:
+            iface = route_iface
+
+        # 2) resolve the gateway for that iface, not the k8s VIP itself
+        gw = self._get_iface_gateway(iface)
+        if not gw:
+            return None
+
+        net_obj = self._get_iface_network(iface)
+        return self.resolve_gateway_mac(gw, iface, str(net_obj) if net_obj else None)
+    def _ip_in_any_cidr(self, ip_str: str, cidrs: list[str]) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(str(ip_str).strip())
+            for cidr in cidrs or []:
+                try:
+                    if ip_obj in ipaddress.ip_network(str(cidr), strict=False):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _is_k8s_service_ip(self, ip_str: str) -> bool:
+        return self._ip_in_any_cidr(ip_str, getattr(self, "K8S_SERVICE_CIDRS", []))
+
+    def _is_k8s_pod_ip(self, ip_str: str) -> bool:
+        return self._ip_in_any_cidr(ip_str, getattr(self, "K8S_POD_CIDRS", []))
+
+    def _k8s_virtual_hit(self, ip_str: str) -> bool:
+        now = time.time()
+        until = self._k8s_virtual_cache.get(str(ip_str), 0.0)
+        if now < until:
+            return True
+        if until:
+            self._k8s_virtual_cache.pop(str(ip_str), None)
+        return False
+
+    def _k8s_virtual_set(self, ip_str: str, ttl: float | None = None) -> None:
+        self._k8s_virtual_cache[str(ip_str)] = time.time() + float(ttl or self.K8S_SERVICE_VIP_TTL)
+    def _gw_soft_mismatch_hit(self, iface: str, gw_ip: str) -> bool:
+        key = (str(iface or "").strip(), str(gw_ip or "").strip())
+        now = time.time()
+        with self._gw_decision_lock:
+            until = self._gw_soft_mismatch_cache.get(key, 0.0)
+            if now < until:
+                return True
+            if until:
+                self._gw_soft_mismatch_cache.pop(key, None)
+            return False
+
+    def _gw_soft_mismatch_set(self, iface: str, gw_ip: str, ttl: float | None = None) -> None:
+        key = (str(iface or "").strip(), str(gw_ip or "").strip())
+        with self._gw_decision_lock:
+            self._gw_soft_mismatch_cache[key] = time.time() + float(ttl or self.GW_SOFT_MISMATCH_TTL)
+
+    def _gw_soft_mismatch_clear(self, gw_ip: str | None = None) -> None:
+        with self._gw_decision_lock:
+            if not gw_ip:
+                self._gw_soft_mismatch_cache.clear()
+                return
+            gw_ip = str(gw_ip).strip()
+            dead = [k for k in self._gw_soft_mismatch_cache.keys() if len(k) >= 2 and k[1] == gw_ip]
+            for k in dead:
+                self._gw_soft_mismatch_cache.pop(k, None)
+
+    def _iface_is_authoritative_gateway_iface(self, iface: str, gw_ip: str) -> bool:
+        """
+        Treat OS / active-WAN state as authoritative even if local CIDR synthesis
+        is stale or imperfect.
+        """
+        iface = str(iface or "").strip()
+        gw_ip = self._normalize_ip(gw_ip)
+        if not iface or not gw_ip:
+            return False
+
+        try:
+            os_gw = self._get_os_gateway_for_iface(iface)
+            if os_gw and self._normalize_ip(os_gw) == gw_ip:
+                return True
+        except Exception:
+            pass
+
+        try:
+            last = getattr(self, "_last_wan_identity", {}) or {}
+            last_iface = str(last.get("iface_name") or "").strip()
+            last_gw = self._normalize_ip(last.get("gateway_ip"))
+            if last_iface == iface and last_gw == gw_ip:
+                return True
+        except Exception:
+            pass
+
+        try:
+            best = self._safe_get_best_interface()
+            if best and str(best).strip() == iface:
+                dg = self._normalize_ip(getattr(self, "default_gateway_ip", None))
+                if dg == gw_ip:
+                    return True
+        except Exception:
+            pass
+
+        return False
+    def _gw_repick_cache_get(self, gw_ip: str) -> str | None:
+        gw_ip = self._normalize_ip(gw_ip)
+        if not gw_ip:
+            return None
+        now = time.time()
+        with self._gw_decision_lock:
+            ent = self._gw_repick_cache.get(gw_ip)
+            if not ent:
+                return None
+            iface, exp = ent
+            if now >= exp:
+                self._gw_repick_cache.pop(gw_ip, None)
+                return None
+            return str(iface)
+
+    def _gw_repick_cache_set(self, gw_ip: str, iface: str, ttl: float | None = None) -> None:
+        gw_ip = self._normalize_ip(gw_ip)
+        iface = str(iface or "").strip()
+        if not gw_ip or not iface:
+            return
+        with self._gw_decision_lock:
+            self._gw_repick_cache[gw_ip] = (
+                iface,
+                time.time() + float(ttl or self.GW_REPICK_CACHE_TTL),
+            )
+
+    def _gw_special_result_get(self, ip_text: str) -> tuple[str, str] | None:
+        ip_text = self._normalize_ip(ip_text)
+        if not ip_text:
+            return None
+        now = time.time()
+        with self._gw_decision_lock:
+            ent = self._gw_special_result_cache.get(ip_text)
+            if not ent:
+                return None
+            mac, exp, reason = ent
+            if now >= exp:
+                self._gw_special_result_cache.pop(ip_text, None)
+                return None
+            return str(mac), str(reason)
+
+    def _gw_special_result_set(self, ip_text: str, mac: str, reason: str, ttl: float | None = None) -> None:
+        ip_text = self._normalize_ip(ip_text)
+        mac = str(mac or "").strip().lower()
+        reason = str(reason or "").strip()
+        if not ip_text or not mac or not reason:
+            return
+        with self._gw_decision_lock:
+            self._gw_special_result_cache[ip_text] = (
+                mac,
+                time.time() + float(ttl or self.GW_SPECIAL_RESULT_TTL),
+                reason,
+            )
+
+    def _gw_log_key(self, kind: str, *parts) -> str:
+        cooked = [str(kind)]
+        for p in parts:
+            try:
+                cooked.append(str(p).strip())
+            except Exception:
+                cooked.append(str(p))
+        return ":".join(cooked)
+    def _sanitize_gateway_candidate(self, gw_ip: str, iface: str | None = None) -> tuple[str | None, str]:
+        gw_ip = self._normalize_ip(gw_ip)
+        if not gw_ip:
+            return None, "bad_ip"
+
+        try:
+            ip_obj = ipaddress.ip_address(gw_ip)
+            if not isinstance(ip_obj, ipaddress.IPv4Address):
+                return None, "not_ipv4"
+
+            if ip_obj.is_loopback:
+                return None, "loopback"
+            if ip_obj.is_multicast:
+                return None, "multicast"
+            if ip_obj.is_unspecified:
+                return None, "unspecified"
+
+            if iface:
+                net_obj = self._get_iface_network(iface)
+                if isinstance(net_obj, ipaddress.IPv4Network):
+                    if net_obj.prefixlen <= 30:
+                        if ip_obj == net_obj.network_address:
+                            return None, "is_network"
+                        if ip_obj == net_obj.broadcast_address:
+                            return None, "is_broadcast"
+
+                iface_ip = self.get_interface_ipv4(iface)
+                if iface_ip and gw_ip == self._normalize_ip(iface_ip):
+                    return None, "is_self_ip"
+
+            # Also reject x.x.x.255 when it is the directed broadcast of *any*
+            # iface we know about, not just the current iface.
+            try:
+                for _iface, cfg in (self._all_iface_cfgs() or {}).items():
+                    cidr = str((cfg or {}).get("cidr") or (cfg or {}).get("network") or "").strip()
+                    if not cidr:
+                        continue
+                    try:
+                        net = ipaddress.ip_network(cidr, strict=False)
+                        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen <= 30:
+                            if ip_obj == net.broadcast_address:
+                                return None, f"is_directed_broadcast:{net}"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            return gw_ip, "ok"
+        except Exception as e:
+            return None, f"error:{e}"
+
+    def _choose_gateway_iface(self, gw_ip: str, iface_hint: str | None = None) -> str | None:
+        gw_ip = self._normalize_ip(gw_ip)
+        if not gw_ip:
+            return None
+
+        # 1) explicit hint if valid
+        if iface_hint:
+            try:
+                self._ensure_dynamic_iface_config(iface_hint)
+            except Exception:
+                pass
+            if self._iface_matches_wan_gateway(iface_hint, gw_ip):
+                return iface_hint
+
+        # 2) route lookup
+        try:
+            route_iface = self._safe_find_route_iface(gw_ip)
+            if route_iface and self._iface_matches_wan_gateway(route_iface, gw_ip):
+                return str(route_iface)
+        except Exception:
+            pass
+
+        # 3) best interface
+        try:
+            best = self._safe_get_best_interface()
+            if best and self._iface_matches_wan_gateway(best, gw_ip):
+                return str(best)
+        except Exception:
+            pass
+
+        # 4) brute-force through known iface configs
+        try:
+            for cand in list((self._all_iface_cfgs() or {}).keys()):
+                if self._iface_matches_wan_gateway(cand, gw_ip):
+                    return str(cand)
+        except Exception:
+            pass
+
+        return None
+
+    def _broadcast_arp_resolve(self, iface: str, target_ip: str, timeout: float = 1.5, retries: int = 2) -> str | None:
+        try:
+            import ipaddress
+
+            BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+            def _is_iface_broadcast_ip(ip_text: str) -> bool:
+                try:
+                    ip_obj = ipaddress.ip_address(str(ip_text))
+                    if ip_obj.version != 4:
+                        return False
+
+                    # Limited broadcast
+                    if str(ip_obj) == "255.255.255.255":
+                        return True
+
+                    # Try to determine directed broadcast from iface CIDR/config
+                    cidr = None
+                    try:
+                        cfg = (self._all_iface_cfgs() or {}).get(iface, {}) or {}
+                        cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip() or None
+                    except Exception:
+                        cidr = None
+
+                    # Fallback: build a /24 from iface IPv4 if no CIDR exists
+                    if not cidr:
+                        try:
+                            iface_ip = self.get_interface_ipv4(iface)
+                            if iface_ip:
+                                cidr = f"{iface_ip}/24"
+                        except Exception:
+                            cidr = None
+
+                    if cidr:
+                        try:
+                            net = ipaddress.ip_interface(cidr).network
+                            if ip_obj == net.broadcast_address:
+                                return True
+                        except Exception:
+                            pass
+
+                    return False
+                except Exception:
+                    return False
+
+            # Broadcast destinations do not ARP-resolve to a host MAC.
+            # They map directly to Ethernet broadcast.
+            if _is_iface_broadcast_ip(target_ip):
+                self._log_rl(
+                    f"gw_broadcast_direct:{iface}:{target_ip}",
+                    5.0,
+                    f"[ARP][GW] 📣 Broadcast IP on {iface}: {target_ip} -> {BROADCAST_MAC}",
+                )
+                return BROADCAST_MAC
+
+            sniffer = getattr(self, "sniffer", None)
+            if not sniffer:
+                return None
+
+            if hasattr(sniffer, "iface_is_l2_capable") and not sniffer.iface_is_l2_capable(iface):
+                self._log_rl(
+                    f"gw_l2_incapable:{iface}:{target_ip}",
+                    5.0,
+                    f"[ARP][GW] 🚫 iface not L2-capable for broadcast ARP: {iface} target={target_ip}",
+                )
+                return None
+
+            src_mac = self.get_interface_mac(iface)
+            src_ip = self.get_interface_ipv4(iface) or "0.0.0.0"
+            if not src_mac:
+                return None
+
+            req = Ether(dst=BROADCAST_MAC, src=src_mac) / ARP(
+                op=1,
+                hwsrc=src_mac,
+                psrc=src_ip,
+                pdst=str(target_ip),
+            )
+
+            for _ in range(max(1, int(retries))):
+                ans = self._safe_call(
+                    sniffer,
+                    "srp1",
+                    req,
+                    iface=iface,
+                    timeout=float(timeout),
+                    verbose=0,
+                )
+                if ans and hasattr(ans, "haslayer") and ans.haslayer(ARP):
+                    mac = self._normalize_mac(ans[ARP].hwsrc)
+                    if mac and not self._is_bad_gateway_mac(mac):
+                        self._log_rl(
+                            f"gw_broadcast_ok:{iface}:{target_ip}",
+                            5.0,
+                            f"[ARP][GW] 📡 Broadcast ARP success on {iface}: {target_ip} -> {mac}",
+                        )
+                        return mac
+
+            self._log_rl(
+                f"gw_broadcast_miss:{iface}:{target_ip}",
+                5.0,
+                f"[ARP][GW] 💤 Broadcast ARP miss on {iface}: {target_ip}",
+            )
+            return None
+        except Exception as e:
+            self._log_rl(
+                f"gw_broadcast_err:{iface}:{target_ip}",
+                5.0,
+                f"[ARP][GW] ❌ Broadcast ARP error on {iface} for {target_ip}: {e}",
+            )
+            return None
+    def fallback_mac_from_os_cache(
+            self,
+            ip: str,
+            *,
+            force_refresh: bool = False,
+    ) -> str | None:
+        mac_re = re.compile(r"(?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}")
+
+        ip = self._normalize_ip(ip)
+        if not ip:
+            return None
+
+        try:
+            now = time.time()
+
+            if force_refresh:
+                self._os_arp_cache_snapshot = None
+
+            cached = self._os_arp_cache_snapshot
+            if cached and (now - cached[0]) <= self.OS_ARP_CACHE_TTL:
+                output = cached[1]
+            else:
+                with self._subprocess_lock:
+                    output = ""
+                    for cmd in (["arp", "-a"], ["arp", "-an"]):
+                        try:
+                            output = subprocess.check_output(
+                                cmd,
+                                text=True,
+                                stderr=subprocess.DEVNULL,
+                                timeout=2.0,
+                            )
+                            if output:
+                                break
+                        except Exception:
+                            continue
+                    self._os_arp_cache_snapshot = (time.time(), output)
+
+            if not output:
+                return None
+
+            ip_text = str(ip).strip()
+            for line in output.splitlines():
+                if ip_text not in line:
+                    continue
+
+                m = mac_re.search(line)
+                if not m:
+                    continue
+
+                mac = self._normalize_mac(m.group(0))
+                if self._is_bad_gateway_mac(mac):
+                    self._log_rl(
+                        f"os_arp_bad_mac:{ip_text}",
+                        5.0,
+                        f"[ARP][GW] 🚫 Ignoring bad OS ARP cache MAC for {ip_text}: {mac}",
+                    )
+                    continue
+
+                self._safe_log(
+                    f"[ARP] 🧭 OS cache{' refresh' if force_refresh else ''}: {ip_text} → {mac}"
+                )
+                return mac
+
+            return None
+        except Exception:
+            return None
+
+    def _is_bad_gateway_mac(self, mac: str | None) -> bool:
+        mac = self._normalize_mac(mac)
+        if not mac:
+            return True
+        if mac == "ff:ff:ff:ff:ff:ff":
+            return True
+        if mac == "00:00:00:00:00:00":
+            return True
+        return False
+
+    def _iface_matches_wan_gateway(self, iface: str, gw_ip: str) -> bool:
+        """
+        Hard gate for gateway ARP:
+        prefer real OS/default-route truth first, then fall back to CIDR math.
+        """
+        try:
+            self._ensure_dynamic_iface_config(iface)
+        except Exception:
+            pass
+
+        # 1) OS and active-WAN state are authoritative.
+        if self._iface_is_authoritative_gateway_iface(iface, gw_ip):
+            return True
+
+        cfg = self._all_iface_cfgs().get(iface, {}) or {}
+        iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(iface) or None
+        cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+
+        if not iface_ip or not cidr:
+            return False
+
+        try:
+            gw = ipaddress.ip_address(str(gw_ip).strip())
+            net = ipaddress.ip_network(str(cidr), strict=False)
+            iface_ip_obj = ipaddress.ip_address(str(iface_ip).strip())
+
+            if gw.version != net.version or iface_ip_obj.version != net.version:
+                return False
+
+            return (gw in net) and (iface_ip_obj in net)
+        except Exception:
+            return False
     # --- new helpers ---
     def _if_ip_key(self, iface: str, ip: str) -> tuple[str, str]:
         return (str(iface or "").strip(), str(ip or "").strip())
@@ -9852,7 +10804,10 @@ class ARPManager:
                 self._gateway_fail_cache.pop(k, None)
         except Exception:
             pass
-
+        try:
+            self._gw_soft_mismatch_clear(gateway_ip)
+        except Exception:
+            pass
         self._safe_log(f"[ARP] Default gateway IP set to: {gateway_ip}")
         return True
 
@@ -10444,17 +11399,7 @@ class ARPManager:
                 return None
         return None
 
-    def _get_iface_gateway(self, iface: str) -> str | None:
-        self._ensure_dynamic_iface_config(iface)
-        cfgs = getattr(self, "_interfaces_config", None) or getattr(self, "interfaces_config", {}) or {}
-        iface_cfg = (cfgs.get(iface) or {}) if isinstance(cfgs, dict) else {}
-        for key in ("gateway", "gateway_ip"):
-            gw = iface_cfg.get(key)
-            if gw:
-                return str(gw)
-        if self.default_gateway_ip and not self._is_hyperv_iface(iface):
-            return str(self.default_gateway_ip)
-        return None
+
 
     # ------------------------------------------------------------------
     # Gateway / special helpers
@@ -10739,8 +11684,22 @@ class ARPManager:
             if mac:
                 self._cache_set(ip_str, mac, now)
                 return mac
+        # Kubernetes service VIPs are virtual and should not go through ARP resolution.
 
         use_iface = self._pick_iface_for_ip(ip_str, iface)
+        if self._is_k8s_service_ip(ip_str):
+            mac = self._resolve_k8s_next_hop_mac(ip_str, use_iface)
+            if mac:
+                return mac
+            if not self._k8s_virtual_hit(ip_str):
+                self._k8s_virtual_set(ip_str)
+                self._log_rl(
+                    f"resolve_k8s_service_virtual:{ip_str}",
+                    30.0,
+                    f"[ARP][K8S] ☸️ {ip_str} is a Kubernetes Service/ClusterIP; using next-hop resolution instead of direct ARP.",
+                )
+            self._negative_cache_set(use_iface, ip_str, ttl=30.0)
+            return None
         if use_iface:
             self._log_rl(
                 f"resolve_iface:{use_iface}:{ip_str}",
@@ -11024,6 +11983,43 @@ class ARPManager:
             self._safe_log(f"[ARP] ❌ Unhandled exception in send_custom_arp_request for {target_ip}: {e}")
             return None
 
+
+    def _allow_self_gateway_resolve(self, use_iface: str, gw_ip: str) -> str | None:
+        """
+        Allow clustered / multi-router gateway ownership only if we already have
+        evidence that SOME OTHER MAC owns gw_ip on this interface.
+        Returns a usable foreign MAC if allowed, else None.
+        """
+        try:
+            if not getattr(self, "ALLOW_SELF_GATEWAY_RESOLVE", False):
+                return None
+
+            our_mac = self._normalize_mac(self.get_interface_mac(use_iface))
+            if not our_mac:
+                return None
+
+            # 1) interface-local passive learn is best
+            mac = self._normalize_mac(self._iface_cache_get(use_iface, gw_ip))
+            if mac and mac != our_mac:
+                return mac
+
+            # 2) gateway cache
+            mac = self._normalize_mac(self._gateway_cache_get(use_iface, gw_ip))
+            if mac and mac != our_mac:
+                return mac
+
+            # 3) OS ARP cache
+            mac = self._normalize_mac(self.fallback_mac_from_os_cache(gw_ip, force_refresh=False))
+            if mac and mac != our_mac:
+                return mac
+
+            if getattr(self, "SELF_GATEWAY_REQUIRE_FOREIGN_MAC", True):
+                return None
+
+            return None
+        except Exception:
+            return None
+
     def resolve_gateway_mac(
             self,
             gw_ip: str,
@@ -11056,8 +12052,181 @@ class ARPManager:
         if not cidr:
             cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
 
-        # never ARP for ourselves
+        BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+        # 0) short-lived special-result cache (broadcast etc.)
+        special = self._gw_special_result_get(gw_ip)
+        if special:
+            mac, reason = special
+            if reason == "directed_broadcast":
+                return mac
+
+        # 1) reject obviously bad gateway candidates early, but let directed-broadcast
+        # targets resolve to Ethernet broadcast instead of dying here.
+        sane_gw, sane_reason = self._sanitize_gateway_candidate(gw_ip, None)
+        if not sane_gw:
+            if str(sane_reason).startswith("is_directed_broadcast:"):
+                self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
+                self._log_rl(
+                    self._gw_log_key("gw_directed_broadcast", gw_ip),
+                    10.0,
+                    f"[ARP][GW] 📣 Directed broadcast: {gw_ip} -> {BROADCAST_MAC}",
+                )
+                return BROADCAST_MAC
+
+            self._log_rl(
+                self._gw_log_key("gw_bad_candidate", gw_ip, sane_reason),
+                5.0,
+                f"[ARP][GW] ⛔ Rejecting bad gateway candidate {gw_ip} on {use_iface}: {sane_reason}",
+            )
+            return None
+
+        gw_ip = sane_gw
+
+        # 2) if we recently learned the right iface for this gateway, use it first
+        cached_iface = self._gw_repick_cache_get(gw_ip)
+        if cached_iface and cached_iface != use_iface:
+            old_iface = use_iface
+            use_iface = cached_iface
+            try:
+                self._ensure_dynamic_iface_config(use_iface)
+            except Exception:
+                pass
+            cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
+            iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
+            cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+
+            self._log_rl(
+                self._gw_log_key("gw_iface_repick_cached", gw_ip, use_iface),
+                10.0,
+                f"[ARP][GW] 🧠 Using cached gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
+            )
+
+        # 3) if the hint iface still does not look right, try to repick once
+        if not self._iface_matches_wan_gateway(use_iface, gw_ip):
+            better_iface = (
+                    self._choose_gateway_iface(gw_ip, use_iface)
+                    or self._find_iface_for_gateway(gw_ip)
+            )
+            if better_iface and better_iface != use_iface:
+                old_iface = use_iface
+                use_iface = str(better_iface)
+                self._gw_repick_cache_set(gw_ip, use_iface)
+
+                try:
+                    self._ensure_dynamic_iface_config(use_iface)
+                except Exception:
+                    pass
+                cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
+                iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
+                cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+
+                self._log_rl(
+                    self._gw_log_key("gw_iface_repick", gw_ip, use_iface),
+                    10.0,
+                    f"[ARP][GW] 🔀 Re-picked gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
+                )
+            else:
+                if not self._iface_matches_wan_gateway(use_iface, gw_ip):
+                    if not self._gw_soft_mismatch_hit(use_iface, gw_ip):
+                        self._gw_soft_mismatch_set(use_iface, gw_ip)
+                        self._log_rl(
+                            self._gw_log_key("gw_iface_mismatch_continue", gw_ip, use_iface),
+                            self.GW_SOFT_MISMATCH_TTL,
+                            f"[ARP][GW] ⚠️ Interface {use_iface} is not a strict on-link match for gateway {gw_ip}; continuing with normal OS/ARP resolution and no broadcast fallback.",
+                        )
+
+        limited_broadcast = (gw_ip == "255.255.255.255")
+        sane_gw_iface, sane_reason_iface = self._sanitize_gateway_candidate(gw_ip, use_iface)
+
+        if limited_broadcast or sane_reason_iface == "is_broadcast" or str(sane_reason_iface).startswith(
+                "is_directed_broadcast:"):
+            self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
+            self._log_rl(
+                self._gw_log_key("gw_true_broadcast", gw_ip),
+                10.0,
+                f"[ARP][GW] 📣 Gateway target is broadcast: {gw_ip} -> {BROADCAST_MAC}",
+            )
+            return BROADCAST_MAC
+
+        if sane_reason_iface in {"loopback", "multicast", "unspecified", "is_network"}:
+            self._log_rl(
+                self._gw_log_key("gw_invalid_candidate", gw_ip, sane_reason_iface),
+                5.0,
+                f"[ARP][GW] ⛔ Invalid gateway candidate {gw_ip} on {use_iface}: {sane_reason_iface}",
+            )
+            return None
+
+        gw_ip = sane_gw
+
+        # If the hint iface does not look like the real L3 gateway iface, try to
+        # repick it — but do NOT fall into broadcast ARP just because the iface
+        # choice is imperfect.
+        if not self._iface_matches_wan_gateway(use_iface, gw_ip):
+            better_iface = (
+                    self._choose_gateway_iface(gw_ip, use_iface)
+                    or self._find_iface_for_gateway(gw_ip)
+            )
+            if better_iface and better_iface != use_iface:
+                old_iface = use_iface
+                use_iface = str(better_iface)
+                try:
+                    self._ensure_dynamic_iface_config(use_iface)
+                except Exception:
+                    pass
+                cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
+                iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
+                cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+
+                self._log_rl(
+                    f"gw_iface_repick:{old_iface}:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] 🔀 Re-picked gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
+                )
+            else:
+                self._log_rl(
+                    f"gw_iface_mismatch_continue:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] ⚠️ Interface {use_iface} is not a strict on-link match for gateway {gw_ip}; continuing with normal OS/ARP resolution and no broadcast fallback.",
+                )
+
+        limited_broadcast = (gw_ip == "255.255.255.255")
+        sane_gw_iface, sane_reason_iface = self._sanitize_gateway_candidate(gw_ip, use_iface)
+
+        if limited_broadcast or sane_reason_iface == "is_broadcast" or str(sane_reason_iface).startswith(
+                "is_directed_broadcast:"):
+            self._log_rl(
+                f"gw_true_broadcast:{use_iface}:{gw_ip}",
+                5.0,
+                f"[ARP][GW] 📣 Gateway target is actually broadcast on {use_iface}: {gw_ip}; using broadcast MAC.",
+            )
+            return BROADCAST_MAC
+
+        if sane_reason_iface in {"loopback", "multicast", "unspecified", "is_network"}:
+            self._log_rl(
+                f"gw_invalid_candidate:{use_iface}:{gw_ip}",
+                5.0,
+                f"[ARP][GW] ⛔ Invalid gateway candidate {gw_ip} on {use_iface}: {sane_reason_iface}",
+            )
+            return None
+
+        mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
+        if mac and not self._is_bad_gateway_mac(mac):
+            return mac
+
         if iface_ip and str(iface_ip).strip() == str(gw_ip).strip():
+            foreign_mac = self._allow_self_gateway_resolve(use_iface, gw_ip)
+            if foreign_mac and not self._is_bad_gateway_mac(foreign_mac):
+                self._cache_set(gw_ip, foreign_mac, time.time())
+                self._gateway_cache_set(use_iface, gw_ip, foreign_mac)
+                self._known_gateway_macs[gw_ip] = foreign_mac
+                self._log_rl(
+                    f"gw_self_foreign:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] 🤝 Self-gateway override: using foreign owner {gw_ip} -> {foreign_mac} on {use_iface}",
+                )
+                return foreign_mac
+
             self._log_rl(
                 f"gw_self:{use_iface}:{gw_ip}",
                 5.0,
@@ -11072,9 +12241,13 @@ class ARPManager:
         ) if cidr else None
 
         if verdict is not None and not verdict.ok:
-            better_iface = self._find_iface_for_gateway(gw_ip)
+            better_iface = (
+                    self._choose_gateway_iface(gw_ip, use_iface)
+                    or self._find_iface_for_gateway(gw_ip)
+            )
             if better_iface and better_iface != use_iface:
-                use_iface = better_iface
+                old_iface = use_iface
+                use_iface = str(better_iface)
                 try:
                     self._ensure_dynamic_iface_config(use_iface)
                 except Exception:
@@ -11088,27 +12261,47 @@ class ARPManager:
                     iface_ip,
                 ) if cidr else None
 
+                self._log_rl(
+                    f"gw_iface_repick_verdict:{old_iface}:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] 🔁 Re-validated gateway path for {gw_ip}: {old_iface} -> {use_iface}",
+                )
+
         if verdict is not None and not verdict.ok:
-            self._log_rl(
-                f"gw_invalid:{use_iface}:{gw_ip}",
-                5.0,
-                f"[ARP][GW] ⛔ Invalid gateway path for {gw_ip} on {use_iface}: {verdict.reason}",
-            )
-            return None
+            hard_reasons = {
+                "is_network",
+                "is_broadcast",
+                "is_self_ip",
+                "special_gw",
+                "version_mismatch",
+            }
+            if verdict.reason in hard_reasons:
+                self._log_rl(
+                    f"gw_invalid:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] ⛔ Invalid gateway path for {gw_ip} on {use_iface}: {verdict.reason}",
+                )
+                return None
+            else:
+                self._log_rl(
+                    f"gw_soft_invalid:{use_iface}:{gw_ip}",
+                    5.0,
+                    f"[ARP][GW] ⚠️ Soft gateway path warning for {gw_ip} on {use_iface}: {verdict.reason}; continuing normal resolution.",
+                )
 
         cached = self._gateway_cache_get(use_iface, gw_ip)
-        if cached:
+        if cached and not self._is_bad_gateway_mac(cached):
             return cached
+
         iface_seen = self._iface_cache_get(use_iface, gw_ip)
-        if iface_seen:
+        if iface_seen and not self._is_bad_gateway_mac(iface_seen):
             self._gateway_cache_set(use_iface, gw_ip, iface_seen)
             self._known_gateway_macs[gw_ip] = iface_seen
             return iface_seen
 
-        # 1) first try OS cache snapshot
         if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
             mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=False)
-            if mac:
+            if mac and not self._is_bad_gateway_mac(mac):
                 self._cache_set(gw_ip, mac, time.time())
                 self._gateway_cache_set(use_iface, gw_ip, mac)
                 self._known_gateway_macs[gw_ip] = mac
@@ -11118,10 +12311,9 @@ class ARPManager:
             return None
 
         if self._gateway_fail_hit(use_iface, gw_ip):
-            # before honoring fail cache, do one forced OS-cache refresh
             if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
                 mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
-                if mac:
+                if mac and not self._is_bad_gateway_mac(mac):
                     self._cache_set(gw_ip, mac, time.time())
                     self._gateway_cache_set(use_iface, gw_ip, mac)
                     self._known_gateway_macs[gw_ip] = mac
@@ -11130,53 +12322,66 @@ class ARPManager:
 
         self._safe_log(
             f"[ARP] 🛣️ resolve_gateway_mac: resolving gateway {gw_ip} "
-            f"(iface_cidr={cidr or 'None'})"
+            f"(iface={use_iface}, iface_cidr={cidr or 'None'})"
         )
 
         for _ in range(max(1, int(retries))):
             mac = self._arp_resolve_ipv4(use_iface, gw_ip)
             mac = self._normalize_mac(mac)
-            if mac:
+            if mac and not self._is_bad_gateway_mac(mac):
                 self._cache_set(gw_ip, mac, time.time())
                 self._gateway_cache_set(use_iface, gw_ip, mac)
                 self._known_gateway_macs[gw_ip] = mac
                 self._safe_log(f"[ARP][GW] 🎯 Resolved {gw_ip} -> {mac} on {use_iface}")
                 return mac
 
-        # 2) active ARP failed — force a fresh OS ARP table read once more
         if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
             mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
-            if mac:
+            if mac and not self._is_bad_gateway_mac(mac):
                 self._cache_set(gw_ip, mac, time.time())
                 self._gateway_cache_set(use_iface, gw_ip, mac)
                 self._known_gateway_macs[gw_ip] = mac
                 self._safe_log(f"[ARP][GW] 🧭 Recovered {gw_ip} from fresh OS ARP cache -> {mac}")
                 return mac
-        # 3) if the configured gateway was stale, try the OS-selected gateway once
+
         real_gw = self._get_os_gateway_for_iface(use_iface)
         if real_gw and real_gw != gw_ip:
-            self._safe_log(
-                f"[ARP][GW] 🔄 Retrying with OS-selected gateway {real_gw} instead of {gw_ip} on {use_iface}"
-            )
+            real_sane, real_reason = self._sanitize_gateway_candidate(real_gw, use_iface)
+            if real_sane and real_reason == "ok":
+                self._safe_log(
+                    f"[ARP][GW] 🔄 Retrying with OS-selected gateway {real_gw} instead of {gw_ip} on {use_iface}"
+                )
 
-            mac = self.fallback_mac_from_os_cache(real_gw, force_refresh=True)
-            if mac:
-                self._cache_set(real_gw, mac, time.time())
-                self._gateway_cache_set(use_iface, real_gw, mac)
-                self._known_gateway_macs[real_gw] = mac
-                return mac
-
-            for _ in range(max(1, int(retries))):
-                mac = self._arp_resolve_ipv4(use_iface, real_gw)
-                mac = self._normalize_mac(mac)
-                if mac:
+                mac = self._resolve_gateway_mac_from_os(use_iface, real_gw)
+                if mac and not self._is_bad_gateway_mac(mac):
                     self._cache_set(real_gw, mac, time.time())
                     self._gateway_cache_set(use_iface, real_gw, mac)
                     self._known_gateway_macs[real_gw] = mac
-                    self._safe_log(f"[ARP][GW] 🎯 Resolved OS-selected gateway {real_gw} -> {mac} on {use_iface}")
                     return mac
+
+                mac = self.fallback_mac_from_os_cache(real_gw, force_refresh=True)
+                if mac and not self._is_bad_gateway_mac(mac):
+                    self._cache_set(real_gw, mac, time.time())
+                    self._gateway_cache_set(use_iface, real_gw, mac)
+                    self._known_gateway_macs[real_gw] = mac
+                    return mac
+
+                for _ in range(max(1, int(retries))):
+                    mac = self._arp_resolve_ipv4(use_iface, real_gw)
+                    mac = self._normalize_mac(mac)
+                    if mac and not self._is_bad_gateway_mac(mac):
+                        self._cache_set(real_gw, mac, time.time())
+                        self._gateway_cache_set(use_iface, real_gw, mac)
+                        self._known_gateway_macs[real_gw] = mac
+                        self._safe_log(f"[ARP][GW] 🎯 Resolved OS-selected gateway {real_gw} -> {mac} on {use_iface}")
+                        return mac
+
+        mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
+        if mac and not self._is_bad_gateway_mac(mac):
+            return mac
+
         self._gateway_fail_set(use_iface, gw_ip)
-        self._safe_log(f"[ARP] ❌ resolve_gateway_mac: failed for {gw_ip}")
+        self._safe_log(f"[ARP] ❌ resolve_gateway_mac: failed for {gw_ip} on {use_iface}")
         return None
     # ------------------------------------------------------------------
     # OS ARP cache fallback
@@ -11823,12 +13028,13 @@ class DHCPServer:
       • safer subnet/reserved-IP bookkeeping
       • compact admin helpers for recovery / inspection
 
-    NOTE:
-      - Set serve_on_all_ifaces=False to restrict to LAN-only serving.
-      - Rogue policy:
-          * "log"              → only log other servers' Offers/Acks
-          * "nak_on_mismatch"  → when a client REQUEST names a different server_id (opt54),
-                                  send NAK (authoritative) to steer it back to us.
+    Protocol fixes in this rewrite:
+      • DHCPREQUEST INIT-REBOOT is handled strictly:
+          ACK only the exact requested address, otherwise NAK.
+      • ACK honors the BOOTP broadcast flag.
+      • ACK/OFFER options include broadcast address + T1/T2 timers.
+      • DHCPv4 classifier prefers BOOTP op over only port heuristics.
+      • Slightly safer handling of foreign-server REQUESTs.
     """
 
     def make_duid(self, mac):
@@ -11869,7 +13075,10 @@ class DHCPServer:
 
         self.serve_on_all_ifaces = bool(serve_on_all_ifaces)
         self.authoritative = bool(authoritative)
-        self.rogue_policy = str(rogue_policy or "nak_on_mismatch")
+        self.rogue_policy = str(rogue_policy or "nak_on_mismatch").strip().lower()
+        if self.rogue_policy not in ("log", "nak_on_mismatch"):
+            self.rogue_policy = "nak_on_mismatch"
+
         self.dns_v6 = dns_v6
         self.search_domains = search_domains
 
@@ -11916,7 +13125,7 @@ class DHCPServer:
         self._reserve_router_ipv4_once()
 
         self.logger.log_message(
-            f"[DHCP] Server initialized. v4Relay={self.dhcp_relay_target_ip or 'None'} "
+            f"[DHCP] 🚀 Server initialized. v4Relay={self.dhcp_relay_target_ip or 'None'} "
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
             f"out_of_pool={self.allow_out_of_pool} same_subnet={self.enforce_same_subnet} "
             f"serve_all_ifaces={self.serve_on_all_ifaces} authoritative={self.authoritative} "
@@ -11929,6 +13138,7 @@ class DHCPServer:
         ipaddress, time = self.ipaddress, self.time
         norm_mac = str(mac or "").lower()
         ip_addr = ipaddress.IPv4Address(ip)
+
         with self._lease_lock:
             in_cfg = self._iface_cfg_for(self.in_iface)
             net = in_cfg.get("network")
@@ -11939,12 +13149,12 @@ class DHCPServer:
                 return False
 
             if ip_addr in self._reserved_ipv4:
-                self.logger.log_message(f"[DHCP] ❌ assign_specific_ipv4 refused: {ip_addr} is reserved")
+                self.logger.log_message(f"[DHCP] 🚫 assign_specific_ipv4 refused: {ip_addr} is reserved")
                 return False
 
             for other_mac, (other_ip, _) in self._leases.items():
                 if other_ip == ip_addr and other_mac != norm_mac and not force:
-                    self.logger.log_message(f"[DHCP] ❌ assign_specific_ipv4 refused: {ip_addr} leased to {other_mac}")
+                    self.logger.log_message(f"[DHCP] ⛔ assign_specific_ipv4 refused: {ip_addr} leased to {other_mac}")
                     return False
 
             if ip_addr in self.available_ips:
@@ -11989,9 +13199,10 @@ class DHCPServer:
         with self._lease_lock:
             self._reserve_router_ipv4_once()
             live_ips = {ip for ip, _ in self._leases.values()}
+            static_ips = set(self._static_leases.values())
             self.available_ips = {
                 ip for ip in self.dynamic_ip_pool
-                if ip not in live_ips and ip not in self._reserved_ipv4
+                if ip not in live_ips and ip not in static_ips and ip not in self._reserved_ipv4
             }
         self.logger.log_message("[DHCP] 🔄 Reconciled IPv4 pool state.")
 
@@ -12039,8 +13250,7 @@ class DHCPServer:
 
             if router_ip:
                 try:
-                    r = self.ipaddress.IPv4Address(router_ip)
-                    self._reserved_ipv4.add(r)
+                    self._reserved_ipv4.add(self.ipaddress.IPv4Address(router_ip))
                 except Exception:
                     pass
 
@@ -12052,10 +13262,7 @@ class DHCPServer:
                     pass
 
             if self._reserved_ipv4:
-                self.available_ips = {
-                    ip for ip in self.available_ips
-                    if ip not in self._reserved_ipv4
-                }
+                self.available_ips = {ip for ip in self.available_ips if ip not in self._reserved_ipv4}
 
     def _cleanup_observed_state(self, now: float):
         cutoff = now - float(self.OBSERVED_SERVER_TTL_SECONDS)
@@ -12088,7 +13295,7 @@ class DHCPServer:
         threading = self.threading
         with self._lifecycle_lock:
             if self._started and self._cleanup_thread and self._cleanup_thread.is_alive():
-                self.logger.log_message("[DHCP] Cleanup thread already running.")
+                self.logger.log_message("[DHCP] ⚠️ Cleanup thread already running.")
                 return
             self._stop_event.clear()
             self._cleanup_thread = threading.Thread(
@@ -12098,12 +13305,12 @@ class DHCPServer:
             )
             self._cleanup_thread.start()
             self._started = True
-        self.logger.log_message("[DHCP] Cleanup thread started.")
+        self.logger.log_message("[DHCP] ▶️ Cleanup thread started.")
 
     def stop(self):
         with self._lifecycle_lock:
             if not self._started:
-                self.logger.log_message("[DHCP] Server already stopped.")
+                self.logger.log_message("[DHCP] ⏹️ Server already stopped.")
                 return
             self._stop_event.set()
             thr = self._cleanup_thread
@@ -12115,7 +13322,7 @@ class DHCPServer:
                 thr.join(timeout=2)
             except Exception:
                 pass
-        self.logger.log_message("[DHCP] Server stopped.")
+        self.logger.log_message("[DHCP] 🛑 Server stopped.")
 
     def _cleanup_leases_loop(self):
         time = self.time
@@ -12123,23 +13330,30 @@ class DHCPServer:
             now = time.time()
             with self._lease_lock:
                 expired_macs = [mac for mac, (ip, expiry) in self._leases.items() if expiry <= now]
+                static_ips = set(self._static_leases.values())
+
                 for mac in expired_macs:
                     ip, _ = self._leases.pop(mac)
-                    if (ip in self.dynamic_ip_pool) and (ip not in set(self._static_leases.values())) and (ip not in self._reserved_ipv4):
+                    if ip in self.dynamic_ip_pool and ip not in static_ips and ip not in self._reserved_ipv4:
                         self.available_ips.add(ip)
                     self._non_pool_leases.discard(ip)
                     self.logger.log_message(f"[DHCP] 🗑️ IPv4 lease for {ip} (MAC: {mac}) expired.")
 
                 self._cleanup_v6_state(now)
                 self._cleanup_observed_state(now)
-                self.force_reconcile_ipv4_pool()
+
+                live_ips = {ip for ip, _ in self._leases.values()}
+                self.available_ips = {
+                    ip for ip in self.dynamic_ip_pool
+                    if ip not in live_ips and ip not in static_ips and ip not in self._reserved_ipv4
+                }
 
             self._stop_event.wait(60)
 
     def _assign_ip(self, client_mac: str, preferred_ip=None):
         ipaddress, time = self.ipaddress, self.time
         norm_mac = str(client_mac or "").lower()
-        self.logger.log_message(f"[DHCP] Assigning IP for {norm_mac}")
+        self.logger.log_message(f"[DHCP] 🧠 Assigning IP for {norm_mac}")
 
         with self._lease_lock:
             in_cfg = self._iface_cfg_for(self.in_iface)
@@ -12159,8 +13373,7 @@ class DHCPServer:
                     self._leases[norm_mac] = (assigned_ip, time.time() + self.LEASE_DURATION_SECONDS)
                     self.logger.log_message(f"[DHCP] 🏠 Renewed dynamic lease for {assigned_ip} to {norm_mac}")
                     return assigned_ip
-                else:
-                    self._leases.pop(norm_mac, None)
+                self._leases.pop(norm_mac, None)
 
             if preferred_ip is not None:
                 if not isinstance(preferred_ip, ipaddress.IPv4Address):
@@ -12184,7 +13397,7 @@ class DHCPServer:
                                 self._non_pool_leases.add(preferred_ip)
                             else:
                                 self.logger.log_message(
-                                    f"[DHCP] ⚠️ Requested {preferred_ip} is out of pool and policy forbids it."
+                                    f"[DHCP] 🚫 Requested {preferred_ip} is out of pool and policy forbids it."
                                 )
                                 preferred_ip = None
                         if preferred_ip is not None:
@@ -12194,22 +13407,25 @@ class DHCPServer:
 
             try:
                 ip_from_pool = min(self.available_ips)
-                self.available_ips.discard(ip_from_pool)
-                self._leases[norm_mac] = (ip_from_pool, time.time() + self.LEASE_DURATION_SECONDS)
-                self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {ip_from_pool} to {norm_mac}.")
-                return ip_from_pool
             except ValueError:
                 self.logger.log_message(f"[DHCP] ❌ No available dynamic IP addresses in pool for {norm_mac}.")
                 return None
+
+            self.available_ips.discard(ip_from_pool)
+            self._leases[norm_mac] = (ip_from_pool, time.time() + self.LEASE_DURATION_SECONDS)
+            self.logger.log_message(f"[DHCP] 💻 Assigned new dynamic IP {ip_from_pool} to {norm_mac}.")
+            return ip_from_pool
 
     # ---- DHCP helpers ----
 
     def _get_requested_ip_opt50(self, dhcp_layer):
         try:
             for opt in dhcp_layer.options:
-                if isinstance(opt, tuple) and opt[0] in ('requested_addr', 'requested_addr_ip', 50):
+                if isinstance(opt, tuple) and opt[0] in ("requested_addr", "requested_addr_ip", 50):
                     val = opt[1]
-                    return self.ipaddress.IPv4Address(val if not isinstance(val, bytes) else val)
+                    if isinstance(val, bytes) and len(val) == 4:
+                        return self.ipaddress.IPv4Address(val)
+                    return self.ipaddress.IPv4Address(str(val))
         except Exception:
             pass
         return None
@@ -12217,10 +13433,12 @@ class DHCPServer:
     def _get_server_id_opt54(self, dhcp_layer):
         try:
             for opt in dhcp_layer.options:
-                if isinstance(opt, tuple) and opt[0] in ('server_id', 54):
+                if isinstance(opt, tuple) and opt[0] in ("server_id", 54):
                     v = opt[1]
                     try:
-                        return str(self.ipaddress.IPv4Address(v))
+                        if isinstance(v, bytes) and len(v) == 4:
+                            return str(self.ipaddress.IPv4Address(v))
+                        return str(self.ipaddress.IPv4Address(str(v)))
                     except Exception:
                         return str(v)
         except Exception:
@@ -12244,50 +13462,194 @@ class DHCPServer:
         except Exception:
             return None
 
+    def _bootp_broadcast_requested(self, bootp_layer) -> bool:
+        try:
+            return bool(int(getattr(bootp_layer, "flags", 0)) & 0x8000)
+        except Exception:
+            return False
+
+    def _build_v4_reply_options(self, message_type: str, router_in_ip: str, net):
+        opts = [("message-type", message_type)]
+
+        if net is not None:
+            try:
+                opts.append(("subnet_mask", str(net.netmask)))
+            except Exception:
+                pass
+            try:
+                opts.append(("broadcast_address", str(net.broadcast_address)))
+            except Exception:
+                pass
+
+        lease = int(self.LEASE_DURATION_SECONDS)
+        t1 = max(60, int(lease * 0.5))
+        t2 = max(t1 + 60, int(lease * 0.875))
+        if t2 > lease:
+            t2 = lease
+
+        opts.extend([
+            ("router", router_in_ip),
+            ("name_server", router_in_ip),
+            ("lease_time", lease),
+            ("renewal_time", t1),
+            ("rebinding_time", t2),
+            ("server_id", router_in_ip),
+            "end",
+        ])
+        return opts
+
+    def _can_ack_requested_ip(self, client_mac: str, requested_ip, net) -> bool:
+        if requested_ip is None:
+            return False
+
+        try:
+            requested_ip = requested_ip if isinstance(requested_ip, self.ipaddress.IPv4Address) else self.ipaddress.IPv4Address(requested_ip)
+        except Exception:
+            return False
+
+        norm_mac = str(client_mac or "").lower()
+        now = self.time.time()
+
+        with self._lease_lock:
+            self._reserve_router_ipv4_once()
+
+            if requested_ip in self._reserved_ipv4:
+                return False
+
+            if self.enforce_same_subnet and net and requested_ip not in net:
+                return False
+
+            if norm_mac in self._leases:
+                leased_ip, expiry = self._leases[norm_mac]
+                if leased_ip == requested_ip and expiry > now:
+                    return True
+
+            if self._static_leases.get(norm_mac) == requested_ip:
+                return True
+
+            for other_mac, (other_ip, other_expiry) in self._leases.items():
+                if other_mac != norm_mac and other_ip == requested_ip and other_expiry > now:
+                    return False
+
+            if requested_ip in self.available_ips:
+                return True
+
+            if requested_ip in self.dynamic_ip_pool:
+                return True
+
+            if requested_ip not in self.dynamic_ip_pool and self.allow_out_of_pool:
+                return True
+
+        return False
+
+    def _should_nak_foreign_server_request(self, client_mac: str, requested_ip, router_in_ip: str, net) -> bool:
+        """
+        Only NAK a client selecting another server when it looks like
+        the request still belongs to our managed network scope.
+        """
+        if not (self.authoritative and self.rogue_policy == "nak_on_mismatch"):
+            return False
+
+        if requested_ip is None:
+            return False
+
+        try:
+            requested_ip = requested_ip if isinstance(requested_ip, self.ipaddress.IPv4Address) else self.ipaddress.IPv4Address(requested_ip)
+        except Exception:
+            return False
+
+        if self.enforce_same_subnet and net and requested_ip not in net:
+            return False
+
+        if requested_ip in self._reserved_ipv4:
+            return False
+
+        if requested_ip in self.dynamic_ip_pool:
+            return True
+
+        norm_mac = str(client_mac or "").lower()
+        if self._static_leases.get(norm_mac) == requested_ip:
+            return True
+
+        return False
+
     def _classify_dhcp(self, pkt):
-        if pkt.haslayer(UDP):
-            sport, dport = int(pkt[UDP].sport), int(pkt[UDP].dport)
+        if not pkt.haslayer(UDP):
+            return None, None
 
-            if pkt.haslayer(DHCP) and pkt.haslayer(BOOTP):
-                if dport == 67 and sport in (68, 67):
+        sport, dport = int(pkt[UDP].sport), int(pkt[UDP].dport)
+
+        if pkt.haslayer(DHCP) and pkt.haslayer(BOOTP):
+            try:
+                op = int(getattr(pkt[BOOTP], "op", 0))
+                if op == 1:
                     return "v4", "client"
-                if sport == 67 and dport == 68:
+                if op == 2:
                     return "v4", "server"
-                return "v4", "other"
+            except Exception:
+                pass
 
-            if pkt.haslayer(DHCP6_Solicit):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_InfoRequest):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Reply):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Request):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Renew):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Confirm):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Release):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Decline):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 546: return "v6", "server"
-            if pkt.haslayer(DHCP6_Advertise):
-                if dport == 546 and sport == 547: return "v6", "server"
-                if dport == 547 and sport == 546: return "v6", "client"
-            if pkt.haslayer(DHCP6_RelayForward):
-                if dport == 547 and sport == 546: return "v6", "client"
-                if sport == 547 and dport == 547: return "v6", "other"
-            if pkt.haslayer(DHCP6_RelayReply):
-                if sport == 547 and dport in (546, 547): return "v6", "server"
-                if dport == 547 and sport in (546, 547): return "v6", "other"
+            if dport == 67 and sport in (68, 67):
+                return "v4", "client"
+            if sport == 67 and dport in (68, 67):
+                return "v4", "server"
+            return "v4", "other"
+
+        if pkt.haslayer(DHCP6_Solicit):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_InfoRequest):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Reply):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Request):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Renew):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Confirm):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Release):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Decline):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 546:
+                return "v6", "server"
+        if pkt.haslayer(DHCP6_Advertise):
+            if dport == 546 and sport == 547:
+                return "v6", "server"
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+        if pkt.haslayer(DHCP6_RelayForward):
+            if dport == 547 and sport == 546:
+                return "v6", "client"
+            if sport == 547 and dport == 547:
+                return "v6", "other"
+        if pkt.haslayer(DHCP6_RelayReply):
+            if sport == 547 and dport in (546, 547):
+                return "v6", "server"
+            if dport == 547 and sport in (546, 547):
+                return "v6", "other"
 
         return None, None
 
@@ -12340,12 +13702,12 @@ class DHCPServer:
 
     def handle_packet(self, pkt, inbound_iface: str, find_route_function) -> bool:
         if not self.serve_on_all_ifaces and inbound_iface != self.in_iface:
-            self.logger.log_message(f"[DHCP] Ignoring on non-LAN iface {inbound_iface} (serve_on_all_ifaces=False).")
+            self.logger.log_message(f"[DHCP] 🚪 Ignoring on non-LAN iface {inbound_iface} (serve_on_all_ifaces=False).")
             return True
 
         in_cfg = self._iface_cfg_for(inbound_iface)
         if not in_cfg:
-            self.logger.log_message(f"[DHCP] Error: iface '{inbound_iface}' not found in configuration.")
+            self.logger.log_message(f"[DHCP] ❌ Error: iface '{inbound_iface}' not found in configuration.")
             return True
 
         router_in_ip = in_cfg.get("ip_addr")
@@ -12374,7 +13736,7 @@ class DHCPServer:
         # ================= DHCPv4 =================
         if version == "v4":
             if not (pkt.haslayer(BOOTP) and pkt.haslayer(DHCP)):
-                self.logger.log_message("[DHCP] Malformed v4 (missing BOOTP/DHCP); ignoring.")
+                self.logger.log_message("[DHCP] ⚠️ Malformed v4 (missing BOOTP/DHCP); ignoring.")
                 return True
 
             bootp_layer = pkt[BOOTP]
@@ -12409,8 +13771,8 @@ class DHCPServer:
                 tag = "our" if (sid == router_in_ip or (router_mac_l and src_mac_l == router_mac_l)) else "other"
 
                 self.logger.log_message(
-                    f"[DHCP] v4 {kind} observed from {src_mac} (sid={sid or src_ip}) "
-                    f"→ {client_mac} yiaddr={yiaddr} on {inbound_iface} [{tag}]"
+                    f"[DHCP] 👀 v4 {kind} observed from {src_mac} (sid={sid or src_ip}) "
+                    f"-> {client_mac} yiaddr={yiaddr} on {inbound_iface} [{tag}]"
                 )
                 return True
 
@@ -12435,7 +13797,7 @@ class DHCPServer:
 
             if self.dhcp_relay_target_ip:
                 self.logger.log_message(
-                    f"[DHCP] Relaying v4 to {self.dhcp_relay_target_ip} (iface={inbound_iface})."
+                    f"[DHCP] 🔁 Relaying v4 to {self.dhcp_relay_target_ip} (iface={inbound_iface})."
                 )
                 relay_packet = (
                     IP(src=router_in_ip, dst=self.dhcp_relay_target_ip)
@@ -12453,6 +13815,7 @@ class DHCPServer:
                 return True
 
             requested_ip = self._get_requested_ip_opt50(dhcp_layer)
+
             ciaddr_ip = None
             try:
                 ci = str(bootp_layer.ciaddr)
@@ -12461,21 +13824,7 @@ class DHCPServer:
             except Exception:
                 pass
 
-            def _build_v4_reply_options(message_type: str):
-                opts = [("message-type", message_type)]
-                if net is not None:
-                    try:
-                        opts.append(("subnet_mask", str(net.netmask)))
-                    except Exception:
-                        pass
-                opts.extend([
-                    ("router", router_in_ip),
-                    ("name_server", router_in_ip),
-                    ("lease_time", self.LEASE_DURATION_SECONDS),
-                    ("server_id", router_in_ip),
-                    "end",
-                ])
-                return opts
+            broadcast_requested = self._bootp_broadcast_requested(bootp_layer)
 
             def _wrap_l2(l3_pkt, dst_mac: str | None, broadcast: bool = False):
                 if is_loopback_request:
@@ -12493,7 +13842,7 @@ class DHCPServer:
                     preferred_ip=requested_ip if self.allow_out_of_pool else None,
                 )
                 if not assigned_ip:
-                    self.logger.log_message(f"[DHCP] No IP for DISCOVER from {client_mac}.")
+                    self.logger.log_message(f"[DHCP] ❌ No IP for DISCOVER from {client_mac}.")
                     return True
 
                 offer_l3 = (
@@ -12505,13 +13854,14 @@ class DHCPServer:
                         yiaddr=str(assigned_ip),
                         siaddr=router_in_ip,
                         chaddr=bootp_layer.chaddr,
+                        flags=bootp_layer.flags,
                     )
-                    / DHCP(options=_build_v4_reply_options("offer"))
+                    / DHCP(options=self._build_v4_reply_options("offer", router_in_ip, net))
                 )
                 reply = _wrap_l2(offer_l3, dst_mac=None, broadcast=True)
                 self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(
-                    f"[DHCP] 📝 Offer {assigned_ip} → {client_mac} (iface={inbound_iface})"
+                    f"[DHCP] 🎁 Offer {assigned_ip} -> {client_mac} (iface={inbound_iface})"
                 )
                 return True
 
@@ -12520,44 +13870,52 @@ class DHCPServer:
                 opt54 = self._get_server_id_opt54(dhcp_layer)
 
                 if opt54 and opt54 != router_in_ip:
-                    if self.rogue_policy == "nak_on_mismatch":
-                        req_ip = self._get_requested_ip_opt50(dhcp_layer)
-                        if not (req_ip and req_ip in self.dynamic_ip_pool):
-                            self.logger.log_message(
-                                f"[DHCP] Ignoring request for {req_ip} managed by other server {opt54}"
-                            )
-                            return True
-
-                if opt54 and opt54 != router_in_ip and self.authoritative and self.rogue_policy == "nak_on_mismatch":
-                    nak_l3 = (
-                        IP(src=router_in_ip, dst="255.255.255.255")
-                        / UDP(sport=67, dport=68)
-                        / BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr)
-                        / DHCP(options=[
-                            ("message-type", "nak"),
-                            ("server_id", router_in_ip),
-                            ("message", "Use this DHCP server"),
-                            "end",
-                        ])
-                    )
-                    reply = _wrap_l2(nak_l3, dst_mac=None, broadcast=True)
-                    self.sniffer.send(reply, inbound_iface)
-                    self.logger.log_message(
-                        f"[DHCP] 🚫 Authoritative NAK to {client_mac}: "
-                        f"client named server_id={opt54}, ours={router_in_ip}."
-                    )
+                    if self._should_nak_foreign_server_request(client_mac, requested_ip, router_in_ip, net):
+                        nak_l3 = (
+                            IP(src=router_in_ip, dst="255.255.255.255")
+                            / UDP(sport=67, dport=68)
+                            / BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr, flags=bootp_layer.flags)
+                            / DHCP(options=[
+                                ("message-type", "nak"),
+                                ("server_id", router_in_ip),
+                                ("message", "Use this DHCP server"),
+                                "end",
+                            ])
+                        )
+                        reply = _wrap_l2(nak_l3, dst_mac=None, broadcast=True)
+                        self.sniffer.send(reply, inbound_iface)
+                        self.logger.log_message(
+                            f"[DHCP] 🚫 Authoritative NAK to {client_mac}: "
+                            f"client named server_id={opt54}, ours={router_in_ip}."
+                        )
+                    else:
+                        self.logger.log_message(
+                            f"[DHCP] 👤 Ignoring REQUEST from {client_mac} naming foreign server_id={opt54}."
+                        )
                     return True
 
-                preferred = requested_ip or ciaddr_ip
-                assigned_ip = self._assign_ip(
-                    client_mac,
-                    preferred_ip=preferred if self.allow_out_of_pool else None,
-                )
+                is_init_reboot = (requested_ip is not None) and (opt54 is None) and (ciaddr_ip is None)
+
+                if is_init_reboot:
+                    if self._can_ack_requested_ip(client_mac, requested_ip, net):
+                        assigned_ip = self._assign_ip(client_mac, preferred_ip=requested_ip)
+                    else:
+                        assigned_ip = None
+                        self.logger.log_message(
+                            f"[DHCP] ⚠️ INIT-REBOOT request from {client_mac} for {requested_ip} cannot be honored; NAK."
+                        )
+                else:
+                    preferred = requested_ip or ciaddr_ip
+                    assigned_ip = self._assign_ip(
+                        client_mac,
+                        preferred_ip=preferred if self.allow_out_of_pool else None,
+                    )
+
                 if not assigned_ip:
                     nak_l3 = (
                         IP(src=router_in_ip, dst="255.255.255.255")
                         / UDP(sport=67, dport=68)
-                        / BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr)
+                        / BOOTP(op=2, xid=bootp_layer.xid, chaddr=bootp_layer.chaddr, flags=bootp_layer.flags)
                         / DHCP(options=[
                             ("message-type", "nak"),
                             ("server_id", router_in_ip),
@@ -12567,12 +13925,16 @@ class DHCPServer:
                     reply = _wrap_l2(nak_l3, dst_mac=None, broadcast=True)
                     self.sniffer.send(reply, inbound_iface)
                     self.logger.log_message(
-                        f"[DHCP] 🚫 NAK to {client_mac} (no IP) (iface={inbound_iface})."
+                        f"[DHCP] 🚫 NAK to {client_mac} (iface={inbound_iface})."
                     )
                     return True
 
+                ack_broadcast = bool(broadcast_requested or ciaddr_ip is None)
+                ack_dst_ip = "255.255.255.255" if ack_broadcast else str(assigned_ip)
+                ack_dst_mac = None if ack_broadcast else (pkt[Ether].src if pkt.haslayer(Ether) else None)
+
                 ack_l3 = (
-                    IP(src=router_in_ip, dst=str(assigned_ip))
+                    IP(src=router_in_ip, dst=ack_dst_ip)
                     / UDP(sport=67, dport=68)
                     / BOOTP(
                         op=2,
@@ -12580,14 +13942,15 @@ class DHCPServer:
                         yiaddr=str(assigned_ip),
                         siaddr=router_in_ip,
                         chaddr=bootp_layer.chaddr,
+                        flags=bootp_layer.flags,
                     )
-                    / DHCP(options=_build_v4_reply_options("ack"))
+                    / DHCP(options=self._build_v4_reply_options("ack", router_in_ip, net))
                 )
-                dst_mac = pkt[Ether].src if pkt.haslayer(Ether) else None
-                reply = _wrap_l2(ack_l3, dst_mac=dst_mac, broadcast=False)
+                reply = _wrap_l2(ack_l3, dst_mac=ack_dst_mac, broadcast=ack_broadcast)
                 self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(
-                    f"[DHCP] 🛰️ ACK {assigned_ip} → {client_mac} (iface={inbound_iface})"
+                    f"[DHCP] ✅ ACK {assigned_ip} -> {client_mac} "
+                    f"(broadcast={ack_broadcast}) (iface={inbound_iface})"
                 )
                 return True
 
@@ -12599,6 +13962,10 @@ class DHCPServer:
                         opts.append(("subnet_mask", str(net.netmask)))
                     except Exception:
                         pass
+                    try:
+                        opts.append(("broadcast_address", str(net.broadcast_address)))
+                    except Exception:
+                        pass
                 opts.extend([
                     ("router", router_in_ip),
                     ("name_server", router_in_ip),
@@ -12606,8 +13973,12 @@ class DHCPServer:
                     "end",
                 ])
 
+                inform_broadcast = bool(broadcast_requested or ciaddr_ip is None)
+                inform_dst_ip = "255.255.255.255" if inform_broadcast else str(ciaddr_ip)
+                inform_dst_mac = None if inform_broadcast else (pkt[Ether].src if pkt.haslayer(Ether) else None)
+
                 ack_l3 = (
-                    IP(src=router_in_ip, dst="255.255.255.255")
+                    IP(src=router_in_ip, dst=inform_dst_ip)
                     / UDP(sport=67, dport=68)
                     / BOOTP(
                         op=2,
@@ -12615,13 +13986,15 @@ class DHCPServer:
                         yiaddr="0.0.0.0",
                         siaddr=router_in_ip,
                         chaddr=bootp_layer.chaddr,
+                        flags=bootp_layer.flags,
                     )
                     / DHCP(options=opts)
                 )
-                reply = _wrap_l2(ack_l3, dst_mac=None, broadcast=True)
+                reply = _wrap_l2(ack_l3, dst_mac=inform_dst_mac, broadcast=inform_broadcast)
                 self.sniffer.send(reply, inbound_iface)
                 self.logger.log_message(
-                    f"[DHCP] ℹ️ INFORM ACK → {client_mac} (iface={inbound_iface})"
+                    f"[DHCP] ℹ️ INFORM ACK -> {client_mac} "
+                    f"(broadcast={inform_broadcast}) (iface={inbound_iface})"
                 )
                 return True
 
@@ -12634,7 +14007,7 @@ class DHCPServer:
                 )
                 return True
 
-            self.logger.log_message(f"[DHCP] v4 type {msg_type_norm} not handled; ignoring.")
+            self.logger.log_message(f"[DHCP] 🤷 v4 type {msg_type_norm} not handled; ignoring.")
             return True
 
         # ================= DHCPv6 =================
@@ -12675,9 +14048,9 @@ class DHCPServer:
                     if now < exp and addr not in self._v6_declined:
                         return addr
 
-                net = self.dhcp6_prefix
-                base = int(net.network_address)
-                host_bits = 128 - int(net.prefixlen)
+                net6 = self.dhcp6_prefix
+                base = int(net6.network_address)
+                host_bits = 128 - int(net6.prefixlen)
                 if host_bits <= 0:
                     return ipaddress.IPv6Address(base)
 
@@ -12726,8 +14099,10 @@ class DHCPServer:
             def _add_dns_opts(reply_pkt):
                 try:
                     def _to_list_ipv6(v):
-                        if v is None: return []
-                        if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                        if v is None:
+                            return []
+                        if isinstance(v, (list, tuple)):
+                            return [str(x) for x in v]
                         return [str(v)]
                     dns_list = _to_list_ipv6(self.dns_v6)
                     if dns_list:
@@ -12736,8 +14111,10 @@ class DHCPServer:
                     pass
                 try:
                     def _to_list_str(v):
-                        if v is None: return []
-                        if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                        if v is None:
+                            return []
+                        if isinstance(v, (list, tuple)):
+                            return [str(x) for x in v]
                         if isinstance(v, str) and "," in v:
                             return [s.strip() for s in v.split(",") if s.strip()]
                         return [str(v)]
@@ -12756,7 +14133,7 @@ class DHCPServer:
 
             router_ll = self.router_ipv6_link_local_out
             if not router_ll:
-                self.logger.log_message("[DHCP] v6: missing router IPv6 (no link-local/global); cannot serve.")
+                self.logger.log_message("[DHCP] ❌ v6: missing router IPv6 (no link-local/global); cannot serve.")
                 return True
 
             is_loopback = not pkt.haslayer(Ether)
@@ -12767,27 +14144,38 @@ class DHCPServer:
             msgtype = 0
 
             if pkt.haslayer(DHCP6_Solicit):
-                dhcp6 = pkt[DHCP6_Solicit]; msgtype = 1
+                dhcp6 = pkt[DHCP6_Solicit]
+                msgtype = 1
             elif pkt.haslayer(DHCP6_InfoRequest):
-                dhcp6 = pkt[DHCP6_InfoRequest]; msgtype = 11
+                dhcp6 = pkt[DHCP6_InfoRequest]
+                msgtype = 11
             elif pkt.haslayer(DHCP6_Request):
-                dhcp6 = pkt[DHCP6_Request]; msgtype = 3
+                dhcp6 = pkt[DHCP6_Request]
+                msgtype = 3
             elif pkt.haslayer(DHCP6_Renew):
-                dhcp6 = pkt[DHCP6_Renew]; msgtype = 5
+                dhcp6 = pkt[DHCP6_Renew]
+                msgtype = 5
             elif pkt.haslayer(DHCP6_Confirm):
-                dhcp6 = pkt[DHCP6_Confirm]; msgtype = 4
+                dhcp6 = pkt[DHCP6_Confirm]
+                msgtype = 4
             elif pkt.haslayer(DHCP6_Release):
-                dhcp6 = pkt[DHCP6_Release]; msgtype = 8
+                dhcp6 = pkt[DHCP6_Release]
+                msgtype = 8
             elif pkt.haslayer(DHCP6_Decline):
-                dhcp6 = pkt[DHCP6_Decline]; msgtype = 9
+                dhcp6 = pkt[DHCP6_Decline]
+                msgtype = 9
             elif pkt.haslayer(DHCP6_Advertise):
-                dhcp6 = pkt[DHCP6_Advertise]; msgtype = 2
+                dhcp6 = pkt[DHCP6_Advertise]
+                msgtype = 2
             elif pkt.haslayer(DHCP6_Reply):
-                dhcp6 = pkt[DHCP6_Reply]; msgtype = 7
+                dhcp6 = pkt[DHCP6_Reply]
+                msgtype = 7
             elif pkt.haslayer(DHCP6_RelayForward):
-                dhcp6 = pkt[DHCP6_RelayForward]; msgtype = 12
+                dhcp6 = pkt[DHCP6_RelayForward]
+                msgtype = 12
             elif pkt.haslayer(DHCP6_RelayReply):
-                dhcp6 = pkt[DHCP6_RelayReply]; msgtype = 13
+                dhcp6 = pkt[DHCP6_RelayReply]
+                msgtype = 13
 
             if msgtype in (2, 7, 10, 13):
                 src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "(no-ether)"
@@ -12818,18 +14206,18 @@ class DHCPServer:
 
                 name = {2: "ADVERTISE", 7: "REPLY", 10: "RECONFIGURE", 13: "RELAY-REPLY"}.get(msgtype, f"type={msgtype}")
                 self.logger.log_message(
-                    f"[DHCP] v6 {name} observed from {src_mac} → {dst_ll} [{tag}] DNS={dns_list or '[]'} DOM={dom_list or '[]'}"
+                    f"[DHCP] 👀 v6 {name} observed from {src_mac} -> {dst_ll} [{tag}] DNS={dns_list or '[]'} DOM={dom_list or '[]'}"
                 )
                 return True
 
             if direction != "client":
                 src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "(no-ether)"
-                self.logger.log_message(f"[DHCP] v6 server→client observed from {src_mac}; skipping.")
+                self.logger.log_message(f"[DHCP] 👤 v6 server->client observed from {src_mac}; skipping.")
                 return True
 
             if self.dhcp6_relay_target_ip:
                 target = self.dhcp6_relay_target_ip
-                self.logger.log_message(f"[DHCP] Relaying v6 to {target}.")
+                self.logger.log_message(f"[DHCP] 🔁 Relaying v6 to {target}.")
                 relay = (
                     IPv6(src=router_ll, dst=target, hlim=255)
                     / UDP(sport=547, dport=547)
@@ -12839,7 +14227,6 @@ class DHCPServer:
                 self.sniffer.send(out, inbound_iface)
                 return True
 
-            # ---- DECLINE
             if msgtype == 9:
                 du = _clid_hex(pkt)
                 if du and du in self._v6_leases:
@@ -12852,21 +14239,21 @@ class DHCPServer:
                 if clid:
                     reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
                     st = _status(0, "Declined")
-                    if st: reply /= st
+                    if st:
+                        reply /= st
                     reply = _add_dns_opts(reply)
                     _send_v6_reply(v6src, client_mac, reply)
 
-                self.logger.log_message(f"[DHCP] v6 DECLINE handled for {v6src} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] 🙅 v6 DECLINE handled for {v6src} (iface={inbound_iface})")
                 return True
 
-            # ---- SOLICIT
             if msgtype == 1:
                 v6src_raw = pkt[IPv6].src
                 router_ll_nz = _rm_zone(router_ll)
                 v6src_nz = _rm_zone(v6src_raw)
 
                 if not router_ll_nz or not v6src_nz:
-                    self.logger.log_message("[DHCP] v6: invalid link-local addressing; skipping reply")
+                    self.logger.log_message("[DHCP] ⚠️ v6: invalid link-local addressing; skipping reply")
                     return False
 
                 dhcp6 = pkt.getlayer(DHCP6_Solicit) or pkt.getlayer(DHCP6_InfoRequest)
@@ -12879,10 +14266,9 @@ class DHCPServer:
 
                 out = (Ether(src=router_in_mac, dst=client_mac) / advertise) if (client_mac and not is_loopback) else advertise
                 self.sniffer.send(out, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 ADVERTISE → {v6src_nz} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] 🎁 v6 ADVERTISE -> {v6src_nz} (iface={inbound_iface})")
                 return True
 
-            # ---- INFO-REQUEST
             if msgtype == 11:
                 clid_layer = pkt.getlayer(DHCP6OptClientId)
                 clid = DHCP6OptClientId(duid=clid_layer.duid) if clid_layer is not None else None
@@ -12893,13 +14279,17 @@ class DHCPServer:
                     reply /= clid
 
                 def _to_list_ipv6(v):
-                    if v is None: return []
-                    if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                    if v is None:
+                        return []
+                    if isinstance(v, (list, tuple)):
+                        return [str(x) for x in v]
                     return [str(v)]
 
                 def _to_list_str(v):
-                    if v is None: return []
-                    if isinstance(v, (list, tuple)): return [str(x) for x in v]
+                    if v is None:
+                        return []
+                    if isinstance(v, (list, tuple)):
+                        return [str(x) for x in v]
                     if isinstance(v, str) and "," in v:
                         return [s.strip() for s in v.split(",") if s.strip()]
                     return [str(v)]
@@ -12936,29 +14326,28 @@ class DHCPServer:
                     out = ip6 / udp / reply
 
                 self.sniffer.send(out, inbound_iface)
-                self.logger.log_message(f"[DHCP] v6 INFO-REPLY → {v6src} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] ℹ️ v6 INFO-REPLY -> {v6src} (iface={inbound_iface})")
                 return True
 
-            # ---- CONFIRM
             if msgtype == 4:
                 clid = _mk_clid_opt(pkt)
                 if not clid:
-                    self.logger.log_message("[DHCP] v6 CONFIRM missing Client-ID; ignoring.")
+                    self.logger.log_message("[DHCP] ⚠️ v6 CONFIRM missing Client-ID; ignoring.")
                     return True
 
                 reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
                 st = _status(0, "On-link") if self.dhcp6_prefix else _status(4, "NotOnLink")
-                if st: reply /= st
+                if st:
+                    reply /= st
                 reply = _add_dns_opts(reply)
                 _send_v6_reply(v6src, client_mac, reply)
-                self.logger.log_message(f"[DHCP] v6 CONFIRM-REPLY → {v6src} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] ✅ v6 CONFIRM-REPLY -> {v6src} (iface={inbound_iface})")
                 return True
 
-            # ---- REQUEST / RENEW / REBIND
             if msgtype in (3, 5, 6):
                 clid = _mk_clid_opt(pkt)
                 if not clid:
-                    self.logger.log_message(f"[DHCP] v6 msg={msgtype} missing Client-ID; ignoring.")
+                    self.logger.log_message(f"[DHCP] ⚠️ v6 msg={msgtype} missing Client-ID; ignoring.")
                     return True
 
                 reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
@@ -12968,7 +14357,8 @@ class DHCPServer:
                     addr = _pick_v6_addr_for_client(pkt)
                     if addr is None:
                         st = _status(2, "NoAddrsAvail")
-                        if st: reply /= st
+                        if st:
+                            reply /= st
                     else:
                         try:
                             T1 = int(self.V6_LEASE_SECONDS * 0.5)
@@ -12982,19 +14372,20 @@ class DHCPServer:
                             reply /= ia_reply
                         except Exception:
                             st = _status(1, "UnspecFail")
-                            if st: reply /= st
+                            if st:
+                                reply /= st
                 else:
                     st = _status(0, "Stateless")
-                    if st: reply /= st
+                    if st:
+                        reply /= st
 
                 reply = _add_dns_opts(reply)
                 _send_v6_reply(v6src, client_mac, reply)
 
                 name = {3: "REQUEST", 5: "RENEW", 6: "REBIND"}.get(msgtype, str(msgtype))
-                self.logger.log_message(f"[DHCP] v6 {name}-REPLY → {v6src} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] 🛰️ v6 {name}-REPLY -> {v6src} (iface={inbound_iface})")
                 return True
 
-            # ---- RELEASE
             if msgtype == 8:
                 du = _clid_hex(pkt)
                 if du and du in self._v6_leases:
@@ -13005,14 +14396,15 @@ class DHCPServer:
                 if clid:
                     reply = DHCP6_Reply(trid=dhcp6.trid) / self._dhcp6_srv_id / clid
                     st = _status(0, "Released")
-                    if st: reply /= st
+                    if st:
+                        reply /= st
                     reply = _add_dns_opts(reply)
                     _send_v6_reply(v6src, client_mac, reply)
 
-                self.logger.log_message(f"[DHCP] v6 RELEASE handled for {v6src} (iface={inbound_iface})")
+                self.logger.log_message(f"[DHCP] 🔓 v6 RELEASE handled for {v6src} (iface={inbound_iface})")
                 return True
 
-            self.logger.log_message(f"[DHCP] v6 msgtype {msgtype} not handled; ignoring.")
+            self.logger.log_message(f"[DHCP] 🤷 v6 msgtype {msgtype} not handled; ignoring.")
             return True
 
         return False

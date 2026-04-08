@@ -1195,50 +1195,126 @@ class SnifferSoftware:
         """
         Return 'A.B.C.D/pfx' for the interface.
         Supports Windows Npcap names ('\\Device\\NPF_{GUID}') and friendly names.
-        Returns None for Npcap loopback or if no IPv4 is configured.
+        Returns None only if no usable IPv4 can be derived.
         """
         if not iface_name:
             return None
-        if os.name == "nt" and self._is_npf_loopback(iface_name):
-            return "127.0.0.1/8"  # synthetic; ensures downstream code doesn't crash
-        iface_name = self._normalize_pcap_name(iface_name)
-        # Windows pcap device path?
-        if os.name == "nt" and iface_name.lower().startswith("\\device\\npf_"):
-            if self._is_npf_loopback(iface_name):
-                return None
 
-            # Prefer Scapy's Windows inventory
+        try:
+            iface_name = self._normalize_pcap_name(iface_name)
+        except Exception:
+            iface_name = str(iface_name)
+
+        # Synthetic loopback CIDR so callers do not explode
+        try:
+            if os.name == "nt" and self._is_npf_loopback(iface_name):
+                return "127.0.0.1/8"
+        except Exception:
+            pass
+
+        # ---------------------------------------------------------
+        # 1) FIRST: trust our own cached interface config
+        # ---------------------------------------------------------
+        try:
+            cfg = (getattr(self, "_interfaces_config", {}) or {}).get(iface_name, {}) or {}
+
+            cidr = cfg.get("cidr")
+            if cidr:
+                return str(cidr)
+
+            net = cfg.get("network")
+            if net is not None:
+                try:
+                    return str(net)
+                except Exception:
+                    pass
+
+            ip_addr = cfg.get("ip_addr")
+            netmask = cfg.get("netmask")
+            if ip_addr and netmask:
+                try:
+                    pref = ipaddress.IPv4Network((str(ip_addr), str(netmask)), strict=False).prefixlen
+                    return f"{ip_addr}/{pref}"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ---------------------------------------------------------
+        # 2) Windows Npcap device lookup
+        # ---------------------------------------------------------
+        if os.name == "nt" and iface_name.lower().startswith("\\device\\npf_"):
             try:
                 if 'get_windows_if_list' in globals() and get_windows_if_list:
                     for itf in get_windows_if_list():
                         if itf.get("pcap_name") == iface_name:
-                            # Try vector form first
                             ips = (itf.get("ips") or [])
                             masks = (itf.get("netmasks") or [])
+
                             for ip, m in zip(ips, masks):
-                                if ip and m and "." in ip:
-                                    pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
+                                if ip and m and "." in str(ip):
+                                    try:
+                                        pref = ipaddress.IPv4Network((str(ip), str(m)), strict=False).prefixlen
+                                        return f"{ip}/{pref}"
+                                    except Exception:
+                                        continue
+
+                            ip = itf.get("ip")
+                            m = itf.get("netmask")
+                            if ip and m and "." in str(ip):
+                                try:
+                                    pref = ipaddress.IPv4Network((str(ip), str(m)), strict=False).prefixlen
                                     return f"{ip}/{pref}"
-                            # Fallback to scalar ip/netmask keys
-                            ip, m = itf.get("ip"), itf.get("netmask")
-                            if ip and m and "." in ip:
-                                pref = ipaddress.IPv4Network((ip, m), strict=False).prefixlen
-                                return f"{ip}/{pref}"
+                                except Exception:
+                                    pass
             except Exception:
                 pass
 
-            # Last resort: match the device MAC to a psutil NIC and read its IPv4
-            return self._ipv4_cidr_via_mac_match(iface_name)
+            # MAC -> psutil NIC fallback
+            try:
+                cidr = self._ipv4_cidr_via_mac_match(iface_name)
+                if cidr:
+                    return cidr
+            except Exception:
+                pass
 
-        # Non-Windows or friendly (human) name: use psutil inventory
-        addr, mask = self._ipv4_addr_netmask_for_iface(iface_name)
-        if not addr or not mask:
-            return None
+        # ---------------------------------------------------------
+        # 3) Friendly-name / partial-name psutil fallback
+        # ---------------------------------------------------------
         try:
-            pref = ipaddress.IPv4Network((addr, mask), strict=False).prefixlen
-            return f"{addr}/{pref}"
+            addr, mask = self._ipv4_addr_netmask_for_iface(iface_name)
+            if addr and mask:
+                pref = ipaddress.IPv4Network((str(addr), str(mask)), strict=False).prefixlen
+                return f"{addr}/{pref}"
         except Exception:
-            return None
+            pass
+
+        # ---------------------------------------------------------
+        # 4) Final fallback: try matching friendly_name from config
+        # ---------------------------------------------------------
+        try:
+            for full_name, cfg in (getattr(self, "_interfaces_config", {}) or {}).items():
+                if full_name == iface_name:
+                    continue
+
+                friendly = str((cfg or {}).get("friendly_name") or "").strip()
+                if not friendly:
+                    continue
+
+                if friendly.lower() == iface_name.lower():
+                    ip_addr = (cfg or {}).get("ip_addr")
+                    netmask = (cfg or {}).get("netmask")
+                    if ip_addr and netmask:
+                        pref = ipaddress.IPv4Network((str(ip_addr), str(netmask)), strict=False).prefixlen
+                        return f"{ip_addr}/{pref}"
+
+                    net = (cfg or {}).get("network")
+                    if net is not None:
+                        return str(net)
+        except Exception:
+            pass
+
+        return None
 
     def _ipv4_cidr_for_pcap_name(self, pcap_name: str) -> str | None:
         """
