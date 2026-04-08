@@ -1474,7 +1474,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         except Exception:
             return None
-    def _start_single_sniffer(self, iface_name: str):
+    def _start_single_sniffer(self, iface_name: str, promisc = False):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
         friendly_name_for_filter = next(
@@ -1503,7 +1503,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.sniffer.sniff(
                     iface=name,
                     prn=direct_process,
-                    promisc=True,
+                    promisc=promisc,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
                     mac_filter_only=True,
@@ -2446,8 +2446,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 ipaddress.ip_address(dst_ip) in inbound_network and
                 dst_ip != inbound_config.get("ip_addr")
         )
-
-        if inbound_iface == selected_iface:
+        loop_candidate = inbound_iface in {initial_outbound_iface, selected_iface}
+        if loop_candidate:
             if not is_intra_lan:
                 alternate_route = self.rip_manager.find_alternate_route(dst_ip, exclude_iface=inbound_iface)
                 if alternate_route:  # ✅ Ensure alternate_route is valid first
@@ -2660,7 +2660,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2915,7 +2915,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             sniffing_tasks = []
             for iface_name in self._interfaces_config.keys():
                 if iface_name not in ["WireShark", "Nate's Tunnel", "WinDivertBridge"]:
-                    sniffing_tasks.append((self._start_single_sniffer, (iface_name,)))
+                    sniffing_tasks.append((self._start_single_sniffer, (iface_name,promisc,)))
             self.parallel_python.run_all_parallel(sniffing_tasks, return_type="void")
             self.parallel_python.increase_ram_usage(1000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)

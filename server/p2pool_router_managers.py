@@ -8015,11 +8015,11 @@ class TransportStratumManager:
         handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
         snapshot_metrics() -> dict
 
-    Safe PacketWriter additions:
+    Active PacketWriter additions:
     - feeds observed packets into PacketWriter's RX bus
     - blocks malformed exact packets / flows via PacketWriter
-    - can emit protocol-aware ICMP diagnostics for malformed shell packets
-    - does NOT spoof ACK / hijack live TCP conversations
+    - can emit ICMP diagnostics for malformed shell packets
+    - can attempt guarded TCP reply TX via PacketWriter
     """
 
     # ---- Tunables ----
@@ -8040,8 +8040,7 @@ class TransportStratumManager:
 
     MAX_PENDING_IDS = 256
     PARTIAL_JSON_COOLDOWN_S = 6.0
-    RUNTIME_LOG_INTERVAL_S = 60.0
-    IDLE_RUNTIME_SEC = 30.0
+    IDLE_RUNTIME_SEC = 120
 
     DUP_WINDOW_S = 4.0
     MALFORMED_FLOW_BLOCK_TTL_S = 20.0
@@ -8091,6 +8090,11 @@ class TransportStratumManager:
         self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         self._last_gc = time.time()
 
+        self.active_tx_enabled = True
+        self.respond_only_if_dst_owned = False
+        self._last_tx_slots = {}
+        self.TX_COOLDOWN_S = 1.0
+
         self._metrics = {
             "seen": 0,
             "flows": 0,
@@ -8108,27 +8112,53 @@ class TransportStratumManager:
             "rejected": 0,
             "errors": 0,
             "unknown": 0,
+
+            "share_submit": 0,
+            "share_accept": 0,
+            "share_reject": 0,
+
             "flow_open": 0,
             "flow_established": 0,
             "flow_fin": 0,
             "flow_rst": 0,
             "syn_with_payload": 0,
             "partial_json": 0,
+
             "classify_monero": 0,
             "classify_btc": 0,
             "classify_unknown": 0,
+
             "submit_rtt_count": 0,
             "submit_rtt_ms_total": 0,
+
             "packetwriter_observed": 0,
             "packetwriter_block_exact": 0,
             "packetwriter_block_flow": 0,
             "packetwriter_icmp_diag": 0,
             "duplicate_payload": 0,
-        }
 
+            "tx_attempt": 0,
+            "tx_queued": 0,
+            "tx_failed": 0,
+            "tx_skipped_no_writer": 0,
+            "tx_skipped_not_owned": 0,
+        }
+        # TX cache / semantic dedupe
+        self._tx_cache = collections.OrderedDict()
+        self._tx_sem_cache = collections.OrderedDict()
+        self.TX_CACHE_TTL_S = 8.0
+        self.TX_SEM_CACHE_TTL_S = 12.0
+        self.TX_CACHE_SOFT_MAX = 8192
+
+        self._metrics.update({
+            "tx_cache_hit": 0,
+            "tx_sem_cache_hit": 0,
+        })
         self._emit(
             f"[Transport][🧵 TCP][⛏️ Stratum] Manager ready. "
-            f"ports={sorted(self.ports)} packet_writer={'yes' if self.packet_writer else 'no'}"
+            f"ports={sorted(self.ports)} "
+            f"packet_writer={'yes' if self.packet_writer else 'no'} "
+            f"respond_only_if_dst_owned={self.respond_only_if_dst_owned}"
         )
 
     # ------------------------------------------------------------------
@@ -8213,9 +8243,9 @@ class TransportStratumManager:
                         if self._should_log(st, importance="low", slot="unknown"):
                             preview = self._safe_ascii(line, self.ASCII_PREVIEW_MAX) or "-"
                             self._emit(
-                                f"{self._tag_prefix(st, 'FLOW')} "
-                                f"{src_ip}:{sport} -> {dst_ip}:{dport} UNKNOWN_JSON_TEXT "
-                                f"dir={direction} preview={preview}"
+                                f"{self._tag_prefix(st)}[🧾 UNKNOWN] "
+                                f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                                f"dir={direction} iface={iface} preview={preview}"
                             )
                         self._metrics["unknown"] += 1
                         processed += 1
@@ -8225,6 +8255,19 @@ class TransportStratumManager:
                     self._bump_metrics(event)
 
                     self._maybe_packetwriter_actions(
+                        packet=packet,
+                        st=st,
+                        event=event,
+                        flags=flags,
+                        inbound_iface=inbound_iface,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        sport=sport,
+                        dport=dport,
+                        now=now,
+                    )
+
+                    self._maybe_packetwriter_tx(
                         packet=packet,
                         st=st,
                         event=event,
@@ -8279,6 +8322,19 @@ class TransportStratumManager:
                             now=now,
                         )
 
+                        self._maybe_packetwriter_tx(
+                            packet=packet,
+                            st=st,
+                            event=partial_event,
+                            flags=flags,
+                            inbound_iface=inbound_iface,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            sport=sport,
+                            dport=dport,
+                            now=now,
+                        )
+
                         if partial_event.get("_classification_changed") and self._should_log(st, importance="med", slot="classify"):
                             self._emit_classification(st, partial_event)
 
@@ -8294,8 +8350,23 @@ class TransportStratumManager:
                                 direction=direction,
                                 now=now,
                             )
+            else:
+                control_event = self._make_control_event(flags)
+                if control_event is not None:
+                    self._update_state_from_event(st, control_event, now=now, direction=direction)
+                    self._maybe_packetwriter_tx(
+                        packet=packet,
+                        st=st,
+                        event=control_event,
+                        flags=flags,
+                        inbound_iface=inbound_iface,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        sport=sport,
+                        dport=dport,
+                        now=now,
+                    )
 
-            self._maybe_runtime_log(st, now)
             self._maybe_gc(now)
 
             self._metrics["seen"] += 1
@@ -8304,7 +8375,7 @@ class TransportStratumManager:
         except Exception as e:
             self._metrics["errors"] += 1
             try:
-                self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][ERROR] {type(e).__name__}: {e}")
+                self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][❌ ERROR] {type(e).__name__}: {e}")
             except Exception:
                 pass
             return False
@@ -8365,6 +8436,95 @@ class TransportStratumManager:
 
         return snap
 
+    def _prune_tx_caches(self, now: float) -> None:
+        try:
+            for cache, ttl in (
+                    (self._tx_cache, self.TX_CACHE_TTL_S),
+                    (self._tx_sem_cache, self.TX_SEM_CACHE_TTL_S),
+            ):
+                stale = []
+                for k, ts in cache.items():
+                    if (now - float(ts)) > ttl:
+                        stale.append(k)
+                for k in stale:
+                    cache.pop(k, None)
+
+                while len(cache) > self.TX_CACHE_SOFT_MAX:
+                    cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def _tx_exact_cache_key(
+            self,
+            *,
+            reply_src_ip: str,
+            reply_dst_ip: str,
+            reply_sport: int,
+            reply_dport: int,
+            flags: str,
+            payload: bytes,
+            tx_reason: str,
+    ) -> tuple:
+        try:
+            payload_sig = hashlib.sha1(bytes(payload or b"")).hexdigest()[:12]
+        except Exception:
+            payload_sig = "nopayload"
+        return (
+            str(tx_reason),
+            str(reply_src_ip),
+            int(reply_sport),
+            str(reply_dst_ip),
+            int(reply_dport),
+            str(flags),
+            payload_sig,
+        )
+
+    def _tx_semantic_cache_key(
+            self,
+            *,
+            kind: str,
+            src_ip: str,
+            dst_ip: str,
+            sport: int,
+            dport: int,
+            flags: Dict[str, Any],
+    ) -> tuple:
+        return (
+            str(kind or ""),
+            str(src_ip),
+            str(dst_ip),
+            int(dport),
+            bool(flags.get("syn")),
+            bool(flags.get("ack")),
+            bool(flags.get("rst")),
+            bool(flags.get("fin")),
+        )
+
+    def _tx_exact_cache_hit(self, key: tuple, now: float) -> bool:
+        self._prune_tx_caches(now)
+        ts = self._tx_cache.get(key)
+        if ts is not None and (now - float(ts)) <= self.TX_CACHE_TTL_S:
+            self._metrics["tx_cache_hit"] += 1
+            return True
+        return False
+
+    def _tx_sem_cache_hit(self, key: tuple, now: float) -> bool:
+        self._prune_tx_caches(now)
+        ts = self._tx_sem_cache.get(key)
+        if ts is not None and (now - float(ts)) <= self.TX_SEM_CACHE_TTL_S:
+            self._metrics["tx_sem_cache_hit"] += 1
+            return True
+        return False
+
+    def _remember_tx_exact(self, key: tuple, now: float) -> None:
+        self._tx_cache[key] = now
+        while len(self._tx_cache) > self.TX_CACHE_SOFT_MAX:
+            self._tx_cache.popitem(last=False)
+
+    def _remember_tx_sem(self, key: tuple, now: float) -> None:
+        self._tx_sem_cache[key] = now
+        while len(self._tx_sem_cache) > self.TX_CACHE_SOFT_MAX:
+            self._tx_sem_cache.popitem(last=False)
     # ------------------------------------------------------------------
     # PacketWriter integration
     # ------------------------------------------------------------------
@@ -8381,7 +8541,7 @@ class TransportStratumManager:
             )
             self._metrics["packetwriter_observed"] += 1
         except Exception as e:
-            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW] ⚠️ observe failed: {e}")
+            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW][⚠️ ObserveFail] {e}")
 
     def _maybe_packetwriter_actions(
         self,
@@ -8397,6 +8557,12 @@ class TransportStratumManager:
         dport: int,
         now: float,
     ) -> None:
+        _ = src_ip
+        _ = dst_ip
+        _ = sport
+        _ = dport
+        _ = now
+
         if not self.packet_writer:
             return
 
@@ -8452,7 +8618,7 @@ class TransportStratumManager:
             if ok:
                 self._metrics["packetwriter_block_exact"] += 1
         except Exception as e:
-            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW] ⚠️ block_exact failed: {e}")
+            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW][⚠️ BlockExactFail] {e}")
 
     def _packetwriter_block_flow(self, packet, *, ttl: float, reason: str, tag: str) -> None:
         if not hasattr(self.packet_writer, "block_flow"):
@@ -8467,7 +8633,7 @@ class TransportStratumManager:
             if ok:
                 self._metrics["packetwriter_block_flow"] += 1
         except Exception as e:
-            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW] ⚠️ block_flow failed: {e}")
+            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW][⚠️ BlockFlowFail] {e}")
 
     def _packetwriter_send_icmp_diag(self, packet, inbound_iface: str) -> None:
         if not hasattr(self.packet_writer, "send_icmp_time_exceeded"):
@@ -8476,7 +8642,291 @@ class TransportStratumManager:
             self.packet_writer.send_icmp_time_exceeded(packet, inbound_iface)
             self._metrics["packetwriter_icmp_diag"] += 1
         except Exception as e:
-            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW] ⚠️ icmp diag failed: {e}")
+            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW][⚠️ ICMPDiagFail] {e}")
+
+    def _maybe_packetwriter_tx(
+            self,
+            *,
+            packet,
+            st: Dict[str, Any],
+            event: Dict[str, Any],
+            flags: Dict[str, Any],
+            inbound_iface: str,
+            src_ip: str,
+            dst_ip: str,
+            sport: int,
+            dport: int,
+            now: float,
+    ) -> bool:
+        _ = sport
+
+        self._metrics["tx_attempt"] += 1
+
+        if not getattr(self, "active_tx_enabled", False):
+            return False
+
+        pw = getattr(self, "packet_writer", None)
+        if pw is None:
+            self._metrics["tx_skipped_no_writer"] += 1
+            return False
+
+        if packet is None or TCP is None or not packet.haslayer(TCP):
+            return False
+
+        if self.respond_only_if_dst_owned and not self._dst_is_router_ip(dst_ip):
+            self._metrics["tx_skipped_not_owned"] += 1
+            return False
+
+        kind = str(event.get("kind") or "")
+        rt = st.get("runtime", {}) or {}
+
+        if not self._tx_slot_ready(st, f"tx:{kind}", now):
+            return False
+
+        syn_only = bool(flags.get("syn") and not flags.get("ack"))
+        payload_len = self._tcp_payload_len(packet)
+
+        sem_key = self._tx_semantic_cache_key(
+            kind=kind,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            sport=sport,
+            dport=dport,
+            flags=flags,
+        )
+
+        if syn_only and kind in {
+            "control_syn",
+            "login",
+            "subscribe",
+            "authorize",
+            "job",
+            "notify",
+            "submit",
+            "partial_json",
+            "result_bool",
+            "result_status",
+        }:
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(
+                packet,
+                inbound_iface,
+                flags="SA",
+                tx_reason=f"syn_{kind}",
+            )
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if kind == "transport_rst":
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(packet, inbound_iface, flags="RA", tx_reason="rst")
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if kind == "transport_fin":
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(packet, inbound_iface, flags="FA", tx_reason="fin")
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if kind == "error":
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(packet, inbound_iface, flags="RA", tx_reason="error")
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if rt.get("established") and payload_len > 0 and kind in {
+            "login",
+            "subscribe",
+            "authorize",
+            "job",
+            "notify",
+            "submit",
+            "result_bool",
+            "result_status",
+            "result_obj",
+            "set_difficulty",
+            "set_extranonce",
+            "keepalive",
+            "partial_json",
+            "json",
+            "text",
+            "rpc",
+        }:
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(
+                packet,
+                inbound_iface,
+                flags="A",
+                tx_reason=f"ack_{kind}",
+            )
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        return False
+
+    def _dst_is_router_ip(self, dst_ip: str) -> bool:
+        pw = getattr(self, "packet_writer", None)
+        if pw is None:
+            return False
+        cfgs = getattr(pw, "_interfaces_config", {}) or {}
+        for cfg in cfgs.values():
+            ip4 = str(cfg.get("ip_addr") or "").strip()
+            ip6 = str(cfg.get("ip6_addr") or "").strip()
+            if dst_ip == ip4 or dst_ip == ip6:
+                return True
+        return False
+
+    def _tcp_payload_len(self, packet) -> int:
+        try:
+            if Raw is not None and packet.haslayer(Raw):
+                return len(bytes(packet[Raw].load))
+        except Exception:
+            pass
+        try:
+            tcp = packet[TCP]
+            if getattr(tcp, "payload", None) is not None:
+                return len(bytes(tcp.payload))
+        except Exception:
+            pass
+        return 0
+
+    def _tcp_advance(self, packet) -> int:
+        adv = self._tcp_payload_len(packet)
+        try:
+            fl = packet[TCP].flags
+            if fl & 0x02:
+                adv += 1
+            if fl & 0x01:
+                adv += 1
+        except Exception:
+            pass
+        return adv
+
+    def _tx_slot_ready(self, st: Dict[str, Any], slot: str, now: float) -> bool:
+        client = st.get("client")
+        server = st.get("server")
+        if client and server:
+            flow_id = f"{client[0]}:{client[1]}-{server[0]}:{server[1]}"
+        else:
+            flow_id = "unknown"
+        key = (flow_id, slot)
+        last = float(self._last_tx_slots.get(key, 0.0) or 0.0)
+        if (now - last) < self.TX_COOLDOWN_S:
+            return False
+        self._last_tx_slots[key] = now
+        return True
+
+    def _queue_tcp_reply(
+            self,
+            request_packet,
+            inbound_iface: str,
+            *,
+            flags: str = "A",
+            payload: bytes = b"",
+            seq: Optional[int] = None,
+            ack: Optional[int] = None,
+            tx_reason: str = "reply",
+    ) -> bool:
+        pw = getattr(self, "packet_writer", None)
+        if pw is None or TCP is None or request_packet is None or not request_packet.haslayer(TCP):
+            self._metrics["tx_failed"] += 1
+            return False
+
+        try:
+            if request_packet.haslayer(IP):
+                ip = IP(
+                    src=request_packet[IP].dst,
+                    dst=request_packet[IP].src,
+                    ttl=64,
+                )
+            elif request_packet.haslayer(IPv6):
+                ip = IPv6(
+                    src=request_packet[IPv6].dst,
+                    dst=request_packet[IPv6].src,
+                    hlim=64,
+                )
+            else:
+                self._metrics["tx_failed"] += 1
+                return False
+
+            tin = request_packet[TCP]
+
+            if seq is None:
+                seq = int(getattr(tin, "ack", 0) or 0)
+
+            if ack is None:
+                ack = int(tin.seq) + self._tcp_advance(request_packet)
+
+            exact_key = self._tx_exact_cache_key(
+                reply_src_ip=ip.src,
+                reply_dst_ip=ip.dst,
+                reply_sport=int(tin.dport),
+                reply_dport=int(tin.sport),
+                flags=flags,
+                payload=payload,
+                tx_reason=tx_reason,
+            )
+
+            now = time.time()
+            if self._tx_exact_cache_hit(exact_key, now):
+                return False
+
+            out = ip / TCP(
+                sport=int(tin.dport),
+                dport=int(tin.sport),
+                flags=flags,
+                seq=int(seq),
+                ack=int(ack),
+                window=int(getattr(tin, "window", 8192) or 8192),
+            )
+
+            if payload:
+                out = out / Raw(load=bytes(payload))
+
+            setattr(out, "_pw_tx", True)
+            setattr(out, "_pw_allow_local_dest", True)
+
+            ok = False
+            if hasattr(pw, "queue_packet"):
+                ok = bool(pw.queue_packet(out, inbound_iface))
+            elif hasattr(pw, "_send_raw_packet"):
+                ok = bool(pw._send_raw_packet(out, inbound_iface, allow_dst_ours=True))
+            else:
+                ok = False
+
+            if ok:
+                self._remember_tx_exact(exact_key, now)
+                self._metrics["tx_queued"] += 1
+                self._emit(
+                    f"[Transport][🧵 TCP][⛏️ Stratum][TX][📤 Send] "
+                    f"reason={tx_reason} flags={flags} "
+                    f"{ip.src}:{int(tin.dport)} -> {ip.dst}:{int(tin.sport)} "
+                    f"bytes={len(payload or b'')}"
+                )
+            else:
+                self._metrics["tx_failed"] += 1
+                self._emit(
+                    f"[Transport][🧵 TCP][⛏️ Stratum][TX][⚠️ QueueFail] "
+                    f"reason={tx_reason} flags={flags} "
+                    f"{ip.src}:{int(tin.dport)} -> {ip.dst}:{int(tin.sport)}"
+                )
+            return ok
+
+        except Exception as e:
+            self._metrics["tx_failed"] += 1
+            self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][TX][❌ Error] queue tcp reply failed: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Flow state
@@ -8539,7 +8989,6 @@ class TransportStratumManager:
             "last_accept_ts": None,
             "last_reject_ts": None,
             "last_keepalive_ts": None,
-            "last_runtime_log_ts": 0.0,
             "last_partial_c2s_ts": 0.0,
             "last_partial_s2c_ts": 0.0,
             "duplicate_recent": False,
@@ -8589,6 +9038,9 @@ class TransportStratumManager:
     # Parsing
     # ------------------------------------------------------------------
     def _parse_line(self, line: bytes, *, st: Dict[str, Any], direction: str) -> Optional[Dict[str, Any]]:
+        _ = st
+        _ = direction
+
         obj = self._try_json(line)
         if isinstance(obj, dict):
             return self._parse_json_rpc(obj, line, st=st, direction=direction)
@@ -8609,6 +9061,10 @@ class TransportStratumManager:
             "\"keepalived\"",
             "\"status\":\"ok\"",
             "\"status\": \"ok\"",
+            "\"accepted\"",
+            "\"rejected\"",
+            "\"result\":true",
+            "\"result\":false",
             "{\"id\":",
             "\"id\":",
         ):
@@ -8678,6 +9134,9 @@ class TransportStratumManager:
         st: Dict[str, Any],
         direction: str,
     ) -> Dict[str, Any]:
+        _ = st
+        _ = direction
+
         method = self._safe_text(obj.get("method"))
         ident = obj.get("id")
         params = obj.get("params")
@@ -8725,6 +9184,7 @@ class TransportStratumManager:
                     "worker": worker,
                     "job_id": job_id,
                     "nonce": nonce,
+                    "share": True,
                     "importance": "high",
                     "family": "btc_stratum",
                     "family_confidence": 0.98,
@@ -8798,6 +9258,7 @@ class TransportStratumManager:
                     "job_id": job_id,
                     "nonce": nonce,
                     "id": ident,
+                    "share": True,
                     "importance": "high",
                     "family": "monero_stratum",
                     "family_confidence": 0.95,
@@ -8939,7 +9400,29 @@ class TransportStratumManager:
     # ------------------------------------------------------------------
     # Event / state
     # ------------------------------------------------------------------
+    def _make_control_event(self, flags: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if flags.get("syn") and not flags.get("ack"):
+            return {
+                "kind": "control_syn",
+                "importance": "low",
+                "log_slot": "control_syn",
+            }
+        if flags.get("rst"):
+            return {
+                "kind": "transport_rst",
+                "importance": "med",
+                "log_slot": "transport_rst",
+            }
+        if flags.get("fin"):
+            return {
+                "kind": "transport_fin",
+                "importance": "low",
+                "log_slot": "transport_fin",
+            }
+        return None
+
     def _update_state_from_event(self, st: Dict[str, Any], event: Dict[str, Any], *, now: float, direction: str) -> None:
+        _ = direction
         kind = event.get("kind")
         rt = st["runtime"]
 
@@ -8994,11 +9477,11 @@ class TransportStratumManager:
                 rt["last_accept_ts"] = now
                 if rt.get("state") not in ("closed", "error"):
                     rt["state"] = "active"
-                else:
-                    st["rejected"] = int(st.get("rejected", 0)) + 1
-                    rt["rejects_seen"] += 1
-                    rt["last_reject_ts"] = now
-                    rt["state"] = "error"
+            else:
+                st["rejected"] = int(st.get("rejected", 0)) + 1
+                rt["rejects_seen"] += 1
+                rt["last_reject_ts"] = now
+                rt["state"] = "error"
         elif kind == "error":
             st["rejected"] = int(st.get("rejected", 0)) + 1
             rt["rejects_seen"] += 1
@@ -9010,6 +9493,12 @@ class TransportStratumManager:
         elif kind == "partial_json":
             if not rt.get("established"):
                 rt["state"] = "handshake"
+        elif kind == "control_syn":
+            rt["state"] = "handshake"
+        elif kind == "transport_fin":
+            rt["state"] = "idle"
+        elif kind == "transport_rst":
+            rt["state"] = "error"
 
         idle_sec = max(0.0, now - float(rt.get("last_activity_ts", now)))
         if idle_sec >= self.IDLE_RUNTIME_SEC and rt.get("state") == "active":
@@ -9054,12 +9543,14 @@ class TransportStratumManager:
         if kind in ("result_bool", "result_status") and req.get("kind") == "submit":
             event["worker"] = event.get("worker") or req.get("worker") or st.get("last_worker")
             event["job_id"] = event.get("job_id") or req.get("job_id") or st.get("last_job_id")
+            event["share_result"] = True
             self._metrics["submit_rtt_count"] += 1
             self._metrics["submit_rtt_ms_total"] += int(event["rtt_ms"])
 
         if kind == "error" and req.get("kind") == "submit":
             event["worker"] = event.get("worker") or req.get("worker") or st.get("last_worker")
             event["job_id"] = event.get("job_id") or req.get("job_id") or st.get("last_job_id")
+            event["share_result"] = True
             self._metrics["submit_rtt_count"] += 1
             self._metrics["submit_rtt_ms_total"] += int(event["rtt_ms"])
 
@@ -9104,6 +9595,7 @@ class TransportStratumManager:
             self._metrics["set_extranonce"] += 1
         elif kind == "submit":
             self._metrics["submit"] += 1
+            self._metrics["share_submit"] += 1
         elif kind == "login":
             self._metrics["login"] += 1
         elif kind == "job":
@@ -9113,13 +9605,19 @@ class TransportStratumManager:
         elif kind in ("result_bool", "result_status"):
             if event.get("accepted"):
                 self._metrics["accepted"] += 1
+                if event.get("share_result"):
+                    self._metrics["share_accept"] += 1
             else:
                 self._metrics["rejected"] += 1
+                if event.get("share_result"):
+                    self._metrics["share_reject"] += 1
         elif kind == "error":
             self._metrics["rejected"] += 1
+            if event.get("share_result"):
+                self._metrics["share_reject"] += 1
         elif kind == "partial_json":
             self._metrics["partial_json"] += 1
-        elif kind in ("json", "rpc", "text", "result_obj"):
+        elif kind in ("json", "rpc", "text", "result_obj", "control_syn", "transport_rst", "transport_fin"):
             pass
         else:
             self._metrics["unknown"] += 1
@@ -9148,6 +9646,13 @@ class TransportStratumManager:
         payload: bytes,
         now: float,
     ) -> None:
+        _ = src_ip
+        _ = dst_ip
+        _ = sport
+        _ = dport
+        _ = iface
+        _ = now
+
         rt = st["runtime"]
         syn = bool(flags.get("syn"))
         ack = bool(flags.get("ack"))
@@ -9191,6 +9696,15 @@ class TransportStratumManager:
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
+    def _classification_emoji(self, family: Optional[str]) -> str:
+        if family == "btc_stratum":
+            return "₿"
+        if family == "monero_stratum":
+            return "🪙"
+        if family:
+            return "❓"
+        return "❔"
+
     def _log_event(
         self,
         *,
@@ -9204,6 +9718,7 @@ class TransportStratumManager:
         direction: str,
         now: float,
     ) -> None:
+        _ = now
         tag = self._tag_prefix(st)
 
         kind = event.get("kind")
@@ -9220,7 +9735,7 @@ class TransportStratumManager:
 
         if kind == "submit":
             self._emit(
-                f"{tag}[📤 SUBMIT] {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"{tag}[⛏️📤 SHARE SUBMIT] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
                 f"id={event.get('id')} worker={worker} job_id={job_id} nonce={event.get('nonce', '-')}"
             )
@@ -9228,7 +9743,10 @@ class TransportStratumManager:
 
         if kind in ("result_bool", "result_status"):
             accepted = bool(event.get("accepted"))
-            em = "✅ ACCEPT" if accepted else "❌ REJECT"
+            if event.get("share_result"):
+                em = "✅ SHARE ACCEPT" if accepted else "❌ SHARE REJECT"
+            else:
+                em = "✅ RESULT" if accepted else "❌ RESULT"
             self._emit(
                 f"{tag}[{em}] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
@@ -9242,6 +9760,20 @@ class TransportStratumManager:
                 f"{tag}[🔐 AUTH] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
                 f"kind={kind} id={event.get('id')} worker={worker} agent={event.get('agent', '-')}"
+            )
+            return
+
+        if kind == "set_difficulty":
+            self._emit(
+                f"{tag}[🎚️ DIFF] {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"dir={direction} iface={iface} difficulty={event.get('difficulty')}"
+            )
+            return
+
+        if kind == "set_extranonce":
+            self._emit(
+                f"{tag}[🧬 EXTRANONCE] {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"dir={direction} iface={iface} extranonce={event.get('extranonce')}"
             )
             return
 
@@ -9271,27 +9803,6 @@ class TransportStratumManager:
         self._emit(
             f"{tag}[ℹ️ EVENT] {src_ip}:{sport} -> {dst_ip}:{dport} "
             f"dir={direction} iface={iface} kind={kind} preview={event.get('preview', '-')}"
-        )
-
-    def _maybe_runtime_log(self, st: Dict[str, Any], now: float) -> None:
-        rt = st["runtime"]
-        last = float(rt.get("last_runtime_log_ts", 0.0) or 0.0)
-        if (now - last) < self.RUNTIME_LOG_INTERVAL_S:
-            return
-        rt["last_runtime_log_ts"] = now
-
-        if not self._should_log(st, importance="low", slot="runtime"):
-            return
-
-        self._emit(
-            f"{self._tag_prefix(st)}[📊 RUNTIME] "
-            f"family={rt.get('proto_family') or '-'} state={rt.get('state')} "
-            f"established={rt.get('established')} "
-            f"c2s_pkts={rt.get('packets_c2s')} s2c_pkts={rt.get('packets_s2c')} "
-            f"c2s_bytes={rt.get('bytes_c2s')} s2c_bytes={rt.get('bytes_s2c')} "
-            f"jobs={rt.get('jobs_seen')} submits={rt.get('submits_seen')} "
-            f"accepts={rt.get('accepts_seen')} rejects={rt.get('rejects_seen')} "
-            f"anomalies={list(rt.get('anomalies', []))}"
         )
 
     # ------------------------------------------------------------------
@@ -9406,9 +9917,15 @@ class TransportStratumManager:
             return "-"
 
     def _family_hint_from_text(self, low: str):
-        if any(x in low for x in ("\"seed_hash\"", "\"algo\":\"rx/", "\"method\":\"job\"", "\"method\":\"login\"", "\"method\":\"submit\"")):
+        if any(x in low for x in (
+            "\"seed_hash\"", "\"algo\":\"rx/", "\"method\":\"job\"",
+            "\"method\":\"login\"", "\"method\":\"submit\""
+        )):
             return "monero_stratum", 0.90, "text hint monero"
-        if any(x in low for x in ("mining.subscribe", "mining.authorize", "mining.notify", "mining.submit", "mining.set_difficulty")):
+        if any(x in low for x in (
+            "mining.subscribe", "mining.authorize", "mining.notify",
+            "mining.submit", "mining.set_difficulty", "mining.set_extranonce"
+        )):
             return "btc_stratum", 0.90, "text hint btc"
         return "unknown_stratum", 0.50, "text hint unknown"
 
@@ -9587,14 +10104,15 @@ class TransportStratumManager:
         except Exception:
             return False
 
-    def _tag_prefix(self, st: Dict[str, Any]) -> str:
-        lane = "LAN" if self._is_private_pair(st.get("client"), st.get("server")) else "WAN"
+    def _tag_prefix(self, st: Dict[str, Any], lane_hint: Optional[str] = None) -> str:
+        lane = lane_hint or ("LAN" if self._is_private_pair(st.get("client"), st.get("server")) else "WAN")
         fam = self._family_lane_name(st)
         return f"[Transport][🧵 TCP][⛏️ Stratum][{fam}][{lane}]"
 
     def _emit_classification(self, st: Dict[str, Any], event: Dict[str, Any]) -> None:
+        em = self._classification_emoji(event.get("family"))
         self._emit(
-            f"{self._tag_prefix(st)}[🧠 CLASSIFY] "
+            f"{self._tag_prefix(st)}[🧠 CLASSIFY][{em}] "
             f"family={event.get('family')} confidence={event.get('family_confidence')} "
             f"reason={event.get('family_reason')}"
         )
@@ -9635,19 +10153,11 @@ class TransportMoneroManager:
         handle(packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool
         snapshot_metrics() -> dict
 
-    This rewrite keeps the same public signatures while tightening event parsing and
-    standardizing the on-wire log families to:
+    Log families:
         [Transport][🪙 Monero][P2P]
         [Transport][🪙 Monero][RPC]
         [Transport][🪙 Monero][P2Pool]
-
-    Design goals:
-    - Only log when a Monero-family packet is actually caught/classified.
-    - Parse as much as possible from payload content, not just the port.
-    - Preserve runtime counters for snapshot_metrics() without spamming runtime logs.
-    - Avoid treating opaque SYN-with-data on 18080 as a confirmed Levin handshake.
-    - Recognize Monero peerlist / handshake-like payloads that expose epee field names
-      like m_ip, m_port, rpc_port, pruning_seed, top_id, and top_version.
+        [Transport][🪙 Monero][TX]
     """
 
     LOG_RPS = 2.0
@@ -9669,7 +10179,6 @@ class TransportMoneroManager:
     PARTIAL_JSON_COOLDOWN_S = 6.0
     PARTIAL_BINARY_COOLDOWN_S = 6.0
     CONTROL_DUP_TTL_S = 2.0
-    RUNTIME_LOG_INTERVAL_S = 60.0
     IDLE_RUNTIME_SEC = 30.0
 
     MAX_PENDING_IDS = 256
@@ -9730,6 +10239,7 @@ class TransportMoneroManager:
     def __init__(
         self,
         logger,
+        packet_writer=None,
         *,
         ports: Optional[set] = None,
         log_rps: float = LOG_RPS,
@@ -9737,11 +10247,17 @@ class TransportMoneroManager:
         flow_cooldown_s: float = FLOW_COOLDOWN_S,
     ):
         self.log = logger
+        self.packet_writer = packet_writer
         self.ports = set(int(p) for p in (ports or self.DEFAULT_PORTS))
         self._tb = self._TokenBucket(capacity=int(log_burst), refill_rate_per_s=float(log_rps))
         self._flow_cool = float(flow_cooldown_s)
         self._flows: Dict[Tuple[str, int, str, int], Dict[str, Any]] = {}
         self._last_gc = time.time()
+
+        self.active_tx_enabled = True
+        self.respond_only_if_dst_owned = False
+        self._last_tx_slots = {}
+        self.TX_COOLDOWN_S = 1.0
 
         self._metrics = {
             "seen": 0,
@@ -9789,13 +10305,30 @@ class TransportMoneroManager:
 
             "rpc_rtt_count": 0,
             "rpc_rtt_ms_total": 0.0,
-        }
 
+            "tx_attempt": 0,
+            "tx_queued": 0,
+            "tx_failed": 0,
+            "tx_skipped_no_writer": 0,
+            "tx_skipped_not_owned": 0,
+        }
+        # --- in __init__ ---
+        self._tx_cache = collections.OrderedDict()
+        self._tx_sem_cache = collections.OrderedDict()
+        self.TX_CACHE_TTL_S = 8.0
+        self.TX_SEM_CACHE_TTL_S = 12.0
+        self.TX_CACHE_SOFT_MAX = 8192
+
+        self._metrics.update({
+            "tx_cache_hit": 0,
+            "tx_sem_cache_hit": 0,
+        })
         self._emit(
             "[Transport][🪙 Monero] Manager ready. "
             f"p2p_ports={sorted(self.MONERO_P2P_PORTS & self.ports)} "
             f"rpc_ports={sorted(self.MONERO_RPC_PORTS & self.ports)} "
-            f"p2pool_ports={sorted(self.P2POOL_PORTS & self.ports)}"
+            f"p2pool_ports={sorted(self.P2POOL_PORTS & self.ports)} "
+            f"packet_writer={'yes' if self.packet_writer else 'no'}"
         )
 
     def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
@@ -9909,13 +10442,27 @@ class TransportMoneroManager:
                         now=now,
                     )
 
+                self._maybe_transmit_response(
+                    st=st,
+                    event=event,
+                    packet=packet,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    sport=sport,
+                    dport=dport,
+                    inbound_iface=inbound_iface,
+                    direction=direction,
+                    flags=flags,
+                    now=now,
+                )
+
             self._maybe_gc(now)
             self._metrics["seen"] += 1
             return bool(matched_any)
 
         except Exception as exc:
             self._metrics["errors"] += 1
-            self._emit(f"[Transport][🪙 Monero][Error] handle failed: {exc}")
+            self._emit(f"[Transport][🪙 Monero][❌ Error] handle failed: {exc}")
             return False
 
     def snapshot_metrics(self) -> dict:
@@ -9993,6 +10540,7 @@ class TransportMoneroManager:
                 monero_runtime["peerlist_events"] += int(mr.get("peerlist_events", 0))
                 monero_runtime["last_peerlist_ts"] = self._max_ts(monero_runtime["last_peerlist_ts"], mr.get("last_peerlist_ts"))
                 monero_runtime["last_timed_sync_ts"] = self._max_ts(monero_runtime["last_timed_sync_ts"], mr.get("last_timed_sync_ts"))
+                monero_runtime["last_rpc_ts"] = self._max_ts(monero_runtime["last_rpc_ts"], mr.get("last_tx_ts"))
             elif fam == "monero_rpc":
                 monero_runtime["rpc_flows"] += 1
                 monero_rpc_flows += 1
@@ -10020,6 +10568,442 @@ class TransportMoneroManager:
             float(self._metrics["rpc_rtt_ms_total"]) / float(self._metrics["rpc_rtt_count"]), 2
         ) if self._metrics["rpc_rtt_count"] > 0 else 0.0
         return snap
+
+    def _prune_tx_caches(self, now: float) -> None:
+        try:
+            for cache, ttl in (
+                    (self._tx_cache, self.TX_CACHE_TTL_S),
+                    (self._tx_sem_cache, self.TX_SEM_CACHE_TTL_S),
+            ):
+                stale = []
+                for k, ts in cache.items():
+                    if (now - float(ts)) > ttl:
+                        stale.append(k)
+                for k in stale:
+                    cache.pop(k, None)
+
+                while len(cache) > self.TX_CACHE_SOFT_MAX:
+                    cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def _tx_exact_cache_key(
+            self,
+            *,
+            reply_src_ip: str,
+            reply_dst_ip: str,
+            reply_sport: int,
+            reply_dport: int,
+            flags: str,
+            payload: bytes,
+            tx_reason: str,
+    ) -> tuple:
+        try:
+            payload_sig = hashlib.sha1(bytes(payload or b"")).hexdigest()[:12]
+        except Exception:
+            payload_sig = "nopayload"
+        return (
+            str(tx_reason),
+            str(reply_src_ip),
+            int(reply_sport),
+            str(reply_dst_ip),
+            int(reply_dport),
+            str(flags),
+            payload_sig,
+        )
+
+    def _tx_semantic_cache_key(
+            self,
+            *,
+            kind: str,
+            src_ip: str,
+            dst_ip: str,
+            sport: int,
+            dport: int,
+            flags: Dict[str, Any],
+    ) -> tuple:
+        return (
+            str(kind or ""),
+            str(src_ip),
+            str(dst_ip),
+            int(dport),
+            bool(flags.get("syn")),
+            bool(flags.get("ack")),
+            bool(flags.get("rst")),
+            bool(flags.get("fin")),
+        )
+
+    def _tx_exact_cache_hit(self, key: tuple, now: float) -> bool:
+        self._prune_tx_caches(now)
+        ts = self._tx_cache.get(key)
+        if ts is not None and (now - float(ts)) <= self.TX_CACHE_TTL_S:
+            self._metrics["tx_cache_hit"] += 1
+            return True
+        return False
+
+    def _tx_sem_cache_hit(self, key: tuple, now: float) -> bool:
+        self._prune_tx_caches(now)
+        ts = self._tx_sem_cache.get(key)
+        if ts is not None and (now - float(ts)) <= self.TX_SEM_CACHE_TTL_S:
+            self._metrics["tx_sem_cache_hit"] += 1
+            return True
+        return False
+
+    def _remember_tx_exact(self, key: tuple, now: float) -> None:
+        self._tx_cache[key] = now
+        while len(self._tx_cache) > self.TX_CACHE_SOFT_MAX:
+            self._tx_cache.popitem(last=False)
+
+    def _remember_tx_sem(self, key: tuple, now: float) -> None:
+        self._tx_sem_cache[key] = now
+        while len(self._tx_sem_cache) > self.TX_CACHE_SOFT_MAX:
+            self._tx_sem_cache.popitem(last=False)
+
+    def _maybe_transmit_response(
+            self,
+            *,
+            st: Dict[str, Any],
+            event: Dict[str, Any],
+            packet,
+            src_ip: str,
+            dst_ip: str,
+            sport: int,
+            dport: int,
+            inbound_iface: str,
+            direction: str,
+            flags: Dict[str, Any],
+            now: float,
+    ) -> bool:
+        self._metrics["tx_attempt"] += 1
+
+        if not getattr(self, "active_tx_enabled", False):
+            return False
+
+        pw = getattr(self, "packet_writer", None)
+        if pw is None:
+            self._metrics["tx_skipped_no_writer"] += 1
+            return False
+
+        if packet is None or TCP is None or not packet.haslayer(TCP):
+            return False
+
+        kind = str(event.get("kind") or "")
+        rt = st.get("runtime", {}) or {}
+
+        if not self._tx_slot_ready(st, f"tx:{kind}", now):
+            return False
+
+        syn_only = bool(flags.get("syn") and not flags.get("ack"))
+        payload_len = self._tcp_payload_len(packet)
+
+        sem_key = self._tx_semantic_cache_key(
+            kind=kind,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            sport=sport,
+            dport=dport,
+            flags=flags,
+        )
+
+        if syn_only and kind in (
+                "p2pool_control_syn",
+                "p2pool_data_seed",
+                "p2pool_share",
+                "p2pool_block",
+                "p2pool_peerlist",
+                "p2p_control_syn",
+                "p2p_seed",
+                "p2p_handshake",
+                "p2p_peerlist",
+        ):
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(
+                packet,
+                inbound_iface,
+                flags="SA",
+                tx_reason=f"syn_{kind}",
+            )
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if kind == "transport_rst":
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(packet, inbound_iface, flags="RA", tx_reason="rst")
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if kind == "transport_fin":
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(packet, inbound_iface, flags="FA", tx_reason="fin")
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if rt.get("established") and payload_len > 0 and kind in (
+                "p2pool_share",
+                "p2pool_block",
+                "p2pool_peerlist",
+                "p2pool_chain",
+                "p2pool_partial",
+                "p2p_message",
+                "p2p_blockrelay",
+                "p2p_txrelay",
+                "p2p_chain",
+                "p2p_peerlist",
+                "rpc_method",
+                "rpc_template",
+                "rpc_submit_block",
+                "rpc_response",
+                "rpc_response_error",
+                "rpc_http",
+                "rpc_partial_json",
+        ):
+            if self._tx_sem_cache_hit(sem_key, now):
+                return False
+            ok = self._queue_tcp_reply(
+                packet,
+                inbound_iface,
+                flags="A",
+                tx_reason=f"ack_{kind}",
+            )
+            if ok:
+                self._remember_tx_sem(sem_key, now)
+            return ok
+
+        if rt.get("established"):
+            if kind == "p2p_ping":
+                if self._tx_sem_cache_hit(sem_key, now):
+                    return False
+                cmd = int(event.get("command") or 1003)
+                ok = self._queue_levin_reply(
+                    packet,
+                    inbound_iface,
+                    command=cmd,
+                    body=b"",
+                    tx_reason="levin_ping",
+                )
+                if ok:
+                    self._remember_tx_sem(sem_key, now)
+                return ok
+
+            if kind == "p2p_timed_sync":
+                if self._tx_sem_cache_hit(sem_key, now):
+                    return False
+                cmd = int(event.get("command") or 1002)
+                ok = self._queue_levin_reply(
+                    packet,
+                    inbound_iface,
+                    command=cmd,
+                    body=b"",
+                    tx_reason="levin_timed_sync",
+                )
+                if ok:
+                    self._remember_tx_sem(sem_key, now)
+                return ok
+
+        return False
+
+    def _dst_is_router_ip(self, dst_ip: str) -> bool:
+        pw = getattr(self, "packet_writer", None)
+        if pw is None:
+            return False
+        cfgs = getattr(pw, "_interfaces_config", {}) or {}
+        for cfg in cfgs.values():
+            ip4 = str(cfg.get("ip_addr") or "").strip()
+            ip6 = str(cfg.get("ip6_addr") or "").strip()
+            if dst_ip == ip4 or dst_ip == ip6:
+                return True
+        return False
+
+    def _tcp_payload_len(self, packet) -> int:
+        try:
+            if Raw is not None and packet.haslayer(Raw):
+                return len(bytes(packet[Raw].load))
+        except Exception:
+            pass
+        try:
+            tcp = packet[TCP]
+            if getattr(tcp, "payload", None) is not None:
+                return len(bytes(tcp.payload))
+        except Exception:
+            pass
+        return 0
+
+    def _tcp_advance(self, packet) -> int:
+        adv = self._tcp_payload_len(packet)
+        try:
+            fl = packet[TCP].flags
+            if fl & 0x02:
+                adv += 1
+            if fl & 0x01:
+                adv += 1
+        except Exception:
+            pass
+        return adv
+
+    def _tx_slot_ready(self, st: Dict[str, Any], slot: str, now: float) -> bool:
+        flow_id = st.get("flow_id") or "unknown"
+        key = (flow_id, slot)
+        last = float(self._last_tx_slots.get(key, 0.0) or 0.0)
+        if (now - last) < self.TX_COOLDOWN_S:
+            return False
+        self._last_tx_slots[key] = now
+        return True
+
+    def _queue_tcp_reply(
+            self,
+            request_packet,
+            inbound_iface: str,
+            *,
+            flags: str = "A",
+            payload: bytes = b"",
+            seq: Optional[int] = None,
+            ack: Optional[int] = None,
+            tx_reason: str = "reply",
+    ) -> bool:
+        pw = getattr(self, "packet_writer", None)
+        if pw is None or TCP is None or request_packet is None or not request_packet.haslayer(TCP):
+            self._metrics["tx_failed"] += 1
+            return False
+
+        try:
+            if request_packet.haslayer(IP):
+                ip = IP(
+                    src=request_packet[IP].dst,
+                    dst=request_packet[IP].src,
+                    ttl=64,
+                )
+            elif request_packet.haslayer(IPv6):
+                ip = IPv6(
+                    src=request_packet[IPv6].dst,
+                    dst=request_packet[IPv6].src,
+                    hlim=64,
+                )
+            else:
+                self._metrics["tx_failed"] += 1
+                return False
+
+            tin = request_packet[TCP]
+
+            if seq is None:
+                seq = int(getattr(tin, "ack", 0) or 0)
+
+            if ack is None:
+                ack = int(tin.seq) + self._tcp_advance(request_packet)
+
+            exact_key = self._tx_exact_cache_key(
+                reply_src_ip=ip.src,
+                reply_dst_ip=ip.dst,
+                reply_sport=int(tin.dport),
+                reply_dport=int(tin.sport),
+                flags=flags,
+                payload=payload,
+                tx_reason=tx_reason,
+            )
+
+            now = time.time()
+            if self._tx_exact_cache_hit(exact_key, now):
+                return False
+
+            out = ip / TCP(
+                sport=int(tin.dport),
+                dport=int(tin.sport),
+                flags=flags,
+                seq=int(seq),
+                ack=int(ack),
+                window=int(getattr(tin, "window", 8192) or 8192),
+            )
+
+            if payload:
+                out = out / Raw(load=bytes(payload))
+
+            setattr(out, "_pw_tx", True)
+            setattr(out, "_pw_allow_local_dest", True)
+
+            ok = False
+            if hasattr(pw, "queue_packet"):
+                ok = bool(pw.queue_packet(out, inbound_iface))
+            elif hasattr(pw, "_send_raw_packet"):
+                ok = bool(pw._send_raw_packet(out, inbound_iface, allow_dst_ours=True))
+            else:
+                ok = False
+
+            if ok:
+                self._remember_tx_exact(exact_key, now)
+                self._metrics["tx_queued"] += 1
+                self._emit(
+                    f"[Transport][🪙 Monero][TX][📤 Send] reason={tx_reason} "
+                    f"flags={flags} {ip.src}:{int(tin.dport)} -> {ip.dst}:{int(tin.sport)} "
+                    f"bytes={len(payload or b'')}"
+                )
+            else:
+                self._metrics["tx_failed"] += 1
+                self._emit(
+                    f"[Transport][🪙 Monero][TX][⚠️ QueueFail] reason={tx_reason} "
+                    f"flags={flags} {ip.src}:{int(tin.dport)} -> {ip.dst}:{int(tin.sport)}"
+                )
+            return ok
+
+        except Exception as exc:
+            self._metrics["tx_failed"] += 1
+            self._emit(f"[Transport][🪙 Monero][TX][❌ Error] queue tcp reply failed: {exc}")
+            return False
+
+    def _serialize_levin(
+        self,
+        *,
+        command: int,
+        body: bytes = b"",
+        expect_response: bool = False,
+        return_code: int = 0,
+        flags: int = 0,
+        protocol_version: int = 1,
+    ) -> bytes:
+        body = bytes(body or b"")
+        return (
+            self._levin_signature_bytes()
+            + int(len(body)).to_bytes(8, "little", signed=False)
+            + (b"\x01" if expect_response else b"\x00")
+            + int(command).to_bytes(4, "little", signed=False)
+            + int(return_code).to_bytes(4, "little", signed=True)
+            + int(flags).to_bytes(4, "little", signed=False)
+            + int(protocol_version).to_bytes(4, "little", signed=False)
+            + body
+        )
+
+    def _queue_levin_reply(
+        self,
+        request_packet,
+        inbound_iface: str,
+        *,
+        command: int,
+        body: bytes = b"",
+        seq: Optional[int] = None,
+        ack: Optional[int] = None,
+        tx_reason: str = "levin",
+    ) -> bool:
+        payload = self._serialize_levin(
+            command=int(command),
+            body=body,
+            expect_response=False,
+            return_code=1,
+            flags=0,
+            protocol_version=1,
+        )
+        return self._queue_tcp_reply(
+            request_packet,
+            inbound_iface,
+            flags="PA",
+            payload=payload,
+            seq=seq,
+            ack=ack,
+            tx_reason=tx_reason,
+        )
 
     # ---------------------------------------------------------------------
     # Flow / runtime state
@@ -10085,7 +11069,6 @@ class TransportMoneroManager:
             "bytes_s2c": 0,
             "control_frames": 0,
             "control_psh_ack": 0,
-            "last_runtime_log_ts": 0.0,
             "last_partial_json_ts": 0.0,
             "last_partial_binary_ts": 0.0,
             "anomalies": deque(maxlen=32),
@@ -10140,11 +11123,17 @@ class TransportMoneroManager:
         now: float,
     ) -> List[Dict[str, Any]]:
         if family == "monero_rpc":
-            return self._parse_rpc_payload(st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now)
+            return self._parse_rpc_payload(
+                st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now
+            )
         if family == "monero_p2p":
-            return self._parse_monero_p2p_payload(st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now)
+            return self._parse_monero_p2p_payload(
+                st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now
+            )
         if family == "p2pool":
-            return self._parse_p2pool_payload(st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now)
+            return self._parse_p2pool_payload(
+                st=st, payload=payload, direction=direction, flags=flags, facts=facts, now=now
+            )
         return []
 
     # ---- RPC ----
@@ -10185,42 +11174,49 @@ class TransportMoneroManager:
                     events.append(evt)
 
         if not events:
-            partial_evt = self._maybe_partial_rpc_json(st=st, buf=st[buf_key], direction=direction, now=now)
+            partial_evt = self._maybe_partial_rpc_json(
+                st=st, buf=st[buf_key], direction=direction, now=now
+            )
             if partial_evt is not None:
                 events.append(partial_evt)
+
         return events
 
     def _try_parse_http_prefix(self, buf: bytes) -> Tuple[Optional[Dict[str, Any]], int]:
         if not buf:
             return None, 0
+
         if buf.startswith(b"POST ") or buf.startswith(b"GET ") or buf.startswith(b"HTTP/1.1 ") or buf.startswith(b"HTTP/1.0 "):
             end = buf.find(b"\r\n\r\n")
             if end == -1:
                 end = buf.find(b"\n\n")
+
             if end == -1:
                 preview = self._safe_ascii(buf[: self.ASCII_PREVIEW_MAX], self.ASCII_PREVIEW_MAX) or "-"
                 return {
                     "family": "monero_rpc",
                     "tag_family": "RPC",
-                    "tag": "Response" if buf.startswith(b"HTTP/") else "Method",
+                    "tag": "HTTP",
                     "kind": "rpc_http_partial",
                     "preview": preview,
                     "importance": "low",
                     "log_slot": "rpc_http",
                 }, 0
+
             header_blob = buf[:end]
             text = self._safe_ascii(header_blob, self.ASCII_PREVIEW_MAX) or "-"
             first_line = text.splitlines()[0] if text else "-"
             return {
                 "family": "monero_rpc",
                 "tag_family": "RPC",
-                "tag": "Response" if first_line.startswith("HTTP/") else "Method",
+                "tag": "HTTP",
                 "kind": "rpc_http",
                 "first_line": first_line,
                 "preview": text,
                 "importance": "med",
                 "log_slot": "rpc_http",
             }, end + 4
+
         return None, 0
 
     def _parse_rpc_line(self, line: bytes) -> Optional[Dict[str, Any]]:
@@ -10232,7 +11228,7 @@ class TransportMoneroManager:
                 return {
                     "family": "monero_rpc",
                     "tag_family": "RPC",
-                    "tag": "Response" if '"result"' in low or '"error"' in low else "Method",
+                    "tag": "JSON",
                     "kind": "rpc_json_text",
                     "preview": txt,
                     "importance": "low",
@@ -10295,6 +11291,7 @@ class TransportMoneroManager:
                         height = None
                 elif result.get("blocktemplate_blob") is not None:
                     status = status or "TEMPLATE"
+
             return {
                 "family": "monero_rpc",
                 "tag_family": "RPC",
@@ -10319,11 +11316,20 @@ class TransportMoneroManager:
                 "importance": "low",
                 "log_slot": "rpc_response",
             }
+
         return None
 
-    def _maybe_partial_rpc_json(self, *, st: Dict[str, Any], buf: bytes, direction: str, now: float) -> Optional[Dict[str, Any]]:
+    def _maybe_partial_rpc_json(
+        self,
+        *,
+        st: Dict[str, Any],
+        buf: bytes,
+        direction: str,
+        now: float,
+    ) -> Optional[Dict[str, Any]]:
         if not buf:
             return None
+
         rt = st["runtime"]
         last_ts = float(rt.get("last_partial_json_ts", 0.0) or 0.0)
         if (now - last_ts) < self.PARTIAL_JSON_COOLDOWN_S:
@@ -10332,6 +11338,7 @@ class TransportMoneroManager:
         sample = bytes(buf[-min(len(buf), self.MAX_LINE_BYTES):])
         text = self._safe_ascii(sample, self.ASCII_PREVIEW_MAX) or "-"
         low = text.lower()
+
         if (
             sample[:1] in (b"{", b"[")
             or b'"jsonrpc"' in sample
@@ -10345,13 +11352,14 @@ class TransportMoneroManager:
             return {
                 "family": "monero_rpc",
                 "tag_family": "RPC",
-                "tag": "Response" if '"result"' in low or '"error"' in low else "Method",
+                "tag": "Partial",
                 "kind": "rpc_partial_json",
                 "preview": text,
                 "direction": direction,
                 "importance": "low",
                 "log_slot": "rpc_partial",
             }
+
         return None
 
     # ---- Monero P2P ----
@@ -10413,9 +11421,16 @@ class TransportMoneroManager:
 
         return events
 
-    def _try_parse_monero_epee_peer_blob(self, buf: bytes, *, flags: Dict[str, Any], facts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _try_parse_monero_epee_peer_blob(
+        self,
+        buf: bytes,
+        *,
+        flags: Dict[str, Any],
+        facts: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         if not buf:
             return None
+
         token_hits = 0
         for tok in self.P2P_EPEE_TOKENS:
             if tok in buf:
@@ -10518,6 +11533,7 @@ class TransportMoneroManager:
             "importance": "med",
             "log_slot": "levin",
         }
+
         if cmd == 1001:
             base["tag"] = "Handshake"
             base["kind"] = "p2p_handshake"
@@ -10554,7 +11570,14 @@ class TransportMoneroManager:
             return base
         return None
 
-    def _make_soft_monero_p2p_binary_event(self, *, buf: bytes, facts: Dict[str, Any], now: float, st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _make_soft_monero_p2p_binary_event(
+        self,
+        *,
+        buf: bytes,
+        facts: Dict[str, Any],
+        now: float,
+        st: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         rt = st["runtime"]
         last_ts = float(rt.get("last_partial_binary_ts", 0.0) or 0.0)
         if (now - last_ts) < self.PARTIAL_BINARY_COOLDOWN_S:
@@ -10562,6 +11585,7 @@ class TransportMoneroManager:
 
         preview = self._hex_preview(buf, 64)
         rt["last_partial_binary_ts"] = now
+
         if facts["printable_ratio"] <= 0.20:
             rt["anomalies"].append("monero_p2p_partial_binary")
             return {
@@ -10574,6 +11598,7 @@ class TransportMoneroManager:
                 "importance": "low",
                 "log_slot": "levin_partial",
             }
+
         return None
 
     # ---- P2Pool ----
@@ -10588,6 +11613,7 @@ class TransportMoneroManager:
         facts: Dict[str, Any],
         now: float,
     ) -> List[Dict[str, Any]]:
+        _ = now
         events: List[Dict[str, Any]] = []
         buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
         st[buf_key] = self._append_buf(st.get(buf_key, b""), payload)
@@ -10712,6 +11738,7 @@ class TransportMoneroManager:
         facts: Dict[str, Any],
         now: float,
     ) -> Optional[Dict[str, Any]]:
+        _ = direction
         rt = st["runtime"]
         last_ts = float(rt.get("last_partial_binary_ts", 0.0) or 0.0)
         if (now - last_ts) < self.PARTIAL_BINARY_COOLDOWN_S:
@@ -10732,6 +11759,7 @@ class TransportMoneroManager:
                 "importance": "low",
                 "log_slot": "p2pool_partial",
             }
+
         if family == "monero_p2p":
             return {
                 "family": "monero_p2p",
@@ -10743,17 +11771,19 @@ class TransportMoneroManager:
                 "importance": "low",
                 "log_slot": "levin_partial",
             }
+
         if family == "monero_rpc":
             return {
                 "family": "monero_rpc",
                 "tag_family": "RPC",
-                "tag": "Response",
+                "tag": "Partial",
                 "kind": "rpc_partial_json",
                 "preview": self._safe_ascii(payload, self.ASCII_PREVIEW_MAX) or preview_hex,
                 "bytes": effective_len,
                 "importance": "low",
                 "log_slot": "rpc_partial",
             }
+
         return None
 
     # ---------------------------------------------------------------------
@@ -10799,23 +11829,67 @@ class TransportMoneroManager:
 
         if flags.get("syn") and not flags.get("ack"):
             if family == "p2pool":
-                return {"family": "p2pool", "tag_family": "P2Pool", "tag": "Handshake", "kind": "p2pool_control_syn", "bytes": 0, "importance": "low", "log_slot": "p2pool_ctrl_syn"}
+                return {
+                    "family": "p2pool",
+                    "tag_family": "P2Pool",
+                    "tag": "Handshake",
+                    "kind": "p2pool_control_syn",
+                    "bytes": 0,
+                    "importance": "low",
+                    "log_slot": "p2pool_ctrl_syn",
+                }
             if family == "monero_p2p":
-                return {"family": "monero_p2p", "tag_family": "P2P", "tag": "Handshake", "kind": "p2p_control_syn", "bytes": 0, "importance": "low", "log_slot": "p2p_ctrl_syn"}
+                return {
+                    "family": "monero_p2p",
+                    "tag_family": "P2P",
+                    "tag": "Handshake",
+                    "kind": "p2p_control_syn",
+                    "bytes": 0,
+                    "importance": "low",
+                    "log_slot": "p2p_ctrl_syn",
+                }
 
         if flags.get("psh") and flags.get("ack") and not (flags.get("syn") or flags.get("fin") or flags.get("rst")):
             rt["control_psh_ack"] += 1
-            return {"family": family, "tag_family": tag_family, "tag": "Control", "kind": "transport_control_ack", "bytes": 0, "importance": "low", "log_slot": "transport_control"}
+            return {
+                "family": family,
+                "tag_family": tag_family,
+                "tag": "Control",
+                "kind": "transport_control_ack",
+                "bytes": 0,
+                "importance": "low",
+                "log_slot": "transport_control",
+            }
 
         if flags.get("ack") and not (flags.get("syn") or flags.get("fin") or flags.get("rst") or flags.get("psh")):
             return None
+
         if flags.get("rst"):
-            return {"family": family, "tag_family": tag_family, "tag": "Reset", "kind": "transport_rst", "bytes": 0, "importance": "med", "log_slot": "transport_rst"}
+            return {
+                "family": family,
+                "tag_family": tag_family,
+                "tag": "Reset",
+                "kind": "transport_rst",
+                "bytes": 0,
+                "importance": "med",
+                "log_slot": "transport_rst",
+            }
+
         if flags.get("fin"):
-            return {"family": family, "tag_family": tag_family, "tag": "Finish", "kind": "transport_fin", "bytes": 0, "importance": "low", "log_slot": "transport_fin"}
+            return {
+                "family": family,
+                "tag_family": tag_family,
+                "tag": "Finish",
+                "kind": "transport_fin",
+                "bytes": 0,
+                "importance": "low",
+                "log_slot": "transport_fin",
+            }
+
         return None
 
     def _update_state_from_event(self, st: Dict[str, Any], event: Dict[str, Any], *, now: float, direction: str) -> None:
+        _ = direction
         rt = st["runtime"]
         family = event.get("family")
 
@@ -10825,9 +11899,12 @@ class TransportMoneroManager:
 
         if family == "p2pool":
             p2r = rt["p2pool_runtime"]
-            if kind in ("p2pool_handshake", "p2pool_control_syn", "p2pool_data_seed"):
+            if kind in ("p2pool_handshake", "p2pool_control_syn"):
                 p2r["handshakes"] += 1
-                rt["state"] = "handshake" if kind != "p2pool_data_seed" else "seed"
+                rt["state"] = "handshake"
+            elif kind == "p2pool_data_seed":
+                p2r["handshakes"] += 1
+                rt["state"] = "seed"
             elif kind == "p2pool_peerlist":
                 p2r["peerlists"] += 1
                 p2r["last_peerlist_ts"] = now
@@ -10933,31 +12010,41 @@ class TransportMoneroManager:
             rt["state"] = "reset"
 
     def _update_runtime_from_tcp(self, *, st: Dict[str, Any], flags: Dict[str, Any], effective_len: int, now: float) -> None:
+        _ = now
         rt = st["runtime"]
         if flags.get("syn"):
+            if not rt.get("syn_seen"):
+                self._metrics["flow_open"] += 1
             rt["syn_seen"] = True
-            self._metrics["flow_open"] += 1
             if effective_len > 0:
                 self._metrics["syn_with_payload"] += 1
+
         if flags.get("syn") and flags.get("ack"):
             rt["synack_seen"] = True
+
         if flags.get("ack"):
             rt["ack_seen"] = True
+
         if rt.get("syn_seen") and rt.get("ack_seen") and not rt.get("established"):
             rt["established"] = True
             self._metrics["flow_established"] += 1
+
         if flags.get("fin"):
+            if not rt.get("fin_seen"):
+                self._metrics["flow_fin"] += 1
             rt["fin_seen"] = True
-            self._metrics["flow_fin"] += 1
+
         if flags.get("rst"):
+            if not rt.get("rst_seen"):
+                self._metrics["flow_rst"] += 1
             rt["rst_seen"] = True
-            self._metrics["flow_rst"] += 1
 
     def _bump_metrics(self, event: Dict[str, Any]) -> None:
         kind = str(event.get("kind") or "")
         fam = str(event.get("family") or "")
+
         if fam == "p2pool":
-            if kind in ("p2pool_handshake", "p2pool_control_syn", "p2pool_data_seed"):
+            if kind in ("p2pool_handshake", "p2pool_control_syn"):
                 self._metrics["p2pool_handshake"] += 1
             elif kind == "p2pool_peerlist":
                 self._metrics["p2pool_peerlist"] += 1
@@ -10969,6 +12056,7 @@ class TransportMoneroManager:
                 self._metrics["p2pool_chain"] += 1
             elif kind == "p2pool_data_seed":
                 self._metrics["p2pool_seed"] += 1
+
         elif fam == "monero_p2p":
             if kind == "p2p_handshake":
                 self._metrics["monero_p2p_handshake"] += 1
@@ -10990,6 +12078,7 @@ class TransportMoneroManager:
                 self._metrics["monero_p2p_seed"] += 1
                 if kind == "monero_levin_partial":
                     self._metrics["monero_levin_partial"] += 1
+
         elif fam == "monero_rpc":
             if kind == "rpc_method":
                 self._metrics["rpc_method"] += 1
@@ -11011,17 +12100,64 @@ class TransportMoneroManager:
     def _emit_classification(self, st: Dict[str, Any], event: Dict[str, Any]) -> None:
         family = event.get("family") or "unknown"
         flow_id = st.get("flow_id") or "UNKNOWN"
+
         if family == "monero_p2p":
             self._metrics["classify_monero_p2p"] += 1
-            self._emit(f"[Transport][🪙 Monero][P2P][Classify] [{flow_id}] tag={event.get('tag')}")
+            self._emit(f"[Transport][🪙 Monero][P2P][🧠 Classify] [{flow_id}] tag={event.get('tag')}")
         elif family == "monero_rpc":
             self._metrics["classify_monero_rpc"] += 1
-            self._emit(f"[Transport][🪙 Monero][RPC][Classify] [{flow_id}] tag={event.get('tag')}")
+            self._emit(f"[Transport][🪙 Monero][RPC][🧠 Classify] [{flow_id}] tag={event.get('tag')}")
         elif family == "p2pool":
             self._metrics["classify_p2pool"] += 1
-            self._emit(f"[Transport][🪙 Monero][P2Pool][Classify] [{flow_id}] tag={event.get('tag')}")
+            self._emit(f"[Transport][🪙 Monero][P2Pool][🧠 Classify] [{flow_id}] tag={event.get('tag')}")
         else:
             self._metrics["classify_unknown"] += 1
+
+    def _emoji_for_event(self, family: str, kind: str, tag: str) -> str:
+        if family == "p2pool":
+            return {
+                "p2pool_control_syn": "🤝",
+                "p2pool_peerlist": "👥",
+                "p2pool_share": "🧩",
+                "p2pool_block": "🧱",
+                "p2pool_chain": "🧬",
+                "p2pool_partial": "🧩",
+                "p2pool_data_seed": "🌱",
+            }.get(kind, "🪙")
+
+        if family == "monero_p2p":
+            return {
+                "p2p_handshake": "🤝",
+                "p2p_control_syn": "🤝",
+                "p2p_timed_sync": "⏱️",
+                "p2p_ping": "📡",
+                "p2p_support_flags": "🎛️",
+                "p2p_blockrelay": "🧱",
+                "p2p_txrelay": "📦",
+                "p2p_chain": "🧬",
+                "p2p_peerlist": "👥",
+                "p2p_seed": "🌱",
+                "monero_levin_partial": "🧩",
+                "p2p_message": "💬",
+                "transport_control_ack": "🛂",
+                "transport_rst": "⛔",
+                "transport_fin": "🏁",
+            }.get(kind, "🪙")
+
+        if family == "monero_rpc":
+            return {
+                "rpc_method": "📞",
+                "rpc_template": "🧱",
+                "rpc_submit_block": "📤",
+                "rpc_response": "📥",
+                "rpc_response_error": "❌",
+                "rpc_http": "🌐",
+                "rpc_http_partial": "🌐",
+                "rpc_partial_json": "🧩",
+                "rpc_json_text": "🧾",
+            }.get(kind, "🪙")
+
+        return "🪙"
 
     def _log_event(
         self,
@@ -11036,8 +12172,13 @@ class TransportMoneroManager:
         direction: str,
         now: float,
     ) -> None:
-        family = event.get("family")
+        _ = st
+        _ = now
+        family = str(event.get("family") or "")
+        kind = str(event.get("kind") or "")
         tag = str(event.get("tag") or "Message")
+        emoji = self._emoji_for_event(family, kind, tag)
+
         flow = f"{src_ip}:{sport} -> {dst_ip}:{dport}"
         if direction == "s2c":
             flow = f"{src_ip}:{sport} <- {dst_ip}:{dport}"
@@ -11056,7 +12197,7 @@ class TransportMoneroManager:
                 suffix_parts.append(f"reason={event['reason']}")
             if event.get("preview_hex"):
                 suffix_parts.append(f"hex={event['preview_hex']}")
-            self._emit(f"[Transport][🪙 Monero][P2P][{tag}] " + " ".join(suffix_parts))
+            self._emit(f"[Transport][🪙 Monero][P2P][{emoji} {tag}] " + " ".join(suffix_parts))
             return
 
         if family == "monero_rpc":
@@ -11074,7 +12215,7 @@ class TransportMoneroManager:
             preview = event.get("preview") or event.get("result_preview") or event.get("params_preview")
             if preview:
                 suffix_parts.append(f"preview={preview}")
-            self._emit(f"[Transport][🪙 Monero][RPC][{tag}] " + " ".join(suffix_parts))
+            self._emit(f"[Transport][🪙 Monero][RPC][{emoji} {tag}] " + " ".join(suffix_parts))
             return
 
         if family == "p2pool":
@@ -11089,7 +12230,7 @@ class TransportMoneroManager:
                 suffix_parts.append("seed=true")
             if event.get("preview_hex"):
                 suffix_parts.append(f"hex={event['preview_hex']}")
-            self._emit(f"[Transport][🪙 Monero][P2Pool][{tag}] " + " ".join(suffix_parts))
+            self._emit(f"[Transport][🪙 Monero][P2Pool][{emoji} {tag}] " + " ".join(suffix_parts))
             return
 
     # ---------------------------------------------------------------------
@@ -11141,30 +12282,33 @@ class TransportMoneroManager:
         try:
             ip_layer = packet.getlayer("IP") or packet.getlayer("IPv6")
             tcp = packet[TCP]
-            if hasattr(ip_layer, "len"):
+            if hasattr(ip_layer, "len") and hasattr(ip_layer, "ihl"):
                 total_len = int(ip_layer.len)
                 tcp_hlen = int(getattr(tcp, "dataofs", 5) or 5) * 4
                 return max(0, total_len - (int(ip_layer.ihl) * 4) - tcp_hlen)
         except Exception:
             pass
         try:
-            return len(bytes(tcp.payload))
+            return len(bytes(packet[TCP].payload))
         except Exception:
             return 0
 
     def _payload_facts(self, payload: bytes) -> Dict[str, Any]:
         if not payload:
             return {"entropy": 0.0, "printable_ratio": 1.0, "sha1_8": "n/a"}
+
         freqs = collections.Counter(payload)
         plen = float(len(payload))
         entropy = 0.0
         for count in freqs.values():
             p = float(count) / plen
             entropy -= p * math.log(p, 2)
+
         printable = 0
         for b in payload:
             if 32 <= b <= 126 or b in (9, 10, 13):
                 printable += 1
+
         sha = hashlib.sha1(payload).hexdigest()[:8]
         return {
             "entropy": round(entropy, 4),
@@ -11355,10 +12499,19 @@ class TransportMoneroManager:
         if not isinstance(recent, collections.OrderedDict):
             recent = collections.OrderedDict()
             rt["recent_control_fps"] = recent
-        fp = (src_ip, dst_ip, int(sport), int(dport), tuple(sorted(k for k, v in flags.items() if v)), int(effective_len))
+
+        fp = (
+            src_ip,
+            dst_ip,
+            int(sport),
+            int(dport),
+            tuple(sorted(k for k, v in flags.items() if v)),
+            int(effective_len),
+        )
         ts = recent.get(fp)
         if ts is not None and (now - float(ts)) < self.CONTROL_DUP_TTL_S:
             return True
+
         recent[fp] = now
         while len(recent) > self.MAX_CONTROL_FPS:
             recent.popitem(last=False)
@@ -11392,18 +12545,22 @@ class TransportMoneroManager:
         if (now - self._last_gc) < self.GC_PERIOD_SEC:
             return
         self._last_gc = now
+
         old = []
         for k, st in self._flows.items():
             last = float(st.get("last", now) or now)
             if (now - last) > self.FLOW_TTL_SEC:
                 old.append(k)
+
         for k in old:
             self._flows.pop(k, None)
+
         if len(self._flows) > self.FLOW_SOFT_MAX:
             items = sorted(self._flows.items(), key=lambda kv: float(kv[1].get("last", 0.0)))
             trim_n = max(0, len(self._flows) - self.FLOW_SOFT_MAX)
             for k, _v in items[:trim_n]:
                 self._flows.pop(k, None)
+
         self._metrics["flows"] = len(self._flows)
 
     def _max_ts(self, a: Optional[float], b: Optional[float]) -> Optional[float]:
@@ -23627,6 +24784,7 @@ class TransportManager:
 
         self.transport_monero = TransportMoneroManager(
             self.logger,
+            self.packet_writer,
         )
         self.transport_scada = TransportSCADAManager(self.logger)
         self.transport_rip = TransportRIPManager(self.logger)
@@ -26305,7 +27463,7 @@ class EthernetBridgeManager:
     Dynamic bridge boundary behavior:
       - Scores frames at runtime instead of relying on a fixed allow/deny rule
       - Strongly discourages bridging likely Monero / Stratum / HTTPS / SSH /
-        HTTP / mDNS / other important routed application traffic
+        HTTP / mDNS / IGMP / ICMP / other important routed application traffic
       - Prefers bridging true local L2/LAN control traffic
       - When boundary says "do not bridge", attaches a passthrough candidate:
             frame._bridge_passthrough_candidate
@@ -26523,6 +27681,135 @@ class EthernetBridgeManager:
             return False
         return False
 
+    def _has_igmp(self, frame: Packet) -> bool:
+        """
+        Detect IGMP robustly, even when Scapy's specific IGMPv3 layer classes
+        differ across environments.
+        """
+        try:
+            if frame is None:
+                return False
+        except Exception:
+            return False
+
+        try:
+            if frame.haslayer(IP):
+                proto = int(getattr(frame[IP], "proto", -1))
+                if proto == 2:
+                    return True
+        except Exception:
+            pass
+
+        for layer_name in ("IGMP", "IGMPv3", "IGMPv3mr", "IGMPv3mq", "IGMPv3gr"):
+            try:
+                layer_cls = globals().get(layer_name)
+                if layer_cls is not None and frame.haslayer(layer_cls):
+                    return True
+            except Exception:
+                pass
+
+        try:
+            s = frame.summary().lower()
+            if "igmp" in s:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _has_icmp_boundary(self, frame: Packet) -> bool:
+        """
+        ICMP/ICMPv6 traffic that should prefer the boundary passthrough path.
+        ICMPv6 ND is excluded so ND can remain local-control.
+        """
+        try:
+            if frame.haslayer(IP):
+                if int(getattr(frame[IP], "proto", -1)) == 1:
+                    return True
+        except Exception:
+            pass
+
+        try:
+            if frame.haslayer(IPv6):
+                if not self._has_icmpv6_nd(frame) and int(getattr(frame[IPv6], "nh", -1)) == 58:
+                    return True
+        except Exception:
+            pass
+
+        try:
+            s = frame.summary().lower()
+            if "icmpv6" in s and not self._has_icmpv6_nd(frame):
+                return True
+            if "icmp" in s and "icmpv6nd" not in s and "igmp" not in s:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _is_portless_unidentified_ip(self, frame: Packet) -> bool:
+        """
+        IP/IPv6 traffic with no TCP/UDP ports and no strong protocol family match.
+        This should go upward to the L3 pipeline instead of being L2-flooded.
+        """
+        try:
+            if frame is None:
+                return False
+
+            if not (frame.haslayer(IP) or frame.haslayer(IPv6)):
+                return False
+
+            if frame.haslayer(TCP) or frame.haslayer(UDP):
+                return False
+
+            if frame.haslayer(ARP) or frame.haslayer(BOOTP) or frame.haslayer(DHCP):
+                return False
+
+            if frame.haslayer(DNS):
+                return False
+
+            if self._has_icmpv6_nd(frame):
+                return False
+
+            if self._has_igmp(frame):
+                return False
+
+            if self._has_icmp_boundary(frame):
+                return False
+
+            return True
+        except Exception:
+            return False
+
+    def _is_forced_boundary_l3(self, frame: Packet):
+        """
+        Hard pre-bridge escape hatch.
+        Returns: (should_boundary, family, candidate, reason)
+        """
+        candidate = self._build_passthrough_candidate(frame)
+        if candidate is None:
+            return False, None, None, None
+
+        try:
+            if self._has_igmp(frame):
+                return True, "igmp", candidate, "forced_boundary:igmp"
+        except Exception:
+            pass
+
+        try:
+            if self._has_icmp_boundary(frame):
+                return True, "icmp", candidate, "forced_boundary:icmp"
+        except Exception:
+            pass
+
+        try:
+            if self._is_portless_unidentified_ip(frame):
+                return True, "portless_ip_unknown", candidate, "forced_boundary:portless_ip_unknown"
+        except Exception:
+            pass
+
+        return False, None, None, None
+
     def _build_flow_key(self, frame: Packet, inbound_iface: str) -> str:
         src_ip, dst_ip = self._get_ips(frame)
         sport, dport = self._get_ports(frame)
@@ -26588,8 +27875,13 @@ class EthernetBridgeManager:
         is_broadcast = dst_mac == "ff:ff:ff:ff:ff:ff"
         is_multicast = dst_mac.startswith(("01:00:5e", "33:33"))
 
-        # Broadcast/multicast is normally easier to bridge, but not for mDNS.
-        if (is_broadcast or is_multicast) and app_family != "mdns":
+        boundary_families = {
+            "monero", "stratum", "https", "ssh", "http", "generic_routed",
+            "mdns", "igmp", "icmp", "portless_ip_unknown"
+        }
+
+        # Broadcast/multicast is normally easier to bridge, but not for boundary protocols.
+        if (is_broadcast or is_multicast) and app_family not in boundary_families:
             threshold -= 0.16
 
         # If we already learned an exact destination port, slightly easier to bridge.
@@ -26597,8 +27889,12 @@ class EthernetBridgeManager:
             threshold -= 0.06
 
         # Routed / app classifications make threshold stricter.
-        if app_family in {"monero", "stratum", "https", "ssh", "http", "generic_routed", "mdns"}:
+        if app_family in boundary_families:
             threshold += min(0.22, classification.get("confidence", 0.0) * 0.22)
+
+        # Make hard-boundary families especially likely to stay on the boundary.
+        if app_family in {"igmp", "icmp", "portless_ip_unknown"}:
+            threshold += 0.10
 
         # Clamp
         if threshold < 0.18:
@@ -26620,6 +27916,43 @@ class EthernetBridgeManager:
         confidence = 0.0
         family = "none"
         emoji = "🟢"
+
+        # IGMP boundary traffic
+        igmp_hits = 0
+        try:
+            if self._has_igmp(frame):
+                igmp_hits += 1
+                hints.append("igmp_proto")
+        except Exception:
+            pass
+        try:
+            if dst_ip in {"224.0.0.1", "224.0.0.2", "224.0.0.22"}:
+                igmp_hits += 1
+                hints.append("igmp_group_dst")
+        except Exception:
+            pass
+        try:
+            if frame.haslayer(Ether) and str(frame[Ether].dst).lower().startswith("01:00:5e"):
+                igmp_hits += 1
+                hints.append("igmp_l2_multicast")
+        except Exception:
+            pass
+
+        if igmp_hits:
+            conf = 0.52 + min(0.34, igmp_hits * 0.14)
+            if conf > confidence:
+                confidence = min(conf, 1.0)
+                family = "igmp"
+                emoji = "📡"
+
+        # ICMP / ICMPv6 boundary traffic
+        if self._has_icmp_boundary(frame):
+            conf = 0.72
+            if conf > confidence:
+                confidence = conf
+                family = "icmp"
+                emoji = "📶"
+                hints.append("icmp_boundary")
 
         # mDNS / DNS-SD boundary traffic
         mdns_qname = ""
@@ -26753,6 +28086,19 @@ class EthernetBridgeManager:
                 family = "http"
                 emoji = "🌐"
 
+        # Portless/unidentified IP traffic should prefer the L3 passthrough path.
+        if self._is_portless_unidentified_ip(frame) and family == "none":
+            conf = 0.56
+            if len(data) > 0:
+                conf += min(0.10, len(data) / 4096.0)
+                hints.append("portless_ip_payload")
+            else:
+                hints.append("portless_ip_no_payload")
+            hints.append("no_transport_ports")
+            confidence = min(conf, 1.0)
+            family = "portless_ip_unknown"
+            emoji = "🧩"
+
         # Generic routed TCP app payload
         if frame.haslayer(TCP) and len(data) > 0 and family == "none":
             confidence = max(confidence, 0.28 + min(0.22, len(data) / 2048.0))
@@ -26785,6 +28131,15 @@ class EthernetBridgeManager:
                 return True
             if self._has_icmpv6_nd(frame):
                 return True
+
+            # These must stay on the boundary / outer L3 logic.
+            if self._has_igmp(frame):
+                return False
+            if self._has_icmp_boundary(frame):
+                return False
+            if self._is_portless_unidentified_ip(frame):
+                return False
+
             if frame.haslayer(DNS):
                 sport, dport = self._get_ports(frame)
                 src_ip, dst_ip = self._get_ips(frame)
@@ -26802,19 +28157,21 @@ class EthernetBridgeManager:
                 if src_ip and self._is_link_local_ipv6(src_ip):
                     return True
                 if dst_ip and (self._is_link_local_ipv6(dst_ip) or self._is_ipv6_multicast(dst_ip)):
-                    # Keep generic IPv6 local behavior, but avoid marking mDNS
-                    # as control-plane if classifier already recognized it.
                     cls = self._classify_application_interest(frame)
-                    if cls.get("family") != "mdns":
+                    if cls.get("family") not in {"mdns", "igmp", "icmp", "portless_ip_unknown"}:
                         return True
 
             if frame.haslayer(IP):
                 src_ip, dst_ip = self._get_ips(frame)
                 if src_ip and self._is_link_local_ipv4(src_ip):
                     return True
-                if dst_ip and (self._is_link_local_ipv4(dst_ip) or self._is_ipv4_multicast(dst_ip) or dst_ip == "255.255.255.255"):
+                if dst_ip and (
+                    self._is_link_local_ipv4(dst_ip)
+                    or self._is_ipv4_multicast(dst_ip)
+                    or dst_ip == "255.255.255.255"
+                ):
                     cls = self._classify_application_interest(frame)
-                    if cls.get("family") != "mdns":
+                    if cls.get("family") not in {"mdns", "igmp", "icmp", "portless_ip_unknown"}:
                         return True
         except Exception:
             return False
@@ -26891,16 +28248,21 @@ class EthernetBridgeManager:
         app_conf = float(classification.get("confidence", 0.0))
         is_local_control = self._is_local_control_plane(frame)
 
+        boundary_families = {
+            "monero", "stratum", "https", "ssh", "http", "generic_routed",
+            "mdns", "igmp", "icmp", "portless_ip_unknown"
+        }
+        hard_passthrough_families = {"igmp", "icmp", "portless_ip_unknown"}
+
         positives = []
         negatives = []
 
-        # Normal multicast/broadcast friendliness, except for mDNS which is
-        # intentionally treated as boundary traffic.
-        if is_broadcast and app_family != "mdns":
+        # Normal multicast/broadcast friendliness, except for boundary traffic.
+        if is_broadcast and app_family not in boundary_families:
             positives.append(("broadcast_mac", 0.40))
-        if is_multicast and app_family != "mdns":
+        if is_multicast and app_family not in boundary_families:
             positives.append(("multicast_mac", 0.28))
-        if is_local_control and app_family != "mdns":
+        if is_local_control and app_family not in boundary_families:
             positives.append(("local_control_plane", 0.48))
         if target_iface and target_iface != inbound_iface:
             positives.append(("known_unicast_target", 0.24))
@@ -26914,12 +28276,12 @@ class EthernetBridgeManager:
         if frame.haslayer(IP) or frame.haslayer(IPv6):
             negatives.append(("ip_or_ipv6_present", 0.10))
 
-        # Link-local / multicast IP can still be bridge-friendly, except for mDNS.
+        # Link-local / multicast IP can still be bridge-friendly, except for boundary traffic.
         if src_ip and (self._is_link_local_ipv4(src_ip) or self._is_link_local_ipv6(src_ip)):
-            if app_family != "mdns":
+            if app_family not in boundary_families:
                 positives.append(("src_link_local", 0.18))
             else:
-                negatives.append(("mdns_src_linklocal_boundary", 0.10))
+                negatives.append((f"{app_family}_src_linklocal_boundary", 0.10))
 
         if dst_ip and (
             self._is_link_local_ipv4(dst_ip)
@@ -26928,19 +28290,26 @@ class EthernetBridgeManager:
             or self._is_ipv6_multicast(dst_ip)
             or dst_ip == "255.255.255.255"
         ):
-            if app_family != "mdns":
+            if app_family not in boundary_families:
                 positives.append(("dst_local_multicast_or_linklocal", 0.24))
             else:
-                negatives.append(("mdns_dst_multicast_boundary", 0.22))
+                negatives.append((f"{app_family}_dst_multicast_boundary", 0.22))
 
         # Important app/routed traffic gets penalized heavily.
-        if app_family in {"monero", "stratum", "https", "ssh", "http", "generic_routed", "mdns"}:
+        if app_family in boundary_families:
             negatives.append((f"{app_family}_boundary", 0.28 + (app_conf * 0.72)))
 
-        # Extra nudge so mDNS really stays on the boundary even though it often
-        # looks "local" from an L2 perspective.
         if app_family == "mdns":
             negatives.append(("mdns_service_discovery_boundary", 0.22))
+
+        if app_family == "igmp":
+            negatives.append(("igmp_membership_boundary", 0.32))
+
+        if app_family == "icmp":
+            negatives.append(("icmp_boundary", 0.28))
+
+        if app_family == "portless_ip_unknown":
+            negatives.append(("portless_ip_boundary", 0.30))
 
         # TCP handshake with data or established data is more likely app/routed than local L2-only.
         try:
@@ -26994,6 +28363,10 @@ class EthernetBridgeManager:
 
         threshold = self._get_dynamic_threshold(frame, target_iface, classification)
         should_bridge = bridge_score >= threshold
+
+        # Hard boundary override for families meant for outer L3 handling.
+        if app_family in hard_passthrough_families:
+            should_bridge = False
 
         reason = "bridge"
         if not should_bridge:
@@ -27097,7 +28470,32 @@ class EthernetBridgeManager:
         src_mac = str(frame[Ether].src).lower()
         dst_mac = str(frame[Ether].dst).lower()
 
+        # Learn source MAC first.
         self.learn_mac(src_mac, inbound_iface)
+
+        # HARD EARLY BOUNDARY:
+        # Do this before bridge membership / MAC table / flood logic so IGMP/ICMP
+        # cannot fall into unknown-unicast flooding when Ethernet dst is weird/unicast.
+        forced_boundary, forced_family, forced_candidate, forced_reason = self._is_forced_boundary_l3(frame)
+        if forced_boundary:
+            if forced_candidate is not None:
+                self._annotate_passthrough(frame, forced_candidate, forced_reason)
+                pass_name = "IPv4" if forced_candidate.haslayer(IP) else "IPv6" if forced_candidate.haslayer(IPv6) else "IP"
+            else:
+                pass_name = "none"
+
+            emoji = {
+                "igmp": "📡",
+                "icmp": "📶",
+                "portless_ip_unknown": "🧩",
+            }.get(forced_family, "🚧")
+
+            self.logger.log_message(
+                f"[Bridge] 🚧🧠 Hard boundary on {self._safe_iface_tail(inbound_iface)} "
+                f"{src_mac}->{dst_mac} class={emoji}{forced_family} wrap={pass_name} "
+                f"reason={forced_reason}"
+            )
+            return False
 
         bridge_name = self.get_bridge_for_interface(inbound_iface)
         if not bridge_name:
@@ -27119,7 +28517,30 @@ class EthernetBridgeManager:
         app_conf = float(classification.get("confidence", 0.0))
         app_emoji = classification.get("emoji", "🟢")
 
+        boundary_passthrough_families = {
+            "monero", "stratum", "https", "ssh", "http", "generic_routed",
+            "mdns", "igmp", "icmp", "portless_ip_unknown"
+        }
+
         if target_iface and target_iface == inbound_iface:
+            candidate = None
+            if app_family in boundary_passthrough_families:
+                candidate = self._build_passthrough_candidate(frame)
+
+            if candidate is not None:
+                self._annotate_passthrough(
+                    frame,
+                    candidate,
+                    f"same_port_boundary_passthrough:{app_family}"
+                )
+                self._update_flow_bias(decision["flow_key"], bridged=False, app_conf=app_conf)
+                pass_name = "IPv4" if candidate.haslayer(IP) else "IPv6" if candidate.haslayer(IPv6) else "IP"
+                self.logger.log_message(
+                    f"[Bridge] ↩️🧳 Same-port L2 target, but holding boundary for "
+                    f"{app_emoji}{app_family} {src_mac}->{dst_mac} wrap={pass_name}."
+                )
+                return False
+
             self._update_flow_bias(decision["flow_key"], bridged=False, app_conf=app_conf)
             self.logger.log_message(
                 f"[Bridge] ↩️🚫 Dropping L2 Frame {src_mac}->{dst_mac} (same source/dest port)."

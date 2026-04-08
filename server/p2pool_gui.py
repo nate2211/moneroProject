@@ -404,6 +404,7 @@ class P2PoolGUI(QMainWindow):
         use_uplink = self.router_tab.use_uplink_checkbox.isChecked()
         nat_os = self.router_tab.nat_os_checkbox.isChecked()
         python_server = self.router_tab.python_server_checkbox.isChecked()
+        promisc = self.router_tab.promisc_checkbox.isChecked()
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
@@ -430,6 +431,7 @@ class P2PoolGUI(QMainWindow):
                 use_uplink=use_uplink,
                 nat_os=nat_os,
                 python_server=python_server,
+                promisc=promisc
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")

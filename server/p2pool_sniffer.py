@@ -1453,6 +1453,448 @@ class SnifferSoftware:
         else:
             return "33:33:%02x:%02x:%02x:%02x" % (b[12], b[13], b[14], b[15])
 
+    def _is_iface_recovery_error(self, err_text: str) -> bool:
+        s = str(err_text or "").strip().lower()
+        if not s:
+            return False
+
+        needles = (
+            "not found",
+            "no such device",
+            "invalid handle",
+            "the handle is invalid",
+            "device removed",
+            "adapter was removed",
+            "network adapter has been removed",
+            "interface disappeared",
+            "error_device_removed",
+            "status_device_removed",
+            "filename, directory name, or volume label syntax is incorrect",
+        )
+        if any(n in s for n in needles):
+            return True
+
+        try:
+            return self._looks_like_removed_iface_error(s)
+        except Exception:
+            return False
+
+    def _recover_send_iface(self, failed_iface: str, packet: Packet) -> str | None:
+        """
+        Only called after a real iface/open/send failure.
+        """
+        failed_iface = self._normalize_pcap_name(failed_iface)
+
+        # 1) aliases / reopen candidates
+        try:
+            current = {}
+            for row in get_windows_if_list():
+                pcap_name = self._normalize_pcap_name(row.get("pcap_name"))
+                if not pcap_name:
+                    continue
+                current[pcap_name] = pcap_name
+                for k in ("name", "win_name", "friendlyname", "description", "guid"):
+                    v = row.get(k)
+                    if isinstance(v, str) and v.strip():
+                        current[self._normalize_pcap_name(v)] = pcap_name
+
+            for cand in self._iter_reopen_candidates(failed_iface):
+                cand = self._normalize_pcap_name(cand)
+                pcap_name = current.get(cand)
+                if pcap_name and pcap_name != failed_iface:
+                    return pcap_name
+        except Exception:
+            pass
+
+        # 2) OS-selected egress for destination
+        try:
+            alt = self._pick_pcap_iface_for_dst(str(packet.dst))
+            if alt:
+                alt = self._normalize_pcap_name(alt)
+                if alt != failed_iface:
+                    return alt
+        except Exception:
+            pass
+
+        # 3) outbound manager fallback
+        try:
+            alt = self.outbound_manager.get_next_interface(packet)
+            if alt:
+                alt = self._normalize_pcap_name(alt)
+                if alt != failed_iface:
+                    return alt
+        except Exception:
+            pass
+
+        return None
+
+    def _recover_sr1_iface(self, failed_iface: str, packet: Packet) -> str | None:
+        """
+        Only used after a real interface failure.
+        """
+        failed_iface = self._normalize_pcap_name(failed_iface)
+
+        # 1) try alias / reopen candidates
+        try:
+            current = {}
+            for row in get_windows_if_list():
+                pcap_name = self._normalize_pcap_name(row.get("pcap_name"))
+                if not pcap_name:
+                    continue
+                current[pcap_name] = pcap_name
+                for k in ("name", "win_name", "friendlyname", "description", "guid"):
+                    v = row.get(k)
+                    if isinstance(v, str) and v.strip():
+                        current[self._normalize_pcap_name(v)] = pcap_name
+
+            for cand in self._iter_reopen_candidates(failed_iface):
+                cand = self._normalize_pcap_name(cand)
+                mapped = current.get(cand)
+                if mapped and mapped != failed_iface:
+                    return mapped
+        except Exception:
+            pass
+
+        # 2) if loopback was involved or iface is stale, ask OS which NIC reaches dst
+        try:
+            alt = self._pick_pcap_iface_for_dst(str(packet.dst))
+            if alt:
+                alt = self._normalize_pcap_name(alt)
+                if alt != failed_iface:
+                    return alt
+        except Exception:
+            pass
+
+        # 3) outbound manager fallback
+        try:
+            alt = self.outbound_manager.get_next_interface(packet)
+            if alt:
+                alt = self._normalize_pcap_name(alt)
+                if alt != failed_iface:
+                    return alt
+        except Exception:
+            pass
+
+        return None
+
+    def _build_pcap_alias_map(self):
+        """
+        Build:
+          - alias_to_pcap: any known alias -> real pcap_name
+          - pcap_to_row:   real pcap_name -> windows iface row
+        """
+        alias_to_pcap = {}
+        pcap_to_row = {}
+
+        try:
+            for row in get_windows_if_list():
+                pcap_name = self._normalize_pcap_name(row.get("pcap_name"))
+                if not pcap_name:
+                    continue
+
+                pcap_to_row[pcap_name] = row
+                alias_to_pcap[pcap_name] = pcap_name
+
+                for key in ("name", "win_name", "friendlyname", "description", "guid"):
+                    val = row.get(key)
+                    if isinstance(val, str) and val.strip():
+                        alias_to_pcap[self._normalize_pcap_name(val)] = pcap_name
+        except Exception:
+            pass
+
+        return alias_to_pcap, pcap_to_row
+
+    def _friendly_name_for_pcap_iface(self, iface: str) -> str | None:
+        """
+        Resolve a pcap iface/alias to a Windows-friendly adapter name.
+        """
+        iface = self._normalize_pcap_name(iface)
+        alias_to_pcap, pcap_to_row = self._build_pcap_alias_map()
+
+        pcap_name = alias_to_pcap.get(iface, iface)
+        row = pcap_to_row.get(pcap_name)
+        if row:
+            for key in ("friendlyname", "name", "win_name", "description"):
+                val = row.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+
+        # Fallback to router config
+        try:
+            cfg = (getattr(self, "_interfaces_config", {}) or {}).get(iface, {}) or {}
+            for key in ("friendly_name", "name", "description"):
+                val = cfg.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        except Exception:
+            pass
+
+        return None
+
+    def _adapter_looks_up(self, friendly_name: str) -> bool:
+        """
+        Best-effort check whether the Windows adapter appears present/up.
+        """
+        if not friendly_name:
+            return False
+
+        try:
+            stats = psutil.net_if_stats()
+            for nic, st in stats.items():
+                if nic.strip().lower() == friendly_name.strip().lower():
+                    return bool(st.isup)
+        except Exception:
+            pass
+
+        return False
+
+    def _maybe_reenable_adapter(self, friendly_name: str, read_label: str = "Sniffer") -> bool:
+        """
+        Best-effort attempt to re-enable a Windows adapter.
+        Requires admin privileges.
+        Returns True if the adapter appears up afterward.
+        """
+        if not friendly_name:
+            return False
+
+        subprocess_mod = __import__("subprocess")
+        ps_name = friendly_name.replace("'", "''")
+        netsh_name_arg = f"name={friendly_name}"
+
+        def _run(cmd):
+            try:
+                return subprocess_mod.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=getattr(subprocess_mod, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                return None
+
+        def _wait_up(seconds: float = 2.5, step: float = 0.25) -> bool:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                if self._adapter_looks_up(friendly_name):
+                    return True
+                time.sleep(step)
+            return self._adapter_looks_up(friendly_name)
+
+        # 1) Try simple enable first
+        enable_cmds = [
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                f"Enable-NetAdapter -Name '{ps_name}' -Confirm:$false",
+            ],
+            [
+                "netsh",
+                "interface",
+                "set",
+                "interface",
+                netsh_name_arg,
+                "admin=ENABLED",
+            ],
+        ]
+
+        for cmd in enable_cmds:
+            _run(cmd)
+            if _wait_up():
+                self.logger.log_message(
+                    f"[{read_label}] 🟢 Adapter '{friendly_name}' is enabled/up."
+                )
+                return True
+
+        # 2) Last resort: bounce the adapter (disable -> enable)
+        bounce_cmds = [
+            (
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command",
+                    f"Disable-NetAdapter -Name '{ps_name}' -Confirm:$false",
+                ],
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command",
+                    f"Enable-NetAdapter -Name '{ps_name}' -Confirm:$false",
+                ],
+            ),
+            (
+                [
+                    "netsh",
+                    "interface",
+                    "set",
+                    "interface",
+                    netsh_name_arg,
+                    "admin=DISABLED",
+                ],
+                [
+                    "netsh",
+                    "interface",
+                    "set",
+                    "interface",
+                    netsh_name_arg,
+                    "admin=ENABLED",
+                ],
+            ),
+        ]
+
+        for disable_cmd, enable_cmd in bounce_cmds:
+            _run(disable_cmd)
+            time.sleep(1.0)
+            _run(enable_cmd)
+
+            if _wait_up(seconds=4.0):
+                self.logger.log_message(
+                    f"[{read_label}] 🔄 Adapter '{friendly_name}' was bounced and is back up."
+                )
+                return True
+
+        return self._adapter_looks_up(friendly_name)
+
+    def _recover_read_handle(self,
+                             *,
+                             handle,
+                             active_iface: str,
+                             promisc: bool,
+                             timeout: int,
+                             bpf_filter: str | None,
+                             read_label: str = "Sniffer"):
+        """
+        Recover from pcap_next_ex() read-side interface removal.
+
+        Returns:
+          (new_handle, new_active_iface, new_dlt, recovered: bool, last_err: str)
+
+        Behavior:
+          1) Close stale handle
+          2) Resolve aliases -> real pcap_name
+          3) If adapter looks missing/down, try to re-enable it
+          4) Refresh interface inventory
+          5) Reopen only on real pcap_name values
+        """
+        last_err = ""
+
+        try:
+            if handle:
+                try:
+                    self.libpcap.pcap_close(handle)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        time.sleep(0.15)
+
+        failed_iface = self._normalize_pcap_name(active_iface)
+
+        alias_to_pcap, _pcap_to_row = self._build_pcap_alias_map()
+
+        def _resolve_to_pcap_name(x: str | None) -> str | None:
+            if not x:
+                return None
+            x = self._normalize_pcap_name(x)
+            return alias_to_pcap.get(x, x)
+
+        friendly_name = self._friendly_name_for_pcap_iface(failed_iface)
+        failed_pcap_name = _resolve_to_pcap_name(failed_iface)
+
+        # Build candidate list of REAL pcap names only
+        candidate_pcap_names = []
+        seen = set()
+
+        def add_candidate(x):
+            if not x:
+                return
+            pcap_name = _resolve_to_pcap_name(x)
+            if pcap_name and pcap_name not in seen:
+                seen.add(pcap_name)
+                candidate_pcap_names.append(pcap_name)
+
+        add_candidate(failed_iface)
+
+        for candidate in self._iter_reopen_candidates(failed_iface):
+            add_candidate(candidate)
+
+        if friendly_name:
+            add_candidate(friendly_name)
+
+        # If adapter seems missing/down, try to re-enable BEFORE reopen
+        failed_known_now = bool(failed_pcap_name and failed_pcap_name in alias_to_pcap.values())
+        adapter_up = self._adapter_looks_up(friendly_name) if friendly_name else False
+
+        if (not failed_known_now) or (friendly_name and not adapter_up):
+            if friendly_name:
+                self.logger.log_message(
+                    f"[{read_label}] 🩺 Adapter '{friendly_name}' looks missing/down for '{failed_iface}'. "
+                    f"Attempting re-enable before reopen."
+                )
+
+                self._maybe_reenable_adapter(friendly_name, read_label=read_label)
+
+                # Refresh interface inventory after re-enable attempt
+                time.sleep(1.0)
+                alias_to_pcap, _pcap_to_row = self._build_pcap_alias_map()
+
+                def _resolve_to_pcap_name_refreshed(x: str | None) -> str | None:
+                    if not x:
+                        return None
+                    x = self._normalize_pcap_name(x)
+                    return alias_to_pcap.get(x, x)
+
+                candidate_pcap_names = []
+                seen = set()
+
+                def add_candidate_refreshed(x):
+                    if not x:
+                        return
+                    pcap_name = _resolve_to_pcap_name_refreshed(x)
+                    if pcap_name and pcap_name not in seen:
+                        seen.add(pcap_name)
+                        candidate_pcap_names.append(pcap_name)
+
+                add_candidate_refreshed(failed_iface)
+                for candidate in self._iter_reopen_candidates(failed_iface):
+                    add_candidate_refreshed(candidate)
+                if friendly_name:
+                    add_candidate_refreshed(friendly_name)
+
+        # Reopen only using real pcap device names
+        for pcap_candidate in candidate_pcap_names:
+            try:
+                new_handle, err = self._open_pcap_handle(
+                    iface=pcap_candidate,
+                    promisc=promisc,
+                    timeout=int(timeout),
+                    bpf_filter=bpf_filter,
+                )
+                if new_handle:
+                    try:
+                        new_dlt = self.libpcap.pcap_datalink(new_handle)
+                    except Exception:
+                        new_dlt = None
+
+                    self.logger.log_message(
+                        f"[{read_label}] 🔁 Recovered read handle on '{pcap_candidate}' "
+                        f"datalink={new_dlt} ({self._dlt_name(new_dlt) if new_dlt is not None else 'unknown'})"
+                    )
+                    return new_handle, pcap_candidate, new_dlt, True, ""
+
+                last_err = err or last_err
+            except Exception as e:
+                last_err = str(e)
+
+        self.logger.log_message(
+            f"[{read_label}] ❌ Reopen failed after device removal on '{failed_iface}': {last_err}"
+        )
+        return None, failed_iface, None, False, last_err
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -1523,29 +1965,22 @@ class SnifferSoftware:
                             f"[Sniffer] Interface removed on '{active_iface}'. Closing stale handle and attempting reopen."
                         )
 
-                        try:
-                            self.libpcap.pcap_close(handle)
-                        except Exception:
-                            pass
-                        handle = None
+                        handle, active_iface, dlt, recovered, reopen_err = self._recover_read_handle(
+                            handle=handle,
+                            active_iface=active_iface,
+                            promisc=promisc,
+                            timeout=int(timeout),
+                            bpf_filter=filter,
+                            read_label="Sniffer",
+                        )
 
-                        time.sleep(0.15)
-
-                        reopened_handle, reopened_iface, reopen_err = _open_on_candidates(active_iface)
-                        if not reopened_handle:
-                            self.logger.log_message(
-                                f"[Sniffer] Reopen failed after device removal on '{active_iface}': {reopen_err}. Closing sniffer."
-                            )
+                        if not recovered or not handle:
                             return
 
-                        handle = reopened_handle
-                        active_iface = reopened_iface
-                        dlt = self.libpcap.pcap_datalink(handle)
-
-                        self.logger.log_message(
-                            f"[Sniffer] Reopened capture on '{active_iface}' datalink={dlt} ({self._dlt_name(dlt)})"
-                        )
                         continue
+
+                    self.logger.log_message(f"[Sniffer] Error reading packet: {err}")
+                    continue
                 elif ret == -2:
                     # breakloop() or EOF - for live capture, just retry after a small pause
                     time.sleep(0.05)
@@ -1725,15 +2160,16 @@ class SnifferSoftware:
         finally:
             self.libpcap.pcap_close(handle)
 
-    def send(self, packet: Packet, iface: str = None, verbose: int = 0, route_info: dict = None, dst_mac: str = None,
-             src_mac: str = None):
+    def send(self, packet: Packet, iface: str = None, verbose: int = 0, route_info: dict = None,
+             dst_mac: str = None, src_mac: str = None):
         """
         Sends a Layer 3 packet (IP/IPv6) by wrapping in Ether().
+        Only tries iface recovery when the chosen interface actually fails.
         """
         if not (isinstance(packet, IP) or isinstance(packet, IPv6)):
             packet, _why = self._coerce_to_l3(packet)
             if packet is None:
-                self.logger.log_message(f"[Sniffer] sr1: could not obtain a Layer 3 packet. Hint: {_why}")
+                self.logger.log_message(f"[Sniffer] send: could not obtain a Layer 3 packet. Hint: {_why}")
                 return None
 
         try:
@@ -1741,7 +2177,7 @@ class SnifferSoftware:
                 route_info = self.rip_manager.find_route(packet.dst)
                 if not route_info:
                     self.logger.log_message(f"[Sniffer] Error: No route found for destination {packet.dst}")
-                    return
+                    return None
 
             iface_out = self._normalize_pcap_name(iface or route_info['interface'])
             gw_ip = route_info['next_hop'] if route_info['next_hop'] != '0.0.0.0' else packet.dst
@@ -1749,7 +2185,7 @@ class SnifferSoftware:
             # If loopback and dst is local/private → use OS stack at L3, skip pcap/L2 entirely
             if self._is_npf_loopback(iface_out) and self._dst_is_private_or_local(str(packet.dst)):
                 self._send_l3_loopback(packet, expect_reply=False)
-                return
+                return None
 
             # For remote dst: remap loopback to real NIC first
             iface_out = self._ensure_egress_iface_for_dst(iface_out, str(packet.dst))
@@ -1757,44 +2193,97 @@ class SnifferSoftware:
                 self.logger.log_message(f"[Sniffer] Error: cannot map loopback to a real NIC for {packet.dst}")
                 return None
 
-            iface_cidr = self._ipv4_cidr_for_iface(iface_out)
-            if not iface_cidr:
-                verbose = 1
-                iface_out = self.outbound_manager.get_next_interface(packet)
+            # Fast path: trust the chosen iface first
+            try:
                 iface_cidr = self._ipv4_cidr_for_iface(iface_out)
                 if not iface_cidr:
                     self.logger.log_message(f"[Sniffer] Error: could not derive IPv4 CIDR for iface '{iface_out}'")
                     return None
 
-            # Resolve next hop MAC (only if not loopback gw)
-            if not dst_mac:
-                if self.is_loopback(gw_ip):
-                    dst_mac = None
+                if not dst_mac:
+                    if self.is_loopback(gw_ip):
+                        resolved_dst_mac = None
+                    else:
+                        resolved_dst_mac = self.arp_manager.resolve_gateway_mac(
+                            gw_ip, iface=iface_out, iface_cidr=iface_cidr
+                        )
+                        if not resolved_dst_mac:
+                            resolved_dst_mac = getmacbyip(gw_ip)
+                            if not resolved_dst_mac:
+                                self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                                return None
                 else:
-                    dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
-                    if not dst_mac:
-                        dst_mac = getmacbyip(gw_ip)
-                        if not dst_mac:
-                            self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                            return None
+                    resolved_dst_mac = dst_mac
 
-            if not src_mac:
-                src_mac = get_if_hwaddr(iface_out)
+                resolved_src_mac = src_mac or get_if_hwaddr(iface_out)
 
-            l2_packet = Ether(src=src_mac, dst=dst_mac) / packet
+                l2_packet = Ether(src=resolved_src_mac, dst=resolved_dst_mac) / packet
 
-            if verbose >= 1:
-                self.logger.log_message(f"[Sniffer] Resolved route: {packet.dst} -> via {gw_ip} on {iface_out} [+] L2 Frame: {src_mac} -> {dst_mac}")
+                if verbose >= 1:
+                    self.logger.log_message(
+                        f"[Sniffer] Resolved route: {packet.dst} -> via {gw_ip} on {iface_out} "
+                        f"[+] L2 Frame: {resolved_src_mac} -> {resolved_dst_mac}"
+                    )
 
-            self.sendp(l2_packet, iface=iface_out, verbose=verbose)
+                self.sendp(l2_packet, iface=iface_out, verbose=verbose)
+                return None
+
+            except Exception as e:
+                err = str(e)
+
+                # Only recover/remap when this is actually an interface failure
+                if not self._is_iface_recovery_error(err):
+                    self.logger.log_message(f"[Sniffer] An error occurred during send: {e}")
+                    return None
+
+                retry_iface = self._recover_send_iface(iface_out, packet)
+                if not retry_iface:
+                    self.logger.log_message(
+                        f"[Sniffer] An error occurred during send: {e} "
+                        f"(no recovery iface found for {iface_out})"
+                    )
+                    return None
+
+                self.logger.log_message(
+                    f"[Sniffer] 🔁 send iface recovery: {iface_out} -> {retry_iface} after error: {e}"
+                )
+
+                retry_cidr = self._ipv4_cidr_for_iface(retry_iface)
+                if not retry_cidr:
+                    self.logger.log_message(
+                        f"[Sniffer] Error: recovered iface '{retry_iface}' has no usable IPv4 CIDR"
+                    )
+                    return None
+
+                if not dst_mac:
+                    if self.is_loopback(gw_ip):
+                        resolved_dst_mac = None
+                    else:
+                        resolved_dst_mac = self.arp_manager.resolve_gateway_mac(
+                            gw_ip, iface=retry_iface, iface_cidr=retry_cidr
+                        )
+                        if not resolved_dst_mac:
+                            resolved_dst_mac = getmacbyip(gw_ip)
+                            if not resolved_dst_mac:
+                                self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
+                                return None
+                else:
+                    resolved_dst_mac = dst_mac
+
+                resolved_src_mac = src_mac or get_if_hwaddr(retry_iface)
+                l2_packet = Ether(src=resolved_src_mac, dst=resolved_dst_mac) / packet
+                self.sendp(l2_packet, iface=retry_iface, verbose=verbose)
+                return None
 
         except Exception as e:
             self.logger.log_message(f"[Sniffer] An error occurred during send: {e}")
+            return None
 
     def sr1(self, packet: Packet, iface: str = None, timeout: int = 2, verbose: int = 0,
             route_info: dict = None, dst_mac: str = None, src_mac: str = None) -> Optional[Packet]:
         """
         Sends a Layer 3 packet and waits for a single reply (within timeout).
+        Uses interface resolution/recovery only when actually needed.
         """
         # If a full Ether frame was passed, unwrap it
         if isinstance(packet, Ether) and (IP in packet or IPv6 in packet):
@@ -1812,195 +2301,281 @@ class SnifferSoftware:
                 if not route_info:
                     self.logger.log_message(f"[Sniffer] Error: No route found for destination {packet.dst}")
                     return None
+
             iface_out = iface or route_info['interface']
-            iface_out = self._normalize_pcap_name(iface_out)  # normalize
+            iface_out = self._normalize_pcap_name(iface_out)
             gw_ip = route_info['next_hop'] if route_info['next_hop'] != '0.0.0.0' else packet.dst
 
+            # local/private loopback path stays fast
+            if self._is_npf_loopback(iface_out) and self._dst_is_private_or_local(str(packet.dst)):
+                return self._send_l3_loopback(packet, expect_reply=True, timeout=timeout, iface=iface_out)
 
-            iface_cidr = self._ipv4_cidr_for_iface(iface_out)  # now safe
-            if not iface_cidr:
-                self.logger.log_message(f"[Sniffer] SR1 Error: could not derive IPv4 CIDR for iface '{iface_out}'")
-                return None
-            if not dst_mac:
-                if self.is_loopback(gw_ip):
-                    dst_mac = None
+            # remote loopback remap stays fast
+            remapped = self._ensure_egress_iface_for_dst(iface_out, str(packet.dst))
+            if remapped:
+                iface_out = self._normalize_pcap_name(remapped)
+
+            def _build_l2_for(use_iface: str):
+                use_iface = self._normalize_pcap_name(use_iface)
+
+                iface_cidr = self._ipv4_cidr_for_iface(use_iface)
+                if not iface_cidr:
+                    raise RuntimeError(f"could not derive IPv4 CIDR for iface '{use_iface}'")
+
+                resolved_dst_mac = dst_mac
+                if not resolved_dst_mac:
+                    if self.is_loopback(gw_ip):
+                        resolved_dst_mac = None
+                    else:
+                        resolved_dst_mac = self.arp_manager.resolve_gateway_mac(
+                            gw_ip, iface=use_iface, iface_cidr=iface_cidr
+                        )
+                        if not resolved_dst_mac:
+                            resolved_dst_mac = getmacbyip(gw_ip)
+                            if not resolved_dst_mac:
+                                raise RuntimeError(f"Could not resolve MAC for gateway {gw_ip}")
+
+                resolved_src_mac = src_mac
+                if not resolved_src_mac:
+                    resolved_src_mac = get_if_hwaddr(use_iface)
+
+                l2 = Ether(src=resolved_src_mac, dst=resolved_dst_mac) / packet
+                return use_iface, iface_cidr, resolved_src_mac, resolved_dst_mac, l2
+
+            # -------- prepare packet --------
+            try:
+                iface_out, iface_cidr, src_mac_eff, dst_mac_eff, l2_packet = _build_l2_for(iface_out)
+            except Exception as e:
+                if not self._is_iface_recovery_error(e):
+                    self.logger.log_message(f"[Sniffer] Error preparing packet for sr1: {e}")
+                    return None
+
+                retry_iface = self._recover_sr1_iface(iface_out, packet)
+                if not retry_iface:
+                    self.logger.log_message(
+                        f"[Sniffer] Error preparing packet for sr1: {e} (no recovery iface found)"
+                    )
+                    return None
+
+                self.logger.log_message(
+                    f"[Sniffer] 🔁 sr1 iface recovery during prepare: {iface_out} -> {retry_iface} after error: {e}"
+                )
+
+                try:
+                    iface_out, iface_cidr, src_mac_eff, dst_mac_eff, l2_packet = _build_l2_for(retry_iface)
+                except Exception as e2:
+                    self.logger.log_message(f"[Sniffer] Error preparing packet for sr1 after recovery: {e2}")
+                    return None
+
+            errbuf = ctypes.create_string_buffer(256)
+            handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
+
+            if not handle:
+                open_err = errbuf.value.decode("utf-8", errors="ignore")
+
+                if self._is_iface_recovery_error(open_err):
+                    retry_iface = self._recover_sr1_iface(iface_out, packet)
+                    if retry_iface and retry_iface != iface_out:
+                        self.logger.log_message(
+                            f"[Sniffer] 🔁 sr1 open_live recovery: {iface_out} -> {retry_iface} after error: {open_err}"
+                        )
+                        iface_out = retry_iface
+                        handle = self.libpcap.pcap_open_live(
+                            iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf
+                        )
+
+                if not handle:
+                    self.logger.log_message(
+                        f"[Sniffer] Error opening device {iface_out}: {errbuf.value.decode('utf-8', errors='ignore')}"
+                    )
+                    return None
+
+            try:
+                try:
+                    self.libpcap.pcap_setdirection(handle, 1)  # PCAP_D_IN
+                except Exception:
+                    pass
+
+                dlt = self.libpcap.pcap_datalink(handle)
+
+                try:
+                    self.libpcap.pcap_setdirection(handle, PCAP_D_IN)
+                except Exception:
+                    pass
+
+                if TCP in packet:
+                    inner = (f"tcp and src host {packet.dst} and dst host {packet.src} and "
+                             f"src port {packet.dport} and dst port {packet.sport}")
+                elif UDP in packet:
+                    inner = (f"udp and src host {packet.dst} and dst host {packet.src} and "
+                             f"src port {packet.dport} and dst port {packet.sport}")
                 else:
-                    dst_mac = self.arp_manager.resolve_gateway_mac(gw_ip, iface=iface_out, iface_cidr=iface_cidr)
-                    if not dst_mac:
-                        dst_mac = getmacbyip(gw_ip)
-                        if not dst_mac:
-                            self.logger.log_message(f"[Sniffer] Error: Could not resolve MAC for gateway {gw_ip}")
-                            return None
+                    if IPv6 in packet:
+                        inner = f"ip6 and src host {packet.dst} and dst host {packet.src} and (icmp6 or (tcp or udp))"
+                    else:
+                        inner = f"ip and src host {packet.dst} and dst host {packet.src} and (icmp or (tcp or udp))"
 
-            if not src_mac:
-                src_mac = get_if_hwaddr(iface_out)
+                DLT_NULL = 0
+                DLT_LOOP = 12
+                DLT_RAW = 101
+                supports_vlan = dlt not in (DLT_NULL, DLT_LOOP, DLT_RAW)
+                candidates = [f"({inner}) or (vlan and {inner})", inner] if supports_vlan else [inner]
 
-            l2_packet = Ether(src=src_mac, dst=dst_mac) / packet
+                bpf = bpf_program()
+                compiled = False
+                last_err = ""
+
+                for expr in candidates:
+                    if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), expr.encode("utf-8"), 1, 0) == 0:
+                        if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
+                            compiled = True
+                            break
+                        else:
+                            last_err = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8", errors="ignore")
+                            self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                            continue
+                    else:
+                        last_err = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8", errors="ignore")
+                        if "vlan" in last_err.lower() and expr != inner:
+                            self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                            if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), inner.encode("utf-8"), 1, 0) == 0:
+                                if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
+                                    compiled = True
+                                    break
+                                else:
+                                    last_err = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8",
+                                                                                                errors="ignore")
+                            self.libpcap.pcap_freecode(ctypes.byref(bpf))
+                        else:
+                            self.libpcap.pcap_freecode(ctypes.byref(bpf))
+
+                if not compiled:
+                    self.logger.log_message(f"[Sniffer] Error compiling/setting BPF filter (DLT={dlt}): {last_err}")
+                    return None
+
+                packet_bytes = bytes(l2_packet)
+                result = self.libpcap.pcap_sendpacket(
+                    handle,
+                    (ctypes.c_ubyte * len(packet_bytes))(*packet_bytes),
+                    len(packet_bytes)
+                )
+
+                if result != 0:
+                    error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8", errors="ignore")
+
+                    if self.use_hyperv:
+                        self.hyperv_manager.send_packet(bytes(packet))
+                        self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out}; sent via PYPIPE")
+                        return None
+
+                    try:
+                        dst_ip = str(packet.dst)
+                    except Exception:
+                        dst_ip = None
+
+                    if dst_ip and self._dst_is_private_or_local(dst_ip):
+                        self.logger.log_message(
+                            f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; trying OS loopback/local fallback"
+                        )
+                        return self._send_l3_loopback(packet, expect_reply=True, timeout=timeout, iface=iface_out)
+
+                    if self._is_iface_recovery_error(error_msg):
+                        retry_iface = self._recover_sr1_iface(iface_out, packet)
+                        if retry_iface and retry_iface != iface_out:
+                            self.logger.log_message(
+                                f"[Sniffer] 🔁 sr1 send recovery: {iface_out} -> {retry_iface} after error: {error_msg}"
+                            )
+                            return self.sr1(
+                                packet,
+                                iface=retry_iface,
+                                timeout=timeout,
+                                verbose=verbose,
+                                route_info=route_info,
+                                dst_mac=dst_mac,
+                                src_mac=src_mac,
+                            )
+
+                    retry_iface = self._ensure_egress_iface_for_dst(iface_out, dst_ip) if dst_ip else None
+                    if retry_iface and retry_iface != iface_out:
+                        self.logger.log_message(
+                            f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; retrying on {retry_iface}"
+                        )
+                        return self.sr1(packet, iface=retry_iface, timeout=timeout, verbose=verbose,
+                                        route_info=route_info)
+
+                    self.logger.log_message(f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}")
+                    return None
+
+                if verbose >= 1:
+                    self.logger.log_message(f"[+] Sent packet on {iface_out}: {l2_packet.summary()}")
+                    if verbose >= 2:
+                        l2_packet.show()
+
+                pkthdr_ptr = ctypes.POINTER(pcap_pkthdr)()
+                packet_data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+                start_time = time.time()
+
+                while time.time() - start_time < timeout:
+                    ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
+                    if ret == 1:
+                        if not pkthdr_ptr or not pkthdr_ptr.contents:
+                            self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
+                            continue
+                        packet_len = getattr(pkthdr_ptr.contents, "caplen", pkthdr_ptr.contents.len)
+                        if packet_len <= 0:
+                            self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
+                            continue
+                        raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
+                        reply_packet = self._decode_by_dlt(raw_packet, dlt)
+                        return reply_packet
+                    elif ret == -1:
+                        error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
+
+                        if self._looks_like_removed_iface_error(error_msg):
+                            self.logger.log_message(
+                                f"[Sniffer] Interface disappeared while waiting for sr1 reply on '{iface_out}'. Attempting reopen."
+                            )
+
+                            handle, iface_out, dlt, recovered, reopen_err = self._recover_read_handle(
+                                handle=handle,
+                                active_iface=iface_out,
+                                promisc=True,
+                                timeout=int(timeout * 1000),
+                                bpf_filter=inner if 'inner' in locals() else None,
+                                read_label="Sniffer",
+                            )
+
+                            if not recovered or not handle:
+                                self.logger.log_message(
+                                    f"[Sniffer] sr1 read recovery failed on '{iface_out}': {reopen_err}"
+                                )
+                                return None
+
+                            # Restore inbound direction if supported
+                            try:
+                                self.libpcap.pcap_setdirection(handle, PCAP_D_IN)
+                            except Exception:
+                                try:
+                                    self.libpcap.pcap_setdirection(handle, 1)
+                                except Exception:
+                                    pass
+
+                            continue
+
+                        self.logger.log_message(f"[Sniffer] Error reading packet: {error_msg}")
+                        break
+
+                if verbose >= 1:
+                    self.logger.log_message("[Sniffer] Timeout: No reply received.")
+                return None
+
+            finally:
+                if handle:
+                    self.libpcap.pcap_close(handle)
 
         except Exception as e:
             self.logger.log_message(f"[Sniffer] Error preparing packet for sr1: {e}")
             return None
-
-        errbuf = ctypes.create_string_buffer(256)
-        handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
-        if not handle:
-            iface_out = self.outbound_manager.get_next_interface(packet)
-            handle = self.libpcap.pcap_open_live(iface_out.encode("utf-8"), 65535, 1, int(timeout * 1000), errbuf)
-            if not handle:
-                self.logger.log_message(
-                    f"[Sniffer] Error opening device {iface_out}: {errbuf.value.decode('utf-8', errors='ignore')}")
-                return None
-        try:
-            self.libpcap.pcap_setdirection(handle, 1)  # PCAP_D_IN
-        except Exception:
-            pass
-        try:
-            # Get datalink (DLT) and use it for decoding the reply
-            dlt = self.libpcap.pcap_datalink(handle)
-
-            # Prefer inbound-only if supported (avoid seeing our own transmit)
-            try:
-                self.libpcap.pcap_setdirection(handle, PCAP_D_IN)
-            except Exception:
-                pass
-
-            # Compile BPF filter for the reply (REVERSED flow)
-            # We expect: src=remote (packet.dst), dst=local (packet.src)
-            if TCP in packet:
-                inner = (f"tcp and src host {packet.dst} and dst host {packet.src} and "
-                         f"src port {packet.dport} and dst port {packet.sport}")
-            elif UDP in packet:
-                inner = (f"udp and src host {packet.dst} and dst host {packet.src} and "
-                         f"src port {packet.dport} and dst port {packet.sport}")
-            else:
-                # ICMP/ICMPv6 or other L4-less traffic
-                if IPv6 in packet:
-                    inner = f"ip6 and src host {packet.dst} and dst host {packet.src} and (icmp6 or (tcp or udp))"
-                else:
-                    inner = f"ip and src host {packet.dst} and dst host {packet.src} and (icmp or (tcp or udp))"
-
-            # Decide whether the linktype can use 'vlan'
-            dlt = self.libpcap.pcap_datalink(handle)
-            # Loopback/raw types do NOT support 'vlan'
-            DLT_NULL = 0
-            DLT_LOOP = 12
-            DLT_RAW = 101
-            supports_vlan = dlt not in (DLT_NULL, DLT_LOOP, DLT_RAW)
-
-            # Try filters in order of preference
-            candidates = [f"({inner}) or (vlan and {inner})", inner] if supports_vlan else [inner]
-
-            bpf = bpf_program()
-            compiled = False
-            last_err = ""
-            for expr in candidates:
-                if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), expr.encode("utf-8"), 1, 0) == 0:
-                    if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
-                        compiled = True
-                        break
-                    else:
-                        last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                        # free and try next candidate
-                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
-                        continue
-                else:
-                    last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                    # If error mentions VLAN on a weird DLT, fall back to inner only once
-                    if "vlan" in last_err.lower() and expr != inner:
-                        # free current bpf before retry
-                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
-                        # attempt compile/set with inner only
-                        if self.libpcap.pcap_compile(handle, ctypes.byref(bpf), inner.encode("utf-8"), 1, 0) == 0:
-                            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == 0:
-                                compiled = True
-                                break
-                            else:
-                                last_err = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                        # free and continue to next candidate (though there isn't one)
-                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
-                    else:
-                        # free and try next candidate
-                        self.libpcap.pcap_freecode(ctypes.byref(bpf))
-
-            if not compiled:
-                self.logger.log_message(f"[Sniffer] Error compiling/setting BPF filter (DLT={dlt}): {last_err}")
-                return None
-
-            # Send the packet
-            packet_bytes = bytes(l2_packet)
-            result = self.libpcap.pcap_sendpacket(
-                handle,
-                (ctypes.c_ubyte * len(packet_bytes))(*packet_bytes),
-                len(packet_bytes)
-            )
-
-            if result != 0:
-                error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode("utf-8", errors="ignore")
-
-                if self.use_hyperv:
-                    self.hyperv_manager.send_packet(bytes(packet))
-                    self.logger.log_message(f"[Sniffer] 🪈 sr1 send failed on {iface_out}; sent via PYPIPE")
-                    return None
-
-                # non-Hyper-V fallback 1: local/loopback traffic -> OS loopback
-                try:
-                    dst_ip = str(packet.dst)
-                except Exception:
-                    dst_ip = None
-
-                if dst_ip and self._dst_is_private_or_local(dst_ip):
-                    self.logger.log_message(
-                        f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; trying OS loopback/local fallback"
-                    )
-                    return self._send_l3_loopback(packet, expect_reply=True, timeout=timeout, iface=iface_out)
-
-                # non-Hyper-V fallback 2: loopback pcap -> real egress NIC
-                retry_iface = self._ensure_egress_iface_for_dst(iface_out, dst_ip) if dst_ip else None
-                if retry_iface and retry_iface != iface_out:
-                    self.logger.log_message(
-                        f"[Sniffer] 🔁 sr1 pcap send failed on {iface_out}; retrying on {retry_iface}"
-                    )
-                    return self.sr1(packet, iface=retry_iface, timeout=timeout, verbose=verbose, route_info=route_info)
-
-                self.logger.log_message(f"[Sniffer] ❌ sr1 send failed on {iface_out}: {error_msg}")
-                return None
-
-            if verbose >= 1:
-                self.logger.log_message(f"[+] Sent packet on {iface_out}: {l2_packet.summary()}")
-                if verbose >= 2:
-                    l2_packet.show()
-
-            # Receive response (bounded by timeout)
-            pkthdr_ptr = ctypes.POINTER(pcap_pkthdr)()
-            packet_data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
-
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
-                if ret == 1:
-                    if not pkthdr_ptr or not pkthdr_ptr.contents:
-                        self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
-                        continue
-                    packet_len = getattr(pkthdr_ptr.contents, "caplen", pkthdr_ptr.contents.len)
-                    if packet_len <= 0:
-                        self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
-                        continue
-                    raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
-                    reply_packet = self._decode_by_dlt(raw_packet, dlt)
-                    return reply_packet
-                elif ret == -1:
-                    error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
-                    self.logger.log_message(f"[Sniffer] Error reading packet: {error_msg}")
-                    break
-                # ret == 0 -> timeout tick -> loop
-
-            if verbose >= 1:
-                self.logger.log_message("[Sniffer] Timeout: No reply received.")
-            return None
-
-        finally:
-            if handle:
-                self.libpcap.pcap_close(handle)
 
     def sr2(self, packet: Packet, iface: str, timeout: int = 2, verbose: int = 0) -> Optional[Packet]:
         """
@@ -2101,6 +2676,38 @@ class SnifferSoftware:
                         return reply_packet
                 elif ret == -1:
                     error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
+
+                    if self._looks_like_removed_iface_error(error_msg):
+                        self.logger.log_message(
+                            f"[Sniffer] Interface disappeared while waiting for sr1 reply on '{iface_out}'. Attempting reopen."
+                        )
+
+                        handle, iface_out, dlt, recovered, reopen_err = self._recover_read_handle(
+                            handle=handle,
+                            active_iface=iface_out,
+                            promisc=True,
+                            timeout=int(timeout * 1000),
+                            bpf_filter=bpf_filter_str,
+                            read_label="Sniffer",
+                        )
+
+                        if not recovered or not handle:
+                            self.logger.log_message(
+                                f"[Sniffer] sr1 read recovery failed on '{iface_out}': {reopen_err}"
+                            )
+                            return None
+
+                        # Restore inbound direction if supported
+                        try:
+                            self.libpcap.pcap_setdirection(handle, PCAP_D_IN)
+                        except Exception:
+                            try:
+                                self.libpcap.pcap_setdirection(handle, 1)
+                            except Exception:
+                                pass
+
+                        continue
+
                     self.logger.log_message(f"[Sniffer] Error reading packet: {error_msg}")
                     break
 
