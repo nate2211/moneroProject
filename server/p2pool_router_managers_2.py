@@ -9917,22 +9917,39 @@ class ARPManager:
         self._k8s_virtual_cache: dict[str, float] = {}
 
     def _resolve_gateway_mac_from_os(self, iface: str, gw_ip: str) -> str | None:
-        """
-        Resolve a gateway MAC using OS-visible state first, without forcing active ARP.
-        Safe helper for resolve_gateway_mac().
-
-        Resolution order:
-          1) interface-local ARP cache
-          2) gateway cache
-          3) generic ARP cache
-          4) OS ARP cache snapshot / refresh
-          5) passive learned gateway owner on this iface
-        """
         try:
             iface = str(iface or "").strip()
             gw_ip = self._normalize_ip(gw_ip)
             if not iface or not gw_ip:
                 return None
+
+            BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+            # 0) existing special-result cache
+            special = self._gw_special_result_get(gw_ip)
+            if special:
+                mac, reason = special
+                mac = self._normalize_mac(mac)
+                reason = str(reason or "").strip()
+                if mac and reason in ("directed_broadcast", "broadcast", "hyperv_special"):
+                    self._log_rl(
+                        self._gw_log_key("gw_os_special_cache", gw_ip, iface),
+                        10.0,
+                        f"[ARP][GW] 📣 OS-helper special cache hit for {gw_ip} on {iface}: {mac} ({reason})",
+                    )
+                    return mac
+
+            # 0.5) classify broadcast/special target up front
+            sane_ip, sane_reason = self._sanitize_gateway_candidate(gw_ip, iface)
+            if gw_ip == "255.255.255.255" or sane_reason == "is_broadcast" or str(sane_reason).startswith(
+                    "is_directed_broadcast:"):
+                self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
+                self._log_rl(
+                    self._gw_log_key("gw_os_special_broadcast", gw_ip, iface),
+                    10.0,
+                    f"[ARP][GW] 📣 OS-helper recognized broadcast target for {gw_ip} on {iface}: {BROADCAST_MAC}",
+                )
+                return BROADCAST_MAC
 
             # 1) interface-local cache
             mac = self._normalize_mac(self._iface_cache_get(iface, gw_ip))
@@ -9964,6 +9981,17 @@ class ARPManager:
                         mac = self._normalize_mac(ent)
                 except Exception:
                     mac = None
+
+                # allow cached broadcast only if target has been classified special
+                if mac == BROADCAST_MAC:
+                    self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
+                    self._log_rl(
+                        self._gw_log_key("gw_os_global_broadcast", gw_ip, iface),
+                        10.0,
+                        f"[ARP][GW] 📣 OS-helper global cache broadcast hit for {gw_ip}: {BROADCAST_MAC}",
+                    )
+                    return BROADCAST_MAC
+
                 if mac and not self._is_bad_gateway_mac(mac):
                     self._log_rl(
                         self._gw_log_key("gw_os_global_cache", gw_ip),
@@ -9974,6 +10002,16 @@ class ARPManager:
 
             # 4) OS ARP cache
             mac = self._normalize_mac(self.fallback_mac_from_os_cache(gw_ip, force_refresh=False))
+
+            if mac == BROADCAST_MAC:
+                self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
+                self._log_rl(
+                    self._gw_log_key("gw_os_arp_broadcast", gw_ip, iface),
+                    10.0,
+                    f"[ARP][GW] 📣 OS-helper recovered broadcast target {gw_ip} from OS ARP cache: {BROADCAST_MAC}",
+                )
+                return BROADCAST_MAC
+
             if mac and not self._is_bad_gateway_mac(mac):
                 self._cache_set(gw_ip, mac, time.time())
                 self._gateway_cache_set(iface, gw_ip, mac)
@@ -10373,6 +10411,7 @@ class ARPManager:
                 f"[ARP][GW] ❌ Broadcast ARP error on {iface} for {target_ip}: {e}",
             )
             return None
+
     def fallback_mac_from_os_cache(
             self,
             ip: str,
@@ -10415,6 +10454,21 @@ class ARPManager:
                 return None
 
             ip_text = str(ip).strip()
+            BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+
+            # decide once whether this IP should be allowed to return broadcast MAC
+            allow_broadcast = False
+            try:
+                sane_ip, sane_reason = self._sanitize_gateway_candidate(ip_text, None)
+                if ip_text == "255.255.255.255":
+                    allow_broadcast = True
+                elif sane_reason == "is_broadcast":
+                    allow_broadcast = True
+                elif str(sane_reason).startswith("is_directed_broadcast:"):
+                    allow_broadcast = True
+            except Exception:
+                allow_broadcast = False
+
             for line in output.splitlines():
                 if ip_text not in line:
                     continue
@@ -10424,6 +10478,17 @@ class ARPManager:
                     continue
 
                 mac = self._normalize_mac(m.group(0))
+                if not mac:
+                    continue
+
+                # allow Ethernet broadcast only for broadcast targets
+                if mac == BROADCAST_MAC and allow_broadcast:
+                    self._gw_special_result_set(ip_text, BROADCAST_MAC, "directed_broadcast")
+                    self._safe_log(
+                        f"[ARP][GW] 📣 OS cache{' refresh' if force_refresh else ''}: {ip_text} → {BROADCAST_MAC} (broadcast target)"
+                    )
+                    return BROADCAST_MAC
+
                 if self._is_bad_gateway_mac(mac):
                     self._log_rl(
                         f"os_arp_bad_mac:{ip_text}",
@@ -10747,7 +10812,26 @@ class ARPManager:
         return None
 
     def _get_iface_gateway(self, iface: str) -> str | None:
-        self._ensure_dynamic_iface_config(iface)
+        """
+        Return the most usable gateway for an interface.
+
+        Order:
+          1) configured per-interface gateway, canonicalized against OS truth
+          2) OS-reported gateway for this iface
+          3) for Hyper-V / bridge / tunnel style ifaces with no own gateway,
+             repick a real routed WAN iface and use its gateway
+          4) last known WAN identity gateway
+          5) fallback default gateway
+        """
+        iface = str(iface or "").strip()
+        if not iface:
+            return None
+
+        try:
+            self._ensure_dynamic_iface_config(iface)
+        except Exception:
+            pass
+
         cfgs = getattr(self, "_interfaces_config", None) or getattr(self, "interfaces_config", {}) or {}
         iface_cfg = (cfgs.get(iface) or {}) if isinstance(cfgs, dict) else {}
 
@@ -10766,14 +10850,79 @@ class ARPManager:
                     return os_gw
                 return gw
 
-        # 2) OS route view
+        # 2) OS route view for this iface
         os_gw = self._get_os_gateway_for_iface(iface)
         if os_gw:
             return os_gw
 
-        # 3) fallback default
-        if self.default_gateway_ip and not self._is_hyperv_iface(iface):
-            return str(self.default_gateway_ip)
+        # 3) bridge / Hyper-V / tunnel fallback:
+        # these often have no real default gateway of their own, so repick a real routed iface
+        if self._is_hyperv_iface(iface):
+            repick = None
+
+            try:
+                repick = self._safe_get_best_interface()
+            except Exception:
+                repick = None
+
+            if repick:
+                repick = str(repick).strip()
+
+            if repick and repick != iface:
+                try:
+                    self._ensure_dynamic_iface_config(repick)
+                except Exception:
+                    pass
+
+                repick_os_gw = self._get_os_gateway_for_iface(repick)
+                if repick_os_gw:
+                    self._log_rl(
+                        f"gw_hyperv_repick:{iface}:{repick}",
+                        5.0,
+                        f"[ARP][GW] 🔀 Re-picked usable gateway iface for {iface}: {repick} gw={repick_os_gw}",
+                    )
+                    return repick_os_gw
+
+                repick_cfg = (cfgs.get(repick) or {}) if isinstance(cfgs, dict) else {}
+                for key in ("gateway", "gateway_ip"):
+                    repick_gw = self._normalize_ip(repick_cfg.get(key))
+                    if repick_gw:
+                        self._log_rl(
+                            f"gw_hyperv_repick_cfg:{iface}:{repick}",
+                            5.0,
+                            f"[ARP][GW] 🔀 Re-picked config gateway for {iface}: {repick} gw={repick_gw}",
+                        )
+                        return repick_gw
+
+        # 4) last known active WAN identity
+        try:
+            last = getattr(self, "_last_wan_identity", {}) or {}
+            last_gw = self._normalize_ip(last.get("gateway_ip"))
+            last_iface = str(last.get("iface_name") or "").strip()
+            if last_gw:
+                if not self._is_hyperv_iface(iface):
+                    return last_gw
+                if last_iface and last_iface != iface:
+                    self._log_rl(
+                        f"gw_last_wan:{iface}:{last_iface}",
+                        5.0,
+                        f"[ARP][GW] 🧭 Using last WAN gateway for {iface}: {last_gw} via {last_iface}",
+                    )
+                    return last_gw
+        except Exception:
+            pass
+
+        # 5) fallback default
+        if self.default_gateway_ip:
+            gw = self._normalize_ip(self.default_gateway_ip)
+            if gw:
+                if self._is_hyperv_iface(iface):
+                    self._log_rl(
+                        f"gw_default_hyperv:{iface}",
+                        5.0,
+                        f"[ARP][GW] 🪄 Using default gateway fallback for bridge iface {iface}: {gw}",
+                    )
+                return gw
 
         return None
 
@@ -11615,11 +11764,24 @@ class ARPManager:
         iface_ip = self.get_interface_ipv4(iface) if iface else None
         gw_ip = self._get_iface_gateway(iface) if iface else None
 
+        # Hyper-V link-local stays special
         if ip_obj.is_link_local and self._is_hyperv_iface(iface):
             return str(ip_obj), "hyperv_link_local"
 
+        # Directed / limited broadcast should resolve to Ethernet broadcast, not fail
+        sane_ip, sane_reason = self._sanitize_gateway_candidate(str(ip_obj), iface)
+        if str(ip_obj) == "255.255.255.255" or str(sane_reason).startswith(
+                "is_directed_broadcast:") or sane_reason == "is_broadcast":
+            self._gw_special_result_set(str(ip_obj), "ff:ff:ff:ff:ff:ff", "directed_broadcast")
+            return str(ip_obj), "directed_broadcast"
+
+        # Other special addresses
         if self.is_special_ip(str(ip_obj), iface_network=str(net_obj) if net_obj else None):
             if self._is_hyperv_iface(iface):
+                mac = self._resolve_hyperv_special(str(ip_obj), iface)
+                if mac:
+                    self._gw_special_result_set(str(ip_obj), mac, "hyperv_special")
+                    return str(ip_obj), "hyperv_special"
                 return None, "special_hyperv"
             return None, "special"
 
@@ -11627,13 +11789,10 @@ class ARPManager:
             return str(ip_obj), "on_link"
 
         if not gw_ip:
+            # keep the reason, but let caller try special-result cache first
             return None, "no_gateway"
 
-        verdict = self._validate_gateway_onlink(gw_ip, str(net_obj) if net_obj else None, iface_ip)
-        if not verdict.ok:
-            return None, f"bad_gateway:{verdict.reason}"
-
-        return verdict.gw, "via_gateway"
+        return str(gw_ip), "gateway"
 
     # ------------------------------------------------------------------
     # Core resolution
@@ -12333,71 +12492,6 @@ class ARPManager:
         self._gateway_fail_set(use_iface, gw_ip)
         self._safe_log(f"[ARP] ❌ resolve_gateway_mac: failed for {gw_ip} on {use_iface}")
         return None
-    # ------------------------------------------------------------------
-    # OS ARP cache fallback
-    # ------------------------------------------------------------------
-
-    def fallback_mac_from_os_cache(
-            self,
-            ip: str,
-            *,
-            force_refresh: bool = False,
-    ) -> str | None:
-        mac_re = re.compile(r"(?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}")
-
-        ip = self._normalize_ip(ip)
-        if not ip:
-            return None
-
-        try:
-            now = time.time()
-
-            if force_refresh:
-                self._os_arp_cache_snapshot = None
-
-            cached = self._os_arp_cache_snapshot
-            if cached and (now - cached[0]) <= self.OS_ARP_CACHE_TTL:
-                output = cached[1]
-            else:
-                with self._subprocess_lock:
-                    output = ""
-                    for cmd in (["arp", "-a"], ["arp", "-an"]):
-                        try:
-                            output = subprocess.check_output(
-                                cmd,
-                                text=True,
-                                stderr=subprocess.DEVNULL,
-                                timeout=2.0,
-                            )
-                            if output:
-                                break
-                        except Exception:
-                            continue
-                    self._os_arp_cache_snapshot = (time.time(), output)
-
-            if not output:
-                return None
-
-            ip_text = str(ip).strip()
-            for line in output.splitlines():
-                if ip_text not in line:
-                    continue
-
-                m = mac_re.search(line)
-                if not m:
-                    continue
-
-                mac = self._normalize_mac(m.group(0))
-                if mac:
-                    self._safe_log(
-                        f"[ARP] 🧭 OS cache{' refresh' if force_refresh else ''}: {ip_text} → {mac}"
-                    )
-                    return mac
-
-            return None
-        except Exception:
-            return None
-
     # ------------------------------------------------------------------
     # Ownership / lease helpers
     # ------------------------------------------------------------------

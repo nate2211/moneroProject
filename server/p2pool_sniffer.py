@@ -240,7 +240,7 @@ class SnifferSoftware:
             0x8863,  # PPPoE Discovery (to avoid false "unsupported" spam)
             0x8847,  # MPLS unicast
             0x8848,}
-        self.unsupported_ethertypes = {0x8006}
+        self.unsupported_ethertypes = {}
         self.local_ips = self._get_local_ips()
         self.banned_packets = []
         self._load_pcap_library()
@@ -1895,6 +1895,84 @@ class SnifferSoftware:
             f"[{read_label}] ❌ Reopen failed after device removal on '{failed_iface}': {last_err}"
         )
         return None, failed_iface, None, False, last_err
+
+    def _capture_meta_from_pkthdr(self, pkthdr_ptr):
+        """
+        Build capture metadata from libpcap's packet header.
+        - captured_len: bytes actually captured into memory
+        - wire_len: original on-the-wire packet length
+        - capture_complete: True if we captured the whole packet
+        """
+        try:
+            hdr = pkthdr_ptr.contents
+            captured_len = int(getattr(hdr, "caplen", 0) or 0)
+            wire_len = int(getattr(hdr, "len", captured_len) or captured_len)
+        except Exception:
+            return {
+                "captured_len": 0,
+                "wire_len": 0,
+                "capture_complete": False,
+                "capture_quality": "invalid_header",
+                "truncated_bytes": 0,
+            }
+
+        capture_complete = (captured_len >= wire_len and wire_len > 0)
+        truncated_bytes = max(0, wire_len - captured_len)
+
+        return {
+            "captured_len": captured_len,
+            "wire_len": wire_len,
+            "capture_complete": capture_complete,
+            "capture_quality": "full" if capture_complete else "truncated",
+            "truncated_bytes": truncated_bytes,
+        }
+
+    def _attach_capture_meta(self, packet, meta: dict, *, iface: str = None, dlt: int = None):
+        """
+        Attach capture metadata directly to the decoded Scapy packet.
+        """
+        try:
+            setattr(packet, "_captured_len", int(meta.get("captured_len", 0) or 0))
+            setattr(packet, "_wire_len", int(meta.get("wire_len", 0) or 0))
+            setattr(packet, "_capture_complete", bool(meta.get("capture_complete", False)))
+            setattr(packet, "_capture_quality", str(meta.get("capture_quality", "unknown")))
+            setattr(packet, "_truncated_bytes", int(meta.get("truncated_bytes", 0) or 0))
+            if iface is not None:
+                setattr(packet, "_capture_iface", iface)
+            if dlt is not None:
+                setattr(packet, "_capture_dlt", dlt)
+        except Exception:
+            pass
+        return packet
+
+    def _decode_captured_packet(self, pkthdr_ptr, packet_data_ptr, dlt: int, *, iface: str = None,
+                                warn_on_truncation: bool = True):
+        """
+        Safe helper for libpcap receive sites.
+        """
+        if not pkthdr_ptr or not pkthdr_ptr.contents:
+            self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
+            return None, None
+
+        meta = self._capture_meta_from_pkthdr(pkthdr_ptr)
+        packet_len = int(meta["captured_len"])
+
+        if packet_len <= 0:
+            self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
+            return None, meta
+
+        raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
+        packet = self._decode_by_dlt(raw_packet, dlt)
+        self._attach_capture_meta(packet, meta, iface=iface, dlt=dlt)
+
+        if warn_on_truncation and not meta["capture_complete"]:
+            self.logger.log_message(
+                f"[Sniffer] ⚠️ Truncated capture on {iface or '?'}: "
+                f"captured={meta['captured_len']} wire={meta['wire_len']} "
+                f"lost={meta['truncated_bytes']} dlt={dlt} ({self._dlt_name(dlt)})"
+            )
+
+        return packet, meta
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -1986,34 +2064,42 @@ class SnifferSoftware:
                     time.sleep(0.05)
                     continue
 
-                if not pkthdr_ptr or not pkthdr_ptr.contents:
+                packet, meta = self._decode_captured_packet(
+                    pkthdr_ptr,
+                    packet_data_ptr,
+                    dlt,
+                    iface=active_iface,
+                    warn_on_truncation=True,
+                )
+                if packet is None:
                     continue
 
-                packet_len = pkthdr_ptr.contents.caplen
-                if packet_len <= 0:
-                    continue
-
-                raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
+                packet_len = int(getattr(packet, "_captured_len", 0) or 0)
+                wire_len = int(getattr(packet, "_wire_len", packet_len) or packet_len)
+                capture_tag = "FULL" if getattr(packet, "_capture_complete", False) else "TRUNC"
 
                 try:
                     try:
-                        packet = self._decode_by_dlt(raw_packet, dlt)
-                    except Exception:
-                        continue  # malformed frame
-                    try:
                         if packet.summary() not in self.logged_packets:
-                            self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | {packet.summary()}")
+                            self.logger.log_message(
+                                f"[Packet] iface={active_iface} caplen={packet_len} wire={wire_len} "
+                                f"capture={capture_tag} | {packet.summary()}"
+                            )
                             self.logged_packets.append(packet.summary())
-                            if "Loopback" in iface:
+
+                            if "Loopback" in active_iface:
                                 processed_packet = session().process(pkt=packet, cls=None) if session else packet
                                 try:
                                     if prn and processed_packet is not None:
-                                        prn(session().process(pkt=packet, cls=None) if session else packet)
+                                        prn(processed_packet)
                                         continue
                                 except Exception:
                                     pass
                     except Exception:
-                        self.logger.log_message(f"[Packet] iface={iface} len={packet_len} | <decode error>")
+                        self.logger.log_message(
+                            f"[Packet] iface={active_iface} caplen={packet_len} wire={wire_len} "
+                            f"capture={capture_tag} | <decode error>"
+                        )
 
                     try:
                         if stop_filter and stop_filter(packet):
@@ -2518,15 +2604,15 @@ class SnifferSoftware:
                 while time.time() - start_time < timeout:
                     ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
                     if ret == 1:
-                        if not pkthdr_ptr or not pkthdr_ptr.contents:
-                            self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
+                        reply_packet, meta = self._decode_captured_packet(
+                            pkthdr_ptr,
+                            packet_data_ptr,
+                            dlt,
+                            iface=iface_out,
+                            warn_on_truncation=True,
+                        )
+                        if reply_packet is None:
                             continue
-                        packet_len = getattr(pkthdr_ptr.contents, "caplen", pkthdr_ptr.contents.len)
-                        if packet_len <= 0:
-                            self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
-                            continue
-                        raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
-                        reply_packet = self._decode_by_dlt(raw_packet, dlt)
                         return reply_packet
                     elif ret == -1:
                         error_msg = (self.libpcap.pcap_geterr(handle) or b"").decode('utf-8', errors='ignore')
@@ -2657,15 +2743,22 @@ class SnifferSoftware:
             while time.time() - start_time < timeout:
                 ret = self.libpcap.pcap_next_ex(handle, ctypes.byref(pkthdr_ptr), ctypes.byref(packet_data_ptr))
                 if ret == 1:
-                    packet_len = pkthdr_ptr.contents.caplen
-                    raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
-                    reply_packet = self._decode_by_dlt(raw_packet, dlt)
+                    reply_packet, meta = self._decode_captured_packet(
+                        pkthdr_ptr,
+                        packet_data_ptr,
+                        dlt,
+                        iface=iface_out,
+                        warn_on_truncation=True,
+                    )
+                    if reply_packet is None:
+                        continue
 
                     if ARP in packet and reply_packet.haslayer(ARP):
                         if reply_packet[ARP].op == 2 and reply_packet[ARP].psrc == packet[ARP].pdst:
                             if verbose >= 1:
                                 self.logger.log_message(
-                                    f"[Sniffer] ✅ Received ARP reply on {iface_out}: {reply_packet.summary()}")
+                                    f"[Sniffer] ✅ Received ARP reply on {iface_out}: {reply_packet.summary()}"
+                                )
                             return reply_packet
                         else:
                             continue
