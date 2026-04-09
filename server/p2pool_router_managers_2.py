@@ -12054,58 +12054,88 @@ class ARPManager:
 
         BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
 
-        # 0) short-lived special-result cache (broadcast etc.)
+        #self._log_rl(
+        #    self._gw_log_key("gw_begin", gw_ip, use_iface, cidr or "nocidr"),
+        #    2.0,
+        #    f"[ARP] 🛣️ resolve_gateway_mac: resolving gateway {gw_ip} (iface={use_iface}, iface_cidr={cidr or 'unknown'})",
+        #)
+
+        # ------------------------------------------------------------------
+        # 0) Special cached result first (broadcast etc.)
+        # ------------------------------------------------------------------
         special = self._gw_special_result_get(gw_ip)
         if special:
             mac, reason = special
-            if reason == "directed_broadcast":
+            if mac:
+                if reason == "directed_broadcast":
+                    self._log_rl(
+                        self._gw_log_key("gw_special_broadcast_hit", gw_ip, use_iface),
+                        10.0,
+                        f"[ARP][GW] 📣 Cached broadcast target: {gw_ip} -> {mac}",
+                    )
                 return mac
 
-        # 1) reject obviously bad gateway candidates early, but let directed-broadcast
-        # targets resolve to Ethernet broadcast instead of dying here.
-        sane_gw, sane_reason = self._sanitize_gateway_candidate(gw_ip, None)
-        if not sane_gw:
-            if str(sane_reason).startswith("is_directed_broadcast:"):
-                self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
-                self._log_rl(
-                    self._gw_log_key("gw_directed_broadcast", gw_ip),
-                    10.0,
-                    f"[ARP][GW] 📣 Directed broadcast: {gw_ip} -> {BROADCAST_MAC}",
-                )
-                return BROADCAST_MAC
+        # ------------------------------------------------------------------
+        # 1) EARLY broadcast detection BEFORE OS-helper / fail logging.
+        #    This is the main fix for 169.254.66.255.
+        # ------------------------------------------------------------------
+        limited_broadcast = (gw_ip == "255.255.255.255")
 
+        sane_global, sane_reason_global = self._sanitize_gateway_candidate(gw_ip, None)
+        if limited_broadcast or str(sane_reason_global).startswith("is_directed_broadcast:"):
+            self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
             self._log_rl(
-                self._gw_log_key("gw_bad_candidate", gw_ip, sane_reason),
+                self._gw_log_key("gw_true_broadcast_early", gw_ip),
+                10.0,
+                f"[ARP][GW] 📣 Gateway target is broadcast: {gw_ip} -> {BROADCAST_MAC}",
+            )
+            return BROADCAST_MAC
+
+        if sane_reason_global in {"loopback", "multicast", "unspecified", "is_network"}:
+            self._log_rl(
+                self._gw_log_key("gw_invalid_global", gw_ip, sane_reason_global),
                 5.0,
-                f"[ARP][GW] ⛔ Rejecting bad gateway candidate {gw_ip} on {use_iface}: {sane_reason}",
+                f"[ARP][GW] ⛔ Invalid gateway candidate {gw_ip}: {sane_reason_global}",
             )
             return None
 
-        gw_ip = sane_gw
-
-        # 2) if we recently learned the right iface for this gateway, use it first
-        cached_iface = self._gw_repick_cache_get(gw_ip)
-        if cached_iface and cached_iface != use_iface:
-            old_iface = use_iface
-            use_iface = cached_iface
-            try:
-                self._ensure_dynamic_iface_config(use_iface)
-            except Exception:
-                pass
-            cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
-            iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
-            cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
-
+        if not sane_global:
             self._log_rl(
-                self._gw_log_key("gw_iface_repick_cached", gw_ip, use_iface),
-                10.0,
-                f"[ARP][GW] 🧠 Using cached gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
+                self._gw_log_key("gw_bad_candidate", gw_ip, sane_reason_global),
+                5.0,
+                f"[ARP][GW] ⛔ Refusing bad gateway candidate {gw_ip}: {sane_reason_global}",
             )
+            return None
 
-        # 3) if the hint iface still does not look right, try to repick once
+        gw_ip = sane_global
+
+        # ------------------------------------------------------------------
+        # 2) Kubernetes Service / virtual VIPs should resolve next hop, not ARP directly.
+        # ------------------------------------------------------------------
+        try:
+            if self._is_k8s_service_ip(gw_ip) or self._k8s_virtual_hit(gw_ip):
+                self._k8s_virtual_set(gw_ip)
+                self._log_rl(
+                    self._gw_log_key("gw_k8s_vip", gw_ip, use_iface),
+                    10.0,
+                    f"[ARP][K8S] ☸️ {gw_ip} is a Kubernetes Service/ClusterIP; using next-hop resolution instead of direct ARP.",
+                )
+                mac = self._resolve_k8s_next_hop_mac(gw_ip, use_iface)
+                mac = self._normalize_mac(mac)
+                if mac:
+                    return mac
+                return None
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # 3) If iface hint is imperfect, try to repick. But do not ever treat
+        #    a mismatch as a reason to fail a broadcast target.
+        # ------------------------------------------------------------------
         if not self._iface_matches_wan_gateway(use_iface, gw_ip):
             better_iface = (
-                    self._choose_gateway_iface(gw_ip, use_iface)
+                    self._gw_repick_cache_get(gw_ip)
+                    or self._choose_gateway_iface(gw_ip, use_iface)
                     or self._find_iface_for_gateway(gw_ip)
             )
             if better_iface and better_iface != use_iface:
@@ -12117,33 +12147,35 @@ class ARPManager:
                     self._ensure_dynamic_iface_config(use_iface)
                 except Exception:
                     pass
+
                 cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
                 iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
-                cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+                cidr = str(cidr or cfg.get("cidr") or cfg.get("network") or "").strip()
 
                 self._log_rl(
-                    self._gw_log_key("gw_iface_repick", gw_ip, use_iface),
+                    self._gw_log_key("gw_iface_repick", gw_ip, old_iface, use_iface),
                     10.0,
                     f"[ARP][GW] 🔀 Re-picked gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
                 )
             else:
-                if not self._iface_matches_wan_gateway(use_iface, gw_ip):
-                    if not self._gw_soft_mismatch_hit(use_iface, gw_ip):
-                        self._gw_soft_mismatch_set(use_iface, gw_ip)
-                        self._log_rl(
-                            self._gw_log_key("gw_iface_mismatch_continue", gw_ip, use_iface),
-                            self.GW_SOFT_MISMATCH_TTL,
-                            f"[ARP][GW] ⚠️ Interface {use_iface} is not a strict on-link match for gateway {gw_ip}; continuing with normal OS/ARP resolution and no broadcast fallback.",
-                        )
+                if not self._gw_soft_mismatch_hit(use_iface, gw_ip):
+                    self._gw_soft_mismatch_set(use_iface, gw_ip)
+                    self._log_rl(
+                        self._gw_log_key("gw_iface_mismatch_continue", gw_ip, use_iface),
+                        self.GW_SOFT_MISMATCH_TTL,
+                        f"[ARP][GW] ⚠️ Interface {use_iface} is not a strict on-link match for gateway {gw_ip}; continuing with normal OS/ARP resolution and no broadcast fallback.",
+                    )
 
-        limited_broadcast = (gw_ip == "255.255.255.255")
-        sane_gw_iface, sane_reason_iface = self._sanitize_gateway_candidate(gw_ip, use_iface)
+        # ------------------------------------------------------------------
+        # 4) Re-check after iface selection using iface-local network knowledge.
+        # ------------------------------------------------------------------
+        sane_iface, sane_reason_iface = self._sanitize_gateway_candidate(gw_ip, use_iface)
 
         if limited_broadcast or sane_reason_iface == "is_broadcast" or str(sane_reason_iface).startswith(
                 "is_directed_broadcast:"):
             self._gw_special_result_set(gw_ip, BROADCAST_MAC, "directed_broadcast")
             self._log_rl(
-                self._gw_log_key("gw_true_broadcast", gw_ip),
+                self._gw_log_key("gw_true_broadcast_iface", gw_ip, use_iface),
                 10.0,
                 f"[ARP][GW] 📣 Gateway target is broadcast: {gw_ip} -> {BROADCAST_MAC}",
             )
@@ -12151,208 +12183,116 @@ class ARPManager:
 
         if sane_reason_iface in {"loopback", "multicast", "unspecified", "is_network"}:
             self._log_rl(
-                self._gw_log_key("gw_invalid_candidate", gw_ip, sane_reason_iface),
+                self._gw_log_key("gw_invalid_iface", gw_ip, sane_reason_iface, use_iface),
                 5.0,
                 f"[ARP][GW] ⛔ Invalid gateway candidate {gw_ip} on {use_iface}: {sane_reason_iface}",
             )
             return None
 
-        gw_ip = sane_gw
-
-        # If the hint iface does not look like the real L3 gateway iface, try to
-        # repick it — but do NOT fall into broadcast ARP just because the iface
-        # choice is imperfect.
-        if not self._iface_matches_wan_gateway(use_iface, gw_ip):
-            better_iface = (
-                    self._choose_gateway_iface(gw_ip, use_iface)
-                    or self._find_iface_for_gateway(gw_ip)
-            )
-            if better_iface and better_iface != use_iface:
-                old_iface = use_iface
-                use_iface = str(better_iface)
-                try:
-                    self._ensure_dynamic_iface_config(use_iface)
-                except Exception:
-                    pass
-                cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
-                iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
-                cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
-
-                self._log_rl(
-                    f"gw_iface_repick:{old_iface}:{use_iface}:{gw_ip}",
-                    5.0,
-                    f"[ARP][GW] 🔀 Re-picked gateway iface for {gw_ip}: {old_iface} -> {use_iface}",
-                )
-            else:
-                self._log_rl(
-                    f"gw_iface_mismatch_continue:{use_iface}:{gw_ip}",
-                    5.0,
-                    f"[ARP][GW] ⚠️ Interface {use_iface} is not a strict on-link match for gateway {gw_ip}; continuing with normal OS/ARP resolution and no broadcast fallback.",
-                )
-
-        limited_broadcast = (gw_ip == "255.255.255.255")
-        sane_gw_iface, sane_reason_iface = self._sanitize_gateway_candidate(gw_ip, use_iface)
-
-        if limited_broadcast or sane_reason_iface == "is_broadcast" or str(sane_reason_iface).startswith(
-                "is_directed_broadcast:"):
-            self._log_rl(
-                f"gw_true_broadcast:{use_iface}:{gw_ip}",
-                5.0,
-                f"[ARP][GW] 📣 Gateway target is actually broadcast on {use_iface}: {gw_ip}; using broadcast MAC.",
-            )
-            return BROADCAST_MAC
-
-        if sane_reason_iface in {"loopback", "multicast", "unspecified", "is_network"}:
-            self._log_rl(
-                f"gw_invalid_candidate:{use_iface}:{gw_ip}",
-                5.0,
-                f"[ARP][GW] ⛔ Invalid gateway candidate {gw_ip} on {use_iface}: {sane_reason_iface}",
-            )
-            return None
-
-        mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
-        if mac and not self._is_bad_gateway_mac(mac):
-            return mac
-
-        if iface_ip and str(iface_ip).strip() == str(gw_ip).strip():
+        # self-IP gateway case
+        if sane_reason_iface == "is_self_ip" or (iface_ip and str(iface_ip).strip() == str(gw_ip).strip()):
             foreign_mac = self._allow_self_gateway_resolve(use_iface, gw_ip)
+            foreign_mac = self._normalize_mac(foreign_mac)
             if foreign_mac and not self._is_bad_gateway_mac(foreign_mac):
                 self._cache_set(gw_ip, foreign_mac, time.time())
                 self._gateway_cache_set(use_iface, gw_ip, foreign_mac)
                 self._known_gateway_macs[gw_ip] = foreign_mac
                 self._log_rl(
-                    f"gw_self_foreign:{use_iface}:{gw_ip}",
+                    self._gw_log_key("gw_self_foreign", gw_ip, use_iface),
                     5.0,
                     f"[ARP][GW] 🤝 Self-gateway override: using foreign owner {gw_ip} -> {foreign_mac} on {use_iface}",
                 )
                 return foreign_mac
 
             self._log_rl(
-                f"gw_self:{use_iface}:{gw_ip}",
+                self._gw_log_key("gw_self_refuse", gw_ip, use_iface),
                 5.0,
                 f"[ARP][GW] 🚫 Refusing self-gateway resolve for {gw_ip} on {use_iface}",
             )
             return None
 
-        verdict = self._validate_gateway_onlink(
-            gw_ip,
-            cidr if cidr else None,
-            iface_ip,
-        ) if cidr else None
+        # ------------------------------------------------------------------
+        # 5) Cheap non-active resolution first.
+        # ------------------------------------------------------------------
+        mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
+        mac = self._normalize_mac(mac)
+        if mac and not self._is_bad_gateway_mac(mac):
+            return mac
 
-        if verdict is not None and not verdict.ok:
-            better_iface = (
-                    self._choose_gateway_iface(gw_ip, use_iface)
-                    or self._find_iface_for_gateway(gw_ip)
+        # Forced refresh of OS ARP cache for normal, non-broadcast targets.
+        mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
+        mac = self._normalize_mac(mac)
+        if mac and not self._is_bad_gateway_mac(mac):
+            self._cache_set(gw_ip, mac, time.time())
+            self._gateway_cache_set(use_iface, gw_ip, mac)
+            self._known_gateway_macs[gw_ip] = mac
+            self._log_rl(
+                self._gw_log_key("gw_os_arp_refresh", gw_ip, use_iface),
+                10.0,
+                f"[ARP][GW] 🧭 Recovered gateway from refreshed OS ARP cache: {gw_ip} -> {mac}",
             )
-            if better_iface and better_iface != use_iface:
-                old_iface = use_iface
-                use_iface = str(better_iface)
-                try:
-                    self._ensure_dynamic_iface_config(use_iface)
-                except Exception:
-                    pass
-                cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
-                iface_ip = cfg.get("ip_addr") or self.get_interface_ipv4(use_iface) or None
-                cidr = str(cfg.get("cidr") or cfg.get("network") or "").strip()
+            return mac
+
+        # ------------------------------------------------------------------
+        # 6) On-link validation / active ARP
+        # ------------------------------------------------------------------
+        verdict = None
+        try:
+            if cidr:
                 verdict = self._validate_gateway_onlink(
                     gw_ip,
                     cidr if cidr else None,
                     iface_ip,
-                ) if cidr else None
-
-                self._log_rl(
-                    f"gw_iface_repick_verdict:{old_iface}:{use_iface}:{gw_ip}",
-                    5.0,
-                    f"[ARP][GW] 🔁 Re-validated gateway path for {gw_ip}: {old_iface} -> {use_iface}",
                 )
+        except Exception:
+            verdict = None
 
-        if verdict is not None and not verdict.ok:
-            hard_reasons = {
-                "is_network",
-                "is_broadcast",
-                "is_self_ip",
-                "special_gw",
-                "version_mismatch",
-            }
-            if verdict.reason in hard_reasons:
-                self._log_rl(
-                    f"gw_invalid:{use_iface}:{gw_ip}",
-                    5.0,
-                    f"[ARP][GW] ⛔ Invalid gateway path for {gw_ip} on {use_iface}: {verdict.reason}",
-                )
-                return None
-            else:
-                self._log_rl(
-                    f"gw_soft_invalid:{use_iface}:{gw_ip}",
-                    5.0,
-                    f"[ARP][GW] ⚠️ Soft gateway path warning for {gw_ip} on {use_iface}: {verdict.reason}; continuing normal resolution.",
-                )
+        allow_active_probe = False
+        if verdict is not None:
+            allow_active_probe = bool(verdict.ok)
+        else:
+            allow_active_probe = bool(self._iface_is_authoritative_gateway_iface(use_iface, gw_ip))
 
-        cached = self._gateway_cache_get(use_iface, gw_ip)
-        if cached and not self._is_bad_gateway_mac(cached):
-            return cached
-
-        iface_seen = self._iface_cache_get(use_iface, gw_ip)
-        if iface_seen and not self._is_bad_gateway_mac(iface_seen):
-            self._gateway_cache_set(use_iface, gw_ip, iface_seen)
-            self._known_gateway_macs[gw_ip] = iface_seen
-            return iface_seen
-
-        if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
-            mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=False)
-            if mac and not self._is_bad_gateway_mac(mac):
-                self._cache_set(gw_ip, mac, time.time())
-                self._gateway_cache_set(use_iface, gw_ip, mac)
-                self._known_gateway_macs[gw_ip] = mac
-                return mac
-
-        if not getattr(self, "sniffer", None):
-            return None
-
-        if self._gateway_fail_hit(use_iface, gw_ip):
-            if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
-                mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
+        if allow_active_probe:
+            for _ in range(max(1, int(retries))):
+                mac = self._arp_resolve_ipv4(use_iface, gw_ip)
+                mac = self._normalize_mac(mac)
                 if mac and not self._is_bad_gateway_mac(mac):
                     self._cache_set(gw_ip, mac, time.time())
                     self._gateway_cache_set(use_iface, gw_ip, mac)
                     self._known_gateway_macs[gw_ip] = mac
+                    self._log_rl(
+                        self._gw_log_key("gw_active_probe_ok", gw_ip, use_iface),
+                        10.0,
+                        f"[ARP][GW] 🎯 Active ARP resolved gateway {gw_ip} -> {mac} on {use_iface}",
+                    )
                     return mac
-            return None
 
-        self._safe_log(
-            f"[ARP] 🛣️ resolve_gateway_mac: resolving gateway {gw_ip} "
-            f"(iface={use_iface}, iface_cidr={cidr or 'None'})"
-        )
-
-        for _ in range(max(1, int(retries))):
-            mac = self._arp_resolve_ipv4(use_iface, gw_ip)
-            mac = self._normalize_mac(mac)
-            if mac and not self._is_bad_gateway_mac(mac):
-                self._cache_set(gw_ip, mac, time.time())
-                self._gateway_cache_set(use_iface, gw_ip, mac)
-                self._known_gateway_macs[gw_ip] = mac
-                self._safe_log(f"[ARP][GW] 🎯 Resolved {gw_ip} -> {mac} on {use_iface}")
-                return mac
-
-        if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
-            mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
-            if mac and not self._is_bad_gateway_mac(mac):
-                self._cache_set(gw_ip, mac, time.time())
-                self._gateway_cache_set(use_iface, gw_ip, mac)
-                self._known_gateway_macs[gw_ip] = mac
-                self._safe_log(f"[ARP][GW] 🧭 Recovered {gw_ip} from fresh OS ARP cache -> {mac}")
-                return mac
-
+        # ------------------------------------------------------------------
+        # 7) If this gw looks stale, retry with OS-selected gateway for that iface.
+        # ------------------------------------------------------------------
         real_gw = self._get_os_gateway_for_iface(use_iface)
+        real_gw = self._normalize_ip(real_gw)
         if real_gw and real_gw != gw_ip:
             real_sane, real_reason = self._sanitize_gateway_candidate(real_gw, use_iface)
+
+            if real_gw == "255.255.255.255" or str(real_reason).startswith(
+                    "is_directed_broadcast:") or real_reason == "is_broadcast":
+                self._gw_special_result_set(real_gw, BROADCAST_MAC, "directed_broadcast")
+                self._log_rl(
+                    self._gw_log_key("gw_real_broadcast", real_gw, use_iface),
+                    10.0,
+                    f"[ARP][GW] 📣 OS-selected gateway target is broadcast: {real_gw} -> {BROADCAST_MAC}",
+                )
+                return BROADCAST_MAC
+
             if real_sane and real_reason == "ok":
                 self._safe_log(
                     f"[ARP][GW] 🔄 Retrying with OS-selected gateway {real_gw} instead of {gw_ip} on {use_iface}"
                 )
 
                 mac = self._resolve_gateway_mac_from_os(use_iface, real_gw)
+                mac = self._normalize_mac(mac)
                 if mac and not self._is_bad_gateway_mac(mac):
                     self._cache_set(real_gw, mac, time.time())
                     self._gateway_cache_set(use_iface, real_gw, mac)
@@ -12360,6 +12300,7 @@ class ARPManager:
                     return mac
 
                 mac = self.fallback_mac_from_os_cache(real_gw, force_refresh=True)
+                mac = self._normalize_mac(mac)
                 if mac and not self._is_bad_gateway_mac(mac):
                     self._cache_set(real_gw, mac, time.time())
                     self._gateway_cache_set(use_iface, real_gw, mac)
@@ -12376,10 +12317,19 @@ class ARPManager:
                         self._safe_log(f"[ARP][GW] 🎯 Resolved OS-selected gateway {real_gw} -> {mac} on {use_iface}")
                         return mac
 
-        mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
-        if mac and not self._is_bad_gateway_mac(mac):
-            return mac
+        # ------------------------------------------------------------------
+        # 8) Final chance: re-check special cache so broadcast never falls through
+        #    to the fail log if another branch marked it special.
+        # ------------------------------------------------------------------
+        special = self._gw_special_result_get(gw_ip)
+        if special:
+            mac, reason = special
+            if mac and reason == "directed_broadcast":
+                return mac
 
+        # ------------------------------------------------------------------
+        # 9) True failure for non-broadcast targets only.
+        # ------------------------------------------------------------------
         self._gateway_fail_set(use_iface, gw_ip)
         self._safe_log(f"[ARP] ❌ resolve_gateway_mac: failed for {gw_ip} on {use_iface}")
         return None
