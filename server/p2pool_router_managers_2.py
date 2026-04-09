@@ -10016,11 +10016,6 @@ class ARPManager:
                 self._cache_set(gw_ip, mac, time.time())
                 self._gateway_cache_set(iface, gw_ip, mac)
                 self._known_gateway_macs[gw_ip] = mac
-                self._log_rl(
-                    self._gw_log_key("gw_os_arp_cache", gw_ip),
-                    10.0,
-                    f"[ARP][GW] 🧭 OS-helper recovered {gw_ip} from OS ARP cache: {mac}",
-                )
                 return mac
 
             # 5) passive learned gateway owner on this iface
@@ -10466,8 +10461,10 @@ class ARPManager:
                     allow_broadcast = True
                 elif str(sane_reason).startswith("is_directed_broadcast:"):
                     allow_broadcast = True
+                elif ip_text.endswith(".255"):
+                    allow_broadcast = True
             except Exception:
-                allow_broadcast = False
+                allow_broadcast = ip_text.endswith(".255")
 
             for line in output.splitlines():
                 if ip_text not in line:
@@ -10481,12 +10478,8 @@ class ARPManager:
                 if not mac:
                     continue
 
-                # allow Ethernet broadcast only for broadcast targets
                 if mac == BROADCAST_MAC and allow_broadcast:
                     self._gw_special_result_set(ip_text, BROADCAST_MAC, "directed_broadcast")
-                    self._safe_log(
-                        f"[ARP][GW] 📣 OS cache{' refresh' if force_refresh else ''}: {ip_text} → {BROADCAST_MAC} (broadcast target)"
-                    )
                     return BROADCAST_MAC
 
                 if self._is_bad_gateway_mac(mac):
@@ -10496,12 +10489,11 @@ class ARPManager:
                         f"[ARP][GW] 🚫 Ignoring bad OS ARP cache MAC for {ip_text}: {mac}",
                     )
                     continue
-
                 self._safe_log(
                     f"[ARP] 🧭 OS cache{' refresh' if force_refresh else ''}: {ip_text} → {mac}"
                 )
                 return mac
-
+                return mac
             return None
         except Exception:
             return None
@@ -11752,47 +11744,91 @@ class ARPManager:
 
     def _remote_or_gateway_target(self, target_ip: str, iface: str) -> tuple[str | None, str]:
         try:
-            ip_obj = ipaddress.ip_address(str(target_ip).strip())
+            iface = str(iface or "").strip()
+            if not iface:
+                return None, "no_iface"
+
+            ip_text = self._normalize_ip(target_ip)
+            if not ip_text:
+                return None, "bad_ip"
+
+            ip_obj = ipaddress.ip_address(ip_text)
             if not isinstance(ip_obj, ipaddress.IPv4Address):
                 return None, "not_ipv4"
-        except Exception:
-            return None, "bad_ip"
 
-        self._ensure_dynamic_iface_config(iface)
+            self._ensure_dynamic_iface_config(iface)
 
-        net_obj = self._get_iface_network(iface)
-        iface_ip = self.get_interface_ipv4(iface) if iface else None
-        gw_ip = self._get_iface_gateway(iface) if iface else None
+            net_obj = self._get_iface_network(iface)
+            iface_ip = self._normalize_ip(self.get_interface_ipv4(iface) if iface else None)
+            gw_ip = self._normalize_ip(self._get_iface_gateway(iface) if iface else None)
 
-        # Hyper-V link-local stays special
-        if ip_obj.is_link_local and self._is_hyperv_iface(iface):
-            return str(ip_obj), "hyperv_link_local"
+            # 0) honor already-known special target result first
+            special = self._gw_special_result_get(ip_text)
+            if special:
+                _mac, reason = special
+                reason = str(reason or "").strip()
+                if reason == "directed_broadcast":
+                    return ip_text, "directed_broadcast"
+                if reason == "hyperv_special":
+                    return ip_text, "hyperv_special"
 
-        # Directed / limited broadcast should resolve to Ethernet broadcast, not fail
-        sane_ip, sane_reason = self._sanitize_gateway_candidate(str(ip_obj), iface)
-        if str(ip_obj) == "255.255.255.255" or str(sane_reason).startswith(
-                "is_directed_broadcast:") or sane_reason == "is_broadcast":
-            self._gw_special_result_set(str(ip_obj), "ff:ff:ff:ff:ff:ff", "directed_broadcast")
-            return str(ip_obj), "directed_broadcast"
+            # 1) obvious non-ARP cases
+            if ip_obj.is_loopback:
+                return None, "loopback"
+            if ip_obj.is_multicast:
+                return None, "multicast"
+            if ip_obj.is_unspecified:
+                return None, "unspecified"
 
-        # Other special addresses
-        if self.is_special_ip(str(ip_obj), iface_network=str(net_obj) if net_obj else None):
-            if self._is_hyperv_iface(iface):
-                mac = self._resolve_hyperv_special(str(ip_obj), iface)
+            # 2) self IP should never go through remote/gateway ARP
+            if iface_ip and ip_text == iface_ip:
+                return None, "self_ip"
+
+            # 3) directed / limited broadcast resolves to Ethernet broadcast directly
+            sane_ip, sane_reason = self._sanitize_gateway_candidate(ip_text, iface)
+            if (
+                    ip_text == "255.255.255.255"
+                    or sane_reason == "is_broadcast"
+                    or str(sane_reason).startswith("is_directed_broadcast:")
+            ):
+                self._gw_special_result_set(ip_text, "ff:ff:ff:ff:ff:ff", "directed_broadcast")
+                return ip_text, "directed_broadcast"
+
+            # 4) Kubernetes service VIPs are virtual; caller should use next-hop logic
+            if self._is_k8s_service_ip(ip_text):
+                return None, "k8s_service_virtual"
+
+            # 5) Hyper-V/link-local special handling
+            if ip_obj.is_link_local and self._is_hyperv_iface(iface):
+                mac = self._resolve_hyperv_special(ip_text, iface)
                 if mac:
-                    self._gw_special_result_set(str(ip_obj), mac, "hyperv_special")
-                    return str(ip_obj), "hyperv_special"
-                return None, "special_hyperv"
-            return None, "special"
+                    self._gw_special_result_set(ip_text, mac, "hyperv_special")
+                    return ip_text, "hyperv_special"
+                return ip_text, "hyperv_link_local"
 
-        if net_obj and self.is_on_link(str(ip_obj), str(net_obj)):
-            return str(ip_obj), "on_link"
+            # 6) other special IPs
+            if self.is_special_ip(ip_text, iface_network=str(net_obj) if net_obj else None):
+                if self._is_hyperv_iface(iface):
+                    mac = self._resolve_hyperv_special(ip_text, iface)
+                    if mac:
+                        self._gw_special_result_set(ip_text, mac, "hyperv_special")
+                        return ip_text, "hyperv_special"
+                    return None, "special_hyperv"
+                return None, "special"
 
-        if not gw_ip:
-            # keep the reason, but let caller try special-result cache first
+            # 7) direct on-link host
+            if net_obj and self.is_on_link(ip_text, str(net_obj)):
+                return ip_text, "on_link"
+
+            # 8) off-link host must resolve via gateway
+            if gw_ip:
+                return gw_ip, "via_gateway"
+
+            # 9) no direct path and no gateway
             return None, "no_gateway"
 
-        return str(gw_ip), "gateway"
+        except Exception as e:
+            return None, f"error:{e}"
 
     # ------------------------------------------------------------------
     # Core resolution
@@ -11829,12 +11865,22 @@ class ARPManager:
                 5.0,
                 f"[ARP] 🔗 Static resolve: {ip_str} -> {static_mac}",
             )
+            self._log_rl(
+                f"resolve_ok:static:{ip_str}",
+                5.0,
+                f"[ARP] ⚡ Resolved {ip_str} -> {static_mac} via static entry",
+            )
             return static_mac
 
         entry = self._cache_get(ip_str)
         if entry:
             mac_cached, ts = entry[:2]
             if now - ts < self.CACHE_TIMEOUT:
+                self._log_rl(
+                    f"resolve_ok:cache:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {mac_cached} via cache",
+                )
                 return mac_cached
 
         for dhcp_srv in (self.dhcp_server_in, self.dhcp_server_out):
@@ -11842,6 +11888,11 @@ class ARPManager:
             mac = self._normalize_mac(bind.get(ip_str))
             if mac:
                 self._cache_set(ip_str, mac, now)
+                self._log_rl(
+                    f"resolve_ok:dhcp:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {mac} via DHCP binding",
+                )
                 return mac
         # Kubernetes service VIPs are virtual and should not go through ARP resolution.
 
@@ -11849,6 +11900,11 @@ class ARPManager:
         if self._is_k8s_service_ip(ip_str):
             mac = self._resolve_k8s_next_hop_mac(ip_str, use_iface)
             if mac:
+                self._log_rl(
+                    f"resolve_ok:k8s:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {mac} via Kubernetes next-hop",
+                )
                 return mac
             if not self._k8s_virtual_hit(ip_str):
                 self._k8s_virtual_set(ip_str)
@@ -11871,6 +11927,11 @@ class ARPManager:
 
         iface_mac = self._iface_cache_get(use_iface, ip_str)
         if iface_mac:
+            self._log_rl(
+                f"resolve_ok:iface_cache:{use_iface}:{ip_str}",
+                5.0,
+                f"[ARP] ⚡ Resolved {ip_str} -> {iface_mac} via iface-cache on {use_iface.split('_')[-1]}",
+            )
             return iface_mac
 
         # only allow the old global cache when it is safe
@@ -11879,6 +11940,11 @@ class ARPManager:
             if entry:
                 mac_cached, ts = entry[:2]
                 if now - ts < self.CACHE_TIMEOUT:
+                    self._log_rl(
+                        f"resolve_ok:global_cache:{ip_str}",
+                        5.0,
+                        f"[ARP] ⚡ Resolved {ip_str} -> {mac_cached} via global cache",
+                    )
                     return mac_cached
 
         li = self._temp_arp_leases.get(ip_str)
@@ -11886,6 +11952,11 @@ class ARPManager:
             our_mac = self.get_interface_mac(use_iface)
             if our_mac:
                 self._cache_set(ip_str, our_mac, now)
+                self._log_rl(
+                    f"resolve_ok:lease:{use_iface}:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {our_mac} via temporary lease on {use_iface.split('_')[-1]}",
+                )
                 return our_mac
 
         if self._is_hyperv_iface(use_iface):
@@ -11898,6 +11969,11 @@ class ARPManager:
                         f"resolve_hyperv_ll:{use_iface}:{ip_str}",
                         10.0,
                         f"[ARP] 🧩 resolve: Hyper-V link-local {ip_str} → {hyperv_mac} on {use_iface.split('_')[-1]}",
+                    )
+                    self._log_rl(
+                        f"resolve_ok:hyperv:{use_iface}:{ip_str}",
+                        5.0,
+                        f"[ARP] ⚡ Resolved {ip_str} -> {hyperv_mac} via Hyper-V special path",
                     )
                     return hyperv_mac
 
@@ -11917,13 +11993,12 @@ class ARPManager:
         if mode == "via_gateway":
             cached_gw = self._gateway_cache_get(use_iface, arp_target)
             if cached_gw:
+                self._log_rl(
+                    f"resolve_ok:gw_cache:{use_iface}:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {cached_gw} via gateway-cache on {use_iface.split('_')[-1]}",
+                )
                 return cached_gw
-
-            if self.PREFER_OS_ARP_CACHE_FOR_GATEWAY:
-                mac = self.fallback_mac_from_os_cache(arp_target)
-                if mac:
-                    self._gateway_cache_set(use_iface, arp_target, mac)
-                    return mac
 
             if self._gateway_fail_hit(use_iface, arp_target):
                 better_iface = self._find_iface_for_gateway(arp_target)
@@ -11941,6 +12016,11 @@ class ARPManager:
             )
             if mac:
                 self._gateway_cache_set(use_iface, arp_target, mac)
+                self._log_rl(
+                    f"resolve_ok:gw_resolve:{use_iface}:{ip_str}",
+                    5.0,
+                    f"[ARP] ⚡ Resolved {ip_str} -> {mac} via gateway {arp_target} on {use_iface.split('_')[-1]}",
+                )
                 return mac
 
             self._gateway_fail_set(use_iface, arp_target)
@@ -11950,6 +12030,11 @@ class ARPManager:
         mac = self.fallback_mac_from_os_cache(ip_str)
         if mac:
             self._cache_set(ip_str, mac, now)
+            self._log_rl(
+                f"resolve_ok:os_cache:{ip_str}",
+                5.0,
+                f"[ARP] ⚡ Resolved {ip_str} -> {mac} via OS ARP cache",
+            )
             return mac
 
         mac = self.send_custom_arp_request(ip_str, iface=use_iface, timeout=2)
@@ -11957,6 +12042,11 @@ class ARPManager:
             self._iface_cache_set(use_iface, ip_str, mac, source="active")
             if not self._is_hyperv_iface(use_iface):
                 self._cache_set(ip_str, mac, now)
+            self._log_rl(
+                f"resolve_ok:active:{use_iface}:{ip_str}",
+                5.0,
+                f"[ARP] ⚡ Resolved {ip_str} -> {mac} via active ARP on {use_iface.split('_')[-1]}",
+            )
             return mac
 
         try:
@@ -11966,6 +12056,11 @@ class ARPManager:
         mac = self._normalize_mac(mac)
         if mac:
             self._cache_set(ip_str, mac, now)
+            self._log_rl(
+                f"resolve_ok:getmacbyip:{ip_str}",
+                5.0,
+                f"[ARP] ⚡ Resolved {ip_str} -> {mac} via getmacbyip",
+            )
             return mac
 
         self._negative_cache_set(use_iface, ip_str)
@@ -12375,13 +12470,23 @@ class ARPManager:
         # ------------------------------------------------------------------
         mac = self._resolve_gateway_mac_from_os(use_iface, gw_ip)
         mac = self._normalize_mac(mac)
-        if mac and not self._is_bad_gateway_mac(mac):
+        mac = self._normalize_mac(mac)
+        if mac and (
+                (mac == "ff:ff:ff:ff:ff:ff" and (str(gw_ip) == "255.255.255.255" or str(gw_ip).endswith(".255")))
+                or
+                (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+        ):
             return mac
 
         # Forced refresh of OS ARP cache for normal, non-broadcast targets.
         mac = self.fallback_mac_from_os_cache(gw_ip, force_refresh=True)
         mac = self._normalize_mac(mac)
-        if mac and not self._is_bad_gateway_mac(mac):
+        mac = self._normalize_mac(mac)
+        if mac and (
+                (mac == "ff:ff:ff:ff:ff:ff" and (str(gw_ip) == "255.255.255.255" or str(gw_ip).endswith(".255")))
+                or
+                (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+        ):
             self._cache_set(gw_ip, mac, time.time())
             self._gateway_cache_set(use_iface, gw_ip, mac)
             self._known_gateway_macs[gw_ip] = mac
@@ -12416,7 +12521,13 @@ class ARPManager:
             for _ in range(max(1, int(retries))):
                 mac = self._arp_resolve_ipv4(use_iface, gw_ip)
                 mac = self._normalize_mac(mac)
-                if mac and not self._is_bad_gateway_mac(mac):
+                mac = self._normalize_mac(mac)
+                if mac and (
+                        (mac == "ff:ff:ff:ff:ff:ff" and (
+                                str(gw_ip) == "255.255.255.255" or str(gw_ip).endswith(".255")))
+                        or
+                        (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+                ):
                     self._cache_set(gw_ip, mac, time.time())
                     self._gateway_cache_set(use_iface, gw_ip, mac)
                     self._known_gateway_macs[gw_ip] = mac
@@ -12452,7 +12563,13 @@ class ARPManager:
 
                 mac = self._resolve_gateway_mac_from_os(use_iface, real_gw)
                 mac = self._normalize_mac(mac)
-                if mac and not self._is_bad_gateway_mac(mac):
+                mac = self._normalize_mac(mac)
+                if mac and (
+                        (mac == "ff:ff:ff:ff:ff:ff" and (
+                                str(real_gw) == "255.255.255.255" or str(real_gw).endswith(".255")))
+                        or
+                        (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+                ):
                     self._cache_set(real_gw, mac, time.time())
                     self._gateway_cache_set(use_iface, real_gw, mac)
                     self._known_gateway_macs[real_gw] = mac
@@ -12460,7 +12577,13 @@ class ARPManager:
 
                 mac = self.fallback_mac_from_os_cache(real_gw, force_refresh=True)
                 mac = self._normalize_mac(mac)
-                if mac and not self._is_bad_gateway_mac(mac):
+                mac = self._normalize_mac(mac)
+                if mac and (
+                        (mac == "ff:ff:ff:ff:ff:ff" and (
+                                str(real_gw) == "255.255.255.255" or str(real_gw).endswith(".255")))
+                        or
+                        (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+                ):
                     self._cache_set(real_gw, mac, time.time())
                     self._gateway_cache_set(use_iface, real_gw, mac)
                     self._known_gateway_macs[real_gw] = mac
@@ -12469,7 +12592,13 @@ class ARPManager:
                 for _ in range(max(1, int(retries))):
                     mac = self._arp_resolve_ipv4(use_iface, real_gw)
                     mac = self._normalize_mac(mac)
-                    if mac and not self._is_bad_gateway_mac(mac):
+                    mac = self._normalize_mac(mac)
+                    if mac and (
+                            (mac == "ff:ff:ff:ff:ff:ff" and (
+                                    str(real_gw) == "255.255.255.255" or str(real_gw).endswith(".255")))
+                            or
+                            (mac != "ff:ff:ff:ff:ff:ff" and not self._is_bad_gateway_mac(mac))
+                    ):
                         self._cache_set(real_gw, mac, time.time())
                         self._gateway_cache_set(use_iface, real_gw, mac)
                         self._known_gateway_macs[real_gw] = mac

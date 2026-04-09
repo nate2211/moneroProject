@@ -861,13 +861,194 @@ class SnapshotMethodGenerator:
         return s
 
 
-class AskManagerChatGenerator:
-    TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_./:-]+")
-    DEFAULT_REDACTIONS: List[Tuple[re.Pattern, str]] = [
-        (re.compile(r"\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)(?:\\.|$)){4}\\b"), "<IP4>"),
-        (re.compile(r"\\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\\b"), "<MAC>"),
-        (re.compile(r"\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"), "<EMAIL>"),
-    ]
+@dataclass
+class AskDialogueState:
+    active_topic: str = "misc"
+    active_flow_key: Optional[str] = None
+    last_intent: str = "general"
+    compared_topics: List[str] = field(default_factory=list)
+    last_prompt: str = ""
+    last_reply: str = ""
+    last_packets: List[KnowledgePacket] = field(default_factory=list)
+    last_ts: float = field(default_factory=time.time)
+
+
+@dataclass
+class AskEvidenceBundle:
+    topic: str = "misc"
+    prompt: str = ""
+    packets: List[KnowledgePacket] = field(default_factory=list)
+    flows: List[Dict[str, Any]] = field(default_factory=list)
+    anomalies: List[Dict[str, Any]] = field(default_factory=list)
+    stats: Dict[str, Any] = field(default_factory=dict)
+    token_lines: List[str] = field(default_factory=list)
+    related_topics: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AskAnalysis:
+    topic: str = "misc"
+    answer_mode: str = "general"
+    observations: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    next_steps: List[str] = field(default_factory=list)
+    concise_summary: str = ""
+    confidence: float = 0.5
+
+
+class AskTokenMemory:
+    TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+", re.UNICODE)
+
+    def __init__(self, max_per_token: int = 50000) -> None:
+        self._token_bank: Dict[str, Deque[Tuple[str, str, float]]] = defaultdict(
+            lambda: deque(maxlen=max_per_token)
+        )
+        self._lock = threading.RLock()
+
+    def index(self, text: str, role: str) -> None:
+        now = time.time()
+        seen = set()
+        for tok in self.TOKEN_RE.findall(text or ""):
+            tok = tok.lower()
+            if len(tok) < 2 or tok in seen:
+                continue
+            seen.add(tok)
+            with self._lock:
+                self._token_bank[tok].append((role, text, now))
+
+    def fetch(self, token: str, limit: int = 6) -> List[str]:
+        with self._lock:
+            rows = list(self._token_bank.get((token or "").lower(), ()))
+        rows = rows[-limit:]
+        return [f"{role}: {text}" for role, text, _ in rows if text]
+
+
+class AskMessageStore:
+    def __init__(self, max_messages: int = 500) -> None:
+        self._messages: Deque[Tuple[str, str]] = deque(maxlen=max_messages)
+        self._lock = threading.RLock()
+
+    def add(self, role: str, text: str) -> None:
+        with self._lock:
+            self._messages.append((role, text))
+
+    def all(self) -> List[Tuple[str, str]]:
+        with self._lock:
+            return list(self._messages)
+
+    def tail(self, limit: int = 20) -> List[Tuple[str, str]]:
+        with self._lock:
+            return list(self._messages)[-limit:]
+
+
+class AskIntentRouter:
+    _TOPIC_HINTS: Dict[str, Tuple[str, ...]] = {
+        "dns": ("dns", "resolver", "qname", "llmnr", "mdns"),
+        "dhcp": ("dhcp", "lease", "offer", "discover", "ack"),
+        "tls": ("tls", "ssl", "sni", "alpn", "certificate", "clienthello", "serverhello"),
+        "http": ("http", "https", "request", "response"),
+        "vpn": ("vpn", "wireguard", "ipsec", "gre", "tunnel", "natt"),
+        "quic": ("quic", "http/3", "dcid", "scid"),
+        "transport": ("tcp", "udp", "syn", "ack", "rst", "fin", "port"),
+        "router": ("router", "forward", "bridge", "interface", "iface", "phase", "component", "windivert", "wintun"),
+        "arp": ("arp", "who-has", "is-at"),
+    }
+
+    def classify(self, prompt: str, state: AskDialogueState) -> Tuple[str, str]:
+        low = (prompt or "").strip().lower()
+        if not low:
+            return "empty", state.active_topic
+
+        if any(x in low for x in ("purge", "clear", "forget")):
+            return "purge", self.guess_topic(prompt, state)
+        if any(x in low for x in ("inspect sensitive", "sensitive dump", "unredacted")):
+            return "inspect_sensitive", self.guess_topic(prompt, state)
+        if any(x in low for x in ("inspect", "dump", "summary", "status")):
+            return "inspect", self.guess_topic(prompt, state)
+        if any(x in low for x in ("stats", "metrics", "statistics")):
+            return "stats", self.guess_topic(prompt, state)
+        if "tokens" in low:
+            return "tokens", self.guess_topic(prompt, state)
+        if any(x in low for x in ("emit", "snapshot")):
+            return "emit", self.guess_topic(prompt, state)
+        if any(x in low for x in ("compare", "versus", "vs ")):
+            return "compare", self.guess_topic(prompt, state)
+        if any(x in low for x in ("trace flow", "trace", "follow flow", "flow ")):
+            return "trace_flow", self.guess_topic(prompt, state)
+        if any(x in low for x in ("why", "explain", "diagnose", "what changed", "what is happening")):
+            return "explain", self.guess_topic(prompt, state)
+        return "general", self.guess_topic(prompt, state)
+
+    def guess_topic(self, prompt: str, state: AskDialogueState) -> str:
+        low = (prompt or "").lower()
+        scores = Counter()
+        for topic, words in self._TOPIC_HINTS.items():
+            for w in words:
+                if w in low:
+                    scores[topic] += 3
+        if "that flow" in low or "same flow" in low:
+            if state.active_topic:
+                scores[state.active_topic] += 2
+        if scores:
+            return scores.most_common(1)[0][0]
+        return state.active_topic or "misc"
+
+
+class AskKnowledgeRetriever:
+    def __init__(self, ask_manager: "AskManager") -> None:
+        self._am = ask_manager
+
+    def retrieve(self, prompt: str, topic: str, intent: str) -> AskEvidenceBundle:
+        token_lines = self._token_match_lines(prompt, limit=10)
+        packets = self._am._retrieve_snippets(prompt, topk=18, per_topic_limit=10)
+        flows = self._am._co_manager.packet_learner.snapshot_flows(topic, top_k=5)
+        anomalies = [a for a in self._am._co_manager.packet_learner.get_numeric_anomalies(limit=24) if a["topic"] == topic][:6]
+        stats = self._am._co_manager.compute_statistics_from_learned_data(
+            topics=[topic],
+            percentiles=[5, 25, 50, 75, 95],
+            topk_categorical=8,
+            min_count_for_stats=2,
+        ).get(topic, {})
+        related_topics = self._infer_related_topics(packets)
+        if intent == "trace_flow" and self._am.state.active_flow_key:
+            flow_key = self._am.state.active_flow_key
+            packets = [pkt for pkt in packets if pkt.flow_key == flow_key or pkt.session_key == flow_key or pkt.route_key == flow_key] or packets
+        return AskEvidenceBundle(
+            topic=topic,
+            prompt=prompt,
+            packets=packets,
+            flows=flows,
+            anomalies=anomalies,
+            stats=stats,
+            token_lines=token_lines,
+            related_topics=related_topics,
+        )
+
+    def _token_match_lines(self, prompt: str, limit: int) -> List[str]:
+        tokens = [t for t in self._am._tokenize(prompt) if t and not t.isdigit()]
+        seen = set()
+        out: List[str] = []
+        for tok, _ in Counter(tokens).most_common():
+            for line in self._am._token_memory.fetch(tok, limit=4):
+                if line in seen:
+                    continue
+                seen.add(line)
+                out.append(line)
+                if len(out) >= limit:
+                    return out
+        return out
+
+    @staticmethod
+    def _infer_related_topics(packets: List[KnowledgePacket]) -> List[str]:
+        c = Counter()
+        for pkt in packets:
+            c[pkt.topic] += 1
+            for rel in pkt.related_topics:
+                c[str(rel)] += 1
+        return [k for k, _ in c.most_common(5)]
+
+
+class AskAnalysisEngine:
     TOPIC_TIPS = {
         "dns": "Compare query bursts, repeated qnames, resolver spread, LLMNR/mDNS leakage, and response pairing.",
         "dhcp": "Track Discover→Offer→Request→Ack continuity, relay metadata, lease reuse, and option consistency.",
@@ -881,7 +1062,260 @@ class AskManagerChatGenerator:
         "misc": "Reduce to one interface and one flow, then compare direction, TTL, stage, component, and repeat density.",
     }
 
-    def __init__(self, token_store: Callable[[str, int], Sequence[str]], knowledge_retriever: Callable[[str, int, int], List[KnowledgePacket]], knowledge_exporter: Callable[[], Dict[str, List[Dict[str, Any]]]], payload_formatter: Callable[[Dict[str, Any], bool, bool, Optional[str]], str], packet_learner_ref: PacketLearnerManager, stats_manager_ref: StatisticsManager, *, per_token_limit: int = 6, max_token_lines: int = 8, max_hint_lines: int = 8, rng_seed: Optional[int] = None, redactions: Optional[List[Tuple[re.Pattern, str]]] = None) -> None:
+    def analyze(self, intent: str, evidence: AskEvidenceBundle, state: AskDialogueState) -> AskAnalysis:
+        topic = evidence.topic or "misc"
+        stats = evidence.stats or {}
+        numeric = stats.get("numeric", {})
+        categorical = stats.get("categorical", {})
+        obs: List[str] = []
+        warns: List[str] = []
+        steps: List[str] = []
+
+        if "length" in numeric:
+            st = numeric["length"]
+            obs.append(f"avg length={st.get('mean', 0):.1f}B p95={st.get('p95', st.get('max', 0)):.1f}B")
+        if "entropy" in numeric:
+            st = numeric["entropy"]
+            obs.append(f"avg entropy={st.get('mean', 0):.2f} max={st.get('max', 0):.2f}")
+            if st.get("mean", 0.0) > 6.5:
+                warns.append("payloads are generally high entropy, so expect encrypted or compressed traffic patterns")
+        if "confidence" in numeric:
+            st = numeric["confidence"]
+            obs.append(f"avg confidence={st.get('mean', 0):.2f}")
+        if "rps" in numeric:
+            st = numeric["rps"]
+            obs.append(f"activity mean={st.get('mean', 0):.2f}/s p95={st.get('p95', st.get('max', 0)):.2f}/s")
+        if "topic_diversity" in numeric:
+            st = numeric["topic_diversity"]
+            obs.append(f"diversity mean={st.get('mean', 0):.2f}")
+
+        for feat in ("port", "iface", "component", "phase", "proto"):
+            top = categorical.get(feat, {}).get("top_k", [])
+            if top:
+                obs.append(f"{feat}=" + ", ".join(f"{v}({c})" for v, c in top[:4]))
+
+        if evidence.anomalies:
+            top_anom = evidence.anomalies[0]
+            warns.append(
+                f"recent anomaly: {top_anom['feature']} deviated (value={top_anom['value']:.2f}, z={top_anom['z_score']:.2f})"
+            )
+
+        if topic in ("router", "transport"):
+            if categorical.get("iface", {}).get("unique_count", 0) > 2:
+                warns.append("same topic is spanning several interfaces, which can indicate mirroring, rebroadcast, or path duplication")
+            if categorical.get("phase", {}).get("unique_count", 0) > 2:
+                warns.append("same topic spans many phases, which can indicate queue/forward/handled drift")
+        if topic == "tls":
+            steps.append("check whether ClientHello-like events are progressing into ServerHello / certificate stages")
+        if topic == "dns":
+            top_ports = categorical.get("port", {}).get("top_k", [])
+            if any(p in {"137", "1900", "3702"} for p, _ in top_ports):
+                warns.append("name-resolution side traffic may be mixed into the DNS topic")
+        if evidence.flows:
+            busiest = evidence.flows[0]
+            steps.append(
+                f"inspect busiest flow {busiest['key']} across iface={busiest.get('iface')} and stages={busiest.get('top_stages')}"
+            )
+
+        tip = self.TOPIC_TIPS.get(topic, self.TOPIC_TIPS["misc"])
+        steps.append(tip)
+
+        summary = self._make_summary(intent, topic, evidence, obs, warns)
+        confidence = self._estimate_confidence(evidence, warns)
+
+        return AskAnalysis(
+            topic=topic,
+            answer_mode=intent,
+            observations=obs[:10],
+            warnings=warns[:6],
+            next_steps=steps[:5],
+            concise_summary=summary,
+            confidence=confidence,
+        )
+
+    @staticmethod
+    def _make_summary(
+        intent: str,
+        topic: str,
+        evidence: AskEvidenceBundle,
+        observations: List[str],
+        warnings: List[str],
+    ) -> str:
+        packet_count = len(evidence.packets)
+        flow_count = len(evidence.flows)
+        anomaly_count = len(evidence.anomalies)
+        base = f"Topic {topic.upper()} with {packet_count} retrieved evidence item(s), {flow_count} active flow summary item(s)"
+        if anomaly_count:
+            base += f", and {anomaly_count} recent anomaly marker(s)"
+        if intent == "compare":
+            base += ". Comparison mode is active."
+        elif intent == "trace_flow":
+            base += ". Flow-trace mode is active."
+        elif intent == "explain":
+            base += ". Explanation mode is active."
+        if warnings:
+            base += f" Primary caution: {warnings[0]}."
+        elif observations:
+            base += f" Primary observation: {observations[0]}."
+        return base
+
+    @staticmethod
+    def _estimate_confidence(evidence: AskEvidenceBundle, warnings: List[str]) -> float:
+        score = 0.25
+        if evidence.packets:
+            score += min(0.25, 0.02 * len(evidence.packets))
+        if evidence.stats:
+            score += 0.20
+        if evidence.flows:
+            score += 0.15
+        if warnings:
+            score += 0.05
+        return max(0.05, min(0.95, score))
+
+
+class AskResponseComposer:
+    DEFAULT_REDACTIONS: List[Tuple[re.Pattern, str]] = [
+        (re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.|$)){4}\b"), "<IP4>"),
+        (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
+        (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<EMAIL>"),
+    ]
+
+    def __init__(self, ask_manager: "AskManager") -> None:
+        self._am = ask_manager
+
+    def compose(
+        self,
+        intent: str,
+        evidence: AskEvidenceBundle,
+        analysis: AskAnalysis,
+        *,
+        redact: bool = True,
+    ) -> str:
+        if intent == "general" and evidence.token_lines and not evidence.packets:
+            lines = ["Using token matches from history:"]
+            for s in evidence.token_lines[:8]:
+                lines.append(f"• {self._present(s, redact=redact, max_len=220)}")
+            return "\n".join(lines)
+
+        lines: List[str] = [f"Topic: {analysis.topic.upper()}"]
+        lines.append(f"Mode: {analysis.answer_mode}")
+        lines.append(f"Confidence: {analysis.confidence:.2f}")
+        lines.append("")
+        lines.append(analysis.concise_summary)
+
+        if evidence.token_lines:
+            lines.append("")
+            lines.append("Token matches from history:")
+            for s in evidence.token_lines[:6]:
+                lines.append(f"• {self._present(s, redact=redact, max_len=220)}")
+
+        if evidence.packets:
+            lines.append("")
+            lines.append("Relevant evidence:")
+            for pkt in evidence.packets[:8]:
+                rendered = self._am._payload_to_text(pkt.payload, redact=redact, include_raw=False, topic=pkt.topic)
+                if rendered:
+                    lines.append(f"• {self._present(rendered, redact=False, max_len=220)}")
+
+        if analysis.observations:
+            lines.append("")
+            lines.append("Observations:")
+            for row in analysis.observations[:8]:
+                lines.append(f"• {row}")
+
+        if evidence.flows:
+            lines.append("")
+            lines.append("Busy flows:")
+            for flow in evidence.flows[:4]:
+                lines.append(
+                    "• "
+                    + self._present(flow["key"], redact=redact, max_len=120)
+                    + f" (packets={flow['packets']}, bytes={flow['bytes']}, iface={flow.get('iface')})"
+                )
+
+        if analysis.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            for row in analysis.warnings[:5]:
+                lines.append(f"• {row}")
+
+        if analysis.next_steps:
+            lines.append("")
+            lines.append("Next step:")
+            lines.append(f"• {analysis.next_steps[0]}")
+            if len(analysis.next_steps) > 1:
+                lines.append("Consider checking:")
+                for row in analysis.next_steps[1:4]:
+                    lines.append(f"• {row}")
+
+        return "\n".join(lines)
+
+    def _present(self, s: str, *, redact: bool, max_len: int) -> str:
+        out = s
+        if redact:
+            for pat, repl in self.DEFAULT_REDACTIONS:
+                out = pat.sub(repl, out)
+        if len(out) > max_len:
+            out = out[: max_len - 3] + "..."
+        return out
+
+
+class AskCommandDispatcher:
+    def __init__(self, ask_manager: "AskManager") -> None:
+        self._am = ask_manager
+
+    def maybe_handle(self, intent: str, prompt: str, topic: str) -> Optional[str]:
+        if intent == "empty":
+            return "Say something and I’ll analyze it."
+        if intent == "purge":
+            removed = self._am._co_manager.purge_topic(topic)
+            return f"Purged topic '{topic}' ({removed} item(s))."
+        if intent == "inspect_sensitive":
+            return self._am._format_inspect(redact=False)
+        if intent == "inspect":
+            return self._am._format_inspect(redact=True)
+        if intent == "stats":
+            stats = self._am._co_manager.compute_statistics_from_learned_data(
+                topics=[],
+                percentiles=[5, 25, 50, 75, 95],
+                topk_categorical=8,
+                min_count_for_stats=2,
+            )
+            return self._am._format_stats(stats)
+        if intent == "tokens":
+            return self._am._raw_from_tokens(prompt, limit=12)
+        if intent == "emit":
+            cfg = self._am._co_manager._default_emit_builder()
+            code = self._am._co_manager.generate_class_from_config(cfg)
+            return f"Emitted snapshot class '{cfg.get('class_name')}' ({len(code)} bytes)."
+        return None
+
+
+class AskManagerChatGenerator:
+    """
+    Backward-compatible chat generator wrapper.
+    It preserves the original constructor signature while delegating to the
+    split retrieval / analysis / composition pipeline when bound to an
+    AskManager instance.
+    """
+
+    TOPIC_TIPS = AskAnalysisEngine.TOPIC_TIPS
+
+    def __init__(
+        self,
+        token_store: Callable[[str, int], Sequence[str]],
+        knowledge_retriever: Callable[[str, int, int], List[KnowledgePacket]],
+        knowledge_exporter: Callable[[], Dict[str, List[Dict[str, Any]]]],
+        payload_formatter: Callable[[Dict[str, Any], bool, bool, Optional[str]], str],
+        packet_learner_ref: PacketLearnerManager,
+        stats_manager_ref: StatisticsManager,
+        *,
+        per_token_limit: int = 6,
+        max_token_lines: int = 8,
+        max_hint_lines: int = 8,
+        rng_seed: Optional[int] = None,
+        redactions: Optional[List[Tuple[re.Pattern, str]]] = None,
+    ) -> None:
         self._token_store = token_store
         self._knowledge_retriever = knowledge_retriever
         self._knowledge_exporter = knowledge_exporter
@@ -892,19 +1326,41 @@ class AskManagerChatGenerator:
         self._max_token_lines = int(max_token_lines)
         self._max_hint_lines = int(max_hint_lines)
         self._rng = random.Random(rng_seed)
-        self._redactions = list(redactions or self.DEFAULT_REDACTIONS)
+        self._redactions = list(redactions or AskResponseComposer.DEFAULT_REDACTIONS)
+        self._am = getattr(knowledge_retriever, "__self__", None)
 
     def generate(self, prompt: str, *, redact: bool) -> str:
-        tokens = [t for t in self._tokenize(prompt) if t and not t.isdigit()]
-        token_lines = self._fetch_token_lines(tokens, per_token_limit=self._per_token_limit)
+        if self._am is not None and hasattr(self._am, '_intent_router'):
+            intent, topic = self._am._intent_router.classify(prompt, self._am.state)
+            evidence = self._am._retriever.retrieve(prompt, topic, intent)
+            analysis = self._am._analysis_engine.analyze(intent, evidence, self._am.state)
+            return self._am._composer.compose(intent, evidence, analysis, redact=redact)
+
+        tokens = [t for t in AskManager._TOKEN_RE.findall((prompt or '').lower()) if t and not t.isdigit()]
+        token_lines: List[str] = []
+        seen = set()
+        for tok, _ in Counter(tokens).most_common():
+            try:
+                lines = self._token_store(tok, self._per_token_limit) or []
+            except Exception:
+                lines = []
+            for line in lines:
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                token_lines.append(line)
+                if len(token_lines) >= self._max_token_lines:
+                    break
+            if len(token_lines) >= self._max_token_lines:
+                break
         if token_lines:
             lines = ["Using token matches from history:"]
             for s in token_lines[: self._max_token_lines]:
-                lines.append(f"• {self._present(s, redact=redact, max_len=220)}")
-            return "\\n".join(lines)
+                lines.append(f"• {s[:220]}")
+            return "\n".join(lines)
         packets = self._knowledge_retriever(prompt, topk=12, per_topic_limit=8)
-        topic = self._guess_topic(prompt, packets)
-        learned_stats = self._sm.compute(
+        topic = packets[0].topic if packets else 'misc'
+        stats = self._sm.compute(
             online_num_stats=self._pl.get_all_online_numeric_stats(),
             cat_counters=self._pl.get_all_categorical_counters(),
             recent_numeric_vectors=self._pl.get_recent_numeric_vectors(),
@@ -913,47 +1369,55 @@ class AskManagerChatGenerator:
             topk_categorical=6,
             min_count_for_stats=2,
         ).get(topic, {})
+        numeric = stats.get('numeric', {})
+        categorical = stats.get('categorical', {})
         lines = [f"Topic: {topic.upper()}"]
-        hints = self._collect_packet_hints(packets, redact=redact)
-        if hints:
-            lines.append("Relevant evidence:")
-            lines.extend(f"• {h}" for h in hints[: self._max_hint_lines])
-        observations = self._observations(topic, learned_stats)
-        if observations:
-            lines.append("")
-            lines.append("Observations:")
-            lines.extend(f"• {x}" for x in observations)
-        recent_flows = self._pl.snapshot_flows(topic, top_k=3)
-        if recent_flows:
-            lines.append("")
-            lines.append("Busy flows:")
-            for flow in recent_flows:
-                lines.append(f"• {self._present(flow['key'], redact=redact, max_len=120)} (packets={flow['packets']}, bytes={flow['bytes']}, iface={flow['iface']})")
-        anomalies = [a for a in self._pl.get_numeric_anomalies(limit=16) if a['topic'] == topic][:3]
-        if anomalies:
-            lines.append("")
-            lines.append("Anomalies:")
-            for a in anomalies:
-                lines.append(f"• {a['feature']} deviated (value={a['value']:.2f}, z={a['z_score']:.2f})")
-        lines.append("")
+        if packets:
+            lines.append('Relevant evidence:')
+            for pkt in packets[: self._max_hint_lines]:
+                try:
+                    s = self._payload_formatter(pkt.payload, redact=redact, include_raw=False, topic=pkt.topic)
+                except Exception:
+                    s = ''
+                if s:
+                    lines.append(f"• {s[:220]}")
+        obs = []
+        if 'length' in numeric:
+            st = numeric['length']
+            obs.append(f"avg length={st.get('mean', 0):.1f}B p95={st.get('p95', st.get('max', 0)):.1f}B")
+        if 'entropy' in numeric:
+            st = numeric['entropy']
+            obs.append(f"avg entropy={st.get('mean', 0):.2f} max={st.get('max', 0):.2f}")
+        for feat in ('port', 'iface', 'component', 'phase', 'proto'):
+            top = categorical.get(feat, {}).get('top_k', [])
+            if top:
+                obs.append(f"{feat}=" + ", ".join(f"{v}({c})" for v, c in top[:4]))
+        if obs:
+            lines.append('')
+            lines.append('Observations:')
+            for row in obs[:8]:
+                lines.append(f"• {row}")
+        flows = self._pl.snapshot_flows(topic, top_k=3)
+        if flows:
+            lines.append('')
+            lines.append('Busy flows:')
+            for flow in flows[:3]:
+                lines.append(f"• {flow['key'][:120]} (packets={flow['packets']}, bytes={flow['bytes']}, iface={flow['iface']})")
+        lines.append('')
         lines.append(f"Next step: {self.TOPIC_TIPS.get(topic, self.TOPIC_TIPS['misc'])}")
-        followups = self._followup_questions(topic, learned_stats, recent_flows)
-        if followups:
-            lines.append("")
-            lines.append("Consider checking:")
-            lines.extend(f"• {q}" for q in followups[:4])
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _tokenize(self, text: str) -> List[str]:
-        return self.TOKEN_PATTERN.findall((text or "").lower())
+        return [t.lower() for t in AskManager._TOKEN_RE.findall((text or ""))]
 
-    def _fetch_token_lines(self, tokens: Iterable[str], *, per_token_limit: int) -> List[str]:
-        freq = Counter(tokens)
+    def _fetch_token_lines(self, tokens: Iterable[str], per_token_limit: Optional[int] = None) -> List[str]:
+        limit = self._per_token_limit if per_token_limit is None else int(per_token_limit)
+        freq = Counter([t for t in tokens if t])
         seen = set()
         out: List[str] = []
         for tok, _ in freq.most_common():
             try:
-                lines = self._token_store(tok, per_token_limit) or []
+                lines = self._token_store(tok, limit) or []
             except Exception:
                 lines = []
             for line in lines:
@@ -966,6 +1430,11 @@ class AskManagerChatGenerator:
         return out
 
     def _guess_topic(self, prompt: str, packets: List[KnowledgePacket]) -> str:
+        if self._am is not None and hasattr(self._am, '_intent_router'):
+            try:
+                return self._am._intent_router.guess_topic(prompt, self._am.state)
+            except Exception:
+                pass
         low = (prompt or "").lower()
         score = Counter()
         lex = {
@@ -999,7 +1468,7 @@ class AskManagerChatGenerator:
         return score.most_common(1)[0][0] if score else "misc"
 
     def _collect_packet_hints(self, packets: List[KnowledgePacket], *, redact: bool) -> List[str]:
-        out = []
+        out: List[str] = []
         for pkt in packets:
             try:
                 s = self._payload_formatter(pkt.payload, redact=redact, include_raw=False, topic=pkt.topic)
@@ -1010,9 +1479,9 @@ class AskManagerChatGenerator:
         return out
 
     def _observations(self, topic: str, learned_stats: Dict[str, Any]) -> List[str]:
-        out = []
-        numeric = learned_stats.get("numeric", {})
-        categorical = learned_stats.get("categorical", {})
+        out: List[str] = []
+        numeric = learned_stats.get("numeric", {}) if isinstance(learned_stats, dict) else {}
+        categorical = learned_stats.get("categorical", {}) if isinstance(learned_stats, dict) else {}
         if "length" in numeric:
             st = numeric["length"]
             out.append(f"avg length={st.get('mean', 0):.1f}B p95={st.get('p95', st.get('max', 0)):.1f}B")
@@ -1036,7 +1505,7 @@ class AskManagerChatGenerator:
 
     def _followup_questions(self, topic: str, learned_stats: Dict[str, Any], recent_flows: List[Dict[str, Any]]) -> List[str]:
         qs: List[str] = []
-        categorical = learned_stats.get("categorical", {})
+        categorical = learned_stats.get("categorical", {}) if isinstance(learned_stats, dict) else {}
         if topic in ("router", "transport"):
             if categorical.get("iface", {}).get("unique_count", 0) > 2:
                 qs.append("Does the same flow appear on multiple interfaces, suggesting mirroring, rebroadcast, or path duplication?")
@@ -1063,9 +1532,9 @@ class AskManagerChatGenerator:
 
 
 class AskManager:
-    _RE_IPv4 = re.compile(r"\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\b")
-    _RE_MAC = re.compile(r"\\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\\b")
-    _RE_HEX = re.compile(r"\\b(?:0x)?[0-9a-fA-F]{16,}\\b")
+    _RE_IPv4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
+    _RE_MAC = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+    _RE_HEX = re.compile(r"\b(?:0x)?[0-9a-fA-F]{16,}\b")
     _TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+", re.UNICODE)
 
     def __init__(self, co_manager_ref: Any, *, max_messages: int = 500, default_ttl: float = 180.0, rng_seed: Optional[int] = None) -> None:
@@ -1075,6 +1544,14 @@ class AskManager:
         self._default_ttl = float(default_ttl)
         self._rng = random.Random(rng_seed if rng_seed is not None else int(time.time()))
         self._token_bank: Dict[str, Deque[Tuple[str, str, float]]] = defaultdict(lambda: deque(maxlen=50000))
+        self._token_memory = AskTokenMemory()
+        self._message_store = AskMessageStore(max_messages=max_messages)
+        self.state = AskDialogueState()
+        self._intent_router = AskIntentRouter()
+        self._retriever = AskKnowledgeRetriever(self)
+        self._analysis_engine = AskAnalysisEngine()
+        self._composer = AskResponseComposer(self)
+        self._dispatcher = AskCommandDispatcher(self)
         self.chat_generator = AskManagerChatGenerator(
             token_store=self._fetch_token_lines_for_chatgen,
             knowledge_retriever=self._retrieve_snippets,
@@ -1089,43 +1566,65 @@ class AskManager:
         prompt = (prompt or "").strip()
         if not prompt:
             return "Say something and I’ll analyze it."
+
         self._submit_message(prompt, role="user")
-        low = prompt.lower()
+        intent, topic = self._intent_router.classify(prompt, self.state)
+
         try:
-            if "purge" in low or "clear" in low or "forget" in low:
-                topic = self._guess_topic(prompt)
-                removed = self._co_manager.purge_topic(topic)
-                reply = f"Purged topic '{topic}' ({removed} item(s))."
-            elif "inspect sensitive" in low or "sensitive dump" in low or "unredacted" in low:
-                reply = self._format_inspect(redact=False)
-            elif "inspect" in low or "dump" in low or "summary" in low or "status" in low:
-                reply = self._format_inspect(redact=True)
-            elif "stats" in low or "metrics" in low or "statistics" in low:
-                stats = self._co_manager.compute_statistics_from_learned_data(topics=[], percentiles=[5, 25, 50, 75, 95], topk_categorical=8, min_count_for_stats=2)
-                reply = self._format_stats(stats)
-            elif "tokens" in low:
-                reply = self._raw_from_tokens(prompt, limit=12)
-            elif "emit" in low or "snapshot" in low:
-                cfg = self._co_manager._default_emit_builder()
-                code = self._co_manager.generate_class_from_config(cfg)
-                reply = f"Emitted snapshot class '{cfg.get('class_name')}' ({len(code)} bytes)."
+            reply = self._dispatcher.maybe_handle(intent, prompt, topic)
+            if reply is None:
+                evidence = self._retriever.retrieve(prompt, topic, intent)
+                analysis = self._analysis_engine.analyze(intent, evidence, self.state)
+                reply = self._composer.compose(intent, evidence, analysis, redact=True)
+                self._update_state(prompt, reply, intent, topic, evidence)
             else:
-                reply = self.chat_generator.generate(prompt, redact=True)
+                self._update_state(prompt, reply, intent, topic, None)
         except Exception as ex:
             reply = f"Internal error while answering: {type(ex).__name__}: {ex}"
-            self._co_manager._log(f"[AskManager] Error: {ex}\\n{traceback.format_exc()}", 1)
+            self._co_manager._log(f"[AskManager] Error: {ex}\n{traceback.format_exc()}", 1)
+
         self._submit_message(reply, role="assistant")
         return reply
+
+    def _update_state(
+        self,
+        prompt: str,
+        reply: str,
+        intent: str,
+        topic: str,
+        evidence: Optional[AskEvidenceBundle],
+    ) -> None:
+        self.state.active_topic = topic or self.state.active_topic or "misc"
+        self.state.last_intent = intent
+        self.state.last_prompt = prompt
+        self.state.last_reply = reply
+        self.state.last_ts = time.time()
+        if evidence:
+            self.state.last_packets = list(evidence.packets[:12])
+            if evidence.flows:
+                self.state.active_flow_key = evidence.flows[0]["key"]
+            if intent == "compare":
+                self.state.compared_topics = evidence.related_topics[:2]
 
     def _submit_message(self, text: str, *, role: str) -> None:
         with self._lock:
             self._messages.append((role, text))
+        self._message_store.add(role, text)
         if role == "user":
             self._index_tokens(text, role=role)
+
         topic = self._guess_topic(text)
         pkt = KnowledgePacket(
             topic=topic,
-            payload={"attributes": {"summary": self._summarize(text, 220), "length": len(text), "uppercase_ratio": self._uppercase_ratio(text), "tokens": self._tokenize(text)[:20]}, "raw_text": text[:2000]},
+            payload={
+                "attributes": {
+                    "summary": self._summarize(text, 220),
+                    "length": len(text),
+                    "uppercase_ratio": self._uppercase_ratio(text),
+                    "tokens": self._tokenize(text)[:20],
+                },
+                "raw_text": text[:2000],
+            },
             ttl=self._default_ttl,
             source=role,
             tags=self._infer_tags(text),
@@ -1134,7 +1633,14 @@ class AskManager:
             component_name="ask-manager",
             path_stage="chat",
         )
-        self._co_manager.submit_event(topic=pkt.topic, attributes=pkt.payload.get("attributes"), ttl=pkt.ttl, source=pkt.source, tags=pkt.tags, importance=pkt.importance)
+        self._co_manager.submit_event(
+            topic=pkt.topic,
+            attributes=pkt.payload.get("attributes"),
+            ttl=pkt.ttl,
+            source=pkt.source,
+            tags=pkt.tags,
+            importance=pkt.importance,
+        )
 
     def _format_inspect(self, *, redact: bool) -> str:
         snap = self._export_knowledge()
@@ -1146,141 +1652,204 @@ class AskManager:
             for row in items[:6]:
                 payload = row.get("payload") or {}
                 iface = row.get("iface")
-                flow_key = row.get("flow_key")
-                conf = row.get("confidence")
-                lines.append("  • " + self._payload_to_text(payload, redact=redact, include_raw=not redact, topic=topic)[:220])
-                if iface or flow_key or conf is not None:
-                    lines.append(f"    meta: iface={iface} flow={flow_key} confidence={conf}")
-        return "\\n".join(lines)
+                source = row.get("source")
+                summary = self._payload_to_text(payload, redact=redact, include_raw=False, topic=topic)
+                bits = [f"source={source}", f"iface={iface}"] if iface or source else []
+                prefix = f"  - {' '.join(bits)} ".rstrip()
+                lines.append(f"{prefix}{summary}" if summary else f"{prefix}(no summary)")
+        return "\n".join(lines)
 
     def _format_stats(self, stats: Dict[str, Any]) -> str:
-        lines = ["Statistics (headlines):"]
-        shown = 0
-        for topic, block in stats.items():
-            for feat, fs in (block.get("numeric") or {}).items():
-                lines.append(f"• [{topic}.{feat}] count={fs.get('count')} mean={fs.get('mean', 0):.3g} std={fs.get('std', 0):.3g}")
-                shown += 1
-                if shown >= 12:
-                    return "\\n".join(lines)
-        return "\\n".join(lines) if shown else "No numeric feature has enough samples yet."
-
-    def _retrieve_snippets(self, prompt: str, *, topk: int = 6, per_topic_limit: int = 3) -> List[KnowledgePacket]:
-        query_toks = set(self._tokenize(prompt))
-        scored: List[Tuple[float, KnowledgePacket]] = []
-        now = time.time()
-        with self._co_manager._k_lock:
-            for topic, dq in self._co_manager._knowledge_by_topic.items():
-                if not dq:
-                    continue
-                for pkt in list(dq)[-max(1, per_topic_limit * 3):]:
-                    if pkt.is_expired(now):
-                        continue
-                    text = self._payload_to_text(pkt.payload, redact=True, include_raw=False, topic=topic)
-                    overlap = len(query_toks & set(self._tokenize(text)))
-                    recency = 1.0 / (1.0 + (now - pkt.ts) / 60.0)
-                    score = overlap + recency + (0.5 * pkt.importance) + pkt.confidence
-                    scored.append((score, pkt))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [pkt for _, pkt in scored[:topk]]
-
-    def _export_knowledge(self) -> Dict[str, List[Dict[str, Any]]]:
-        return self._co_manager.export_knowledge()
+        if not stats:
+            return "No statistics available yet."
+        lines = ["Statistics snapshot:"]
+        for topic, block in sorted(stats.items(), key=lambda kv: kv[0])[:10]:
+            lines.append(f"[{topic}]")
+            numeric = block.get("numeric", {})
+            categorical = block.get("categorical", {})
+            if numeric:
+                for feat, st in sorted(numeric.items()):
+                    lines.append(
+                        f"  - {feat}: count={st.get('count', 0)} mean={st.get('mean', 0):.3f} "
+                        f"std={st.get('std', 0):.3f} min={st.get('min', 0):.3f} max={st.get('max', 0):.3f}"
+                    )
+            if categorical:
+                for feat, info in sorted(categorical.items()):
+                    top_k = info.get("top_k", [])[:4]
+                    rendered = ", ".join(f"{v}({c})" for v, c in top_k)
+                    lines.append(
+                        f"  - {feat}: unique={info.get('unique_count', 0)} total={info.get('total_count', 0)} top={rendered}"
+                    )
+        return "\n".join(lines)
 
     def _index_tokens(self, text: str, *, role: str) -> None:
         raw = text[:2000]
         ts = time.time()
+        self._token_memory.index(text, role=role)
         for tok in self._tokenize(text):
             if tok and not tok.isdigit():
                 self._token_bank[tok].append((role, raw, ts))
+
+    def _raw_from_tokens(self, query: str, *, limit: int = 12) -> str:
+        hits = []
+        seen = set()
+        for tok in self._tokenize(query):
+            for line in self._token_memory.fetch(tok, limit=3):
+                if line in seen:
+                    continue
+                seen.add(line)
+                hits.append(line)
+                if len(hits) >= limit:
+                    break
+            if len(hits) >= limit:
+                break
+        if not hits:
+            return "No token hits found."
+        return "Token hits:\n" + "\n".join(f"- {line}" for line in hits)
 
     def _fetch_token_lines_for_chatgen(self, token: str, limit: int) -> Sequence[str]:
         dq = self._token_bank.get(token)
         if not dq:
             return []
-        return [line for role, line, _ts in list(dq)[-limit:][::-1] if role == "user"]
+        lines = [line for role, line, _ts in list(dq)[-limit:][::-1] if role == "user"]
+        if lines:
+            return lines
+        return self._token_memory.fetch(token, limit=limit)
 
-    def _raw_from_tokens(self, query: str, *, limit: int = 12) -> str:
-        lines = []
-        seen = set()
-        for tok in self._tokenize(query):
-            for line in self._fetch_token_lines_for_chatgen(tok, limit):
-                if line not in seen:
-                    seen.add(line)
-                    lines.append(line)
-                if len(lines) >= limit:
-                    break
-            if len(lines) >= limit:
+    def _retrieve_snippets(self, prompt: str, *, topk: int = 6, per_topic_limit: int = 3) -> List[KnowledgePacket]:
+        tokens = [t.lower() for t in self._tokenize(prompt) if t]
+        topic = self._guess_topic(prompt)
+        now = time.time()
+
+        scored: List[Tuple[float, KnowledgePacket]] = []
+        export = self._co_manager._export_nonexpired_packets()
+        topic_counter = Counter()
+
+        for pkt in export:
+            pkt_text = self._payload_to_text(pkt.payload, redact=False, include_raw=True, topic=pkt.topic).lower()
+            score = 0.0
+            if pkt.topic == topic:
+                score += 3.0
+            if pkt.topic == self.state.active_topic:
+                score += 1.0
+            for tok in tokens:
+                if tok and tok in pkt_text:
+                    score += 1.0
+                if tok and tok in " ".join(map(str, pkt.tags)).lower():
+                    score += 0.75
+                if tok and tok == str(pkt.iface).lower():
+                    score += 0.5
+                if tok and tok in str(pkt.flow_key).lower():
+                    score += 1.25
+            if self.state.active_flow_key and self.state.active_flow_key in (
+                pkt.flow_key,
+                pkt.session_key,
+                pkt.route_key,
+            ):
+                score += 2.5
+            score += min(1.0, float(pkt.importance) * 0.1)
+            score += min(1.0, float(pkt.confidence) * 0.5)
+            age_s = max(0.0, now - pkt.ts)
+            score += max(0.0, 1.0 - (age_s / 600.0))
+            if score > 0.0:
+                topic_counter[pkt.topic] += 1
+                scored.append((score, pkt))
+
+        scored.sort(key=lambda x: (x[0], x[1].importance, x[1].ts), reverse=True)
+
+        out: List[KnowledgePacket] = []
+        topic_seen: Counter = Counter()
+        for _, pkt in scored:
+            if topic_seen[pkt.topic] >= per_topic_limit:
+                continue
+            out.append(pkt)
+            topic_seen[pkt.topic] += 1
+            if len(out) >= topk:
                 break
-        if not lines:
-            return "No raw token matches yet."
-        return "Raw token matches:\\n" + "\\n".join(f"  {i + 1}. {s}" for i, s in enumerate(lines[:limit]))
 
-    def _guess_topic(self, text: str) -> str:
-        low = (text or "").lower()
-        lex = [
-            ("dns", ["dns", "resolver", "mdns", "llmnr", "port 53", "1900", "3702", "137"]),
-            ("dhcp", ["dhcp", "lease", "offer", "discover"]),
-            ("tls", ["tls", "ssl", "sni", "alpn", "certificate", "handshake"]),
-            ("http", ["http", "https", "request", "response", "18080"]),
-            ("vpn", ["vpn", "wireguard", "ipsec", "esp", "ah", "gre", "tunnel"]),
-            ("quic", ["quic", "http/3"]),
-            ("transport", ["tcp", "udp", "icmp", "syn", "ack", "rst", "fin", "port"]),
-            ("router", ["router", "interface", "iface", "wintun", "windivert", "bridge", "forward", "phase", "component"]),
-            ("arp", ["arp", "who-has", "is-at"]),
-        ]
-        for topic, words in lex:
-            if any(w in low for w in words):
-                return topic
-        return "misc"
+        if not out and topic:
+            out = self._co_manager.packet_learner.get_recent_packets(topic, limit=min(topk, 8))
 
-    def _infer_tags(self, text: str) -> List[str]:
-        tags = []
-        low = text.lower()
-        for x in ("error", "fix", "bug", "stats", "emit", "inspect", "tls", "dns", "transport", "router", "arp"):
-            if x in low:
-                tags.append(x)
-        return tags[:8]
+        return out
+
+    def _export_knowledge(self) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for pkt in self._co_manager._export_nonexpired_packets():
+            out[pkt.topic].append(
+                {
+                    "topic": pkt.topic,
+                    "source": pkt.source,
+                    "iface": pkt.iface,
+                    "payload": copy.deepcopy(pkt.payload),
+                    "importance": pkt.importance,
+                    "confidence": pkt.confidence,
+                    "flow_key": pkt.flow_key,
+                    "session_key": pkt.session_key,
+                    "route_key": pkt.route_key,
+                    "ts": pkt.ts,
+                }
+            )
+        return dict(out)
 
     def _payload_to_text(self, payload: Dict[str, Any], *, redact: bool, include_raw: bool, topic: Optional[str]) -> str:
-        attrs = payload.get("attributes", {}) if isinstance(payload, dict) else {}
-        parts = []
-        if topic == "tls" and attrs.get("hs_type_name"):
-            parts.append(f"TLS {attrs.get('hs_type_name')}")
-        if topic == "dns" and attrs.get("dns_query"):
-            parts.append(f"DNS query {attrs.get('dns_query')}")
-        if attrs.get("proto"):
-            parts.append(f"{str(attrs.get('proto')).upper()} packet")
-        if attrs.get("sport") and attrs.get("dport"):
-            parts.append(f"{attrs.get('sport')} -> {attrs.get('dport')}")
-        if attrs.get("tcp_flags"):
-            parts.append(f"flags={','.join(map(str, attrs.get('tcp_flags')))}")
-        for k in ("summary", "iface_in", "phase", "component", "saddr", "daddr", "eth_src", "eth_dst", "ttl"):
-            if k in attrs:
-                parts.append(f"{k}:{attrs[k]}")
-        if include_raw and payload.get("raw_text"):
-            parts.append(f"raw_text:{payload.get('raw_text')}")
-        s = " ".join(str(x) for x in parts if x)
+        if not isinstance(payload, dict):
+            return ""
+        attrs = payload.get("attributes", {}) if isinstance(payload.get("attributes"), dict) else {}
+        methods = payload.get("methods", {}) if isinstance(payload.get("methods"), dict) else {}
+        parts: List[str] = []
+
+        for k, v in sorted(attrs.items(), key=lambda kv: str(kv[0])):
+            if isinstance(v, (str, int, float, bool)):
+                parts.append(f"{k}={v}")
+            elif isinstance(v, (list, tuple)):
+                parts.append(f"{k}=" + ",".join(map(str, list(v)[:8])))
+
+        if methods:
+            parts.append("methods=" + ",".join(sorted(map(str, methods.keys()))[:12]))
+
+        if include_raw:
+            raw_text = payload.get("raw_text")
+            if isinstance(raw_text, str) and raw_text.strip():
+                parts.append("raw=" + raw_text[:220])
+
+        text = " ".join(parts)
         if redact:
-            s = self._RE_IPv4.sub("[IP]", s)
-            s = self._RE_MAC.sub("[MAC]", s)
-            s = self._RE_HEX.sub("[HEX]", s)
-        return s[:300]
+            text = self._RE_IPv4.sub("<IP4>", text)
+            text = self._RE_MAC.sub("<MAC>", text)
+            text = self._RE_HEX.sub("<HEX>", text)
+        return text[:1200]
+
+    def _guess_topic(self, text: str) -> str:
+        return self._intent_router.guess_topic(text, self.state)
+
+    @staticmethod
+    def _summarize(text: str, max_len: int) -> str:
+        text = re.sub(r"\s+", " ", text or "").strip()
+        return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+    @staticmethod
+    def _uppercase_ratio(text: str) -> float:
+        letters = [c for c in (text or "") if c.isalpha()]
+        if not letters:
+            return 0.0
+        return sum(1 for c in letters if c.isupper()) / len(letters)
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
         return [t.lower() for t in AskManager._TOKEN_RE.findall(text or "")]
 
-    @staticmethod
-    def _uppercase_ratio(text: str) -> float:
-        letters = sum(1 for ch in text if ch.isalpha())
-        if not letters:
-            return 0.0
-        return sum(1 for ch in text if ch.isupper()) / letters
+    def _infer_tags(self, text: str) -> List[str]:
+        low = (text or "").lower()
+        tags = []
+        for tag in ("dns", "dhcp", "tls", "http", "vpn", "quic", "router", "transport", "arp", "flow", "compare", "stats", "snapshot"):
+            if tag in low:
+                tags.append(tag)
+        return tags[:12]
 
-    @staticmethod
-    def _summarize(text: str, max_len: int) -> str:
-        t = (text or "").strip()
-        return t if len(t) <= max_len else t[: max_len - 3] + "..."
+
+# ======================================================================================
+# Snapshot builder
+# ======================================================================================
 
 
 class SnapshotBuilder:
@@ -2145,6 +2714,24 @@ class CodeOutputManager:
 
     def compute_statistics_from_learned_data(self, topics: Iterable[str], percentiles: List[int], topk_categorical: int, min_count_for_stats: int) -> Dict[str, Any]:
         return self.stats_manager.compute(online_num_stats=self.packet_learner.get_all_online_numeric_stats(), cat_counters=self.packet_learner.get_all_categorical_counters(), recent_numeric_vectors=self.packet_learner.get_recent_numeric_vectors(), topics=topics, percentiles=list(percentiles), topk_categorical=int(topk_categorical), min_count_for_stats=int(min_count_for_stats))
+
+    def _export_nonexpired_packets(self) -> List[KnowledgePacket]:
+        """
+        Compatibility helper used by older AskManager/summary paths.
+
+        Returns a shallow snapshot list of non-expired KnowledgePacket objects
+        across all topics, newest-first within each topic insertion order.
+        """
+        now = time.time()
+        out: List[KnowledgePacket] = []
+        with self._k_lock:
+            for _, dq in self._knowledge_by_topic.items():
+                for pkt in dq:
+                    if pkt.is_expired(now):
+                        continue
+                    out.append(pkt)
+        out.sort(key=lambda p: p.ts, reverse=True)
+        return out
 
     def export_knowledge(self) -> Dict[str, List[Dict[str, Any]]]:
         now = time.time()
