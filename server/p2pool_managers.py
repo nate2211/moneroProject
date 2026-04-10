@@ -2755,6 +2755,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     level="info",
                 )
                 self.python_server_manager.start()
+                self.arp_manager.add_trusted_port("Miner")
             if use_lan:
                 self.lan_manager = LanManager(self, DHCPServer, gateway_manager=self.gateway_manager)
                 self.lan_manager.configure(
