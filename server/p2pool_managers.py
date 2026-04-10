@@ -60,7 +60,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
-    ESPManager
+    ESPManager, SocketInterface
 from p2pool_tools import ParallelPythonTool
 from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
@@ -194,7 +194,7 @@ class PythonRouterManager:
         self.uplink_manager = None
         self.hypervrouter_manager = None
         self.python_server_manager = None
-
+        self.socket_interface = SocketInterface(self, self.router_logger)
         # WAN/public-IP observation state
         self.public_ip_observed: Optional[str] = None
         self._public_ip_last_refresh: float = 0.0
@@ -209,9 +209,32 @@ class PythonRouterManager:
         # Tracks the extra on-link WAN address we may publish to NAT in double-NAT cases
         self._nat_last_marked_public_on_lan: Optional[str] = None
 
-
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
 
+    # --- add this helper inside PythonRouterManager ---
+    def _boundary_transit_ifaces(self) -> set[str]:
+        out = {SocketInterface.IFACE_NAME}
+
+        for cand in (
+                getattr(self, "interface_in_full_name", None),
+                getattr(self, "interface_loopback_full_name", None),
+                getattr(self, "interface_ethernet_2_full_name", None),
+                getattr(self, "interface_lac_full_name", None),
+                getattr(self, "interface_lac_2_full_name", None),
+        ):
+            if cand:
+                out.add(cand)
+
+        try:
+            members = self.ethernet_manager.get_bridge_members()
+            if isinstance(members, (list, tuple, set)):
+                for m in members:
+                    if m:
+                        out.add(str(m))
+        except Exception:
+            pass
+
+        return out
     def _is_public_ipv4_text(self, ip: Optional[str]) -> bool:
         try:
             x = ipaddress.IPv4Address(str(ip or "").strip())
@@ -1813,7 +1836,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             if self.gateway_manager and self.gateway_manager.handle_packet(packet, inbound_iface):
                 return
-            if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface):
+            if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface) and inbound_iface != "HyperVManager":
                 return
             if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
                                                                                                         inbound_iface):
@@ -1830,6 +1853,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     source="router",
                     raw_bytes=bytes(packet)  # best fidelity
                 )
+            # --- early in the router packet-processing path ---
+            if self.socket_interface and self.socket_interface.handle_packet(packet, inbound_iface):
+                return True
             # ==========================================================
             # ✅ ARP HANDLING BLOCK (reply/learn) BEFORE "no IP layer" drop
             # ==========================================================
@@ -1844,6 +1870,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.arp_manager.learn_arp_response(packet)
                 self.arp_manager.reply_to_arp_request(packet, inbound_iface)
                 return
+
             # 1) Bridge real Ethernet frames on bridge-member ports first
             if packet.haslayer(Ether):
                 try:
@@ -2688,8 +2715,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     health_probe_fn=self._probe_host_internet_health,
                     fail_open_after_failures=3,
                     recover_after_successes=3,
+                    transit_ifaces_fn=self._boundary_transit_ifaces,  # <-- add this
                 )
                 self.host_connectivity_boundary.start()
+            self.socket_interface.start()
             self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
             self.dns_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ipv4_out = self.router_ip_out
@@ -2978,6 +3007,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.hyperv_manager.teardown()
                 self.hyperv_enabled = False
             self.parallel_python.release_ram_usage()
+
+            if self.socket_interface:
+                self.socket_interface.stop()
             if use_stratum_comm:
                 if self.daemon_manager:
                     self.daemon_manager.stop()

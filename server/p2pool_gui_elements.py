@@ -1732,7 +1732,7 @@ class RouterTab(QWidget):
                 "General", "Router", "DHCP", "Transport", "HostBoundary", "TLS", "Python", "C++", "Signing",
                 "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
                 "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher",
-                "Notifier", "NAT/RIP/ARP/NDP","Bridge/L2", "Wintun/WinDivert", "mDNS", "Firewall", "Packet", "Analysis"
+                "Notifier", "NAT/RIP/ARP/NDP","Bridge/L2", "Wintun/WinDivert", "HyperVRouterManager", "SocketInterface", "mDNS", "Firewall", "Packet", "Analysis"
             ],
             "Minimal": ["General"],
         }

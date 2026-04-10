@@ -1,5 +1,6 @@
 import binascii
 import collections
+import errno
 import hashlib
 import hmac
 import math
@@ -14,12 +15,14 @@ import traceback
 import urllib
 from collections import defaultdict, deque
 from collections.abc import Set
+from dataclasses import dataclass, field
 from typing import Optional, List, Any, Callable, Union, DefaultDict, Deque
 import ipaddress
 import threading
 import json
 import time
 import numpy as np
+import select
 import zmq
 from scapy.arch import get_if_hwaddr
 from scapy.config import conf
@@ -197,10 +200,1897 @@ def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
 def _canon_key(ip1: str, pt1: int, ip2: str, pt2: int):
     return tuple(sorted([(ip1, pt1), (ip2, pt2)]))
 
+SocketFlowKey = Tuple[int, str, Tuple[Tuple[str, int], Tuple[str, int]]]
+
+
+@dataclass
+class SocketPacketRecord:
+    digest: str
+    ts: float
+    inbound_iface: str
+    flow_key: SocketFlowKey
+    score: float
+    payload_len: int
+    summary: str = ""
+
+
+@dataclass
+class SocketCandidate:
+    """
+    Observed potential session.
+    This is only evidence gathered from packets. It is not a live socket.
+    """
+    key: SocketFlowKey
+    family: int
+    proto: str
+
+    ep_a_ip: str
+    ep_a_port: int
+    ep_b_ip: str
+    ep_b_port: int
+
+    local_ip: Optional[str] = None
+    local_port: Optional[int] = None
+    remote_ip: Optional[str] = None
+    remote_port: Optional[int] = None
+
+    preferred_iface: Optional[str] = None
+    preferred_role: str = ""
+    preferred_bind_ip: Optional[str] = None
+
+    peer_kind: str = "unknown"
+    ownership_confidence: float = 0.0
+    route_affinity: float = 0.0
+    connect_confidence: float = 0.0
+
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    last_ingress_ts: float = 0.0
+    last_egress_ts: float = 0.0
+    last_payload_ts: float = 0.0
+    last_signal_ts: float = 0.0
+    last_promote_attempt_ts: float = 0.0
+
+    seen_count: int = 0
+    ingress_hits: int = 0
+    egress_hits: int = 0
+    payload_hits: int = 0
+    bytes_seen: int = 0
+    bytes_payload: int = 0
+
+    score: float = 0.0
+    best_score: float = 0.0
+    stable_score: float = 0.0
+
+    observation_generation: int = 0
+    last_promote_generation: int = 0
+
+    recent_payload_digest: Optional[str] = None
+    recent_payload_digest_ts: float = 0.0
+    last_open_signal_digest: Optional[str] = None
+
+    open_fail_count: int = 0
+    peer_close_count: int = 0
+    peer_closed_before_active: int = 0
+    cooldown_until: float = 0.0
+
+    tx_hints: Deque[bytes] = field(default_factory=lambda: deque(maxlen=16))
+    observed_ifaces: Deque[str] = field(default_factory=lambda: deque(maxlen=32))
+    history: Deque[str] = field(default_factory=lambda: deque(maxlen=32))
+
+    def observe(self, meta: Dict[str, Any], now: float) -> None:
+        self.last_seen = now
+        self.seen_count += 1
+        self.bytes_seen += int(meta.get("payload_len", 0) or 0)
+        self.observed_ifaces.append(str(meta.get("inbound_iface") or ""))
+
+        direction = str(meta.get("direction") or "")
+        payload_len = int(meta.get("payload_len") or 0)
+
+        if direction == "egress":
+            self.egress_hits += 1
+            self.last_egress_ts = now
+        elif direction == "ingress":
+            self.ingress_hits += 1
+            self.last_ingress_ts = now
+
+        if payload_len > 0:
+            self.payload_hits += 1
+            self.bytes_payload += payload_len
+            self.last_payload_ts = now
+
+        if meta.get("local_ip") and self.local_ip is None:
+            self.local_ip = str(meta["local_ip"])
+            self.local_port = int(meta["local_port"])
+
+        if meta.get("remote_ip") and self.remote_ip is None:
+            self.remote_ip = str(meta["remote_ip"])
+            self.remote_port = int(meta["remote_port"])
+
+        cand_iface = meta.get("preferred_iface")
+        cand_conf = float(meta.get("connect_confidence", 0.0))
+        if cand_iface:
+            if self.preferred_iface is None or cand_conf >= self.connect_confidence:
+                self.preferred_iface = str(cand_iface)
+                self.preferred_role = str(meta.get("preferred_role") or "")
+                self.preferred_bind_ip = meta.get("preferred_bind_ip")
+
+        peer_kind = str(meta.get("peer_kind") or "")
+        if peer_kind:
+            if self.peer_kind in ("", "unknown"):
+                self.peer_kind = peer_kind
+            elif self.peer_kind != "unicast" and peer_kind == "unicast":
+                self.peer_kind = "unicast"
+
+        self.ownership_confidence = max(self.ownership_confidence, float(meta.get("ownership_confidence", 0.0)))
+        self.route_affinity = max(self.route_affinity, float(meta.get("route_affinity", 0.0)))
+        self.connect_confidence = max(self.connect_confidence, cand_conf)
+
+    def update_score(self, raw_score: float) -> None:
+        repeat_bonus = min(7.5, self.seen_count * 0.50)
+        payload_bonus = min(6.0, self.payload_hits * 0.40)
+        bidir_bonus = 2.25 if (self.egress_hits > 0 and self.ingress_hits > 0) else 0.0
+
+        confidence_bonus = (self.connect_confidence * 8.0)
+        confidence_bonus += (self.ownership_confidence * 2.5)
+        confidence_bonus += (self.route_affinity * 2.0)
+
+        if self.peer_kind != "unicast":
+            confidence_bonus -= 8.0
+
+        target = raw_score + repeat_bonus + payload_bonus + bidir_bonus + confidence_bonus
+
+        if self.seen_count <= 1:
+            self.score = target
+            self.stable_score = target
+        else:
+            self.score = (self.score * 0.72) + (target * 0.28)
+            self.stable_score = (self.stable_score * 0.85) + (self.score * 0.15)
+
+        if self.score > self.best_score:
+            self.best_score = self.score
+
+    def queue_tx_hint(self, payload: bytes, max_queue: int = 16, max_chunk: int = 131072) -> bool:
+        if not payload:
+            return False
+
+        digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
+        now = time.time()
+
+        if self.recent_payload_digest == digest and (now - self.recent_payload_digest_ts) < 0.25:
+            return False
+
+        self.recent_payload_digest = digest
+        self.recent_payload_digest_ts = now
+
+        if len(self.tx_hints) >= max_queue:
+            try:
+                tail = self.tx_hints.pop()
+                merged = (tail + payload)[-max_chunk:]
+                self.tx_hints.append(merged)
+            except Exception:
+                try:
+                    self.tx_hints.popleft()
+                except Exception:
+                    pass
+                self.tx_hints.append(bytes(payload))
+            return True
+
+        self.tx_hints.append(bytes(payload))
+        return True
+
+    def note_fresh_open_signal(self, payload: bytes, now: float) -> None:
+        if not payload:
+            return
+        digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
+        if digest != self.last_open_signal_digest or (now - self.last_signal_ts) > 0.50:
+            self.observation_generation += 1
+            self.last_open_signal_digest = digest
+            self.last_signal_ts = now
+
+    def may_promote(self, now: float, tcp_threshold: float, udp_threshold: float, min_retry_sec: float) -> bool:
+        if not self.remote_ip or not self.remote_port or not self.local_ip or not self.local_port:
+            return False
+        if now < self.cooldown_until:
+            return False
+        if (now - self.last_promote_attempt_ts) < min_retry_sec:
+            return False
+        if self.connect_confidence < 0.55:
+            return False
+        if self.peer_kind != "unicast":
+            return False
+        if self.egress_hits <= 0:
+            return False
+        if self.payload_hits <= 0:
+            return False
+        if self.last_promote_generation > 0 and self.observation_generation <= self.last_promote_generation:
+            return False
+
+        threshold = tcp_threshold if self.proto == "TCP" else udp_threshold
+        return self.best_score >= threshold and self.stable_score >= (threshold * 0.75)
+
+    def apply_feedback(self, reason: str, now: float) -> None:
+        txt = str(reason or "").lower()
+
+        if "peer-closed-before-active" in txt:
+            self.peer_closed_before_active += 1
+            backoff = min(60.0, 3.0 * (2 ** min(self.peer_closed_before_active - 1, 4)))
+            self.cooldown_until = max(self.cooldown_until, now + backoff)
+            self.connect_confidence = max(0.10, self.connect_confidence - 0.10)
+            return
+
+        if "peer-closed" in txt:
+            self.peer_close_count += 1
+            backoff = min(30.0, 2.0 * (2 ** min(self.peer_close_count - 1, 4)))
+            self.cooldown_until = max(self.cooldown_until, now + backoff)
+            return
+
+        if "open:" in txt or "connect:" in txt or "send:" in txt or "recv:" in txt or "invalid-socket" in txt:
+            self.open_fail_count += 1
+            backoff = min(20.0, 1.5 * (1 + self.open_fail_count))
+            self.cooldown_until = max(self.cooldown_until, now + backoff)
+            return
+
+        self.cooldown_until = max(self.cooldown_until, now + 1.0)
+
+
+@dataclass
+class SocketStream:
+    """
+    Canonical stream representation for a promoted session.
+    Owns TX/RX buffers, byte counters, stream sequencing, and synthetic packet rebuilds.
+    """
+    family: int
+    proto: str
+    local_ip: str
+    local_port: int
+    remote_ip: str
+    remote_port: int
+
+    tx_queue: Deque[bytes] = field(default_factory=deque)
+    tx_bytes_queued: int = 0
+
+    rx_buffer: bytearray = field(default_factory=bytearray)
+
+    seq_tx: int = 1
+    seq_rx: int = 1
+    ack_value: int = 1
+
+    bytes_tx: int = 0
+    bytes_rx: int = 0
+    bytes_tx_payload: int = 0
+    bytes_rx_payload: int = 0
+
+    last_tx_ts: float = 0.0
+    last_rx_ts: float = 0.0
+    last_tx_digest: Optional[str] = None
+    last_tx_digest_ts: float = 0.0
+
+    stream_kind: str = "unknown"
+
+    def queue_tx(self, payload: bytes, max_chunks: int = 64, max_bytes: int = 262144) -> bool:
+        if not payload:
+            return False
+
+        payload = bytes(payload)
+        digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
+        now = time.time()
+
+        if self.last_tx_digest == digest and (now - self.last_tx_digest_ts) < 0.25:
+            return False
+
+        self.last_tx_digest = digest
+        self.last_tx_digest_ts = now
+
+        if self.tx_queue:
+            try:
+                tail = self.tx_queue[-1]
+                if len(tail) < 32768:
+                    merged = (tail + payload)[-131072:]
+                    self.tx_bytes_queued -= len(tail)
+                    self.tx_queue[-1] = merged
+                    self.tx_bytes_queued += len(merged)
+                    return True
+            except Exception:
+                pass
+
+        while len(self.tx_queue) >= max_chunks or self.tx_bytes_queued >= max_bytes:
+            try:
+                dropped = self.tx_queue.popleft()
+                self.tx_bytes_queued -= len(dropped)
+            except Exception:
+                break
+
+        self.tx_queue.append(payload)
+        self.tx_bytes_queued += len(payload)
+        return True
+
+    def prepend_tx(self, payload: bytes) -> None:
+        if not payload:
+            return
+        data = bytes(payload)
+        self.tx_queue.appendleft(data)
+        self.tx_bytes_queued += len(data)
+
+    def pop_tx(self) -> Optional[bytes]:
+        if not self.tx_queue:
+            return None
+        chunk = self.tx_queue.popleft()
+        self.tx_bytes_queued -= len(chunk)
+        return chunk
+
+    def note_sent(self, sent: int) -> None:
+        if sent <= 0:
+            return
+
+        now = time.time()
+        self.last_tx_ts = now
+        self.bytes_tx += int(sent)
+        self.bytes_tx_payload += int(sent)
+        self.seq_tx += int(sent)
+        self.ack_value = max(1, self.seq_tx)
+
+    def note_recv(self, received: int) -> None:
+        if received <= 0:
+            return
+
+        now = time.time()
+        self.last_rx_ts = now
+        self.bytes_rx += int(received)
+        self.bytes_rx_payload += int(received)
+
+    def classify_chunk(self, payload: bytes) -> str:
+        if not payload:
+            return self.stream_kind
+
+        p = payload
+        lowered = p[:64].lower()
+
+        try:
+            if len(p) >= 3 and p[0] == 0x16 and p[1] == 0x03:
+                self.stream_kind = "tls"
+                return self.stream_kind
+
+            if lowered.startswith(b"get ") or lowered.startswith(b"post ") or lowered.startswith(b"head ") or lowered.startswith(b"http/"):
+                self.stream_kind = "http"
+                return self.stream_kind
+
+            if b'"method":"' in lowered or b'"id":' in lowered or b"mining.subscribe" in p.lower() or b"mining.authorize" in p.lower():
+                self.stream_kind = "stratum"
+                return self.stream_kind
+
+            if b"blocktemplate_blob" in p.lower() or b"submitblock" in p.lower() or b"getblocktemplate" in p.lower():
+                self.stream_kind = "monero-rpc"
+                return self.stream_kind
+
+            if self.proto == "TCP" and len(p) >= 8 and any(x in p.lower() for x in (b"levin", b"p2pool", b"peerlist", b"handshake")):
+                self.stream_kind = "monero-p2p"
+                return self.stream_kind
+        except Exception:
+            pass
+
+        if self.stream_kind == "unknown":
+            self.stream_kind = self.proto.lower()
+        return self.stream_kind
+
+    def ingest_rx_bytes(self, data: bytes, emit_chunk_size: int = 32768, flush_tail: bool = True) -> List[bytes]:
+        if not data:
+            return []
+
+        if self.proto == "UDP":
+            self.note_recv(len(data))
+            self.classify_chunk(data)
+            return [bytes(data)]
+
+        self.rx_buffer.extend(data)
+        self.note_recv(len(data))
+
+        out: List[bytes] = []
+
+        while len(self.rx_buffer) >= emit_chunk_size:
+            chunk = bytes(self.rx_buffer[:emit_chunk_size])
+            del self.rx_buffer[:emit_chunk_size]
+            self.classify_chunk(chunk)
+            out.append(chunk)
+
+        if flush_tail and self.rx_buffer:
+            chunk = bytes(self.rx_buffer)
+            self.rx_buffer.clear()
+            self.classify_chunk(chunk)
+            out.append(chunk)
+
+        return out
+
+    def build_rx_packet(self, payload: bytes) -> Optional[Packet]:
+        try:
+            if self.family == 6:
+                ip_layer = IPv6(src=self.remote_ip, dst=self.local_ip)
+            else:
+                ip_layer = IP(src=self.remote_ip, dst=self.local_ip)
+
+            if self.proto == "TCP":
+                pkt = ip_layer / TCP(
+                    sport=int(self.remote_port),
+                    dport=int(self.local_port),
+                    flags="PA",
+                    seq=int(self.seq_rx),
+                    ack=max(1, int(self.ack_value)),
+                ) / Raw(load=payload)
+                self.seq_rx += len(payload)
+                return pkt
+
+            return ip_layer / UDP(
+                sport=int(self.remote_port),
+                dport=int(self.local_port),
+            ) / Raw(load=payload)
+
+        except Exception:
+            return None
+
+    def build_rx_packets(self, data: bytes) -> List[Packet]:
+        packets: List[Packet] = []
+        for chunk in self.ingest_rx_bytes(data):
+            pkt = self.build_rx_packet(chunk)
+            if pkt is not None:
+                packets.append(pkt)
+        return packets
+
+
+@dataclass
+class SocketConnection:
+    """
+    Live promoted session.
+    Owns the real socket and delegates stream behavior to SocketStream.
+    """
+    key: SocketFlowKey
+    family: int
+    proto: str
+    local_ip: str
+    local_port: int
+    remote_ip: str
+    remote_port: int
+
+    stream: SocketStream
+
+    bind_ip: Optional[str] = None
+    preferred_iface: Optional[str] = None
+    candidate_generation: int = 0
+
+    socket_obj: Optional[socket.socket] = None
+    state: str = "opening"  # opening | connected | cooling | closed
+    active: bool = False
+
+    created_ts: float = field(default_factory=time.time)
+    connected_ts: float = 0.0
+    last_io_ts: float = 0.0
+    last_error: str = ""
+    cooldown_until: float = 0.0
+    close_requested: bool = False
+
+    actual_local_port: Optional[int] = None
+    peer_close_count: int = 0
+    open_fail_count: int = 0
+
+    def wants_read(self) -> bool:
+        return self.socket_obj is not None and self.state in ("opening", "connected")
+
+    def wants_write(self) -> bool:
+        if self.socket_obj is None:
+            return False
+        if self.state == "opening":
+            return True
+        return self.state == "connected" and bool(self.stream.tx_queue)
+
+    def queue_tx(self, payload: bytes) -> bool:
+        return self.stream.queue_tx(payload)
+
+    def note_connected(self, sock: socket.socket) -> None:
+        self.state = "connected"
+        self.connected_ts = time.time()
+        self.last_io_ts = self.connected_ts
+
+        try:
+            local_name = sock.getsockname()
+            if isinstance(local_name, tuple) and len(local_name) >= 2:
+                self.actual_local_port = int(local_name[1])
+        except Exception:
+            pass
+
+        if self.proto == "UDP":
+            self.active = True
+
+    def note_close_feedback(self, reason: str) -> None:
+        self.last_error = str(reason or "")
+        txt = self.last_error.lower()
+        now = time.time()
+
+        if "peer-closed-before-active" in txt:
+            self.cooldown_until = max(self.cooldown_until, now + 4.0)
+        elif "peer-closed" in txt:
+            self.peer_close_count += 1
+            self.cooldown_until = max(self.cooldown_until, now + min(30.0, 2.0 * (2 ** min(self.peer_close_count, 4))))
+        elif "open:" in txt or "connect:" in txt or "send:" in txt or "recv:" in txt or "invalid-socket" in txt:
+            self.open_fail_count += 1
+            self.cooldown_until = max(self.cooldown_until, now + min(20.0, 1.5 * (1 + self.open_fail_count)))
+        else:
+            self.cooldown_until = max(self.cooldown_until, now + 1.0)
+
+        self.state = "cooling"
+
+
+class SocketInterface:
+    IFACE_NAME = "Socket interface"
+
+    KNOWN_PRIORITY_PORTS = {
+        53, 80, 123, 443, 853,
+        3333, 4444, 5555, 7777, 8443, 8844,
+        18080, 37888, 37889,
+    }
+
+    TCP_OPEN_THRESHOLD = 14.0
+    UDP_OPEN_THRESHOLD = 11.0
+
+    FLOW_IDLE_TTL = 180.0
+    PACKET_TTL = 120.0
+    MAX_PACKET_RECORDS = 8192
+    MAX_CANDIDATES = 4096
+    MAX_TX_HINTS_PER_CANDIDATE = 16
+    MIN_OPEN_RETRY_SEC = 2.0
+
+    SESSION_PROBE_GRACE_SEC = 1.50
+    LIVE_IDLE_TTL = 120.0
+
+    def __init__(self, router, router_logger):
+        self.router = router
+        self.logger = router_logger
+
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._wakeup_event = threading.Event()
+        self._started = False
+
+        self._io_thread: Optional[threading.Thread] = None
+        self._cleanup_thread: Optional[threading.Thread] = None
+
+        self.packet_records: "OrderedDict[str, SocketPacketRecord]" = OrderedDict()
+
+        self.candidates: Dict[SocketFlowKey, SocketCandidate] = {}
+        self.candidates_by_remote: Dict[str, Set[SocketFlowKey]] = defaultdict(set)
+
+        self.connections: Dict[SocketFlowKey, SocketConnection] = {}
+        self.sock_to_connection_key: Dict[socket.socket, SocketFlowKey] = {}
+
+        self._open_requests: Deque[SocketFlowKey] = deque()
+        self._iface_activity: Dict[str, int] = defaultdict(int)
+        self._identity_cache_ts: float = 0.0
+        self._identity_cache: Dict[str, Dict[str, Any]] = {}
+
+        self.logger.log_message("[SocketInterface] 🧠 initialized (stream-backed connection mode)")
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._stop_event.clear()
+            self._wakeup_event.clear()
+
+        self._io_thread = threading.Thread(
+            target=self._io_loop,
+            name="SocketInterfaceIO",
+            daemon=True,
+        )
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="SocketInterfaceCleanup",
+            daemon=True,
+        )
+        self._io_thread.start()
+        self._cleanup_thread.start()
+
+        self.logger.log_message("[SocketInterface] 🚀 started")
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self._started:
+                return
+            self._started = False
+            self._stop_event.set()
+            for conn in self.connections.values():
+                conn.close_requested = True
+
+        self._wake_io()
+
+        if self._io_thread and self._io_thread.is_alive():
+            self._io_thread.join(timeout=3.0)
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=3.0)
+
+        with self._lock:
+            for conn in list(self.connections.values()):
+                self._close_connection_locked(conn, reason="manager-stop")
+            self.sock_to_connection_key.clear()
+
+        self.logger.log_message("[SocketInterface] 🛑 stopped")
+
+    # ------------------------------------------------------------------
+    # public hot path
+    # ------------------------------------------------------------------
+
+    def handle_packet(self, packet: Packet, inbound_iface: str) -> bool:
+        try:
+            if not self._started or self._stop_event.is_set():
+                return False
+
+            if inbound_iface == self.IFACE_NAME:
+                return False
+
+            if bool(getattr(packet, "_socket_interface_injected", False)):
+                return False
+
+            meta = self._extract_meta(packet, inbound_iface)
+            if meta is None:
+                return False
+
+            now = time.time()
+            payload = meta["payload"]
+            flow_key = meta["flow_key"]
+
+            with self._lock:
+                self._iface_activity[str(inbound_iface or "")] += 1
+
+                candidate = self.candidates.get(flow_key)
+                if candidate is None:
+                    if len(self.candidates) >= self.MAX_CANDIDATES:
+                        self._prune_candidates_locked(now)
+
+                    candidate = SocketCandidate(
+                        key=flow_key,
+                        family=meta["family"],
+                        proto=meta["proto"],
+                        ep_a_ip=flow_key[2][0][0],
+                        ep_a_port=flow_key[2][0][1],
+                        ep_b_ip=flow_key[2][1][0],
+                        ep_b_port=flow_key[2][1][1],
+                    )
+                    self.candidates[flow_key] = candidate
+
+                candidate.observe(meta, now)
+                candidate.update_score(float(meta["raw_score"]))
+
+                digest = self._record_packet_locked(packet, inbound_iface, flow_key, candidate.score, len(payload))
+                candidate.history.append(digest)
+
+                if meta["direction"] == "egress" and payload:
+                    candidate.queue_tx_hint(payload, max_queue=self.MAX_TX_HINTS_PER_CANDIDATE)
+                    if meta.get("fresh_open_signal"):
+                        candidate.note_fresh_open_signal(payload, now)
+
+                if candidate.remote_ip:
+                    self.candidates_by_remote[candidate.remote_ip].add(candidate.key)
+
+                conn = self.connections.get(flow_key)
+                if conn is not None:
+                    if meta["direction"] == "egress" and payload:
+                        queued = conn.queue_tx(payload)
+                        if queued:
+                            self._wake_io()
+                        return queued
+                    return False
+
+                if not meta["connectable"]:
+                    return False
+                if meta["direction"] != "egress":
+                    return False
+                if candidate.peer_kind != "unicast":
+                    return False
+
+                if not candidate.may_promote(now, self.TCP_OPEN_THRESHOLD, self.UDP_OPEN_THRESHOLD, self.MIN_OPEN_RETRY_SEC):
+                    return False
+
+                best = self._choose_best_candidate_for_remote_locked(candidate.remote_ip, candidate.proto)
+                if best is None or best.key != candidate.key:
+                    return False
+
+                candidate.last_promote_attempt_ts = now
+                candidate.last_promote_generation = candidate.observation_generation
+                self._queue_open_request_locked(candidate)
+                self._wake_io()
+
+            return False
+
+        except Exception as e:
+            self.logger.log_message(f"[SocketInterface] ❌ handle_packet error: {type(e).__name__}: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # open / close / io
+    # ------------------------------------------------------------------
+
+    def _queue_open_request_locked(self, candidate: SocketCandidate) -> None:
+        if candidate.key in self.connections:
+            return
+        if candidate.key in self._open_requests:
+            return
+        self._open_requests.append(candidate.key)
+
+    def _io_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    self._service_open_requests_locked()
+                    self._service_close_requests_locked()
+                    self._service_probe_timeouts_locked()
+                    self._sweep_dead_sockets_locked()
+                    rlist, wlist = self._build_select_lists_locked()
+
+                if not rlist and not wlist:
+                    self._wakeup_event.wait(0.35)
+                    self._wakeup_event.clear()
+                    continue
+
+                try:
+                    readable, writable, _ = select.select(rlist, wlist, [], 0.50)
+                except OSError as e:
+                    if getattr(e, "winerror", None) == 10022:
+                        self.logger.log_message("[SocketInterface] ⚠️ select() WinError 10022; sweeping connection table")
+                        with self._lock:
+                            self._sweep_dead_sockets_locked(force_close_invalid=True)
+                        self._wakeup_event.wait(0.10)
+                        self._wakeup_event.clear()
+                        continue
+                    raise
+
+                for sock in writable:
+                    conn = self._connection_from_socket(sock)
+                    if conn is not None:
+                        self._service_connection_write(conn)
+
+                for sock in readable:
+                    conn = self._connection_from_socket(sock)
+                    if conn is not None:
+                        self._service_connection_read(conn)
+
+                self._wakeup_event.clear()
+
+            except Exception as e:
+                self.logger.log_message(f"[SocketInterface] ❗ io loop error: {type(e).__name__}: {e}")
+                self._wakeup_event.wait(0.15)
+                self._wakeup_event.clear()
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop_event.wait(5.0):
+            try:
+                now = time.time()
+                with self._lock:
+                    self._prune_candidates_locked(now)
+                    self._prune_packet_records_locked(now)
+                    self._prune_connections_locked(now)
+            except Exception as e:
+                self.logger.log_message(f"[SocketInterface] ⚠️ cleanup error: {type(e).__name__}: {e}")
+
+    def _service_open_requests_locked(self) -> None:
+        while self._open_requests:
+            key = self._open_requests.popleft()
+            candidate = self.candidates.get(key)
+            if candidate is None:
+                continue
+            if key in self.connections:
+                continue
+            self._open_connection_from_candidate_locked(candidate)
+
+    def _service_close_requests_locked(self) -> None:
+        for conn in list(self.connections.values()):
+            if conn.close_requested:
+                self._close_connection_locked(conn, reason=conn.last_error or "close-requested")
+
+    def _service_probe_timeouts_locked(self) -> None:
+        now = time.time()
+        for conn in self.connections.values():
+            if conn.proto != "TCP":
+                continue
+            if conn.socket_obj is None:
+                continue
+            if conn.state != "connected":
+                continue
+            if conn.active:
+                continue
+            if conn.connected_ts <= 0:
+                continue
+
+            if now >= (conn.connected_ts + self.SESSION_PROBE_GRACE_SEC) and conn.stream.bytes_tx_payload == 0 and conn.stream.bytes_rx_payload == 0:
+                conn.last_error = "peer-closed-before-active"
+                conn.close_requested = True
+
+    def _build_select_lists_locked(self):
+        rlist = []
+        wlist = []
+
+        for conn in self.connections.values():
+            sock = conn.socket_obj
+            if sock is None:
+                continue
+
+            if not self._socket_is_valid(sock):
+                conn.last_error = "invalid-socket"
+                conn.close_requested = True
+                continue
+
+            if conn.wants_read():
+                rlist.append(sock)
+            if conn.wants_write():
+                wlist.append(sock)
+
+        return rlist, wlist
+
+    def _service_connection_write(self, conn: SocketConnection) -> None:
+        sock = conn.socket_obj
+        if sock is None:
+            return
+
+        try:
+            if conn.state == "opening":
+                err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err not in (0, None):
+                    conn.last_error = f"connect-so_error={err}"
+                    conn.close_requested = True
+                    self._wake_io()
+                    return
+
+                conn.note_connected(sock)
+                self.logger.log_message(
+                    f"[SocketInterface] ✅ connected {conn.proto} "
+                    f"{conn.local_ip}:{conn.local_port} -> {conn.remote_ip}:{conn.remote_port}"
+                )
+
+            while conn.state == "connected":
+                chunk = conn.stream.pop_tx()
+                if not chunk:
+                    break
+
+                try:
+                    sent = sock.send(chunk)
+                except (BlockingIOError, InterruptedError):
+                    conn.stream.prepend_tx(chunk)
+                    break
+                except OSError as e:
+                    conn.last_error = f"send:{type(e).__name__}:{e}"
+                    conn.close_requested = True
+                    self._wake_io()
+                    return
+
+                if sent is None or sent <= 0:
+                    conn.stream.prepend_tx(chunk)
+                    break
+
+                conn.last_io_ts = time.time()
+                conn.stream.note_sent(int(sent))
+
+                if conn.proto == "TCP":
+                    conn.active = True
+
+                if sent < len(chunk):
+                    remain = chunk[sent:]
+                    conn.stream.prepend_tx(remain)
+                    break
+
+        except Exception as e:
+            conn.last_error = f"write:{type(e).__name__}:{e}"
+            conn.close_requested = True
+            self._wake_io()
+
+    def _service_connection_read(self, conn: SocketConnection) -> None:
+        sock = conn.socket_obj
+        if sock is None or conn.state not in ("opening", "connected"):
+            return
+
+        try:
+            while True:
+                try:
+                    data = sock.recv(65535)
+                except (BlockingIOError, InterruptedError):
+                    return
+
+                if not data:
+                    conn.last_error = "peer-closed-before-active" if not conn.active else "peer-closed"
+                    conn.close_requested = True
+                    self._wake_io()
+                    return
+
+                conn.last_io_ts = time.time()
+
+                packets = conn.stream.build_rx_packets(data)
+                if conn.proto == "TCP" and packets:
+                    conn.active = True
+
+                for pkt in packets:
+                    setattr(pkt, "sniffed_on", self.IFACE_NAME)
+                    setattr(pkt, "_socket_interface_injected", True)
+                    setattr(pkt, "_socket_stream_kind", conn.stream.stream_kind)
+                    self._feed_back_to_router(pkt)
+
+                if len(data) < 65535:
+                    return
+
+        except OSError as e:
+            conn.last_error = f"recv:{type(e).__name__}:{e}"
+            conn.close_requested = True
+            self._wake_io()
+        except Exception as e:
+            conn.last_error = f"recv:{type(e).__name__}:{e}"
+            conn.close_requested = True
+            self._wake_io()
+
+    def _open_connection_from_candidate_locked(self, candidate: SocketCandidate) -> bool:
+        if not candidate.remote_ip or not candidate.remote_port or not candidate.local_ip or not candidate.local_port:
+            candidate.apply_feedback("open:missing-endpoints", time.time())
+            return False
+
+        family = socket.AF_INET6 if candidate.family == 6 else socket.AF_INET
+        remote_addr = self._make_sockaddr(family, candidate.remote_ip, int(candidate.remote_port))
+        if remote_addr is None:
+            candidate.apply_feedback("open:bad-remote", time.time())
+            return False
+
+        bind_candidates = self._bind_candidates_for_candidate(candidate)
+        if not bind_candidates:
+            candidate.apply_feedback("open:no-bind-candidate", time.time())
+            return False
+
+        last_err = None
+
+        for bind_ip in bind_candidates:
+            bind_addr = self._make_sockaddr(family, bind_ip, 0)
+            if bind_addr is None:
+                continue
+
+            s = None
+            try:
+                sock_type = socket.SOCK_STREAM if candidate.proto == "TCP" else socket.SOCK_DGRAM
+                s = socket.socket(family, sock_type)
+                s.setblocking(False)
+
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                except Exception:
+                    pass
+
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+                except Exception:
+                    pass
+
+                if candidate.proto == "TCP":
+                    try:
+                        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception:
+                        pass
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    except Exception:
+                        pass
+
+                s.bind(bind_addr)
+
+                err = s.connect_ex(remote_addr)
+                acceptable = {
+                    0,
+                    getattr(errno, "EINPROGRESS", 10035),
+                    getattr(errno, "EWOULDBLOCK", 10035),
+                    10035,
+                }
+                if err not in acceptable:
+                    last_err = f"connect_ex={err}"
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    continue
+
+                stream = SocketStream(
+                    family=candidate.family,
+                    proto=candidate.proto,
+                    local_ip=str(candidate.local_ip),
+                    local_port=int(candidate.local_port),
+                    remote_ip=str(candidate.remote_ip),
+                    remote_port=int(candidate.remote_port),
+                )
+
+                while candidate.tx_hints:
+                    hint = candidate.tx_hints.popleft()
+                    stream.queue_tx(hint)
+
+                conn = SocketConnection(
+                    key=candidate.key,
+                    family=candidate.family,
+                    proto=candidate.proto,
+                    local_ip=str(candidate.local_ip),
+                    local_port=int(candidate.local_port),
+                    remote_ip=str(candidate.remote_ip),
+                    remote_port=int(candidate.remote_port),
+                    stream=stream,
+                    bind_ip=bind_ip,
+                    preferred_iface=candidate.preferred_iface,
+                    candidate_generation=int(candidate.observation_generation),
+                )
+
+                conn.socket_obj = s
+                conn.state = "connected" if (candidate.proto == "UDP" or err == 0) else "opening"
+
+                if conn.state == "connected":
+                    conn.note_connected(s)
+
+                self.connections[conn.key] = conn
+                self.sock_to_connection_key[s] = conn.key
+
+                self.logger.log_message(
+                    f"[SocketInterface] 🔌 promoted {candidate.proto} "
+                    f"{candidate.local_ip}:{candidate.local_port} -> {candidate.remote_ip}:{candidate.remote_port} "
+                    f"score={candidate.best_score:.2f} state={conn.state} bind={bind_ip}"
+                )
+                return True
+
+            except OSError as e:
+                last_err = f"{type(e).__name__}:{e}"
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                last_err = f"{type(e).__name__}:{e}"
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:
+                    pass
+
+        candidate.apply_feedback(f"open:{last_err or 'failed'}", time.time())
+        self.logger.log_message(
+            f"[SocketInterface] ❌ promote failed {candidate.proto} "
+            f"{candidate.remote_ip}:{candidate.remote_port}: {last_err or 'failed'}"
+        )
+        return False
+
+    def _close_connection_locked(self, conn: SocketConnection, reason: str = "") -> None:
+        sock = conn.socket_obj
+        conn.socket_obj = None
+        conn.close_requested = False
+        conn.note_close_feedback(reason or conn.last_error or "closed")
+
+        if sock is not None:
+            self.sock_to_connection_key.pop(sock, None)
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        candidate = self.candidates.get(conn.key)
+        if candidate is not None:
+            candidate.apply_feedback(reason or conn.last_error or "closed", time.time())
+
+        self.connections.pop(conn.key, None)
+
+        self.logger.log_message(
+            f"[SocketInterface] 🔒 closed {conn.proto} "
+            f"{conn.local_ip}:{conn.local_port} -> {conn.remote_ip}:{conn.remote_port} ({reason})"
+        )
+
+    def _sweep_dead_sockets_locked(self, force_close_invalid: bool = False) -> None:
+        for conn in list(self.connections.values()):
+            sock = conn.socket_obj
+            if sock is None:
+                continue
+            valid = self._socket_is_valid(sock)
+            if not valid or force_close_invalid:
+                self._close_connection_locked(conn, reason=conn.last_error or "invalid-socket")
+
+    def _prune_connections_locked(self, now: float) -> None:
+        for conn in list(self.connections.values()):
+            last_activity = max(conn.last_io_ts or 0.0, conn.connected_ts or 0.0, conn.created_ts)
+            if conn.socket_obj is None:
+                self.connections.pop(conn.key, None)
+                continue
+            if (now - last_activity) > self.LIVE_IDLE_TTL:
+                self._close_connection_locked(conn, reason="idle-timeout")
+
+    def _socket_is_valid(self, sock: Optional[socket.socket]) -> bool:
+        if sock is None:
+            return False
+        try:
+            fileno = sock.fileno()
+            if fileno is None or fileno < 0:
+                return False
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # candidate selection / bookkeeping
+    # ------------------------------------------------------------------
+
+    def _choose_best_candidate_for_remote_locked(self, remote_ip: Optional[str], proto: Optional[str] = None) -> Optional[SocketCandidate]:
+        if not remote_ip:
+            return None
+
+        best = None
+        best_rank = None
+
+        for key in list(self.candidates_by_remote.get(remote_ip, set())):
+            cand = self.candidates.get(key)
+            if cand is None:
+                continue
+            if proto and cand.proto != proto:
+                continue
+            if cand.peer_kind != "unicast":
+                continue
+            if not cand.local_ip or not cand.remote_ip:
+                continue
+            if key in self.connections:
+                continue
+
+            rank = (
+                float(cand.connect_confidence),
+                float(cand.ownership_confidence),
+                float(cand.route_affinity),
+                float(cand.best_score),
+                float(cand.stable_score),
+                int(cand.payload_hits),
+                int(cand.egress_hits),
+                float(cand.last_seen),
+            )
+            if best is None or rank > best_rank:
+                best = cand
+                best_rank = rank
+
+        return best
+
+    def _record_packet_locked(
+        self,
+        packet: Packet,
+        inbound_iface: str,
+        flow_key: SocketFlowKey,
+        score: float,
+        payload_len: int,
+    ) -> str:
+        raw_bytes = self._safe_packet_bytes(packet)
+
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(flow_key).encode("utf-8", errors="ignore"))
+        h.update(str(inbound_iface).encode("utf-8", errors="ignore"))
+        h.update(len(raw_bytes).to_bytes(4, "big", signed=False))
+        if len(raw_bytes) <= 192:
+            h.update(raw_bytes)
+        else:
+            h.update(raw_bytes[:128])
+            h.update(raw_bytes[-32:])
+
+        digest = h.hexdigest()
+        self.packet_records[digest] = SocketPacketRecord(
+            digest=digest,
+            ts=time.time(),
+            inbound_iface=inbound_iface,
+            flow_key=flow_key,
+            score=score,
+            payload_len=payload_len,
+            summary=self._safe_summary(packet),
+        )
+        self.packet_records.move_to_end(digest)
+
+        while len(self.packet_records) > self.MAX_PACKET_RECORDS:
+            self.packet_records.popitem(last=False)
+
+        return digest
+
+    def _prune_candidates_locked(self, now: float) -> None:
+        stale = []
+        for key, cand in self.candidates.items():
+            if (now - cand.last_seen) > self.FLOW_IDLE_TTL and key not in self.connections:
+                stale.append(key)
+
+        for key in stale:
+            cand = self.candidates.pop(key, None)
+            if cand and cand.remote_ip:
+                self.candidates_by_remote.get(cand.remote_ip, set()).discard(key)
+
+    def _prune_packet_records_locked(self, now: float) -> None:
+        stale = [digest for digest, rec in self.packet_records.items() if (now - rec.ts) > self.PACKET_TTL]
+        for digest in stale:
+            self.packet_records.pop(digest, None)
+
+        while len(self.packet_records) > self.MAX_PACKET_RECORDS:
+            self.packet_records.popitem(last=False)
+
+    # ------------------------------------------------------------------
+    # metadata / scoring
+    # ------------------------------------------------------------------
+
+    def _extract_meta(self, packet: Packet, inbound_iface: str) -> Optional[Dict[str, Any]]:
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if ip_layer is None:
+                return None
+
+            tcp = packet.getlayer(TCP)
+            udp = packet.getlayer(UDP)
+            if tcp is None and udp is None:
+                return None
+
+            proto = "TCP" if tcp is not None else "UDP"
+            sport = int((tcp or udp).sport)
+            dport = int((tcp or udp).dport)
+
+            src_ip = self._normalize_ip_text(getattr(ip_layer, "src", None))
+            dst_ip = self._normalize_ip_text(getattr(ip_layer, "dst", None))
+            if not src_ip or not dst_ip:
+                return None
+
+            family = 6 if isinstance(ip_layer, IPv6) else 4
+
+            payload = b""
+            raw = packet.getlayer(Raw)
+            if raw is not None:
+                try:
+                    payload = bytes(raw.load)
+                except Exception:
+                    payload = b""
+
+            flags = ""
+            if tcp is not None:
+                try:
+                    flags = str(tcp.flags)
+                except Exception:
+                    flags = ""
+
+            local_map = self._get_local_identity_map()
+            src_info = local_map.get(src_ip)
+            dst_info = local_map.get(dst_ip)
+
+            local_src = src_info is not None
+            local_dst = dst_info is not None
+
+            direction = "transit"
+            connectable = False
+            local_ip = None
+            local_port = None
+            remote_ip = None
+            remote_port = None
+            local_info = None
+
+            if local_src and not local_dst:
+                direction = "egress"
+                connectable = True
+                local_ip, local_port = src_ip, sport
+                remote_ip, remote_port = dst_ip, dport
+                local_info = src_info
+            elif local_dst and not local_src:
+                direction = "ingress"
+                connectable = True
+                local_ip, local_port = dst_ip, dport
+                remote_ip, remote_port = src_ip, sport
+                local_info = dst_info
+            elif local_src and local_dst:
+                direction = "internal"
+                local_ip, local_port = src_ip, sport
+                remote_ip, remote_port = dst_ip, dport
+                local_info = src_info
+
+            preferred_iface = self._choose_preferred_iface(local_info, inbound_iface, family) if local_info else None
+            preferred_role = self._iface_role(preferred_iface) if preferred_iface else ""
+            preferred_bind_ip = self._choose_bind_ip_for_identity(
+                local_ip=local_ip,
+                family=family,
+                inbound_iface=inbound_iface,
+                preferred_iface=preferred_iface,
+                preferred_role=preferred_role,
+            )
+
+            ownership_confidence = self._ownership_confidence(
+                local_info=local_info,
+                inbound_iface=inbound_iface,
+                preferred_iface=preferred_iface,
+                local_ip=local_ip,
+            )
+            route_affinity = self._route_affinity(
+                local_ip=local_ip,
+                bind_ip=preferred_bind_ip,
+                inbound_iface=inbound_iface,
+                preferred_iface=preferred_iface,
+                preferred_role=preferred_role,
+            )
+
+            peer_kind = self._classify_peer_kind(
+                remote_ip=remote_ip,
+                family=family,
+                inbound_iface=inbound_iface,
+            ) if remote_ip else "unknown"
+
+            connect_confidence = max(
+                0.0,
+                min(1.0, (ownership_confidence * 0.60) + (route_affinity * 0.40)),
+            )
+
+            fresh_open_signal = False
+            if direction == "egress" and len(payload) > 0:
+                fresh_open_signal = True
+
+            flow_key = self._flow_key(family, proto, src_ip, sport, dst_ip, dport)
+
+            return {
+                "family": family,
+                "proto": proto,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "sport": sport,
+                "dport": dport,
+                "flags": flags,
+                "payload": payload,
+                "payload_len": len(payload),
+                "local_src": local_src,
+                "local_dst": local_dst,
+                "direction": direction,
+                "connectable": connectable,
+                "local_ip": local_ip,
+                "local_port": local_port,
+                "remote_ip": remote_ip,
+                "remote_port": remote_port,
+                "preferred_iface": preferred_iface,
+                "preferred_role": preferred_role,
+                "preferred_bind_ip": preferred_bind_ip,
+                "ownership_confidence": ownership_confidence,
+                "route_affinity": route_affinity,
+                "connect_confidence": connect_confidence,
+                "peer_kind": peer_kind,
+                "fresh_open_signal": fresh_open_signal,
+                "raw_score": self._score_packet(
+                    family=family,
+                    proto=proto,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    sport=sport,
+                    dport=dport,
+                    payload_len=len(payload),
+                    flags=flags,
+                    local_src=local_src,
+                    local_dst=local_dst,
+                    direction=direction,
+                ),
+                "flow_key": flow_key,
+                "inbound_iface": inbound_iface,
+            }
+
+        except Exception:
+            return None
+
+    def _score_packet(
+        self,
+        *,
+        family: int,
+        proto: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        payload_len: int,
+        flags: str,
+        local_src: bool,
+        local_dst: bool,
+        direction: str,
+    ) -> float:
+        score = 0.0
+
+        score += 3.20 if proto == "TCP" else 2.20
+
+        if direction == "egress":
+            score += 6.00
+        elif direction == "ingress":
+            score += 2.00
+        elif direction == "internal":
+            score -= 2.50
+        else:
+            score -= 8.00
+
+        if payload_len > 0:
+            score += min(8.0, 1.0 + math.log2(payload_len + 1))
+        else:
+            score += 0.20
+
+        if sport in self.KNOWN_PRIORITY_PORTS or dport in self.KNOWN_PRIORITY_PORTS:
+            score += 3.00
+
+        if proto == "TCP":
+            if "S" in flags and "A" not in flags:
+                score += 3.50
+            if "P" in flags and payload_len > 0:
+                score += 2.25
+            if "F" in flags or "R" in flags:
+                score -= 3.50
+
+        try:
+            ip_src = ipaddress.ip_address(src_ip)
+            ip_dst = ipaddress.ip_address(dst_ip)
+
+            if ip_src.is_multicast or ip_dst.is_multicast:
+                score -= 10.0
+            if ip_src.is_loopback or ip_dst.is_loopback:
+                score -= 4.0
+            if ip_src.is_unspecified or ip_dst.is_unspecified:
+                score -= 12.0
+        except Exception:
+            pass
+
+        if local_src and local_dst:
+            score -= 8.0
+
+        if family == 6:
+            score += 0.35
+
+        return score
+
+    # ------------------------------------------------------------------
+    # router re-entry
+    # ------------------------------------------------------------------
+
+    def _feed_back_to_router(self, packet: Packet) -> bool:
+        try:
+            fn = getattr(self.router, "process_packet", None)
+            if callable(fn):
+                try:
+                    return bool(fn(packet, self.IFACE_NAME))
+                except TypeError:
+                    pass
+                try:
+                    return bool(fn(packet, inbound_iface=self.IFACE_NAME))
+                except TypeError:
+                    pass
+                try:
+                    return bool(fn(packet))
+                except TypeError:
+                    pass
+
+            tm = getattr(self.router, "transport_manager", None)
+            if tm is not None:
+                h = getattr(tm, "handle_packet", None)
+                if callable(h):
+                    return bool(h(packet, self.IFACE_NAME))
+
+            return False
+
+        except Exception as e:
+            self.logger.log_message(f"[SocketInterface] ❌ feed-back error: {type(e).__name__}: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # general helpers
+    # ------------------------------------------------------------------
+
+    def _connection_from_socket(self, sock: socket.socket) -> Optional[SocketConnection]:
+        with self._lock:
+            key = self.sock_to_connection_key.get(sock)
+            if key is None:
+                return None
+            return self.connections.get(key)
+
+    def _wake_io(self) -> None:
+        self._wakeup_event.set()
+
+    def _flow_key(self, family: int, proto: str, src_ip: str, sport: int, dst_ip: str, dport: int) -> SocketFlowKey:
+        a = (str(src_ip), int(sport))
+        b = (str(dst_ip), int(dport))
+        pair = tuple(sorted((a, b)))
+        return (int(family), str(proto), pair)
+
+    def _safe_packet_bytes(self, packet: Packet) -> bytes:
+        try:
+            return bytes(packet)
+        except Exception:
+            return b""
+
+    def _safe_summary(self, packet: Packet) -> str:
+        try:
+            return packet.summary()
+        except Exception:
+            return "packet"
+
+    def _normalize_ip_text(self, ip_text: Optional[str]) -> Optional[str]:
+        if ip_text is None:
+            return None
+        text = str(ip_text).strip()
+        if not text:
+            return None
+        text = text.split("/", 1)[0]
+        text = text.split("%", 1)[0]
+        return text or None
+
+    def _make_sockaddr(self, family: int, ip_text: Optional[str], port: int):
+        if not ip_text:
+            return None
+
+        ip_text = str(ip_text).strip()
+        if not ip_text:
+            return None
+
+        try:
+            if family == socket.AF_INET:
+                ip4 = ipaddress.IPv4Address(ip_text.split("%", 1)[0])
+                return (str(ip4), int(port))
+
+            host = ip_text.split("%", 1)[0]
+            ip6 = ipaddress.IPv6Address(host)
+            if ip6.is_link_local:
+                return None
+            return (str(ip6), int(port), 0, 0)
+
+        except Exception:
+            return None
+
+    def _pick_bind_ip(self, family_num: int) -> Optional[str]:
+        family_ver = 6 if family_num == 6 else 4
+        candidates = []
+
+        for attr in ("router_ip_out", "router_ip_in", "router_ipv6_out", "router_ipv6_link_local_out"):
+            try:
+                v = getattr(self.router, attr, None)
+                if v:
+                    candidates.append(self._normalize_ip_text(v))
+            except Exception:
+                pass
+
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(cand)
+                if ip_obj.version != family_ver:
+                    continue
+                if ip_obj.is_unspecified or ip_obj.is_multicast:
+                    continue
+                return cand
+            except Exception:
+                continue
+
+        return None
+
+    # ------------------------------------------------------------------
+    # identity / interface helpers
+    # ------------------------------------------------------------------
+
+    def _iface_role(self, iface: Optional[str]) -> str:
+        if not iface:
+            return ""
+        iface = str(iface)
+
+        if iface == getattr(self.router, "interface_out_full_name", None):
+            return "out"
+        if iface == getattr(self.router, "interface_in_full_name", None):
+            return "in"
+        if iface == getattr(self.router, "interface_loopback_full_name", None):
+            return "loopback"
+        if iface == getattr(self.router, "interface_ethernet_2_full_name", None):
+            return "helper"
+        if iface == getattr(self.router, "interface_lac_full_name", None):
+            return "helper"
+        if iface == getattr(self.router, "interface_lac_2_full_name", None):
+            return "helper"
+        return "other"
+
+    def _get_local_identity_map(self) -> Dict[str, Dict[str, Any]]:
+        now = time.monotonic()
+        if self._identity_cache and (now - self._identity_cache_ts) < 2.0:
+            return self._identity_cache
+
+        out: Dict[str, Dict[str, Any]] = {}
+
+        def add(ip_value, iface: Optional[str] = None, role: Optional[str] = None, source: str = ""):
+            ip_txt = self._normalize_ip_text(ip_value)
+            if not ip_txt:
+                return
+
+            entry = out.setdefault(ip_txt, {
+                "ip": ip_txt,
+                "ifaces": set(),
+                "roles": set(),
+                "sources": set(),
+            })
+            if iface:
+                entry["ifaces"].add(str(iface))
+            if role:
+                entry["roles"].add(str(role))
+            if source:
+                entry["sources"].add(str(source))
+
+        add(getattr(self.router, "router_ip_out", None), getattr(self.router, "interface_out_full_name", None), "out", "router_attr")
+        add(getattr(self.router, "router_ip_in", None), getattr(self.router, "interface_in_full_name", None), "in", "router_attr")
+        add(getattr(self.router, "router_ipv6_out", None), getattr(self.router, "interface_out_full_name", None), "out", "router_attr")
+        add(getattr(self.router, "router_ipv6_link_local_out", None), getattr(self.router, "interface_out_full_name", None), "out", "router_attr")
+
+        try:
+            cfgs = getattr(self.router, "_interfaces_config", {}) or {}
+            for iface_name, cfg in cfgs.items():
+                if not isinstance(cfg, dict):
+                    continue
+                role = self._iface_role(iface_name)
+                for k in ("ip_addr", "ip", "ipv4", "ipv6"):
+                    add(cfg.get(k), iface_name, role, f"cfg:{k}")
+        except Exception:
+            pass
+
+        try:
+            fn = getattr(self.router, "_get_all_local_ips", None)
+            if callable(fn):
+                for x in (fn() or []):
+                    add(x, None, "host", "host_enum")
+        except Exception:
+            pass
+
+        self._identity_cache = out
+        self._identity_cache_ts = now
+        return out
+
+    def _choose_preferred_iface(self, local_info: Optional[Dict[str, Any]], inbound_iface: str, family: int) -> Optional[str]:
+        if not local_info:
+            return None
+
+        ifaces = list(local_info.get("ifaces", set()) or [])
+        if not ifaces:
+            return None
+
+        inbound_iface = str(inbound_iface or "")
+        if inbound_iface and inbound_iface in ifaces:
+            return inbound_iface
+
+        inbound_role = self._iface_role(inbound_iface)
+        if inbound_role:
+            for iface in ifaces:
+                if self._iface_role(iface) == inbound_role:
+                    return iface
+
+        if len(ifaces) == 1:
+            return ifaces[0]
+
+        preferred = getattr(self.router, "interface_out_full_name", None)
+        if preferred in ifaces:
+            return preferred
+
+        return ifaces[0]
+
+    def _ownership_confidence(
+        self,
+        local_info: Optional[Dict[str, Any]],
+        inbound_iface: str,
+        preferred_iface: Optional[str],
+        local_ip: Optional[str],
+    ) -> float:
+        if not local_info or not local_ip:
+            return 0.0
+
+        inbound_iface = str(inbound_iface or "")
+        ifaces = set(local_info.get("ifaces", set()) or [])
+        roles = set(local_info.get("roles", set()) or [])
+
+        score = 0.20
+
+        if inbound_iface and inbound_iface in ifaces:
+            score = 1.0
+        elif preferred_iface and preferred_iface in ifaces:
+            score = 0.88
+        elif ifaces:
+            score = 0.70
+        elif "host" in roles:
+            score = 0.40
+
+        try:
+            if local_ip == self._normalize_ip_text(getattr(self.router, "router_ip_out", None)):
+                score = max(score, 0.95)
+            if local_ip == self._normalize_ip_text(getattr(self.router, "router_ip_in", None)):
+                score = max(score, 0.90)
+        except Exception:
+            pass
+
+        return max(0.0, min(1.0, score))
+
+    def _route_affinity(
+        self,
+        local_ip: Optional[str],
+        bind_ip: Optional[str],
+        inbound_iface: str,
+        preferred_iface: Optional[str],
+        preferred_role: str,
+    ) -> float:
+        if not bind_ip:
+            return 0.0
+
+        bind_ip = self._normalize_ip_text(bind_ip)
+        local_ip = self._normalize_ip_text(local_ip)
+
+        score = 0.45
+
+        if bind_ip and local_ip and bind_ip == local_ip:
+            score = 0.95
+
+        if preferred_iface and preferred_iface == str(inbound_iface or ""):
+            score = max(score, 0.90)
+
+        if preferred_role in {"out", "in"}:
+            score = max(score, 0.80)
+
+        return max(0.0, min(1.0, score))
+
+    def _classify_peer_kind(self, remote_ip: Optional[str], family: int, inbound_iface: str) -> str:
+        if not remote_ip:
+            return "unknown"
+
+        try:
+            ip_obj = ipaddress.ip_address(str(remote_ip))
+        except Exception:
+            return "bad-address"
+
+        if ip_obj.version != family:
+            return "family-mismatch"
+        if ip_obj.is_unspecified:
+            return "unspecified"
+        if ip_obj.is_multicast:
+            return "multicast"
+        if ip_obj.is_loopback:
+            return "loopback"
+
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            if str(ip_obj) == "255.255.255.255":
+                return "broadcast"
+            directed = self._directed_broadcast_for_iface(str(inbound_iface or ""))
+            if directed and str(ip_obj) == directed:
+                return "broadcast"
+
+        return "unicast"
+
+    def _directed_broadcast_for_iface(self, iface: str) -> Optional[str]:
+        try:
+            cfg = (getattr(self.router, "_interfaces_config", {}) or {}).get(iface)
+            if not isinstance(cfg, dict):
+                return None
+
+            cidr = cfg.get("cidr")
+            if cidr:
+                net = ipaddress.ip_interface(str(cidr)).network
+                if isinstance(net, ipaddress.IPv4Network):
+                    return str(net.broadcast_address)
+
+            ip_text = self._normalize_ip_text(cfg.get("ip_addr") or cfg.get("ip") or cfg.get("ipv4"))
+            mask = cfg.get("netmask") or cfg.get("mask")
+            if ip_text and mask:
+                net = ipaddress.ip_interface(f"{ip_text}/{mask}").network
+                if isinstance(net, ipaddress.IPv4Network):
+                    return str(net.broadcast_address)
+
+        except Exception:
+            pass
+
+        return None
+
+    def _choose_bind_ip_for_identity(
+        self,
+        local_ip: Optional[str],
+        family: int,
+        inbound_iface: str,
+        preferred_iface: Optional[str],
+        preferred_role: str,
+    ) -> Optional[str]:
+        candidates: List[str] = []
+
+        if local_ip:
+            candidates.append(local_ip)
+
+        for iface in (preferred_iface, inbound_iface):
+            for cand in self._iface_bind_ips(iface, family):
+                candidates.append(cand)
+
+        if preferred_role == "out":
+            for attr in ("router_ip_out", "router_ipv6_out", "router_ipv6_link_local_out"):
+                v = getattr(self.router, attr, None)
+                if v:
+                    candidates.append(v)
+        elif preferred_role == "in":
+            v = getattr(self.router, "router_ip_in", None)
+            if v:
+                candidates.append(v)
+
+        seen = set()
+        for cand in candidates:
+            ip_txt = self._normalize_ip_text(cand)
+            if not ip_txt or ip_txt in seen:
+                continue
+            seen.add(ip_txt)
+            try:
+                ip_obj = ipaddress.ip_address(ip_txt)
+                if ip_obj.version != family:
+                    continue
+                if ip_obj.is_unspecified or ip_obj.is_multicast:
+                    continue
+                return ip_txt
+            except Exception:
+                continue
+
+        return None
+
+    def _iface_bind_ips(self, iface: Optional[str], family: int) -> List[str]:
+        out: List[str] = []
+        if not iface:
+            return out
+
+        try:
+            cfg = (getattr(self.router, "_interfaces_config", {}) or {}).get(iface)
+            if isinstance(cfg, dict):
+                for k in ("ip_addr", "ip", "ipv4", "ipv6"):
+                    v = self._normalize_ip_text(cfg.get(k))
+                    if not v:
+                        continue
+                    try:
+                        if ipaddress.ip_address(v).version == family:
+                            out.append(v)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return out
+
+    def _bind_candidates_for_candidate(self, candidate: SocketCandidate) -> List[str]:
+        candidates: List[str] = []
+
+        if candidate.preferred_bind_ip:
+            candidates.append(candidate.preferred_bind_ip)
+        if candidate.local_ip:
+            candidates.append(candidate.local_ip)
+
+        for cand in self._iface_bind_ips(candidate.preferred_iface, candidate.family):
+            candidates.append(cand)
+
+        if candidate.preferred_role == "out":
+            for attr in ("router_ip_out", "router_ipv6_out", "router_ipv6_link_local_out"):
+                v = getattr(self.router, attr, None)
+                if v:
+                    candidates.append(v)
+        elif candidate.preferred_role == "in":
+            v = getattr(self.router, "router_ip_in", None)
+            if v:
+                candidates.append(v)
+
+        if not candidates:
+            fallback = self._pick_bind_ip(candidate.family)
+            if fallback:
+                candidates.append(fallback)
+
+        seen = set()
+        out: List[str] = []
+
+        for cand in candidates:
+            ip_txt = self._normalize_ip_text(cand)
+            if not ip_txt or ip_txt in seen:
+                continue
+            seen.add(ip_txt)
+            try:
+                ip_obj = ipaddress.ip_address(ip_txt)
+                if ip_obj.version != candidate.family:
+                    continue
+                if ip_obj.is_unspecified or ip_obj.is_multicast:
+                    continue
+                out.append(ip_txt)
+            except Exception:
+                pass
+
+        return out
 FlowEnd = tuple[str, int]
 FlowKey = tuple[FlowEnd, FlowEnd]
-
-
 class ISAKMPManager:
     """
     Manages ISAKMP packets. This version is hardened with per-source IP
