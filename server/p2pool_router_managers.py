@@ -10033,6 +10033,7 @@ class TransportStratumManager:
             "tx_skipped_no_writer": 0,
             "tx_skipped_not_owned": 0,
         }
+
         # TX cache / semantic dedupe
         self._tx_cache = collections.OrderedDict()
         self._tx_sem_cache = collections.OrderedDict()
@@ -10044,6 +10045,7 @@ class TransportStratumManager:
             "tx_cache_hit": 0,
             "tx_sem_cache_hit": 0,
         })
+
         self._emit(
             f"[Transport][🧵 TCP][⛏️ Stratum] Manager ready. "
             f"ports={sorted(self.ports)} "
@@ -10114,24 +10116,32 @@ class TransportStratumManager:
                 buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
                 st[buf_key] = self._append_buf(st.get(buf_key, b""), payload)
 
-                lines, remain = self._split_lines(st[buf_key])
+                frames, remain = self._drain_messages(st[buf_key])
                 st[buf_key] = remain
 
                 processed = 0
-                for raw_line in lines:
+                for item in frames:
                     if processed >= self.MAX_MESSAGES_PER_PKT:
                         break
 
-                    line = raw_line.strip(b"\r\n\t \x00")
-                    if not line:
+                    kind = item.get("kind")
+                    raw = item.get("raw", b"")
+                    if not raw:
                         continue
-                    if len(line) > self.MAX_LINE_BYTES:
-                        line = line[: self.MAX_LINE_BYTES]
 
-                    event = self._parse_line(line, st=st, direction=direction)
+                    if kind == "json":
+                        event = self._parse_json_rpc(
+                            item.get("obj") or {},
+                            raw,
+                            st=st,
+                            direction=direction,
+                        )
+                    else:
+                        event = self._parse_line(raw, st=st, direction=direction)
+
                     if event is None:
                         if self._should_log(st, importance="low", slot="unknown"):
-                            preview = self._safe_ascii(line, self.ASCII_PREVIEW_MAX) or "-"
+                            preview = self._safe_ascii(raw, self.ASCII_PREVIEW_MAX) or "-"
                             self._emit(
                                 f"{self._tag_prefix(st)}[🧾 UNKNOWN] "
                                 f"{src_ip}:{sport} -> {dst_ip}:{dport} "
@@ -10188,7 +10198,7 @@ class TransportStratumManager:
 
                     processed += 1
 
-                if not lines:
+                if not frames:
                     partial_event = self._maybe_partial_event(
                         buf=st[buf_key],
                         st=st,
@@ -10329,8 +10339,8 @@ class TransportStratumManager:
     def _prune_tx_caches(self, now: float) -> None:
         try:
             for cache, ttl in (
-                    (self._tx_cache, self.TX_CACHE_TTL_S),
-                    (self._tx_sem_cache, self.TX_SEM_CACHE_TTL_S),
+                (self._tx_cache, self.TX_CACHE_TTL_S),
+                (self._tx_sem_cache, self.TX_SEM_CACHE_TTL_S),
             ):
                 stale = []
                 for k, ts in cache.items():
@@ -10345,15 +10355,15 @@ class TransportStratumManager:
             pass
 
     def _tx_exact_cache_key(
-            self,
-            *,
-            reply_src_ip: str,
-            reply_dst_ip: str,
-            reply_sport: int,
-            reply_dport: int,
-            flags: str,
-            payload: bytes,
-            tx_reason: str,
+        self,
+        *,
+        reply_src_ip: str,
+        reply_dst_ip: str,
+        reply_sport: int,
+        reply_dport: int,
+        flags: str,
+        payload: bytes,
+        tx_reason: str,
     ) -> tuple:
         try:
             payload_sig = hashlib.sha1(bytes(payload or b"")).hexdigest()[:12]
@@ -10370,14 +10380,14 @@ class TransportStratumManager:
         )
 
     def _tx_semantic_cache_key(
-            self,
-            *,
-            kind: str,
-            src_ip: str,
-            dst_ip: str,
-            sport: int,
-            dport: int,
-            flags: Dict[str, Any],
+        self,
+        *,
+        kind: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        flags: Dict[str, Any],
     ) -> tuple:
         return (
             str(kind or ""),
@@ -10415,6 +10425,7 @@ class TransportStratumManager:
         self._tx_sem_cache[key] = now
         while len(self._tx_sem_cache) > self.TX_CACHE_SOFT_MAX:
             self._tx_sem_cache.popitem(last=False)
+
     # ------------------------------------------------------------------
     # PacketWriter integration
     # ------------------------------------------------------------------
@@ -10535,18 +10546,18 @@ class TransportStratumManager:
             self._emit(f"[Transport][🧵 TCP][⛏️ Stratum][PW][⚠️ ICMPDiagFail] {e}")
 
     def _maybe_packetwriter_tx(
-            self,
-            *,
-            packet,
-            st: Dict[str, Any],
-            event: Dict[str, Any],
-            flags: Dict[str, Any],
-            inbound_iface: str,
-            src_ip: str,
-            dst_ip: str,
-            sport: int,
-            dport: int,
-            now: float,
+        self,
+        *,
+        packet,
+        st: Dict[str, Any],
+        event: Dict[str, Any],
+        flags: Dict[str, Any],
+        inbound_iface: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        now: float,
     ) -> bool:
         _ = sport
 
@@ -10718,15 +10729,15 @@ class TransportStratumManager:
         return True
 
     def _queue_tcp_reply(
-            self,
-            request_packet,
-            inbound_iface: str,
-            *,
-            flags: str = "A",
-            payload: bytes = b"",
-            seq: Optional[int] = None,
-            ack: Optional[int] = None,
-            tx_reason: str = "reply",
+        self,
+        request_packet,
+        inbound_iface: str,
+        *,
+        flags: str = "A",
+        payload: bytes = b"",
+        seq: Optional[int] = None,
+        ack: Optional[int] = None,
+        tx_reason: str = "reply",
     ) -> bool:
         pw = getattr(self, "packet_writer", None)
         if pw is None or TCP is None or request_packet is None or not request_packet.haslayer(TCP):
@@ -10734,13 +10745,13 @@ class TransportStratumManager:
             return False
 
         try:
-            if request_packet.haslayer(IP):
+            if IP is not None and request_packet.haslayer(IP):
                 ip = IP(
                     src=request_packet[IP].dst,
                     dst=request_packet[IP].src,
                     ttl=64,
                 )
-            elif request_packet.haslayer(IPv6):
+            elif IPv6 is not None and request_packet.haslayer(IPv6):
                 ip = IPv6(
                     src=request_packet[IPv6].dst,
                     dst=request_packet[IPv6].src,
@@ -10957,18 +10968,26 @@ class TransportStratumManager:
             "\"result\":false",
             "{\"id\":",
             "\"id\":",
+            "\"jsonrpc\"",
+            "\"blob\"",
+            "\"target\"",
+            "\"seed_hash\"",
+            "\"algo\"",
         ):
             if needle in low:
                 family, confidence, reason = self._family_hint_from_text(low)
+                kind = "text"
+                if "\"method\":\"job\"" in low or "\"blob\"" in low or "\"seed_hash\"" in low or "\"target\"" in low:
+                    kind = "partial_json"
                 return {
-                    "kind": "text",
+                    "kind": kind,
                     "label": needle.replace('"', ""),
                     "preview": text,
                     "importance": "low",
                     "family": family,
                     "family_confidence": confidence,
                     "family_reason": reason,
-                    "log_slot": "text",
+                    "log_slot": "text" if kind == "text" else "partial",
                 }
 
         return None
@@ -11033,6 +11052,24 @@ class TransportStratumManager:
         result = obj.get("result")
         error = obj.get("error")
         top_status = self._safe_text(obj.get("status"))
+
+        if self._looks_like_monero_job(obj):
+            job_id, height = self._extract_job_result(result or params or obj)
+            return {
+                "kind": "job",
+                "method": method or "job",
+                "id": ident,
+                "job_id": job_id,
+                "height": height,
+                "algo": self._first_present(params, result, obj, "algo"),
+                "target": self._first_present(params, result, obj, "target"),
+                "seed_hash": self._first_present(params, result, obj, "seed_hash"),
+                "importance": "high",
+                "family": "monero_stratum",
+                "family_confidence": 0.99,
+                "family_reason": "monero job/blob/target/seed_hash pattern",
+                "log_slot": "job",
+            }
 
         if method:
             m = method.lower()
@@ -11169,15 +11206,19 @@ class TransportStratumManager:
                 }
 
             if m == "job":
-                job_id, height = self._extract_job_result(result or params)
+                job_id, height = self._extract_job_result(result or params or obj)
                 return {
                     "kind": "job",
                     "method": method,
                     "job_id": job_id,
                     "height": height,
+                    "id": ident,
+                    "algo": self._first_present(params, result, obj, "algo"),
+                    "target": self._first_present(params, result, obj, "target"),
+                    "seed_hash": self._first_present(params, result, obj, "seed_hash"),
                     "importance": "high",
                     "family": "monero_stratum",
-                    "family_confidence": 0.96,
+                    "family_confidence": 0.99,
                     "family_reason": "method=job",
                     "log_slot": "job",
                 }
@@ -11215,17 +11256,20 @@ class TransportStratumManager:
             }
 
         if isinstance(result, dict):
-            if any(k in result for k in ("job", "job_id", "blob", "target", "height")):
+            if any(k in result for k in ("job", "job_id", "blob", "target", "seed_hash", "height", "algo")):
                 job_id, height = self._extract_job_result(result)
                 return {
                     "kind": "job",
                     "job_id": job_id,
                     "height": height,
                     "id": ident,
+                    "algo": self._safe_text(result.get("algo")),
+                    "target": self._safe_text(result.get("target")),
+                    "seed_hash": self._safe_text(result.get("seed_hash")),
                     "importance": "high",
                     "family": "monero_stratum",
-                    "family_confidence": 0.94,
-                    "family_reason": "result contains job/blob/target/height",
+                    "family_confidence": 0.96,
+                    "family_reason": "result contains job/blob/target/seed_hash/height",
                     "log_slot": "job",
                 }
 
@@ -11619,7 +11663,8 @@ class TransportStratumManager:
             self._emit(
                 f"{tag}[🧩 JOB] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
-                f"job_id={job_id} height={event.get('height', st.get('last_height', '-'))} worker={worker}"
+                f"job_id={job_id} height={event.get('height', st.get('last_height', '-'))} "
+                f"worker={worker} algo={event.get('algo', '-')} target={event.get('target', '-')}"
             )
             return
 
@@ -11641,11 +11686,20 @@ class TransportStratumManager:
                 f"{tag}[{em}] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
                 f"id={event.get('id')} worker={worker} job_id={job_id} "
-                f"status={event.get('status', event.get('accepted'))} rtt_ms={event.get('rtt_ms', '-')}"
+                f"status={event.get('status', event.get('accepted'))} "
+                f"rtt_ms={event.get('rtt_ms', '-')}"
             )
             return
 
-        if kind in ("login", "subscribe", "authorize"):
+        if kind == "error":
+            self._emit(
+                f"{tag}[❌ ERROR] {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"dir={direction} iface={iface} "
+                f"id={event.get('id')} code={event.get('code')} message={event.get('message') or '-'}"
+            )
+            return
+
+        if kind in ("subscribe", "authorize", "login"):
             self._emit(
                 f"{tag}[🔐 AUTH] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
@@ -11656,14 +11710,14 @@ class TransportStratumManager:
         if kind == "set_difficulty":
             self._emit(
                 f"{tag}[🎚️ DIFF] {src_ip}:{sport} -> {dst_ip}:{dport} "
-                f"dir={direction} iface={iface} difficulty={event.get('difficulty')}"
+                f"dir={direction} iface={iface} diff={event.get('difficulty', '-')}"
             )
             return
 
         if kind == "set_extranonce":
             self._emit(
-                f"{tag}[🧬 EXTRANONCE] {src_ip}:{sport} -> {dst_ip}:{dport} "
-                f"dir={direction} iface={iface} extranonce={event.get('extranonce')}"
+                f"{tag}[🧪 EXTRA] {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"dir={direction} iface={iface} extranonce={event.get('extranonce', '-')}"
             )
             return
 
@@ -11674,277 +11728,368 @@ class TransportStratumManager:
             )
             return
 
-        if kind == "error":
-            self._emit(
-                f"{tag}[🚫 ERROR] {src_ip}:{sport} -> {dst_ip}:{dport} "
-                f"dir={direction} iface={iface} "
-                f"id={event.get('id')} code={event.get('code')} message={event.get('message')}"
-            )
-            return
-
         if kind == "partial_json":
             self._emit(
                 f"{tag}[🧩 PARTIAL] {src_ip}:{sport} -> {dst_ip}:{dport} "
-                f"dir={direction} iface={iface} "
-                f"bytes={event.get('bytes')} preview={event.get('preview')}"
+                f"dir={direction} iface={iface} bytes={event.get('bytes', '-')} preview={event.get('preview', '-')}"
+            )
+            return
+
+        if kind == "control_syn":
+            self._emit(
+                f"{tag}[🤝 SYN] {src_ip}:{sport} -> {dst_ip}:{dport} dir={direction} iface={iface}"
+            )
+            return
+
+        if kind == "transport_fin":
+            self._emit(
+                f"{tag}[🏁 FIN] {src_ip}:{sport} -> {dst_ip}:{dport} dir={direction} iface={iface}"
+            )
+            return
+
+        if kind == "transport_rst":
+            self._emit(
+                f"{tag}[💥 RST] {src_ip}:{sport} -> {dst_ip}:{dport} dir={direction} iface={iface}"
             )
             return
 
         self._emit(
-            f"{tag}[ℹ️ EVENT] {src_ip}:{sport} -> {dst_ip}:{dport} "
+            f"{tag}[🔎 EVENT] {src_ip}:{sport} -> {dst_ip}:{dport} "
             f"dir={direction} iface={iface} kind={kind} preview={event.get('preview', '-')}"
         )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Low-level helpers
     # ------------------------------------------------------------------
-    def _maybe_gc(self, now: float) -> None:
-        if (now - self._last_gc) < self.GC_PERIOD_SEC:
-            return
-
-        ttl = self.FLOW_TTL_SEC
-        stale = [k for k, v in self._flows.items() if (now - float(v.get("last", now))) > ttl]
-        for k in stale:
-            self._flows.pop(k, None)
-
-        if len(self._flows) > self.FLOW_SOFT_MAX:
-            excess = len(self._flows) - self.FLOW_SOFT_MAX
-            victims = sorted(self._flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:excess]
-            for k, _ in victims:
-                self._flows.pop(k, None)
-
-        self._metrics["flows"] = len(self._flows)
-        self._last_gc = now
-
-    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple[str, str, str, str]:
-        a = (str(src_ip), int(sport))
-        b = (str(dst_ip), int(dport))
-        return (
-            (a[0], str(a[1]), b[0], str(b[1]))
-            if a <= b
-            else (b[0], str(b[1]), a[0], str(a[1]))
-        )
-
     def _is_service_port(self, sport: int, dport: int) -> bool:
         return int(sport) in self.ports or int(dport) in self.ports
 
+    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple[str, str, str, str]:
+        if int(dport) in self.ports and int(sport) not in self.ports:
+            return (str(src_ip), str(int(sport)), str(dst_ip), str(int(dport)))
+        if int(sport) in self.ports and int(dport) not in self.ports:
+            return (str(dst_ip), str(int(dport)), str(src_ip), str(int(sport)))
+        return (str(src_ip), str(int(sport)), str(dst_ip), str(int(dport)))
+
+    def _iface_suffix(self, inbound_iface: str) -> str:
+        try:
+            return str(inbound_iface or "")
+        except Exception:
+            return "-"
+
     def _payload_sample(self, packet, *, cap: int) -> bytes:
         try:
-            payload = b""
             if Raw is not None and packet.haslayer(Raw):
-                payload = bytes(packet[Raw].load)
-            else:
-                raw_payload = bytes(packet[TCP].payload)
-                payload = raw_payload if raw_payload else b""
-            if len(payload) > cap:
-                payload = payload[:cap]
-            return payload
+                return bytes(packet[Raw].load)[:cap]
         except Exception:
-            return b""
+            pass
 
-    def _append_buf(self, cur: bytes, more: bytes) -> bytes:
-        cur = cur or b""
-        more = more or b""
-        out = cur + more
+        try:
+            tcp = packet[TCP]
+            payload = getattr(tcp, "payload", None)
+            if payload is not None:
+                return bytes(payload)[:cap]
+        except Exception:
+            pass
+
+        return b""
+
+    def _append_buf(self, prior: bytes, payload: bytes) -> bytes:
+        out = bytes(prior or b"") + bytes(payload or b"")
         if len(out) > self.MAX_BUF_PER_DIR:
             out = out[-self.MAX_BUF_PER_DIR:]
         return out
 
-    def _split_lines(self, buf: bytes):
+    def _drain_messages(self, buf: bytes) -> Tuple[List[Dict[str, Any]], bytes]:
+        """
+        Drain JSON frames from arbitrary TCP byte streams.
+
+        Fix over the original:
+        - supports newline-delimited JSON
+        - supports multiple JSON objects in one packet
+        - supports JSON objects without trailing newline
+        - keeps partial tail buffered for the next segment
+        """
+        items: List[Dict[str, Any]] = []
         if not buf:
-            return [], b""
-        parts = buf.split(b"\n")
-        if len(parts) == 1:
-            return [], buf
-        lines = [p + b"\n" for p in parts[:-1]]
-        remain = parts[-1]
+            return items, b""
+
+        data = bytes(buf).replace(b"\x00", b"")
+        if not data:
+            return items, b""
+
+        # Fast path for line-oriented streams
+        for line in data.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            obj = self._try_json(s)
+            if isinstance(obj, dict):
+                items.append({"kind": "json", "raw": s, "obj": obj})
+            elif len(s) <= self.MAX_LINE_BYTES:
+                items.append({"kind": "text", "raw": s})
+
+        # Brace-balanced JSON scan so split/combined frames still work.
+        balanced: List[Tuple[int, int, Dict[str, Any], bytes]] = []
+        start = -1
+        depth = 0
+        in_str = False
+        esc = False
+        last_complete_end = -1
+
+        for i, b in enumerate(data):
+            ch = chr(b)
+
+            if start < 0:
+                if ch == "{":
+                    start = i
+                    depth = 1
+                    in_str = False
+                    esc = False
+                continue
+
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    raw = data[start:i + 1].strip()
+                    obj = self._try_json(raw)
+                    if isinstance(obj, dict):
+                        balanced.append((start, i + 1, obj, raw))
+                        last_complete_end = i + 1
+                    start = -1
+
+        seen = set()
+        for item in items:
+            raw = item.get("raw", b"")
+            if raw and raw not in seen:
+                seen.add(raw)
+
+        for _, _, obj, raw in balanced:
+            if raw and raw not in seen:
+                seen.add(raw)
+                items.append({"kind": "json", "raw": raw, "obj": obj})
+
+        if start >= 0:
+            remain = data[start:]
+        elif last_complete_end >= 0:
+            remain = data[last_complete_end:]
+            if not remain.strip():
+                remain = b""
+        else:
+            remain = b""
+
+        if len(remain) > self.MAX_BUF_PER_DIR:
+            remain = remain[-self.MAX_BUF_PER_DIR:]
+
+        if len(items) > self.MAX_MESSAGES_PER_PKT:
+            items = items[: self.MAX_MESSAGES_PER_PKT]
+
+        return items, remain
+
+    def _split_lines(self, buf: bytes) -> Tuple[List[bytes], bytes]:
+        lines = []
+        remain = bytes(buf or b"")
+        if not remain:
+            return lines, b""
+
+        if b"\n" not in remain:
+            return lines, remain
+
+        parts = remain.splitlines(keepends=False)
+        if remain.endswith((b"\n", b"\r")):
+            lines = [p for p in parts if p]
+            remain = b""
+        else:
+            lines = [p for p in parts[:-1] if p]
+            remain = parts[-1] if parts else b""
+
         return lines, remain
 
-    def _safe_text(self, value) -> Optional[str]:
-        if value is None:
-            return None
+    def _try_json(self, data: bytes) -> Optional[Dict[str, Any]]:
         try:
-            return str(value)
+            obj = json.loads(data.decode("utf-8", errors="replace"))
+            if isinstance(obj, dict):
+                return obj
         except Exception:
             return None
+        return None
 
-    def _safe_ascii(self, value, limit: int = 160) -> str:
-        try:
-            if isinstance(value, bytes):
-                text = value.decode("utf-8", "replace")
-            else:
-                text = str(value)
-            text = text.replace("\r", "\\r").replace("\n", "\\n")
-            if len(text) > limit:
-                return text[:limit] + "..."
-            return text
-        except Exception:
-            return "-"
+    def _family_hint_from_text(self, text: str) -> Tuple[Optional[str], float, Optional[str]]:
+        low = str(text or "").lower()
 
-    def _try_json(self, line: bytes):
-        try:
-            return json.loads(line.decode("utf-8", "replace"))
-        except Exception:
+        btc_needles = (
+            "mining.subscribe",
+            "mining.authorize",
+            "mining.notify",
+            "mining.set_difficulty",
+            "mining.set_extranonce",
+            "mining.submit",
+        )
+        if any(n in low for n in btc_needles):
+            return "btc_stratum", 0.90, "btc stratum text hints"
+
+        xmr_needles = (
+            "\"method\":\"job\"",
+            "\"method\": \"job\"",
+            "\"method\":\"login\"",
+            "\"method\": \"login\"",
+            "\"method\":\"submit\"",
+            "\"method\": \"submit\"",
+            "\"method\":\"keepalived\"",
+            "\"blob\"",
+            "\"target\"",
+            "\"seed_hash\"",
+            "\"algo\"",
+            "rx/0",
+        )
+        if any(n in low for n in xmr_needles):
+            return "monero_stratum", 0.92, "monero stratum text hints"
+
+        if "\"jsonrpc\"" in low or "\"method\"" in low or "\"id\"" in low:
+            return "unknown_stratum", 0.55, "json-rpc looking payload on stratum port"
+
+        return None, 0.0, None
+
+    def _looks_like_monero_job(self, obj: Dict[str, Any]) -> bool:
+        if not isinstance(obj, dict):
+            return False
+
+        method = self._safe_text(obj.get("method"))
+        params = obj.get("params")
+        result = obj.get("result")
+
+        if str(method or "").strip().lower() == "job":
+            return True
+
+        for candidate in (params, result, obj):
+            if isinstance(candidate, dict):
+                if any(k in candidate for k in ("blob", "job_id", "target", "seed_hash", "height", "algo")):
+                    return True
+
+        return False
+
+    def _first_present(self, *args):
+        if len(args) < 2:
             return None
-
-    def _id_key(self, ident) -> Optional[str]:
-        if ident is None:
-            return None
-        try:
-            return str(ident)
-        except Exception:
-            return None
-
-    def _iface_suffix(self, inbound_iface: str) -> str:
-        try:
-            s = str(inbound_iface or "")
-            if not s:
-                return "-"
-            if s.startswith("\\Device\\NPF_"):
-                return s[-12:]
-            return s
-        except Exception:
-            return "-"
-
-    def _family_hint_from_text(self, low: str):
-        if any(x in low for x in (
-            "\"seed_hash\"", "\"algo\":\"rx/", "\"method\":\"job\"",
-            "\"method\":\"login\"", "\"method\":\"submit\""
-        )):
-            return "monero_stratum", 0.90, "text hint monero"
-        if any(x in low for x in (
-            "mining.subscribe", "mining.authorize", "mining.notify",
-            "mining.submit", "mining.set_difficulty", "mining.set_extranonce"
-        )):
-            return "btc_stratum", 0.90, "text hint btc"
-        return "unknown_stratum", 0.50, "text hint unknown"
+        key = args[-1]
+        for d in args[:-1]:
+            if isinstance(d, dict) and key in d:
+                return self._safe_text(d.get(key))
+        return None
 
     def _extract_worker(self, params):
         try:
             if isinstance(params, list) and params:
-                return str(params[0])
+                return self._safe_text(params[0])
             if isinstance(params, dict):
-                for key in ("login", "user", "worker", "worker_name"):
-                    if key in params:
-                        return str(params[key])
-        except Exception:
-            pass
-        return None
-
-    def _extract_agent(self, params):
-        try:
-            if isinstance(params, dict):
-                for key in ("agent", "pass", "password"):
-                    if key in params:
-                        return str(params[key])
+                return self._safe_text(params.get("login") or params.get("user") or params.get("worker"))
         except Exception:
             pass
         return None
 
     def _extract_login_name(self, params):
-        try:
-            if isinstance(params, dict):
-                for key in ("login", "user", "wallet", "address"):
-                    if key in params:
-                        return str(params[key])
-        except Exception:
-            pass
+        if isinstance(params, dict):
+            return self._safe_text(params.get("login") or params.get("user") or params.get("worker"))
+        return self._extract_worker(params)
+
+    def _extract_agent(self, params):
+        if isinstance(params, dict):
+            return self._safe_text(params.get("agent"))
         return None
-
-    def _extract_submit_fields(self, params):
-        worker = None
-        job_id = None
-        nonce = None
-        try:
-            if isinstance(params, list):
-                if len(params) > 0:
-                    worker = str(params[0])
-                if len(params) > 1:
-                    job_id = str(params[1])
-                if len(params) > 2:
-                    nonce = str(params[2])
-            elif isinstance(params, dict):
-                worker = self._extract_worker(params)
-                job_id = params.get("job_id") or params.get("id")
-                nonce = params.get("nonce")
-                if job_id is not None:
-                    job_id = str(job_id)
-                if nonce is not None:
-                    nonce = str(nonce)
-        except Exception:
-            pass
-        return worker, job_id, nonce
-
-    def _extract_monero_submit(self, params):
-        worker = None
-        job_id = None
-        nonce = None
-        try:
-            if isinstance(params, dict):
-                worker = self._extract_login_name(params) or self._extract_worker(params)
-                job_id = params.get("job_id") or params.get("id")
-                nonce = params.get("nonce")
-                if job_id is not None:
-                    job_id = str(job_id)
-                if nonce is not None:
-                    nonce = str(nonce)
-        except Exception:
-            pass
-        return worker, job_id, nonce
-
-    def _extract_notify_fields(self, params):
-        job_id = None
-        clean_jobs = None
-        height = None
-        try:
-            if isinstance(params, list):
-                if len(params) > 0:
-                    job_id = str(params[0])
-                if len(params) > 8:
-                    clean_jobs = bool(params[8])
-            elif isinstance(params, dict):
-                if "job_id" in params:
-                    job_id = str(params["job_id"])
-                if "clean_jobs" in params:
-                    clean_jobs = bool(params["clean_jobs"])
-                if "height" in params:
-                    height = params["height"]
-        except Exception:
-            pass
-        return job_id, clean_jobs, height
 
     def _extract_first_scalar(self, params):
         try:
             if isinstance(params, list) and params:
                 return params[0]
             if isinstance(params, dict):
-                for _, v in params.items():
-                    return v
+                for k in ("difficulty", "diff", "value"):
+                    if k in params:
+                        return params.get(k)
         except Exception:
             pass
         return None
 
-    def _extract_job_result(self, result):
-        job_id = None
-        height = None
+    def _extract_submit_fields(self, params):
+        worker = job_id = nonce = None
         try:
-            if isinstance(result, dict):
-                if "job_id" in result:
-                    job_id = str(result["job_id"])
-                elif "id" in result:
-                    job_id = str(result["id"])
-                if "height" in result:
-                    height = result["height"]
+            if isinstance(params, list):
+                if len(params) >= 1:
+                    worker = self._safe_text(params[0])
+                if len(params) >= 2:
+                    job_id = self._safe_text(params[1])
+                if len(params) >= 3:
+                    nonce = self._safe_text(params[2])
+            elif isinstance(params, dict):
+                worker = self._safe_text(params.get("worker") or params.get("user"))
+                job_id = self._safe_text(params.get("job_id"))
+                nonce = self._safe_text(params.get("nonce"))
+        except Exception:
+            pass
+        return worker, job_id, nonce
+
+    def _extract_monero_submit(self, params):
+        worker = job_id = nonce = None
+        try:
+            if isinstance(params, dict):
+                worker = self._safe_text(params.get("id") or params.get("worker") or params.get("login"))
+                job_id = self._safe_text(params.get("job_id"))
+                nonce = self._safe_text(params.get("nonce"))
+            elif isinstance(params, list):
+                if len(params) >= 1:
+                    worker = self._safe_text(params[0])
+                if len(params) >= 2:
+                    job_id = self._safe_text(params[1])
+                if len(params) >= 3:
+                    nonce = self._safe_text(params[2])
+        except Exception:
+            pass
+        return worker, job_id, nonce
+
+    def _extract_notify_fields(self, params):
+        job_id = clean_jobs = height = None
+        try:
+            if isinstance(params, list):
+                if len(params) >= 1:
+                    job_id = self._safe_text(params[0])
+                if len(params) >= 9:
+                    clean_jobs = params[8]
+            elif isinstance(params, dict):
+                job_id = self._safe_text(params.get("job_id"))
+                clean_jobs = params.get("clean_jobs")
+                height = params.get("height")
+        except Exception:
+            pass
+        return job_id, clean_jobs, height
+
+    def _extract_job_result(self, obj):
+        job_id = height = None
+        try:
+            if isinstance(obj, dict):
+                if "job" in obj and isinstance(obj["job"], dict):
+                    nested = obj["job"]
+                    job_id = self._safe_text(nested.get("job_id") or nested.get("id"))
+                    height = nested.get("height")
+                else:
+                    job_id = self._safe_text(obj.get("job_id") or obj.get("id"))
+                    height = obj.get("height")
         except Exception:
             pass
         return job_id, height
-
-    def _status_is_accept(self, status: str) -> bool:
-        try:
-            s = str(status).strip().lower()
-            return s in ("ok", "accepted", "true", "success")
-        except Exception:
-            return False
 
     def _extract_error(self, error):
         try:
@@ -11955,6 +12100,49 @@ class TransportStratumManager:
             return None, self._safe_text(error)
         except Exception:
             return None, None
+
+    def _id_key(self, ident: Any) -> Optional[str]:
+        if ident is None:
+            return None
+        try:
+            return json.dumps(ident, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            try:
+                return str(ident)
+            except Exception:
+                return None
+
+    def _safe_text(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return str(value)
+        except Exception:
+            return None
+
+    def _safe_ascii(self, raw: bytes, limit: int) -> str:
+        try:
+            return "".join(chr(b) if 32 <= int(b) <= 126 else "." for b in bytes(raw[:limit]))
+        except Exception:
+            return "-"
+
+    def _status_is_accept(self, status) -> bool:
+        s = str(status or "").strip().lower()
+        return s in ("ok", "accepted", "success", "true", "1")
+
+    def _tcp_flags(self, packet) -> Dict[str, Any]:
+        try:
+            t = packet[TCP]
+            flags = int(t.flags)
+            return {
+                "syn": bool(flags & 0x02),
+                "ack": bool(flags & 0x10),
+                "fin": bool(flags & 0x01),
+                "rst": bool(flags & 0x04),
+                "psh": bool(flags & 0x08),
+            }
+        except Exception:
+            return {"syn": False, "ack": False, "fin": False, "rst": False, "psh": False}
 
     def _should_log(self, st: Dict[str, Any], *, importance: str, slot: str) -> bool:
         slots = st.setdefault("last_log_slots", {})
@@ -12013,28 +12201,27 @@ class TransportStratumManager:
         except Exception:
             pass
 
-    def _tcp_flags(self, packet) -> Dict[str, Any]:
-        try:
-            tcp = packet[TCP]
-            compact = tcp.sprintf("%TCP.flags%")
-            flagset = set(compact)
-            return {
-                "compact": compact,
-                "syn": "S" in flagset,
-                "ack": "A" in flagset,
-                "fin": "F" in flagset,
-                "rst": "R" in flagset,
-                "psh": "P" in flagset,
-            }
-        except Exception:
-            return {
-                "compact": "-",
-                "syn": False,
-                "ack": False,
-                "fin": False,
-                "rst": False,
-                "psh": False,
-            }
+    def _maybe_gc(self, now: float) -> None:
+        if (now - self._last_gc) < self.GC_PERIOD_SEC:
+            return
+
+        self._last_gc = now
+        dead = []
+        for k, st in self._flows.items():
+            if (now - float(st.get("last", now))) > self.FLOW_TTL_SEC:
+                dead.append(k)
+
+        for k in dead:
+            self._flows.pop(k, None)
+
+        while len(self._flows) > self.FLOW_SOFT_MAX:
+            try:
+                oldest = next(iter(self._flows))
+            except StopIteration:
+                break
+            self._flows.pop(oldest, None)
+
+        self._metrics["flows"] = len(self._flows)
 class TransportMoneroManager:
     """
     Monero transport observer/logger.

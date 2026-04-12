@@ -9922,7 +9922,46 @@ class ARPManager:
         ]
         self.K8S_SERVICE_VIP_TTL = 60.0
         self._k8s_virtual_cache: dict[str, float] = {}
+        # --- add in __init__ ---
+        self.ALLOW_SELF_IP_RESOLVE = True
 
+    # --- add helper ---
+    def _resolve_owned_iface_ip(self, iface: str, ip_text: str) -> str | None:
+        try:
+            if not getattr(self, "ALLOW_SELF_IP_RESOLVE", True):
+                return None
+
+            use_iface = str(iface or "").strip()
+            ip_norm = self._normalize_ip(ip_text)
+            if not use_iface or not ip_norm:
+                return None
+
+            try:
+                self._ensure_dynamic_iface_config(use_iface)
+            except Exception:
+                pass
+
+            cfg = self._all_iface_cfgs().get(use_iface, {}) or {}
+            iface_ip = self._normalize_ip(cfg.get("ip_addr") or self.get_interface_ipv4(use_iface))
+            if iface_ip != ip_norm:
+                return None
+
+            our_mac = self._normalize_mac(cfg.get("mac") or self.get_interface_mac(use_iface))
+            if not our_mac:
+                return None
+
+            self._iface_cache_set(use_iface, ip_norm, our_mac, source="self")
+            if not self._is_hyperv_iface(use_iface):
+                self._cache_set(ip_norm, our_mac, time.time(), kind="self")
+
+            self._log_rl(
+                f"resolve_owned_iface_ip:{use_iface}:{ip_norm}",
+                5.0,
+                f"[ARP] 🪞 Own-IP resolve on {use_iface.split('_')[-1]}: {ip_norm} -> {our_mac}",
+            )
+            return our_mac
+        except Exception:
+            return None
     def _resolve_gateway_mac_from_os(self, iface: str, gw_ip: str) -> str | None:
         try:
             iface = str(iface or "").strip()
@@ -11904,6 +11943,9 @@ class ARPManager:
         # Kubernetes service VIPs are virtual and should not go through ARP resolution.
 
         use_iface = self._pick_iface_for_ip(ip_str, iface)
+        own_mac = self._resolve_owned_iface_ip(use_iface, ip_str)
+        if own_mac:
+            return own_mac
         if self._is_k8s_service_ip(ip_str):
             mac = self._resolve_k8s_next_hop_mac(ip_str, use_iface)
             if mac:
@@ -12452,6 +12494,18 @@ class ARPManager:
 
         # self-IP gateway case
         if sane_reason_iface == "is_self_ip" or (iface_ip and str(iface_ip).strip() == str(gw_ip).strip()):
+            own_mac = self._resolve_owned_iface_ip(use_iface, gw_ip)
+            own_mac = self._normalize_mac(own_mac)
+            if own_mac and not self._is_bad_gateway_mac(own_mac):
+                self._cache_set(gw_ip, own_mac, time.time())
+                self._gateway_cache_set(use_iface, gw_ip, own_mac)
+                self._known_gateway_macs[gw_ip] = own_mac
+                self._log_rl(
+                    self._gw_log_key("gw_self_owned", gw_ip, use_iface),
+                    5.0,
+                    f"[ARP][GW] 🪞 Self-gateway resolve: {gw_ip} -> {own_mac} on {use_iface}",
+                )
+                return own_mac
             foreign_mac = self._allow_self_gateway_resolve(use_iface, gw_ip)
             foreign_mac = self._normalize_mac(foreign_mac)
             if foreign_mac and not self._is_bad_gateway_mac(foreign_mac):
@@ -12817,10 +12871,15 @@ class ARPManager:
                         )
                         return False
                     return True
+
+                # not in DHCP leases: allow most cases, but still keep the strong checks above
+                if self._lease_active(str(sender_ip)):
+                    return True
+
                 self._safe_log(
-                    f"[ARP][DAI] 🚫 Blocked ARP from {sender_mac} for {sender_ip} on untrusted port {str(inbound_iface).split('_')[-1]}: IP not in DHCP leases."
+                    f"[ARP][DAI] ℹ️ Allowing ARP from {sender_mac} for {sender_ip} on untrusted port {str(inbound_iface).split('_')[-1]}: IP not in DHCP leases."
                 )
-                return False
+                return True
 
             self._safe_log(
                 f"[ARP][INSPECT] ⚠️ No DHCP server reference. Permitting ARP from {sender_ip} on untrusted port {str(inbound_iface).split('_')[-1]}."
@@ -22660,6 +22719,14 @@ class HyperVRouterManager:
                 ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
             except Exception:
                 pass
+
+            bind_ip = str(self.bind_ip or "").strip()
+            if bind_ip and bind_ip != "0.0.0.0":
+                try:
+                    ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind_ip))
+                except Exception:
+                    pass
+
             ds.settimeout(1.0)
             return ds
         except Exception as e:
@@ -22669,6 +22736,14 @@ class HyperVRouterManager:
                 ["⚠️", "📡", "🧯"],
             )
             return None
+
+    def _join_multicast_group(self, sock_obj: socket.socket) -> None:
+        iface_ip = str(self.bind_ip or "").strip()
+        if iface_ip and iface_ip != "0.0.0.0":
+            mreq = struct.pack("=4s4s", socket.inet_aton(self.discovery_group), socket.inet_aton(iface_ip))
+        else:
+            mreq = struct.pack("=4s4s", socket.inet_aton(self.discovery_group), socket.inet_aton("0.0.0.0"))
+        sock_obj.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     def _open_discovery_socket(self) -> Optional[socket.socket]:
         try:
@@ -22884,8 +22959,19 @@ class HyperVRouterManager:
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         try:
             tx_sock.sendto(raw, (self.discovery_group, self.discovery_port))
-        except Exception:
-            pass
+            self._log_sparse(
+                f"hello-sent:{self.bind_ip}:{self.node_id}",
+                "peer",
+                f"hello sent node={self.node_id} seg={self.segment_id} adv={msg['listen_ip']}:{advertised_data_port}",
+                ["📡", "📤"],
+                every=10.0,
+            )
+        except Exception as e:
+            self._log_evt(
+                "peer",
+                f"hello send failed: {type(e).__name__}: {e}",
+                ["⚠️", "📡", "🧯"],
+            )
 
     def _flush_network_queue(self) -> None:
         with self._sock_lock:
@@ -22906,7 +22992,20 @@ class HyperVRouterManager:
         try:
             msg = json.loads(raw.decode("utf-8"))
         except Exception:
+            self._log_sparse(
+                f"wire-bad-json:{from_ip}:{from_port}",
+                "peer",
+                f"wire rx invalid json from={from_ip}:{from_port} via={which} bytes={len(raw)}",
+                ["⚠️", "📥", "🧯"],
+                every=2.0,
+            )
             return
+
+        self._log_evt(
+            "peer",
+            f"wire msg type={msg.get('type')} node={msg.get('node_id') or msg.get('src_node_id')} seg={msg.get('segment_id')} from={from_ip}:{from_port} via={which}",
+            ["📥", "🧠"],
+        )
 
         if msg.get("magic") != self.MAGIC:
             return
