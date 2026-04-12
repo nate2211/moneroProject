@@ -2908,6 +2908,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     sniffer=self.sniffer,
                     out_iface=self.interface_out_full_name,
                 )
+                self.p2p_manager.set_managers(
+                    self.arp_manager,
+                    self.rip_manager,
+                    broadcast_manager=getattr(self, "broadcast_manager", None),
+                    firewall_manager=getattr(self, "firewall_manager", None),
+                    netroute_manager=getattr(self, "netroute_manager", None),
+                    transport_manager=getattr(self, "transport_manager", None),
+                    interfaces_config=getattr(self, "_interfaces_config", None),
+                    router_network=getattr(self, "router_network_out", None),
+                )
                 self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
                 self.p2p_manager.start()
             if use_netroute:

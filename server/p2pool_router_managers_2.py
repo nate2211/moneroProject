@@ -15084,20 +15084,21 @@ class FirewallManager:
 
 class P2PPeerManager:
     """
-    Manages peer-to-peer discovery.
-    Sends via SnifferSoftware (direct L2 injection to bypass Windows routing).
-    Listens via standard OS UDP sockets (background thread).
+    Quiet, LAN-aware peer discovery manager.
 
-    Rewritten to:
-    - fix listener socket timeout typo
-    - keep the same public signature
-    - discover peers more reliably by using BOTH:
-        1) raw/L2 broadcast via sniffer
-        2) normal UDP broadcast fallback via OS socket
-    - store peers by advertised router_ip when available
-    - survive transient socket/send failures without poisoning the whole manager
+    Goals:
+    - same constructor shape
+    - backward-compatible set_managers()
+    - never send to 0.0.0.0
+    - never bind sender to invalid local IPs
+    - discover peers by:
+        * periodic HELLO broadcast
+        * targeted PROBE unicast scan across LAN candidates
+        * direct HERE replies
+    - stay relatively quiet in logs
     """
-    MAGIC_HEADER = "PYROUTER_P2P_V5"
+
+    MAGIC_HEADER = "PYROUTER_P2P_V9"
 
     def __init__(
         self,
@@ -15117,24 +15118,76 @@ class P2PPeerManager:
         self.sniffer = sniffer
         self.out_iface = out_iface
 
+        # legacy / common manager hooks
         self.arp_manager = None
         self.rip_manager = None
+
+        # optional richer context
+        self.broadcast_manager = None
+        self.firewall_manager = None
+        self.netroute_manager = None
+        self.transport_manager = None
+        self.interfaces_config = None
+        self.router_network = None
 
         self.running = False
         self._listen_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
+        self._scan_thread: Optional[threading.Thread] = None
+        self._housekeeping_thread: Optional[threading.Thread] = None
         self._listen_sock: Optional[socket.socket] = None
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
 
         self.peers: Dict[str, Dict[str, Any]] = {}
-        self.peer_timeout = 35.0
-        self.broadcast_interval = 10.0
 
-    def set_managers(self, arp_manager, rip_manager):
+        self.peer_timeout = 40.0
+        self.broadcast_interval = 12.0
+        self.scan_interval = 20.0
+        self.probe_spacing = 0.03
+        self.max_scan_hosts = 256
+        self.summary_interval = 60.0
+        self.peer_refresh_grace = 8.0
+
+        self._last_log_times: Dict[str, float] = {}
+        self._last_summary_ts = 0.0
+        self._last_summary_fingerprint = ""
+        self._last_candidate_refresh = 0.0
+        self._candidate_cache: List[str] = []
+
+        self._hostname = socket.gethostname()
+        self._hello_counter = 0
+
+    # ------------------------------------------------------------------
+    # Public wiring
+    # ------------------------------------------------------------------
+
+    def set_managers(
+        self,
+        arp_manager=None,
+        rip_manager=None,
+        broadcast_manager=None,
+        firewall_manager=None,
+        netroute_manager=None,
+        transport_manager=None,
+        interfaces_config=None,
+        router_network=None,
+    ):
+        """
+        Backward compatible:
+            set_managers(self.arp_manager, self.rip_manager)
+
+        Optional richer context can be passed too.
+        """
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
+        self.broadcast_manager = broadcast_manager
+        self.firewall_manager = firewall_manager
+        self.netroute_manager = netroute_manager
+        self.transport_manager = transport_manager
+        self.interfaces_config = interfaces_config
+        self.router_network = router_network
 
     def start(self):
         with self._lock:
@@ -15154,62 +15207,126 @@ class P2PPeerManager:
                 daemon=False,
                 name="P2P-Broadcaster",
             )
+            self._scan_thread = threading.Thread(
+                target=self._scanner_loop,
+                daemon=False,
+                name="P2P-Scanner",
+            )
+            self._housekeeping_thread = threading.Thread(
+                target=self._housekeeping_loop,
+                daemon=False,
+                name="P2P-Housekeeping",
+            )
 
             self._listen_thread.start()
             self._broadcast_thread.start()
+            self._scan_thread.start()
+            self._housekeeping_thread.start()
 
         self._log(
-            f"[P2P] 🟢 Started Node {self.node_id[:8]} on port {self.port} (Hybrid Mode)"
+            f"[P2P] 🟢 Started node {self.node_id[:8]} on UDP/{self.port} "
+            f"(router_ip={self._safe_text(self._normalize_ipv4(self.router_ip), 'auto')}, "
+            f"broadcast_ip={self._safe_text(self._normalize_ipv4(self.broadcast_ip), 'auto')})",
+            force=True,
         )
 
     def stop(self):
         with self._lock:
-            if not self.running and not self._listen_thread and not self._broadcast_thread:
+            if (
+                not self.running
+                and not self._listen_thread
+                and not self._broadcast_thread
+                and not self._scan_thread
+                and not self._housekeeping_thread
+            ):
                 return
 
             self.running = False
             self._stop_event.set()
 
             listen_sock = self._listen_sock
-            listen_thread = self._listen_thread
-            broadcast_thread = self._broadcast_thread
+            threads = [
+                ("Listener", self._listen_thread),
+                ("Broadcaster", self._broadcast_thread),
+                ("Scanner", self._scan_thread),
+                ("Housekeeping", self._housekeeping_thread),
+            ]
 
-        self._log("[P2P] 🛑 Stopping Peer Manager...")
+        self._log("[P2P] 🛑 Stopping peer manager...", force=True)
 
         self._safe_close_socket(listen_sock)
 
-        if listen_thread:
-            listen_thread.join(timeout=5.0)
-            if listen_thread.is_alive():
-                self._log("[P2P] ⚠️ Listener thread did not stop cleanly.")
-
-        if broadcast_thread:
-            broadcast_thread.join(timeout=5.0)
-            if broadcast_thread.is_alive():
-                self._log("[P2P] ⚠️ Broadcaster thread did not stop cleanly.")
+        for thread_name, thread in threads:
+            if thread:
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    self._log(
+                        f"[P2P] ⚠️ {thread_name} thread did not stop cleanly.",
+                        key=f"stop-thread-{thread_name}",
+                        cooldown=10.0,
+                    )
 
         with self._lock:
             self._listen_thread = None
             self._broadcast_thread = None
+            self._scan_thread = None
+            self._housekeeping_thread = None
             self._listen_sock = None
             self.peers.clear()
+            self._candidate_cache = []
 
-        self._log("[P2P] ✅ Peer Manager stopped.")
+        self._log("[P2P] ✅ Peer manager stopped.", force=True)
 
     def get_known_peers(self) -> Dict[str, Dict[str, Any]]:
         self._prune_dead_peers()
         with self._lock:
             return {k: dict(v) for k, v in self.peers.items()}
 
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
 
-    def _log(self, message: str):
+    def _log(self, message: str, *, key: Optional[str] = None, cooldown: float = 0.0, force: bool = False):
         try:
+            now = time.time()
+            slot = str(key or message)
+            if not force and cooldown > 0.0:
+                prev = float(self._last_log_times.get(slot, 0.0))
+                if (now - prev) < cooldown:
+                    return
+                self._last_log_times[slot] = now
             self.router_logger.log_message(message)
         except Exception:
             pass
+
+    def _log_summary_if_changed(self, *, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_summary_ts) < self.summary_interval:
+            return
+
+        with self._lock:
+            peer_count = len(self.peers)
+            candidate_count = len(self._candidate_cache)
+            top_peers = sorted(self.peers.keys())[:16]
+
+        fingerprint = f"{peer_count}|{candidate_count}|{'/'.join(top_peers)}"
+        if not force and fingerprint == self._last_summary_fingerprint:
+            return
+
+        self._last_summary_ts = now
+        self._last_summary_fingerprint = fingerprint
+
+        self._log(
+            f"[P2P] 📊 peers={peer_count} candidates={candidate_count} "
+            f"bind={self._safe_text(self._normalize_ipv4(self.router_ip), 'auto')} "
+            f"broadcast={self._safe_text(self._normalize_ipv4(self.broadcast_ip), 'auto')} "
+            f"port={self.port}",
+            force=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
 
     def _safe_close_socket(self, sock: Optional[socket.socket]):
         if sock is None:
@@ -15223,55 +15340,417 @@ class P2PPeerManager:
         except Exception:
             pass
 
-    def _build_payload(self) -> Dict[str, Any]:
-        arp_data: Dict[str, Any] = {}
-        route_data: List[Any] = []
+    def _safe_int(self, value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
 
-        arp_manager = self.arp_manager
-        rip_manager = self.rip_manager
+    def _safe_text(self, value: Any, fallback: str = "") -> str:
+        s = str(value or "").strip()
+        return s if s else fallback
 
-        if arp_manager and hasattr(arp_manager, "get_cache_view"):
+    def _normalize_ipv4(self, value: Any) -> str:
+        try:
+            return str(ipaddress.IPv4Address(str(value or "").strip()))
+        except Exception:
+            return ""
+
+    def _is_unspecified_ip(self, ip_s: str) -> bool:
+        try:
+            return ipaddress.IPv4Address(self._normalize_ipv4(ip_s)).is_unspecified
+        except Exception:
+            return False
+
+    def _is_self_ip(self, ip_s: str) -> bool:
+        ip_s = self._normalize_ipv4(ip_s)
+        me = self._normalize_ipv4(self.router_ip)
+        if not ip_s:
+            return False
+        if ip_s == me:
+            return True
+        if ip_s.startswith("127."):
+            return True
+        return False
+
+    def _is_bindable_local_ip(self, ip_s: str) -> bool:
+        ip_s = self._normalize_ipv4(ip_s)
+        if not ip_s:
+            return False
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_s)
+            if ip_obj.is_unspecified:
+                return False
+            if ip_obj.is_multicast or ip_obj.is_reserved:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _is_valid_unicast_target(self, ip_s: str) -> bool:
+        ip_s = self._normalize_ipv4(ip_s)
+        if not ip_s:
+            return False
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_s)
+            if ip_obj.is_unspecified:
+                return False
+            if ip_obj.is_loopback:
+                return False
+            if ip_obj.is_multicast:
+                return False
+            if ip_obj.is_reserved:
+                return False
+            if ip_obj.is_link_local:
+                return False
+            if self._is_self_ip(ip_s):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _is_valid_broadcast_target(self, ip_s: str) -> bool:
+        ip_s = self._normalize_ipv4(ip_s)
+        if not ip_s:
+            return False
+        if ip_s == "255.255.255.255":
+            return True
+
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_s)
+            if ip_obj.is_unspecified:
+                return False
+            if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_reserved:
+                return False
+        except Exception:
+            return False
+
+        net = self._get_scan_network()
+        if net is not None:
             try:
-                raw_arp = arp_manager.get_cache_view()
-                for ip, val in (raw_arp or {}).items():
-                    arp_data[str(ip)] = list(val) if isinstance(val, tuple) else val
-            except Exception as e:
-                self._log(f"[P2P] ⚠️ Failed to collect ARP data: {e}")
+                if ip_s == str(net.broadcast_address):
+                    return True
+            except Exception:
+                pass
 
-        if rip_manager and hasattr(rip_manager, "get_routing_table_view"):
-            try:
-                route_data = rip_manager.get_routing_table_view() or []
-            except Exception as e:
-                self._log(f"[P2P] ⚠️ Failed to collect route data: {e}")
+        return ip_s.endswith(".255")
 
-        return {
+    # ------------------------------------------------------------------
+    # Payload / peer state
+    # ------------------------------------------------------------------
+
+    def _build_payload(self, msg_type: str, include_state: bool = False) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
             "magic": self.MAGIC_HEADER,
+            "version": 9,
+            "type": str(msg_type or "hello").lower(),
             "node_id": self.node_id,
-            "router_ip": self.router_ip,
-            "port": self.port,
-            "arp_table": arp_data,
-            "routes": route_data,
+            "router_ip": self._normalize_ipv4(self.router_ip),
+            "listen_port": self.port,
+            "hostname": self._hostname,
+            "iface": str(self.out_iface or ""),
             "ts": time.time(),
         }
+
+        if include_state:
+            arp_data: Dict[str, Any] = {}
+            route_data: List[Any] = []
+
+            if self.arp_manager and hasattr(self.arp_manager, "get_cache_view"):
+                try:
+                    raw = self.arp_manager.get_cache_view() or {}
+                    for ip_s, val in raw.items():
+                        arp_data[str(ip_s)] = list(val) if isinstance(val, tuple) else val
+                except Exception as e:
+                    self._log(
+                        f"[P2P] ⚠️ ARP snapshot failed: {e}",
+                        key="arp-snapshot-error",
+                        cooldown=20.0,
+                    )
+
+            if self.rip_manager and hasattr(self.rip_manager, "get_routing_table_view"):
+                try:
+                    route_data = self.rip_manager.get_routing_table_view() or []
+                except Exception as e:
+                    self._log(
+                        f"[P2P] ⚠️ route snapshot failed: {e}",
+                        key="route-snapshot-error",
+                        cooldown=20.0,
+                    )
+
+            payload["arp_table"] = arp_data
+            payload["routes"] = route_data
+
+        return payload
+
+    def _is_self_payload(self, sender_ip: str, payload: Dict[str, Any]) -> bool:
+        try:
+            if str(payload.get("node_id") or "") == self.node_id:
+                return True
+
+            advertised = self._normalize_ipv4(payload.get("router_ip"))
+            if advertised and self._is_self_ip(advertised):
+                return True
+
+            if sender_ip and self._is_self_ip(sender_ip):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _record_peer(self, sender_ip: str, sender_port: int, payload: Dict[str, Any], source: str):
+        endpoint_ip = self._normalize_ipv4(sender_ip)
+        if not self._is_valid_unicast_target(endpoint_ip):
+            return
+
+        router_ip = self._normalize_ipv4(payload.get("router_ip")) or endpoint_ip
+        node_id = str(payload.get("node_id") or "").strip()
+        hostname = str(payload.get("hostname") or "").strip()
+        listen_port = self._safe_int(payload.get("listen_port"), sender_port or self.port)
+        now = time.time()
+
+        with self._lock:
+            prev = self.peers.get(endpoint_ip, {})
+            is_new = endpoint_ip not in self.peers
+
+            merged_arp = dict(prev.get("arp_table", {}) or {})
+            merged_routes = list(prev.get("routes", []) or [])
+
+            new_arp = payload.get("arp_table", {}) or {}
+            new_routes = payload.get("routes", []) or []
+
+            if isinstance(new_arp, dict):
+                merged_arp.update(new_arp)
+            if isinstance(new_routes, list) and new_routes:
+                merged_routes = new_routes
+
+            self.peers[endpoint_ip] = {
+                "node_id": node_id,
+                "hostname": hostname,
+                "router_ip": router_ip,
+                "endpoint_ip": endpoint_ip,
+                "source_ip": endpoint_ip,
+                "port": listen_port,
+                "last_seen": now,
+                "last_source": source,
+                "arp_table": merged_arp,
+                "routes": merged_routes,
+            }
+
+        if is_new:
+            self._log(
+                f"[P2P] 🤝 Peer discovered {endpoint_ip}:{listen_port} "
+                f"(node={node_id[:8] or 'unknown'} host={hostname or 'unknown'} via {source})",
+                force=True,
+            )
+            self._log_summary_if_changed(force=True)
+
+    def _prune_dead_peers(self):
+        now = time.time()
+        removed: List[str] = []
+
+        with self._lock:
+            for ip_s, data in list(self.peers.items()):
+                if (now - float(data.get("last_seen", 0.0))) > self.peer_timeout:
+                    self.peers.pop(ip_s, None)
+                    removed.append(ip_s)
+
+        for ip_s in removed:
+            self._log(f"[P2P] 👻 Peer expired {ip_s}", force=True)
+
+        if removed:
+            self._log_summary_if_changed(force=True)
+
+    # ------------------------------------------------------------------
+    # Scan intelligence
+    # ------------------------------------------------------------------
+
+    def _infer_network_from_router_network(self) -> Optional[ipaddress.IPv4Network]:
+        rn = self.router_network
+        try:
+            if isinstance(rn, ipaddress.IPv4Network):
+                return rn
+            if rn is not None:
+                net = ipaddress.ip_network(str(rn), strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    return net
+        except Exception:
+            pass
+        return None
+
+    def _infer_network_from_broadcast(self) -> Optional[ipaddress.IPv4Network]:
+        local_ip = self._normalize_ipv4(self.router_ip)
+        bcast_ip = self._normalize_ipv4(self.broadcast_ip)
+
+        if not self._is_bindable_local_ip(local_ip):
+            return None
+        if not self._is_valid_broadcast_target(bcast_ip):
+            return None
+
+        try:
+            ip_obj = ipaddress.IPv4Address(local_ip)
+            bcast_obj = ipaddress.IPv4Address(bcast_ip)
+
+            for prefix in range(32, -1, -1):
+                net = ipaddress.IPv4Network(f"{ip_obj}/{prefix}", strict=False)
+                if ip_obj in net and net.broadcast_address == bcast_obj:
+                    return net
+        except Exception:
+            pass
+
+        return None
+
+    def _fallback_network(self) -> Optional[ipaddress.IPv4Network]:
+        local_ip = self._normalize_ipv4(self.router_ip)
+        if not self._is_bindable_local_ip(local_ip):
+            return None
+        try:
+            return ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        except Exception:
+            return None
+
+    def _get_scan_network(self) -> Optional[ipaddress.IPv4Network]:
+        net = self._infer_network_from_router_network()
+        if net is None:
+            net = self._infer_network_from_broadcast()
+        if net is None:
+            net = self._fallback_network()
+        if net is None:
+            return None
+
+        try:
+            host_count = max(int(net.num_addresses) - 2, 0)
+            if host_count <= self.max_scan_hosts:
+                return net
+        except Exception:
+            return net
+
+        return self._fallback_network()
 
     def _get_broadcast_targets(self) -> List[str]:
         targets: List[str] = []
 
-        preferred = str(self.broadcast_ip or "").strip()
-        if preferred:
+        preferred = self._normalize_ipv4(self.broadcast_ip)
+        if self._is_valid_broadcast_target(preferred):
             targets.append(preferred)
+
+        net = self._get_scan_network()
+        if net is not None:
+            try:
+                directed = str(net.broadcast_address)
+                if self._is_valid_broadcast_target(directed) and directed not in targets:
+                    targets.append(directed)
+            except Exception:
+                pass
 
         if "255.255.255.255" not in targets:
             targets.append("255.255.255.255")
 
-        # de-dupe while preserving order
         seen = set()
         out: List[str] = []
         for t in targets:
-            if t and t not in seen:
-                seen.add(t)
-                out.append(t)
+            t = self._normalize_ipv4(t)
+            if not self._is_valid_broadcast_target(t):
+                continue
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
         return out
+
+    def _get_network_candidates(self) -> List[str]:
+        net = self._get_scan_network()
+        if net is None:
+            return []
+
+        me = self._normalize_ipv4(self.router_ip)
+        out: List[str] = []
+
+        try:
+            for host in net.hosts():
+                ip_s = str(host)
+                if ip_s == me:
+                    continue
+                if not self._is_valid_unicast_target(ip_s):
+                    continue
+                out.append(ip_s)
+                if len(out) >= self.max_scan_hosts:
+                    break
+        except Exception:
+            pass
+
+        return out
+
+    def _get_arp_candidates(self) -> List[str]:
+        out: List[str] = []
+        if self.arp_manager and hasattr(self.arp_manager, "get_cache_view"):
+            try:
+                raw = self.arp_manager.get_cache_view() or {}
+                for ip_s in raw.keys():
+                    ip_s = self._normalize_ipv4(ip_s)
+                    if self._is_valid_unicast_target(ip_s):
+                        out.append(ip_s)
+            except Exception:
+                pass
+        return out
+
+    def _get_route_candidates(self) -> List[str]:
+        out: List[str] = []
+        if self.rip_manager and hasattr(self.rip_manager, "get_routing_table_view"):
+            try:
+                routes = self.rip_manager.get_routing_table_view() or []
+                for rec in routes:
+                    if not isinstance(rec, dict):
+                        continue
+                    for field in ("next_hop", "gateway", "via", "neighbor"):
+                        ip_s = self._normalize_ipv4(rec.get(field))
+                        if self._is_valid_unicast_target(ip_s):
+                            out.append(ip_s)
+            except Exception:
+                pass
+        return out
+
+    def _get_known_peer_candidates(self) -> List[str]:
+        with self._lock:
+            peers_copy = list(self.peers.values())
+
+        out: List[str] = []
+        for peer in peers_copy:
+            for field in ("endpoint_ip", "router_ip", "source_ip"):
+                ip_s = self._normalize_ipv4(peer.get(field))
+                if self._is_valid_unicast_target(ip_s):
+                    out.append(ip_s)
+        return out
+
+    def _refresh_candidate_cache(self) -> List[str]:
+        now = time.time()
+        if self._candidate_cache and (now - self._last_candidate_refresh) < 6.0:
+            return list(self._candidate_cache)
+
+        candidates: List[str] = []
+        candidates.extend(self._get_arp_candidates())
+        candidates.extend(self._get_route_candidates())
+        candidates.extend(self._get_known_peer_candidates())
+        candidates.extend(self._get_network_candidates())
+
+        seen = set()
+        deduped: List[str] = []
+        for ip_s in candidates:
+            ip_s = self._normalize_ipv4(ip_s)
+            if not self._is_valid_unicast_target(ip_s):
+                continue
+            if ip_s in seen:
+                continue
+            seen.add(ip_s)
+            deduped.append(ip_s)
+
+        self._candidate_cache = deduped
+        self._last_candidate_refresh = now
+        return list(deduped)
+
+    # ------------------------------------------------------------------
+    # Socket send helpers
+    # ------------------------------------------------------------------
 
     def _open_listener_socket(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -15282,8 +15761,6 @@ class P2PPeerManager:
         except Exception:
             pass
 
-        # Windows can be picky here; do not fail startup just because this option
-        # is unavailable.
         try:
             if hasattr(socket, "SO_REUSEPORT"):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -15294,106 +15771,37 @@ class P2PPeerManager:
         sock.settimeout(1.0)
         return sock
 
-    def _is_self_payload(self, sender_ip: str, payload: Dict[str, Any]) -> bool:
-        try:
-            if payload.get("node_id") == self.node_id:
-                return True
-            advertised_ip = str(payload.get("router_ip") or "").strip()
-            if advertised_ip and advertised_ip == self.router_ip:
-                return True
-            if sender_ip and sender_ip == self.router_ip:
-                return True
-        except Exception:
-            pass
-        return False
+    def _send_udp(self, target_ip: str, packet_bytes: bytes, *, bind_local: bool = False) -> bool:
+        target_ip = self._normalize_ipv4(target_ip)
+        is_broadcast = self._is_valid_broadcast_target(target_ip)
+        is_unicast = self._is_valid_unicast_target(target_ip)
 
-    def _update_peer(self, sender_ip: str, payload: Dict[str, Any]):
-        advertised_ip = str(payload.get("router_ip") or sender_ip or "").strip()
-        if not advertised_ip:
-            return
-
-        now = time.time()
-        node_id = str(payload.get("node_id") or "").strip()
-        peer_port = int(payload.get("port") or self.port)
-
-        with self._lock:
-            old = self.peers.get(advertised_ip)
-            is_new = old is None
-
-            self.peers[advertised_ip] = {
-                "node_id": node_id,
-                "router_ip": advertised_ip,
-                "source_ip": sender_ip,
-                "port": peer_port,
-                "last_seen": now,
-                "arp_table": payload.get("arp_table", {}) or {},
-                "routes": payload.get("routes", []) or [],
-            }
-
-        if is_new:
-            self._log(
-                f"[P2P] 🤝 Discovered new router peer: {advertised_ip} "
-                f"(src={sender_ip}, node={node_id[:8] or 'unknown'}, port={peer_port})"
-            )
-
-    def _prune_dead_peers(self):
-        now = time.time()
-        with self._lock:
-            dead_peers = [
-                ip
-                for ip, data in self.peers.items()
-                if (now - float(data.get("last_seen", 0.0))) > self.peer_timeout
-            ]
-            for ip in dead_peers:
-                del self.peers[ip]
-                self._log(f"[P2P] 👻 Peer {ip} timed out and was removed.")
-
-    def _send_via_sniffer(self, target_ip: str, packet_bytes: bytes) -> bool:
-        sniffer = self.sniffer
-        out_iface = self.out_iface
-        if not sniffer or not out_iface:
+        if not is_broadcast and not is_unicast:
             return False
 
-        try:
-            pkt = (
-                IP(src=self.router_ip, dst=target_ip)
-                / UDP(sport=self.port, dport=self.port)
-                / Raw(load=packet_bytes)
-            )
-
-            sniffer.send(
-                pkt,
-                iface=out_iface,
-                dst_mac="ff:ff:ff:ff:ff:ff",
-                verbose=0,
-            )
-            return True
-        except Exception as e:
-            self._log(
-                f"[P2P] ⚠️ Sniffer broadcast failed to {target_ip}:{self.port} "
-                f"on {out_iface}: {e}"
-            )
-            return False
-
-    def _send_via_udp_fallback(self, target_ip: str, packet_bytes: bytes) -> bool:
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            # Bind to router_ip when possible so the source address is predictable.
-            try:
-                if self.router_ip:
-                    sock.bind((self.router_ip, 0))
-            except Exception:
-                pass
+            if is_broadcast:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+            if bind_local:
+                local_ip = self._normalize_ipv4(self.router_ip)
+                if self._is_bindable_local_ip(local_ip):
+                    try:
+                        sock.bind((local_ip, 0))
+                    except Exception:
+                        pass
 
             sock.sendto(packet_bytes, (target_ip, self.port))
             return True
         except Exception as e:
             self._log(
-                f"[P2P] ⚠️ UDP fallback broadcast failed to {target_ip}:{self.port}: {e}"
+                f"[P2P] ⚠️ UDP send failed to {target_ip}:{self.port}: {e}",
+                key=f"udp-send-{target_ip}",
+                cooldown=15.0,
             )
             return False
         finally:
@@ -15403,9 +15811,76 @@ class P2PPeerManager:
                 except Exception:
                     pass
 
-    # -------------------------------------------------------------------------
+    def _send_sniffer(self, target_ip: str, packet_bytes: bytes) -> bool:
+        if not self.sniffer or not self.out_iface:
+            return False
+
+        target_ip = self._normalize_ipv4(target_ip)
+        is_broadcast = self._is_valid_broadcast_target(target_ip)
+        is_unicast = self._is_valid_unicast_target(target_ip)
+
+        if not is_broadcast and not is_unicast:
+            return False
+
+        try:
+            ip_layer = IP(dst=target_ip)
+            local_ip = self._normalize_ipv4(self.router_ip)
+            if self._is_bindable_local_ip(local_ip):
+                ip_layer.src = local_ip
+
+            pkt = ip_layer / UDP(sport=self.port, dport=self.port) / Raw(load=packet_bytes)
+
+            kwargs = {
+                "iface": self.out_iface,
+                "verbose": 0,
+            }
+            if is_broadcast:
+                kwargs["dst_mac"] = "ff:ff:ff:ff:ff:ff"
+
+            self.sniffer.send(pkt, **kwargs)
+            return True
+        except Exception as e:
+            self._log(
+                f"[P2P] ⚠️ sniffer send failed to {target_ip}:{self.port} on {self.out_iface}: {e}",
+                key=f"sniffer-send-{target_ip}",
+                cooldown=15.0,
+            )
+            return False
+
+    def _send_message(
+        self,
+        target_ip: str,
+        msg_type: str,
+        *,
+        include_state: bool = False,
+        prefer_udp_only: bool = False,
+    ) -> bool:
+        target_ip = self._normalize_ipv4(target_ip)
+        if not self._is_valid_broadcast_target(target_ip) and not self._is_valid_unicast_target(target_ip):
+            return False
+
+        payload = self._build_payload(msg_type=msg_type, include_state=include_state)
+        packet_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        udp_ok = self._send_udp(target_ip, packet_bytes, bind_local=True)
+        sniffer_ok = False
+
+        if not prefer_udp_only:
+            sniffer_ok = self._send_sniffer(target_ip, packet_bytes)
+
+        return bool(udp_ok or sniffer_ok)
+
+    def _reply_here(self, target_ip: str):
+        self._send_message(
+            target_ip=target_ip,
+            msg_type="here",
+            include_state=True,
+            prefer_udp_only=True,
+        )
+
+    # ------------------------------------------------------------------
     # Worker loops
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _listener_loop(self):
         sock: Optional[socket.socket] = None
@@ -15417,10 +15892,11 @@ class P2PPeerManager:
 
             self._log(
                 f"[P2P] 👂 Listener bound on 0.0.0.0:{self.port} "
-                f"(node={self.node_id[:8]})"
+                f"(node={self.node_id[:8]} host={self._hostname})",
+                force=True,
             )
         except Exception as e:
-            self._log(f"[P2P] ❌ Failed to bind listener socket: {e}")
+            self._log(f"[P2P] ❌ Failed to bind listener socket: {e}", force=True)
             with self._lock:
                 self.running = False
                 self._listen_sock = None
@@ -15432,36 +15908,52 @@ class P2PPeerManager:
             while not self._stop_event.is_set():
                 try:
                     data, addr = sock.recvfrom(65535)
-                    sender_ip = str(addr[0]).strip()
+                    sender_ip = self._normalize_ipv4(addr[0])
+                    sender_port = self._safe_int(addr[1], self.port)
 
-                    if not data:
+                    if not sender_ip or not data:
                         continue
 
                     try:
                         payload = json.loads(data.decode("utf-8"))
-                    except json.JSONDecodeError:
+                    except Exception:
                         continue
 
-                    if payload.get("magic") != self.MAGIC_HEADER:
+                    if str(payload.get("magic") or "") != self.MAGIC_HEADER:
                         continue
 
                     if self._is_self_payload(sender_ip, payload):
                         continue
 
-                    self._update_peer(sender_ip, payload)
+                    msg_type = str(payload.get("type") or "hello").strip().lower()
+                    if msg_type not in ("hello", "probe", "here", "announce"):
+                        msg_type = "hello"
+
+                    source = "broadcast" if msg_type in ("hello", "announce") else msg_type
+                    self._record_peer(sender_ip, sender_port, payload, source=source)
+
+                    if msg_type in ("hello", "probe", "announce"):
+                        self._reply_here(sender_ip)
 
                 except socket.timeout:
-                    self._prune_dead_peers()
                     continue
                 except OSError as e:
                     if self._stop_event.is_set():
                         break
-                    self._log(f"[P2P] ⚠️ Listener socket error: {e}")
-                    time.sleep(0.25)
+                    self._log(
+                        f"[P2P] ⚠️ listener socket error: {e}",
+                        key="listener-oserror",
+                        cooldown=10.0,
+                    )
+                    time.sleep(0.20)
                 except Exception as e:
                     if not self._stop_event.is_set():
-                        self._log(f"[P2P] ⚠️ Listener error: {e}")
-                        time.sleep(0.25)
+                        self._log(
+                            f"[P2P] ⚠️ listener error: {type(e).__name__}: {e}",
+                            key="listener-error",
+                            cooldown=10.0,
+                        )
+                        time.sleep(0.20)
         finally:
             self._safe_close_socket(sock)
             with self._lock:
@@ -15471,43 +15963,99 @@ class P2PPeerManager:
     def _broadcaster_loop(self):
         while not self._stop_event.is_set():
             try:
-                payload = self._build_payload()
-                packet_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                self._hello_counter += 1
+                include_state = (self._hello_counter % 4 == 0)
 
-                sent_any = False
                 targets = self._get_broadcast_targets()
+                ok_count = 0
 
                 for target_ip in targets:
                     if self._stop_event.is_set():
                         break
 
-                    sniffer_ok = self._send_via_sniffer(target_ip, packet_bytes)
-                    udp_ok = self._send_via_udp_fallback(target_ip, packet_bytes)
+                    ok = self._send_message(
+                        target_ip=target_ip,
+                        msg_type="hello",
+                        include_state=include_state,
+                        prefer_udp_only=False,
+                    )
+                    if ok:
+                        ok_count += 1
 
-                    if sniffer_ok or udp_ok:
-                        sent_any = True
-                        path_bits = []
-                        if sniffer_ok:
-                            path_bits.append("L2")
-                        if udp_ok:
-                            path_bits.append("UDP")
-                        path_s = "+".join(path_bits) if path_bits else "unknown"
-
-                        self._log(
-                            f"[P2P] 📣 Broadcast sent via {path_s} from {self.router_ip} "
-                            f"to {target_ip}:{self.port}"
-                        )
-
-                if not sent_any:
-                    self._log("[P2P] ⚠️ No discovery broadcast path succeeded this cycle.")
+                if ok_count <= 0:
+                    self._log(
+                        "[P2P] ⚠️ No HELLO broadcast path succeeded this cycle.",
+                        key="hello-broadcast-fail",
+                        cooldown=20.0,
+                    )
 
             except Exception as e:
                 if not self._stop_event.is_set():
-                    self._log(f"[P2P] ⚠️ Broadcast send error: {e}")
-
-            self._prune_dead_peers()
+                    self._log(
+                        f"[P2P] ⚠️ broadcaster error: {e}",
+                        key="broadcaster-error",
+                        cooldown=10.0,
+                    )
 
             if self._stop_event.wait(self.broadcast_interval):
+                break
+
+    def _scanner_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                candidates = self._refresh_candidate_cache()
+
+                for ip_s in candidates:
+                    if self._stop_event.is_set():
+                        break
+
+                    skip = False
+                    with self._lock:
+                        existing = self.peers.get(ip_s)
+                        if existing:
+                            last_seen = float(existing.get("last_seen", 0.0))
+                            if (time.time() - last_seen) < self.peer_refresh_grace:
+                                skip = True
+
+                    if skip:
+                        continue
+
+                    self._send_message(
+                        target_ip=ip_s,
+                        msg_type="probe",
+                        include_state=False,
+                        prefer_udp_only=True,
+                    )
+
+                    if self._stop_event.wait(self.probe_spacing):
+                        break
+
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    self._log(
+                        f"[P2P] ⚠️ scanner error: {e}",
+                        key="scanner-error",
+                        cooldown=10.0,
+                    )
+
+            if self._stop_event.wait(self.scan_interval):
+                break
+
+    def _housekeeping_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self._prune_dead_peers()
+                self._refresh_candidate_cache()
+                self._log_summary_if_changed(force=False)
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    self._log(
+                        f"[P2P] ⚠️ housekeeping error: {e}",
+                        key="housekeeping-error",
+                        cooldown=10.0,
+                    )
+
+            if self._stop_event.wait(5.0):
                 break
 
 
@@ -22070,6 +22618,9 @@ class _Peer:
 
     discovery_port: int = 0
     last_hello_tx_ts: float = 0.0
+    advertised_ip: str = ""
+    last_hello_from_ip: str = ""
+    last_data_from_ip: str = ""
 
 
 @dataclass
@@ -22105,7 +22656,8 @@ class HyperVRouterManager:
       - supports optional compressed payloads for larger frames
     """
 
-    MAGIC = "HVRM6"
+    MAGIC = "HVRM5"
+    ACCEPT_MAGICS = {"HVRM5", "HVRM6"}
     INBOUND_IFACE_NAME = "HyperVManager"
 
     DEFAULT_PROTOCOLS = {
@@ -23286,7 +23838,7 @@ class HyperVRouterManager:
             )
             return
 
-        if msg.get("magic") not in {self.MAGIC, "HVRM5"}:
+        if msg.get("magic") not in self.ACCEPT_MAGICS:
             return
         if msg.get("segment_id") != self.segment_id:
             return
@@ -23330,12 +23882,15 @@ class HyperVRouterManager:
         with self._lock:
             peer = self._peers.get(node_id)
             if peer is None:
+                advertised_ip = str(msg.get("listen_ip") or from_ip)
                 peer = _Peer(
                     node_id=node_id,
                     host_name=str(msg.get("host_name") or node_id),
-                    listen_ip=str(msg.get("listen_ip") or from_ip),
+                    listen_ip=str(advertised_ip or from_ip),
                     data_port=int(msg.get("data_port") or self.data_port),
                     segment_id=str(msg.get("segment_id") or self.segment_id),
+                    advertised_ip=str(advertised_ip or ""),
+                    last_hello_from_ip=str(from_ip or ""),
                 )
                 self._peers[node_id] = peer
                 is_new = True
@@ -23343,7 +23898,9 @@ class HyperVRouterManager:
             old_tuple = (peer.listen_ip, peer.data_port, peer.host_name, set(peer.sender_ids), dict(peer.sender_kinds))
 
             peer.host_name = str(msg.get("host_name") or peer.host_name)
-            peer.listen_ip = str(msg.get("listen_ip") or from_ip)
+            peer.advertised_ip = str(msg.get("listen_ip") or peer.advertised_ip or from_ip)
+            peer.last_hello_from_ip = str(from_ip or peer.last_hello_from_ip or "")
+            peer.listen_ip = self._choose_peer_ip(peer.advertised_ip, peer.last_hello_from_ip, peer.last_data_from_ip, peer.listen_ip)
             peer.data_port = int(msg.get("data_port") or peer.data_port)
             peer.discovery_port = int(msg.get("discovery_port") or peer.discovery_port or self.discovery_port)
             peer.segment_id = str(msg.get("segment_id") or peer.segment_id)
@@ -23455,8 +24012,9 @@ class HyperVRouterManager:
             pass
 
         self._note_peer_frame_rx(src_node_id, len(raw))
+        self._note_peer_data_path(src_node_id, from_ip)
 
-        pkt = self._decode_packet(raw)
+        pkt = self._decode_wire_packet(raw, protocol_tag)
         if pkt is None:
             self._stats["remote_ingress_decode_fail"] += 1
             self._send_frame_ack(
@@ -23534,6 +24092,7 @@ class HyperVRouterManager:
 
         if src_node_id:
             self._note_peer_ack(src_node_id)
+            self._note_peer_data_path(src_node_id, from_ip)
 
         if not frame_id:
             return
@@ -23864,6 +24423,17 @@ class HyperVRouterManager:
                 return
             peer.last_ack_ts = time.time()
 
+    def _note_peer_data_path(self, node_id: str, from_ip: str) -> None:
+        if not node_id or not from_ip:
+            return
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is None:
+                return
+            peer.last_data_from_ip = str(from_ip)
+            peer.listen_ip = self._choose_peer_ip(peer.advertised_ip, peer.last_hello_from_ip, peer.last_data_from_ip, peer.listen_ip)
+
+
     # ---------------------------------------------------------
     # decode / encode / router feed
     # ---------------------------------------------------------
@@ -23946,6 +24516,31 @@ class HyperVRouterManager:
                 pass
         return None
 
+    def _decode_wire_packet(self, raw: bytes, protocol_tag: str):
+        proto = str(protocol_tag or "RAW").upper()
+        if not raw:
+            return None
+
+        if proto in {"IP", "TCP", "UDP", "ICMP", "ESP", "AH", "GRE", "ISAKMP", "IKEV2"} and IP is not None:
+            try:
+                return IP(raw)
+            except Exception:
+                pass
+
+        if proto in {"IPV6", "ICMPV6"} and IPv6 is not None:
+            try:
+                return IPv6(raw)
+            except Exception:
+                pass
+
+        if proto == "ETHER" and Ether is not None:
+            try:
+                return Ether(raw)
+            except Exception:
+                pass
+
+        return self._decode_packet(raw)
+
     def _feed_packet_into_router(self, packet) -> bool:
         router = self._resolve_router()
         if router is None:
@@ -23958,20 +24553,36 @@ class HyperVRouterManager:
             )
             return False
 
-        for fn_name in ("process_packet", "handle_packet"):
+        for fn_name in ("process_packet", "handle_packet", "_process_packet", "route_packet"):
             fn = getattr(router, fn_name, None)
             if not callable(fn):
                 continue
             try:
+                called = False
                 try:
-                    return bool(fn(packet, self.INBOUND_IFACE_NAME))
+                    result = fn(packet, self.INBOUND_IFACE_NAME)
+                    called = True
                 except TypeError:
-                    pass
-                try:
-                    return bool(fn(packet, inbound_iface=self.INBOUND_IFACE_NAME))
-                except TypeError:
-                    pass
-                return bool(fn(packet))
+                    result = None
+                if not called:
+                    try:
+                        result = fn(packet, inbound_iface=self.INBOUND_IFACE_NAME)
+                        called = True
+                    except TypeError:
+                        result = None
+                if not called:
+                    try:
+                        result = fn(packet, iface_name=self.INBOUND_IFACE_NAME)
+                        called = True
+                    except TypeError:
+                        result = None
+                if not called:
+                    result = fn(packet)
+                    called = True
+
+                if result is False:
+                    continue
+                return True
             except Exception as e:
                 self._log_sparse(
                     f"router-process-fail:{fn_name}",
@@ -23983,7 +24594,7 @@ class HyperVRouterManager:
         self._log_sparse(
             "router-no-process",
             "frame",
-            "router has no callable process_packet or handle_packet",
+            "router has no callable packet ingest method or all returned False",
             ["⚠️", "🧠", "🧯"],
             every=3.0,
         )
@@ -24264,12 +24875,14 @@ class HyperVRouterManager:
             peers = list(self._peers.values())
 
         for peer in peers:
-            if not peer.listen_ip:
-                continue
             if (now - peer.last_seen) > max(self.peer_timeout_sec, self._direct_hello_every_sec * 4.0):
                 continue
-            out.append((peer.listen_ip, int(peer.discovery_port or self.discovery_port)))
-            out.append((peer.listen_ip, int(peer.data_port or self.data_port)))
+            target_ips = [peer.listen_ip, peer.last_hello_from_ip, peer.last_data_from_ip, peer.advertised_ip]
+            for ip in target_ips:
+                if not ip:
+                    continue
+                out.append((ip, int(peer.discovery_port or self.discovery_port)))
+                out.append((ip, int(peer.data_port or self.data_port)))
         deduped: List[Tuple[str, int]] = []
         seen: Set[Tuple[str, int]] = set()
         for item in out:
@@ -24284,6 +24897,45 @@ class HyperVRouterManager:
             if peer is None:
                 return 0.0
             return float(peer.last_seen or 0.0)
+
+
+    def _choose_peer_ip(self, advertised_ip: str, hello_ip: str, data_ip: str, current_ip: str = "") -> str:
+        candidates = [str(data_ip or "").strip(), str(hello_ip or "").strip(), str(advertised_ip or "").strip(), str(current_ip or "").strip()]
+        bind_ip = str(self.bind_ip or "").strip()
+        for ip in candidates:
+            if self._same_ipv4_subnet(ip, bind_ip):
+                return ip
+        for ip in candidates:
+            if self._is_private_ipv4(ip):
+                return ip
+        for ip in candidates:
+            if ip:
+                return ip
+        return ""
+
+    def _same_ipv4_subnet(self, ip_a: str, ip_b: str) -> bool:
+        try:
+            a = str(ip_a or "").split(".")
+            b = str(ip_b or "").split(".")
+            return len(a) == 4 and len(b) == 4 and a[:3] == b[:3]
+        except Exception:
+            return False
+
+    def _is_private_ipv4(self, ip: str) -> bool:
+        try:
+            parts = [int(x) for x in str(ip or "").split(".")]
+            if len(parts) != 4:
+                return False
+            if parts[0] == 10:
+                return True
+            if parts[0] == 172 and 16 <= parts[1] <= 31:
+                return True
+            if parts[0] == 192 and parts[1] == 168:
+                return True
+            return False
+        except Exception:
+            return False
+
 
 
 @dataclass
