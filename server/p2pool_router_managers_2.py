@@ -15082,23 +15082,26 @@ class FirewallManager:
             return True
 
 
+
 class P2PPeerManager:
     """
-    Quiet, LAN-aware peer discovery manager.
+    Safe, low-impact LAN peer discovery manager.
 
-    Goals:
-    - same constructor shape
-    - backward-compatible set_managers()
-    - never send to 0.0.0.0
-    - never bind sender to invalid local IPs
-    - discover peers by:
-        * periodic HELLO broadcast
-        * targeted PROBE unicast scan across LAN candidates
-        * direct HERE replies
-    - stay relatively quiet in logs
+    Traffic-safety goals:
+    - Never modifies routes, gateways, NAT, firewall, or interface config
+    - Never uses raw packet injection or sniffer sending
+    - Never scans entire subnets
+    - Never sends to invalid targets like 0.0.0.0
+    - Uses one listener socket and one lightweight sender socket
+    - Broadcasts slowly and only replies directly when contacted
+    - Optional refresh only for already-known peers / ARP hints, with a tiny budget
+
+    Compatibility goals:
+    - Same constructor shape as prior versions
+    - Backward-compatible set_managers()
     """
 
-    MAGIC_HEADER = "PYROUTER_P2P_V9"
+    MAGIC_HEADER = "PYROUTER_P2P_SAFE_V1"
 
     def __init__(
         self,
@@ -15115,14 +15118,16 @@ class P2PPeerManager:
         self.port = int(port)
         self.node_id = str(uuid.uuid4())
 
+        # Kept only for compatibility with existing router construction.
+        # This manager intentionally does not use raw send paths.
         self.sniffer = sniffer
         self.out_iface = out_iface
 
-        # legacy / common manager hooks
+        # Common manager hooks
         self.arp_manager = None
         self.rip_manager = None
 
-        # optional richer context
+        # Optional richer context
         self.broadcast_manager = None
         self.firewall_manager = None
         self.netroute_manager = None
@@ -15131,36 +15136,44 @@ class P2PPeerManager:
         self.router_network = None
 
         self.running = False
-        self._listen_thread: Optional[threading.Thread] = None
-        self._broadcast_thread: Optional[threading.Thread] = None
-        self._scan_thread: Optional[threading.Thread] = None
-        self._housekeeping_thread: Optional[threading.Thread] = None
-        self._listen_sock: Optional[socket.socket] = None
-
         self._lock = threading.RLock()
+        self._send_lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        self._listen_thread: Optional[threading.Thread] = None
+        self._announce_thread: Optional[threading.Thread] = None
+        self._refresh_thread: Optional[threading.Thread] = None
+
+        self._listen_sock: Optional[socket.socket] = None
+        self._send_sock: Optional[socket.socket] = None
 
         self.peers: Dict[str, Dict[str, Any]] = {}
 
-        self.peer_timeout = 40.0
-        self.broadcast_interval = 12.0
-        self.scan_interval = 20.0
-        self.probe_spacing = 0.03
-        self.max_scan_hosts = 256
+        # Timing tuned to stay out of the router's way
+        self.peer_timeout = 60.0
+        self.broadcast_interval = 20.0
+        self.refresh_interval = 25.0
         self.summary_interval = 60.0
-        self.peer_refresh_grace = 8.0
+        self.min_reply_gap = 2.0
+        self.min_refresh_gap = 30.0
 
+        # Keep refresh tiny so this manager never becomes chatty
+        self.max_refresh_targets_per_cycle = 2
+        self.max_cached_candidates = 24
+
+        # Quiet logging / caches
+        self._hostname = socket.gethostname()
+        self._hello_counter = 0
         self._last_log_times: Dict[str, float] = {}
         self._last_summary_ts = 0.0
-        self._last_summary_fingerprint = ""
+        self._last_summary_fp = ""
+        self._last_reply_times: Dict[str, float] = {}
+        self._last_refresh_times: Dict[str, float] = {}
         self._last_candidate_refresh = 0.0
         self._candidate_cache: List[str] = []
 
-        self._hostname = socket.gethostname()
-        self._hello_counter = 0
-
     # ------------------------------------------------------------------
-    # Public wiring
+    # Public API
     # ------------------------------------------------------------------
 
     def set_managers(
@@ -15178,7 +15191,7 @@ class P2PPeerManager:
         Backward compatible:
             set_managers(self.arp_manager, self.rip_manager)
 
-        Optional richer context can be passed too.
+        Extra arguments are optional and only used for safe hints.
         """
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
@@ -15197,36 +15210,48 @@ class P2PPeerManager:
             self.running = True
             self._stop_event.clear()
 
+            try:
+                self._listen_sock = self._build_listener_socket()
+            except Exception as e:
+                self.running = False
+                self._stop_event.set()
+                self._listen_sock = None
+                self._log(f"[P2P] ❌ Failed to create listener socket: {e}", force=True)
+                return
+
+            try:
+                self._send_sock = self._build_sender_socket()
+            except Exception as e:
+                self._safe_close_socket(self._listen_sock)
+                self._listen_sock = None
+                self.running = False
+                self._stop_event.set()
+                self._log(f"[P2P] ❌ Failed to create sender socket: {e}", force=True)
+                return
+
             self._listen_thread = threading.Thread(
                 target=self._listener_loop,
                 daemon=False,
                 name="P2P-Listener",
             )
-            self._broadcast_thread = threading.Thread(
-                target=self._broadcaster_loop,
+            self._announce_thread = threading.Thread(
+                target=self._announce_loop,
                 daemon=False,
-                name="P2P-Broadcaster",
+                name="P2P-Announce",
             )
-            self._scan_thread = threading.Thread(
-                target=self._scanner_loop,
+            self._refresh_thread = threading.Thread(
+                target=self._refresh_loop,
                 daemon=False,
-                name="P2P-Scanner",
-            )
-            self._housekeeping_thread = threading.Thread(
-                target=self._housekeeping_loop,
-                daemon=False,
-                name="P2P-Housekeeping",
+                name="P2P-Refresh",
             )
 
             self._listen_thread.start()
-            self._broadcast_thread.start()
-            self._scan_thread.start()
-            self._housekeeping_thread.start()
+            self._announce_thread.start()
+            self._refresh_thread.start()
 
         self._log(
             f"[P2P] 🟢 Started node {self.node_id[:8]} on UDP/{self.port} "
-            f"(router_ip={self._safe_text(self._normalize_ipv4(self.router_ip), 'auto')}, "
-            f"broadcast_ip={self._safe_text(self._normalize_ipv4(self.broadcast_ip), 'auto')})",
+            f"(bind={self._display_ip(self.router_ip)} broadcast={self._display_ip(self.broadcast_ip)})",
             force=True,
         )
 
@@ -15235,9 +15260,8 @@ class P2PPeerManager:
             if (
                 not self.running
                 and not self._listen_thread
-                and not self._broadcast_thread
-                and not self._scan_thread
-                and not self._housekeeping_thread
+                and not self._announce_thread
+                and not self._refresh_thread
             ):
                 return
 
@@ -15245,33 +15269,34 @@ class P2PPeerManager:
             self._stop_event.set()
 
             listen_sock = self._listen_sock
+            send_sock = self._send_sock
             threads = [
                 ("Listener", self._listen_thread),
-                ("Broadcaster", self._broadcast_thread),
-                ("Scanner", self._scan_thread),
-                ("Housekeeping", self._housekeeping_thread),
+                ("Announce", self._announce_thread),
+                ("Refresh", self._refresh_thread),
             ]
 
         self._log("[P2P] 🛑 Stopping peer manager...", force=True)
 
         self._safe_close_socket(listen_sock)
+        self._safe_close_socket(send_sock)
 
-        for thread_name, thread in threads:
-            if thread:
-                thread.join(timeout=5.0)
-                if thread.is_alive():
+        for name, th in threads:
+            if th:
+                th.join(timeout=5.0)
+                if th.is_alive():
                     self._log(
-                        f"[P2P] ⚠️ {thread_name} thread did not stop cleanly.",
-                        key=f"stop-thread-{thread_name}",
+                        f"[P2P] ⚠️ {name} thread did not stop cleanly.",
+                        key=f"stop-{name}",
                         cooldown=10.0,
                     )
 
         with self._lock:
             self._listen_thread = None
-            self._broadcast_thread = None
-            self._scan_thread = None
-            self._housekeeping_thread = None
+            self._announce_thread = None
+            self._refresh_thread = None
             self._listen_sock = None
+            self._send_sock = None
             self.peers.clear()
             self._candidate_cache = []
 
@@ -15307,48 +15332,26 @@ class P2PPeerManager:
         with self._lock:
             peer_count = len(self.peers)
             candidate_count = len(self._candidate_cache)
-            top_peers = sorted(self.peers.keys())[:16]
+            keys = sorted(self.peers.keys())[:16]
 
-        fingerprint = f"{peer_count}|{candidate_count}|{'/'.join(top_peers)}"
-        if not force and fingerprint == self._last_summary_fingerprint:
+        fp = f"{peer_count}|{candidate_count}|{'/'.join(keys)}"
+        if not force and fp == self._last_summary_fp:
             return
 
         self._last_summary_ts = now
-        self._last_summary_fingerprint = fingerprint
+        self._last_summary_fp = fp
 
         self._log(
             f"[P2P] 📊 peers={peer_count} candidates={candidate_count} "
-            f"bind={self._safe_text(self._normalize_ipv4(self.router_ip), 'auto')} "
-            f"broadcast={self._safe_text(self._normalize_ipv4(self.broadcast_ip), 'auto')} "
+            f"bind={self._display_ip(self.router_ip)} "
+            f"broadcast={self._display_ip(self.broadcast_ip)} "
             f"port={self.port}",
             force=True,
         )
 
     # ------------------------------------------------------------------
-    # Generic helpers
+    # IP helpers
     # ------------------------------------------------------------------
-
-    def _safe_close_socket(self, sock: Optional[socket.socket]):
-        if sock is None:
-            return
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-    def _safe_int(self, value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return int(default)
-
-    def _safe_text(self, value: Any, fallback: str = "") -> str:
-        s = str(value or "").strip()
-        return s if s else fallback
 
     def _normalize_ipv4(self, value: Any) -> str:
         try:
@@ -15356,11 +15359,15 @@ class P2PPeerManager:
         except Exception:
             return ""
 
-    def _is_unspecified_ip(self, ip_s: str) -> bool:
+    def _display_ip(self, value: Any) -> str:
+        ip_s = self._normalize_ipv4(value)
+        return ip_s if ip_s else "auto"
+
+    def _safe_int(self, value: Any, default: int) -> int:
         try:
-            return ipaddress.IPv4Address(self._normalize_ipv4(ip_s)).is_unspecified
+            return int(value)
         except Exception:
-            return False
+            return int(default)
 
     def _is_self_ip(self, ip_s: str) -> bool:
         ip_s = self._normalize_ipv4(ip_s)
@@ -15378,34 +15385,32 @@ class P2PPeerManager:
         if not ip_s:
             return False
         try:
-            ip_obj = ipaddress.IPv4Address(ip_s)
-            if ip_obj.is_unspecified:
+            obj = ipaddress.IPv4Address(ip_s)
+            if obj.is_unspecified:
                 return False
-            if ip_obj.is_multicast or ip_obj.is_reserved:
+            if obj.is_multicast or obj.is_reserved:
                 return False
             return True
         except Exception:
             return False
 
-    def _is_valid_unicast_target(self, ip_s: str) -> bool:
+    def _is_private_same_lan_target(self, ip_s: str) -> bool:
         ip_s = self._normalize_ipv4(ip_s)
         if not ip_s:
             return False
+
         try:
-            ip_obj = ipaddress.IPv4Address(ip_s)
-            if ip_obj.is_unspecified:
-                return False
-            if ip_obj.is_loopback:
-                return False
-            if ip_obj.is_multicast:
-                return False
-            if ip_obj.is_reserved:
-                return False
-            if ip_obj.is_link_local:
+            obj = ipaddress.IPv4Address(ip_s)
+            if obj.is_unspecified or obj.is_loopback or obj.is_multicast or obj.is_reserved or obj.is_link_local:
                 return False
             if self._is_self_ip(ip_s):
                 return False
-            return True
+
+            net = self._get_local_network()
+            if net is not None:
+                return obj in net and ip_s not in (str(net.network_address), str(net.broadcast_address))
+
+            return obj.is_private
         except Exception:
             return False
 
@@ -15413,36 +15418,89 @@ class P2PPeerManager:
         ip_s = self._normalize_ipv4(ip_s)
         if not ip_s:
             return False
+
         if ip_s == "255.255.255.255":
             return True
 
         try:
-            ip_obj = ipaddress.IPv4Address(ip_s)
-            if ip_obj.is_unspecified:
-                return False
-            if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_reserved:
+            obj = ipaddress.IPv4Address(ip_s)
+            if obj.is_unspecified or obj.is_loopback or obj.is_multicast or obj.is_reserved:
                 return False
         except Exception:
             return False
 
-        net = self._get_scan_network()
+        net = self._get_local_network()
         if net is not None:
             try:
-                if ip_s == str(net.broadcast_address):
-                    return True
+                return ip_s == str(net.broadcast_address)
             except Exception:
                 pass
 
         return ip_s.endswith(".255")
 
     # ------------------------------------------------------------------
-    # Payload / peer state
+    # Local network inference
+    # ------------------------------------------------------------------
+
+    def _infer_network_from_router_network(self) -> Optional[ipaddress.IPv4Network]:
+        rn = self.router_network
+        try:
+            if isinstance(rn, ipaddress.IPv4Network):
+                return rn
+            if rn is not None:
+                net = ipaddress.ip_network(str(rn), strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    return net
+        except Exception:
+            pass
+        return None
+
+    def _infer_network_from_broadcast(self) -> Optional[ipaddress.IPv4Network]:
+        local_ip = self._normalize_ipv4(self.router_ip)
+        bcast_ip = self._normalize_ipv4(self.broadcast_ip)
+
+        if not self._is_bindable_local_ip(local_ip):
+            return None
+        if not self._is_valid_broadcast_target(bcast_ip):
+            return None
+
+        try:
+            ip_obj = ipaddress.IPv4Address(local_ip)
+            bcast_obj = ipaddress.IPv4Address(bcast_ip)
+
+            for prefix in range(32, -1, -1):
+                net = ipaddress.IPv4Network(f"{ip_obj}/{prefix}", strict=False)
+                if ip_obj in net and net.broadcast_address == bcast_obj:
+                    return net
+        except Exception:
+            pass
+        return None
+
+    def _fallback_network(self) -> Optional[ipaddress.IPv4Network]:
+        local_ip = self._normalize_ipv4(self.router_ip)
+        if not self._is_bindable_local_ip(local_ip):
+            return None
+        try:
+            return ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        except Exception:
+            return None
+
+    def _get_local_network(self) -> Optional[ipaddress.IPv4Network]:
+        net = self._infer_network_from_router_network()
+        if net is None:
+            net = self._infer_network_from_broadcast()
+        if net is None:
+            net = self._fallback_network()
+        return net
+
+    # ------------------------------------------------------------------
+    # Payload helpers
     # ------------------------------------------------------------------
 
     def _build_payload(self, msg_type: str, include_state: bool = False) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "magic": self.MAGIC_HEADER,
-            "version": 9,
+            "version": 1,
             "type": str(msg_type or "hello").lower(),
             "node_id": self.node_id,
             "router_ip": self._normalize_ipv4(self.router_ip),
@@ -15487,20 +15545,23 @@ class P2PPeerManager:
         try:
             if str(payload.get("node_id") or "") == self.node_id:
                 return True
+            if sender_ip and self._is_self_ip(sender_ip):
+                return True
 
             advertised = self._normalize_ipv4(payload.get("router_ip"))
             if advertised and self._is_self_ip(advertised):
-                return True
-
-            if sender_ip and self._is_self_ip(sender_ip):
                 return True
         except Exception:
             pass
         return False
 
+    # ------------------------------------------------------------------
+    # Peer table
+    # ------------------------------------------------------------------
+
     def _record_peer(self, sender_ip: str, sender_port: int, payload: Dict[str, Any], source: str):
         endpoint_ip = self._normalize_ipv4(sender_ip)
-        if not self._is_valid_unicast_target(endpoint_ip):
+        if not self._is_private_same_lan_target(endpoint_ip):
             return
 
         router_ip = self._normalize_ipv4(payload.get("router_ip")) or endpoint_ip
@@ -15562,70 +15623,8 @@ class P2PPeerManager:
             self._log_summary_if_changed(force=True)
 
     # ------------------------------------------------------------------
-    # Scan intelligence
+    # Safe candidate selection
     # ------------------------------------------------------------------
-
-    def _infer_network_from_router_network(self) -> Optional[ipaddress.IPv4Network]:
-        rn = self.router_network
-        try:
-            if isinstance(rn, ipaddress.IPv4Network):
-                return rn
-            if rn is not None:
-                net = ipaddress.ip_network(str(rn), strict=False)
-                if isinstance(net, ipaddress.IPv4Network):
-                    return net
-        except Exception:
-            pass
-        return None
-
-    def _infer_network_from_broadcast(self) -> Optional[ipaddress.IPv4Network]:
-        local_ip = self._normalize_ipv4(self.router_ip)
-        bcast_ip = self._normalize_ipv4(self.broadcast_ip)
-
-        if not self._is_bindable_local_ip(local_ip):
-            return None
-        if not self._is_valid_broadcast_target(bcast_ip):
-            return None
-
-        try:
-            ip_obj = ipaddress.IPv4Address(local_ip)
-            bcast_obj = ipaddress.IPv4Address(bcast_ip)
-
-            for prefix in range(32, -1, -1):
-                net = ipaddress.IPv4Network(f"{ip_obj}/{prefix}", strict=False)
-                if ip_obj in net and net.broadcast_address == bcast_obj:
-                    return net
-        except Exception:
-            pass
-
-        return None
-
-    def _fallback_network(self) -> Optional[ipaddress.IPv4Network]:
-        local_ip = self._normalize_ipv4(self.router_ip)
-        if not self._is_bindable_local_ip(local_ip):
-            return None
-        try:
-            return ipaddress.ip_network(f"{local_ip}/24", strict=False)
-        except Exception:
-            return None
-
-    def _get_scan_network(self) -> Optional[ipaddress.IPv4Network]:
-        net = self._infer_network_from_router_network()
-        if net is None:
-            net = self._infer_network_from_broadcast()
-        if net is None:
-            net = self._fallback_network()
-        if net is None:
-            return None
-
-        try:
-            host_count = max(int(net.num_addresses) - 2, 0)
-            if host_count <= self.max_scan_hosts:
-                return net
-        except Exception:
-            return net
-
-        return self._fallback_network()
 
     def _get_broadcast_targets(self) -> List[str]:
         targets: List[str] = []
@@ -15634,7 +15633,7 @@ class P2PPeerManager:
         if self._is_valid_broadcast_target(preferred):
             targets.append(preferred)
 
-        net = self._get_scan_network()
+        net = self._get_local_network()
         if net is not None:
             try:
                 directed = str(net.broadcast_address)
@@ -15658,29 +15657,6 @@ class P2PPeerManager:
             out.append(t)
         return out
 
-    def _get_network_candidates(self) -> List[str]:
-        net = self._get_scan_network()
-        if net is None:
-            return []
-
-        me = self._normalize_ipv4(self.router_ip)
-        out: List[str] = []
-
-        try:
-            for host in net.hosts():
-                ip_s = str(host)
-                if ip_s == me:
-                    continue
-                if not self._is_valid_unicast_target(ip_s):
-                    continue
-                out.append(ip_s)
-                if len(out) >= self.max_scan_hosts:
-                    break
-        except Exception:
-            pass
-
-        return out
-
     def _get_arp_candidates(self) -> List[str]:
         out: List[str] = []
         if self.arp_manager and hasattr(self.arp_manager, "get_cache_view"):
@@ -15688,24 +15664,8 @@ class P2PPeerManager:
                 raw = self.arp_manager.get_cache_view() or {}
                 for ip_s in raw.keys():
                     ip_s = self._normalize_ipv4(ip_s)
-                    if self._is_valid_unicast_target(ip_s):
+                    if self._is_private_same_lan_target(ip_s):
                         out.append(ip_s)
-            except Exception:
-                pass
-        return out
-
-    def _get_route_candidates(self) -> List[str]:
-        out: List[str] = []
-        if self.rip_manager and hasattr(self.rip_manager, "get_routing_table_view"):
-            try:
-                routes = self.rip_manager.get_routing_table_view() or []
-                for rec in routes:
-                    if not isinstance(rec, dict):
-                        continue
-                    for field in ("next_hop", "gateway", "via", "neighbor"):
-                        ip_s = self._normalize_ipv4(rec.get(field))
-                        if self._is_valid_unicast_target(ip_s):
-                            out.append(ip_s)
             except Exception:
                 pass
         return out
@@ -15718,84 +15678,87 @@ class P2PPeerManager:
         for peer in peers_copy:
             for field in ("endpoint_ip", "router_ip", "source_ip"):
                 ip_s = self._normalize_ipv4(peer.get(field))
-                if self._is_valid_unicast_target(ip_s):
+                if self._is_private_same_lan_target(ip_s):
                     out.append(ip_s)
         return out
 
     def _refresh_candidate_cache(self) -> List[str]:
         now = time.time()
-        if self._candidate_cache and (now - self._last_candidate_refresh) < 6.0:
+        if self._candidate_cache and (now - self._last_candidate_refresh) < 10.0:
             return list(self._candidate_cache)
 
         candidates: List[str] = []
-        candidates.extend(self._get_arp_candidates())
-        candidates.extend(self._get_route_candidates())
         candidates.extend(self._get_known_peer_candidates())
-        candidates.extend(self._get_network_candidates())
+        candidates.extend(self._get_arp_candidates())
 
         seen = set()
         deduped: List[str] = []
         for ip_s in candidates:
             ip_s = self._normalize_ipv4(ip_s)
-            if not self._is_valid_unicast_target(ip_s):
+            if not self._is_private_same_lan_target(ip_s):
                 continue
             if ip_s in seen:
                 continue
             seen.add(ip_s)
             deduped.append(ip_s)
+            if len(deduped) >= self.max_cached_candidates:
+                break
 
         self._candidate_cache = deduped
         self._last_candidate_refresh = now
         return list(deduped)
 
     # ------------------------------------------------------------------
-    # Socket send helpers
+    # Sockets
     # ------------------------------------------------------------------
 
-    def _open_listener_socket(self) -> socket.socket:
+    def _build_listener_socket(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except Exception:
+            pass
+        sock.bind(("0.0.0.0", self.port))
+        sock.settimeout(1.0)
+        return sock
 
+    def _build_sender_socket(self) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         except Exception:
             pass
 
-        try:
-            if hasattr(socket, "SO_REUSEPORT"):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except Exception:
-            pass
+        local_ip = self._normalize_ipv4(self.router_ip)
+        if self._is_bindable_local_ip(local_ip):
+            try:
+                sock.bind((local_ip, 0))
+            except Exception:
+                pass
 
-        sock.bind(("0.0.0.0", self.port))
-        sock.settimeout(1.0)
         return sock
 
-    def _send_udp(self, target_ip: str, packet_bytes: bytes, *, bind_local: bool = False) -> bool:
+    def _send_message(self, target_ip: str, msg_type: str, *, include_state: bool, allow_broadcast: bool) -> bool:
         target_ip = self._normalize_ipv4(target_ip)
-        is_broadcast = self._is_valid_broadcast_target(target_ip)
-        is_unicast = self._is_valid_unicast_target(target_ip)
+        if allow_broadcast:
+            if not self._is_valid_broadcast_target(target_ip):
+                return False
+        else:
+            if not self._is_private_same_lan_target(target_ip):
+                return False
 
-        if not is_broadcast and not is_unicast:
+        payload = self._build_payload(msg_type=msg_type, include_state=include_state)
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        sock = self._send_sock
+        if sock is None:
             return False
 
-        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            if is_broadcast:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-            if bind_local:
-                local_ip = self._normalize_ipv4(self.router_ip)
-                if self._is_bindable_local_ip(local_ip):
-                    try:
-                        sock.bind((local_ip, 0))
-                    except Exception:
-                        pass
-
-            sock.sendto(packet_bytes, (target_ip, self.port))
+            with self._send_lock:
+                sock.sendto(raw, (target_ip, self.port))
             return True
         except Exception as e:
             self._log(
@@ -15804,107 +15767,41 @@ class P2PPeerManager:
                 cooldown=15.0,
             )
             return False
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-    def _send_sniffer(self, target_ip: str, packet_bytes: bytes) -> bool:
-        if not self.sniffer or not self.out_iface:
-            return False
-
-        target_ip = self._normalize_ipv4(target_ip)
-        is_broadcast = self._is_valid_broadcast_target(target_ip)
-        is_unicast = self._is_valid_unicast_target(target_ip)
-
-        if not is_broadcast and not is_unicast:
-            return False
-
-        try:
-            ip_layer = IP(dst=target_ip)
-            local_ip = self._normalize_ipv4(self.router_ip)
-            if self._is_bindable_local_ip(local_ip):
-                ip_layer.src = local_ip
-
-            pkt = ip_layer / UDP(sport=self.port, dport=self.port) / Raw(load=packet_bytes)
-
-            kwargs = {
-                "iface": self.out_iface,
-                "verbose": 0,
-            }
-            if is_broadcast:
-                kwargs["dst_mac"] = "ff:ff:ff:ff:ff:ff"
-
-            self.sniffer.send(pkt, **kwargs)
-            return True
-        except Exception as e:
-            self._log(
-                f"[P2P] ⚠️ sniffer send failed to {target_ip}:{self.port} on {self.out_iface}: {e}",
-                key=f"sniffer-send-{target_ip}",
-                cooldown=15.0,
-            )
-            return False
-
-    def _send_message(
-        self,
-        target_ip: str,
-        msg_type: str,
-        *,
-        include_state: bool = False,
-        prefer_udp_only: bool = False,
-    ) -> bool:
-        target_ip = self._normalize_ipv4(target_ip)
-        if not self._is_valid_broadcast_target(target_ip) and not self._is_valid_unicast_target(target_ip):
-            return False
-
-        payload = self._build_payload(msg_type=msg_type, include_state=include_state)
-        packet_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-        udp_ok = self._send_udp(target_ip, packet_bytes, bind_local=True)
-        sniffer_ok = False
-
-        if not prefer_udp_only:
-            sniffer_ok = self._send_sniffer(target_ip, packet_bytes)
-
-        return bool(udp_ok or sniffer_ok)
 
     def _reply_here(self, target_ip: str):
-        self._send_message(
+        target_ip = self._normalize_ipv4(target_ip)
+        if not self._is_private_same_lan_target(target_ip):
+            return
+
+        now = time.time()
+        last = float(self._last_reply_times.get(target_ip, 0.0))
+        if (now - last) < self.min_reply_gap:
+            return
+
+        if self._send_message(
             target_ip=target_ip,
             msg_type="here",
             include_state=True,
-            prefer_udp_only=True,
-        )
+            allow_broadcast=False,
+        ):
+            self._last_reply_times[target_ip] = now
 
     # ------------------------------------------------------------------
     # Worker loops
     # ------------------------------------------------------------------
 
     def _listener_loop(self):
-        sock: Optional[socket.socket] = None
+        sock = self._listen_sock
+        if sock is None:
+            return
 
         try:
-            sock = self._open_listener_socket()
-            with self._lock:
-                self._listen_sock = sock
-
             self._log(
                 f"[P2P] 👂 Listener bound on 0.0.0.0:{self.port} "
                 f"(node={self.node_id[:8]} host={self._hostname})",
                 force=True,
             )
-        except Exception as e:
-            self._log(f"[P2P] ❌ Failed to bind listener socket: {e}", force=True)
-            with self._lock:
-                self.running = False
-                self._listen_sock = None
-            self._stop_event.set()
-            self._safe_close_socket(sock)
-            return
 
-        try:
             while not self._stop_event.is_set():
                 try:
                     data, addr = sock.recvfrom(65535)
@@ -15921,7 +15818,6 @@ class P2PPeerManager:
 
                     if str(payload.get("magic") or "") != self.MAGIC_HEADER:
                         continue
-
                     if self._is_self_payload(sender_ip, payload):
                         continue
 
@@ -15960,102 +15856,104 @@ class P2PPeerManager:
                 if self._listen_sock is sock:
                     self._listen_sock = None
 
-    def _broadcaster_loop(self):
+    def _announce_loop(self):
+        initial_delay = 1.0 + (abs(hash(self.node_id)) % 1000) / 1000.0
+        if self._stop_event.wait(initial_delay):
+            return
+
         while not self._stop_event.is_set():
             try:
                 self._hello_counter += 1
                 include_state = (self._hello_counter % 4 == 0)
 
-                targets = self._get_broadcast_targets()
-                ok_count = 0
-
-                for target_ip in targets:
+                success_count = 0
+                for target_ip in self._get_broadcast_targets():
                     if self._stop_event.is_set():
                         break
-
-                    ok = self._send_message(
+                    if self._send_message(
                         target_ip=target_ip,
                         msg_type="hello",
                         include_state=include_state,
-                        prefer_udp_only=False,
-                    )
-                    if ok:
-                        ok_count += 1
+                        allow_broadcast=True,
+                    ):
+                        success_count += 1
 
-                if ok_count <= 0:
+                if success_count <= 0:
                     self._log(
                         "[P2P] ⚠️ No HELLO broadcast path succeeded this cycle.",
-                        key="hello-broadcast-fail",
+                        key="hello-fail",
                         cooldown=20.0,
                     )
 
             except Exception as e:
                 if not self._stop_event.is_set():
                     self._log(
-                        f"[P2P] ⚠️ broadcaster error: {e}",
-                        key="broadcaster-error",
+                        f"[P2P] ⚠️ announce error: {e}",
+                        key="announce-error",
                         cooldown=10.0,
                     )
 
-            if self._stop_event.wait(self.broadcast_interval):
+            sleep_for = self.broadcast_interval + random.uniform(-1.5, 1.5)
+            sleep_for = max(10.0, sleep_for)
+            if self._stop_event.wait(sleep_for):
                 break
 
-    def _scanner_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                candidates = self._refresh_candidate_cache()
+    def _refresh_loop(self):
+        if self._stop_event.wait(5.0):
+            return
 
-                for ip_s in candidates:
-                    if self._stop_event.is_set():
-                        break
-
-                    skip = False
-                    with self._lock:
-                        existing = self.peers.get(ip_s)
-                        if existing:
-                            last_seen = float(existing.get("last_seen", 0.0))
-                            if (time.time() - last_seen) < self.peer_refresh_grace:
-                                skip = True
-
-                    if skip:
-                        continue
-
-                    self._send_message(
-                        target_ip=ip_s,
-                        msg_type="probe",
-                        include_state=False,
-                        prefer_udp_only=True,
-                    )
-
-                    if self._stop_event.wait(self.probe_spacing):
-                        break
-
-            except Exception as e:
-                if not self._stop_event.is_set():
-                    self._log(
-                        f"[P2P] ⚠️ scanner error: {e}",
-                        key="scanner-error",
-                        cooldown=10.0,
-                    )
-
-            if self._stop_event.wait(self.scan_interval):
-                break
-
-    def _housekeeping_loop(self):
         while not self._stop_event.is_set():
             try:
                 self._prune_dead_peers()
-                self._refresh_candidate_cache()
+                candidates = self._refresh_candidate_cache()
+
+                # Tiny refresh budget only, to avoid competing with router traffic
+                budget = self.max_refresh_targets_per_cycle
+                if candidates:
+                    ordered = list(candidates)
+                    random.shuffle(ordered)
+
+                    for ip_s in ordered:
+                        if self._stop_event.is_set():
+                            break
+                        if budget <= 0:
+                            break
+                        if not self._is_private_same_lan_target(ip_s):
+                            continue
+
+                        with self._lock:
+                            peer = self.peers.get(ip_s)
+
+                        now = time.time()
+                        if peer is not None:
+                            last_seen = float(peer.get("last_seen", 0.0))
+                            if (now - last_seen) < self.min_refresh_gap:
+                                continue
+
+                        last_refresh = float(self._last_refresh_times.get(ip_s, 0.0))
+                        if (now - last_refresh) < self.min_refresh_gap:
+                            continue
+
+                        if self._send_message(
+                            target_ip=ip_s,
+                            msg_type="probe",
+                            include_state=False,
+                            allow_broadcast=False,
+                        ):
+                            self._last_refresh_times[ip_s] = now
+                            budget -= 1
+
                 self._log_summary_if_changed(force=False)
+
             except Exception as e:
                 if not self._stop_event.is_set():
                     self._log(
-                        f"[P2P] ⚠️ housekeeping error: {e}",
-                        key="housekeeping-error",
+                        f"[P2P] ⚠️ refresh error: {e}",
+                        key="refresh-error",
                         cooldown=10.0,
                     )
 
-            if self._stop_event.wait(5.0):
+            if self._stop_event.wait(self.refresh_interval):
                 break
 
 

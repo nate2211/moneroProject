@@ -2918,7 +2918,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     interfaces_config=getattr(self, "_interfaces_config", None),
                     router_network=getattr(self, "router_network_out", None),
                 )
-                self.p2p_manager.set_managers(self.arp_manager, self.rip_manager)
                 self.p2p_manager.start()
             if use_netroute:
                 self.netroute_manager = NetRouteManager(
