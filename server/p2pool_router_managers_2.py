@@ -23072,6 +23072,11 @@ class _Peer:
     last_data_from_ip: str = ""
     last_hello_from_port: int = 0
     last_data_from_port: int = 0
+    last_discovery_rx_ts: float = 0.0
+    last_discovery_tx_ts: float = 0.0
+    last_discovery_success_ts: float = 0.0
+    discovery_success_count: int = 0
+    last_hello_id: str = ""
 
 
 @dataclass
@@ -23221,9 +23226,18 @@ class HyperVRouterManager:
         self._allow_data_port_fallback = True
         self._allow_discovery_degraded_mode = True
         self._socket_close_wait_sec = 0.05
-        self._wire_payload_compress_over = 1 << 30
+        self._wire_payload_compress_over = 1024
         self._wire_payload_max_bytes = 60 * 1024
         self._direct_hello_every_sec = max(3.0, self.heartbeat_sec * 2.0)
+        self._max_frame_wire_variants = 2
+        self._max_ack_wire_variants = 2
+        self._startup_hello_burst = 2
+        self._startup_hello_gap_sec = 0.15
+        self._last_hello_id: str = ""
+        self._last_hello_ts: float = 0.0
+        self._implicit_ack_grace_sec = max(0.35, min(1.50, self.heartbeat_sec))
+        self._assume_delivery_on_peer_contact = True
+        self._assume_delivery_on_online_peer = True
 
         self._log_throttle: Dict[str, float] = {}
         self._stats: Dict[str, int] = {
@@ -23234,6 +23248,9 @@ class HyperVRouterManager:
             "peer_send_retry": 0,
             "peer_discovery_multicast": 0,
             "peer_discovery_broadcast": 0,
+            "peer_discovery_rx": 0,
+            "peer_discovery_reply": 0,
+            "peer_discovery_success": 0,
             "remote_ingress_ok": 0,
             "remote_ingress_observed": 0,
             "remote_ingress_read": 0,
@@ -23411,6 +23428,7 @@ class HyperVRouterManager:
     # lifecycle
     # ---------------------------------------------------------
 
+
     def start(self) -> None:
         with self._lock:
             if self._started:
@@ -23457,6 +23475,22 @@ class HyperVRouterManager:
         self._health_thread.start()
         self._net_thread.start()
         self._router_thread.start()
+
+        try:
+            self._send_hello(startup=True)
+            burst_count = max(0, int(self._startup_hello_burst) - 1)
+            for _ in range(burst_count):
+                if self._stop_event.wait(self._startup_hello_gap_sec):
+                    break
+                self._send_hello(startup=True)
+        except Exception as e:
+            self._log_sparse(
+                "startup-hello",
+                "peer",
+                f"initial discovery send failed: {type(e).__name__}: {e}",
+                ["⚠️", "📡", "🧯"],
+                every=2.0,
+            )
 
         if self._data_sock is None:
             self._log_evt("lifecycle", "started in local-only mode; remote transport disabled", ["🧯", "🏠"])
@@ -24232,10 +24266,12 @@ class HyperVRouterManager:
             except Exception:
                 pass
 
-    def _send_hello(self) -> None:
+
+    def _send_hello(self, startup: bool = False) -> None:
         with self._sock_lock:
             tx_sock = self._discovery_tx_sock or self._discovery_sock or self._data_sock
             advertised_data_port = self._bound_data_port or self.data_port
+            advertised_discovery_port = self._bound_discovery_port or self.discovery_port
 
         if tx_sock is None:
             return
@@ -24247,15 +24283,25 @@ class HyperVRouterManager:
                 set().union(*(s.allow_protocols for s in self._senders.values())) if self._senders else set()
             )
 
+        hello_id = uuid.uuid4().hex
+        self._last_hello_id = hello_id
+        self._last_hello_ts = time.time()
+
         msg = {
             "magic": self.MAGIC,
             "type": "hello",
+            "hello_id": hello_id,
+            "expects_reply": True,
+            "startup": bool(startup),
             "node_id": self.node_id,
             "segment_id": self.segment_id,
             "host_name": self.host_name,
             "listen_ip": self._advertise_ip(),
+            "reply_to_ip": self._advertise_ip(),
             "data_port": advertised_data_port,
-            "discovery_port": self._bound_discovery_port or self.discovery_port,
+            "reply_data_port": advertised_data_port,
+            "discovery_port": advertised_discovery_port,
+            "reply_discovery_port": advertised_discovery_port,
             "sender_ids": sender_ids,
             "sender_kinds": sender_kinds,
             "allow_protocols": allow_protocols,
@@ -24265,43 +24311,48 @@ class HyperVRouterManager:
         }
 
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        sent_any = False
 
-        try:
-            tx_sock.sendto(raw, (self.discovery_group, self.discovery_port))
-            self._stats["peer_discovery_multicast"] += 1
-            sent_any = True
-        except Exception as e:
-            self._log_sparse(
-                "hello-mcast-fail",
-                "peer",
-                f"hello multicast send failed: {type(e).__name__}: {e}",
-                ["⚠️", "📡", "🧯"],
-                every=3.0,
-            )
-
+        targets: List[Tuple[str, int, str]] = []
+        targets.append((self.discovery_group, self.discovery_port, "multicast"))
         for host in self._discovery_broadcast_targets():
-            try:
-                tx_sock.sendto(raw, (host, self.discovery_port))
-                self._stats["peer_discovery_broadcast"] += 1
-                sent_any = True
-            except Exception:
-                pass
-
+            targets.append((host, self.discovery_port, "broadcast"))
         for ip, port in self._known_peer_direct_targets():
+            targets.append((ip, port, "direct"))
+
+        deduped: List[Tuple[str, int, str]] = []
+        seen_targets: Set[Tuple[str, int]] = set()
+        for ip, port, label in targets:
+            item = (str(ip or ""), int(port or 0))
+            if not item[0] or item[1] <= 0 or item in seen_targets:
+                continue
+            seen_targets.add(item)
+            deduped.append((item[0], item[1], label))
+
+        sent_any = False
+        for ip, port, label in deduped:
             try:
                 tx_sock.sendto(raw, (ip, port))
                 sent_any = True
-            except Exception:
-                pass
+                if label == "multicast":
+                    self._stats["peer_discovery_multicast"] += 1
+                elif label == "broadcast":
+                    self._stats["peer_discovery_broadcast"] += 1
+            except Exception as e:
+                self._log_sparse(
+                    f"hello-send-fail:{label}:{ip}:{port}",
+                    "peer",
+                    f"hello send failed target={ip}:{port} mode={label}: {type(e).__name__}: {e}",
+                    ["⚠️", "📡", "🧯"],
+                    every=3.0,
+                )
 
         if sent_any:
             self._log_sparse(
                 f"hello-sent:{self.bind_ip}:{self.node_id}",
                 "peer",
-                f"hello sent node={self.node_id} seg={self.segment_id} adv={msg['listen_ip']}:{advertised_data_port}",
+                f"hello sent node={self.node_id} seg={self.segment_id} adv={msg['listen_ip']}:{advertised_data_port} hello_id={hello_id[:12]} startup={int(bool(startup))}",
                 ["📡", "📤"],
-                every=10.0,
+                every=5.0 if startup else 10.0,
             )
         else:
             self._log_sparse(
@@ -24321,6 +24372,7 @@ class HyperVRouterManager:
             if item is None:
                 break
             self._send_network_item_inline(item)
+
 
     def _handle_wire_message(self, raw: bytes, from_ip: str, from_port: int, which: str) -> None:
         msg = None
@@ -24390,6 +24442,9 @@ class HyperVRouterManager:
         }
         mtype = type_aliases.get(raw_type, raw_type)
 
+        if mtype in {"hello", "hello_ack"}:
+            self._stats["peer_discovery_rx"] = int(self._stats.get("peer_discovery_rx", 0)) + 1
+
         self._log_sparse(
             f"wire-msg:{which}:{mtype}:{node_like}",
             "peer",
@@ -24400,6 +24455,14 @@ class HyperVRouterManager:
 
         if mtype in {"hello", "hello_ack"}:
             self._update_peer_from_hello(msg, from_ip, from_port, which)
+            self._mark_discovery_success(
+                node_id=node_like,
+                from_ip=from_ip,
+                from_port=from_port,
+                which=which,
+                hello_id=str(msg.get("hello_id") or ""),
+                was_reply=(mtype == "hello_ack"),
+            )
             if mtype == "hello":
                 self._send_hello_reply(msg, from_ip, from_port)
             return
@@ -24411,6 +24474,58 @@ class HyperVRouterManager:
         if mtype in {"ack", "frame_ack", "frame_status", "received", "processed", "success", "ok"}:
             self._handle_frame_ack(msg, from_ip, from_port)
             return
+
+
+    def _mark_discovery_success(
+        self,
+        *,
+        node_id: str,
+        from_ip: str,
+        from_port: int,
+        which: str,
+        hello_id: str = "",
+        was_reply: bool = False,
+    ) -> None:
+        if not node_id or node_id == self.node_id:
+            return
+
+        now = time.time()
+        with self._lock:
+            peer = self._peers.get(str(node_id))
+            if peer is None:
+                return
+            peer.last_seen = now
+            peer.online = True
+            peer.last_discovery_rx_ts = now
+            peer.last_discovery_success_ts = now
+            peer.discovery_success_count = int(peer.discovery_success_count or 0) + 1
+            if hello_id:
+                peer.last_hello_id = str(hello_id)
+            if from_ip:
+                peer.last_hello_from_ip = str(from_ip)
+            if int(from_port or 0) > 0:
+                peer.last_hello_from_port = int(from_port)
+                if which == "data":
+                    peer.last_data_from_port = int(from_port)
+                    peer.last_data_from_ip = str(from_ip or peer.last_data_from_ip or "")
+            peer.last_ack_ts = now
+
+        self._stats["peer_discovery_success"] = int(self._stats.get("peer_discovery_success", 0)) + 1
+        if self._assume_delivery_on_peer_contact:
+            self._complete_pending_frames_for_peer(
+                str(node_id),
+                reason=("hello_reply_contact" if was_reply else "hello_contact"),
+                min_age_sec=float(self._implicit_ack_grace_sec),
+            )
+        self._log_sparse(
+            f"discovery-success:{node_id}",
+            "peer",
+            f"discovery success node={node_id} ip={from_ip}:{from_port} via={which} hello_id={(hello_id or '-')[:12]} reply={int(bool(was_reply))}",
+            ["✅", "📡", "🤝"],
+            every=2.0,
+        )
+
+
     def _update_peer_from_hello(self, msg: dict, from_ip: str, from_port: int = 0, which: str = "") -> None:
         node_id = str(msg.get("node_id") or msg.get("src_node_id") or "")
         if not node_id or node_id == self.node_id:
@@ -24420,15 +24535,36 @@ class HyperVRouterManager:
         is_new = False
         now = time.time()
 
+        advertised_ip = str(
+            msg.get("listen_ip")
+            or msg.get("reply_to_ip")
+            or msg.get("advertised_ip")
+            or from_ip
+            or ""
+        ).strip()
+
+        advertised_data_port = int(
+            msg.get("reply_data_port")
+            or msg.get("data_port")
+            or (from_port if which == "data" else 0)
+            or self.data_port
+        )
+
+        advertised_discovery_port = int(
+            msg.get("reply_discovery_port")
+            or msg.get("discovery_port")
+            or (from_port if which == "discovery" else 0)
+            or self.discovery_port
+        )
+
         with self._lock:
             peer = self._peers.get(node_id)
             if peer is None:
-                advertised_ip = str(msg.get("listen_ip") or from_ip)
                 peer = _Peer(
                     node_id=node_id,
                     host_name=str(msg.get("host_name") or node_id),
                     listen_ip=str(advertised_ip or from_ip),
-                    data_port=int(msg.get("data_port") or self.data_port),
+                    data_port=int(advertised_data_port or self.data_port),
                     segment_id=str(msg.get("segment_id") or self.segment_id),
                     advertised_ip=str(advertised_ip or ""),
                     last_hello_from_ip=str(from_ip or ""),
@@ -24440,29 +24576,36 @@ class HyperVRouterManager:
             old_tuple = (
                 peer.listen_ip,
                 peer.data_port,
+                peer.discovery_port,
                 peer.host_name,
                 set(peer.sender_ids),
                 dict(peer.sender_kinds),
                 peer.last_hello_from_ip,
                 peer.last_data_from_ip,
+                peer.discovery_success_count,
             )
 
-            peer.host_name = str(msg.get("host_name") or peer.host_name)
-            peer.advertised_ip = str(msg.get("listen_ip") or peer.advertised_ip or from_ip)
+            peer.host_name = str(msg.get("host_name") or peer.host_name or node_id)
+            peer.segment_id = str(msg.get("segment_id") or peer.segment_id or self.segment_id)
+            peer.advertised_ip = str(advertised_ip or peer.advertised_ip or from_ip or "")
             peer.last_hello_from_ip = str(from_ip or peer.last_hello_from_ip or "")
-            if from_port > 0:
+            if int(from_port or 0) > 0:
                 peer.last_hello_from_port = int(from_port)
+
             if which == "data":
                 peer.last_data_from_ip = str(from_ip or peer.last_data_from_ip or "")
+                if int(from_port or 0) > 0:
+                    peer.last_data_from_port = int(from_port)
+
             peer.listen_ip = self._choose_peer_ip(
                 peer.advertised_ip,
                 peer.last_hello_from_ip,
                 peer.last_data_from_ip,
                 peer.listen_ip,
             )
-            peer.data_port = int(msg.get("data_port") or peer.data_port)
-            peer.discovery_port = int(msg.get("discovery_port") or peer.discovery_port or self.discovery_port)
-            peer.segment_id = str(msg.get("segment_id") or peer.segment_id)
+
+            peer.data_port = int(advertised_data_port or peer.data_port or self.data_port)
+            peer.discovery_port = int(advertised_discovery_port or peer.discovery_port or self.discovery_port)
             peer.sender_ids = set(str(x) for x in (msg.get("sender_ids") or []))
             peer.sender_kinds = {str(k): str(v) for k, v in (msg.get("sender_kinds") or {}).items()}
             peer.allow_protocols = set(str(x) for x in (msg.get("allow_protocols") or []))
@@ -24471,44 +24614,46 @@ class HyperVRouterManager:
             peer.last_seen = now
             peer.online = True
             peer.hello_count += 1
-
-            if which == "data" and from_port > 0:
-                peer.data_port = int(msg.get("data_port") or from_port or peer.data_port)
-            elif from_port > 0 and not peer.discovery_port:
-                peer.discovery_port = int(from_port)
+            peer.last_discovery_rx_ts = now
+            if str(msg.get("hello_id") or "").strip():
+                peer.last_hello_id = str(msg.get("hello_id") or "").strip()
 
             new_tuple = (
                 peer.listen_ip,
                 peer.data_port,
+                peer.discovery_port,
                 peer.host_name,
                 set(peer.sender_ids),
                 dict(peer.sender_kinds),
                 peer.last_hello_from_ip,
                 peer.last_data_from_ip,
+                peer.discovery_success_count,
             )
             changed = new_tuple != old_tuple
 
         if is_new:
             self._log_evt(
                 "peer",
-                f"peer discovered node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} senders={sorted(peer.sender_ids)} protocols={sorted(peer.allow_protocols)}",
+                f"peer discovered node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} discovery={peer.discovery_port} senders={sorted(peer.sender_ids)} protocols={sorted(peer.allow_protocols)}",
                 ["🤝", "🌐", "✅"],
             )
         elif changed:
             self._log_evt(
                 "peer",
-                f"peer updated node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} senders={sorted(peer.sender_ids)}",
+                f"peer updated node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} discovery={peer.discovery_port} senders={sorted(peer.sender_ids)}",
                 ["🔄", "🌐", "📝"],
             )
+
+
     def _send_hello_reply(self, hello_msg: dict, from_ip: str, from_port: int = 0) -> None:
         with self._sock_lock:
-            has_data = self._data_sock is not None
+            has_data = (self._data_sock is not None) or (self._discovery_tx_sock is not None) or (self._discovery_sock is not None)
         if not has_data:
             return
 
         reply_ports: List[int] = []
-        primary_data_port = int(hello_msg.get("data_port") or 0)
-        discovery_reply_port = int(hello_msg.get("discovery_port") or 0)
+        primary_data_port = int(hello_msg.get("reply_data_port") or hello_msg.get("data_port") or 0)
+        discovery_reply_port = int(hello_msg.get("reply_discovery_port") or hello_msg.get("discovery_port") or 0)
 
         for p in (primary_data_port, from_port, discovery_reply_port, self.discovery_port):
             if int(p or 0) > 0 and int(p) not in reply_ports:
@@ -24527,12 +24672,16 @@ class HyperVRouterManager:
         msg = {
             "magic": self.MAGIC,
             "type": "hello_ack",
+            "hello_id": str(hello_msg.get("hello_id") or ""),
             "node_id": self.node_id,
             "segment_id": self.segment_id,
             "host_name": self.host_name,
             "listen_ip": self._advertise_ip(),
+            "reply_to_ip": self._advertise_ip(),
             "data_port": self._bound_data_port or self.data_port,
+            "reply_data_port": self._bound_data_port or self.data_port,
             "discovery_port": self._bound_discovery_port or self.discovery_port,
+            "reply_discovery_port": self._bound_discovery_port or self.discovery_port,
             "sender_ids": sender_ids,
             "sender_kinds": sender_kinds,
             "allow_protocols": allow_protocols,
@@ -24541,14 +24690,38 @@ class HyperVRouterManager:
             "ts": time.time(),
         }
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        sent_any = False
         for port in reply_ports:
-            self._queue_network_message(
-                raw=raw,
-                ip=from_ip,
-                port=port,
-                mtype="hello_reply",
-                peer_node_id=str(hello_msg.get("node_id") or ""),
+            inline_ok = self._send_network_item_inline(
+                {
+                    "raw": raw,
+                    "ip": from_ip,
+                    "port": port,
+                    "mtype": "hello_reply",
+                    "peer_node_id": str(hello_msg.get("node_id") or ""),
+                }
             )
+            if not inline_ok:
+                inline_ok = self._queue_network_message(
+                    raw=raw,
+                    ip=from_ip,
+                    port=port,
+                    mtype="hello_reply",
+                    peer_node_id=str(hello_msg.get("node_id") or ""),
+                )
+            sent_any = inline_ok or sent_any
+
+        if sent_any:
+            self._stats["peer_discovery_reply"] = int(self._stats.get("peer_discovery_reply", 0)) + 1
+            self._log_sparse(
+                f"hello-reply:{from_ip}",
+                "peer",
+                f"hello reply sent to node={str(hello_msg.get('node_id') or '?')} ip={from_ip} ports={reply_ports}",
+                ["📡", "↩️", "✅"],
+                every=2.0,
+            )
+
     def _handle_remote_frame(self, msg: dict, from_ip: str, from_port: int) -> None:
         frame_id = str(msg.get("frame_id") or msg.get("id") or "")
         trace_id = str(msg.get("trace_id") or msg.get("trace") or "")
@@ -24557,10 +24730,14 @@ class HyperVRouterManager:
         src_sender_id = str(msg.get("src_sender_id") or msg.get("sender_id") or "")
         protocol_tag = str(msg.get("protocol_tag") or msg.get("protocol") or msg.get("proto") or "RAW")
 
+        ack_targets = self._candidate_ack_targets_from_message(msg, from_ip, from_port, src_node_id)
+        ack_ip = ack_targets[0][0] if ack_targets else str(from_ip or "")
+        ack_port = ack_targets[0][1] if ack_targets else int(from_port or 0)
+
         if not src_node_id:
             self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
+                dst_ip=ack_ip,
+                dst_port=ack_port,
                 dst_node_id=src_node_id,
                 frame_id=frame_id or "-",
                 status="bad_frame",
@@ -24573,8 +24750,8 @@ class HyperVRouterManager:
         raw = self._unpack_payload_bytes(msg)
         if raw is None:
             self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
+                dst_ip=ack_ip,
+                dst_port=ack_port,
                 dst_node_id=src_node_id,
                 frame_id=frame_id or "-",
                 status="decode_failed",
@@ -24601,8 +24778,8 @@ class HyperVRouterManager:
         if pkt is None:
             self._stats["remote_ingress_decode_fail"] += 1
             self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
+                dst_ip=ack_ip,
+                dst_port=ack_port,
                 dst_node_id=src_node_id,
                 frame_id=frame_id,
                 status="decode_failed",
@@ -24644,8 +24821,8 @@ class HyperVRouterManager:
         if queued:
             self._stats["remote_ingress_queued"] = int(self._stats.get("remote_ingress_queued", 0)) + 1
             self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
+                dst_ip=ack_ip,
+                dst_port=ack_port,
                 dst_node_id=src_node_id,
                 frame_id=frame_id,
                 status="received",
@@ -24666,8 +24843,8 @@ class HyperVRouterManager:
         if fed:
             self._stats["remote_ingress_ok"] += 1
             self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
+                dst_ip=ack_ip,
+                dst_port=ack_port,
                 dst_node_id=src_node_id,
                 frame_id=frame_id,
                 status="processed",
@@ -24686,8 +24863,8 @@ class HyperVRouterManager:
         if feed_error:
             detail += f" feed_error={feed_error}"
         self._send_frame_ack(
-            dst_ip=from_ip,
-            dst_port=from_port,
+            dst_ip=ack_ip,
+            dst_port=ack_port,
             dst_node_id=src_node_id,
             frame_id=frame_id,
             status="received",
@@ -24752,9 +24929,11 @@ class HyperVRouterManager:
         raw: bytes,
         dst_sender_id: str,
     ) -> List[bytes]:
-        payload_b64 = base64.b64encode(bytes(raw or b"")).decode("ascii")
+        payload_b64, payload_codec, payload_sha256 = self._pack_payload_bytes(bytes(raw or b""))
         payload_len = len(raw or b"")
-        payload_sha256 = hashlib.sha256(bytes(raw or b"")).hexdigest()
+        advertised_ip = self._advertise_ip()
+        preferred_ack_port = int(self._bound_data_port or self.data_port or 0)
+        source_sender_id = self._derive_source_sender_id(inbound_iface)
         base = {
             "magic": self.MAGIC,
             "segment_id": self.segment_id,
@@ -24768,8 +24947,8 @@ class HyperVRouterManager:
             "node_id": self.node_id,
             "src_host_name": self.host_name,
             "host_name": self.host_name,
-            "src_sender_id": self._derive_source_sender_id(inbound_iface),
-            "sender_id": self._derive_source_sender_id(inbound_iface),
+            "src_sender_id": source_sender_id,
+            "sender_id": source_sender_id,
             "dst_sender_id": dst_sender_id or "",
             "src_inbound_iface": inbound_iface,
             "payload_b64": payload_b64,
@@ -24778,9 +24957,23 @@ class HyperVRouterManager:
             "data_b64": payload_b64,
             "payload_len": payload_len,
             "payload_sha256": payload_sha256,
+            "payload_codec": payload_codec,
+            "codec": payload_codec,
+            "requires_ack": True,
+            "expects_ack": True,
+            "reply_to_ip": advertised_ip,
+            "reply_ip": advertised_ip,
+            "ack_ip": advertised_ip,
+            "reply_port": preferred_ack_port,
+            "ack_port": preferred_ack_port,
+            "reply_data_port": preferred_ack_port,
+            "src_data_port": preferred_ack_port,
+            "reply_discovery_port": int(self._bound_discovery_port or self.discovery_port or 0),
         }
         variants = []
-        for t in ("frame", "packet", "peer_frame", "data"):
+        wire_types = ["frame", "data"]
+        max_variants = max(1, int(getattr(self, "_max_frame_wire_variants", 2) or 2))
+        for t in wire_types[:max_variants]:
             msg = dict(base)
             msg["type"] = t
             if t == "data":
@@ -24804,9 +24997,15 @@ class HyperVRouterManager:
             "result": status,
             "detail": detail,
             "message": detail,
+            "reply_to_ip": self._advertise_ip(),
+            "reply_port": int(self._bound_data_port or self.data_port or 0),
         }
         out=[]
-        for t in ("ack", "frame_ack", "frame_status", status):
+        wire_types = ["ack", "frame_ack"]
+        if status not in {"ack", "frame_ack"}:
+            wire_types.append(status)
+        max_variants = max(1, int(getattr(self, "_max_ack_wire_variants", 2) or 2))
+        for t in wire_types[:max_variants]:
             msg=dict(base)
             msg["type"]=t
             out.append(json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
@@ -24859,6 +25058,8 @@ class HyperVRouterManager:
                 "created_ts": time.time(),
                 "last_send_ts": 0.0,
                 "retry_count": 0,
+                "send_success_count": 0,
+                "first_send_ok_ts": 0.0,
                 "last_ack_status": "",
                 "last_ack_detail": "",
                 "raw_msg": raw_messages[0],
@@ -24866,8 +25067,23 @@ class HyperVRouterManager:
             }
 
         ok_any = False
+        if peer_targets and raw_messages:
+            primary_item = {
+                "raw": raw_messages[0],
+                "ip": peer_targets[0][0],
+                "port": peer_targets[0][1],
+                "mtype": "frame",
+                "peer_node_id": dst_node_id,
+                "frame_id": frame_id,
+                "trace_id": trace_id,
+                "protocol_tag": protocol_tag,
+                "dst_sender_id": dst_sender_id,
+            }
+            ok_any = self._send_network_item_inline(primary_item) or ok_any
         for ip, port in peer_targets:
             for idx, raw_msg in enumerate(raw_messages):
+                if ok_any and idx == 0 and ip == peer_targets[0][0] and port == peer_targets[0][1]:
+                    continue
                 ok_any = self._queue_network_message(
                     raw=raw_msg,
                     ip=ip,
@@ -24893,6 +25109,17 @@ class HyperVRouterManager:
         raws = self._make_frame_ack_messages(frame_id=frame_id, status=status, detail=detail)
         targets = self._candidate_reply_targets(dst_node_id=dst_node_id, dst_ip=dst_ip, dst_port=int(dst_port or 0))
         ok_any = False
+        if raws and targets:
+            primary_item = {
+                "raw": raws[0],
+                "ip": targets[0][0],
+                "port": targets[0][1],
+                "mtype": "ack",
+                "peer_node_id": dst_node_id,
+                "frame_id": frame_id,
+                "status": status,
+            }
+            ok_any = self._send_network_item_inline(primary_item) or ok_any
         for raw in raws:
             for ip, port in targets:
                 ok_any = self._queue_network_message(
@@ -24905,6 +25132,53 @@ class HyperVRouterManager:
                     status=status,
                 ) or ok_any
         return ok_any
+    def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[Tuple[str, int]]:
+        out: List[Tuple[str, int]] = []
+
+        def _push(ip_val: Any, port_val: Any) -> None:
+            ip_s = str(ip_val or "").strip()
+            try:
+                port_i = int(port_val or 0)
+            except Exception:
+                port_i = 0
+            if ip_s and port_i > 0:
+                out.append((ip_s, port_i))
+
+        explicit_ips = [
+            msg.get("reply_ip"),
+            msg.get("reply_to_ip"),
+            msg.get("ack_ip"),
+            from_ip,
+        ]
+        explicit_ports = [
+            msg.get("reply_port"),
+            msg.get("ack_port"),
+            msg.get("reply_data_port"),
+            msg.get("src_data_port"),
+            from_port,
+            msg.get("reply_discovery_port"),
+            msg.get("discovery_port"),
+        ]
+
+        for ip_val in explicit_ips:
+            for port_val in explicit_ports:
+                _push(ip_val, port_val)
+
+        for ip_val, port_val in self._candidate_reply_targets(
+            dst_node_id=src_node_id,
+            dst_ip=str(from_ip or ""),
+            dst_port=int(from_port or 0),
+        ):
+            _push(ip_val, port_val)
+
+        deduped: List[Tuple[str, int]] = []
+        seen: Set[Tuple[str, int]] = set()
+        for item in out:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped
+
     def _candidate_reply_targets(self, *, dst_node_id: str, dst_ip: str, dst_port: int) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
         if dst_ip and int(dst_port or 0) > 0:
@@ -24941,6 +25215,72 @@ class HyperVRouterManager:
                 seen.add(item)
                 deduped.append(item)
         return deduped
+
+    def _can_assume_delivery(self, info: Dict[str, Any], now: Optional[float] = None) -> bool:
+        if not bool(getattr(self, "_assume_delivery_on_online_peer", True)):
+            return False
+
+        now = float(now or time.time())
+        last_send_ts = float(info.get("last_send_ts", 0.0) or 0.0)
+        first_send_ok_ts = float(info.get("first_send_ok_ts", 0.0) or 0.0)
+        send_success_count = int(info.get("send_success_count", 0) or 0)
+        peer_node_id = str(info.get("peer_node_id") or "")
+
+        if not peer_node_id or send_success_count <= 0 or last_send_ts <= 0.0:
+            return False
+
+        min_age = float(getattr(self, "_implicit_ack_grace_sec", 0.50) or 0.50)
+        if (now - last_send_ts) < min_age and (first_send_ok_ts <= 0.0 or (now - first_send_ok_ts) < min_age):
+            return False
+
+        with self._lock:
+            peer = self._peers.get(peer_node_id)
+            if peer is None or not peer.online:
+                return False
+            recent_seen = float(peer.last_seen or 0.0)
+            recent_discovery = float(peer.last_discovery_success_ts or 0.0)
+            recent_ack = float(peer.last_ack_ts or 0.0)
+
+        if recent_ack >= last_send_ts:
+            return True
+        if recent_seen >= last_send_ts:
+            return True
+        if recent_discovery >= last_send_ts:
+            return True
+        return False
+
+    def _complete_pending_frames_for_peer(self, node_id: str, *, reason: str, min_age_sec: float = 0.0) -> int:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return 0
+
+        now = time.time()
+        completed: List[Dict[str, Any]] = []
+        with self._pending_lock:
+            for frame_id, info in list(self._pending_frames.items()):
+                if str(info.get("peer_node_id") or "") != node_id:
+                    continue
+                last_send_ts = float(info.get("last_send_ts", 0.0) or 0.0)
+                send_success_count = int(info.get("send_success_count", 0) or 0)
+                if last_send_ts <= 0.0 or send_success_count <= 0:
+                    continue
+                if min_age_sec > 0.0 and (now - last_send_ts) < float(min_age_sec):
+                    continue
+                info["last_ack_status"] = "assumed_delivered"
+                info["last_ack_detail"] = f"delivery completed via {reason}"
+                info["last_ack_ts"] = now
+                completed.append(dict(info))
+                self._pending_frames.pop(frame_id, None)
+
+        for info in completed:
+            self._log_sparse(
+                f"ack-complete:{node_id}",
+                "ack",
+                f"delivery marked successful frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={node_id} reason={reason}",
+                ["✅", "📡", "🤝"],
+                every=0.75,
+            )
+        return len(completed)
 
     def _queue_network_message(
         self,
@@ -24994,7 +25334,11 @@ class HyperVRouterManager:
                 with self._pending_lock:
                     pending = self._pending_frames.get(str(item.get("frame_id") or ""))
                     if pending is not None:
-                        pending["last_send_ts"] = time.time()
+                        now_ts = time.time()
+                        pending["last_send_ts"] = now_ts
+                        pending["send_success_count"] = int(pending.get("send_success_count", 0)) + 1
+                        if float(pending.get("first_send_ok_ts", 0.0) or 0.0) <= 0.0:
+                            pending["first_send_ok_ts"] = now_ts
 
             return True
         except Exception as e:
@@ -25030,6 +25374,7 @@ class HyperVRouterManager:
         now = time.time()
         retry_items: List[Dict[str, Any]] = []
         expired: List[Dict[str, Any]] = []
+        assumed_success: List[Dict[str, Any]] = []
 
         with self._pending_lock:
             for frame_id, info in list(self._pending_frames.items()):
@@ -25038,6 +25383,14 @@ class HyperVRouterManager:
                 retry_count = int(info.get("retry_count", 0))
 
                 if last_send_ts <= 0.0:
+                    continue
+
+                if self._can_assume_delivery(info, now):
+                    info["last_ack_status"] = "assumed_delivered"
+                    info["last_ack_detail"] = "peer remained healthy without explicit ack"
+                    info["last_ack_ts"] = now
+                    assumed_success.append(dict(info))
+                    self._pending_frames.pop(frame_id, None)
                     continue
 
                 age = now - created_ts
@@ -25075,6 +25428,15 @@ class HyperVRouterManager:
                 "ack",
                 f"retrying unacked frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retry={info.get('retry_count')}",
                 ["🔁", "📡", "🧠"],
+                every=1.0,
+            )
+
+        for info in assumed_success:
+            self._log_sparse(
+                f"ack-assumed:{info.get('peer_node_id') or '?'}",
+                "ack",
+                f"delivery marked successful without explicit ack frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} reason={info.get('last_ack_status') or 'assumed_delivered'}",
+                ["✅", "📡", "🤝"],
                 every=1.0,
             )
 
@@ -25697,7 +26059,17 @@ class HyperVRouterManager:
     def _pack_payload_bytes(self, raw: bytes) -> Tuple[str, str, str]:
         payload = bytes(raw or b"")
         codec = "plain"
-        payload_sha256 = hashlib.sha256(raw).hexdigest()
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        compress_over = int(getattr(self, "_wire_payload_compress_over", 0) or 0)
+        if compress_over > 0 and len(payload) >= compress_over:
+            try:
+                compressed = zlib.compress(payload, level=1)
+                if len(compressed) + 24 < len(payload):
+                    payload = compressed
+                    codec = "zlib"
+            except Exception:
+                codec = "plain"
+                payload = bytes(raw or b"")
         return base64.b64encode(payload).decode("ascii"), codec, payload_sha256
 
     def _unpack_payload_bytes(self, msg: Dict[str, Any]) -> Optional[bytes]:
@@ -25854,6 +26226,7 @@ class HyperVRouterManager:
             return False
         except Exception:
             return False
+
 
 
 
