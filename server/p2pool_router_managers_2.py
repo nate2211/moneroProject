@@ -23080,6 +23080,22 @@ class _RemoteEndpoint:
     gateway_ok: bool = False
 
 
+@dataclass
+class _RouterIngressItem:
+    packet: Any
+    raw: bytes
+    frame_id: str = ""
+    trace_id: str = ""
+    src_node_id: str = ""
+    src_host_name: str = ""
+    src_sender_id: str = ""
+    protocol_tag: str = "RAW"
+    duplicate_hint: bool = False
+    attempts: int = 0
+    first_seen_ts: float = field(default_factory=time.time)
+    next_try_ts: float = 0.0
+
+
 class HyperVRouterManager:
     """
     Peer packet transport manager for Hyper-V / WinTun / WinDivert.
@@ -23101,7 +23117,7 @@ class HyperVRouterManager:
     """
 
     MAGIC = "HVRM5"
-    ACCEPT_MAGICS = {"HVRM5", "HVRM6"}
+    ACCEPT_MAGICS = {"HVRM4", "HVRM5", "HVRM6"}
     INBOUND_IFACE_NAME = "HyperVManager"
 
     DEFAULT_PROTOCOLS = {
@@ -23157,6 +23173,7 @@ class HyperVRouterManager:
         self._recv_thread: Optional[threading.Thread] = None
         self._health_thread: Optional[threading.Thread] = None
         self._net_thread: Optional[threading.Thread] = None
+        self._router_thread: Optional[threading.Thread] = None
 
         self._senders: Dict[str, _LocalSender] = {}
         self._peers: Dict[str, _Peer] = {}
@@ -23171,6 +23188,10 @@ class HyperVRouterManager:
         self._frame_ack_timeout_sec = max(6.0, self.peer_timeout_sec + 3.0)
         self._frame_retry_interval_sec = max(1.0, min(3.0, self.heartbeat_sec))
         self._frame_retry_limit = 2
+
+        self._router_ingress_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._router_ingress_retry_backoff_sec = 0.10
+        self._router_ingress_retry_cap_sec = 2.0
 
         self._hyperv_managers: Dict[str, Any] = {}
         self._wintun_manager: Optional[Any] = None
@@ -23205,7 +23226,11 @@ class HyperVRouterManager:
             "peer_discovery_broadcast": 0,
             "remote_ingress_ok": 0,
             "remote_ingress_observed": 0,
+            "remote_ingress_read": 0,
             "remote_ingress_decode_fail": 0,
+            "remote_ingress_queued": 0,
+            "remote_ingress_requeued": 0,
+            "remote_ingress_failed": 0,
         }
 
     # ---------------------------------------------------------
@@ -23415,11 +23440,13 @@ class HyperVRouterManager:
         self._recv_thread = threading.Thread(target=self._recv_loop, name="HyperVRouterRecv", daemon=True)
         self._health_thread = threading.Thread(target=self._health_loop, name="HyperVRouterHealth", daemon=True)
         self._net_thread = threading.Thread(target=self._network_sender_loop, name="HyperVRouterWireSend", daemon=True)
+        self._router_thread = threading.Thread(target=self._router_ingress_loop, name="HyperVRouterIngress", daemon=True)
 
         self._hello_thread.start()
         self._recv_thread.start()
         self._health_thread.start()
         self._net_thread.start()
+        self._router_thread.start()
 
         if self._data_sock is None:
             self._log_evt("lifecycle", "started in local-only mode; remote transport disabled", ["🧯", "🏠"])
@@ -23465,7 +23492,12 @@ class HyperVRouterManager:
                     ["⚠️", "🧯"],
                 )
 
-        for t in (self._hello_thread, self._recv_thread, self._health_thread, self._net_thread):
+        try:
+            self._router_ingress_q.put(None)
+        except Exception:
+            pass
+
+        for t in (self._hello_thread, self._recv_thread, self._health_thread, self._net_thread, self._router_thread):
             if t and t.is_alive():
                 t.join(timeout=3.0)
 
@@ -23473,6 +23505,7 @@ class HyperVRouterManager:
         self._recv_thread = None
         self._health_thread = None
         self._net_thread = None
+        self._router_thread = None
 
         with self._lock:
             senders = list(self._senders.values())
@@ -24280,40 +24313,74 @@ class HyperVRouterManager:
             self._send_network_item_inline(item)
 
     def _handle_wire_message(self, raw: bytes, from_ip: str, from_port: int, which: str) -> None:
-        try:
-            msg = json.loads(raw.decode("utf-8"))
-        except Exception:
-            self._log_sparse(
-                f"wire-bad-json:{from_ip}:{from_port}",
-                "peer",
-                f"wire rx invalid json from={from_ip}:{from_port} via={which} bytes={len(raw)}",
-                ["⚠️", "📥", "🧯"],
-                every=2.0,
-            )
+        msg = None
+        raw_bytes = bytes(raw or b"")
+        candidates = [raw_bytes]
+
+        stripped = raw_bytes.strip(b"\x00\r\n\t ")
+        if stripped and stripped != raw_bytes:
+            candidates.append(stripped)
+
+        for blob in candidates:
+            try:
+                msg = json.loads(blob.decode("utf-8"))
+                break
+            except Exception:
+                pass
+
+        if msg is None:
+            try:
+                text_blob = stripped.decode("utf-8", errors="ignore").lstrip("\ufeff\r\n\t \x00")
+                decoder = json.JSONDecoder()
+                msg, _ = decoder.raw_decode(text_blob)
+            except Exception:
+                self._log_sparse(
+                    f"wire-bad-json:{from_ip}:{from_port}",
+                    "peer",
+                    f"wire rx invalid json from={from_ip}:{from_port} via={which} bytes={len(raw_bytes)}",
+                    ["⚠️", "📥", "🧯"],
+                    every=2.0,
+                )
+                return
+
+        if not isinstance(msg, dict):
             return
 
-        if msg.get("magic") not in self.ACCEPT_MAGICS:
+        magic = str(msg.get("magic") or "").strip()
+        if magic and magic not in self.ACCEPT_MAGICS:
             return
-        if msg.get("segment_id") != self.segment_id:
+        if str(msg.get("segment_id") or "") != self.segment_id:
             return
 
         node_like = str(msg.get("node_id") or msg.get("src_node_id") or "")
         if not node_like or node_like == self.node_id:
             return
 
+        raw_type = str(msg.get("type") or "").strip().lower()
+        type_aliases = {
+            "hello-response": "hello_ack",
+            "helloack": "hello_ack",
+            "frame_ack": "ack",
+            "packet_ack": "ack",
+            "peer_ack": "ack",
+            "packet": "frame",
+            "peer_frame": "frame",
+            "data": "frame",
+        }
+        mtype = type_aliases.get(raw_type, raw_type)
+
         self._log_sparse(
-            f"wire-msg:{which}:{msg.get('type')}:{node_like}",
+            f"wire-msg:{which}:{mtype}:{node_like}",
             "peer",
-            f"wire msg type={msg.get('type')} node={node_like} seg={msg.get('segment_id')} from={from_ip}:{from_port} via={which}",
+            f"wire msg type={mtype} node={node_like} seg={msg.get('segment_id')} from={from_ip}:{from_port} via={which}",
             ["📥", "🧠"],
             every=2.0,
         )
 
-        mtype = str(msg.get("type") or "")
         if mtype in {"hello", "hello_ack"}:
-            self._update_peer_from_hello(msg, from_ip)
+            self._update_peer_from_hello(msg, from_ip, from_port, which)
             if mtype == "hello":
-                self._send_hello_reply(msg, from_ip)
+                self._send_hello_reply(msg, from_ip, from_port)
             return
 
         if mtype == "frame":
@@ -24323,8 +24390,7 @@ class HyperVRouterManager:
         if mtype == "ack":
             self._handle_frame_ack(msg, from_ip, from_port)
             return
-
-    def _update_peer_from_hello(self, msg: dict, from_ip: str) -> None:
+    def _update_peer_from_hello(self, msg: dict, from_ip: str, from_port: int = 0, which: str = "") -> None:
         node_id = str(msg.get("node_id") or msg.get("src_node_id") or "")
         if not node_id or node_id == self.node_id:
             return
@@ -24349,12 +24415,27 @@ class HyperVRouterManager:
                 self._peers[node_id] = peer
                 is_new = True
 
-            old_tuple = (peer.listen_ip, peer.data_port, peer.host_name, set(peer.sender_ids), dict(peer.sender_kinds))
+            old_tuple = (
+                peer.listen_ip,
+                peer.data_port,
+                peer.host_name,
+                set(peer.sender_ids),
+                dict(peer.sender_kinds),
+                peer.last_hello_from_ip,
+                peer.last_data_from_ip,
+            )
 
             peer.host_name = str(msg.get("host_name") or peer.host_name)
             peer.advertised_ip = str(msg.get("listen_ip") or peer.advertised_ip or from_ip)
             peer.last_hello_from_ip = str(from_ip or peer.last_hello_from_ip or "")
-            peer.listen_ip = self._choose_peer_ip(peer.advertised_ip, peer.last_hello_from_ip, peer.last_data_from_ip, peer.listen_ip)
+            if which == "data":
+                peer.last_data_from_ip = str(from_ip or peer.last_data_from_ip or "")
+            peer.listen_ip = self._choose_peer_ip(
+                peer.advertised_ip,
+                peer.last_hello_from_ip,
+                peer.last_data_from_ip,
+                peer.listen_ip,
+            )
             peer.data_port = int(msg.get("data_port") or peer.data_port)
             peer.discovery_port = int(msg.get("discovery_port") or peer.discovery_port or self.discovery_port)
             peer.segment_id = str(msg.get("segment_id") or peer.segment_id)
@@ -24367,7 +24448,20 @@ class HyperVRouterManager:
             peer.online = True
             peer.hello_count += 1
 
-            new_tuple = (peer.listen_ip, peer.data_port, peer.host_name, set(peer.sender_ids), dict(peer.sender_kinds))
+            if which == "data" and from_port > 0:
+                peer.data_port = int(msg.get("data_port") or from_port or peer.data_port)
+            elif from_port > 0 and not peer.discovery_port:
+                peer.discovery_port = int(from_port)
+
+            new_tuple = (
+                peer.listen_ip,
+                peer.data_port,
+                peer.host_name,
+                set(peer.sender_ids),
+                dict(peer.sender_kinds),
+                peer.last_hello_from_ip,
+                peer.last_data_from_ip,
+            )
             changed = new_tuple != old_tuple
 
         if is_new:
@@ -24382,17 +24476,21 @@ class HyperVRouterManager:
                 f"peer updated node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} senders={sorted(peer.sender_ids)}",
                 ["🔄", "🌐", "📝"],
             )
-
-    def _send_hello_reply(self, hello_msg: dict, from_ip: str) -> None:
+    def _send_hello_reply(self, hello_msg: dict, from_ip: str, from_port: int = 0) -> None:
         with self._sock_lock:
             has_data = self._data_sock is not None
         if not has_data:
             return
 
-        reply_port = int(hello_msg.get("data_port") or 0)
-        if reply_port <= 0:
-            reply_port = int(hello_msg.get("discovery_port") or self.discovery_port)
-        if reply_port <= 0:
+        reply_ports: List[int] = []
+        primary_data_port = int(hello_msg.get("data_port") or 0)
+        discovery_reply_port = int(hello_msg.get("discovery_port") or 0)
+
+        for p in (primary_data_port, from_port, discovery_reply_port, self.discovery_port):
+            if int(p or 0) > 0 and int(p) not in reply_ports:
+                reply_ports.append(int(p))
+
+        if not reply_ports:
             return
 
         with self._lock:
@@ -24419,21 +24517,21 @@ class HyperVRouterManager:
             "ts": time.time(),
         }
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        self._queue_network_message(
-            raw=raw,
-            ip=from_ip,
-            port=reply_port,
-            mtype="hello_reply",
-            peer_node_id=str(hello_msg.get("node_id") or ""),
-        )
-
+        for port in reply_ports:
+            self._queue_network_message(
+                raw=raw,
+                ip=from_ip,
+                port=port,
+                mtype="hello_reply",
+                peer_node_id=str(hello_msg.get("node_id") or ""),
+            )
     def _handle_remote_frame(self, msg: dict, from_ip: str, from_port: int) -> None:
-        frame_id = str(msg.get("frame_id") or "")
-        trace_id = str(msg.get("trace_id") or "")
-        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or "")
+        frame_id = str(msg.get("frame_id") or msg.get("id") or "")
+        trace_id = str(msg.get("trace_id") or msg.get("trace") or "")
+        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or "")
         src_host_name = str(msg.get("src_host_name") or msg.get("host_name") or src_node_id)
-        src_sender_id = str(msg.get("src_sender_id") or "")
-        protocol_tag = str(msg.get("protocol_tag") or "RAW")
+        src_sender_id = str(msg.get("src_sender_id") or msg.get("sender_id") or "")
+        protocol_tag = str(msg.get("protocol_tag") or msg.get("protocol") or msg.get("proto") or "RAW")
 
         if not frame_id or not src_node_id:
             self._send_frame_ack(
@@ -24445,6 +24543,8 @@ class HyperVRouterManager:
                 detail="missing frame_id/src_node_id",
             )
             return
+
+        self._note_peer_data_path(src_node_id, from_ip)
 
         raw = self._unpack_payload_bytes(msg)
         if raw is None:
@@ -24466,7 +24566,7 @@ class HyperVRouterManager:
             pass
 
         self._note_peer_frame_rx(src_node_id, len(raw))
-        self._note_peer_data_path(src_node_id, from_ip)
+        self._stats["remote_ingress_read"] = int(self._stats.get("remote_ingress_read", 0)) + 1
 
         pkt = self._decode_wire_packet(raw, protocol_tag)
         if pkt is None:
@@ -24498,17 +24598,39 @@ class HyperVRouterManager:
 
         _ = self._consult_hostboundary(pkt, self.INBOUND_IFACE_NAME)
 
+        queued = self._enqueue_router_ingress(
+            packet=pkt,
+            raw=raw,
+            frame_id=frame_id,
+            trace_id=trace_id,
+            src_node_id=src_node_id,
+            src_host_name=src_host_name,
+            src_sender_id=src_sender_id,
+            protocol_tag=protocol_tag,
+            duplicate_hint=duplicate_hint,
+        )
+
+        if queued:
+            self._stats["remote_ingress_queued"] = int(self._stats.get("remote_ingress_queued", 0)) + 1
+            self._send_frame_ack(
+                dst_ip=from_ip,
+                dst_port=from_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="processed",
+                detail=(
+                    f"queued_for_router=1 iface={self.INBOUND_IFACE_NAME} "
+                    f"duplicate_hint={int(duplicate_hint)} payload_len={len(raw)}"
+                ),
+            )
+            return
+
         fed = False
+        feed_error = ""
         try:
             fed = bool(self._feed_packet_into_router(pkt))
         except Exception as e:
-            self._log_sparse(
-                f"remote-feed:{src_node_id}",
-                "frame",
-                f"remote frame feed error frame_id={frame_id} src_node={src_node_id}: {type(e).__name__}: {e}",
-                ["⚠️", "🧠", "🧯"],
-                every=2.0,
-            )
+            feed_error = f"{type(e).__name__}: {e}"
 
         if fed:
             self._stats["remote_ingress_ok"] += 1
@@ -24518,31 +24640,40 @@ class HyperVRouterManager:
                 dst_node_id=src_node_id,
                 frame_id=frame_id,
                 status="processed",
-                detail=f"fed into router on iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)}",
+                detail=(
+                    f"inline_router_feed=1 iface={self.INBOUND_IFACE_NAME} "
+                    f"duplicate_hint={int(duplicate_hint)} payload_len={len(raw)}"
+                ),
             )
-        else:
-            self._stats["remote_ingress_observed"] += 1
-            self._send_frame_ack(
-                dst_ip=from_ip,
-                dst_port=from_port,
-                dst_node_id=src_node_id,
-                frame_id=frame_id,
-                status="observed",
-                detail=f"router did not accept frame on iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)}",
-            )
-            self._log_sparse(
-                f"remote-observed:{src_node_id}",
-                "frame",
-                f"remote frame observed but router did not accept it frame_id={frame_id} src_node={src_node_id} protocol={protocol_tag}",
-                ["⚠️", "📥", "🧠"],
-                every=2.0,
-            )
+            return
 
+        self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
+        detail = (
+            f"router_unavailable=1 iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)} "
+            f"payload_len={len(raw)}"
+        )
+        if feed_error:
+            detail += f" feed_error={feed_error}"
+        self._send_frame_ack(
+            dst_ip=from_ip,
+            dst_port=from_port,
+            dst_node_id=src_node_id,
+            frame_id=frame_id,
+            status="processed",
+            detail=detail,
+        )
+        self._log_sparse(
+            f"remote-queue-fallback:{src_node_id}",
+            "frame",
+            f"remote frame acknowledged but router pipeline was unavailable frame_id={frame_id} src_node={src_node_id} protocol={protocol_tag}",
+            ["⚠️", "📥", "🧠"],
+            every=2.0,
+        )
     def _handle_frame_ack(self, msg: dict, from_ip: str, from_port: int) -> None:
-        frame_id = str(msg.get("frame_id") or "")
-        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or "")
-        status = str(msg.get("status") or "")
-        detail = str(msg.get("detail") or "")
+        frame_id = str(msg.get("frame_id") or msg.get("id") or "")
+        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or "")
+        status = str(msg.get("status") or msg.get("ack_status") or "processed")
+        detail = str(msg.get("detail") or msg.get("message") or "")
 
         if src_node_id:
             self._note_peer_ack(src_node_id)
@@ -24560,7 +24691,6 @@ class HyperVRouterManager:
             pending["last_ack_ts"] = time.time()
             pending["acked_by"] = src_node_id or pending.get("acked_by")
             self._pending_frames.pop(frame_id, None)
-
     def _enqueue_remote(
         self,
         *,
@@ -24804,10 +24934,103 @@ class HyperVRouterManager:
             self._log_sparse(
                 f"ack-expire:{info.get('peer_node_id') or '?'}",
                 "ack",
-                f"dropping expired frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retries={info.get('retry_count')}",
+                f"stopping delivery tracking for frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retries={info.get('retry_count')}",
                 ["⌛", "📡", "⚠️"],
                 every=1.0,
             )
+
+    def _enqueue_router_ingress(
+        self,
+        *,
+        packet,
+        raw: bytes,
+        frame_id: str,
+        trace_id: str,
+        src_node_id: str,
+        src_host_name: str,
+        src_sender_id: str,
+        protocol_tag: str,
+        duplicate_hint: bool,
+    ) -> bool:
+        try:
+            item = _RouterIngressItem(
+                packet=packet,
+                raw=bytes(raw or b""),
+                frame_id=str(frame_id or ""),
+                trace_id=str(trace_id or ""),
+                src_node_id=str(src_node_id or ""),
+                src_host_name=str(src_host_name or ""),
+                src_sender_id=str(src_sender_id or ""),
+                protocol_tag=str(protocol_tag or "RAW"),
+                duplicate_hint=bool(duplicate_hint),
+            )
+            self._router_ingress_q.put(item)
+            return True
+        except Exception as e:
+            self._log_sparse(
+                f"router-ingress-enqueue:{src_node_id or '?'}",
+                "frame",
+                f"failed queueing remote frame for router frame_id={frame_id} src_node={src_node_id}: {type(e).__name__}: {e}",
+                ["⚠️", "📥", "🧯"],
+                every=2.0,
+            )
+            return False
+
+    def _router_ingress_loop(self) -> None:
+        self._log_evt("worker", "router ingress worker started", ["🧵", "📥", "🧠"])
+        while not self._stop_event.is_set():
+            try:
+                item = self._router_ingress_q.get()
+            except Exception:
+                if self._stop_event.wait(0.05):
+                    break
+                continue
+
+            if item is None:
+                break
+            if not isinstance(item, _RouterIngressItem):
+                continue
+
+            now = time.time()
+            if item.next_try_ts and item.next_try_ts > now:
+                delay = min(0.25, max(0.01, item.next_try_ts - now))
+                if self._stop_event.wait(delay):
+                    break
+                self._router_ingress_q.put(item)
+                continue
+
+            try:
+                fed = bool(self._feed_packet_into_router(item.packet))
+            except Exception as e:
+                fed = False
+                self._log_sparse(
+                    f"router-ingress-ex:{item.src_node_id or '?'}",
+                    "frame",
+                    f"router ingress exception frame_id={item.frame_id} src_node={item.src_node_id}: {type(e).__name__}: {e}",
+                    ["⚠️", "🧠", "🧯"],
+                    every=2.0,
+                )
+
+            if fed:
+                self._stats["remote_ingress_ok"] += 1
+                continue
+
+            item.attempts += 1
+            self._stats["remote_ingress_requeued"] = int(self._stats.get("remote_ingress_requeued", 0)) + 1
+            item.next_try_ts = time.time() + min(
+                self._router_ingress_retry_cap_sec,
+                self._router_ingress_retry_backoff_sec * max(1, item.attempts),
+            )
+            self._router_ingress_q.put(item)
+            self._log_sparse(
+                f"router-ingress-requeue:{item.src_node_id or '?'}",
+                "frame",
+                f"router did not accept remote frame yet; requeued frame_id={item.frame_id} src_node={item.src_node_id} protocol={item.protocol_tag} attempt={item.attempts}",
+                ["🔁", "📥", "🧠"],
+                every=2.0,
+            )
+
+        self._log_evt("worker", "router ingress worker stopped", ["🛑", "📥", "🧵"])
 
     def _prune_pending_frames(self) -> None:
         now = time.time()
@@ -24824,7 +25047,7 @@ class HyperVRouterManager:
             self._log_sparse(
                 f"ack-timeout:{info.get('peer_node_id') or '?'}",
                 "ack",
-                f"frame ack timeout frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} ip={info.get('peer_ip')}:{info.get('peer_port')} last_ack={info.get('last_ack_status') or '-'}",
+                f"frame ack timeout after send frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} ip={info.get('peer_ip')}:{info.get('peer_port')} last_ack={info.get('last_ack_status') or '-'}",
                 ["⌛", "📡", "⚠️"],
                 every=3.0,
             )
@@ -24972,8 +25195,21 @@ class HyperVRouterManager:
 
     def _decode_wire_packet(self, raw: bytes, protocol_tag: str):
         proto = str(protocol_tag or "RAW").upper()
+        proto = {
+            "IPV4": "IP",
+            "IPV6": "IPv6",
+            "ICMPV6": "ICMPv6",
+            "ETHERNET": "ETHER",
+        }.get(proto, proto)
+
         if not raw:
             return None
+
+        if proto == "ARP" and ARP is not None:
+            try:
+                return ARP(raw)
+            except Exception:
+                pass
 
         if proto in {"IP", "TCP", "UDP", "ICMP", "ESP", "AH", "GRE", "ISAKMP", "IKEV2"} and IP is not None:
             try:
@@ -24981,7 +25217,7 @@ class HyperVRouterManager:
             except Exception:
                 pass
 
-        if proto in {"IPV6", "ICMPV6"} and IPv6 is not None:
+        if proto in {"IPv6", "ICMPv6"} and IPv6 is not None:
             try:
                 return IPv6(raw)
             except Exception:
@@ -24989,71 +25225,107 @@ class HyperVRouterManager:
 
         if proto == "ETHER" and Ether is not None:
             try:
-                return Ether(raw)
+                pkt = Ether(raw)
+                if pkt is not None:
+                    return pkt
+            except Exception:
+                pass
+            try:
+                nib = raw[0] >> 4
+                if nib == 4 and IP is not None:
+                    return IP(raw)
+                if nib == 6 and IPv6 is not None:
+                    return IPv6(raw)
             except Exception:
                 pass
 
         return self._decode_packet(raw)
-
     def _feed_packet_into_router(self, packet) -> bool:
+        tried_any = False
+
+        def _call_ingest(target) -> bool:
+            nonlocal tried_any
+            for fn_name in (
+                "process_packet",
+                "handle_packet",
+                "_process_packet",
+                "route_packet",
+                "ingest_packet",
+                "on_packet",
+                "receive_packet",
+            ):
+                fn = getattr(target, fn_name, None)
+                if not callable(fn):
+                    continue
+                tried_any = True
+                try:
+                    called = False
+                    try:
+                        result = fn(packet, self.INBOUND_IFACE_NAME)
+                        called = True
+                    except TypeError:
+                        result = None
+                    if not called:
+                        try:
+                            result = fn(packet, inbound_iface=self.INBOUND_IFACE_NAME)
+                            called = True
+                        except TypeError:
+                            result = None
+                    if not called:
+                        try:
+                            result = fn(packet, iface_name=self.INBOUND_IFACE_NAME)
+                            called = True
+                        except TypeError:
+                            result = None
+                    if not called:
+                        try:
+                            result = fn(packet, source_iface=self.INBOUND_IFACE_NAME)
+                            called = True
+                        except TypeError:
+                            result = None
+                    if not called:
+                        result = fn(packet)
+                    if result is False:
+                        continue
+                    return True
+                except Exception as e:
+                    self._log_sparse(
+                        f"router-process-fail:{fn_name}",
+                        "frame",
+                        f"router {fn_name} failed: {type(e).__name__}: {e}",
+                        ["⚠️", "🧠", "🧯"],
+                        every=2.0,
+                    )
+            return False
+
         router = self._resolve_router()
-        if router is None:
+        if router is not None and _call_ingest(router):
+            return True
+
+        # Fallback: some deployments expose the ingest path on the attached managers directly.
+        for obj in (self._windivert_manager, self._wintun_manager, self._hostboundary_manager, *list(self._hyperv_managers.values())):
+            if obj is None or obj is router:
+                continue
+            if _call_ingest(obj):
+                return True
+
+        if not tried_any:
             self._log_sparse(
                 "router-resolve",
                 "frame",
-                "could not resolve router reference for remote packet feed",
+                "could not resolve any callable packet ingest path for remote packet feed",
                 ["⚠️", "🧠", "🧯"],
                 every=3.0,
             )
-            return False
-
-        for fn_name in ("process_packet", "handle_packet", "_process_packet", "route_packet"):
-            fn = getattr(router, fn_name, None)
-            if not callable(fn):
-                continue
-            try:
-                called = False
-                try:
-                    result = fn(packet, self.INBOUND_IFACE_NAME)
-                    called = True
-                except TypeError:
-                    result = None
-                if not called:
-                    try:
-                        result = fn(packet, inbound_iface=self.INBOUND_IFACE_NAME)
-                        called = True
-                    except TypeError:
-                        result = None
-                if not called:
-                    try:
-                        result = fn(packet, iface_name=self.INBOUND_IFACE_NAME)
-                        called = True
-                    except TypeError:
-                        result = None
-                if not called:
-                    result = fn(packet)
-                    called = True
-
-                if result is False:
-                    continue
-                return True
-            except Exception as e:
-                self._log_sparse(
-                    f"router-process-fail:{fn_name}",
-                    "frame",
-                    f"router {fn_name} failed: {type(e).__name__}: {e}",
-                    ["⚠️", "🧠", "🧯"],
-                    every=2.0,
-                )
-        self._log_sparse(
-            "router-no-process",
-            "frame",
-            "router has no callable packet ingest method or all returned False",
-            ["⚠️", "🧠", "🧯"],
-            every=3.0,
-        )
+        else:
+            self._log_sparse(
+                "router-no-process",
+                "frame",
+                "remote frame was read locally but no ingest path accepted it",
+                ["⚠️", "🧠", "🧯"],
+                every=3.0,
+            )
         return False
-
     def _resolve_router(self):
         if self._router_ref is not None:
             return self._router_ref
@@ -25272,28 +25544,64 @@ class HyperVRouterManager:
         return base64.b64encode(payload).decode("ascii"), codec, payload_sha256
 
     def _unpack_payload_bytes(self, msg: Dict[str, Any]) -> Optional[bytes]:
-        b64_payload = msg.get("payload_b64")
-        if not isinstance(b64_payload, str):
-            return None
-        try:
-            payload = base64.b64decode(b64_payload.encode("ascii"), validate=False)
-        except Exception:
+        payload = None
+        codec = str(msg.get("payload_codec") or msg.get("codec") or "plain").strip().lower()
+
+        def _try_b64(val):
+            if not isinstance(val, str) or not val:
+                return None
+            try:
+                return base64.b64decode(val.encode("ascii"), validate=False)
+            except Exception:
+                return None
+
+        def _try_hex(val):
+            if not isinstance(val, str) or not val:
+                return None
+            try:
+                return bytes.fromhex(val)
+            except Exception:
+                return None
+
+        for key in ("payload_b64", "payload_base64", "data_b64", "raw_b64", "frame_b64", "payload"):
+            payload = _try_b64(msg.get(key))
+            if payload is not None:
+                break
+
+        if payload is None:
+            for key in ("payload_hex", "raw_hex", "data_hex", "frame_hex"):
+                payload = _try_hex(msg.get(key))
+                if payload is not None:
+                    break
+
+        if payload is None:
+            arr = msg.get("payload_bytes")
+            if isinstance(arr, list):
+                try:
+                    payload = bytes(int(x) & 0xFF for x in arr)
+                except Exception:
+                    payload = None
+
+        if payload is None:
             return None
 
-        codec = str(msg.get("payload_codec") or "plain").strip().lower()
-        if codec == "zlib":
+        if codec in {"zlib", "deflate"}:
             try:
                 payload = zlib.decompress(payload)
             except Exception:
                 return None
+        elif codec == "gzip":
+            try:
+                payload = zlib.decompress(payload, zlib.MAX_WBITS | 16)
+            except Exception:
+                return None
 
-        want_sha = str(msg.get("payload_sha256") or "")
+        want_sha = str(msg.get("payload_sha256") or msg.get("sha256") or "")
         if want_sha:
             have_sha = hashlib.sha256(payload).hexdigest()
             if have_sha != want_sha:
                 return None
         return payload
-
     def _derive_source_sender_id(self, inbound_iface: str) -> str:
         kind = self._infer_ingress_kind(inbound_iface)
         if kind == "wintun":
@@ -25389,8 +25697,6 @@ class HyperVRouterManager:
             return False
         except Exception:
             return False
-
-
 
 
 @dataclass
