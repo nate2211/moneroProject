@@ -23124,6 +23124,9 @@ class HyperVRouterManager:
       - LAN/private targets only by default
       - no immediate "received" + later "processed" double-ack spam
       - sparse, state-oriented logging
+      - early-drops local noise/broadcast/multicast from sidecar mirroring
+      - bounded ingress/pending queues with drop-or-defer behavior
+      - no inline queue-full send fallback on hot paths
     """
 
     MAGIC = "HVRM5"
@@ -23133,6 +23136,10 @@ class HyperVRouterManager:
     DEFAULT_PROTOCOLS = {
         "ETHER", "IP", "IPv6", "TCP", "UDP", "ICMP", "ICMPv6", "ARP",
         "ESP", "AH", "GRE", "ISAKMP", "IKEv2", "RAW",
+    }
+
+    LOCAL_NOISE_UDP_PORTS = {
+        137, 138, 1900, 3702, 5353, 5355, 546, 547,
     }
 
     def __init__(
@@ -23191,15 +23198,17 @@ class HyperVRouterManager:
         self._net_tx_q: queue.Queue = queue.Queue(maxsize=self.max_network_queue)
 
         self._recent: Dict[str, float] = {}
-        self._recent_order: List[Tuple[str, float]] = []
+        self._recent_order: Deque[Tuple[str, float]] = deque()
 
         self._pending_frames: Dict[str, Dict[str, Any]] = {}
         self._pending_lock = threading.RLock()
         self._frame_ack_timeout_sec = max(5.0, self.peer_timeout_sec)
         self._frame_retry_interval_sec = max(1.0, min(2.0, self.heartbeat_sec))
         self._frame_retry_limit = 1
+        self._pending_frame_cap = max(512, min(max_network_queue * 2, 16384))
 
-        self._router_ingress_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._router_ingress_queue_size = max(256, min(max_network_queue, 8192))
+        self._router_ingress_q: queue.Queue = queue.Queue(maxsize=self._router_ingress_queue_size)
         self._router_ingress_retry_backoff_sec = 0.10
         self._router_ingress_retry_cap_sec = 1.0
         self._router_ingress_retry_limit = 6
@@ -23255,6 +23264,7 @@ class HyperVRouterManager:
             "peer_send_fail": 0,
             "peer_send_ok": 0,
             "peer_send_retry": 0,
+            "peer_send_queue_full": 0,
             "peer_discovery_multicast": 0,
             "peer_discovery_broadcast": 0,
             "peer_discovery_rx": 0,
@@ -23267,6 +23277,10 @@ class HyperVRouterManager:
             "remote_ingress_queued": 0,
             "remote_ingress_requeued": 0,
             "remote_ingress_failed": 0,
+            "remote_ingress_queue_full": 0,
+            "pending_pruned": 0,
+            "local_sender_queue_full": 0,
+            "noise_dropped": 0,
         }
 
     # ---------------------------------------------------------
@@ -23540,7 +23554,7 @@ class HyperVRouterManager:
                 )
 
         try:
-            self._router_ingress_q.put(None)
+            self._router_ingress_q.put_nowait(None)
         except Exception:
             pass
 
@@ -23616,6 +23630,11 @@ class HyperVRouterManager:
             if protocol_tag is None:
                 return False
 
+            # Early-drop local noise so this sidecar never mirrors broadcast chatter.
+            if self._should_drop_sidecar_noise(packet, protocol_tag):
+                self._stats["noise_dropped"] = int(self._stats.get("noise_dropped", 0)) + 1
+                return False
+
             raw = self._packet_to_bytes(packet)
             if not raw:
                 return False
@@ -23638,10 +23657,7 @@ class HyperVRouterManager:
             ingress_kind = self._infer_ingress_kind(iface_name)
 
             try:
-                if self._is_noisy_local_broadcast(packet):
-                    fp = self._broadcast_fingerprint(raw, protocol_tag)
-                else:
-                    fp = self._fingerprint(raw, iface_name, protocol_tag, prefix=(ingress_kind or "pkt"))
+                fp = self._fingerprint(raw, iface_name, protocol_tag, prefix=(ingress_kind or "pkt"))
                 self._seen_recently(fp)
             except Exception:
                 pass
@@ -23842,20 +23858,16 @@ class HyperVRouterManager:
             state.send_q.put_nowait(qf)
             return True
         except queue.Full:
-            try:
-                pkt = self._decode_packet(qf.raw)
-                if pkt is None:
-                    state.drop_count += 1
-                    return False
-
-                ok = state.send_callable(pkt)
-                if ok is False:
-                    return False
-
-                state.send_count += 1
-                return True
-            except Exception:
-                return False
+            state.drop_count += 1
+            self._stats["local_sender_queue_full"] = int(self._stats.get("local_sender_queue_full", 0)) + 1
+            self._log_sparse(
+                f"local-queue-full:{state.sender_id}",
+                "worker",
+                f"sender queue full; dropping packet sender='{state.sender_id}' proto={qf.protocol_tag}",
+                ["⚠️", "📦", "🧯"],
+                every=2.0,
+            )
+            return False
 
     def _coerce_send_item(self, item: Any) -> Optional[_QueuedLocalFrame]:
         if item is None:
@@ -24600,11 +24612,6 @@ class HyperVRouterManager:
             )
 
     def _send_hello_reply(self, hello_msg: dict, from_ip: str, from_port: int = 0) -> None:
-        with self._sock_lock:
-            tx_sock = self._discovery_tx_sock or self._discovery_sock or self._data_sock
-        if tx_sock is None:
-            return
-
         with self._lock:
             sender_ids = sorted(self._senders.keys())
             sender_kinds = {sid: self._senders[sid].kind for sid in self._senders}
@@ -24635,7 +24642,6 @@ class HyperVRouterManager:
         }
         raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-        # one best reply target only
         preferred_port = 0
         if int(from_port or 0) == int(self.discovery_port) or int(from_port or 0) == int(self._bound_discovery_port):
             preferred_port = int(hello_msg.get("reply_discovery_port") or hello_msg.get("discovery_port") or from_port or self.discovery_port)
@@ -24645,21 +24651,19 @@ class HyperVRouterManager:
         if not self._transport_ip_allowed(from_ip, discovery=(preferred_port == self.discovery_port or preferred_port == self._bound_discovery_port)):
             return
 
-        ok = self._send_network_item_inline(
-            {
-                "raw": raw,
-                "ip": from_ip,
-                "port": preferred_port,
-                "mtype": "hello_reply",
-                "peer_node_id": str(hello_msg.get("node_id") or ""),
-            }
+        ok = self._queue_network_message(
+            raw=raw,
+            ip=from_ip,
+            port=preferred_port,
+            mtype="hello_reply",
+            peer_node_id=str(hello_msg.get("node_id") or ""),
         )
         if ok:
             self._stats["peer_discovery_reply"] = int(self._stats.get("peer_discovery_reply", 0)) + 1
             self._log_sparse(
                 f"hello-reply:{from_ip}",
                 "peer",
-                f"hello reply sent to node={str(hello_msg.get('node_id') or '?')} ip={from_ip}:{preferred_port}",
+                f"hello reply queued to node={str(hello_msg.get('node_id') or '?')} ip={from_ip}:{preferred_port}",
                 ["📡", "↩️", "✅"],
                 every=3.0,
             )
@@ -24757,35 +24761,11 @@ class HyperVRouterManager:
             self._stats["remote_ingress_queued"] = int(self._stats.get("remote_ingress_queued", 0)) + 1
             return
 
-        fed = False
-        feed_error = ""
-        try:
-            fed = bool(self._feed_packet_into_router(pkt))
-        except Exception as e:
-            feed_error = f"{type(e).__name__}: {e}"
-
-        if fed:
-            self._stats["remote_ingress_ok"] += 1
-            self._send_frame_ack(
-                dst_ip=ack_ip,
-                dst_port=ack_port,
-                dst_node_id=src_node_id,
-                frame_id=frame_id,
-                status="processed",
-                detail=(
-                    f"inline_router_feed=1 iface={self.INBOUND_IFACE_NAME} "
-                    f"duplicate_hint={int(duplicate_hint)} payload_len={len(raw)}"
-                ),
-            )
-            return
-
         self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
         detail = (
-            f"router_unavailable=1 iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)} "
+            f"router_queue_full=1 iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)} "
             f"payload_len={len(raw)}"
         )
-        if feed_error:
-            detail += f" feed_error={feed_error}"
         self._send_frame_ack(
             dst_ip=ack_ip,
             dst_port=ack_port,
@@ -24929,6 +24909,17 @@ class HyperVRouterManager:
         )[0]
 
         with self._pending_lock:
+            self._enforce_pending_frame_cap_locked()
+            if len(self._pending_frames) >= self._pending_frame_cap:
+                self._log_sparse(
+                    f"pending-cap:{dst_node_id}",
+                    "ack",
+                    f"pending frame cap reached; dropping new frame peer={dst_node_id} proto={protocol_tag}",
+                    ["⚠️", "📦", "🧯"],
+                    every=2.0,
+                )
+                return False
+
             self._pending_frames[frame_id] = {
                 "frame_id": frame_id,
                 "trace_id": trace_id,
@@ -24950,19 +24941,21 @@ class HyperVRouterManager:
                 "raw_messages": [raw_msg],
             }
 
-        return self._send_network_item_inline(
-            {
-                "raw": raw_msg,
-                "ip": target_ip,
-                "port": target_port,
-                "mtype": "frame",
-                "peer_node_id": dst_node_id,
-                "frame_id": frame_id,
-                "trace_id": trace_id,
-                "protocol_tag": protocol_tag,
-                "dst_sender_id": dst_sender_id,
-            }
+        ok = self._queue_network_message(
+            raw=raw_msg,
+            ip=target_ip,
+            port=target_port,
+            mtype="frame",
+            peer_node_id=dst_node_id,
+            frame_id=frame_id,
+            trace_id=trace_id,
+            protocol_tag=protocol_tag,
+            dst_sender_id=dst_sender_id,
         )
+        if not ok:
+            with self._pending_lock:
+                self._pending_frames.pop(frame_id, None)
+        return ok
 
     def _send_frame_ack(
         self,
@@ -24980,16 +24973,14 @@ class HyperVRouterManager:
             return False
 
         ip, port = targets[0]
-        return self._send_network_item_inline(
-            {
-                "raw": raws[0],
-                "ip": ip,
-                "port": port,
-                "mtype": "ack",
-                "peer_node_id": dst_node_id,
-                "frame_id": frame_id,
-                "status": status,
-            }
+        return self._queue_network_message(
+            raw=raws[0],
+            ip=ip,
+            port=port,
+            mtype="ack",
+            peer_node_id=dst_node_id,
+            frame_id=frame_id,
+            status=status,
         )
 
     def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[Tuple[str, int]]:
@@ -25048,7 +25039,6 @@ class HyperVRouterManager:
             peer = self._peers.get(str(dst_node_id)) if dst_node_id else None
 
         if peer is not None:
-            # Prefer data path for frame acks.
             for ip, port in [
                 (peer.last_data_from_ip, peer.last_data_from_port or peer.data_port),
                 (peer.listen_ip, peer.data_port),
@@ -25185,7 +25175,15 @@ class HyperVRouterManager:
             self._net_tx_q.put_nowait(item)
             return True
         except queue.Full:
-            return self._send_network_item_inline(item)
+            self._stats["peer_send_queue_full"] = int(self._stats.get("peer_send_queue_full", 0)) + 1
+            self._log_sparse(
+                f"net-q-full:{mtype}",
+                "network",
+                f"network queue full; dropping mtype={mtype} peer={peer_node_id or '-'} ip={ip}:{port}",
+                ["⚠️", "📤", "🧯"],
+                every=2.0,
+            )
+            return False
 
     def _send_network_item_inline(self, item: Dict[str, Any]) -> bool:
         ip = str(item.get("ip") or "")
@@ -25291,7 +25289,7 @@ class HyperVRouterManager:
 
         for info in retry_items:
             self._stats["peer_send_retry"] += 1
-            self._queue_network_message(
+            queued = self._queue_network_message(
                 raw=bytes(info.get("raw_msg") or b""),
                 ip=str(info.get("peer_ip") or ""),
                 port=int(info.get("peer_port") or 0),
@@ -25302,13 +25300,22 @@ class HyperVRouterManager:
                 protocol_tag=str(info.get("protocol_tag") or ""),
                 dst_sender_id=str(info.get("dst_sender_id") or ""),
             )
-            self._log_sparse(
-                f"ack-retry:{info.get('peer_node_id') or '?'}",
-                "ack",
-                f"retrying unacked frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retry={info.get('retry_count')}",
-                ["🔁", "📡", "🧠"],
-                every=1.5,
-            )
+            if queued:
+                self._log_sparse(
+                    f"ack-retry:{info.get('peer_node_id') or '?'}",
+                    "ack",
+                    f"retrying unacked frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retry={info.get('retry_count')}",
+                    ["🔁", "📡", "🧠"],
+                    every=1.5,
+                )
+            else:
+                self._log_sparse(
+                    f"ack-retry-drop:{info.get('peer_node_id') or '?'}",
+                    "ack",
+                    f"retry dropped because network queue is full frame_id={info.get('frame_id')} peer={info.get('peer_node_id') or '?'}",
+                    ["⚠️", "📡", "🧯"],
+                    every=1.5,
+                )
 
         for info in assumed_success:
             self._log_sparse(
@@ -25357,8 +25364,18 @@ class HyperVRouterManager:
                 reply_ip=str(reply_ip or ""),
                 reply_port=int(reply_port or 0),
             )
-            self._router_ingress_q.put(item)
+            self._router_ingress_q.put_nowait(item)
             return True
+        except queue.Full:
+            self._stats["remote_ingress_queue_full"] = int(self._stats.get("remote_ingress_queue_full", 0)) + 1
+            self._log_sparse(
+                f"router-ingress-full:{src_node_id or '?'}",
+                "frame",
+                f"router ingress queue full; dropping remote frame frame_id={frame_id} src_node={src_node_id}",
+                ["⚠️", "📥", "🧯"],
+                every=2.0,
+            )
+            return False
         except Exception as e:
             self._log_sparse(
                 f"router-ingress-enqueue:{src_node_id or '?'}",
@@ -25373,7 +25390,9 @@ class HyperVRouterManager:
         self._log_evt("worker", "router ingress worker started", ["🧵", "📥", "🧠"])
         while not self._stop_event.is_set():
             try:
-                item = self._router_ingress_q.get()
+                item = self._router_ingress_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
             except Exception:
                 if self._stop_event.wait(0.05):
                     break
@@ -25389,7 +25408,8 @@ class HyperVRouterManager:
                 delay = min(0.25, max(0.01, item.next_try_ts - now))
                 if self._stop_event.wait(delay):
                     break
-                self._router_ingress_q.put(item)
+                if not self._requeue_router_ingress_item(item):
+                    self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
                 continue
 
             try:
@@ -25442,7 +25462,20 @@ class HyperVRouterManager:
                 self._router_ingress_retry_cap_sec,
                 self._router_ingress_retry_backoff_sec * max(1, item.attempts),
             )
-            self._router_ingress_q.put(item)
+            if not self._requeue_router_ingress_item(item):
+                self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
+                if item.reply_ip and item.frame_id:
+                    self._send_frame_ack(
+                        dst_ip=item.reply_ip,
+                        dst_port=item.reply_port,
+                        dst_node_id=item.src_node_id,
+                        frame_id=item.frame_id,
+                        status="received",
+                        detail=(
+                            f"router_queue_full=1 final=1 iface={self.INBOUND_IFACE_NAME} "
+                            f"attempts={item.attempts} duplicate_hint={int(item.duplicate_hint)} payload_len={len(item.raw)}"
+                        ),
+                    )
 
         self._log_evt("worker", "router ingress worker stopped", ["🛑", "📥", "🧵"])
 
@@ -25456,6 +25489,7 @@ class HyperVRouterManager:
                 if age > (self._frame_ack_timeout_sec * 2.0):
                     expired.append(info)
                     self._pending_frames.pop(frame_id, None)
+            self._enforce_pending_frame_cap_locked()
 
         for info in expired:
             self._log_sparse(
@@ -25474,12 +25508,12 @@ class HyperVRouterManager:
             fp, ts = self._recent_order[0]
             if ts >= cutoff:
                 break
-            self._recent_order.pop(0)
+            self._recent_order.popleft()
             if self._recent.get(fp) == ts:
                 self._recent.pop(fp, None)
 
         while len(self._recent_order) > self.recent_cache_size:
-            fp, ts = self._recent_order.pop(0)
+            fp, ts = self._recent_order.popleft()
             if self._recent.get(fp) == ts:
                 self._recent.pop(fp, None)
 
@@ -25937,6 +25971,71 @@ class HyperVRouterManager:
 
         return False
 
+    def _packet_udp_ports(self, packet) -> Tuple[int, int]:
+        sport = 0
+        dport = 0
+        try:
+            if UDP is not None and getattr(packet, "haslayer", None) and packet.haslayer(UDP):
+                udp_layer = packet.getlayer(UDP)
+                if udp_layer is not None:
+                    sport = int(getattr(udp_layer, "sport", 0) or 0)
+                    dport = int(getattr(udp_layer, "dport", 0) or 0)
+        except Exception:
+            pass
+        return sport, dport
+
+    def _should_drop_sidecar_noise(self, packet, protocol_tag: str) -> bool:
+        proto = str(protocol_tag or "").upper()
+
+        if proto == "ARP":
+            return True
+
+        try:
+            if ARP is not None and getattr(packet, "haslayer", None) and packet.haslayer(ARP):
+                return True
+        except Exception:
+            pass
+
+        if self._is_noisy_local_broadcast(packet):
+            return True
+
+        sport, dport = self._packet_udp_ports(packet)
+        if sport in self.LOCAL_NOISE_UDP_PORTS or dport in self.LOCAL_NOISE_UDP_PORTS:
+            return True
+
+        return False
+
+    def _requeue_router_ingress_item(self, item: _RouterIngressItem) -> bool:
+        try:
+            self._router_ingress_q.put_nowait(item)
+            return True
+        except queue.Full:
+            self._stats["remote_ingress_queue_full"] = int(self._stats.get("remote_ingress_queue_full", 0)) + 1
+            self._log_sparse(
+                f"router-requeue-full:{item.src_node_id or '?'}",
+                "frame",
+                f"router ingress requeue full; dropping frame_id={item.frame_id} src_node={item.src_node_id}",
+                ["⚠️", "📥", "🧯"],
+                every=2.0,
+            )
+            return False
+
+    def _enforce_pending_frame_cap_locked(self) -> None:
+        if len(self._pending_frames) <= self._pending_frame_cap:
+            return
+
+        overflow = len(self._pending_frames) - self._pending_frame_cap
+        items = sorted(
+            self._pending_frames.items(),
+            key=lambda kv: (
+                float(kv[1].get("last_send_ts", 0.0) or 0.0),
+                float(kv[1].get("created_ts", 0.0) or 0.0),
+            ),
+        )
+        for frame_id, _info in items[: max(1, overflow)]:
+            self._pending_frames.pop(frame_id, None)
+            self._stats["pending_pruned"] = int(self._stats.get("pending_pruned", 0)) + 1
+
     def _log_evt(self, event: str, message: str, emojis: Optional[list[str]] = None) -> None:
         self._log(f"[{str(event or 'evt').upper()}] {message}", emojis)
 
@@ -26157,7 +26256,6 @@ class HyperVRouterManager:
         if not ip_s:
             return False
 
-        # multicast discovery group is allowed locally
         if discovery and ip_s == self.discovery_group:
             return True
 
@@ -26243,7 +26341,6 @@ class HyperVRouterManager:
 
         ports = self._control_ports()
         if sport not in ports and dport not in ports:
-            # still catch accidental raw replays of our own JSON envelope
             payload = self._extract_udp_payload_bytes(packet, raw)
             return self._looks_like_hvrm_json(payload)
 
@@ -26251,9 +26348,7 @@ class HyperVRouterManager:
         if payload:
             return self._looks_like_hvrm_json(payload)
 
-        # control ports with no decodable payload are still treated as control plane
         return True
-
 
 
 @dataclass

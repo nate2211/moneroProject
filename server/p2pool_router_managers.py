@@ -264,6 +264,7 @@ class SocketCandidate:
 
     observation_generation: int = 0
     last_promote_generation: int = 0
+    open_signal_hits: int = 0
 
     recent_payload_digest: Optional[str] = None
     recent_payload_digest_ts: float = 0.0
@@ -327,37 +328,38 @@ class SocketCandidate:
         self.connect_confidence = max(self.connect_confidence, cand_conf)
 
     def update_score(self, raw_score: float) -> None:
-        repeat_bonus = min(7.5, self.seen_count * 0.50)
-        payload_bonus = min(6.0, self.payload_hits * 0.40)
-        bidir_bonus = 2.25 if (self.egress_hits > 0 and self.ingress_hits > 0) else 0.0
+        repeat_bonus = min(5.0, self.seen_count * 0.35)
+        payload_bonus = min(4.5, self.payload_hits * 0.30)
+        bidir_bonus = 1.75 if (self.egress_hits > 0 and self.ingress_hits > 0) else 0.0
+        signal_bonus = min(4.0, self.open_signal_hits * 0.80)
 
-        confidence_bonus = (self.connect_confidence * 8.0)
-        confidence_bonus += (self.ownership_confidence * 2.5)
-        confidence_bonus += (self.route_affinity * 2.0)
+        confidence_bonus = (self.connect_confidence * 7.0)
+        confidence_bonus += (self.ownership_confidence * 2.25)
+        confidence_bonus += (self.route_affinity * 1.75)
 
         if self.peer_kind != "unicast":
-            confidence_bonus -= 8.0
+            confidence_bonus -= 10.0
 
-        target = raw_score + repeat_bonus + payload_bonus + bidir_bonus + confidence_bonus
+        target = raw_score + repeat_bonus + payload_bonus + bidir_bonus + signal_bonus + confidence_bonus
 
         if self.seen_count <= 1:
             self.score = target
             self.stable_score = target
         else:
-            self.score = (self.score * 0.72) + (target * 0.28)
-            self.stable_score = (self.stable_score * 0.85) + (self.score * 0.15)
+            self.score = (self.score * 0.80) + (target * 0.20)
+            self.stable_score = (self.stable_score * 0.88) + (self.score * 0.12)
 
         if self.score > self.best_score:
             self.best_score = self.score
 
-    def queue_tx_hint(self, payload: bytes, max_queue: int = 16, max_chunk: int = 131072) -> bool:
+    def queue_tx_hint(self, payload: bytes, max_queue: int = 16, max_chunk: int = 65536) -> bool:
         if not payload:
             return False
 
         digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
         now = time.time()
 
-        if self.recent_payload_digest == digest and (now - self.recent_payload_digest_ts) < 0.25:
+        if self.recent_payload_digest == digest and (now - self.recent_payload_digest_ts) < 0.40:
             return False
 
         self.recent_payload_digest = digest
@@ -383,19 +385,27 @@ class SocketCandidate:
         if not payload:
             return
         digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
-        if digest != self.last_open_signal_digest or (now - self.last_signal_ts) > 0.50:
+        if digest != self.last_open_signal_digest or (now - self.last_signal_ts) > 0.75:
             self.observation_generation += 1
+            self.open_signal_hits += 1
             self.last_open_signal_digest = digest
             self.last_signal_ts = now
 
-    def may_promote(self, now: float, tcp_threshold: float, udp_threshold: float, min_retry_sec: float) -> bool:
+    def may_promote(
+        self,
+        now: float,
+        tcp_threshold: float,
+        udp_threshold: float,
+        min_retry_sec: float,
+        open_signal_window_sec: float,
+    ) -> bool:
         if not self.remote_ip or not self.remote_port or not self.local_ip or not self.local_port:
             return False
         if now < self.cooldown_until:
             return False
         if (now - self.last_promote_attempt_ts) < min_retry_sec:
             return False
-        if self.connect_confidence < 0.55:
+        if self.connect_confidence < 0.68:
             return False
         if self.peer_kind != "unicast":
             return False
@@ -403,35 +413,59 @@ class SocketCandidate:
             return False
         if self.payload_hits <= 0:
             return False
+        if self.seen_count < 2:
+            return False
         if self.last_promote_generation > 0 and self.observation_generation <= self.last_promote_generation:
             return False
 
         threshold = tcp_threshold if self.proto == "TCP" else udp_threshold
-        return self.best_score >= threshold and self.stable_score >= (threshold * 0.75)
+
+        recent_signal = self.last_signal_ts > 0 and (now - self.last_signal_ts) <= open_signal_window_sec
+        recent_payload = self.last_payload_ts > 0 and (now - self.last_payload_ts) <= max(3.0, open_signal_window_sec)
+
+        if self.proto == "TCP":
+            if self.open_signal_hits <= 0:
+                return False
+            if not recent_signal:
+                return False
+        else:
+            if not (recent_signal or (recent_payload and self.ingress_hits > 0)):
+                return False
+
+        return self.best_score >= threshold and self.stable_score >= (threshold * 0.80)
 
     def apply_feedback(self, reason: str, now: float) -> None:
         txt = str(reason or "").lower()
 
         if "peer-closed-before-active" in txt:
             self.peer_closed_before_active += 1
-            backoff = min(60.0, 3.0 * (2 ** min(self.peer_closed_before_active - 1, 4)))
+            backoff = min(120.0, 8.0 * (2 ** min(self.peer_closed_before_active - 1, 4)))
             self.cooldown_until = max(self.cooldown_until, now + backoff)
-            self.connect_confidence = max(0.10, self.connect_confidence - 0.10)
+            self.connect_confidence = max(0.10, self.connect_confidence - 0.12)
+            self.score *= 0.85
+            self.stable_score *= 0.88
             return
 
         if "peer-closed" in txt:
             self.peer_close_count += 1
-            backoff = min(30.0, 2.0 * (2 ** min(self.peer_close_count - 1, 4)))
+            backoff = min(75.0, 5.0 * (2 ** min(self.peer_close_count - 1, 4)))
             self.cooldown_until = max(self.cooldown_until, now + backoff)
+            self.score *= 0.92
+            self.stable_score *= 0.95
             return
 
         if "open:" in txt or "connect:" in txt or "send:" in txt or "recv:" in txt or "invalid-socket" in txt:
             self.open_fail_count += 1
-            backoff = min(20.0, 1.5 * (1 + self.open_fail_count))
+            backoff = min(60.0, 6.0 + (self.open_fail_count * 4.0))
             self.cooldown_until = max(self.cooldown_until, now + backoff)
+            self.connect_confidence = max(0.10, self.connect_confidence - 0.08)
+            self.score *= 0.82
+            self.stable_score *= 0.88
             return
 
-        self.cooldown_until = max(self.cooldown_until, now + 1.0)
+        self.cooldown_until = max(self.cooldown_until, now + 3.0)
+        self.score *= 0.96
+        self.stable_score *= 0.97
 
 
 @dataclass
@@ -468,7 +502,7 @@ class SocketStream:
 
     stream_kind: str = "unknown"
 
-    def queue_tx(self, payload: bytes, max_chunks: int = 64, max_bytes: int = 262144) -> bool:
+    def queue_tx(self, payload: bytes, max_chunks: int = 48, max_bytes: int = 196608) -> bool:
         if not payload:
             return False
 
@@ -476,7 +510,7 @@ class SocketStream:
         digest = hashlib.blake2b(payload, digest_size=8).hexdigest()
         now = time.time()
 
-        if self.last_tx_digest == digest and (now - self.last_tx_digest_ts) < 0.25:
+        if self.last_tx_digest == digest and (now - self.last_tx_digest_ts) < 0.35:
             return False
 
         self.last_tx_digest = digest
@@ -485,8 +519,8 @@ class SocketStream:
         if self.tx_queue:
             try:
                 tail = self.tx_queue[-1]
-                if len(tail) < 32768:
-                    merged = (tail + payload)[-131072:]
+                if len(tail) < 16384:
+                    merged = (tail + payload)[-65536:]
                     self.tx_bytes_queued -= len(tail)
                     self.tx_queue[-1] = merged
                     self.tx_bytes_queued += len(merged)
@@ -544,7 +578,7 @@ class SocketStream:
             return self.stream_kind
 
         p = payload
-        lowered = p[:64].lower()
+        lowered = p[:128].lower()
 
         try:
             if len(p) >= 3 and p[0] == 0x16 and p[1] == 0x03:
@@ -705,15 +739,15 @@ class SocketConnection:
         now = time.time()
 
         if "peer-closed-before-active" in txt:
-            self.cooldown_until = max(self.cooldown_until, now + 4.0)
+            self.cooldown_until = max(self.cooldown_until, now + 8.0)
         elif "peer-closed" in txt:
             self.peer_close_count += 1
-            self.cooldown_until = max(self.cooldown_until, now + min(30.0, 2.0 * (2 ** min(self.peer_close_count, 4))))
+            self.cooldown_until = max(self.cooldown_until, now + min(75.0, 5.0 * (2 ** min(self.peer_close_count, 4))))
         elif "open:" in txt or "connect:" in txt or "send:" in txt or "recv:" in txt or "invalid-socket" in txt:
             self.open_fail_count += 1
-            self.cooldown_until = max(self.cooldown_until, now + min(20.0, 1.5 * (1 + self.open_fail_count)))
+            self.cooldown_until = max(self.cooldown_until, now + min(60.0, 6.0 + (self.open_fail_count * 4.0)))
         else:
-            self.cooldown_until = max(self.cooldown_until, now + 1.0)
+            self.cooldown_until = max(self.cooldown_until, now + 3.0)
 
         self.state = "cooling"
 
@@ -727,18 +761,27 @@ class SocketInterface:
         18080, 37888, 37889,
     }
 
-    TCP_OPEN_THRESHOLD = 14.0
-    UDP_OPEN_THRESHOLD = 11.0
+    NOISY_UDP_PORTS = {
+        137, 138, 1900, 3702, 5353, 5355, 546, 547,
+    }
 
-    FLOW_IDLE_TTL = 180.0
-    PACKET_TTL = 120.0
-    MAX_PACKET_RECORDS = 8192
-    MAX_CANDIDATES = 4096
-    MAX_TX_HINTS_PER_CANDIDATE = 16
-    MIN_OPEN_RETRY_SEC = 2.0
+    TCP_OPEN_THRESHOLD = 18.0
+    UDP_OPEN_THRESHOLD = 15.0
 
-    SESSION_PROBE_GRACE_SEC = 1.50
+    FLOW_IDLE_TTL = 90.0
+    PACKET_TTL = 75.0
+    MAX_PACKET_RECORDS = 4096
+    MAX_CANDIDATES = 1536
+    MAX_TX_HINTS_PER_CANDIDATE = 12
+    MIN_OPEN_RETRY_SEC = 6.0
+
+    SESSION_PROBE_GRACE_SEC = 4.5
     LIVE_IDLE_TTL = 120.0
+
+    OPEN_SIGNAL_WINDOW_SEC = 4.0
+    MAX_OPEN_REQUESTS_PER_TICK = 4
+    MIN_CANDIDATE_RAW_SCORE = 5.5
+    MIN_NEW_CANDIDATE_CONNECT_CONFIDENCE = 0.62
 
     def __init__(self, router, router_logger):
         self.router = router
@@ -765,7 +808,7 @@ class SocketInterface:
         self._identity_cache_ts: float = 0.0
         self._identity_cache: Dict[str, Dict[str, Any]] = {}
 
-        self.logger.log_message("[SocketInterface] 🧠 initialized (stream-backed connection mode)")
+        self.logger.log_message("[SocketInterface] 🧠 initialized (stream-backed connection mode, tightened admission)")
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -843,10 +886,26 @@ class SocketInterface:
             with self._lock:
                 self._iface_activity[str(inbound_iface or "")] += 1
 
+                conn = self.connections.get(flow_key)
+                if conn is not None:
+                    if meta["direction"] == "egress" and payload:
+                        queued = conn.queue_tx(payload)
+                        if queued:
+                            self._wake_io()
+                        return queued
+                    return False
+
                 candidate = self.candidates.get(flow_key)
                 if candidate is None:
+                    if not self._admit_new_candidate_meta(meta):
+                        return False
+
                     if len(self.candidates) >= self.MAX_CANDIDATES:
                         self._prune_candidates_locked(now)
+                    if len(self.candidates) >= self.MAX_CANDIDATES:
+                        self._evict_low_value_candidates_locked(now, keep_target=(self.MAX_CANDIDATES - 32))
+                    if len(self.candidates) >= self.MAX_CANDIDATES:
+                        return False
 
                     candidate = SocketCandidate(
                         key=flow_key,
@@ -865,22 +924,22 @@ class SocketInterface:
                 digest = self._record_packet_locked(packet, inbound_iface, flow_key, candidate.score, len(payload))
                 candidate.history.append(digest)
 
+                fresh_open_signal = self._is_likely_open_signal(meta)
+
                 if meta["direction"] == "egress" and payload:
-                    candidate.queue_tx_hint(payload, max_queue=self.MAX_TX_HINTS_PER_CANDIDATE)
-                    if meta.get("fresh_open_signal"):
+                    should_queue_hint = (
+                        fresh_open_signal
+                        or candidate.seen_count <= 2
+                        or candidate.best_score >= (self.TCP_OPEN_THRESHOLD - 2.0 if candidate.proto == "TCP" else self.UDP_OPEN_THRESHOLD - 2.0)
+                    )
+                    if should_queue_hint:
+                        candidate.queue_tx_hint(payload, max_queue=self.MAX_TX_HINTS_PER_CANDIDATE)
+
+                    if fresh_open_signal:
                         candidate.note_fresh_open_signal(payload, now)
 
                 if candidate.remote_ip:
                     self.candidates_by_remote[candidate.remote_ip].add(candidate.key)
-
-                conn = self.connections.get(flow_key)
-                if conn is not None:
-                    if meta["direction"] == "egress" and payload:
-                        queued = conn.queue_tx(payload)
-                        if queued:
-                            self._wake_io()
-                        return queued
-                    return False
 
                 if not meta["connectable"]:
                     return False
@@ -889,7 +948,13 @@ class SocketInterface:
                 if candidate.peer_kind != "unicast":
                     return False
 
-                if not candidate.may_promote(now, self.TCP_OPEN_THRESHOLD, self.UDP_OPEN_THRESHOLD, self.MIN_OPEN_RETRY_SEC):
+                if not candidate.may_promote(
+                    now,
+                    self.TCP_OPEN_THRESHOLD,
+                    self.UDP_OPEN_THRESHOLD,
+                    self.MIN_OPEN_RETRY_SEC,
+                    self.OPEN_SIGNAL_WINDOW_SEC,
+                ):
                     return False
 
                 best = self._choose_best_candidate_for_remote_locked(candidate.remote_ip, candidate.proto)
@@ -915,6 +980,8 @@ class SocketInterface:
         if candidate.key in self.connections:
             return
         if candidate.key in self._open_requests:
+            return
+        if len(self._open_requests) >= 128:
             return
         self._open_requests.append(candidate.key)
 
@@ -974,7 +1041,8 @@ class SocketInterface:
                 self.logger.log_message(f"[SocketInterface] ⚠️ cleanup error: {type(e).__name__}: {e}")
 
     def _service_open_requests_locked(self) -> None:
-        while self._open_requests:
+        opened = 0
+        while self._open_requests and opened < self.MAX_OPEN_REQUESTS_PER_TICK:
             key = self._open_requests.popleft()
             candidate = self.candidates.get(key)
             if candidate is None:
@@ -982,6 +1050,7 @@ class SocketInterface:
             if key in self.connections:
                 continue
             self._open_connection_from_candidate_locked(candidate)
+            opened += 1
 
     def _service_close_requests_locked(self) -> None:
         for conn in list(self.connections.values()):
@@ -1002,9 +1071,10 @@ class SocketInterface:
             if conn.connected_ts <= 0:
                 continue
 
-            if now >= (conn.connected_ts + self.SESSION_PROBE_GRACE_SEC) and conn.stream.bytes_tx_payload == 0 and conn.stream.bytes_rx_payload == 0:
-                conn.last_error = "peer-closed-before-active"
-                conn.close_requested = True
+            if now >= (conn.connected_ts + self.SESSION_PROBE_GRACE_SEC):
+                if conn.stream.bytes_tx_payload == 0 and conn.stream.bytes_rx_payload == 0:
+                    conn.last_error = "peer-closed-before-active"
+                    conn.close_requested = True
 
     def _build_select_lists_locked(self):
         rlist = []
@@ -1231,7 +1301,8 @@ class SocketInterface:
                 self.logger.log_message(
                     f"[SocketInterface] 🔌 promoted {candidate.proto} "
                     f"{candidate.local_ip}:{candidate.local_port} -> {candidate.remote_ip}:{candidate.remote_port} "
-                    f"score={candidate.best_score:.2f} state={conn.state} bind={bind_ip}"
+                    f"score={candidate.best_score:.2f} stable={candidate.stable_score:.2f} "
+                    f"signals={candidate.open_signal_hits} state={conn.state} bind={bind_ip}"
                 )
                 return True
 
@@ -1338,11 +1409,14 @@ class SocketInterface:
                 continue
             if key in self.connections:
                 continue
+            if time.time() < cand.cooldown_until:
+                continue
 
             rank = (
                 float(cand.connect_confidence),
                 float(cand.ownership_confidence),
                 float(cand.route_affinity),
+                int(cand.open_signal_hits),
                 float(cand.best_score),
                 float(cand.stable_score),
                 int(cand.payload_hits),
@@ -1403,6 +1477,31 @@ class SocketInterface:
             if cand and cand.remote_ip:
                 self.candidates_by_remote.get(cand.remote_ip, set()).discard(key)
 
+    def _evict_low_value_candidates_locked(self, now: float, keep_target: int) -> None:
+        if len(self.candidates) <= keep_target:
+            return
+
+        victims = sorted(
+            (
+                cand for cand in self.candidates.values()
+                if cand.key not in self.connections
+            ),
+            key=lambda c: (
+                0 if c.peer_kind != "unicast" else 1,
+                float(c.connect_confidence),
+                int(c.open_signal_hits),
+                float(c.best_score),
+                float(c.stable_score),
+                float(c.last_seen),
+            ),
+        )
+
+        while len(self.candidates) > keep_target and victims:
+            cand = victims.pop(0)
+            old = self.candidates.pop(cand.key, None)
+            if old and old.remote_ip:
+                self.candidates_by_remote.get(old.remote_ip, set()).discard(old.key)
+
     def _prune_packet_records_locked(self, now: float) -> None:
         stale = [digest for digest, rec in self.packet_records.items() if (now - rec.ts) > self.PACKET_TTL]
         for digest in stale:
@@ -1429,6 +1528,9 @@ class SocketInterface:
             proto = "TCP" if tcp is not None else "UDP"
             sport = int((tcp or udp).sport)
             dport = int((tcp or udp).dport)
+
+            if proto == "UDP" and (sport in self.NOISY_UDP_PORTS or dport in self.NOISY_UDP_PORTS):
+                return None
 
             src_ip = self._normalize_ip_text(getattr(ip_layer, "src", None))
             dst_ip = self._normalize_ip_text(getattr(ip_layer, "dst", None))
@@ -1517,14 +1619,39 @@ class SocketInterface:
 
             connect_confidence = max(
                 0.0,
-                min(1.0, (ownership_confidence * 0.60) + (route_affinity * 0.40)),
+                min(1.0, (ownership_confidence * 0.65) + (route_affinity * 0.35)),
+            )
+
+            flow_key = self._flow_key(family, proto, src_ip, sport, dst_ip, dport)
+            raw_score = self._score_packet(
+                family=family,
+                proto=proto,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                sport=sport,
+                dport=dport,
+                payload_len=len(payload),
+                flags=flags,
+                local_src=local_src,
+                local_dst=local_dst,
+                direction=direction,
             )
 
             fresh_open_signal = False
-            if direction == "egress" and len(payload) > 0:
-                fresh_open_signal = True
-
-            flow_key = self._flow_key(family, proto, src_ip, sport, dst_ip, dport)
+            if direction == "egress":
+                fresh_open_signal = self._is_likely_open_signal({
+                    "family": family,
+                    "proto": proto,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "sport": sport,
+                    "dport": dport,
+                    "flags": flags,
+                    "payload": payload,
+                    "payload_len": len(payload),
+                    "direction": direction,
+                    "peer_kind": peer_kind,
+                })
 
             return {
                 "family": family,
@@ -1552,19 +1679,7 @@ class SocketInterface:
                 "connect_confidence": connect_confidence,
                 "peer_kind": peer_kind,
                 "fresh_open_signal": fresh_open_signal,
-                "raw_score": self._score_packet(
-                    family=family,
-                    proto=proto,
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    sport=sport,
-                    dport=dport,
-                    payload_len=len(payload),
-                    flags=flags,
-                    local_src=local_src,
-                    local_dst=local_dst,
-                    direction=direction,
-                ),
+                "raw_score": raw_score,
                 "flow_key": flow_key,
                 "inbound_iface": inbound_iface,
             }
@@ -1589,53 +1704,198 @@ class SocketInterface:
     ) -> float:
         score = 0.0
 
-        score += 3.20 if proto == "TCP" else 2.20
+        score += 2.80 if proto == "TCP" else 1.80
 
         if direction == "egress":
-            score += 6.00
+            score += 5.25
         elif direction == "ingress":
-            score += 2.00
+            score += 1.25
         elif direction == "internal":
-            score -= 2.50
+            score -= 4.00
         else:
-            score -= 8.00
+            score -= 10.0
 
         if payload_len > 0:
-            score += min(8.0, 1.0 + math.log2(payload_len + 1))
+            score += min(7.0, 0.8 + math.log2(payload_len + 1))
         else:
-            score += 0.20
+            score -= 0.20
 
         if sport in self.KNOWN_PRIORITY_PORTS or dport in self.KNOWN_PRIORITY_PORTS:
-            score += 3.00
+            score += 2.50
 
         if proto == "TCP":
             if "S" in flags and "A" not in flags:
-                score += 3.50
+                score += 4.00
             if "P" in flags and payload_len > 0:
-                score += 2.25
+                score += 1.60
             if "F" in flags or "R" in flags:
-                score -= 3.50
+                score -= 4.25
+        else:
+            if payload_len <= 0:
+                score -= 1.50
+
+        if sport >= 49152 and dport >= 49152:
+            score -= 3.25
 
         try:
             ip_src = ipaddress.ip_address(src_ip)
             ip_dst = ipaddress.ip_address(dst_ip)
 
             if ip_src.is_multicast or ip_dst.is_multicast:
-                score -= 10.0
+                score -= 12.0
             if ip_src.is_loopback or ip_dst.is_loopback:
-                score -= 4.0
+                score -= 5.0
             if ip_src.is_unspecified or ip_dst.is_unspecified:
                 score -= 12.0
         except Exception:
             pass
 
         if local_src and local_dst:
-            score -= 8.0
+            score -= 10.0
 
         if family == 6:
-            score += 0.35
+            score += 0.20
 
         return score
+
+    def _admit_new_candidate_meta(self, meta: Dict[str, Any]) -> bool:
+        if not meta.get("connectable"):
+            return False
+        if str(meta.get("direction") or "") != "egress":
+            return False
+        if str(meta.get("peer_kind") or "") != "unicast":
+            return False
+        if float(meta.get("connect_confidence", 0.0)) < self.MIN_NEW_CANDIDATE_CONNECT_CONFIDENCE:
+            return False
+        if float(meta.get("raw_score", 0.0)) < self.MIN_CANDIDATE_RAW_SCORE:
+            return False
+
+        proto = str(meta.get("proto") or "")
+        sport = int(meta.get("sport") or 0)
+        dport = int(meta.get("dport") or 0)
+        payload_len = int(meta.get("payload_len") or 0)
+        flags = str(meta.get("flags") or "")
+
+        if proto == "TCP":
+            if "S" in flags and "A" not in flags:
+                return True
+            return self._is_likely_open_signal(meta)
+
+        if proto == "UDP":
+            if payload_len <= 0:
+                return False
+            if self._is_likely_open_signal(meta):
+                return True
+            if dport in self.KNOWN_PRIORITY_PORTS and payload_len >= 48:
+                return True
+            if sport >= 49152 and dport >= 49152:
+                return False
+
+        return False
+
+    def _is_likely_open_signal(self, meta: Dict[str, Any]) -> bool:
+        try:
+            if str(meta.get("direction") or "") != "egress":
+                return False
+
+            proto = str(meta.get("proto") or "")
+            payload = bytes(meta.get("payload") or b"")
+            payload_len = int(meta.get("payload_len") or len(payload))
+            sport = int(meta.get("sport") or 0)
+            dport = int(meta.get("dport") or 0)
+            flags = str(meta.get("flags") or "")
+
+            if proto == "TCP":
+                if "S" in flags and "A" not in flags:
+                    return True
+                if payload_len <= 0:
+                    return False
+                return self._payload_looks_like_client_open(payload, dport=dport, proto=proto)
+
+            if proto == "UDP":
+                if payload_len <= 0:
+                    return False
+
+                if dport == 53:
+                    return self._looks_like_dns_request(payload)
+                if dport == 123:
+                    return len(payload) >= 48
+                if dport == 443:
+                    if self._looks_like_quic_initial(payload):
+                        return True
+
+                if dport in self.KNOWN_PRIORITY_PORTS:
+                    return self._payload_looks_like_client_open(payload, dport=dport, proto=proto)
+
+                if dport in (37888, 37889, 3333, 4444, 5555, 7777, 8844, 18080) and payload_len >= 24:
+                    return True
+
+            return False
+        except Exception:
+            return False
+
+    def _payload_looks_like_client_open(self, payload: bytes, dport: int, proto: str) -> bool:
+        if not payload:
+            return False
+
+        low = payload[:512].lower()
+
+        if len(payload) >= 3 and payload[0] == 0x16 and payload[1] == 0x03:
+            return True
+
+        if low.startswith((b"get ", b"post ", b"put ", b"head ", b"options ", b"connect ", b"pri * http/2.0")):
+            return True
+
+        json_markers = (
+            b'"jsonrpc"',
+            b'"method"',
+            b'"id"',
+            b"mining.subscribe",
+            b"mining.authorize",
+            b'"method":"login"',
+            b'"method":"submit"',
+            b'"method":"job"',
+            b"getblocktemplate",
+            b"submitblock",
+            b"get_info",
+            b"handshake",
+            b"peerlist",
+            b"p2pool",
+            b"levin",
+        )
+        if any(marker in low for marker in json_markers):
+            return True
+
+        if dport == 53 and self._looks_like_dns_request(payload):
+            return True
+
+        if dport in (3333, 4444, 5555, 7777, 18080, 37888, 37889, 8844):
+            if payload.startswith(b"{") or payload.startswith(b"[") or len(payload) >= 24:
+                return True
+
+        return False
+
+    def _looks_like_dns_request(self, payload: bytes) -> bool:
+        try:
+            if len(payload) < 12:
+                return False
+            flags = int.from_bytes(payload[2:4], "big")
+            qr = (flags >> 15) & 0x1
+            qdcount = int.from_bytes(payload[4:6], "big")
+            return qr == 0 and qdcount > 0
+        except Exception:
+            return False
+
+    def _looks_like_quic_initial(self, payload: bytes) -> bool:
+        try:
+            if len(payload) < 6:
+                return False
+            first = payload[0]
+            is_long = bool(first & 0x80)
+            version = payload[1:5]
+            return is_long and version != b"\x00\x00\x00\x00"
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # router re-entry
@@ -2089,6 +2349,7 @@ class SocketInterface:
                 pass
 
         return out
+
 FlowEnd = tuple[str, int]
 FlowKey = tuple[FlowEnd, FlowEnd]
 class ISAKMPManager:
