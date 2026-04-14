@@ -4495,7 +4495,295 @@ class WiresharkManager:
         self.min_packet_len = 60
         self.router_manager = None
 
+    def _looks_like_json_text(self, value: str) -> bool:
+        s = str(value or "").lstrip()
+        if not s:
+            return False
+        if s.startswith("{") or s.startswith("["):
+            return True
+        if '"jsonrpc"' in s or '"method"' in s or '"params"' in s:
+            return True
+        if '"id"' in s and '"result"' in s:
+            return True
+        return False
 
+    def _looks_like_xml_or_http_text(self, value: str) -> bool:
+        s = str(value or "").lstrip()
+        if not s:
+            return False
+        if s.startswith(("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "HTTP/")):
+            return True
+        if s.startswith("<") or s.startswith("<?xml"):
+            return True
+        if "</" in s or "<root" in s or "<html" in s or "<device" in s:
+            return True
+        return False
+
+    def _decode_best_payload_text(self, payload_bytes: bytes) -> str:
+        if not payload_bytes:
+            return ""
+        for enc in ("utf-8", "utf-16", "latin-1"):
+            try:
+                txt = payload_bytes.decode(enc, errors="replace")
+                if txt:
+                    return txt
+            except Exception:
+                pass
+        return ""
+
+    def _classify_application_layer(self, layers: Dict[str, Any], payload_bytes: bytes) -> tuple[str, str]:
+        """
+        Returns (app_layer, detail).
+        app_layer examples: HTTP, TLS, DNS, JSON, JSON-RPC, XML, SOAP, MQTT, WS, TEXT, BINARY, UNKNOWN
+        """
+        text = self._decode_best_payload_text(payload_bytes)
+        text_l = text.lstrip() if text else ""
+
+        if "http" in layers:
+            http = layers.get("http", {})
+            if "http.request.method" in http:
+                return "HTTP", f"request {http.get('http.request.method', '')}".strip()
+            if "http.response.code" in http:
+                return "HTTP", f"response {http.get('http.response.code', '')}".strip()
+            return "HTTP", "http"
+
+        if "ssl" in layers or "tls" in layers:
+            tls = layers.get("ssl", layers.get("tls", {}))
+            sni = tls.get("tls.handshake.extensions_server_name", "")
+            if sni:
+                return "TLS", f"sni={sni}"
+            return "TLS", "tls"
+
+        if "dns" in layers:
+            dns = layers.get("dns", {})
+            qname = dns.get("dns.qry.name", "")
+            if qname:
+                return "DNS", qname
+            return "DNS", "dns"
+
+        if "xml" in layers or (text_l and (text_l.startswith("<?xml") or text_l.startswith("<"))):
+            if "soap" in text_l.lower() or ":envelope" in text_l.lower():
+                return "SOAP", "xml-soap"
+            return "XML", "xml"
+
+        if self._looks_like_json_text(text_l):
+            try:
+                obj = json.loads(text_l)
+                if isinstance(obj, dict):
+                    if "jsonrpc" in obj:
+                        method = obj.get("method", "")
+                        return "JSON-RPC", f"method={method}" if method else "json-rpc"
+                    if "method" in obj and "params" in obj:
+                        return "JSON", "method+params"
+                    if "type" in obj:
+                        return "JSON", f"type={obj.get('type')}"
+                return "JSON", type(obj).__name__
+            except Exception:
+                return "JSON", "json-text"
+
+        if text_l:
+            if text_l.startswith("<?xml") or text_l.startswith("<"):
+                return "XML", "xml-ish"
+            if text_l.startswith(("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "HTTP/")):
+                return "HTTP", "http-text"
+            return "TEXT", "text"
+
+        if payload_bytes:
+            return "BINARY", f"{len(payload_bytes)} bytes"
+
+        return "UNKNOWN", ""
+
+    def _extract_best_payload_bytes(self, layers: Dict[str, Any]) -> Optional[bytes]:
+        """
+        Best-effort payload extraction from tshark JSON.
+        Prefers true hex payloads, then falls back to JSON / XML / HTTP / text-ish fields.
+        """
+
+        def _hex_from(value) -> Optional[bytes]:
+            if not isinstance(value, str) or not value:
+                return None
+            return self._hexdump_to_bytes(value)
+
+        def _text_to_bytes(value) -> Optional[bytes]:
+            if isinstance(value, list):
+                value = "\n".join(str(x) for x in value if x is not None)
+            if not isinstance(value, str):
+                return None
+            s = value.strip()
+            if not s:
+                return None
+            try:
+                return s.encode("utf-8", errors="ignore")
+            except Exception:
+                return None
+
+        tcp = layers.get("tcp", {})
+        udp = layers.get("udp", {})
+        data = layers.get("data", {})
+
+        # 1) Preferred raw hex payload sources
+        for key, src in (
+                ("tcp.payload", tcp),
+                ("udp.payload", udp),
+                ("data.data", data),
+        ):
+            blob = _hex_from(src.get(key))
+            if blob:
+                return blob
+
+        # 2) High-level text carriers, now including JSON
+        for layer_name, key_names in (
+                ("json", None),
+                ("jsonvalue", None),
+                ("data-text-lines", None),
+                ("http", (
+                        "http.file_data",
+                        "http.request.line",
+                        "http.response.line",
+                        "http.request.full_uri",
+                )),
+                ("xml", None),
+                ("line-based-text-data", None),
+                ("text", None),
+        ):
+            layer_obj = layers.get(layer_name)
+            if layer_obj is None:
+                continue
+
+            if isinstance(layer_obj, (str, list)):
+                txt = "\n".join(layer_obj) if isinstance(layer_obj, list) else layer_obj
+                if self._looks_like_json_text(txt) or self._looks_like_xml_or_http_text(txt) or txt.strip():
+                    text_blob = _text_to_bytes(txt)
+                    if text_blob:
+                        return text_blob
+
+            if isinstance(layer_obj, dict):
+                if key_names:
+                    for key in key_names:
+                        val = layer_obj.get(key)
+                        if isinstance(val, str):
+                            if self._looks_like_json_text(val) or self._looks_like_xml_or_http_text(val) or val.strip():
+                                text_blob = _text_to_bytes(val)
+                                if text_blob:
+                                    return text_blob
+
+                for _, val in layer_obj.items():
+                    if isinstance(val, str):
+                        if self._looks_like_json_text(val) or self._looks_like_xml_or_http_text(val) or val.strip():
+                            text_blob = _text_to_bytes(val)
+                            if text_blob:
+                                return text_blob
+                    elif isinstance(val, list):
+                        joined = "\n".join(str(x) for x in val if x is not None)
+                        if self._looks_like_json_text(joined) or self._looks_like_xml_or_http_text(
+                                joined) or joined.strip():
+                            text_blob = _text_to_bytes(joined)
+                            if text_blob:
+                                return text_blob
+
+        return None
+
+    def _build_scapy_from_tshark(self, layers: Dict[str, Any]) -> Optional[Packet]:
+        """
+        Best-effort Scapy reconstruction from tshark JSON.
+        Supports: Ether (if present), IPv4/IPv6 + TCP/UDP, ICMPv6 echo, and Raw payloads.
+        """
+        eth = layers.get("eth", {})
+        eth_src = eth.get("eth.src")
+        eth_dst = eth.get("eth.dst")
+
+        ipver, src_ip, dst_ip = self._get_ip_pair(layers)
+        raw_bytes = self._extract_best_payload_bytes(layers)
+
+        l4_layer = None
+
+        if "tcp" in layers:
+            tcp = layers["tcp"]
+            sport = self._as_int(tcp.get("tcp.srcport"), 0) or 0
+            dport = self._as_int(tcp.get("tcp.dstport"), 0) or 0
+            seq = self._as_int(tcp.get("tcp.seq"), None)
+            ack = self._as_int(tcp.get("tcp.ack"), None)
+            window = self._as_int(tcp.get("tcp.window_size_value"), None)
+
+            flags = 0
+            flag_map = {
+                "tcp.flags.fin": 0x01,
+                "tcp.flags.syn": 0x02,
+                "tcp.flags.reset": 0x04,
+                "tcp.flags.push": 0x08,
+                "tcp.flags.ack": 0x10,
+                "tcp.flags.urg": 0x20,
+                "tcp.flags.ecn": 0x40,
+                "tcp.flags.cwr": 0x80,
+            }
+            for key, bit in flag_map.items():
+                try:
+                    if str(tcp.get(key, "0")) in {"1", "True", "true"}:
+                        flags |= bit
+                except Exception:
+                    pass
+
+            tcp_kwargs = {"sport": sport, "dport": dport}
+            if seq is not None:
+                tcp_kwargs["seq"] = seq
+            if ack is not None:
+                tcp_kwargs["ack"] = ack
+            if window is not None:
+                tcp_kwargs["window"] = window
+            if flags:
+                tcp_kwargs["flags"] = flags
+
+            l4_layer = TCP(**tcp_kwargs)
+            if raw_bytes:
+                l4_layer = l4_layer / Raw(load=raw_bytes)
+
+        elif "udp" in layers:
+            udp = layers["udp"]
+            sport = self._as_int(udp.get("udp.srcport"), 0) or 0
+            dport = self._as_int(udp.get("udp.dstport"), 0) or 0
+            l4_layer = UDP(sport=sport, dport=dport)
+            if raw_bytes:
+                l4_layer = l4_layer / Raw(load=raw_bytes)
+
+        elif "icmpv6" in layers:
+            ic6 = layers["icmpv6"]
+            t = self._as_int(ic6.get("icmpv6.type"), -1)
+            if t == 128:
+                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
+                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
+                l4_layer = ICMPv6EchoRequest(id=ident, seq=seq)
+            elif t == 129:
+                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
+                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
+                l4_layer = ICMPv6EchoReply(id=ident, seq=seq)
+            elif raw_bytes:
+                l4_layer = Raw(load=raw_bytes)
+
+        else:
+            if raw_bytes:
+                l4_layer = Raw(load=raw_bytes)
+
+        net = None
+        if ipver == "ipv4":
+            net = IP(src=src_ip, dst=dst_ip)
+        elif ipver == "ipv6":
+            net = IPv6(src=src_ip, dst=dst_ip)
+
+        out = None
+        if eth_src and eth_dst:
+            out = Ether(src=str(eth_src), dst=str(eth_dst))
+            if net is not None:
+                out = out / net
+        else:
+            out = net if net is not None else None
+
+        if out is None:
+            return None
+
+        if l4_layer is not None:
+            out = out / l4_layer
+
+        return out
 
     def _initialize_geoip(self):
         """Finds and loads the GeoLite2-City database."""
@@ -4869,104 +5157,6 @@ class WiresharkManager:
             return "ipv6", v6.get("ipv6.src", "N/A"), v6.get("ipv6.dst", "N/A")
         return "none", "N/A", "N/A"
 
-    def _build_scapy_from_tshark(self, layers: Dict[str, Any]) -> Optional[Packet]:
-        """
-        Best-effort Scapy reconstruction from tshark JSON.
-        Supports: Ether (if present), IPv4/IPv6 + TCP/UDP, ICMPv6 echo, and Raw payloads.
-        """
-        eth = layers.get("eth", {})
-        eth_src = eth.get("eth.src")
-        eth_dst = eth.get("eth.dst")
-
-        ipver, src_ip, dst_ip = self._get_ip_pair(layers)
-
-        # Decide payload (Raw) source: prefer L4 payload keys, else generic data/data-text-lines
-        raw_bytes = None
-        # TCP payload as hex
-        if "tcp" in layers and "tcp.payload" in layers["tcp"]:
-            raw_bytes = self._hexdump_to_bytes(layers["tcp"]["tcp.payload"])
-        # UDP payload as hex
-        if raw_bytes is None and "udp" in layers and "udp.payload" in layers["udp"]:
-            raw_bytes = self._hexdump_to_bytes(layers["udp"]["udp.payload"])
-        # tshark generic data
-        if raw_bytes is None and "data" in layers and isinstance(layers["data"].get("data.data"), str):
-            raw_bytes = self._hexdump_to_bytes(layers["data"]["data.data"])
-        # data-text-lines (strings → bytes)
-        if raw_bytes is None and "data-text-lines" in layers:
-            dtl = layers["data-text-lines"]
-            if isinstance(dtl, list):
-                dtl = "\n".join(dtl)
-            if isinstance(dtl, str):
-                try:
-                    raw_bytes = dtl.encode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-
-        l4_layer = None
-
-        # Transport build
-        if "tcp" in layers:
-            tcp = layers["tcp"]
-            sport = self._as_int(tcp.get("tcp.srcport"), 0) or 0
-            dport = self._as_int(tcp.get("tcp.dstport"), 0) or 0
-            l4_layer = TCP(sport=sport, dport=dport)
-            if raw_bytes:
-                l4_layer = l4_layer / Raw(load=raw_bytes)
-
-        elif "udp" in layers:
-            udp = layers["udp"]
-            sport = self._as_int(udp.get("udp.srcport"), 0) or 0
-            dport = self._as_int(udp.get("udp.dstport"), 0) or 0
-            l4_layer = UDP(sport=sport, dport=dport)
-            if raw_bytes:
-                l4_layer = l4_layer / Raw(load=raw_bytes)
-
-        elif "icmpv6" in layers:
-            ic6 = layers["icmpv6"]
-            t = self._as_int(ic6.get("icmpv6.type"), -1)
-            # Echo req/rep most common
-            if t == 128:  # Echo Request
-                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
-                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
-                l4_layer = ICMPv6EchoRequest(id=ident, seq=seq)
-            elif t == 129:  # Echo Reply
-                ident = self._as_int(ic6.get("icmpv6.echo.identifier"), 0) or 0
-                seq = self._as_int(ic6.get("icmpv6.echo.sequence_number"), 0) or 0
-                l4_layer = ICMPv6EchoReply(id=ident, seq=seq)
-            else:
-                if raw_bytes:
-                    l4_layer = Raw(load=raw_bytes)
-
-        else:
-            # No recognizable L4; still attach any raw bytes
-            if raw_bytes:
-                l4_layer = Raw(load=raw_bytes)
-
-        # Build IP/IPv6
-        net = None
-        if ipver == "ipv4":
-            net = IP(src=src_ip, dst=dst_ip)
-        elif ipver == "ipv6":
-            net = IPv6(src=src_ip, dst=dst_ip)
-
-        # Final assembly
-        out = None
-        if eth_src and eth_dst:
-            out = Ether(src=str(eth_src), dst=str(eth_dst))
-            if net is not None:
-                out = out / net
-        else:
-            # No Ether, start from network layer if present
-            out = net if net is not None else None
-
-        if out is None:
-            # Nothing we can confidently build
-            return None
-
-        if l4_layer is not None:
-            out = out / l4_layer
-
-        return out
 
     def _is_ipv4_broadcast(self, addr: str) -> bool:
         try:
@@ -4996,89 +5186,160 @@ class WiresharkManager:
         """Parse tshark JSON, log/filter like before, THEN wrap into Scapy and pass to router_manager with iface='WireShark'."""
         yield_no_gil(0.1)
         if not isinstance(packet_data, dict):
-            return  # ignore non-JSON / malformed
+            return
 
         try:
             layers = packet_data.get("_source", {}).get("layers", {})
             if not layers:
                 return
 
-            # ----------------------------------------------------------
-            #          Basic frame / IP / transport extraction
-            # ----------------------------------------------------------
+            def _nz(ip: str) -> str:
+                return ip.split("%", 1)[0] if isinstance(ip, str) else ip
+
+            def _safe_int(v, default=0):
+                try:
+                    return int(str(v or default).strip())
+                except Exception:
+                    return default
+
+            def _is_loopback_addr(ip: str) -> bool:
+                try:
+                    return ipaddress.ip_address(_nz(ip)).is_loopback
+                except Exception:
+                    return False
+
+            def _looks_like_directed_broadcast(ip: str) -> bool:
+                try:
+                    ip_s = str(_nz(ip) or "")
+                    ip_obj = ipaddress.ip_address(ip_s)
+                    if ip_obj.version != 4:
+                        return False
+                    if ip_obj.is_multicast or ip_obj.is_loopback:
+                        return False
+                    parts = ip_s.split(".")
+                    return len(parts) == 4 and parts[-1] == "255"
+                except Exception:
+                    return False
+
+            def _parse_json_loose(text: str):
+                if not text:
+                    return None
+                s = str(text).lstrip("\ufeff\r\n\t \x00")
+                if not s:
+                    return None
+                try:
+                    obj = json.loads(s)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    pass
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, _ = decoder.raw_decode(s)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+
+            def _is_hvrm_control_json_block(decoded_payload: str, payload_bytes: bytes, src_port_val, dst_port_val,
+                                            src_ip_val: str, dst_ip_val: str) -> bool:
+                text = ""
+                if decoded_payload and decoded_payload.strip():
+                    text = decoded_payload
+                elif payload_bytes:
+                    try:
+                        text = payload_bytes.decode("utf-8", errors="ignore")
+                    except Exception:
+                        text = ""
+
+                if not text:
+                    return False
+
+                preview = text[:8192]
+                if '"magic":"HVRM' not in preview and '"magic": "HVRM' not in preview:
+                    return False
+
+                msg = _parse_json_loose(text)
+                if not isinstance(msg, dict):
+                    return False
+
+                magic = str(msg.get("magic") or "").strip()
+                mtype = str(msg.get("type") or "").strip().lower()
+
+                if magic not in {"HVRM4", "HVRM5", "HVRM6"}:
+                    return False
+                if mtype not in {"hello", "hello_ack", "frame", "ack"}:
+                    return False
+
+                sp = _safe_int(src_port_val, 0)
+                dp = _safe_int(dst_port_val, 0)
+
+                if sp in {47771, 47772} or dp in {47771, 47772}:
+                    return True
+
+                if _looks_like_directed_broadcast(dst_ip_val):
+                    return True
+
+                try:
+                    adv_ip = str(msg.get("listen_ip") or msg.get("reply_to_ip") or "")
+                    if adv_ip and adv_ip == str(src_ip_val):
+                        return True
+                except Exception:
+                    pass
+
+                return True
+
             frame = layers.get("frame", {})
             timestamp = frame.get("frame.time", "N/A")
             packet_num = frame.get("frame.number", "N/A")
             packet_len = frame.get("frame.len", "N/A")
 
-            # Filter by minimum packet length
             try:
                 if int(packet_len) < self.min_packet_len:
                     self.logger.log_message(
-                        f"[Wireshark Filter] Filtering small packet (Len: {packet_len}) on interface {interface_id}.")
+                        f"[Wireshark Filter] Filtering small packet (Len: {packet_len}) on interface {interface_id}."
+                    )
                     return
             except ValueError:
-                pass  # packet_len might be "N/A"
+                pass
 
             ip_layer = layers.get("ip") or layers.get("ipv6")
             src_ip = ip_layer.get("ip.src", ip_layer.get("ipv6.src", "N/A")) if ip_layer else "N/A"
             dst_ip = ip_layer.get("ip.dst", ip_layer.get("ipv6.dst", "N/A")) if ip_layer else "N/A"
 
-            # ----------------------------------------------------------
-            #                  Filtering for idle/senseless traffic
-            # ----------------------------------------------------------
-            # IPv4 broadcast?
             if self._is_ipv4_broadcast(dst_ip):
                 self.logger.log_message(
-                    f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}.")
+                    f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}."
+                )
                 return
 
-            # Multicast/Link-local multicast/Discovery?
             dst_is_mcast = self._is_multicast_or_llm(dst_ip)
             if dst_is_mcast:
                 self.logger.log_message(
-                    f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}.")
+                    f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}."
+                )
                 return
-
-            def _nz(ip: str) -> str:
-                return ip.split("%", 1)[0] if isinstance(ip, str) else ip
 
             try:
                 dst_obj = ipaddress.ip_address(_nz(dst_ip))
             except ValueError:
                 dst_obj = None
 
-            def _is_loopback_addr(ip: str) -> bool:
-                import ipaddress
-                try:
-                    return ipaddress.ip_address(_nz(ip)).is_loopback
-                except Exception:
-                    return False
-            # Drop MLD/ND noise: ff02::/16 multicast and solicited-node ff02::1:ff00:0/104
             if "icmpv6" in layers and dst_obj and dst_obj.is_multicast:
-                # Common ICMPv6 types to suppress: 130-143 (MLD), 133-137 (ND/RA/RS/NS/NA)
                 self.logger.log_message(
                     f"[Wireshark Filter] Filtering ICMPv6 multicast to {dst_ip} on interface {interface_id}."
                 )
                 return
-            if _is_loopback_addr(src_ip) and _is_loopback_addr(dst_ip):
-                # optional: lightweight log or counter
-                self.logger.log_message(f"[Wireshark] Skipping local loopback packet {src_ip} -> {dst_ip}")
-                return  # 🚫 do not forward or “send via Scapy”
 
-            if self.router_manager.started and src_ip == dst_ip:
-                # 💡 This packet is addressed to itself. We need to check if it's a case
-                # that requires processing (like private/link-local traffic).
+            if _is_loopback_addr(src_ip) and _is_loopback_addr(dst_ip):
+                self.logger.log_message(f"[Wireshark] Skipping local loopback packet {src_ip} -> {dst_ip}")
+                return
+
+            if self.router_manager and self.router_manager.started and src_ip == dst_ip:
                 is_legitimate_loopback = False
                 try:
                     ip_obj = ipaddress.ip_address(src_ip)
-
-                    # This is the check: is the address private, link-local, or standard loopback?
                     if ip_obj.is_private or ip_obj.is_link_local or ip_obj.is_loopback:
                         is_legitimate_loopback = True
-
                 except ValueError:
-                    # If it's not a valid IP address, we'll treat it as not legitimate.
                     is_legitimate_loopback = False
 
                 if is_legitimate_loopback:
@@ -5087,31 +5348,34 @@ class WiresharkManager:
                     )
                     return
                 else:
-                    # 🚫 This is a self-addressed packet using a public IP. Drop it.
                     self.logger.log_message(
                         f"[Wireshark] 💧 Dropping suspicious self-addressed public IP packet: {src_ip} -> {dst_ip}"
                     )
-                    return  # Stop processing immediately
-            if self.router_manager.started:
-                link_local_ip_bare = self.router_manager.router_ipv6_link_local_out.split('%')[0]
-                if dst_ip == link_local_ip_bare or src_ip == link_local_ip_bare:
-                    self.logger.log_message(
-                        f"[Wireshark] 💧 Dropping packet to our own link-local address: {dst_ip}"
-                    )
-                    return # Stop processing immediately
-            # 0) Fast path: skip non-IP frames entirely (prevents N/A logs)
+                    return
+
+            if self.router_manager and self.router_manager.started:
+                try:
+                    link_local_ip_bare = self.router_manager.router_ipv6_link_local_out.split('%')[0]
+                    if dst_ip == link_local_ip_bare or src_ip == link_local_ip_bare:
+                        self.logger.log_message(
+                            f"[Wireshark] 💧 Dropping packet to our own link-local address: {dst_ip}"
+                        )
+                        return
+                except Exception:
+                    pass
+
             has_ip4 = "ip" in layers
             has_ip6 = "ipv6" in layers
             if not (has_ip4 or has_ip6):
                 return
 
-            # from here on, it is safe to assume we have IPv4 or IPv6
             ip_layer = layers.get("ip") or layers.get("ipv6")
             src_ip = ip_layer.get("ip.src", ip_layer.get("ipv6.src", "N/A"))
-            # Common noisy ports
+            dst_ip = ip_layer.get("ip.dst", ip_layer.get("ipv6.dst", "N/A"))
+
             common_noisy_ports = {
                 "5353", "1900", "137", "138", "139", "445", "520", "161", "162",
-                "67", "68", "546", "547", "5678", "5679", "3702", "5355","22222"
+                "67", "68", "546", "547", "5678", "5679", "3702", "5355", "22222"
             }
 
             if "udp" in layers:
@@ -5120,7 +5384,8 @@ class WiresharkManager:
                 src_port = udp_layer.get("udp.srcport", "N/A")
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
                     self.logger.log_message(
-                        f"[Wireshark Filter] Filtering Discovery/Idle UDP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}.")
+                        f"[Wireshark Filter] Filtering Discovery/Idle UDP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
+                    )
                     return
 
             if "tcp" in layers:
@@ -5129,21 +5394,18 @@ class WiresharkManager:
                 src_port = tcp_layer.get("tcp.srcport", "N/A")
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
                     self.logger.log_message(
-                        f"[Wireshark Filter] Filtering Discovery/Idle TCP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}.")
+                        f"[Wireshark Filter] Filtering Discovery/Idle TCP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
+                    )
                     return
 
-            # ----------------------------------------------------------
-            #                  Contextual / VPN tagging
-            # ----------------------------------------------------------
             def _is_private(addr: str) -> bool:
                 try:
-                    return ipaddress.ip_address(addr.split("%")[0]).is_private  # strip zone index
+                    return ipaddress.ip_address(addr.split("%")[0]).is_private
                 except ValueError:
-                    return True  # treat invalid as private to avoid FP egress tags
+                    return True
 
             context_tags: list[str] = []
 
-            # 1) Loopback packet that will be encrypted by VPN soon
             if (
                     interface_id == self.loopback_interface_id and
                     self.vpn_interface_id is not None and
@@ -5151,178 +5413,207 @@ class WiresharkManager:
             ):
                 context_tags.append("via-VPN-out")
 
-            # 2) Traffic already on VPN adapter
             if interface_id == self.vpn_interface_id:
                 if _is_private(src_ip) and not _is_private(dst_ip):
-                    context_tags.append("VPN→WAN")  # egress after encryption
+                    context_tags.append("VPN→WAN")
                 elif not _is_private(src_ip) and _is_private(dst_ip):
-                    context_tags.append("WAN→VPN")  # ingress before decryption
+                    context_tags.append("WAN→VPN")
                 else:
                     context_tags.append("VPN-internal")
 
-            # ----------------------------------------------------------
-            #               Transport & service lookup
-            # ----------------------------------------------------------
             src_port = dst_port = "N/A"
             tcp_layer = layers.get("tcp")
+            udp_layer = layers.get("udp")
+
             if tcp_layer:
                 src_port = tcp_layer.get("tcp.srcport", "N/A")
                 dst_port = tcp_layer.get("tcp.dstport", "N/A")
-            elif "udp" in layers:
-                udp_layer = layers["udp"]
+            elif udp_layer:
                 src_port = udp_layer.get("udp.srcport", "N/A")
                 dst_port = udp_layer.get("udp.dstport", "N/A")
 
             highest_proto = frame.get("frame.protocols", "N/A").split(":")[-1].upper()
 
-            # ----------------------------------------------------------
-            #                     GeoIP (optional)
-            # ----------------------------------------------------------
-            dst_location = ""
-            if hasattr(self, "_get_geoip_location"):
-                dst_location = self._get_geoip_location(dst_ip)
-            loc_str = f"({dst_location})" if dst_location else ""
+            payload_bytes = b""
+            decoded_payload = ""
+            app_layer = "UNKNOWN"
+            app_detail = ""
 
-            # ----------------------------------------------------------
-            #                       Structured log
-            # ----------------------------------------------------------
+            try:
+                payload_bytes = self._extract_best_payload_bytes(layers) or b""
+            except Exception:
+                payload_bytes = b""
+
+            try:
+                decoded_payload = self._decode_best_payload_text(payload_bytes) if payload_bytes else ""
+            except Exception:
+                decoded_payload = ""
+
+            try:
+                app_layer, app_detail = self._classify_application_layer(layers, payload_bytes)
+            except Exception:
+                app_layer, app_detail = "UNKNOWN", ""
+
+            # HARD DROP BEFORE ANY LOGGING OF JSON / PAYLOAD / GEOIP
+            if _is_hvrm_control_json_block(decoded_payload, payload_bytes, src_port, dst_port, src_ip, dst_ip):
+                self.logger.log_message(
+                    f"[Wireshark Filter] Blocking HVRM control JSON {src_ip}:{src_port} -> {dst_ip}:{dst_port} on interface {interface_id}."
+                )
+                return
+
+            src_location = ""
+            dst_location = ""
+            try:
+                if hasattr(self, "_get_geoip_location"):
+                    src_location = self._get_geoip_location(src_ip)
+                    dst_location = self._get_geoip_location(dst_ip)
+            except Exception:
+                src_location = ""
+                dst_location = ""
+
+            src_loc_str = f"({src_location})" if src_location else ""
+            dst_loc_str = f"({dst_location})" if dst_location else ""
+
             tag_str = f" [{' | '.join(context_tags)}]" if context_tags else ""
+            app_str = f" | App:{app_layer}" + (f" ({app_detail})" if app_detail else "")
             self.logger.log_message(
                 f"[NetTrace-{interface_id}] Pkt:{packet_num:<6} | {timestamp} | Len:{packet_len:<5} | "
-                f"{src_ip}:{src_port} -> {dst_ip}:{dst_port} {loc_str} | Proto:{highest_proto}{tag_str}"
+                f"{src_ip}:{src_port} {src_loc_str} -> {dst_ip}:{dst_port} {dst_loc_str} | "
+                f"Proto:{highest_proto}{app_str}{tag_str}"
             )
 
-            # ----------------------------------------------------------
-            #              Application-layer quick peeks
-            # ----------------------------------------------------------
-            if "http" in layers:
-                http = layers["http"]
+            if app_layer == "HTTP":
+                http = layers.get("http", {})
                 if "http.request.method" in http:
                     host = http.get("http.host", "")
                     uri = http.get("http.request.full_uri", "")
                     self.logger.log_message(
-                        f"[HTTP-{interface_id}] {src_ip} → {host}{uri} ({http['http.request.method']}){tag_str}")
+                        f"[HTTP-{interface_id}] {src_ip} → {host}{uri} ({http['http.request.method']}){tag_str}"
+                    )
                 elif "http.response.code" in http:
                     code = http["http.response.code"]
                     self.logger.log_message(
-                        f"[HTTP-{interface_id}] {dst_ip} ← {code}{tag_str}")
+                        f"[HTTP-{interface_id}] {dst_ip} ← {code}{tag_str}"
+                    )
 
-            elif "ssl" in layers or "tls" in layers:
+            elif app_layer == "TLS":
                 tls = layers.get("ssl", layers.get("tls", {}))
                 if "tls.handshake.extensions_server_name" in tls:
                     sni = tls["tls.handshake.extensions_server_name"]
                     self.logger.log_message(
-                        f"[TLS-{interface_id}] SNI={sni} {src_ip}:{src_port} → {dst_ip}:{dst_port}{tag_str}")
+                        f"[TLS-{interface_id}] SNI={sni} {src_ip}:{src_port} → {dst_ip}:{dst_port}{tag_str}"
+                    )
 
-            if "dns" in layers and layers["dns"].get("dns.qry.name"):
-                dns = layers["dns"]
-                qname = dns["dns.qry.name"]
-                qtype = dns["dns.qry.type"]
+            elif app_layer == "DNS":
+                dns = layers.get("dns", {})
+                qname = dns.get("dns.qry.name", "")
+                qtype = dns.get("dns.qry.type", "")
                 answer = dns.get("dns.a", dns.get("dns.aaaa", ""))
                 self.logger.log_message(
-                    f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}")
-            # ----------------------------------------------------------
-            #           Optional reassembled payload preview (TCP/UDP)
-            # ----------------------------------------------------------
-            raw_payload_hex_str = None
-            if tcp_layer and tcp_layer.get("tcp.payload"):
-                raw_payload_hex_str = tcp_layer["tcp.payload"].replace(":", "")
-            elif "udp" in layers and layers["udp"].get("udp.payload"):
-                raw_payload_hex_str = layers["udp"]["udp.payload"].replace(":", "")
-            elif "data-text-lines" in layers:
-                reassembled = layers["data-text-lines"]
-                if isinstance(reassembled, list):
-                    reassembled = "\n".join(reassembled)
-                try:
-                    raw_payload_hex_str = reassembled.encode('utf-8', errors='ignore').hex()
-                except Exception:
-                    raw_payload_hex_str = None
+                    f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}"
+                )
 
-            if raw_payload_hex_str:
+            elif app_layer in {"JSON", "JSON-RPC"}:
+                preview = decoded_payload[:400] if decoded_payload else ""
+                self.logger.log_message(
+                    f"[JSON-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
+                )
+
+            elif app_layer in {"XML", "SOAP"}:
+                preview = decoded_payload[:400] if decoded_payload else ""
+                self.logger.log_message(
+                    f"[XML-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
+                )
+
+            if payload_bytes:
+                raw_payload_hex_str = payload_bytes.hex()
                 truncated_hex_display = raw_payload_hex_str[:128] + ("..." if len(raw_payload_hex_str) > 128 else "")
-                self.logger.log_message(f"[Payload-Wireshark] 📦 Raw payload (hex): {truncated_hex_display}...")
+                self.logger.log_message(f"[Payload-Wireshark] 📦 Raw payload (hex): {truncated_hex_display}")
 
-                try:
-                    payload_bytes = bytes.fromhex(raw_payload_hex_str)
-                    decoded_payload = payload_bytes.decode('utf-8', errors='replace')
-
-                    replacement_char_count = decoded_payload.count('\ufffd')
-                    printable_char_count = sum(1 for ch in decoded_payload if ch in string.printable)
-
-                    is_human_readable = True
-                    if len(decoded_payload) > 0:
-                        if replacement_char_count / len(decoded_payload) > 0.10:
-                            is_human_readable = False
-                        elif printable_char_count / len(decoded_payload) < 0.50:
-                            is_human_readable = False
-                    elif len(payload_bytes) > 0:
-                        is_human_readable = False
-
-                    if is_human_readable and len(decoded_payload.strip()) > 0:
-                        self.logger.log_message(f"[Payload-Wireshark] 📝 Decoded payload: {decoded_payload}")
-                    else:
-                        self.logger.log_message("[Payload-Wireshark] ⚠️ Decoded payload not considered human-readable.")
-                except UnicodeDecodeError:
-                    self.logger.log_message("[Payload-Wireshark] ⚠️ Could not decode payload as UTF-8.")
-                except Exception as e:
-                    self.logger.log_message(f"[Payload-Wireshark] ❌ Error processing/decoding payload: {e}")
+                if decoded_payload and decoded_payload.strip():
+                    self.logger.log_message(f"[Payload-Wireshark] 📝 Decoded payload: {decoded_payload[:1200]}")
+                else:
+                    self.logger.log_message("[Payload-Wireshark] ⚠️ Decoded payload not considered human-readable.")
             else:
-                self.logger.log_message(f"[Payload-Wireshark] 📦 No reassembled payload data found.")
+                self.logger.log_message("[Payload-Wireshark] 📦 No reassembled payload data found.")
 
-            # ----------------------------------------------------------
-            #                 NEW: build Scapy & dispatch
-            # ----------------------------------------------------------
             try:
-                if self.router_manager.started:
+                if self.router_manager and self.router_manager.started:
                     scapy_pkt = self._build_scapy_from_tshark(layers)
                     if scapy_pkt is None:
-                        # Nothing we could reconstruct; still bail gracefully
                         self.logger.log_message(
-                            "[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON.")
+                            "[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON."
+                        )
                         return
-                    if self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(scapy_pkt, raw, "WireShark"):
-                        return False
-                    # Hand off to your router with inbound iface set to "WireShark"
+
+                    try:
+                        scapy_raw = bytes(scapy_pkt)
+                    except Exception as e:
+                        self.logger.log_message(
+                            f"[Wireshark-Process] ⚠️ Built Scapy packet but could not serialize it: {type(e).__name__}: {e}"
+                        )
+                        return
+
+                    try:
+                        setattr(scapy_pkt, "_ws_layers", layers)
+                        setattr(scapy_pkt, "_ws_app_layer", app_layer)
+                        setattr(scapy_pkt, "_ws_app_detail", app_detail)
+                        setattr(scapy_pkt, "_ws_payload_text", decoded_payload)
+                        setattr(scapy_pkt, "_ws_payload_bytes", payload_bytes)
+                        setattr(scapy_pkt, "_ws_geoip_src", src_location)
+                        setattr(scapy_pkt, "_ws_geoip_dst", dst_location)
+                        setattr(scapy_pkt, "_ws_interface_id", interface_id)
+                        setattr(scapy_pkt, "_ws_timestamp", timestamp)
+                        setattr(scapy_pkt, "_ws_packet_num", packet_num)
+                        setattr(scapy_pkt, "_ws_net_patch", True)
+                    except Exception:
+                        pass
+
+                    if self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(
+                            scapy_pkt, scapy_raw, "WireShark"
+                    ):
+                        return
+
                     try:
                         if self.router_manager.started and (
                                 (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
                                     src_ip)) or
-                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
-                                    dst_ip))
+                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(dst_ip))
                         ):
-                            if self.router_manager.router_ip_out in str(
-                                    src_ip) and self.router_manager.router_ip_out in str(dst_ip):
-                                self.logger.log_message(
-                                    "[Wireshark-Process] Skipping Routers self forward")
+                            if (
+                                    self.router_manager.router_ip_out in str(src_ip)
+                                    and self.router_manager.router_ip_out in str(dst_ip)
+                            ):
+                                self.logger.log_message("[Wireshark-Process] Skipping Routers self forward")
                                 return
-                            try:
-                                if self.router_manager.router_ip_out in str(dst_ip):
-                                    self.logger.log_message(
-                                        "[Wireshark-Process] 🪈 Sending Routers own packet via Scapy through PYPIPE")
-                                    # Prefer (pkt, iface) signature if your router supports it
-                                    self.router_manager.hyperv_manager.send_packet(bytes(scapy_pkt))
-                                else:
-                                    self.logger.log_message(
-                                        "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark.")
-                                    # Prefer (pkt, iface) signature if your router supports it
-                                    self.router_manager.process_packet(scapy_pkt, "WireShark")
-                            except TypeError:
-                                # Fallback to single-arg call if that’s your router’s API
-                                self.router_manager.hyperv_manager.send_packet(bytes(scapy_pkt))
+
+                            if self.router_manager.router_ip_out in str(dst_ip):
+                                self.logger.log_message(
+                                    "[Wireshark-Process] 🪈 Sending Routers own packet via Scapy through PYPIPE"
+                                )
+                                self.router_manager.hyperv_manager.send_packet(scapy_raw)
+                            else:
+                                self.logger.log_message(
+                                    "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
+                                )
+                                self.router_manager.process_packet(scapy_pkt, "WireShark")
                             return
+
                         self.logger.log_message(
-                            "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark.")
-                        # Prefer (pkt, iface) signature if your router supports it
+                            "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
+                        )
                         self.router_manager.process_packet(scapy_pkt, "WireShark")
+
                     except TypeError:
-                        # Fallback to single-arg call if that’s your router’s API
                         self.router_manager.process_packet(scapy_pkt)
+
             except Exception as e:
                 self.logger.log_message(f"[Wireshark-Process] ❌ Scapy build/dispatch error: {e}")
 
         except Exception as e:
             self.logger.log_message(
-                f"[Wireshark-Process] Error processing packet on interface {interface_id}: {e}")
+                f"[Wireshark-Process] Error processing packet on interface {interface_id}: {e}"
+            )
 
     def _redirect_output(self, process: subprocess.Popen, interface_id: str):
         if not process.stdout: return
