@@ -16,6 +16,9 @@ import pywintypes
 import win32api
 import win32file
 import win32pipe
+from scapy.layers.inet import UDP, IP
+from scapy.layers.inet6 import IPv6
+from scapy.layers.l2 import Ether, ARP
 from win32con import GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING
 
 # Optional imports kept for compatibility with the rest of your app
@@ -279,6 +282,7 @@ class HyperVManager:
         self._exit_logged = False
 
         atexit.register(self.teardown)
+
 
     # ---------- helpers ----------
 
@@ -745,7 +749,54 @@ class _PipeFrameReaderBase:
         self._frag6_max_per_stream = 128
 
     # ---------- lifecycle ----------
+    def _should_drop_local_noise_frame(self, frame: bytes) -> bool:
 
+        try:
+            pkt = Ether(frame)
+        except Exception:
+            return False
+
+        try:
+            if pkt.haslayer(ARP):
+                return True
+        except Exception:
+            pass
+
+        try:
+            dst_mac = str(getattr(pkt, "dst", "") or "").lower()
+            if dst_mac == "ff:ff:ff:ff:ff:ff":
+                return True
+            if dst_mac.startswith("01:00:5e:"):
+                return True
+            if dst_mac.startswith("33:33:"):
+                return True
+        except Exception:
+            pass
+
+        try:
+            if pkt.haslayer(UDP):
+                udp = pkt[UDP]
+                sport = int(getattr(udp, "sport", 0) or 0)
+                dport = int(getattr(udp, "dport", 0) or 0)
+                if sport in {137, 138} or dport in {137, 138}:
+                    return True
+        except Exception:
+            pass
+
+        try:
+            ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+            if ip is not None:
+                dst_ip = str(getattr(ip, "dst", "") or "").lower()
+                if dst_ip == "255.255.255.255":
+                    return True
+                if dst_ip.startswith("224."):
+                    return True
+                if dst_ip.startswith("ff"):
+                    return True
+        except Exception:
+            pass
+
+        return False
     def start(self):
         with self._state_lock:
             if self._reader_thread and self._reader_thread.is_alive():
@@ -1157,7 +1208,8 @@ class _PipeFrameReaderBase:
                 if self._stop_event.is_set():
                     break
                 continue
-
+            if self._should_drop_local_noise_frame(frame):
+                continue
             fn = self._wait_for_process_handler()
             if fn is None:
                 self.frames_dropped_no_handler += 1

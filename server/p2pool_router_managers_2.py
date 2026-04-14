@@ -23127,6 +23127,7 @@ class HyperVRouterManager:
       - early-drops local noise/broadcast/multicast from sidecar mirroring
       - bounded ingress/pending queues with drop-or-defer behavior
       - no inline queue-full send fallback on hot paths
+      - explicitly ignores HVRM control/discovery packets seen on WireShark
     """
 
     MAGIC = "HVRM5"
@@ -23140,6 +23141,15 @@ class HyperVRouterManager:
 
     LOCAL_NOISE_UDP_PORTS = {
         137, 138, 1900, 3702, 5353, 5355, 546, 547,
+    }
+
+    HVRM_CONTROL_TYPES = {"hello", "hello_ack", "frame", "ack"}
+    WIRESHARK_IFACE_NAMES = {
+        "wireshark",
+        "wire shark",
+        "wire_shark",
+        "wire-shark",
+        "wireshark-process",
     }
 
     def __init__(
@@ -23281,6 +23291,7 @@ class HyperVRouterManager:
             "pending_pruned": 0,
             "local_sender_queue_full": 0,
             "noise_dropped": 0,
+            "wireshark_hvrm_dropped": 0,
         }
 
     # ---------------------------------------------------------
@@ -23624,6 +23635,15 @@ class HyperVRouterManager:
             if iface_name == self.INBOUND_IFACE_NAME:
                 return False
 
+            raw = self._packet_to_bytes(packet)
+            if not raw:
+                return False
+
+            # Explicitly ignore HVRM control/discovery packets seen on Wireshark.
+            if self._should_drop_wireshark_hvrm(packet, raw, iface_name):
+                self._stats["wireshark_hvrm_dropped"] = int(self._stats.get("wireshark_hvrm_dropped", 0)) + 1
+                return False
+
             _ = self._consult_hostboundary(packet, iface_name)
 
             protocol_tag = self._classify_protocol(packet)
@@ -23635,12 +23655,7 @@ class HyperVRouterManager:
                 self._stats["noise_dropped"] = int(self._stats.get("noise_dropped", 0)) + 1
                 return False
 
-            raw = self._packet_to_bytes(packet)
-            if not raw:
-                return False
-
-            # Critical noise fix:
-            # never re-mirror our own HVRM control plane packets.
+            # Never re-mirror our own HVRM control plane packets.
             if self._is_hvrm_control_packet(packet, raw):
                 return False
 
@@ -23662,7 +23677,7 @@ class HyperVRouterManager:
             except Exception:
                 pass
 
-            exclude_kind = ingress_kind if ingress_kind in {"wintun", "windivert", "hyperv"} else None
+            exclude_kind = ingress_kind if ingress_kind in {"wintun", "windivert", "hyperv", "wireshark"} else None
             endpoints = self._collect_candidate_endpoints(protocol_tag, exclude_kind=exclude_kind)
             if not endpoints:
                 return False
@@ -23717,20 +23732,32 @@ class HyperVRouterManager:
 
         return "observe"
 
+    def _normalize_iface_token(self, iface_name: Any) -> str:
+        txt = str(iface_name or "").strip().lower()
+        txt = txt.replace("_", " ").replace("-", " ")
+        txt = " ".join(txt.split())
+        return txt
+
+    def _is_wireshark_iface(self, inbound_iface: str) -> bool:
+        return self._normalize_iface_token(inbound_iface) in self.WIRESHARK_IFACE_NAMES
+
     def _infer_ingress_kind(self, inbound_iface: str) -> Optional[str]:
-        iface = str(inbound_iface or "").strip().lower()
+        iface = self._normalize_iface_token(inbound_iface)
         if not iface:
             return None
 
-        if self._wintun_iface_name and iface == self._wintun_iface_name.strip().lower():
+        if iface in self.WIRESHARK_IFACE_NAMES:
+            return "wireshark"
+
+        if self._wintun_iface_name and iface == self._normalize_iface_token(self._wintun_iface_name):
             return "wintun"
 
         for name in self._windivert_iface_names:
-            if iface == str(name).strip().lower():
+            if iface == self._normalize_iface_token(name):
                 return "windivert"
 
         for token in self._hyperv_iface_names:
-            token_l = str(token).strip().lower()
+            token_l = self._normalize_iface_token(token)
             if token_l and token_l in iface:
                 return "hyperv"
 
@@ -25032,7 +25059,10 @@ class HyperVRouterManager:
         out: List[Tuple[str, int]] = []
 
         if dst_ip and int(dst_port or 0) > 0:
-            if self._transport_ip_allowed(dst_ip, discovery=(int(dst_port) == self.discovery_port or int(dst_port) == self._bound_discovery_port)):
+            if self._transport_ip_allowed(
+                dst_ip,
+                discovery=(int(dst_port) == self.discovery_port or int(dst_port) == self._bound_discovery_port)
+            ):
                 out.append((str(dst_ip), int(dst_port)))
 
         with self._lock:
@@ -25193,7 +25223,10 @@ class HyperVRouterManager:
         if not ip or port <= 0:
             return False
 
-        if not self._transport_ip_allowed(ip, discovery=(mtype in {"hello", "hello_reply"} or port == self.discovery_port or port == self._bound_discovery_port)):
+        if not self._transport_ip_allowed(
+            ip,
+            discovery=(mtype in {"hello", "hello_reply"} or port == self.discovery_port or port == self._bound_discovery_port)
+        ):
             return False
 
         with self._sock_lock:
@@ -25984,6 +26017,171 @@ class HyperVRouterManager:
             pass
         return sport, dport
 
+    def _extract_udp_payload_bytes(self, packet, raw: Optional[bytes] = None) -> bytes:
+        try:
+            if UDP is not None and getattr(packet, "haslayer", None) and packet.haslayer(UDP):
+                udp_layer = packet.getlayer(UDP)
+                if udp_layer is not None and getattr(udp_layer, "payload", None) is not None:
+                    data = bytes(udp_layer.payload)
+                    if data:
+                        return data[: self._control_payload_scan_limit]
+        except Exception:
+            pass
+
+        try:
+            if Raw is not None and getattr(packet, "haslayer", None) and packet.haslayer(Raw):
+                rl = packet.getlayer(Raw)
+                data = bytes(getattr(rl, "load", b"") or b"")
+                if data:
+                    return data[: self._control_payload_scan_limit]
+        except Exception:
+            pass
+
+        blob = bytes(raw or b"")
+        if not blob:
+            return b""
+
+        idx = blob.find(b'{"magic":"HVRM')
+        if idx >= 0:
+            return blob[idx: idx + self._control_payload_scan_limit]
+
+        stripped = blob.strip(b"\x00\r\n\t ")
+        return stripped[: self._control_payload_scan_limit]
+
+    def _extract_hvrm_message(self, packet, raw: Optional[bytes] = None) -> Optional[Dict[str, Any]]:
+        blob = self._extract_udp_payload_bytes(packet, raw)
+        if not blob:
+            return None
+
+        candidates = [bytes(blob)]
+        stripped = bytes(blob).strip(b"\x00\r\n\t ")
+        if stripped and stripped != blob:
+            candidates.append(stripped)
+
+        for candidate in candidates:
+            try:
+                msg = json.loads(candidate.decode("utf-8", errors="ignore"))
+                if isinstance(msg, dict):
+                    return msg
+            except Exception:
+                pass
+
+        try:
+            text_blob = stripped.decode("utf-8", errors="ignore").lstrip("\ufeff\r\n\t \x00")
+            decoder = json.JSONDecoder()
+            msg, _ = decoder.raw_decode(text_blob)
+            if isinstance(msg, dict):
+                return msg
+        except Exception:
+            pass
+
+        return None
+
+    def _looks_like_hvrm_json(self, blob: bytes) -> bool:
+        if not blob:
+            return False
+
+        preview = bytes(blob[: self._control_payload_scan_limit])
+
+        if b'"magic":"HVRM' not in preview and b'"magic": "HVRM' not in preview:
+            return False
+
+        try:
+            text_blob = preview.decode("utf-8", errors="ignore").lstrip("\ufeff\r\n\t \x00")
+            decoder = json.JSONDecoder()
+            msg, _ = decoder.raw_decode(text_blob)
+            if not isinstance(msg, dict):
+                return False
+
+            magic = str(msg.get("magic") or "").strip()
+            mtype = str(msg.get("type") or "").strip().lower()
+            return magic in self.ACCEPT_MAGICS and mtype in self.HVRM_CONTROL_TYPES
+        except Exception:
+            pass
+
+        return (
+            b'"type":"hello"' in preview
+            or b'"type":"hello_ack"' in preview
+            or b'"type":"frame"' in preview
+            or b'"type":"ack"' in preview
+        )
+
+    def _control_ports(self) -> Set[int]:
+        return {
+            int(self.discovery_port or 0),
+            int(self.data_port or 0),
+            int(self._bound_discovery_port or 0),
+            int(self._bound_data_port or 0),
+        }
+
+    def _is_hvrm_control_packet(self, packet, raw: Optional[bytes] = None) -> bool:
+        sport = 0
+        dport = 0
+
+        try:
+            sport = int(getattr(packet, "sport", 0) or 0)
+        except Exception:
+            sport = 0
+        try:
+            dport = int(getattr(packet, "dport", 0) or 0)
+        except Exception:
+            dport = 0
+
+        try:
+            if UDP is not None and getattr(packet, "haslayer", None) and packet.haslayer(UDP):
+                udp_layer = packet.getlayer(UDP)
+                sport = int(getattr(udp_layer, "sport", sport) or sport)
+                dport = int(getattr(udp_layer, "dport", dport) or dport)
+        except Exception:
+            pass
+
+        payload = self._extract_udp_payload_bytes(packet, raw)
+        if not payload:
+            return False
+
+        if not self._looks_like_hvrm_json(payload):
+            return False
+
+        ports = self._control_ports()
+        if sport in ports or dport in ports:
+            return True
+
+        return True
+
+    def _should_drop_wireshark_hvrm(self, packet, raw: bytes, inbound_iface: str) -> bool:
+        if not self._is_wireshark_iface(inbound_iface):
+            return False
+
+        if not self._is_hvrm_control_packet(packet, raw):
+            return False
+
+        msg = self._extract_hvrm_message(packet, raw)
+        if msg is None:
+            self._log_sparse(
+                "wireshark-hvrm-drop",
+                "route",
+                f"dropping HVRM control packet seen on WireShark iface={inbound_iface}",
+                ["🧹", "🕵️", "📡"],
+                every=3.0,
+            )
+            return True
+
+        mtype = str(msg.get("type") or "").strip().lower()
+        node_id = str(msg.get("node_id") or msg.get("src_node_id") or "").strip()
+        listen_ip = str(msg.get("listen_ip") or msg.get("reply_to_ip") or "").strip()
+
+        if mtype in self.HVRM_CONTROL_TYPES:
+            self._log_sparse(
+                f"wireshark-hvrm-drop:{mtype}",
+                "route",
+                f"dropping HVRM {mtype} from WireShark node={node_id or '-'} listen={listen_ip or '-'}",
+                ["🧹", "🕵️", "📡"],
+                every=3.0,
+            )
+            return True
+
+        return False
+
     def _should_drop_sidecar_noise(self, packet, protocol_tag: str) -> bool:
         proto = str(protocol_tag or "").upper()
 
@@ -26002,6 +26200,12 @@ class HyperVRouterManager:
         sport, dport = self._packet_udp_ports(packet)
         if sport in self.LOCAL_NOISE_UDP_PORTS or dport in self.LOCAL_NOISE_UDP_PORTS:
             return True
+
+        try:
+            if self._is_hvrm_control_packet(packet):
+                return True
+        except Exception:
+            pass
 
         return False
 
@@ -26154,6 +26358,8 @@ class HyperVRouterManager:
             return "windivert-local"
         if kind == "hyperv":
             return str(inbound_iface or "hyperv-local")
+        if kind == "wireshark":
+            return "wireshark-local"
         return str(inbound_iface or "router")
 
     def _discovery_broadcast_targets(self) -> List[str]:
@@ -26215,7 +26421,12 @@ class HyperVRouterManager:
             return float(peer.last_seen or 0.0)
 
     def _choose_peer_ip(self, advertised_ip: str, hello_ip: str, data_ip: str, current_ip: str = "") -> str:
-        candidates = [str(data_ip or "").strip(), str(hello_ip or "").strip(), str(advertised_ip or "").strip(), str(current_ip or "").strip()]
+        candidates = [
+            str(data_ip or "").strip(),
+            str(hello_ip or "").strip(),
+            str(advertised_ip or "").strip(),
+            str(current_ip or "").strip(),
+        ]
         bind_ip = str(self.bind_ip or "").strip()
         for ip in candidates:
             if self._same_ipv4_subnet(ip, bind_ip):
@@ -26271,84 +26482,6 @@ class HyperVRouterManager:
         if discovery:
             return bool(self._allow_public_discovery)
         return bool(self._allow_public_peer_data)
-
-    def _extract_udp_payload_bytes(self, packet, raw: Optional[bytes] = None) -> bytes:
-        try:
-            if UDP is not None and getattr(packet, "haslayer", None) and packet.haslayer(UDP):
-                udp_layer = packet.getlayer(UDP)
-                if udp_layer is not None and getattr(udp_layer, "payload", None) is not None:
-                    data = bytes(udp_layer.payload)
-                    if data:
-                        return data[: self._control_payload_scan_limit]
-        except Exception:
-            pass
-
-        try:
-            if Raw is not None and getattr(packet, "haslayer", None) and packet.haslayer(Raw):
-                rl = packet.getlayer(Raw)
-                data = bytes(getattr(rl, "load", b"") or b"")
-                if data:
-                    return data[: self._control_payload_scan_limit]
-        except Exception:
-            pass
-
-        blob = bytes(raw or b"")
-        idx = blob.find(b'{"magic":"HVRM')
-        if idx >= 0:
-            return blob[idx: idx + self._control_payload_scan_limit]
-        return b""
-
-    def _looks_like_hvrm_json(self, blob: bytes) -> bool:
-        if not blob:
-            return False
-        preview = bytes(blob[: self._control_payload_scan_limit])
-        return (
-            b'"magic":"HVRM' in preview
-            or b'"type":"hello"' in preview
-            or b'"type":"hello_ack"' in preview
-            or b'"type":"frame"' in preview
-            or b'"type":"ack"' in preview
-        )
-
-    def _control_ports(self) -> Set[int]:
-        return {
-            int(self.discovery_port or 0),
-            int(self.data_port or 0),
-            int(self._bound_discovery_port or 0),
-            int(self._bound_data_port or 0),
-        }
-
-    def _is_hvrm_control_packet(self, packet, raw: Optional[bytes] = None) -> bool:
-        sport = 0
-        dport = 0
-
-        try:
-            sport = int(getattr(packet, "sport", 0) or 0)
-        except Exception:
-            sport = 0
-        try:
-            dport = int(getattr(packet, "dport", 0) or 0)
-        except Exception:
-            dport = 0
-
-        try:
-            if UDP is not None and getattr(packet, "haslayer", None) and packet.haslayer(UDP):
-                udp_layer = packet.getlayer(UDP)
-                sport = int(getattr(udp_layer, "sport", sport) or sport)
-                dport = int(getattr(udp_layer, "dport", dport) or dport)
-        except Exception:
-            pass
-
-        ports = self._control_ports()
-        if sport not in ports and dport not in ports:
-            payload = self._extract_udp_payload_bytes(packet, raw)
-            return self._looks_like_hvrm_json(payload)
-
-        payload = self._extract_udp_payload_bytes(packet, raw)
-        if payload:
-            return self._looks_like_hvrm_json(payload)
-
-        return True
 
 
 @dataclass

@@ -186,8 +186,8 @@ class PythonRouterManager:
             self,
             self.code_output_manager,
             pipe_name=r'\\.\pipe\wintun_to_python',
-            max_frames_per_batch=128,
-            max_bytes_per_batch=(2 << 20),  # 2 MiB
+            max_frames_per_batch=256,
+            max_bytes_per_batch = (4 << 20)
         )
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
@@ -5221,7 +5221,6 @@ class WiresharkManager:
                 answer = dns.get("dns.a", dns.get("dns.aaaa", ""))
                 self.logger.log_message(
                     f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}")
-
             # ----------------------------------------------------------
             #           Optional reassembled payload preview (TCP/UDP)
             # ----------------------------------------------------------
@@ -5281,7 +5280,8 @@ class WiresharkManager:
                         self.logger.log_message(
                             "[Wireshark-Process] ⚠️ Could not build Scapy packet from tshark JSON.")
                         return
-
+                    if self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(scapy_pkt, raw, "WireShark"):
+                        return False
                     # Hand off to your router with inbound iface set to "WireShark"
                     try:
                         if self.router_manager.started and (
