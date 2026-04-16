@@ -176,18 +176,11 @@ class PythonRouterManager:
         self.hyperv_enabled = False
         self.broadcast_manager = BroadcastManager(self.router_logger)
         self.windivert_manager = WinDivertManager(
-            self,
-            self.code_output_manager,
-            max_frames_per_batch=64,
-            max_bytes_per_batch=(1 << 20),  # 1 MiB
+            self,self.code_output_manager,max_frames_per_batch=64,max_bytes_per_batch=(1 << 20),  # 1 MiB
         )
 
         self.wintun_manager = WinTunManager(
-            self,
-            self.code_output_manager,
-            pipe_name=r'\\.\pipe\wintun_to_python',
-            max_frames_per_batch=256,
-            max_bytes_per_batch = (4 << 20)
+            self,self.code_output_manager,pipe_name=r'\\.\pipe\wintun_to_python',max_frames_per_batch=256,max_bytes_per_batch = (4 << 20)
         )
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
@@ -206,7 +199,7 @@ class PythonRouterManager:
         self.uplink_manager = None
         self.hypervrouter_manager = None
         self.python_server_manager = None
-        self.socket_interface = SocketInterface(self, self.router_logger)
+        self.socket_interface = None
         # WAN/public-IP observation state
         self.public_ip_observed: Optional[str] = None
         self._public_ip_last_refresh: float = 0.0
@@ -2699,7 +2692,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2730,7 +2723,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     transit_ifaces_fn=self._boundary_transit_ifaces,  # <-- add this
                 )
                 self.host_connectivity_boundary.start()
-            self.socket_interface.start()
+            if use_socket:
+                self.socket_interface = SocketInterface(self, self.router_logger)
+                self.socket_interface.start()
             self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
             self.dns_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ipv4_out = self.router_ip_out

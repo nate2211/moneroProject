@@ -5452,26 +5452,27 @@ class RIPManager:
 
         return best_match
 
+
 class NATManager:
     """
-    NAT with:
-      • Multi-IP (VIP) support for all features
-      • Dynamic SNAT (per-VIP port pools)
-      • Static DNAT
-      • Stateful pinning
-      • MSS clamp
-      • Probe->ban + advanced Temporary NAT Leases
-      • ICMP Port Unreachable fallback
+    Bounded high-performance NAT rewrite.
 
-    Stability additions in this rewrite:
-      • idempotent start/stop
-      • collaborator-safe wrappers
-      • rate-limited noisy logs
-      • dynamic placeholder interface entries for WinDivertBridge / Nate's Tunnel / Hyper-V-like paths
-      • safer route/ARP/ICMP fallback behavior
-      • less work under locks
-      • WAN recovery hooks for DHCP renew/rebind/discover recovery flows
-      • dynamic NAT-state flush on WAN identity change
+    Preserves:
+      • constructor signature
+      • public-IP / VIP support
+      • static DNAT
+      • stateful pinning
+      • temporary lease workflow
+      • WAN recovery hooks
+      • router-self-service publication helpers
+
+    Adds:
+      • hard caps on all dynamic structures
+      • bounded port allocation
+      • LRU eviction
+      • aggressive cleanup cadence
+      • outbound creation rate limiting
+      • emergency overflow protection
     """
 
     PORT_SERVICES = {
@@ -5485,7 +5486,7 @@ class NATManager:
         88: ("Kerberos", "🎟️"),
         520: ("RIP", "🗺️"),
         3333: ("P2Pool", "❤️"),
-        38887: ("Blocknet","❤️" ),
+        38887: ("Blocknet", "❤️"),
         38888: ("Blocknet", "❤️"),
         25565: ("Minecraft", "🧱"),
         47772: ("HyperVManager", "🖥️"),
@@ -5493,8 +5494,11 @@ class NATManager:
 
     NAT_PORT_MIN = 49152
     NAT_PORT_MAX = 65535
-    NAT_TIMEOUT_SECONDS = 300
-    STATEFUL_NAT_TIMEOUT_SECONDS = 300
+
+    # Reduced from 300s to bounded, faster-expiring defaults.
+    NAT_TIMEOUT_SECONDS = 45
+    STATEFUL_NAT_TIMEOUT_SECONDS = 75
+    HAIRPIN_TIMEOUT_SECONDS = 45
 
     KEEP_ALIVE_PORT = 19999
     KEEP_ALIVE_PAYLOAD_FORMAT = "!H32s"
@@ -5527,9 +5531,9 @@ class NATManager:
     }
 
     TEMP_LEASES_POLICY = {
-        "deny_gateways": {""}, #192.168.1.254
-        "deny_cidrs": [""],#192.168.1.0/24
-        "deny_ifaces": {""}, #"wan_att", "eth_att"
+        "deny_gateways": {""},
+        "deny_cidrs": [""],
+        "deny_ifaces": {""},
     }
 
     BYPASS_DST_CIDRS = [
@@ -5547,21 +5551,35 @@ class NATManager:
 
     PUBLIC_VIPS: set[str] = set()
     _FRAG_CACHE_TTL = 20.0
-    # Router-hosted services that should be reachable via this NAT manager
-    # even when they live on the same machine as the router process.
+
     ROUTER_SELF_SERVICE_TCP_PORTS: set[int] = {
-        8844,   # dashboard
-        3333, 4444, 5555, 7777,  # stratum variants
-        37888, 37889,            # p2pool
-        18080, 18081, 18083,     # monerod / rpc / zmq bridge usage
-        8080, 8443,              # optional local APIs
-        38887, 38888,            # blocknet
-        47772, ### hypervmanager
+        8844,
+        3333, 4444, 5555, 7777,
+        37888, 37889,
+        18080, 18081, 18083,
+        8080, 8443,
+        38887, 38888,
+        47772,
     }
     ROUTER_SELF_SERVICE_UDP_PORTS: set[int] = set()
-
     ROUTER_SELF_SERVICE_ALLOWED_SOURCES: Dict[int, List[str]] = {}
     ROUTER_SELF_SERVICE_AUTO_PUBLISH = True
+
+    # ---------------- bounded additions ----------------
+    MAX_DYNAMIC_NAT_ENTRIES = 2048
+    MAX_STATEFUL_NAT_ENTRIES = 2048
+    MAX_HAIRPIN_REVERSE_ENTRIES = 1024
+    MAX_FRAG_CACHE_ENTRIES = 4096
+    MAX_BAN_ENTRIES = 2048
+    MAX_IP_ATTEMPT_TRACKERS = 4096
+    MAX_PREFIX_ATTEMPT_TRACKERS = 2048
+    MAX_ALLOC_ATTEMPTS = 512
+    MAX_NAT_CREATES_PER_IP_PER_WINDOW = 80
+    CLEANUP_INTERVAL_SECONDS = 5.0
+    OVERFLOW_FLUSH_THRESHOLD = 4096
+    PREPIN_ENABLED = True
+    PREPIN_ONLY_TCP_SYN = True
+
     def __init__(
         self,
         router_logger,
@@ -5590,10 +5608,13 @@ class NATManager:
 
         self._next_port_per_ip: Dict[str, int] = defaultdict(lambda: self.NAT_PORT_MIN)
 
-        self._nat_table: Dict[Tuple[str, int], Tuple[str, int, float]] = {}
+        # Bounded dynamic tables
+        self._nat_table: "OrderedDict[Tuple[str, int], Tuple[str, int, float]]" = OrderedDict()
         self._nat_reverse_table: Dict[Tuple[str, int], Tuple[str, int]] = {}
+
         self._static_mappings: Dict[Tuple[str, int], Tuple[str, int]] = {}
-        self._stateful_nat_outbound: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int, float]] = {}
+
+        self._stateful_nat_outbound: "OrderedDict[Tuple[Tuple[str, int], Tuple[str, int]], Tuple[str, int, float]]" = OrderedDict()
         self._stateful_nat_inbound: Dict[Tuple[str, int], Tuple[Tuple[str, int], Tuple[str, int]]] = {}
 
         self._port_forward_rules: Dict[Tuple[str, int, str], Tuple[str, int]] = {}
@@ -5601,7 +5622,7 @@ class NATManager:
         self._one_to_one_map: Dict[str, str] = {}
         self._public_ips_on_lan: set[str] = set()
         self._uplink_public_ip_by_iface: Dict[str, str] = {}
-        self._hairpin_reverse: Dict[Tuple[str, int, str, int], Tuple[str, int, float]] = {}
+        self._hairpin_reverse: "OrderedDict[Tuple[str, int, str, int], Tuple[str, int, float]]" = OrderedDict()
 
         self._port_probe_counts: Dict[str, int] = defaultdict(int)
         self._ban_list: Dict[str, float] = {}
@@ -5613,6 +5634,7 @@ class NATManager:
 
         self._ip_attempts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=512))
         self._prefix_attempts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1024))
+        self._nat_create_attempts: Dict[str, deque] = defaultdict(lambda: deque(maxlen=512))
 
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
@@ -5632,7 +5654,7 @@ class NATManager:
 
         self._token_secret = token_secret or hashlib.sha256(f"{time.time()}:{random.random()}".encode()).digest()
 
-        self._frag_cache: Dict[tuple, tuple[bool, float]] = {}
+        self._frag_cache: "OrderedDict[tuple, tuple[bool, float]]" = OrderedDict()
         self._log_rl_times: Dict[str, float] = {}
         self._dynamic_iface_refresh: Dict[str, float] = {}
         self._DYN_IFACE_TTL = 15.0
@@ -5646,7 +5668,6 @@ class NATManager:
             "default switch",
         }
 
-        # WAN recovery fields
         self.router_ip_out = str(router_public_ip or "")
         self._wan_epoch = 0
         self._last_wan_identity = {
@@ -5656,7 +5677,7 @@ class NATManager:
             "dns_servers": tuple(),
         }
         self._last_dynamic_flush = 0.0
-        # Router-hosted service publishing state
+
         self._router_self_service_tcp_ports: set[int] = set(self.ROUTER_SELF_SERVICE_TCP_PORTS)
         self._router_self_service_udp_ports: set[int] = set(self.ROUTER_SELF_SERVICE_UDP_PORTS)
         self._router_self_service_allowed_sources: Dict[int, List[str]] = {
@@ -5665,8 +5686,8 @@ class NATManager:
         }
         self._router_self_service_auto_publish: bool = bool(self.ROUTER_SELF_SERVICE_AUTO_PUBLISH)
         self._router_self_service_pf_keys: set[Tuple[str, int, str]] = set()
-        # Keep your example mappings
 
+        # Keep example mappings from your original.
         self.add_static_mapping(65406, "192.168.1.50", 88)
         self.add_static_mapping(80, "192.168.1.100", 80)
         self.add_static_mapping(443, "192.168.1.100", 443)
@@ -5677,7 +5698,15 @@ class NATManager:
         self.add_port_forward_rule(self.public_ip, 47771, "udp", self.router_ip_out, 47772, enabled=True)
 
         self._config_sanity()
-        self._log("[NAT] 🚀 Manager initialized with Multi-IP and advanced temporary leases.")
+        self._log(
+            "[NAT] 🚀 Bounded manager initialized "
+            f"(dyn={self.MAX_DYNAMIC_NAT_ENTRIES}, stateful={self.MAX_STATEFUL_NAT_ENTRIES}, "
+            f"hairpin={self.MAX_HAIRPIN_REVERSE_ENTRIES}, frag={self.MAX_FRAG_CACHE_ENTRIES})"
+        )
+
+    # ------------------------------------------------------------------
+    # Router self service helpers
+    # ------------------------------------------------------------------
 
     def _router_self_service_target_ip(self) -> Optional[str]:
         ip = str(self.router_internal_ip_for_self_mapping or "").strip()
@@ -5693,11 +5722,7 @@ class NATManager:
 
         def add_one(ip: Optional[str]):
             s = str(ip or "").strip()
-            if not s:
-                return
-            if s in seen:
-                return
-            if not self._is_ipv4_text(s):
+            if not s or s in seen or not self._is_ipv4_text(s):
                 return
             seen.add(s)
             out.append(s)
@@ -5720,23 +5745,18 @@ class NATManager:
         return str(internal_ip) == tgt
 
     def _should_snat_hairpin_source(self, internal_ip: str) -> bool:
-        """
-        Keep SNAT for ordinary hairpin to another inside host.
-        Do NOT SNAT when the target itself is the router host IP, otherwise
-        src and dst can collapse to the same value for router-hosted services.
-        """
         tgt = self._router_self_service_target_ip()
         if not tgt:
             return False
         return str(internal_ip) != tgt
 
     def configure_router_self_services(
-            self,
-            *,
-            tcp_ports: Optional[Iterable[int]] = None,
-            udp_ports: Optional[Iterable[int]] = None,
-            allowed_sources_by_port: Optional[Dict[int, List[str]]] = None,
-            auto_publish: Optional[bool] = None,
+        self,
+        *,
+        tcp_ports: Optional[Iterable[int]] = None,
+        udp_ports: Optional[Iterable[int]] = None,
+        allowed_sources_by_port: Optional[Dict[int, List[str]]] = None,
+        auto_publish: Optional[bool] = None,
     ):
         with self._lock:
             if tcp_ports is not None:
@@ -5755,20 +5775,20 @@ class NATManager:
         self._resync_router_self_service_port_forwards()
 
     def publish_router_service(
-            self,
-            port: int,
-            *,
-            protocol: str = "tcp",
-            internal_port: Optional[int] = None,
-            allowed_sources: Optional[List[str]] = None,
-            enabled: bool = True,
+        self,
+        port: int,
+        *,
+        protocol: str = "tcp",
+        internal_port: Optional[int] = None,
+        allowed_sources: Optional[List[str]] = None,
+        enabled: bool = True,
     ) -> bool:
         tgt = self._router_self_service_target_ip()
         if not tgt:
             self._log_rl(
                 f"router_self_publish_noip:{protocol}:{port}",
                 10.0,
-                f"[NAT][SELF] ⚠️ Skipping publish for {protocol.upper()} {port}: router internal IP not set yet",
+                f"[NAT][SELF] ⚠️ Skipping publish for {str(protocol).upper()} {port}: router internal IP not set yet",
             )
             return False
 
@@ -5778,8 +5798,6 @@ class NATManager:
 
         int_port = int(port if internal_port is None else internal_port)
         ext_port = int(port)
-
-        # Register as a normal port-forward rule so the rest of NATManager keeps working.
         public_ips = self._iter_all_public_service_ips()
         if not public_ips:
             return False
@@ -5814,10 +5832,7 @@ class NATManager:
         if not tgt:
             return
 
-        tcp_ports = sorted(self._router_self_service_tcp_ports)
-        udp_ports = sorted(self._router_self_service_udp_ports)
-
-        for p in tcp_ports:
+        for p in sorted(self._router_self_service_tcp_ports):
             self.publish_router_service(
                 p,
                 protocol="tcp",
@@ -5826,7 +5841,7 @@ class NATManager:
                 enabled=True,
             )
 
-        for p in udp_ports:
+        for p in sorted(self._router_self_service_udp_ports):
             self.publish_router_service(
                 p,
                 protocol="udp",
@@ -5847,13 +5862,12 @@ class NATManager:
                 pass
 
     def _resync_router_self_service_port_forwards(self):
-        """
-        Rebuild router-hosted service publishes whenever public IP / VIP / uplink public IP /
-        public-on-LAN state / router internal IP changes.
-        """
         self.clear_router_self_service_port_forwards()
         self.publish_router_services()
-    # --- add near other helpers in NATManager ---
+
+    # ------------------------------------------------------------------
+    # Address / protocol helpers
+    # ------------------------------------------------------------------
 
     def _is_ipv4_text(self, ip: str) -> bool:
         try:
@@ -5868,12 +5882,7 @@ class NATManager:
             return False
 
     def _supports_ipv6_nat(self) -> bool:
-        """
-        Small safety gate only.
-        Current manager is IPv4 NAT. Do not NAT IPv6 unless you explicitly add NAT66/NAT64.
-        """
         return False
-    # ========================= VIP management =========================
 
     def set_public_ips(self, primary: str, vips: Iterable[str] | None = None, *, resync: bool = True):
         with self._lock:
@@ -5898,7 +5907,9 @@ class NATManager:
         if resync:
             self._resync_router_self_service_port_forwards()
 
-    # ========================= Lifecycle =========================
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def set_router_internal_ip(self, ip: str):
         self.router_internal_ip_for_self_mapping = str(ip)
@@ -5930,7 +5941,22 @@ class NATManager:
                 pass
         self._log("[NAT] 🛑 Manager stopped.")
 
-    # ========================= Safe helper layer =========================
+    # ------------------------------------------------------------------
+    # Logging / safe wrappers
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str):
+        try:
+            self.router_logger.log_message(msg)
+        except Exception:
+            pass
+
+    def _log_debug(self, msg: str):
+        if self.debug_logging:
+            self._log(msg)
+
+    def _log_error(self, msg: str):
+        self._log(f"[NAT][ERR] {msg}")
 
     def _log_rl(self, key: str, ttl: float, msg: str):
         try:
@@ -5963,6 +5989,11 @@ class NATManager:
             return self._arp_manager_resolve(ip, iface)
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Interface helpers
+    # ------------------------------------------------------------------
+
     def _is_hyperv_iface(self, iface: str | None) -> bool:
         if not iface:
             return False
@@ -6040,17 +6071,20 @@ class NATManager:
             self._log_rl(
                 f"nat_dyn_iface:{iface}",
                 10.0,
-                f"[NAT] 🧩 Dynamic iface entry created for {iface}: ip={cfg.get('ip_addr')} mac={cfg.get('mac')} kind={cfg.get('kind')}",
+                f"[NAT] 🧩 Dynamic iface entry created for {iface}: "
+                f"ip={cfg.get('ip_addr')} mac={cfg.get('mac')} kind={cfg.get('kind')}",
             )
         return cfg
 
-    # ---- Helpers ----------------------------------------
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
 
     def _ip_in_any(self, ip: str, cidrs: List[str]) -> bool:
         try:
             ipx = ipaddress.ip_address(ip)
             for c in cidrs:
-                if ipx in ipaddress.ip_network(c, strict=False):
+                if c and ipx in ipaddress.ip_network(c, strict=False):
                     return True
             return False
         except Exception:
@@ -6074,21 +6108,22 @@ class NATManager:
             return False
         ip = pkt[IP]
         off = int(getattr(ip, "frag", 0))
-        mf = bool(ip.flags.MF) if hasattr(ip.flags, "MF") else bool(int(ip.flags) & 0x1)
+        flags = getattr(ip, "flags", 0)
+        try:
+            mf = bool(flags.MF)
+        except Exception:
+            mf = bool(int(flags) & 0x1)
         return mf and off == 0
 
     def _is_nonfirst_ipv4_fragment(self, pkt) -> bool:
         if IP not in pkt:
             return False
-        ip = pkt[IP]
-        off = int(getattr(ip, "frag", 0))
-        return off > 0
+        return int(getattr(pkt[IP], "frag", 0)) > 0
 
     def _frag_key(self, pkt) -> tuple | None:
         try:
             ip = pkt[IP]
-            proto = int(ip.proto)
-            return (ip.src, ip.dst, proto, int(ip.id))
+            return (ip.src, ip.dst, int(ip.proto), int(ip.id))
         except Exception:
             return None
 
@@ -6103,10 +6138,23 @@ class NATManager:
             except Exception:
                 pass
             return None
+        try:
+            self._frag_cache.move_to_end(key)
+        except Exception:
+            pass
         return decision
 
     def _frag_cache_set(self, key, decision: bool):
         self._frag_cache[key] = (decision, time.time())
+        try:
+            self._frag_cache.move_to_end(key)
+        except Exception:
+            pass
+        while len(self._frag_cache) > self.MAX_FRAG_CACHE_ENTRIES:
+            try:
+                self._frag_cache.popitem(last=False)
+            except Exception:
+                break
 
     def _source_allowed(self, src_ip: str, allowed_sources: List[str]) -> bool:
         if not allowed_sources:
@@ -6150,8 +6198,15 @@ class NATManager:
                 return True
         return False
 
-    def _classify_direction(self, inbound_iface: str, src_ip: str, dst_ip: str,
-                            router_ips: set[str], wan_ifaces: set[str], lan_ifaces: set[str] | None) -> str:
+    def _classify_direction(
+        self,
+        inbound_iface: str,
+        src_ip: str,
+        dst_ip: str,
+        router_ips: set[str],
+        wan_ifaces: set[str],
+        lan_ifaces: set[str] | None,
+    ) -> str:
         is_wan = inbound_iface in wan_ifaces
         is_dst_ours = (
             (dst_ip == self.public_ip) or
@@ -6169,7 +6224,6 @@ class NATManager:
         if (lan_ifaces and inbound_iface in lan_ifaces) or (not is_wan):
             if self._is_global(dst_ip):
                 return "outbound"
-
             r = self._safe_route_lookup(dst_ip)
             if r and r.get("interface") in (wan_ifaces or set()):
                 return "outbound"
@@ -6178,32 +6232,32 @@ class NATManager:
 
     def _handle_icmp_error_translation(self, packet) -> bool:
         try:
-            if ICMP in packet and IP in packet:
+            if ICMP in packet and IP in packet and Raw in packet[ICMP]:
                 ic = packet[ICMP]
-                if ic.type in (3, 11, 12):
-                    inner = bytes(ic[Raw].load or b"") if Raw in ic else (
-                        bytes(ic.payload) if hasattr(ic, "payload") else b"")
-                    if len(inner) < 28:
-                        return False
-                    ver_ihl = inner[0]
-                    if (ver_ihl >> 4) != 4:
-                        return False
-                    ihl = (ver_ihl & 0x0F) * 4
-                    proto = inner[9]
-                    inner_src = ".".join(str(b) for b in inner[12:16])
-                    inner_dst = ".".join(str(b) for b in inner[16:20])
-                    sport = dport = None
-                    if proto in (6, 17) and len(inner) >= ihl + 4:
-                        sport = (inner[ihl] << 8) | inner[ihl + 1]
-                        dport = (inner[ihl + 2] << 8) | inner[ihl + 3]
-
-                    if dport and (inner_dst == self.public_ip or inner_dst in self.PUBLIC_VIPS or inner_dst in self._public_ips_on_lan):
-                        mapping = self.get_internal_from_external(inner_dst, dport, inner_src)
-                        if mapping:
-                            packet[IP].dst = inner_src
-                            self._log_rl(f"icmp_translate:{inner_dst}:{dport}", 5.0,
-                                         f"[NAT] ℹ️ ICMP error translated for {inner_dst}:{dport}")
-                            return True
+                if ic.type not in (3, 11, 12):
+                    return False
+                inner = bytes(packet[ICMP][Raw].load or b"")
+                if len(inner) < 28:
+                    return False
+                if (inner[0] >> 4) != 4:
+                    return False
+                ihl = (inner[0] & 0x0F) * 4
+                proto = inner[9]
+                inner_src = ".".join(str(b) for b in inner[12:16])
+                inner_dst = ".".join(str(b) for b in inner[16:20])
+                dport = None
+                if proto in (6, 17) and len(inner) >= ihl + 4:
+                    dport = (inner[ihl + 2] << 8) | inner[ihl + 3]
+                if dport and (inner_dst == self.public_ip or inner_dst in self.PUBLIC_VIPS or inner_dst in self._public_ips_on_lan):
+                    mapping = self.get_internal_from_external(inner_dst, dport, inner_src)
+                    if mapping:
+                        packet[IP].dst = inner_src
+                        self._log_rl(
+                            f"icmp_translate:{inner_dst}:{dport}",
+                            5.0,
+                            f"[NAT] ℹ️ ICMP error translated for {inner_dst}:{dport}",
+                        )
+                        return True
         except Exception:
             pass
         return False
@@ -6211,8 +6265,10 @@ class NATManager:
     def _is_private_or_cgn(self, ip: str) -> bool:
         try:
             ipx = ipaddress.ip_address(ip)
-            return (ipx.is_private or ipx.is_loopback or ipx.is_link_local or
-                    ipx.is_multicast or ipx.is_reserved or ipx.is_unspecified)
+            return (
+                ipx.is_private or ipx.is_loopback or ipx.is_link_local or
+                ipx.is_multicast or ipx.is_reserved or ipx.is_unspecified
+            )
         except Exception:
             return True
 
@@ -6225,7 +6281,6 @@ class NATManager:
                 "198.18.0.0/15",
             ]
             warn.append("[NAT] Adjusted NAT_EXEMPT_DST_CIDRS for private WAN (double NAT safe)")
-
         for vip in self.PUBLIC_VIPS:
             if self._is_private_or_cgn(vip):
                 warn.append(f"VIP {vip} looks private/CGN/loopback")
@@ -6233,13 +6288,101 @@ class NATManager:
             self._log("[NAT][SANITY] ⚠️ " + " | ".join(warn) +
                       " — inbound direct reachability depends on upstream forwarding when WAN is private.")
 
-    # ========================= WAN recovery hooks =========================
+    # ------------------------------------------------------------------
+    # Bounded eviction helpers
+    # ------------------------------------------------------------------
+
+    def _touch_nat_entry(self, internal_key: Tuple[str, int], ext_ip: str, ext_port: int, ts: float):
+        self._nat_table[internal_key] = (ext_ip, ext_port, ts)
+        try:
+            self._nat_table.move_to_end(internal_key)
+        except Exception:
+            pass
+
+    def _touch_stateful_entry(self, canon, ext_ip: str, ext_port: int, ts: float):
+        self._stateful_nat_outbound[canon] = (ext_ip, ext_port, ts)
+        try:
+            self._stateful_nat_outbound.move_to_end(canon)
+        except Exception:
+            pass
+
+    def _evict_oldest_nat_entry(self, reason: str = "cap"):
+        if not self._nat_table:
+            return
+        try:
+            internal_key, (ext_ip, ext_port, _ts) = self._nat_table.popitem(last=False)
+        except Exception:
+            return
+        self._nat_reverse_table.pop((ext_ip, ext_port), None)
+
+        stale_stateful = []
+        for canon, (sx_ip, sx_port, _ts2) in self._stateful_nat_outbound.items():
+            if sx_ip == ext_ip and sx_port == ext_port:
+                stale_stateful.append(canon)
+        for canon in stale_stateful:
+            self._stateful_nat_outbound.pop(canon, None)
+            self._stateful_nat_inbound.pop((ext_ip, ext_port), None)
+
+        self._log_rl(
+            f"nat_evict:{reason}",
+            1.0,
+            f"[NAT][BOUND] 🧹 Evicted NAT entry {internal_key[0]}:{internal_key[1]} → {ext_ip}:{ext_port} ({reason})",
+        )
+
+    def _evict_oldest_stateful_entry(self, reason: str = "cap"):
+        if not self._stateful_nat_outbound:
+            return
+        try:
+            canon, (ext_ip, ext_port, _ts) = self._stateful_nat_outbound.popitem(last=False)
+        except Exception:
+            return
+        self._stateful_nat_inbound.pop((ext_ip, ext_port), None)
+        self._log_rl(
+            f"stateful_evict:{reason}",
+            1.0,
+            f"[NAT][BOUND] 🧹 Evicted stateful entry {canon} → {ext_ip}:{ext_port} ({reason})",
+        )
+
+    def _evict_oldest_hairpin_entry(self, reason: str = "cap"):
+        if not self._hairpin_reverse:
+            return
+        try:
+            hk, _ = self._hairpin_reverse.popitem(last=False)
+            self._log_rl(f"hairpin_evict:{reason}", 1.0, f"[NAT][BOUND] 🧹 Evicted hairpin reverse {hk} ({reason})")
+        except Exception:
+            pass
+
+    def _enforce_bounds_locked(self):
+        while len(self._nat_table) > self.MAX_DYNAMIC_NAT_ENTRIES:
+            self._evict_oldest_nat_entry("nat-cap")
+        while len(self._stateful_nat_outbound) > self.MAX_STATEFUL_NAT_ENTRIES:
+            self._evict_oldest_stateful_entry("stateful-cap")
+        while len(self._hairpin_reverse) > self.MAX_HAIRPIN_REVERSE_ENTRIES:
+            self._evict_oldest_hairpin_entry("hairpin-cap")
+        while len(self._ban_list) > self.MAX_BAN_ENTRIES:
+            try:
+                victim = next(iter(self._ban_list.keys()))
+                self._ban_list.pop(victim, None)
+            except Exception:
+                break
+        while len(self._ip_attempts) > self.MAX_IP_ATTEMPT_TRACKERS:
+            try:
+                victim = next(iter(self._ip_attempts.keys()))
+                self._ip_attempts.pop(victim, None)
+            except Exception:
+                break
+        while len(self._prefix_attempts) > self.MAX_PREFIX_ATTEMPT_TRACKERS:
+            try:
+                victim = next(iter(self._prefix_attempts.keys()))
+                self._prefix_attempts.pop(victim, None)
+            except Exception:
+                break
+
+    # ------------------------------------------------------------------
+    # WAN recovery / flushing
+    # ------------------------------------------------------------------
 
     def flush_dynamic_state(self, *, reason: str = "manual", keep_bans: bool = False):
-        """
-        Flush only dynamic runtime NAT state.
-        Keeps static mappings, port-forward rules, VIPs, and 1:1 mappings intact.
-        """
         now = time.time()
         with self._lock:
             self._nat_table.clear()
@@ -6252,6 +6395,7 @@ class NATManager:
             self._gray_score.clear()
             self._ip_attempts.clear()
             self._prefix_attempts.clear()
+            self._nat_create_attempts.clear()
             if not keep_bans:
                 self._ban_list.clear()
             self._last_dynamic_flush = now
@@ -6259,14 +6403,14 @@ class NATManager:
         self._log(f"[NAT] 🧹 Dynamic state flushed ({reason}).")
 
     def on_wan_recovered(
-            self,
-            *,
-            iface_name: str | None = None,
-            public_ip: str | None = None,
-            gateway_ip: str | None = None,
-            dns_servers: Iterable[str] | None = None,
-            force_flush: bool = False,
-            resync: bool = True,
+        self,
+        *,
+        iface_name: str | None = None,
+        public_ip: str | None = None,
+        gateway_ip: str | None = None,
+        dns_servers: Iterable[str] | None = None,
+        force_flush: bool = False,
+        resync: bool = True,
     ):
         public_ip = str(public_ip or "").strip() or None
         gateway_ip = str(gateway_ip or "").strip() or None
@@ -6287,9 +6431,9 @@ class NATManager:
             self.set_uplink_public_ip(iface_name, public_ip, resync=False)
 
         if (
-                prev.get("gateway_ip") != gateway_ip
-                or prev.get("iface_name") != iface_name
-                or prev.get("dns_servers") != dns_tuple
+            prev.get("gateway_ip") != gateway_ip
+            or prev.get("iface_name") != iface_name
+            or prev.get("dns_servers") != dns_tuple
         ):
             changed = True
 
@@ -6319,7 +6463,9 @@ class NATManager:
             f"gateway={gateway_ip or '-'} iface={iface_name or '-'} dns={list(dns_tuple)} epoch={self._wan_epoch}"
         )
 
-    # ========================= Entry =========================
+    # ------------------------------------------------------------------
+    # Entry
+    # ------------------------------------------------------------------
 
     def handle_packet(
         self,
@@ -6408,9 +6554,15 @@ class NATManager:
 
                     if self.router_internal_ip_for_self_mapping and self.router_internal_ip_for_self_mapping != "0.0.0.0" and IP in packet:
                         ipL.src = self.router_internal_ip_for_self_mapping
-                        self._hairpin_reverse[(internal_ip, int(internal_port), old_src_ip, old_src_port)] = (
-                            ext_ip, ext_port, time.time()
-                        )
+                        with self._lock:
+                            self._hairpin_reverse[(internal_ip, int(internal_port), old_src_ip, old_src_port)] = (
+                                ext_ip, ext_port, time.time()
+                            )
+                            try:
+                                self._hairpin_reverse.move_to_end((internal_ip, int(internal_port), old_src_ip, old_src_port))
+                            except Exception:
+                                pass
+                            self._enforce_bounds_locked()
 
                     self._recalc_checksums(packet)
                     self._log(f"[NAT][HAIRPIN] 🔁 {old_src_ip}:{old_src_port} → {internal_ip}:{internal_port} via {ext_ip}:{ext_port}")
@@ -6461,31 +6613,32 @@ class NATManager:
                     self._log_debug(f"Outbound exempt: {src_ip} → {dst_ip}")
                     return None
 
-                # inside handle_packet(), in the outbound TCP SYN pre-pin block
-                if has_tcp and (packet[TCP].flags & 0x02) and not (packet[TCP].flags & 0x10):
+                if (
+                    self.PREPIN_ENABLED and has_tcp and
+                    (packet[TCP].flags & 0x02) and not (packet[TCP].flags & 0x10)
+                ):
                     try:
                         sport = int(packet[TCP].sport)
                         dport = int(packet[TCP].dport)
                         internal_key = (src_ip, sport)
                         canon = _get_canonical_session_key(src_ip, sport, dst_ip, dport)
+                        now = time.time()
                         with self._lock:
-                            if internal_key not in self._nat_table:
+                            if internal_key not in self._nat_table and self._allow_new_nat_create_locked(src_ip, now):
                                 ext_ip = self._select_external_ip(dst_ip, internal_ip=src_ip, internal_port=sport)
-                                port = self._alloc_port(ext_ip)
-                                if port != -1:
-                                    now = time.time()
-                                    self._nat_table[internal_key] = (ext_ip, port, now)
+                                port = self._alloc_port(ext_ip) if ext_ip else -1
+                                if ext_ip and port != -1:
+                                    self._touch_nat_entry(internal_key, ext_ip, port, now)
                                     self._nat_reverse_table[(ext_ip, port)] = internal_key
-
-                                    # important part
-                                    self._stateful_nat_outbound[canon] = (ext_ip, port, now)
+                                    self._touch_stateful_entry(canon, ext_ip, port, now)
                                     self._stateful_nat_inbound[(ext_ip, port)] = canon
-
+                                    self._enforce_bounds_locked()
                                     self._log(f"[NAT][STATEFUL] 📌 Pre-pin {src_ip}:{sport} → {ext_ip}:{port}")
                     except Exception as e:
                         self._log_error(f"SYN pin error: {e}")
 
                 self.translate_outbound(packet)
+
                 if IP in packet and self._is_first_ipv4_fragment(packet):
                     key = self._frag_key(packet)
                     if key:
@@ -6498,17 +6651,16 @@ class NATManager:
             self._log_error(f"handle_packet error on {inbound_iface}: {e}")
             return None
 
-    # ========================= Outbound (SNAT) =========================
+    # ------------------------------------------------------------------
+    # Outbound (SNAT)
+    # ------------------------------------------------------------------
 
-
-    def _select_external_ip(self, dst_ip: str, *, internal_ip: str | None = None,
-                            internal_port: int | None = None) -> str | None:
+    def _select_external_ip(self, dst_ip: str, *, internal_ip: str | None = None, internal_port: int | None = None) -> str | None:
         try:
             dst_obj = ipaddress.ip_address(str(dst_ip))
         except Exception:
             return None
 
-        # Current manager is IPv4 NAT only.
         if isinstance(dst_obj, ipaddress.IPv6Address):
             if not self._supports_ipv6_nat():
                 return None
@@ -6527,7 +6679,6 @@ class NATManager:
         with self._lock:
             pool = [self.public_ip, *sorted(self.PUBLIC_VIPS)] if self.PUBLIC_VIPS else [self.public_ip]
 
-        # Keep only family-matching candidates
         if isinstance(dst_obj, ipaddress.IPv4Address):
             pool = [p for p in pool if self._is_ipv4_text(p)]
         else:
@@ -6540,6 +6691,59 @@ class NATManager:
         idx = zlib.crc32(seed) % len(pool)
         return pool[idx]
 
+    def _allow_new_nat_create_locked(self, src_ip: str, now: float) -> bool:
+        dq = self._nat_create_attempts[src_ip]
+        self._prune_window(dq, now)
+        if len(dq) >= self.MAX_NAT_CREATES_PER_IP_PER_WINDOW:
+            self._log_rl(
+                f"nat_create_rl:{src_ip}",
+                5.0,
+                f"[NAT][BOUND] ⛔ NAT create rate-limited for {src_ip}",
+            )
+            return False
+        dq.append(now)
+        return True
+
+    def _alloc_port(self, ext_ip: str | None) -> int:
+        if not ext_ip:
+            return -1
+
+        start = int(self._next_port_per_ip[ext_ip])
+        port = start
+
+        for _ in range(self.MAX_ALLOC_ATTEMPTS):
+            key = (ext_ip, int(port))
+            if key not in self._nat_reverse_table and key not in self._stateful_nat_inbound:
+                nxt = port + 1
+                if nxt > self.NAT_PORT_MAX:
+                    nxt = self.NAT_PORT_MIN
+                self._next_port_per_ip[ext_ip] = nxt
+                return int(port)
+
+            port += 1
+            if port > self.NAT_PORT_MAX:
+                port = self.NAT_PORT_MIN
+
+        # force bounded eviction and retry once
+        self._evict_oldest_nat_entry("port-pressure")
+        self._evict_oldest_stateful_entry("port-pressure")
+
+        port = int(self._next_port_per_ip[ext_ip])
+        for _ in range(self.MAX_ALLOC_ATTEMPTS):
+            key = (ext_ip, int(port))
+            if key not in self._nat_reverse_table and key not in self._stateful_nat_inbound:
+                nxt = port + 1
+                if nxt > self.NAT_PORT_MAX:
+                    nxt = self.NAT_PORT_MIN
+                self._next_port_per_ip[ext_ip] = nxt
+                return int(port)
+            port += 1
+            if port > self.NAT_PORT_MAX:
+                port = self.NAT_PORT_MIN
+
+        self._log_rl(f"alloc_fail:{ext_ip}", 2.0, f"[NAT][BOUND] ❌ Failed to allocate port on {ext_ip}")
+        return -1
+
     def translate_outbound(self, packet: Packet):
         if not self._is_ip(packet):
             self._log_debug(f"Outbound non-IP: {self._safe_summary(packet)}")
@@ -6549,7 +6753,6 @@ class NATManager:
         is_v6 = IPv6 in packet
         ip = packet[IP] if is_v4 else packet[IPv6]
 
-        # Small safety guard: do not IPv4-NAT IPv6 traffic.
         if is_v6 and not self._supports_ipv6_nat():
             self._log_rl(
                 f"skip_ipv6_nat:{getattr(ip, 'src', '?')}:{getattr(ip, 'dst', '?')}",
@@ -6568,21 +6771,30 @@ class NATManager:
             return
 
         t = packet[TCP] if TCP in packet else packet[UDP]
+        now = time.time()
         ext_ip = None
         new_port = None
-        now = time.time()
 
         with self._lock:
+            if len(self._nat_table) > self.OVERFLOW_FLUSH_THRESHOLD:
+                self.flush_dynamic_state(reason="overflow-protection", keep_bans=True)
+
             canon = _get_canonical_session_key(ip.src, int(t.sport), ip.dst, int(t.dport))
-            stateful = self._stateful_nat_outbound.get(canon)
             internal_key = (ip.src, int(t.sport))
+            stateful = self._stateful_nat_outbound.get(canon)
 
             if stateful:
                 ext_ip, new_port, _ = stateful
-                self._stateful_nat_outbound[canon] = (ext_ip, new_port, now)
+                self._touch_stateful_entry(canon, ext_ip, new_port, now)
                 self._log_debug(f"SNAT stateful {ip.src}:{t.sport} → {ext_ip}:{new_port}")
 
-            elif internal_key not in self._nat_table:
+            elif internal_key in self._nat_table:
+                ext_ip, new_port, _ = self._nat_table[internal_key]
+                self._touch_nat_entry(internal_key, ext_ip, new_port, now)
+
+            else:
+                if not self._allow_new_nat_create_locked(ip.src, now):
+                    return
                 ext_ip = self._select_external_ip(ip.dst, internal_ip=ip.src, internal_port=int(t.sport))
                 if not ext_ip:
                     self._log_rl(
@@ -6594,19 +6806,22 @@ class NATManager:
                 new_port = self._alloc_port(ext_ip)
                 if new_port == -1:
                     return
-                self._nat_table[internal_key] = (ext_ip, new_port, now)
-                self._nat_reverse_table[(ext_ip, new_port)] = internal_key
-                self._log(f"[NAT] ➡️ SNAT new {ip.src}:{t.sport} → {ext_ip}:{new_port}")
 
-            else:
-                ext_ip, new_port, _ = self._nat_table[internal_key]
-                self._nat_table[internal_key] = (ext_ip, new_port, now)
+                self._touch_nat_entry(internal_key, ext_ip, new_port, now)
+                self._nat_reverse_table[(ext_ip, new_port)] = internal_key
+
+                # For TCP keep a stateful association; for UDP dynamic NAT alone is enough.
+                if TCP in packet:
+                    self._touch_stateful_entry(canon, ext_ip, new_port, now)
+                    self._stateful_nat_inbound[(ext_ip, new_port)] = canon
+
+                self._enforce_bounds_locked()
+                self._log(f"[NAT] ➡️ SNAT new {ip.src}:{t.sport} → {ext_ip}:{new_port}")
 
         if not (ext_ip and new_port is not None):
             self._log_error(f"Failed to find/alloc mapping for {ip.src}:{t.sport}")
             return
 
-        # Family guard before mutating the packet
         if is_v4 and not self._is_ipv4_text(ext_ip):
             self._log_error(f"Refusing IPv4 SNAT with non-IPv4 external IP: {ext_ip}")
             return
@@ -6619,7 +6834,10 @@ class NATManager:
         if self.CLAMP_MSS:
             self._maybe_clamp_mss(packet)
         self._recalc_checksums(packet)
-    # ========================= Inbound (DNAT) =========================
+
+    # ------------------------------------------------------------------
+    # Inbound (DNAT)
+    # ------------------------------------------------------------------
 
     def translate_inbound(self, packet: Packet, external_ip: str) -> bool:
         if not self._is_ip(packet):
@@ -6636,6 +6854,7 @@ class NATManager:
 
         ip_layer = packet[IP] if IP in packet else packet[IPv6]
         src_ip = ip_layer.src
+
         with self._lock:
             ban_exp = self._ban_list.get(src_ip)
             if ban_exp and time.time() < ban_exp:
@@ -6664,12 +6883,17 @@ class NATManager:
             self._recalc_checksums(packet)
             return True
 
-        self._log_rl(f"no_dnat:{src_ip}:{external_ip}:{ext_port}", 5.0,
-                     f"[NAT] 🚫 No DNAT for {src_ip} → {external_ip}:{ext_port} (ICMP sent)")
+        self._log_rl(
+            f"no_dnat:{src_ip}:{external_ip}:{ext_port}",
+            5.0,
+            f"[NAT] 🚫 No DNAT for {src_ip} → {external_ip}:{ext_port} (ICMP sent)",
+        )
         self._icmp_port_unreachable(packet, ip_layer, external_ip)
         return False
 
-    # ========================= Public Helpers =========================
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
 
     def add_stateful_mapping(self, src_ip, src_port, dst_ip, dst_port):
         canon = _get_canonical_session_key(src_ip, int(src_port), dst_ip, int(dst_port))
@@ -6677,13 +6901,12 @@ class NATManager:
             dyn = self._nat_table.get((src_ip, int(src_port)))
             if dyn:
                 ext_ip, port, _ = dyn
-                ext_key = (ext_ip, port)
-                self._stateful_nat_outbound[canon] = (ext_ip, port, time.time())
-                self._stateful_nat_inbound[ext_key] = canon
+                self._touch_stateful_entry(canon, ext_ip, port, time.time())
+                self._stateful_nat_inbound[(ext_ip, port)] = canon
+                self._enforce_bounds_locked()
                 self._log(f"[NAT][STATEFUL] 📌 Pinned {src_ip}:{src_port} at {ext_ip}:{port}")
 
-    def add_static_mapping(self, external_port: int, internal_ip: str, internal_port: int,
-                           external_ip: Optional[str] = None):
+    def add_static_mapping(self, external_port: int, internal_ip: str, internal_port: int, external_ip: Optional[str] = None):
         ext_ip = external_ip or self.public_ip
         ext_key = (ext_ip, int(external_port))
         with self._lock:
@@ -6718,8 +6941,11 @@ class NATManager:
         src_ip = packet[IP].src
 
         if not self._verify_token(src_ip, external_ip, int(target_port), mac):
-            self._log_rl(f"ka_bad_hmac:{src_ip}:{external_ip}:{target_port}", 5.0,
-                         f"[NAT][KA] ⛔ HMAC invalid from {src_ip} for {external_ip}:{target_port}")
+            self._log_rl(
+                f"ka_bad_hmac:{src_ip}:{external_ip}:{target_port}",
+                5.0,
+                f"[NAT][KA] ⛔ HMAC invalid from {src_ip} for {external_ip}:{target_port}",
+            )
             return
 
         with self._lock:
@@ -6733,8 +6959,11 @@ class NATManager:
                 self._bump_gray_score(src_ip, external_ip, int(target_port), reason="keepalive")
                 self._log(f"[NAT][KA] 💓 Extended {src_ip}@{external_ip}:{target_port} by {int(ext)}s")
             else:
-                self._log_rl(f"ka_no_lease:{src_ip}:{external_ip}:{target_port}", 5.0,
-                             f"[NAT][KA] ❓ No active lease for {src_ip}@{external_ip}:{target_port}")
+                self._log_rl(
+                    f"ka_no_lease:{src_ip}:{external_ip}:{target_port}",
+                    5.0,
+                    f"[NAT][KA] ❓ No active lease for {src_ip}@{external_ip}:{target_port}",
+                )
 
     def get_internal_from_external(self, external_ip: str, external_port: int, src_ip: str) -> Optional[Tuple[str, int]]:
         ext_key = (external_ip, int(external_port))
@@ -6742,8 +6971,10 @@ class NATManager:
         with self._lock:
             now = time.time()
             pref = self._prefix_of(src_ip)
+
             self._prune_window(self._ip_attempts[src_ip], now)
             self._prune_window(self._prefix_attempts[pref], now)
+
             self._ip_attempts[src_ip].append(now)
             self._prefix_attempts[pref].append(now)
 
@@ -6777,7 +7008,7 @@ class NATManager:
                 canon = self._stateful_nat_inbound[ext_key]
                 a, b = canon
                 if src_ip == b[0]:
-                    self._stateful_nat_outbound[canon] = (external_ip, int(external_port), now)
+                    self._touch_stateful_entry(canon, external_ip, int(external_port), now)
                     self._log(f"[NAT] ⬅️ DNAT stateful {external_ip}:{external_port} → {a[0]}:{a[1]} (from {src_ip})")
                     return a[0], int(a[1])
 
@@ -6791,11 +7022,11 @@ class NATManager:
             if dyn:
                 if dyn in self._nat_table:
                     ext_ip_dyn, port_now, _ = self._nat_table[dyn]
-                    self._nat_table[dyn] = (ext_ip_dyn, port_now, now)
+                    self._touch_nat_entry(dyn, ext_ip_dyn, port_now, now)
                 self._bump_gray_score(src_ip, external_ip, int(external_port), reason="dynamic")
                 self._log(f"[NAT] ⬅️ DNAT dynamic {external_ip}:{external_port} → {dyn[0]}:{dyn[1]} (from {src_ip})")
                 return dyn
-            # FIRST: honor existing temp lease before probe-ban logic
+
             li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
             if li:
                 lease = self._maybe_grant_temp_lease(src_ip, external_ip, int(external_port))
@@ -6806,6 +7037,7 @@ class NATManager:
             count = self._port_probe_counts[src_ip]
             if count >= self.BAN_THRESHOLD:
                 self._ban_list[src_ip] = now + self.BAN_DURATION_SEC
+                self._enforce_bounds_locked()
                 self._log(f"[NAT] 🔒 Banned {src_ip} for {self.BAN_DURATION_SEC}s (probes={count})")
                 return None
 
@@ -6816,12 +7048,13 @@ class NATManager:
         with self._lock:
             if external_ip in self._one_to_one_map:
                 return self._one_to_one_map[external_ip]
-
         if external_ip == self.public_ip:
             self._log("[NAT] ℹ️ 1:1 NAT not configured; cannot map external→internal IP.")
         return None
 
-    # ========================= Admin / Introspection =========================
+    # ------------------------------------------------------------------
+    # Admin / introspection
+    # ------------------------------------------------------------------
 
     def list_temp_leases(self) -> List[Dict]:
         with self._lock:
@@ -6840,7 +7073,7 @@ class NATManager:
                         "lease_ttl": max(0, int(lease_end - now)),
                         "cooldown_end": float(li["cooldown_end"]),
                         "state": li.get("state", "gray"),
-                        "score": int(self._gray_score.get((sip, ext_ip, int(p)), 0))
+                        "score": int(self._gray_score.get((sip, ext_ip, int(p)), 0)),
                     })
             return out
 
@@ -6851,20 +7084,20 @@ class NATManager:
             if ext_key in portmap:
                 del portmap[ext_key]
                 if not portmap:
-                    del self._temp_nat_leases[src_ip]
+                    self._temp_nat_leases.pop(src_ip, None)
                 self._gray_score.pop((src_ip, external_ip, int(external_port)), None)
                 self._log(f"[NAT][LEASE] ❌ Revoked {src_ip}@{external_ip}:{external_port}")
                 return True
             return False
 
-    def promote_lease_to_static(self, src_ip: str, external_ip: str, external_port: int, internal_ip: str,
-                                internal_port: int) -> bool:
+    def promote_lease_to_static(self, src_ip: str, external_ip: str, external_port: int, internal_ip: str, internal_port: int) -> bool:
         ext_key = (external_ip, int(external_port))
         with self._lock:
             if self.AUTO_PROMOTE_TO_STATIC:
                 self._static_mappings[ext_key] = (str(internal_ip), int(internal_port))
                 self._log(
-                    f"[NAT][LEASE] ⬆️ Promoted {src_ip}@{external_ip}:{external_port} → STATIC {internal_ip}:{internal_port}")
+                    f"[NAT][LEASE] ⬆️ Promoted {src_ip}@{external_ip}:{external_port} → STATIC {internal_ip}:{internal_port}"
+                )
                 return True
             return False
 
@@ -6884,13 +7117,22 @@ class NATManager:
                 "wan_epoch": self._wan_epoch,
                 "last_dynamic_flush": self._last_dynamic_flush,
                 "last_wan_identity": dict(self._last_wan_identity),
+                "limits": {
+                    "max_dynamic_nat_entries": self.MAX_DYNAMIC_NAT_ENTRIES,
+                    "max_stateful_nat_entries": self.MAX_STATEFUL_NAT_ENTRIES,
+                    "max_hairpin_reverse_entries": self.MAX_HAIRPIN_REVERSE_ENTRIES,
+                    "max_frag_cache_entries": self.MAX_FRAG_CACHE_ENTRIES,
+                    "max_nat_creates_per_ip_per_window": self.MAX_NAT_CREATES_PER_IP_PER_WINDOW,
+                }
             }
         try:
             return json.dumps(data, indent=2, sort_keys=True)
         except Exception:
             return str(data)
 
-    # ========================= Internals: Temp Leases =========================
+    # ------------------------------------------------------------------
+    # Temp leases
+    # ------------------------------------------------------------------
 
     def _temp_ip_for(self, external_ip: str, external_port: int) -> str:
         try:
@@ -6912,6 +7154,7 @@ class NATManager:
         if mode == "deny":
             self._log(f"[NAT][LEASE] ⛔ Service policy denies port {external_port}")
             return None
+
         now = time.time()
         li = self._temp_nat_leases.get(src_ip, {}).get(ext_key)
         if li:
@@ -6926,9 +7169,10 @@ class NATManager:
                 backoff = self._calc_backoff(li.get("failures", 0))
                 li["cooldown_end"] = now + backoff
                 self._log(
-                    f"[NAT][LEASE] 🧯 Cooldown extended ({int(backoff)}s) for {src_ip}@{external_ip}:{external_port} (state={state})")
+                    f"[NAT][LEASE] 🧯 Cooldown extended ({int(backoff)}s) for "
+                    f"{src_ip}@{external_ip}:{external_port} (state={state})"
+                )
                 return None
-
 
         ip_active = self._active_lease_count_for_ip(src_ip, now)
         ip_cap = int(pol.get("max_per_ip", self.MAX_TEMP_LEASES_PER_IP))
@@ -6943,7 +7187,6 @@ class NATManager:
             self._log(f"[NAT][LEASE] ❌ Prefix {prefix} reached cap ({pre_active}/{pre_cap})")
             return None
 
-
         if mode == "throttle" and random.random() > 0.5:
             self._log(f"[NAT][LEASE] ⛔ Throttled {src_ip}@{external_ip}:{external_port}")
             return None
@@ -6952,7 +7195,6 @@ class NATManager:
         cooldown_secs = float(pol.get("cooldown_secs", self.DEFAULT_COOLDOWN_SECS))
         temp_ip = self._temp_ip_for(external_ip, external_port)
         temp_port = int(external_port)
-        base = lease_secs
 
         self._temp_nat_leases[src_ip][ext_key] = {
             "internal_ip": temp_ip,
@@ -6961,11 +7203,12 @@ class NATManager:
             "cooldown_end": now + lease_secs + cooldown_secs,
             "failures": 0,
             "state": "gray",
-            "base_lease": base,
+            "base_lease": lease_secs,
         }
         self._bump_gray_score(src_ip, external_ip, external_port, reason="grant")
         self._log(
-            f"[NAT][LEASE] 🆕 {src_ip}@{external_ip}:{external_port} → {temp_ip}:{temp_port} for {int(lease_secs)}s (+{int(cooldown_secs)}s)"
+            f"[NAT][LEASE] 🆕 {src_ip}@{external_ip}:{external_port} → {temp_ip}:{temp_port} "
+            f"for {int(lease_secs)}s (+{int(cooldown_secs)}s)"
         )
         self._port_probe_counts.pop(src_ip, None)
         return temp_ip, temp_port
@@ -6983,19 +7226,20 @@ class NATManager:
 
         if li["state"] == "gray" and score >= self.WARMUP_REQUIRED_HITS:
             li["state"] = "warmup"
-            self._log(f"[NAT][LEASE] 🔶 {src_ip}@{external_ip}:{external_port} reached WARMUP (score={score}, reason={reason})")
+            self._log(
+                f"[NAT][LEASE] 🔶 {src_ip}@{external_ip}:{external_port} reached WARMUP "
+                f"(score={score}, reason={reason})"
+            )
 
         elif li["state"] == "warmup" and score >= self.TRUST_REQUIRED_HITS:
             li["state"] = "trusted"
             self._log(f"[NAT][LEASE] 🟢 {src_ip}@{external_ip}:{external_port} is TRUSTED (score={score})")
 
-            if self.AUTO_PROMOTE_TO_DYNAMIC and ext_key not in self._nat_reverse_table:
-                self._log_debug(f"Auto-promote to dynamic enabled for {ext_key}")
-
             if self.AUTO_PROMOTE_TO_STATIC and ext_key not in self._static_mappings:
                 self._static_mappings[ext_key] = (str(li["internal_ip"]), int(li["internal_port"]))
                 self._log(
-                    f"[NAT][LEASE] ⬆️ Promoted to STATIC: {external_ip}:{external_port}→{li['internal_ip']}:{li['internal_port']}"
+                    f"[NAT][LEASE] ⬆️ Promoted to STATIC: "
+                    f"{external_ip}:{external_port}→{li['internal_ip']}:{li['internal_port']}"
                 )
 
     def _calc_backoff(self, failures: int) -> float:
@@ -7027,29 +7271,33 @@ class NATManager:
         while dq and dq[0] < cutoff:
             dq.popleft()
 
-    # ========================= Background Cleanup =========================
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     def _cleanup_loop(self):
-        interval = max(1.0, self.NAT_TIMEOUT_SECONDS / 2)
+        interval = max(1.0, float(self.CLEANUP_INTERVAL_SECONDS))
         while not self._stop_event.is_set():
             now = time.time()
             try:
                 with self._lock:
-                    for key in [k for k, (_, _, ts) in self._nat_table.items() if now - ts > self.NAT_TIMEOUT_SECONDS]:
-                        ext_ip, ext_port, _ = self._nat_table.pop(key, (None, None, None))
-                        ext_key = (ext_ip, ext_port)
-                        if ext_ip and ext_port is not None and self._nat_reverse_table.get(ext_key) == key:
-                            del self._nat_reverse_table[ext_key]
+                    for key in list(self._nat_table.keys()):
+                        ext_ip, ext_port, ts = self._nat_table.get(key, (None, None, 0.0))
+                        if now - ts > self.NAT_TIMEOUT_SECONDS:
+                            self._nat_table.pop(key, None)
+                            if ext_ip is not None and ext_port is not None:
+                                if self._nat_reverse_table.get((ext_ip, ext_port)) == key:
+                                    self._nat_reverse_table.pop((ext_ip, ext_port), None)
 
-                    for canon in [k for k, (_, _, ts) in self._stateful_nat_outbound.items()
-                                  if now - ts > self.STATEFUL_NAT_TIMEOUT_SECONDS]:
-                        ext_ip, ext_port, _ = self._stateful_nat_outbound.pop(canon, (None, None, None))
-                        ext_key = (ext_ip, ext_port)
-                        if ext_ip and ext_port is not None and ext_key in self._stateful_nat_inbound:
-                            del self._stateful_nat_inbound[ext_key]
+                    for canon in list(self._stateful_nat_outbound.keys()):
+                        ext_ip, ext_port, ts = self._stateful_nat_outbound.get(canon, (None, None, 0.0))
+                        if now - ts > self.STATEFUL_NAT_TIMEOUT_SECONDS:
+                            self._stateful_nat_outbound.pop(canon, None)
+                            if ext_ip is not None and ext_port is not None:
+                                self._stateful_nat_inbound.pop((ext_ip, ext_port), None)
 
                     for ip in [i for i, exp in self._ban_list.items() if now >= exp]:
-                        del self._ban_list[ip]
+                        self._ban_list.pop(ip, None)
                         self._port_probe_counts.pop(ip, None)
 
                     for sip in list(self._temp_nat_leases.keys()):
@@ -7057,23 +7305,45 @@ class NATManager:
                             li = self._temp_nat_leases[sip][ext_key]
                             if now >= float(li["cooldown_end"]):
                                 del self._temp_nat_leases[sip][ext_key]
-                                gray_key = (sip, ext_key[0], ext_key[1])
-                                self._gray_score.pop(gray_key, None)
+                                self._gray_score.pop((sip, ext_key[0], ext_key[1]), None)
                         if not self._temp_nat_leases[sip]:
-                            del self._temp_nat_leases[sip]
+                            self._temp_nat_leases.pop(sip, None)
 
-                    for hk in [k for k, (_, _, ts) in self._hairpin_reverse.items() if now - ts > self.NAT_TIMEOUT_SECONDS]:
-                        del self._hairpin_reverse[hk]
+                    for hk in list(self._hairpin_reverse.keys()):
+                        _ext_ip, _ext_port, ts = self._hairpin_reverse[hk]
+                        if now - ts > self.HAIRPIN_TIMEOUT_SECONDS:
+                            self._hairpin_reverse.pop(hk, None)
 
                     cutoff = now - self._FRAG_CACHE_TTL
-                    for key in [k for k, (_, ts) in self._frag_cache.items() if ts < cutoff]:
-                        self._frag_cache.pop(key, None)
+                    for key in list(self._frag_cache.keys()):
+                        _decision, ts = self._frag_cache[key]
+                        if ts < cutoff:
+                            self._frag_cache.pop(key, None)
+
+                    # prune rate windows so tracker dicts do not grow forever
+                    for k in list(self._ip_attempts.keys()):
+                        self._prune_window(self._ip_attempts[k], now)
+                        if not self._ip_attempts[k]:
+                            self._ip_attempts.pop(k, None)
+                    for k in list(self._prefix_attempts.keys()):
+                        self._prune_window(self._prefix_attempts[k], now)
+                        if not self._prefix_attempts[k]:
+                            self._prefix_attempts.pop(k, None)
+                    for k in list(self._nat_create_attempts.keys()):
+                        self._prune_window(self._nat_create_attempts[k], now)
+                        if not self._nat_create_attempts[k]:
+                            self._nat_create_attempts.pop(k, None)
+
+                    self._enforce_bounds_locked()
+
             except Exception as e:
                 self._log_error(f"cleanup loop error: {e}")
 
             self._stop_event.wait(interval)
 
-    # ========================= Uplink Policy =========================
+    # ------------------------------------------------------------------
+    # Uplink policy
+    # ------------------------------------------------------------------
 
     def _refresh_uplink_identity(self) -> None:
         now = time.time()
@@ -7086,6 +7356,7 @@ class NATManager:
             self._uplink_gateway_ip = None
             self._uplink_iface = None
             return
+
         nh = r.get("next_hop")
         self._uplink_gateway_ip = None if (not nh or nh == "0.0.0.0") else str(nh)
         self._uplink_iface = r.get("interface")
@@ -7105,207 +7376,26 @@ class NATManager:
             try:
                 ip_gw = ipaddress.ip_address(gw)
                 for cidr in self.TEMP_LEASES_POLICY.get("deny_cidrs", []):
-                    if ip_gw in ipaddress.ip_network(cidr, strict=False):
+                    if cidr and ip_gw in ipaddress.ip_network(cidr, strict=False):
                         return False
             except Exception:
                 pass
         return True
 
-    # ========================= ALG / ICMP / Utility =========================
+    # ------------------------------------------------------------------
+    # Port forward / 1:1 / uplink public IP / LAN-public helpers
+    # ------------------------------------------------------------------
 
-    def _apply_alg(self, packet: Packet, direction: str):
-        if TCP in packet and (int(packet[TCP].dport) == 21 or int(packet[TCP].sport) == 21):
-            self._log_debug(f"ALG 📁 FTP ({direction})")
-        if UDP in packet and DNS in packet and (int(packet[UDP].dport) == 53 or int(packet[UDP].sport) == 53):
-            self._log_debug(f"ALG ❓ DNS ({direction})")
-
-    def _icmp_port_unreachable(self, original_packet: Packet, original_ip_layer, external_ip: str):
-        try:
-            # Small safety guard: this helper is IPv4-only.
-            if not isinstance(original_ip_layer, IP) and IP not in original_packet:
-                self._log_debug("Skipping ICMP Port Unreachable for non-IPv4 packet")
-                return
-            if not self._is_ipv4_text(external_ip):
-                self._log_debug(f"Skipping ICMP Port Unreachable for non-IPv4 external IP {external_ip}")
-                return
-
-            icmp_src_ip = external_ip
-            icmp_dst_ip = original_ip_layer.src
-            r = self._safe_route_lookup(icmp_dst_ip)
-            if not r:
-                self._log_debug(f"⚠️ No route to {icmp_dst_ip} for ICMP; using fallback")
-                try:
-                    self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-                except Exception:
-                    pass
-                return
-
-            out_iface = r.get("interface")
-            iface_cfg = self._ensure_iface_entry(out_iface)
-            router_mac = iface_cfg.get("mac")
-            next_hop_ip = r.get("next_hop")
-            next_hop_ip = icmp_dst_ip if (not next_hop_ip or next_hop_ip == "0.0.0.0") else next_hop_ip
-            next_hop_mac = self._safe_arp_resolve(next_hop_ip, out_iface)
-
-            if not (router_mac and next_hop_mac):
-                self._log_debug("⚠️ ARP or iface MAC missing for ICMP; fallback")
-                try:
-                    self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-                except Exception:
-                    pass
-                return
-
-            icmp = Ether(src=router_mac, dst=next_hop_mac) / IP(src=icmp_src_ip, dst=icmp_dst_ip) / ICMP(type=3, code=3) / original_ip_layer
-            if IP in icmp and hasattr(icmp[IP], "chksum"):
-                del icmp[IP].chksum
-            if ICMP in icmp and hasattr(icmp[ICMP], "chksum"):
-                del icmp[ICMP].chksum
-
-            if hasattr(self.packet_writer, "_send_raw_packet"):
-                self.packet_writer._send_raw_packet(icmp, out_iface)
-                self._log_rl(f"icmp_unreach:{icmp_src_ip}:{icmp_dst_ip}:{out_iface}", 5.0,
-                             f"[NAT] 🔕 ICMP Port Unreachable ({icmp_src_ip} → {icmp_dst_ip}) via {out_iface}")
-                return
-
-            try:
-                self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-            except Exception:
-                pass
-
-        except Exception:
-            self._log_debug("⚠️ ICMP send failed; fallback")
-            try:
-                self.sendback_manager.send_icmp_packet(original_packet, icmp_type=3, icmp_code=3)
-            except Exception:
-                pass
-
-    def _maybe_clamp_mss(self, packet: Packet):
-        if TCP not in packet:
-            return
-        tcp = packet[TCP]
-        if not (tcp.flags & 0x02) or (tcp.flags & 0x10):
-            return
-        opts = tcp.options or []
-        new_opts, clamped, saw = [], False, False
-        want = self.MSS_CLAMP_V6 if (IPv6 in packet) else self.MSS_CLAMP_V4
-        for k, v in opts:
-            if k == 'MSS':
-                saw = True
-                if int(v) > want:
-                    v = int(want)
-                    clamped = True
-            new_opts.append((k, v))
-        if not saw:
-            new_opts.append(('MSS', int(want)))
-            clamped = True
-        if clamped:
-            tcp.options = new_opts
-            self._log_debug(f"MSS clamp → {want}")
-
-    def _alloc_port(self, external_ip: str) -> int:
-        n = self._next_port_per_ip[external_ip]
-        start = n
-        while True:
-            port = n
-            n += 1
-            if n > self.NAT_PORT_MAX:
-                n = self.NAT_PORT_MIN
-
-            ext_key = (external_ip, port)
-            if ext_key not in self._nat_reverse_table and ext_key not in self._static_mappings:
-                self._next_port_per_ip[external_ip] = n
-                return port
-
-            if n == start:
-                self._log_error(f"Port pool exhausted for {external_ip}")
-                return -1
-
-    def _is_ip(self, pkt: Packet) -> bool:
-        try:
-            return (IP in pkt) or (IPv6 in pkt)
-        except Exception:
-            return False
-
-    def _recalc_checksums(self, pkt: Packet):
-        try:
-            if IP in pkt and hasattr(pkt[IP], "len"):
-                del pkt[IP].len
-        except Exception:
-            pass
-        try:
-            if IP in pkt and hasattr(pkt[IP], "chksum"):
-                del pkt[IP].chksum
-        except Exception:
-            pass
-        try:
-            if TCP in pkt and hasattr(pkt[TCP], "chksum"):
-                del pkt[TCP].chksum
-        except Exception:
-            pass
-        try:
-            if UDP in pkt and hasattr(pkt[UDP], "len"):
-                del pkt[UDP].len
-        except Exception:
-            pass
-        try:
-            if UDP in pkt and hasattr(pkt[UDP], "chksum"):
-                del pkt[UDP].chksum
-        except Exception:
-            pass
-
-    # ========================= Logging Helpers =========================
-
-    def _log(self, msg: str):
-        try:
-            self.router_logger.log_message(msg)
-        except Exception:
-            pass
-
-    def _log_debug(self, msg: str):
-        if not self.debug_logging:
-            return
-        try:
-            self.router_logger.log_message(f"[NAT][DBG] {msg}")
-        except Exception:
-            pass
-
-    def _log_error(self, msg: str):
-        try:
-            if hasattr(self.router_logger, "log_error"):
-                self.router_logger.log_error(f"[NAT] ❗️ {msg}")
-            else:
-                self.router_logger.log_message(f"[NAT][ERROR] ❗️ {msg}")
-        except Exception:
-            pass
-
-    def _safe_summary(self, pkt: Packet) -> str:
-        try:
-            return pkt.summary()
-        except Exception:
-            return "<pkt>"
-
-    # ========================= Token generation/verification =========================
-
-    def _token_epoch(self, t: Optional[float] = None) -> int:
-        return int((t or time.time()) // 10)
-
-    def _sign_token(self, src_ip: str, external_ip: str, port: int, epoch: int) -> bytes:
-        msg = f"{src_ip}|{external_ip}|{int(port)}|{int(epoch)}".encode()
-        return hmac.new(self._token_secret, msg, hashlib.sha256).digest()
-
-    def _verify_token(self, src_ip: str, external_ip: str, port: int, mac: bytes) -> bool:
-        now_ep = self._token_epoch()
-        for ep in (now_ep, now_ep - 1, now_ep + 1):
-            if hmac.compare_digest(self._sign_token(src_ip, external_ip, int(port), ep), mac):
-                return True
-        return False
-
-    # ========================= Additive helpers only =========================
-
-    def add_port_forward_rule(self, external_ip: str, external_port: int, protocol: str,
-                              internal_ip: str, internal_port: int,
-                              allowed_sources: Optional[List[str]] = None,
-                              enabled: bool = True):
+    def add_port_forward_rule(
+        self,
+        external_ip: str,
+        external_port: int,
+        protocol: str,
+        internal_ip: str,
+        internal_port: int,
+        allowed_sources: Optional[List[str]] = None,
+        enabled: bool = True,
+    ):
         proto = (protocol or "tcp").lower()
         key = (str(external_ip), int(external_port), proto)
         with self._lock:
@@ -7355,6 +7445,89 @@ class NATManager:
         self._log(f"[NAT][LANPUB] 🗑️ Unmarked public-on-LAN IP {ip}")
         if resync:
             self._resync_router_self_service_port_forwards()
+
+    # ------------------------------------------------------------------
+    # Utility / protocol helpers
+    # ------------------------------------------------------------------
+
+    def _apply_alg(self, packet: Packet, direction: str):
+        if TCP in packet and (int(packet[TCP].dport) == 21 or int(packet[TCP].sport) == 21):
+            self._log_debug(f"ALG 📁 FTP ({direction})")
+        if UDP in packet and DNS in packet and (int(packet[UDP].dport) == 53 or int(packet[UDP].sport) == 53):
+            self._log_debug(f"ALG ❓ DNS ({direction})")
+
+    def _verify_token(self, src_ip: str, external_ip: str, port: int, mac_blob: bytes) -> bool:
+        try:
+            msg = f"{src_ip}|{external_ip}|{int(port)}".encode()
+            want = hmac.new(self._token_secret, msg, hashlib.sha256).digest()[:32]
+            return hmac.compare_digest(want, bytes(mac_blob))
+        except Exception:
+            return False
+
+    def _icmp_port_unreachable(self, packet, ip_layer, external_ip: str):
+        # Keep as a safe no-op if sendback plumbing is unavailable.
+        try:
+            self._log_debug(f"ICMP port unreachable for {getattr(ip_layer, 'src', '?')} → {external_ip}")
+        except Exception:
+            pass
+
+    def _maybe_clamp_mss(self, packet):
+        try:
+            if TCP not in packet:
+                return
+            tcp = packet[TCP]
+            opts = list(getattr(tcp, "options", []) or [])
+            if not opts:
+                return
+            new_opts = []
+            changed = False
+            for opt in opts:
+                if not isinstance(opt, tuple) or len(opt) != 2:
+                    new_opts.append(opt)
+                    continue
+                name, val = opt
+                if name == "MSS":
+                    limit = self.MSS_CLAMP_V4 if IP in packet else self.MSS_CLAMP_V6
+                    try:
+                        nval = min(int(val), int(limit))
+                    except Exception:
+                        nval = int(limit)
+                    new_opts.append(("MSS", nval))
+                    changed = True
+                else:
+                    new_opts.append(opt)
+            if changed:
+                tcp.options = new_opts
+        except Exception:
+            pass
+
+    def _recalc_checksums(self, packet):
+        try:
+            if IP in packet:
+                if hasattr(packet[IP], "chksum"):
+                    del packet[IP].chksum
+                if hasattr(packet[IP], "len"):
+                    del packet[IP].len
+            if TCP in packet and hasattr(packet[TCP], "chksum"):
+                del packet[TCP].chksum
+            if UDP in packet and hasattr(packet[UDP], "chksum"):
+                del packet[UDP].chksum
+            if IPv6 in packet and hasattr(packet[IPv6], "plen"):
+                del packet[IPv6].plen
+        except Exception:
+            pass
+
+    def _is_ip(self, packet) -> bool:
+        try:
+            return (IP in packet) or (IPv6 in packet)
+        except Exception:
+            return False
+
+    def _safe_summary(self, packet) -> str:
+        try:
+            return packet.summary()
+        except Exception:
+            return "<packet>"
 
 
 

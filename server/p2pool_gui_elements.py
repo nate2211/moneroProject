@@ -1801,6 +1801,8 @@ class RouterTab(QWidget):
         self.use_lan_checkbox.setChecked(False)
         self.use_uplink_checkbox = QCheckBox("Use Uplink Manager")
         self.use_uplink_checkbox.setChecked(False)
+        self.use_socket = QCheckBox("Use Socket Interface")
+        self.use_socket.setChecked(False)
         self.nat_os_checkbox = QCheckBox("Use OS Nat")
         self.nat_os_checkbox.setChecked(False)
         self.python_server_checkbox = QCheckBox("Use Python Server")
@@ -1868,7 +1870,7 @@ class RouterTab(QWidget):
         routing_grid.addWidget(self.use_lan_checkbox, 1, 3)
 
         routing_grid.addWidget(self.use_uplink_checkbox, 2, 0)
-        routing_grid.addWidget(self.nat_os_checkbox, 2, 1)
+        routing_grid.addWidget(self.use_socket, 2, 1)
         routing_grid.addWidget(self.python_server_checkbox, 2, 2)
         routing_grid.addWidget(self.promisc_checkbox, 2, 3)
         ip_row = QWidget()
@@ -1887,7 +1889,7 @@ class RouterTab(QWidget):
         comms_form.addRow(self.peer_to_peer_checkbox, self.stratum_comm_checkbox)
         comms_form.addRow(QLabel("IPC Host:"), self.ipc_host_input)
         comms_form.addRow(QLabel("P2Pool IP:"), self.p2pool_server_ip_input)
-
+        comms_form.addRow(self.nat_os_checkbox)
         blocknet_box = QGroupBox("BlockNet")
         blocknet_form = QFormLayout(blocknet_box)
         blocknet_form.addRow(self.blocknet_checkbox)
