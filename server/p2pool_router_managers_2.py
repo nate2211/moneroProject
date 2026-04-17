@@ -23202,7 +23202,7 @@ class _LocalSender:
     stop_fn: Optional[Callable[[], Any]] = None
     started_by_manager: bool = False
 
-    send_q: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=4096))
+    send_q: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=32))
     worker: Optional[threading.Thread] = None
 
     send_count: int = 0
@@ -23326,19 +23326,19 @@ class HyperVRouterManager:
     }
 
     def __init__(
-        self,
-        router_logger,
-        *,
-        discovery_group: str = "239.255.77.77",
-        discovery_port: int = 47771,
-        data_port: int = 47772,
-        heartbeat_sec: float = 12.0,
-        peer_timeout_sec: float = 24.0,
-        sender_failure_cooldown_sec: float = 10.0,
-        dedupe_ttl_sec: float = 8.0,
-        recent_cache_size: int = 8192,
-        max_network_queue: int = 1024,
-        sender_queue_size: int = 512,
+            self,
+            router_logger,
+            *,
+            discovery_group: str = "239.255.77.77",
+            discovery_port: int = 47771,
+            data_port: int = 47772,
+            heartbeat_sec: float = 15.0,
+            peer_timeout_sec: float = 45.0,
+            sender_failure_cooldown_sec: float = 5.0,
+            dedupe_ttl_sec: float = 20.0,
+            recent_cache_size: int = 8192,
+            max_network_queue: int = 64,
+            sender_queue_size: int = 32,
     ):
         self.router_logger = router_logger
 
@@ -23350,8 +23350,8 @@ class HyperVRouterManager:
         self.sender_failure_cooldown_sec = max(1.0, float(sender_failure_cooldown_sec))
         self.dedupe_ttl_sec = max(1.0, float(dedupe_ttl_sec))
         self.recent_cache_size = max(512, min(8192, int(recent_cache_size)))
-        self.max_network_queue = max(128, min(2048, int(max_network_queue)))
-        self.sender_queue_size = max(64, min(1024, int(sender_queue_size)))
+        self.max_network_queue = max(32, min(256, int(max_network_queue)))
+        self.sender_queue_size = max(16, min(128, int(sender_queue_size)))
 
         self.segment_id: str = "default"
         self.node_id: str = ""
@@ -23387,18 +23387,19 @@ class HyperVRouterManager:
         self._pending_lock = threading.RLock()
         self._frame_ack_timeout_sec = max(6.0, self.peer_timeout_sec)
         self._frame_retry_interval_sec = max(1.0, min(2.5, self.heartbeat_sec / 4.0))
-        self._frame_retry_limit = 1
-        self._pending_frame_cap = max(128, min(self.max_network_queue, 1024))
+        self._frame_retry_limit = 0
+        self._pending_frame_cap = max(32, min(self.max_network_queue, 128))
 
-        self._router_ingress_queue_size = max(64, min(self.max_network_queue, 512))
+        self._router_ingress_queue_size = max(16, min(self.max_network_queue, 64))
         self._router_ingress_q: queue.Queue = queue.Queue(maxsize=self._router_ingress_queue_size)
-        self._router_ingress_retry_backoff_sec = 0.10
-        self._router_ingress_retry_cap_sec = 0.50
-        self._router_ingress_retry_limit = 3
-        self._remote_ingress_breaker_threshold = max(16, self._router_ingress_queue_size // 2)
-        self._remote_ingress_breaker_window_sec = 15.0
+        self._router_ingress_retry_limit = 1
+        self._router_ingress_retry_backoff_sec = 0.05
+        self._router_ingress_retry_cap_sec = 0.10
+        self._remote_ingress_breaker_threshold = max(4, self._router_ingress_queue_size // 4)
+        self._remote_ingress_breaker_window_sec = 20.0
         self._remote_ingress_breaker_open_until = 0.0
         self._remote_ingress_queue_full_events: Deque[float] = deque()
+        self._router_ingest_fn = None
 
         self._hyperv_managers: Dict[str, Any] = {}
         self._wintun_manager: Optional[Any] = None
@@ -23421,10 +23422,10 @@ class HyperVRouterManager:
 
         self._wire_payload_compress_over = 1200
         self._wire_payload_max_bytes = 48 * 1024
-        self._mirror_payload_soft_limit = 8192
-        self._consumer_flow_bytes_per_window = 128 * 1024
-        self._consumer_flow_packets_per_window = 128
-        self._consumer_flow_window_sec = 3.0
+        self._mirror_payload_soft_limit = 4096
+        self._consumer_flow_bytes_per_window = 64 * 1024
+        self._consumer_flow_packets_per_window = 48
+        self._consumer_flow_window_sec = 2.0
         self._flow_activity: Dict[str, Dict[str, float]] = {}
         self._flow_activity_order: Deque[str] = deque()
         self._flow_activity_cap = 4096
@@ -23491,6 +23492,25 @@ class HyperVRouterManager:
             "consumer_rate_dropped": 0,
         }
 
+    def _apply_pressure_mode(self) -> None:
+        qfull = int(self._stats.get("peer_send_queue_full", 0))
+        ingress_full = int(self._stats.get("remote_ingress_queue_full", 0))
+        ingress_busy = int(self._stats.get("remote_ingress_busy", 0))
+
+        pressure = qfull + ingress_full + ingress_busy
+
+        if pressure >= 20:
+            self._mirror_payload_soft_limit = 2048
+            self._consumer_flow_bytes_per_window = 32 * 1024
+            self._consumer_flow_packets_per_window = 24
+        elif pressure >= 8:
+            self._mirror_payload_soft_limit = 4096
+            self._consumer_flow_bytes_per_window = 48 * 1024
+            self._consumer_flow_packets_per_window = 36
+        else:
+            self._mirror_payload_soft_limit = 4096
+            self._consumer_flow_bytes_per_window = 64 * 1024
+            self._consumer_flow_packets_per_window = 48
     def _remember_recent_value(
             self,
             store: Dict[str, float],
@@ -23700,6 +23720,15 @@ class HyperVRouterManager:
 
         self._log_evt("sender", f"registered sender '{state.sender_id}' kind={state.kind}", ["📦", "🧩"])
 
+    def _resolve_router_ingest_callable(self):
+        router = self._resolve_router()
+        if router is None:
+            return None
+        for fn_name in ("process_packet", "handle_packet", "_process_packet"):
+            fn = getattr(router, fn_name, None)
+            if callable(fn):
+                return fn
+        return None
     # ---------------------------------------------------------
     # lifecycle
     # ---------------------------------------------------------
@@ -23761,7 +23790,7 @@ class HyperVRouterManager:
                 ["⚠️", "📡", "🧯"],
                 every=2.0,
             )
-
+        self._router_ingest_fn = self._resolve_router_ingest_callable()
         if self._data_sock is None:
             self._log_evt("lifecycle", "started in local-only mode; remote transport disabled", ["🧯", "🏠"])
         elif self._discovery_sock is None and self._discovery_tx_sock is not None:
@@ -24060,17 +24089,15 @@ class HyperVRouterManager:
             if qf is None:
                 state.drop_count += 1
                 continue
-
+            if (time.time() - float(qf.enqueued_ts or 0.0)) > 0.75:
+                state.drop_count += 1
+                continue
             if not state.enabled:
                 state.drop_count += 1
                 continue
 
             if state.cooldown_until > time.time():
-                try:
-                    state.send_q.put_nowait(qf)
-                except Exception:
-                    state.drop_count += 1
-                time.sleep(0.05)
+                state.drop_count += 1
                 continue
 
             try:
@@ -24142,20 +24169,17 @@ class HyperVRouterManager:
             )
 
     def _enqueue_local(self, state: _LocalSender, raw: bytes) -> bool:
-        qf = _QueuedLocalFrame(raw=raw, protocol_tag=self._quick_proto_from_raw(raw))
+        qf = _QueuedLocalFrame(
+            raw=raw,
+            protocol_tag=self._quick_proto_from_raw(raw),
+            enqueued_ts=time.time(),
+        )
         try:
             state.send_q.put_nowait(qf)
             return True
         except queue.Full:
             state.drop_count += 1
             self._stats["local_sender_queue_full"] = int(self._stats.get("local_sender_queue_full", 0)) + 1
-            self._log_sparse(
-                f"local-queue-full:{state.sender_id}",
-                "worker",
-                f"sender queue full; dropping packet sender='{state.sender_id}' proto={qf.protocol_tag}",
-                ["⚠️", "📦", "🧯"],
-                every=2.0,
-            )
             return False
 
     def _coerce_send_item(self, item: Any) -> Optional[_QueuedLocalFrame]:
@@ -24466,7 +24490,7 @@ class HyperVRouterManager:
             for sock_obj in ready:
                 which = "discovery" if sock_obj is self._discovery_sock else "data"
                 try:
-                    data, addr = sock_obj.recvfrom(1024 * 1024)
+                    data, addr = sock_obj.recvfrom(min(65535, int(self._wire_payload_max_bytes) + 4096))
                 except socket.timeout:
                     continue
                 except OSError:
@@ -24486,14 +24510,214 @@ class HyperVRouterManager:
                     )
 
     def _health_loop(self) -> None:
+        self._log_evt("worker", "health worker started", ["🧵", "🩺"])
+
+        last_pressure_apply_ts = 0.0
+        last_discovery_slowdown_ts = 0.0
+
         while not self._stop_event.wait(self.heartbeat_sec):
+            now = time.time()
+
             try:
+                # 1) expire offline peers
                 self._prune_peers()
+            except Exception as e:
+                self._log_sparse(
+                    "health-prune-peers",
+                    "health",
+                    f"health prune_peers failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 2) prune all local / distributed dedupe stores
                 self._prune_recent()
+            except Exception as e:
+                self._log_sparse(
+                    "health-prune-recent",
+                    "health",
+                    f"health prune_recent failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 3) expire pending frame tracking
+                # frame retries are disabled now, so this mainly clears stale tracking
                 self._retry_pending_frames()
+            except Exception as e:
+                self._log_sparse(
+                    "health-retry-pending",
+                    "health",
+                    f"health retry_pending_frames failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 4) hard prune any stale / overflowed pending frame records
                 self._prune_pending_frames()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_sparse(
+                    "health-prune-pending",
+                    "health",
+                    f"health prune_pending_frames failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 5) trim old flow-activity records so consumer-rate tracking does not grow forever
+                cutoff = now - max(2.0, float(self._consumer_flow_window_sec or 2.0) * 2.0)
+                while self._flow_activity_order:
+                    key = self._flow_activity_order[0]
+                    info = self._flow_activity.get(key)
+                    if not isinstance(info, dict):
+                        self._flow_activity_order.popleft()
+                        self._flow_activity.pop(key, None)
+                        continue
+
+                    last_seen = float(info.get("last_seen", 0.0) or 0.0)
+                    if last_seen >= cutoff:
+                        break
+
+                    self._flow_activity_order.popleft()
+                    self._flow_activity.pop(key, None)
+            except Exception as e:
+                self._log_sparse(
+                    "health-prune-flow-activity",
+                    "health",
+                    f"health flow activity prune failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 6) trim breaker event timestamps
+                window_start = now - float(self._remote_ingress_breaker_window_sec or 20.0)
+                dq = self._remote_ingress_queue_full_events
+                while dq and dq[0] < window_start:
+                    dq.popleft()
+            except Exception as e:
+                self._log_sparse(
+                    "health-prune-breaker-events",
+                    "health",
+                    f"health breaker queue prune failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 7) if breaker has been open and pressure cooled off, let it close naturally
+                if self._remote_ingress_breaker_open_until > 0.0 and now >= float(
+                        self._remote_ingress_breaker_open_until):
+                    self._remote_ingress_breaker_open_until = 0.0
+                    self._log_sparse(
+                        "health-breaker-closed",
+                        "health",
+                        "remote ingress breaker closed",
+                        ["🟢", "🩺", "📥"],
+                        every=2.0,
+                    )
+            except Exception as e:
+                self._log_sparse(
+                    "health-breaker-close",
+                    "health",
+                    f"health breaker close check failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 8) dynamically tighten / relax mirroring thresholds based on recent pressure
+                if (now - last_pressure_apply_ts) >= 1.0:
+                    self._apply_pressure_mode()
+                    last_pressure_apply_ts = now
+            except Exception as e:
+                self._log_sparse(
+                    "health-pressure-mode",
+                    "health",
+                    f"health pressure mode update failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 9) if the manager is under clear pressure, make discovery even quieter temporarily
+                pressure = (
+                        int(self._stats.get("peer_send_queue_full", 0))
+                        + int(self._stats.get("remote_ingress_queue_full", 0))
+                        + int(self._stats.get("remote_ingress_busy", 0))
+                )
+
+                if pressure >= 8:
+                    if (now - last_discovery_slowdown_ts) >= 5.0:
+                        self._log_sparse(
+                            "health-discovery-slowdown",
+                            "health",
+                            f"pressure detected; keeping discovery quiet pressure={pressure}",
+                            ["🚦", "📡", "🩺"],
+                            every=5.0,
+                        )
+                        last_discovery_slowdown_ts = now
+            except Exception as e:
+                self._log_sparse(
+                    "health-discovery-pressure",
+                    "health",
+                    f"health discovery pressure check failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+            try:
+                # 10) periodically emit a compact health snapshot
+                with self._pending_lock:
+                    pending_count = len(self._pending_frames)
+
+                ingress_qsize = 0
+                net_qsize = 0
+                try:
+                    ingress_qsize = int(self._router_ingress_q.qsize())
+                except Exception:
+                    ingress_qsize = -1
+                try:
+                    net_qsize = int(self._net_tx_q.qsize())
+                except Exception:
+                    net_qsize = -1
+
+                online_peers = 0
+                with self._lock:
+                    online_peers = sum(1 for p in self._peers.values() if getattr(p, "online", False))
+
+                breaker_open = int(self._is_remote_ingress_breaker_open())
+
+                self._log_sparse(
+                    "health-snapshot",
+                    "health",
+                    (
+                        f"health snapshot peers_online={online_peers} "
+                        f"pending={pending_count} net_q={net_qsize} ingress_q={ingress_qsize} "
+                        f"breaker_open={breaker_open} "
+                        f"send_q_full={int(self._stats.get('peer_send_queue_full', 0))} "
+                        f"ingress_q_full={int(self._stats.get('remote_ingress_queue_full', 0))} "
+                        f"ingress_busy={int(self._stats.get('remote_ingress_busy', 0))} "
+                        f"dropped_general={int(self._stats.get('general_traffic_dropped', 0))} "
+                        f"dropped_noise={int(self._stats.get('noise_dropped', 0))}"
+                    ),
+                    ["🩺", "📊"],
+                    every=max(10.0, float(self.heartbeat_sec)),
+                )
+            except Exception as e:
+                self._log_sparse(
+                    "health-snapshot-fail",
+                    "health",
+                    f"health snapshot failed: {type(e).__name__}: {e}",
+                    ["⚠️", "🩺", "🧯"],
+                    every=2.0,
+                )
+
+        self._log_evt("worker", "health worker stopped", ["🛑", "🩺"])
 
     def _send_hello(self, startup: bool = False) -> None:
         with self._sock_lock:
@@ -26623,8 +26847,23 @@ class HyperVRouterManager:
         tcp_sport, tcp_dport = self._packet_tcp_ports(packet)
         udp_sport, udp_dport = self._packet_udp_ports(packet)
 
-        if udp_sport == 443 or udp_dport == 443:
-            return "quic"
+        allowed_udp_ports = {
+            int(self.discovery_port),
+            int(self.data_port),
+            int(self._bound_discovery_port),
+            int(self._bound_data_port),
+            53,
+            123,
+            3333, 4444, 5555, 7777,
+            18080, 18081, 18083,
+            37888, 37889,
+        }
+
+        if str(protocol_tag or "").upper() == "UDP":
+            if udp_sport == 443 or udp_dport == 443:
+                return "quic"
+            if udp_sport not in allowed_udp_ports and udp_dport not in allowed_udp_ports:
+                return "udp_not_allowlisted"
 
         if tcp_sport == 443 or tcp_dport == 443:
             if not self._is_tls_allowlisted(packet):
@@ -26648,10 +26887,10 @@ class HyperVRouterManager:
         dq.append(now)
         while dq and dq[0] < window_start:
             dq.popleft()
-        if len(dq) >= int(self._remote_ingress_breaker_threshold or 16):
+        if len(dq) >= int(self._remote_ingress_breaker_threshold or 4):
             self._remote_ingress_breaker_open_until = max(
                 self._remote_ingress_breaker_open_until,
-                now + float(self._remote_ingress_breaker_window_sec or 15.0),
+                now + 20.0,
             )
         self._log_sparse(
             f"remote-ingress-full-breaker:{src_node_id or '?'}:{protocol_tag}",
