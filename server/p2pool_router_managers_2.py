@@ -23332,26 +23332,26 @@ class HyperVRouterManager:
         discovery_group: str = "239.255.77.77",
         discovery_port: int = 47771,
         data_port: int = 47772,
-        heartbeat_sec: float = 3.0,
-        peer_timeout_sec: float = 12.0,
+        heartbeat_sec: float = 12.0,
+        peer_timeout_sec: float = 24.0,
         sender_failure_cooldown_sec: float = 10.0,
         dedupe_ttl_sec: float = 8.0,
-        recent_cache_size: int = 32768,
-        max_network_queue: int = 8192,
-        sender_queue_size: int = 4096,
+        recent_cache_size: int = 8192,
+        max_network_queue: int = 1024,
+        sender_queue_size: int = 512,
     ):
         self.router_logger = router_logger
 
         self.discovery_group = str(discovery_group)
         self.discovery_port = int(discovery_port)
         self.data_port = int(data_port)
-        self.heartbeat_sec = max(1.0, float(heartbeat_sec))
-        self.peer_timeout_sec = max(3.0, float(peer_timeout_sec))
+        self.heartbeat_sec = max(10.0, float(heartbeat_sec))
+        self.peer_timeout_sec = max(self.heartbeat_sec * 2.0, float(peer_timeout_sec))
         self.sender_failure_cooldown_sec = max(1.0, float(sender_failure_cooldown_sec))
         self.dedupe_ttl_sec = max(1.0, float(dedupe_ttl_sec))
-        self.recent_cache_size = max(512, int(recent_cache_size))
-        self.max_network_queue = max(512, int(max_network_queue))
-        self.sender_queue_size = max(128, int(sender_queue_size))
+        self.recent_cache_size = max(512, min(8192, int(recent_cache_size)))
+        self.max_network_queue = max(128, min(2048, int(max_network_queue)))
+        self.sender_queue_size = max(64, min(1024, int(sender_queue_size)))
 
         self.segment_id: str = "default"
         self.node_id: str = ""
@@ -23385,16 +23385,20 @@ class HyperVRouterManager:
 
         self._pending_frames: Dict[str, Dict[str, Any]] = {}
         self._pending_lock = threading.RLock()
-        self._frame_ack_timeout_sec = max(5.0, self.peer_timeout_sec)
-        self._frame_retry_interval_sec = max(1.0, min(2.0, self.heartbeat_sec))
+        self._frame_ack_timeout_sec = max(6.0, self.peer_timeout_sec)
+        self._frame_retry_interval_sec = max(1.0, min(2.5, self.heartbeat_sec / 4.0))
         self._frame_retry_limit = 1
-        self._pending_frame_cap = max(512, min(max_network_queue * 2, 16384))
+        self._pending_frame_cap = max(128, min(self.max_network_queue, 1024))
 
-        self._router_ingress_queue_size = max(256, min(max_network_queue, 8192))
+        self._router_ingress_queue_size = max(64, min(self.max_network_queue, 512))
         self._router_ingress_q: queue.Queue = queue.Queue(maxsize=self._router_ingress_queue_size)
         self._router_ingress_retry_backoff_sec = 0.10
-        self._router_ingress_retry_cap_sec = 1.0
-        self._router_ingress_retry_limit = 6
+        self._router_ingress_retry_cap_sec = 0.50
+        self._router_ingress_retry_limit = 3
+        self._remote_ingress_breaker_threshold = max(16, self._router_ingress_queue_size // 2)
+        self._remote_ingress_breaker_window_sec = 15.0
+        self._remote_ingress_breaker_open_until = 0.0
+        self._remote_ingress_queue_full_events: Deque[float] = deque()
 
         self._hyperv_managers: Dict[str, Any] = {}
         self._wintun_manager: Optional[Any] = None
@@ -23411,14 +23415,23 @@ class HyperVRouterManager:
         self._manage_wintun_lifecycle = False
         self._manage_windivert_lifecycle = False
 
-        self._allow_data_port_fallback = True
-        self._allow_discovery_degraded_mode = True
+        self._allow_data_port_fallback = False
+        self._allow_discovery_degraded_mode = False
         self._socket_close_wait_sec = 0.05
 
         self._wire_payload_compress_over = 1200
-        self._wire_payload_max_bytes = 60 * 1024
+        self._wire_payload_max_bytes = 48 * 1024
+        self._mirror_payload_soft_limit = 8192
+        self._consumer_flow_bytes_per_window = 128 * 1024
+        self._consumer_flow_packets_per_window = 128
+        self._consumer_flow_window_sec = 3.0
+        self._flow_activity: Dict[str, Dict[str, float]] = {}
+        self._flow_activity_order: Deque[str] = deque()
+        self._flow_activity_cap = 4096
+        self._tls_allowlist_ports: Set[int] = set()
+        self._tls_allowlist_hosts: Set[str] = set()
 
-        self._direct_hello_every_sec = max(10.0, self.heartbeat_sec * 4.0)
+        self._direct_hello_every_sec = max(30.0, self.heartbeat_sec * 2.0)
         self._max_frame_wire_variants = 1
         self._max_ack_wire_variants = 1
         self._startup_hello_burst = 1
@@ -23426,15 +23439,15 @@ class HyperVRouterManager:
         self._last_hello_id: str = ""
         self._last_hello_ts: float = 0.0
         self._implicit_ack_grace_sec = max(0.35, min(1.25, self.heartbeat_sec))
-        self._assume_delivery_on_peer_contact = True
-        self._assume_delivery_on_online_peer = True
+        self._assume_delivery_on_peer_contact = False
+        self._assume_delivery_on_online_peer = False
 
         # quieter / LAN-scoped behavior
         self._allow_public_peer_data = False
         self._allow_public_discovery = False
         self._send_direct_hello = False
         self._send_global_broadcast = False
-        self._send_subnet_broadcast = True
+        self._send_subnet_broadcast = False
         self._peer_target_limit = 1
         self._ack_target_limit = 1
         self._log_wire_messages = False
@@ -23461,15 +23474,19 @@ class HyperVRouterManager:
             "remote_ingress_requeued": 0,
             "remote_ingress_failed": 0,
             "remote_ingress_queue_full": 0,
+            "remote_ingress_busy": 0,
+            "remote_ingress_breaker_drop": 0,
             "pending_pruned": 0,
             "local_sender_queue_full": 0,
             "noise_dropped": 0,
             "wireshark_hvrm_dropped": 0,
+            "general_traffic_dropped": 0,
+            "quic_dropped": 0,
+            "tls_dropped": 0,
+            "large_stream_dropped": 0,
+            "consumer_rate_dropped": 0,
         }
 
-    # ---------------------------------------------------------
-    # config / attach
-    # ---------------------------------------------------------
 
     def configure(
         self,
@@ -23479,14 +23496,20 @@ class HyperVRouterManager:
         node_id: Optional[str] = None,
     ) -> None:
         self.segment_id = str(segment_id or "default").strip() or "default"
-        self.bind_ip = str(bind_ip or "0.0.0.0").strip() or "0.0.0.0"
+        self.bind_ip = str(bind_ip or "").strip()
         self.node_id = str(node_id or f"{self.host_name}-{uuid.getnode():012x}")
+
+        if not self._is_valid_bind_ip(self.bind_ip):
+            raise ValueError(
+                "HyperVRouterManager requires a concrete IPv4 bind_ip; wildcard/degraded bind is disabled"
+            )
 
         self._log_evt(
             "config",
             f"configured segment='{self.segment_id}' node='{self.node_id}' bind='{self.bind_ip}'",
             ["🧠", "📝"],
         )
+
 
     def register_hyperv_backend(
         self,
@@ -23812,7 +23835,6 @@ class HyperVRouterManager:
             if not raw:
                 return False
 
-            # Explicitly ignore HVRM control/discovery packets seen on Wireshark.
             if self._should_drop_wireshark_hvrm(packet, raw, iface_name):
                 self._stats["wireshark_hvrm_dropped"] = int(self._stats.get("wireshark_hvrm_dropped", 0)) + 1
                 return False
@@ -23823,22 +23845,41 @@ class HyperVRouterManager:
             if protocol_tag is None:
                 return False
 
-            # Early-drop local noise so this sidecar never mirrors broadcast chatter.
             if self._should_drop_sidecar_noise(packet, protocol_tag):
                 self._stats["noise_dropped"] = int(self._stats.get("noise_dropped", 0)) + 1
                 return False
 
-            # Never re-mirror our own HVRM control plane packets.
             if self._is_hvrm_control_packet(packet, raw):
                 return False
 
             if len(raw) > self._wire_payload_max_bytes:
+                self._stats["large_stream_dropped"] = int(self._stats.get("large_stream_dropped", 0)) + 1
                 self._log_sparse(
                     f"wire-too-large:{protocol_tag}",
                     "route",
                     f"wire frame too large to mirror protocol={protocol_tag} iface={iface_name} len={len(raw)}",
                     ["⚠️", "📦", "📏"],
                     every=3.0,
+                )
+                return False
+
+            drop_reason = self._general_traffic_drop_reason(packet, protocol_tag, raw, iface_name)
+            if drop_reason:
+                self._stats["general_traffic_dropped"] = int(self._stats.get("general_traffic_dropped", 0)) + 1
+                if drop_reason == "quic":
+                    self._stats["quic_dropped"] = int(self._stats.get("quic_dropped", 0)) + 1
+                elif drop_reason == "tls":
+                    self._stats["tls_dropped"] = int(self._stats.get("tls_dropped", 0)) + 1
+                elif drop_reason in {"large_stream", "large_payload_stream"}:
+                    self._stats["large_stream_dropped"] = int(self._stats.get("large_stream_dropped", 0)) + 1
+                elif drop_reason == "consumer_rate":
+                    self._stats["consumer_rate_dropped"] = int(self._stats.get("consumer_rate_dropped", 0)) + 1
+                self._log_sparse(
+                    f"general-drop:{drop_reason}:{iface_name}:{protocol_tag}",
+                    "route",
+                    f"sidecar mirror dropped reason={drop_reason} iface={iface_name} proto={protocol_tag} len={len(raw)}",
+                    ["🛑", "📦", "🌐"],
+                    every=2.0,
                 )
                 return False
 
@@ -23884,6 +23925,7 @@ class HyperVRouterManager:
                 every=2.0,
             )
             return False
+
 
     def _consult_hostboundary(self, packet, inbound_iface: str) -> str:
         mgr = self._hostboundary_manager
@@ -24285,69 +24327,28 @@ class HyperVRouterManager:
             return None
 
     def _open_data_socket_with_fallback(self) -> Tuple[Optional[socket.socket], int]:
-        attempts: List[Tuple[str, int, str]] = []
-        bind_ip = self.bind_ip or "0.0.0.0"
+        bind_ip = str(self.bind_ip or "").strip()
+        if not self._is_valid_bind_ip(bind_ip):
+            raise RuntimeError("data socket requires validated concrete bind_ip; wildcard/fallback is disabled")
 
-        attempts.append((bind_ip, self.data_port, "configured"))
-        if bind_ip != "0.0.0.0":
-            attempts.append(("0.0.0.0", self.data_port, "wildcard-port"))
-        if self._allow_data_port_fallback:
-            attempts.append((bind_ip, 0, "configured-ephemeral"))
-            if bind_ip != "0.0.0.0":
-                attempts.append(("0.0.0.0", 0, "wildcard-ephemeral"))
+        sock_obj = None
+        try:
+            sock_obj = self._make_udp_socket()
+            sock_obj.bind((bind_ip, self.data_port))
+            sock_obj.settimeout(0.25)
+            actual_port = int(sock_obj.getsockname()[1])
+            self._log_evt("socket", f"data socket bound on {bind_ip}:{actual_port}", ["📦", "✅"])
+            return sock_obj, actual_port
+        except Exception as e:
+            if sock_obj is not None:
+                self._safe_socket_close(sock_obj)
+            self._log_evt(
+                "socket",
+                f"data socket bind failed on {bind_ip}:{self.data_port}: {type(e).__name__}: {e}",
+                ["⚠️", "📦", "🧯"],
+            )
+            raise
 
-        last_err: Optional[Exception] = None
-
-        for host, port, label in attempts:
-            sock_obj = None
-            try:
-                sock_obj = self._make_udp_socket()
-                sock_obj.bind((host, port))
-                sock_obj.settimeout(0.25)
-                actual_port = int(sock_obj.getsockname()[1])
-
-                if actual_port != self.data_port:
-                    self._log_evt(
-                        "socket",
-                        f"data socket fallback active: requested {bind_ip}:{self.data_port}, bound {host}:{actual_port} ({label})",
-                        ["🧯", "↪️", "📦"],
-                    )
-                else:
-                    self._log_evt("socket", f"data socket bound on {host}:{actual_port}", ["📦", "✅"])
-                return sock_obj, actual_port
-
-            except OSError as e:
-                last_err = e
-                if self._is_addr_in_use_error(e):
-                    self._log_evt(
-                        "socket",
-                        f"data bind in use on {host}:{port} ({label}); trying fallback",
-                        ["⚠️", "📦", "🧯"],
-                    )
-                else:
-                    self._log_evt(
-                        "socket",
-                        f"data bind failed on {host}:{port} ({label}): {type(e).__name__}: {e}",
-                        ["⚠️", "📦", "🧯"],
-                    )
-                if sock_obj is not None:
-                    self._safe_socket_close(sock_obj)
-            except Exception as e:
-                last_err = e
-                self._log_evt(
-                    "socket",
-                    f"data bind failed on {host}:{port} ({label}): {type(e).__name__}: {e}",
-                    ["⚠️", "📦", "🧯"],
-                )
-                if sock_obj is not None:
-                    self._safe_socket_close(sock_obj)
-
-        self._log_evt(
-            "socket",
-            f"data socket unavailable after all fallbacks: {type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}",
-            ["🧯", "❌", "📦"],
-        )
-        return None, self.data_port
 
     def _close_sockets(self) -> None:
         with self._sock_lock:
@@ -24497,10 +24498,6 @@ class HyperVRouterManager:
         if self._transport_ip_allowed(self.discovery_group, discovery=True):
             targets.append((self.discovery_group, self.discovery_port, "multicast"))
 
-        for host in self._discovery_broadcast_targets():
-            if self._transport_ip_allowed(host, discovery=True):
-                targets.append((host, self.discovery_port, "broadcast"))
-
         for ip, port in self._known_peer_direct_targets():
             if self._transport_ip_allowed(ip, discovery=True):
                 targets.append((ip, port, "direct"))
@@ -24540,6 +24537,7 @@ class HyperVRouterManager:
                 ["📡", "📤"],
                 every=10.0,
             )
+
 
     def _flush_network_queue(self) -> None:
         while True:
@@ -24880,6 +24878,23 @@ class HyperVRouterManager:
         ack_ip = ack_targets[0][0] if ack_targets else str(from_ip or "")
         ack_port = ack_targets[0][1] if ack_targets else int(from_port or 0)
 
+        if self._is_remote_ingress_breaker_open():
+            self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
+            self._stats["remote_ingress_breaker_drop"] = int(self._stats.get("remote_ingress_breaker_drop", 0)) + 1
+            if ack_ip and ack_port and frame_id:
+                self._send_frame_ack(
+                    dst_ip=ack_ip,
+                    dst_port=ack_port,
+                    dst_node_id=src_node_id,
+                    frame_id=frame_id or "-",
+                    status="busy",
+                    detail=(
+                        f"breaker_open=1 src_node={src_node_id or '-'} proto={protocol_tag} "
+                        f"payload_len={int(msg.get('payload_len') or 0)}"
+                    ),
+                )
+            return
+
         if not src_node_id:
             self._send_frame_ack(
                 dst_ip=ack_ip,
@@ -24962,18 +24977,20 @@ class HyperVRouterManager:
             return
 
         self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
+        self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
         detail = (
-            f"router_queue_full=1 iface={self.INBOUND_IFACE_NAME} duplicate_hint={int(duplicate_hint)} "
-            f"payload_len={len(raw)}"
+            f"queue_full=1 src_node={src_node_id} proto={protocol_tag} iface={self.INBOUND_IFACE_NAME} "
+            f"duplicate_hint={int(duplicate_hint)} payload_len={len(raw)}"
         )
         self._send_frame_ack(
             dst_ip=ack_ip,
             dst_port=ack_port,
             dst_node_id=src_node_id,
             frame_id=frame_id,
-            status="received",
+            status="queue_full",
             detail=detail,
         )
+
 
     def _handle_frame_ack(self, msg: dict, from_ip: str, from_port: int) -> None:
         frame_id = str(msg.get("frame_id") or msg.get("id") or msg.get("ref") or "")
@@ -24993,8 +25010,10 @@ class HyperVRouterManager:
             detail_l = detail.lower()
             if "processed" in detail_l:
                 status = "processed"
-            elif "received" in detail_l or "queued" in detail_l:
-                status = "received"
+            elif "busy" in detail_l:
+                status = "busy"
+            elif "queue_full" in detail_l:
+                status = "queue_full"
             elif "observed" in detail_l:
                 status = "observed"
             else:
@@ -25007,6 +25026,9 @@ class HyperVRouterManager:
         if not frame_id:
             return
 
+        terminal_success = {"processed", "observed", "ok", "success", "accepted"}
+        terminal_failure = {"busy", "queue_full", "decode_failed", "bad_frame", "failed", "error"}
+
         with self._pending_lock:
             pending = self._pending_frames.get(frame_id)
             if pending is None:
@@ -25015,8 +25037,9 @@ class HyperVRouterManager:
             pending["last_ack_detail"] = detail
             pending["last_ack_ts"] = time.time()
             pending["acked_by"] = src_node_id or pending.get("acked_by")
-            if status in {"received", "processed", "observed", "ok", "success", "queued", "accepted"}:
+            if status in terminal_success or status in terminal_failure:
                 self._pending_frames.pop(frame_id, None)
+
 
     def _make_frame_messages(
         self,
@@ -25082,6 +25105,9 @@ class HyperVRouterManager:
         dst_node_id: str,
         dst_sender_id: str,
     ) -> bool:
+        if self._is_remote_ingress_breaker_open():
+            return False
+
         with self._lock:
             peer = self._peers.get(str(dst_node_id))
             if peer is None or not peer.online:
@@ -25157,6 +25183,7 @@ class HyperVRouterManager:
                 self._pending_frames.pop(frame_id, None)
         return ok
 
+
     def _send_frame_ack(
         self,
         *,
@@ -25182,6 +25209,7 @@ class HyperVRouterManager:
             frame_id=frame_id,
             status=status,
         )
+
 
     def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
@@ -25282,70 +25310,12 @@ class HyperVRouterManager:
         return deduped[: max(1, int(self._peer_target_limit or 1))]
 
     def _can_assume_delivery(self, info: Dict[str, Any], now: Optional[float] = None) -> bool:
-        if not bool(getattr(self, "_assume_delivery_on_online_peer", True)):
-            return False
-
-        now = float(now or time.time())
-        last_send_ts = float(info.get("last_send_ts", 0.0) or 0.0)
-        first_send_ok_ts = float(info.get("first_send_ok_ts", 0.0) or 0.0)
-        send_success_count = int(info.get("send_success_count", 0) or 0)
-        peer_node_id = str(info.get("peer_node_id") or "")
-
-        if not peer_node_id or send_success_count <= 0 or last_send_ts <= 0.0:
-            return False
-
-        min_age = float(getattr(self, "_implicit_ack_grace_sec", 0.50) or 0.50)
-        if (now - last_send_ts) < min_age and (first_send_ok_ts <= 0.0 or (now - first_send_ok_ts) < min_age):
-            return False
-
-        with self._lock:
-            peer = self._peers.get(peer_node_id)
-            if peer is None or not peer.online:
-                return False
-            recent_seen = float(peer.last_seen or 0.0)
-            recent_discovery = float(peer.last_discovery_success_ts or 0.0)
-            recent_ack = float(peer.last_ack_ts or 0.0)
-
-        if recent_ack >= last_send_ts:
-            return True
-        if recent_seen >= last_send_ts:
-            return True
-        if recent_discovery >= last_send_ts:
-            return True
         return False
 
+
     def _complete_pending_frames_for_peer(self, node_id: str, *, reason: str, min_age_sec: float = 0.0) -> int:
-        node_id = str(node_id or "").strip()
-        if not node_id:
-            return 0
+        return 0
 
-        now = time.time()
-        completed: List[Dict[str, Any]] = []
-        with self._pending_lock:
-            for frame_id, info in list(self._pending_frames.items()):
-                if str(info.get("peer_node_id") or "") != node_id:
-                    continue
-                last_send_ts = float(info.get("last_send_ts", 0.0) or 0.0)
-                send_success_count = int(info.get("send_success_count", 0) or 0)
-                if last_send_ts <= 0.0 or send_success_count <= 0:
-                    continue
-                if min_age_sec > 0.0 and (now - last_send_ts) < float(min_age_sec):
-                    continue
-                info["last_ack_status"] = "assumed_delivered"
-                info["last_ack_detail"] = f"delivery completed via {reason}"
-                info["last_ack_ts"] = now
-                completed.append(dict(info))
-                self._pending_frames.pop(frame_id, None)
-
-        for info in completed:
-            self._log_sparse(
-                f"ack-complete:{node_id}",
-                "ack",
-                f"delivery marked successful frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={node_id} reason={reason}",
-                ["✅", "📡", "🤝"],
-                every=1.0,
-            )
-        return len(completed)
 
     def _queue_network_message(
         self,
@@ -25463,7 +25433,6 @@ class HyperVRouterManager:
         now = time.time()
         retry_items: List[Dict[str, Any]] = []
         expired: List[Dict[str, Any]] = []
-        assumed_success: List[Dict[str, Any]] = []
 
         with self._pending_lock:
             for frame_id, info in list(self._pending_frames.items()):
@@ -25472,14 +25441,6 @@ class HyperVRouterManager:
                 retry_count = int(info.get("retry_count", 0))
 
                 if last_send_ts <= 0.0:
-                    continue
-
-                if self._can_assume_delivery(info, now):
-                    info["last_ack_status"] = "assumed_delivered"
-                    info["last_ack_detail"] = "peer remained healthy without explicit ack"
-                    info["last_ack_ts"] = now
-                    assumed_success.append(dict(info))
-                    self._pending_frames.pop(frame_id, None)
                     continue
 
                 age = now - created_ts
@@ -25523,15 +25484,6 @@ class HyperVRouterManager:
                     every=1.5,
                 )
 
-        for info in assumed_success:
-            self._log_sparse(
-                f"ack-assumed:{info.get('peer_node_id') or '?'}",
-                "ack",
-                f"delivery marked successful without explicit ack frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'}",
-                ["✅", "📡", "🤝"],
-                every=1.5,
-            )
-
         for info in expired:
             self._log_sparse(
                 f"ack-expire:{info.get('peer_node_id') or '?'}",
@@ -25540,6 +25492,7 @@ class HyperVRouterManager:
                 ["⌛", "📡", "⚠️"],
                 every=1.5,
             )
+
 
     def _enqueue_router_ingress(
         self,
@@ -25556,6 +25509,11 @@ class HyperVRouterManager:
         reply_ip: str = "",
         reply_port: int = 0,
     ) -> bool:
+        if self._is_remote_ingress_breaker_open():
+            self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
+            self._stats["remote_ingress_breaker_drop"] = int(self._stats.get("remote_ingress_breaker_drop", 0)) + 1
+            return False
+
         try:
             item = _RouterIngressItem(
                 packet=packet,
@@ -25574,12 +25532,19 @@ class HyperVRouterManager:
             return True
         except queue.Full:
             self._stats["remote_ingress_queue_full"] = int(self._stats.get("remote_ingress_queue_full", 0)) + 1
+            self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
+            self._record_remote_ingress_queue_full(
+                src_node_id=src_node_id,
+                src_sender_id=src_sender_id,
+                protocol_tag=protocol_tag,
+                payload_len=len(raw or b""),
+            )
             self._log_sparse(
-                f"router-ingress-full:{src_node_id or '?'}",
+                f"router-ingress-full:{src_node_id or '?'}:{protocol_tag}",
                 "frame",
-                f"router ingress queue full; dropping remote frame frame_id={frame_id} src_node={src_node_id}",
+                f"router ingress queue full; dropping remote frame frame_id={frame_id} src_node={src_node_id} sender={src_sender_id or '-'} proto={protocol_tag} payload_len={len(raw or b'')}",
                 ["⚠️", "📥", "🧯"],
-                every=2.0,
+                every=1.0,
             )
             return False
         except Exception as e:
@@ -25591,6 +25556,7 @@ class HyperVRouterManager:
                 every=2.0,
             )
             return False
+
 
     def _router_ingress_loop(self) -> None:
         self._log_evt("worker", "router ingress worker started", ["🧵", "📥", "🧠"])
@@ -25647,7 +25613,7 @@ class HyperVRouterManager:
                 continue
 
             item.attempts += 1
-            if item.attempts >= int(self._router_ingress_retry_limit or 6):
+            if item.attempts >= int(self._router_ingress_retry_limit or 3):
                 self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
                 if item.reply_ip and item.frame_id:
                     self._send_frame_ack(
@@ -25655,7 +25621,7 @@ class HyperVRouterManager:
                         dst_port=item.reply_port,
                         dst_node_id=item.src_node_id,
                         frame_id=item.frame_id,
-                        status="received",
+                        status="busy",
                         detail=(
                             f"router_unavailable=1 final=1 iface={self.INBOUND_IFACE_NAME} "
                             f"attempts={item.attempts} duplicate_hint={int(item.duplicate_hint)} payload_len={len(item.raw)}"
@@ -25676,14 +25642,14 @@ class HyperVRouterManager:
                         dst_port=item.reply_port,
                         dst_node_id=item.src_node_id,
                         frame_id=item.frame_id,
-                        status="received",
+                        status="queue_full",
                         detail=(
-                            f"router_queue_full=1 final=1 iface={self.INBOUND_IFACE_NAME} "
+                            f"router_requeue_failed=1 iface={self.INBOUND_IFACE_NAME} "
                             f"attempts={item.attempts} duplicate_hint={int(item.duplicate_hint)} payload_len={len(item.raw)}"
                         ),
                     )
+                continue
 
-        self._log_evt("worker", "router ingress worker stopped", ["🛑", "📥", "🧵"])
 
     def _prune_pending_frames(self) -> None:
         now = time.time()
@@ -26370,6 +26336,12 @@ class HyperVRouterManager:
         if self._is_noisy_local_broadcast(packet):
             return True
 
+        try:
+            if self._is_broadcast_or_multicast_packet(packet):
+                return True
+        except Exception:
+            pass
+
         sport, dport = self._packet_udp_ports(packet)
         if sport in self.LOCAL_NOISE_UDP_PORTS or dport in self.LOCAL_NOISE_UDP_PORTS:
             return True
@@ -26381,6 +26353,7 @@ class HyperVRouterManager:
             pass
 
         return False
+
 
     def _requeue_router_ingress_item(self, item: _RouterIngressItem) -> bool:
         try:
@@ -26412,6 +26385,147 @@ class HyperVRouterManager:
         for frame_id, _info in items[: max(1, overflow)]:
             self._pending_frames.pop(frame_id, None)
             self._stats["pending_pruned"] = int(self._stats.get("pending_pruned", 0)) + 1
+
+
+    def _is_valid_bind_ip(self, ip: str) -> bool:
+        ip_s = str(ip or "").strip()
+        if not ip_s or ip_s in {"0.0.0.0", "127.0.0.1"}:
+            return False
+        try:
+            parts = [int(x) for x in ip_s.split(".")]
+            return len(parts) == 4 and all(0 <= x <= 255 for x in parts)
+        except Exception:
+            return False
+
+    def _is_broadcast_or_multicast_packet(self, packet) -> bool:
+        try:
+            ether = packet.getlayer(Ether) if Ether is not None and getattr(packet, "getlayer", None) else None
+            if ether is not None:
+                dst = str(getattr(ether, "dst", "") or "").lower()
+                if dst == "ff:ff:ff:ff:ff:ff":
+                    return True
+                if dst.startswith("01:00:5e") or dst.startswith("33:33"):
+                    return True
+        except Exception:
+            pass
+
+        for attr in ("dst", "src"):
+            try:
+                ip = str(getattr(packet, attr, "") or "")
+                if ip.endswith(".255"):
+                    return True
+                if ip.startswith("224.") or ip.startswith("239."):
+                    return True
+                if ip.lower().startswith("ff"):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _packet_tcp_ports(self, packet) -> Tuple[int, int]:
+        try:
+            if TCP is not None and getattr(packet, "haslayer", None) and packet.haslayer(TCP):
+                layer = packet.getlayer(TCP)
+                return int(getattr(layer, "sport", 0) or 0), int(getattr(layer, "dport", 0) or 0)
+        except Exception:
+            pass
+        return 0, 0
+
+    def _packet_endpoints(self, packet) -> Tuple[str, str]:
+        try:
+            if IP is not None and getattr(packet, "haslayer", None) and packet.haslayer(IP):
+                layer = packet.getlayer(IP)
+                return str(getattr(layer, "src", "") or ""), str(getattr(layer, "dst", "") or "")
+        except Exception:
+            pass
+        try:
+            if IPv6 is not None and getattr(packet, "haslayer", None) and packet.haslayer(IPv6):
+                layer = packet.getlayer(IPv6)
+                return str(getattr(layer, "src", "") or ""), str(getattr(layer, "dst", "") or "")
+        except Exception:
+            pass
+        return "", ""
+
+    def _flow_activity_key(self, packet, protocol_tag: str, iface_name: str) -> str:
+        src_ip, dst_ip = self._packet_endpoints(packet)
+        tcp_sport, tcp_dport = self._packet_tcp_ports(packet)
+        udp_sport, udp_dport = self._packet_udp_ports(packet)
+        sport = tcp_sport or udp_sport
+        dport = tcp_dport or udp_dport
+        return f"{iface_name}|{protocol_tag}|{src_ip}:{sport}|{dst_ip}:{dport}"
+
+    def _track_flow_activity(self, packet, protocol_tag: str, iface_name: str, raw_len: int) -> Dict[str, float]:
+        now = time.time()
+        key = self._flow_activity_key(packet, protocol_tag, iface_name)
+        info = self._flow_activity.get(key)
+        if info is None or (now - float(info.get("window_start", 0.0) or 0.0)) > self._consumer_flow_window_sec:
+            info = {"window_start": now, "packets": 0.0, "bytes": 0.0, "last_seen": now}
+            self._flow_activity[key] = info
+            self._flow_activity_order.append(key)
+        info["packets"] = float(info.get("packets", 0.0) or 0.0) + 1.0
+        info["bytes"] = float(info.get("bytes", 0.0) or 0.0) + float(raw_len)
+        info["last_seen"] = now
+        while len(self._flow_activity_order) > self._flow_activity_cap:
+            old = self._flow_activity_order.popleft()
+            if old != key:
+                self._flow_activity.pop(old, None)
+        return info
+
+    def _is_tls_allowlisted(self, packet) -> bool:
+        tcp_sport, tcp_dport = self._packet_tcp_ports(packet)
+        if tcp_sport in self._tls_allowlist_ports or tcp_dport in self._tls_allowlist_ports:
+            return True
+        src_ip, dst_ip = self._packet_endpoints(packet)
+        return src_ip in self._tls_allowlist_hosts or dst_ip in self._tls_allowlist_hosts
+
+    def _general_traffic_drop_reason(self, packet, protocol_tag: str, raw: bytes, iface_name: str) -> str:
+        if self._is_broadcast_or_multicast_packet(packet):
+            return "broadcast_or_multicast"
+
+        tcp_sport, tcp_dport = self._packet_tcp_ports(packet)
+        udp_sport, udp_dport = self._packet_udp_ports(packet)
+
+        if udp_sport == 443 or udp_dport == 443:
+            return "quic"
+
+        if tcp_sport == 443 or tcp_dport == 443:
+            if not self._is_tls_allowlisted(packet):
+                return "tls"
+
+        if len(raw or b"") >= int(self._mirror_payload_soft_limit or 0):
+            return "large_stream"
+
+        flow_info = self._track_flow_activity(packet, str(protocol_tag or "RAW"), iface_name, len(raw or b""))
+        if float(flow_info.get("bytes", 0.0) or 0.0) >= float(self._consumer_flow_bytes_per_window):
+            return "consumer_rate"
+        if float(flow_info.get("packets", 0.0) or 0.0) >= float(self._consumer_flow_packets_per_window):
+            return "consumer_rate"
+
+        return ""
+
+    def _record_remote_ingress_queue_full(self, *, src_node_id: str, src_sender_id: str, protocol_tag: str, payload_len: int) -> None:
+        now = time.time()
+        window_start = now - float(self._remote_ingress_breaker_window_sec or 15.0)
+        dq = self._remote_ingress_queue_full_events
+        dq.append(now)
+        while dq and dq[0] < window_start:
+            dq.popleft()
+        if len(dq) >= int(self._remote_ingress_breaker_threshold or 16):
+            self._remote_ingress_breaker_open_until = max(
+                self._remote_ingress_breaker_open_until,
+                now + float(self._remote_ingress_breaker_window_sec or 15.0),
+            )
+        self._log_sparse(
+            f"remote-ingress-full-breaker:{src_node_id or '?'}:{protocol_tag}",
+            "frame",
+            f"remote ingress pressure src_node={src_node_id or '-'} sender={src_sender_id or '-'} proto={protocol_tag} payload_len={payload_len} full_events={len(dq)} breaker_until={self._remote_ingress_breaker_open_until:.3f}",
+            ["🚦", "📥", "🧯"],
+            every=1.0,
+        )
+
+    def _is_remote_ingress_breaker_open(self) -> bool:
+        return time.time() < float(getattr(self, "_remote_ingress_breaker_open_until", 0.0) or 0.0)
+
 
     def _log_evt(self, event: str, message: str, emojis: Optional[list[str]] = None) -> None:
         self._log(f"[{str(event or 'evt').upper()}] {message}", emojis)
