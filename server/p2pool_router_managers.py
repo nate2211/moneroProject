@@ -8423,23 +8423,43 @@ class TransportScraperManager:
         return "".join(chr(c) if 32 <= c < 127 else "." for c in s)
 class TransportHTTPSManager:
     """
-    Deeper HTTPS/TLS/QUIC transport handler (callback-safe, single-threaded).
+    Advanced HTTPS/TLS/QUIC transport handler.
 
-    Main goals of this rewrite:
-      - stop over-classifying tiny TCP/443 SYN payloads as QUIC/TLS
-      - classify 443/TCP into phases such as SYN, SYN+DATA, EST, TLS, opaque
-      - keep the same public API and constructor signature
-      - add richer flow state, richer metrics, and safer parsers
-      - only do QUIC parsing on UDP/443
+    Preserves the original public constructor signature and public API:
+      - __init__(...)
+      - handle(packet, inbound_iface) -> bool
+      - snapshot_metrics() -> dict
+
+    Major upgrades over the uploaded version:
+      - TCP TLS record reassembly by direction and sequence
+      - QUIC CRYPTO frame reassembly by offset
+      - better distinction between partial / malformed / opaque
+      - safer noinspect behavior
+      - richer per-flow confidence and parse notes
+      - better buffer trimming and flow cleanup
+      - improved UDP/443 QUIC handling without pretending to decrypt QUIC payloads
+
+    Notes:
+      - This stays passive. It classifies and enriches metadata only.
+      - It expects Scapy-like globals to exist in the outer module:
+            TCP, UDP, IP, IPv6, Raw
+      - It is callback-safe and single-threaded.
     """
 
     FLOW_TTL_SEC = 15 * 60
     FLOW_SOFT_MAX = 50_000
     RL_INTERVAL_SEC = 1.0
-    BYTES_BUDGET = 2048
+    BYTES_BUDGET = 4096
     CHELLO_MIN_CAP = 6
     RECORD_MAX_LEN = 18432
     PARSE_ON_NON443 = False
+
+    TCP_BUFFER_MAX = 512 * 1024
+    TCP_RECORD_SCAN_CAP = 128 * 1024
+    QUIC_CRYPTO_BUFFER_MAX = 512 * 1024
+    MAX_NOTES = 12
+    MAX_TLS_RECORD_VERSIONS = 8
+    MAX_PREVIEW = 32
 
     _TLS_CIPHERS = {
         0x1301: "TLS_AES_128_GCM_SHA256",
@@ -8497,7 +8517,7 @@ class TransportHTTPSManager:
     ):
         self.logger = logger
         self.detect_non443_tls = bool(detect_non443_tls)
-        self._peek_cap = int(max_bytes_to_peek)
+        self._peek_cap = max(256, int(max_bytes_to_peek))
         self.logging_enabled = bool(logging_enabled)
         self.report_tcp_meta = bool(report_tcp_meta)
         self.report_tls_record = bool(report_tls_record)
@@ -8513,7 +8533,7 @@ class TransportHTTPSManager:
         self.flow_cache_ttl = int(flow_cache_ttl)
         self.flow_cache_max = int(flow_cache_max)
 
-        self._tls_flows = {}
+        self._tls_flows: "OrderedDict[tuple, dict]" = OrderedDict()
         self._peek_tcp_meta_cached = None
 
         self._metrics = {
@@ -8570,9 +8590,27 @@ class TransportHTTPSManager:
             "tls_partial_handshake": 0,
             "tls_unknown_handshake": 0,
             "flow_notes_added": 0,
+            # New metrics
+            "tcp_reassembly_attempts": 0,
+            "tcp_reassembly_bytes": 0,
+            "tcp_reassembly_trimmed": 0,
+            "tcp_reassembly_partial": 0,
+            "quic_crypto_reassembly_attempts": 0,
+            "quic_crypto_reassembly_bytes": 0,
+            "quic_crypto_partial": 0,
+            "flows_created": 0,
+            "flows_touched": 0,
+            "opaque_non443_rejected": 0,
+            "buffer_parse_failures": 0,
+            "quic_coalesced_packets_seen": 0,
+            "tls_records_reassembled": 0,
         }
 
-        self._safe_log("[Transport][🔒 HTTPS] Deeper Manager ready")
+        self._safe_log("[Transport][🔒 HTTPS] Advanced Manager ready")
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
 
     def handle(self, packet, inbound_iface: str) -> bool:
         try:
@@ -8587,6 +8625,10 @@ class TransportHTTPSManager:
 
     def snapshot_metrics(self) -> dict:
         return dict(self._metrics)
+
+    # -------------------------------------------------------------------------
+    # UDP / QUIC
+    # -------------------------------------------------------------------------
 
     def _handle_udp_packet(self, packet, inbound_iface: str) -> bool:
         if not self.detect_quic_udp443:
@@ -8610,51 +8652,68 @@ class TransportHTTPSManager:
         src_ip, dst_ip = self._resolve_ips(packet)
         fkey = self._flow_key(src_ip, sport, dst_ip, dport)
         st = self._get_or_create_flow(fkey, now)
-        st["last"] = now
+        self._touch_flow(fkey, st, now)
+
         st["transport"] = "udp"
         st["port_class"] = "443"
+        st["confidence"] = max(float(st.get("confidence", 0.0)), 0.20)
 
-        qhead = self._peek_quic_header_mv(memoryview(raw))
-        if not qhead:
+        qinfo = self._peek_quic_packets_mv(memoryview(raw))
+        if not qinfo or not qinfo.get("packets"):
             self._metrics["udp_443_nonquic"] += 1
             st["proto_hint"] = self._PROTO_HINT_NONE
             self._note_flow(st, "udp443_nonquic")
+            st["parse_reason"] = "udp443_without_valid_quic_header"
             if self.log_packet_prefix and self._should_log_flow(st, now):
                 self._safe_log(self._format_udp443_nonquic_prefix(packet, inbound_iface, st, raw))
             self._clean_if_needed(now)
             return False
 
+        packets = qinfo["packets"]
+        if len(packets) > 1:
+            self._metrics["quic_coalesced_packets_seen"] += 1
+
         self._metrics["quic_seen"] += 1
         st["classified"] = True
         st["proto_hint"] = self._PROTO_HINT_QUIC
-        st["quic_type"] = qhead.get("type")
-        st["quic_version"] = qhead.get("version")
-        st["quic_dcid"] = qhead.get("dcid_hex")
-        st["quic_scid"] = qhead.get("scid_hex")
-        st["quic_token_len"] = qhead.get("token_len")
-        st["quic_payload_len"] = qhead.get("payload_len")
-        self._note_flow(st, qhead.get("type", "quic"))
+        st["confidence"] = max(float(st.get("confidence", 0.0)), 0.96)
+        st["parse_reason"] = "udp443_valid_quic"
+        st["quic_packet_count"] = len(packets)
 
-        qtype = qhead.get("type")
-        if qtype == "INITIAL":
-            self._metrics["quic_initial_seen"] += 1
-        elif qtype == "HANDSHAKE":
-            self._metrics["quic_handshake_seen"] += 1
-        elif qtype == "SHORT":
-            self._metrics["quic_short_seen"] += 1
-        elif qtype == "VERSION_NEGOTIATION":
-            self._metrics["quic_version_negotiation_seen"] += 1
+        first_pkt = packets[0]
+        st["quic_type"] = first_pkt.get("type")
+        st["quic_version"] = first_pkt.get("version")
+        st["quic_dcid"] = first_pkt.get("dcid_hex")
+        st["quic_scid"] = first_pkt.get("scid_hex")
+        st["quic_token_len"] = first_pkt.get("token_len")
+        st["quic_payload_len"] = first_pkt.get("payload_len")
+        self._note_flow(st, first_pkt.get("type", "quic"))
 
-        crypto_data = qhead.get("crypto_data")
-        if crypto_data and self.parse_quic_crypto and not st.get("noinspect"):
-            self._metrics["quic_crypto_frames"] += 1
-            self._handle_tls_handshake_stream(memoryview(crypto_data), st, "quic")
+        for qp in packets:
+            qtype = qp.get("type")
+            if qtype == "INITIAL":
+                self._metrics["quic_initial_seen"] += 1
+            elif qtype == "HANDSHAKE":
+                self._metrics["quic_handshake_seen"] += 1
+            elif qtype == "SHORT":
+                self._metrics["quic_short_seen"] += 1
+            elif qtype == "VERSION_NEGOTIATION":
+                self._metrics["quic_version_negotiation_seen"] += 1
+
+            crypto_parts = qp.get("crypto_parts") or []
+            if crypto_parts and self.parse_quic_crypto and not st.get("noinspect"):
+                self._metrics["quic_crypto_frames"] += len(crypto_parts)
+                self._ingest_quic_crypto_parts(st, crypto_parts)
 
         if self.log_packet_prefix and self._should_log_flow(st, now):
-            self._safe_log(self._format_quic_prefix(packet, inbound_iface, qhead, st))
+            self._safe_log(self._format_quic_prefix(packet, inbound_iface, first_pkt, st))
 
         self._clean_if_needed(now)
         return True
+
+    # -------------------------------------------------------------------------
+    # TCP / TLS
+    # -------------------------------------------------------------------------
 
     def _handle_tcp_packet(self, packet, inbound_iface: str) -> bool:
         if not self._pre_checks(packet):
@@ -8672,7 +8731,8 @@ class TransportHTTPSManager:
         now = time.time()
         fkey = self._flow_key(src_ip, sport, dst_ip, dport)
         st = self._get_or_create_flow(fkey, now)
-        st["last"] = now
+        self._touch_flow(fkey, st, now)
+
         st["transport"] = "tcp"
         st["port_class"] = "443" if on_443 else "non-443"
 
@@ -8693,8 +8753,8 @@ class TransportHTTPSManager:
         st["tcp_type"] = phase.get("tcp_type")
         st["payload_kind"] = phase.get("payload_kind")
         st["payload_fp"] = self._fingerprint_bytes(raw)
-        st["payload_preview_hex"] = self._hex_preview(raw, 16)
-        st["payload_preview_ascii"] = self._ascii_preview(raw, 16)
+        st["payload_preview_hex"] = self._hex_preview(raw, self.MAX_PREVIEW)
+        st["payload_preview_ascii"] = self._ascii_preview(raw, self.MAX_PREVIEW)
 
         rhead = self._peek_tls_record_header_mv(mv) if mv else None
         sslv2 = self._peek_sslv2_header(mv) if mv and not rhead else None
@@ -8723,20 +8783,24 @@ class TransportHTTPSManager:
             return True
 
         if not on_443 and self.detect_non443_tls and not rhead and not sslv2:
+            self._metrics["opaque_non443_rejected"] += 1
             return False
 
         if phase["phase"] == "TCP_SYN_DATA_443":
             self._metrics["tcp_443_syn_data"] += 1
             st["proto_hint"] = self._PROTO_HINT_SYN_DATA
+            st["confidence"] = max(float(st.get("confidence", 0.0)), 0.45)
             if rhead:
                 self._metrics["tcp_443_fastopen_candidates"] += 1
                 self._metrics["tcp_443_tls_candidates"] += 1
                 self._note_flow(st, "tls_on_syn_candidate")
-                self._handle_tls_payload(mv, st, direction)
+                self._ingest_tcp_tls_bytes(st, direction, tmeta, raw)
             else:
                 self._note_flow(st, "syn_payload_not_tls")
             if self._should_log_flow(st, now):
-                self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, phase, dyn_tag))
+                self._safe_log(
+                    self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, phase, dyn_tag)
+                )
             self._bump_seen(on_443)
             self._clean_if_needed(now)
             return True
@@ -8744,8 +8808,12 @@ class TransportHTTPSManager:
         if sslv2 and not rhead:
             st["classified"] = True
             st["proto_hint"] = self._PROTO_HINT_SSLV2
+            st["confidence"] = max(float(st.get("confidence", 0.0)), 0.90)
+            st["parse_reason"] = "sslv2_header_detected"
             if self._should_log_flow(st, now):
-                self._safe_log(self._format_logline_sslv2(src_ip, sport, dst_ip, dport, inbound_iface, st, sslv2, dyn_tag))
+                self._safe_log(
+                    self._format_logline_sslv2(src_ip, sport, dst_ip, dport, inbound_iface, st, sslv2, dyn_tag)
+                )
             self._bump_seen(on_443)
             self._clean_if_needed(now)
             return True
@@ -8755,14 +8823,18 @@ class TransportHTTPSManager:
             self._metrics["tcp_443_tls_records"] += 1
             st["classified"] = True
             st["proto_hint"] = self._PROTO_HINT_TLS
+            st["confidence"] = max(float(st.get("confidence", 0.0)), 0.93)
+            st["parse_reason"] = "tls_record_header_detected"
 
             if st.get("noinspect", False):
                 self._metrics["fast_path_hits"] += 1
             else:
-                self._handle_tls_payload(mv, st, direction)
+                self._ingest_tcp_tls_bytes(st, direction, tmeta, raw)
 
             if self._should_log_flow(st, now):
-                self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, phase, dyn_tag))
+                self._safe_log(
+                    self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, rhead, phase, dyn_tag)
+                )
             self._bump_seen(on_443)
             self._clean_if_needed(now)
             return True
@@ -8770,76 +8842,250 @@ class TransportHTTPSManager:
         if on_443:
             self._metrics["tcp_443_opaque"] += 1
             st["proto_hint"] = self._PROTO_HINT_OPAQUE
+            st["confidence"] = max(float(st.get("confidence", 0.0)), 0.30)
+            st["parse_reason"] = "tcp443_payload_without_tls_header"
             self._note_flow(st, "opaque_443_payload")
             if self._should_log_flow(st, now):
-                self._safe_log(self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, None, phase, dyn_tag))
+                self._safe_log(
+                    self._format_logline(src_ip, sport, dst_ip, dport, inbound_iface, st, None, phase, dyn_tag)
+                )
             self._bump_seen(on_443)
             self._clean_if_needed(now)
             return True
 
         return False
 
+    # -------------------------------------------------------------------------
+    # Flow lifecycle
+    # -------------------------------------------------------------------------
+
     def _get_or_create_flow(self, fkey, now: float) -> dict:
         st = self._tls_flows.get(fkey)
-        if st is None:
-            st = {
-                "first": now,
-                "last": now,
-                "last_log": 0.0,
-                "classified": False,
-                "noinspect": False,
-                "proto_hint": self._PROTO_HINT_NONE,
-                "transport": None,
-                "port_class": None,
-                "phase": None,
-                "tcp_type": None,
-                "payload_kind": None,
-                "payload_fp": None,
-                "payload_preview_hex": None,
-                "payload_preview_ascii": None,
-                "notes": [],
-                "tcp_state": self._TCP_STATE_INIT,
-                "tls_state": self._TLS_STATE_INIT,
-                "tls_ver_neg": None,
-                "tls_record_versions": [],
-                "tls_records_seen": 0,
-                "sni": None,
-                "alpn": None,
-                "ja3": None,
-                "cipher": None,
-                "ech_seen": False,
-                "sans": None,
-                "quic_type": None,
-                "quic_version": None,
-                "quic_dcid": None,
-                "quic_scid": None,
-                "quic_token_len": None,
-                "quic_payload_len": None,
-                "quic_like_tcp": None,
-                "tcp": {"a2b": {}, "b2a": {}},
-            }
-            self._tls_flows[fkey] = st
+        if st is not None:
+            return st
+
+        st = {
+            "first": now,
+            "last": now,
+            "last_log": 0.0,
+            "classified": False,
+            "noinspect": False,
+            "proto_hint": self._PROTO_HINT_NONE,
+            "transport": None,
+            "port_class": None,
+            "phase": None,
+            "tcp_type": None,
+            "payload_kind": None,
+            "payload_fp": None,
+            "payload_preview_hex": None,
+            "payload_preview_ascii": None,
+            "notes": [],
+            "confidence": 0.0,
+            "parse_reason": None,
+            "tcp_state": self._TCP_STATE_INIT,
+            "tls_state": self._TLS_STATE_INIT,
+            "tls_ver_neg": None,
+            "tls_record_versions": [],
+            "tls_records_seen": 0,
+            "sni": None,
+            "alpn": None,
+            "ja3": None,
+            "cipher": None,
+            "ech_seen": False,
+            "sans": None,
+            "quic_type": None,
+            "quic_version": None,
+            "quic_dcid": None,
+            "quic_scid": None,
+            "quic_token_len": None,
+            "quic_payload_len": None,
+            "quic_like_tcp": None,
+            "quic_packet_count": 0,
+            "tcp": {"a2b": {}, "b2a": {}},
+            "tls_buffers": {
+                "a2b": self._new_tls_dir_state(),
+                "b2a": self._new_tls_dir_state(),
+            },
+            "quic_crypto": {
+                "ranges": {},
+                "next_offset": 0,
+                "buffered_bytes": 0,
+                "last_source": None,
+            },
+        }
+        self._tls_flows[fkey] = st
+        self._metrics["flows_created"] += 1
         return st
+
+    def _touch_flow(self, fkey, st: dict, now: float):
+        st["last"] = now
+        self._metrics["flows_touched"] += 1
+        try:
+            self._tls_flows.move_to_end(fkey)
+        except Exception:
+            pass
+
+    def _new_tls_dir_state(self) -> dict:
+        return {
+            "buffer": bytearray(),
+            "expected_seq": None,
+            "last_seq": None,
+            "last_ack": None,
+            "buffer_start_seq": None,
+            "records_seen": 0,
+        }
 
     def _note_flow(self, st: dict, note: str):
         try:
             notes = st.setdefault("notes", [])
             if note and note not in notes:
                 notes.append(note)
-                if len(notes) > 8:
-                    del notes[:-8]
+                if len(notes) > self.MAX_NOTES:
+                    del notes[:-self.MAX_NOTES]
                 self._metrics["flow_notes_added"] += 1
         except Exception:
             pass
 
-    def _handle_tls_payload(self, mv: memoryview, st: dict, direction: str):
+    # -------------------------------------------------------------------------
+    # TCP TLS reassembly
+    # -------------------------------------------------------------------------
+
+    def _ingest_tcp_tls_bytes(self, st: dict, direction: str, tmeta: dict | None, raw: bytes | None):
+        if not raw:
+            return
+        if not tmeta:
+            self._handle_tls_payload(memoryview(raw), st, direction)
+            return
+
+        self._metrics["tcp_reassembly_attempts"] += 1
+        self._metrics["tcp_reassembly_bytes"] += len(raw)
+
+        dstate = st.setdefault("tls_buffers", {}).setdefault(direction, self._new_tls_dir_state())
+        seq = tmeta.get("seq")
+        if seq is None:
+            self._handle_tls_payload(memoryview(raw), st, direction)
+            return
+
+        try:
+            seq = int(seq)
+        except Exception:
+            self._handle_tls_payload(memoryview(raw), st, direction)
+            return
+
+        buf = dstate["buffer"]
+
+        if dstate["expected_seq"] is None:
+            dstate["expected_seq"] = seq + len(raw)
+            dstate["last_seq"] = seq
+            dstate["last_ack"] = tmeta.get("ack")
+            dstate["buffer_start_seq"] = seq
+            buf.extend(raw)
+        else:
+            expected = int(dstate["expected_seq"])
+            if seq == expected:
+                buf.extend(raw)
+                dstate["expected_seq"] = expected + len(raw)
+            elif seq > expected:
+                self._metrics["tcp_reassembly_partial"] += 1
+                self._note_flow(st, "tcp_gap")
+                gap = seq - expected
+                if gap > self.TCP_BUFFER_MAX:
+                    gap = self.TCP_BUFFER_MAX
+                buf.extend(b"\x00" * gap)
+                buf.extend(raw)
+                dstate["expected_seq"] = seq + len(raw)
+            else:
+                overlap = expected - seq
+                if overlap >= len(raw):
+                    self._metrics["tcp_retx"] += 1
+                    self._note_flow(st, "tcp_retx_overlap")
+                else:
+                    tail = raw[overlap:]
+                    buf.extend(tail)
+                    dstate["expected_seq"] = expected + len(tail)
+                    self._note_flow(st, "tcp_partial_overlap")
+
+            dstate["last_seq"] = seq
+            dstate["last_ack"] = tmeta.get("ack")
+
+        if len(buf) > self.TCP_BUFFER_MAX:
+            trim = len(buf) - self.TCP_BUFFER_MAX
+            del buf[:trim]
+            self._metrics["tcp_reassembly_trimmed"] += trim
+            if dstate["buffer_start_seq"] is not None:
+                dstate["buffer_start_seq"] += trim
+
+        parsed = self._handle_tls_payload(memoryview(bytes(buf[:self.TCP_RECORD_SCAN_CAP])), st, direction)
+        if parsed > 0:
+            del buf[:parsed]
+            self._metrics["tls_records_reassembled"] += 1
+            if dstate["buffer_start_seq"] is not None:
+                dstate["buffer_start_seq"] += parsed
+
+    # -------------------------------------------------------------------------
+    # QUIC CRYPTO reassembly
+    # -------------------------------------------------------------------------
+
+    def _ingest_quic_crypto_parts(self, st: dict, crypto_parts):
+        self._metrics["quic_crypto_reassembly_attempts"] += 1
+        qc = st.setdefault("quic_crypto", {})
+        ranges = qc.setdefault("ranges", {})
+        next_offset = int(qc.get("next_offset", 0) or 0)
+
+        for off, frag in crypto_parts:
+            if not frag:
+                continue
+            off = int(off or 0)
+            if off < 0:
+                continue
+            existing = ranges.get(off)
+            if existing is None or len(frag) > len(existing):
+                ranges[off] = frag
+                self._metrics["quic_crypto_reassembly_bytes"] += len(frag)
+
+        assembled = bytearray()
+        cursor = next_offset
+        while True:
+            frag = ranges.get(cursor)
+            if frag is None:
+                break
+            assembled.extend(frag)
+            cursor += len(frag)
+            del ranges[cursor - len(frag)]
+
+        if not assembled:
+            self._metrics["quic_crypto_partial"] += 1
+            return
+
+        qc["next_offset"] = cursor
+        qc["buffered_bytes"] = min(
+            self.QUIC_CRYPTO_BUFFER_MAX,
+            int(qc.get("buffered_bytes", 0) or 0) + len(assembled),
+        )
+        self._handle_tls_handshake_stream(memoryview(bytes(assembled[: self._peek_cap])), st, "quic")
+
+        # trim huge sparse maps
+        if len(ranges) > 1024:
+            keep = sorted(ranges.items(), key=lambda kv: kv[0])[:256]
+            qc["ranges"] = dict(keep)
+
+    # -------------------------------------------------------------------------
+    # TLS record parsing
+    # -------------------------------------------------------------------------
+
+    def _handle_tls_payload(self, mv: memoryview, st: dict, direction: str) -> int:
+        """
+        Parse as many full TLS records as possible from the supplied view.
+        Returns number of bytes successfully consumed from the front.
+        """
         p = 0
-        cap = min(len(mv), self._peek_cap)
+        cap = min(len(mv), self._peek_cap if len(mv) > self._peek_cap else len(mv))
 
         while p + 5 <= cap:
             rhead = self._peek_tls_record_header_mv(mv[p:])
             if not rhead:
-                self._metrics["tls_invalid_record_header"] += 1
+                if p == 0:
+                    self._metrics["tls_invalid_record_header"] += 1
                 break
 
             ct = rhead["ct"]
@@ -8850,19 +9096,25 @@ class TransportHTTPSManager:
                 self._metrics["tls_partial_handshake"] += 1
                 break
 
-            record_payload_mv = mv[p + 5:end_of_record]
+            record_payload_mv = mv[p + 5 : end_of_record]
             st["tls_records_seen"] = int(st.get("tls_records_seen") or 0) + 1
             ver = rhead.get("version")
-            if ver and ver not in st["tls_record_versions"]:
-                st["tls_record_versions"].append(ver)
+            versions = st.setdefault("tls_record_versions", [])
+            if ver and ver not in versions:
+                versions.append(ver)
+                if len(versions) > self.MAX_TLS_RECORD_VERSIONS:
+                    del versions[:-self.MAX_TLS_RECORD_VERSIONS]
 
             if ct == "ApplicationData":
                 self._metrics["tls_appdata_seen"] += 1
                 st["tls_state"] = self._TLS_STATE_EST
-                st["noinspect"] = True
                 self._metrics["tls_state_est"] += 1
-                self._metrics["noinspect_set"] += 1
                 self._note_flow(st, "appdata")
+                # safer than old version: do not noinspect unless we already got handshake metadata
+                if self._has_useful_tls_metadata(st):
+                    st["noinspect"] = True
+                    self._metrics["noinspect_set"] += 1
+                p = end_of_record
                 break
 
             if ct == "Alert":
@@ -8870,11 +9122,12 @@ class TransportHTTPSManager:
                 st["tls_state"] = self._TLS_STATE_ALERT
                 self._note_flow(st, "alert")
                 try:
-                    if len(record_payload_mv) >= 2 and record_payload_mv[1] == 0x00:
+                    if len(record_payload_mv) >= 2 and int(record_payload_mv[1]) == 0x00:
                         st["noinspect"] = True
                         self._metrics["noinspect_set"] += 1
                 except Exception:
                     pass
+                p = end_of_record
                 break
 
             if ct == "Handshake":
@@ -8882,18 +9135,24 @@ class TransportHTTPSManager:
 
             p = end_of_record
 
+        return p
+
     def _handle_tls_handshake_record(self, record_mv: memoryview, st: dict, direction: str):
         p = 0
         while p + 4 <= len(record_mv):
             try:
                 msg_type = int(record_mv[p])
-                msg_len = (int(record_mv[p + 1]) << 16) | (int(record_mv[p + 2]) << 8) | int(record_mv[p + 3])
+                msg_len = (
+                    (int(record_mv[p + 1]) << 16)
+                    | (int(record_mv[p + 2]) << 8)
+                    | int(record_mv[p + 3])
+                )
                 end_of_msg = p + 4 + msg_len
                 if end_of_msg > len(record_mv):
                     self._metrics["tls_partial_handshake"] += 1
                     break
 
-                msg_mv = record_mv[p + 4:end_of_msg]
+                msg_mv = record_mv[p + 4 : end_of_msg]
 
                 if msg_type == 0x01:
                     ch = self._peek_client_hello_rich_mv(msg_mv)
@@ -8902,6 +9161,8 @@ class TransportHTTPSManager:
                         st["tls_state"] = self._TLS_STATE_CH
                         self._metrics["tls_state_ch"] += 1
                         st["proto_hint"] = self._PROTO_HINT_TLS
+                        st["confidence"] = max(float(st.get("confidence", 0.0)), 0.98)
+                        st["parse_reason"] = "tls_client_hello"
                         self._note_flow(st, "client_hello")
                         if ch.get("sni"):
                             if st.get("sni") == ch["sni"]:
@@ -8924,17 +9185,19 @@ class TransportHTTPSManager:
                         self._metrics["server_hello_seen"] += 1
                         st["tls_state"] = self._TLS_STATE_SH
                         self._metrics["tls_state_sh"] += 1
+                        st["confidence"] = max(float(st.get("confidence", 0.0)), 0.99)
+                        st["parse_reason"] = "tls_server_hello"
                         self._note_flow(st, "server_hello")
                         if sh.get("cipher") is not None:
                             st["cipher"] = sh["cipher"]
                             self._metrics["cipher_set"] += 1
                         if sh.get("version") is not None:
-                            st["tls_ver_neg"] = sh["version"]
+                            st["tls_ver_neg"] = self._tls_version_name(int(sh["version"]))
 
                 elif msg_type == 0x08:
                     self._note_flow(st, "encrypted_extensions")
 
-                elif msg_type == 0x0b:
+                elif msg_type == 0x0B:
                     if self.parse_certificates and st.get("sans") is None:
                         cert_data = self._peek_certificate_mv(msg_mv)
                         if cert_data:
@@ -8950,8 +9213,9 @@ class TransportHTTPSManager:
                     st["tls_state"] = self._TLS_STATE_EST
                     self._metrics["tls_state_est"] += 1
                     self._note_flow(st, "finished")
-                    st["noinspect"] = True
-                    self._metrics["noinspect_set"] += 1
+                    if self._has_useful_tls_metadata(st):
+                        st["noinspect"] = True
+                        self._metrics["noinspect_set"] += 1
 
                 else:
                     self._metrics["tls_unknown_handshake"] += 1
@@ -8968,20 +9232,29 @@ class TransportHTTPSManager:
         while p + 4 <= cap:
             try:
                 msg_type = int(mv[p])
-                msg_len = (int(mv[p + 1]) << 16) | (int(mv[p + 2]) << 8) | int(mv[p + 3])
+                msg_len = (
+                    (int(mv[p + 1]) << 16)
+                    | (int(mv[p + 2]) << 8)
+                    | int(mv[p + 3])
+                )
                 end_of_msg = p + 4 + msg_len
                 if end_of_msg > cap:
                     self._metrics["tls_partial_handshake"] += 1
                     break
-                msg_mv = mv[p + 4:end_of_msg]
+
+                msg_mv = mv[p + 4 : end_of_msg]
                 if msg_type == 0x01:
                     ch = self._peek_client_hello_rich_mv(msg_mv)
                     if ch:
                         self._metrics["client_hello_seen"] += 1
                         st["tls_state"] = self._TLS_STATE_CH
                         st["proto_hint"] = self._PROTO_HINT_QUIC
+                        st["confidence"] = max(float(st.get("confidence", 0.0)), 0.98)
+                        st["parse_reason"] = f"{source}_client_hello"
                         self._note_flow(st, f"{source}_client_hello")
                         if ch.get("sni"):
+                            if st.get("sni") == ch["sni"]:
+                                self._metrics["sni_cache_hits"] += 1
                             st["sni"] = ch["sni"]
                             self._metrics["sni_parsed"] += 1
                         if ch.get("alpn"):
@@ -8996,13 +9269,14 @@ class TransportHTTPSManager:
                     if sh:
                         self._metrics["server_hello_seen"] += 1
                         st["tls_state"] = self._TLS_STATE_SH
+                        st["parse_reason"] = f"{source}_server_hello"
                         self._note_flow(st, f"{source}_server_hello")
                         if sh.get("cipher") is not None:
                             st["cipher"] = sh["cipher"]
                             self._metrics["cipher_set"] += 1
                         if sh.get("version") is not None:
-                            st["tls_ver_neg"] = sh["version"]
-                elif msg_type == 0x0b and self.parse_certificates and st.get("sans") is None:
+                            st["tls_ver_neg"] = self._tls_version_name(int(sh["version"]))
+                elif msg_type == 0x0B and self.parse_certificates and st.get("sans") is None:
                     cert_data = self._peek_certificate_mv(msg_mv)
                     if cert_data:
                         self._metrics["cert_parsed"] += 1
@@ -9016,9 +9290,21 @@ class TransportHTTPSManager:
                 self._metrics["parser_errors"] += 1
                 break
 
-    def _log_packet_prefix(self, packet, inbound_iface: str, st: dict,
-                           rhead: dict | None, sslv2: dict | None, raw: bytes | None,
-                           phase: dict, quic_like_tcp: dict | None):
+    # -------------------------------------------------------------------------
+    # Logging / formatting
+    # -------------------------------------------------------------------------
+
+    def _log_packet_prefix(
+        self,
+        packet,
+        inbound_iface: str,
+        st: dict,
+        rhead: dict | None,
+        sslv2: dict | None,
+        raw: bytes | None,
+        phase: dict,
+        quic_like_tcp: dict | None,
+    ):
         if sslv2:
             self._metrics["sslv2_seen"] += 1
             self._safe_log(self._format_packet_prefix_ssl2(packet, inbound_iface, sslv2))
@@ -9034,9 +9320,14 @@ class TransportHTTPSManager:
             return
         self._safe_log(self._format_packet_prefix_header_only(packet, inbound_iface, st, phase, quic_like_tcp))
 
-    def _format_packet_prefix_header_only(self, pkt, inbound_iface: str, st: dict,
-                                          phase: dict | None = None,
-                                          quic_like_tcp: dict | None = None) -> str:
+    def _format_packet_prefix_header_only(
+        self,
+        pkt,
+        inbound_iface: str,
+        st: dict,
+        phase: dict | None = None,
+        quic_like_tcp: dict | None = None,
+    ) -> str:
         try:
             length = getattr(pkt, "wirelen", None) or len(bytes(pkt))
         except Exception:
@@ -9062,9 +9353,16 @@ class TransportHTTPSManager:
             + (f" {' '.join(extra)}" if extra else "")
         )
 
-    def _format_packet_prefix(self, pkt, inbound_iface: str, rhead: dict,
-                              ch_cache: dict | None, raw: bytes | None, st: dict,
-                              phase: dict | None = None) -> str:
+    def _format_packet_prefix(
+        self,
+        pkt,
+        inbound_iface: str,
+        rhead: dict,
+        ch_cache: dict | None,
+        raw: bytes | None,
+        st: dict,
+        phase: dict | None = None,
+    ) -> str:
         try:
             length = getattr(pkt, "wirelen", None) or len(bytes(pkt))
         except Exception:
@@ -9154,12 +9452,13 @@ class TransportHTTPSManager:
         phase_name = phase.get("phase") if phase else "-"
         payload_kind = phase.get("payload_kind") if phase else "-"
         note_str = self._compact_list(st.get("notes"), 4)
+        conf = f"{float(st.get('confidence', 0.0)):.2f}"
 
         kind = f"{rhead.get('ct')}/{rhead.get('version')}" if rhead else (payload_kind or "header-only")
         base = (
             f"[Transport][🧵 {tcp_state}][🔒 {tls_state}] {tls_part} "
             f"{src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)} "
-            f"phase={phase_name} hint={proto_hint} kind={kind} "
+            f"phase={phase_name} hint={proto_hint} conf={conf} kind={kind} "
             f"sni={sni} alpn={alpn} cipher={cipher_str} sans={sans} notes={note_str}"
         )
         if dyn_tag:
@@ -9177,6 +9476,10 @@ class TransportHTTPSManager:
         if dyn_tag:
             line += f" | dyn={dyn_tag}"
         return line
+
+    # -------------------------------------------------------------------------
+    # Classification helpers
+    # -------------------------------------------------------------------------
 
     def _classify_tcp_443_phase(self, tmeta: dict | None, raw: bytes | None, on_443: bool) -> dict:
         flags = (tmeta or {}).get("flags", "") or ""
@@ -9213,6 +9516,10 @@ class TransportHTTPSManager:
         except Exception:
             return None
 
+    # -------------------------------------------------------------------------
+    # Flow cleanup / pacing
+    # -------------------------------------------------------------------------
+
     def _should_log_flow(self, st, now: float) -> bool:
         last = st.get("last_log", 0.0)
         if (now - last) >= self.RL_INTERVAL_SEC:
@@ -9222,22 +9529,27 @@ class TransportHTTPSManager:
 
     def _clean_if_needed(self, now_ts: float):
         ttl = self.flow_cache_ttl
-        if ttl > 0 and self._metrics["https_seen"] % 8192 == 0:
+        if ttl > 0 and (self._metrics["https_seen"] + self._metrics["quic_seen"]) % 4096 == 0:
             stale = [k for k, v in self._tls_flows.items() if now_ts - v.get("last", now_ts) > ttl]
             for k in stale:
                 self._tls_flows.pop(k, None)
-        if len(self._tls_flows) > self.flow_cache_max:
-            excess = len(self._tls_flows) - int(self.flow_cache_max * 0.9)
-            victims = sorted(self._tls_flows.items(), key=lambda kv: kv[1].get("last", 0.0))[:max(int(excess), 0)]
-            for k, _ in victims:
-                self._tls_flows.pop(k, None)
-            self._metrics["flow_cache_evictions"] += max(int(excess), 0)
+
+        while len(self._tls_flows) > self.flow_cache_max:
+            try:
+                self._tls_flows.popitem(last=False)
+                self._metrics["flow_cache_evictions"] += 1
+            except Exception:
+                break
 
     def _bump_seen(self, on_443: bool):
         if on_443:
             self._metrics["https_seen"] += 1
         else:
             self._metrics["tls_non443_seen"] += 1
+
+    # -------------------------------------------------------------------------
+    # Direction / TCP state
+    # -------------------------------------------------------------------------
 
     def _dir_in_flow(self, src_ip, sport, dst_ip, dport, fkey):
         first = (str(src_ip), str(int(sport)))
@@ -9304,6 +9616,10 @@ class TransportHTTPSManager:
         except Exception:
             return None
 
+    # -------------------------------------------------------------------------
+    # TLS / SSL / QUIC low-level helpers
+    # -------------------------------------------------------------------------
+
     def _cheap_tls_signature(self, pkt) -> bool:
         raw = self._get_raw_bytes(pkt)
         if not raw or len(raw) < 2:
@@ -9367,108 +9683,133 @@ class TransportHTTPSManager:
             self._metrics["sslv2_handshake_labeled"] += 1
         return name
 
-    def _peek_quic_header_mv(self, mv: memoryview):
+    def _peek_quic_packets_mv(self, mv: memoryview):
+        """
+        Best-effort parser for one or more QUIC packets carried in a single UDP datagram.
+        This does not remove header protection and does not decrypt payloads.
+        It only walks enough structure to identify packet type and extract CRYPTO frames
+        when they are visible in the provided bytes.
+        """
         try:
             if not mv or len(mv) < 1:
                 return None
 
-            first = int(mv[0])
-            long_header = bool(first & 0x80)
+            packets = []
+            p = 0
+            total = len(mv)
 
-            if not long_header:
-                if len(mv) < 3:
-                    return None
-                return {
-                    "type": "SHORT",
-                    "version": None,
-                    "dcid_hex": None,
-                    "scid_hex": None,
-                    "token_len": None,
-                    "payload_len": len(mv),
-                    "crypto_data": None,
-                }
+            while p < total:
+                first = int(mv[p])
+                long_header = bool(first & 0x80)
 
-            if len(mv) < 6:
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
+                if not long_header:
+                    packets.append({
+                        "type": "SHORT",
+                        "version": None,
+                        "dcid_hex": None,
+                        "scid_hex": None,
+                        "token_len": None,
+                        "payload_len": total - p,
+                        "crypto_parts": None,
+                    })
+                    break
 
-            p = 1
-            version = (int(mv[p]) << 24) | (int(mv[p + 1]) << 16) | (int(mv[p + 2]) << 8) | int(mv[p + 3])
-            p += 4
-
-            if version == 0:
-                return {
-                    "type": "VERSION_NEGOTIATION",
-                    "version": "0x00000000",
-                    "dcid_hex": None,
-                    "scid_hex": None,
-                    "token_len": None,
-                    "payload_len": len(mv),
-                    "crypto_data": None,
-                }
-
-            if p >= len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-
-            dcid_len = int(mv[p]); p += 1
-            if dcid_len > 20 or p + dcid_len > len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-            dcid = bytes(mv[p:p + dcid_len]); p += dcid_len
-
-            if p >= len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-
-            scid_len = int(mv[p]); p += 1
-            if scid_len > 20 or p + scid_len > len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-            scid = bytes(mv[p:p + scid_len]); p += scid_len
-
-            packet_type_bits = (first >> 4) & 0x03
-            packet_type = {0: "INITIAL", 1: "0-RTT", 2: "HANDSHAKE", 3: "RETRY"}.get(packet_type_bits, "LONG")
-
-            token_len = None
-            if packet_type == "INITIAL":
-                token_len, p = self._read_quic_varint(mv, p)
-                if token_len is None:
+                if p + 6 > total:
                     self._metrics["quic_false_positive_rejected"] += 1
-                    return None
-                if p + token_len > len(mv):
+                    break
+
+                qstart = p
+                p += 1
+                version = (
+                    (int(mv[p]) << 24) | (int(mv[p + 1]) << 16) |
+                    (int(mv[p + 2]) << 8) | int(mv[p + 3])
+                )
+                p += 4
+
+                if version == 0:
+                    packets.append({
+                        "type": "VERSION_NEGOTIATION",
+                        "version": "0x00000000",
+                        "dcid_hex": None,
+                        "scid_hex": None,
+                        "token_len": None,
+                        "payload_len": total - qstart,
+                        "crypto_parts": None,
+                    })
+                    break
+
+                if p >= total:
                     self._metrics["quic_false_positive_rejected"] += 1
-                    return None
-                p += token_len
+                    break
 
-            payload_len, p2 = self._read_quic_varint(mv, p)
-            if payload_len is None:
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-            p = p2
+                dcid_len = int(mv[p])
+                p += 1
+                if dcid_len > 20 or p + dcid_len > total:
+                    self._metrics["quic_false_positive_rejected"] += 1
+                    break
+                dcid = bytes(mv[p : p + dcid_len])
+                p += dcid_len
 
-            if p >= len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
+                if p >= total:
+                    self._metrics["quic_false_positive_rejected"] += 1
+                    break
 
-            pn_len = (first & 0x03) + 1
-            if p + pn_len > len(mv):
-                self._metrics["quic_false_positive_rejected"] += 1
-                return None
-            p += pn_len
+                scid_len = int(mv[p])
+                p += 1
+                if scid_len > 20 or p + scid_len > total:
+                    self._metrics["quic_false_positive_rejected"] += 1
+                    break
+                scid = bytes(mv[p : p + scid_len])
+                p += scid_len
 
-            remaining = bytes(mv[p:min(len(mv), p + max(int(payload_len), 0))])
-            crypto_data = self._extract_quic_crypto_frames(memoryview(remaining)) if remaining else None
+                packet_type_bits = (first >> 4) & 0x03
+                packet_type = {0: "INITIAL", 1: "0-RTT", 2: "HANDSHAKE", 3: "RETRY"}.get(packet_type_bits, "LONG")
 
-            return {
-                "type": packet_type,
-                "version": f"0x{version:08x}",
-                "dcid_hex": dcid.hex() if dcid else "",
-                "scid_hex": scid.hex() if scid else "",
-                "token_len": token_len,
-                "payload_len": int(payload_len),
-                "crypto_data": crypto_data,
-            }
+                token_len = None
+                if packet_type == "INITIAL":
+                    token_len, p = self._read_quic_varint(mv, p)
+                    if token_len is None or p + token_len > total:
+                        self._metrics["quic_false_positive_rejected"] += 1
+                        break
+                    p += token_len
+
+                payload_len, p = self._read_quic_varint(mv, p)
+                if payload_len is None:
+                    self._metrics["quic_false_positive_rejected"] += 1
+                    break
+
+                pn_len = (first & 0x03) + 1
+                if p + pn_len > total:
+                    self._metrics["quic_false_positive_rejected"] += 1
+                    break
+                p += pn_len
+
+                payload_start = p
+                payload_end = min(total, payload_start + int(payload_len))
+                if payload_end < payload_start:
+                    break
+
+                remaining = mv[payload_start:payload_end]
+                crypto_parts = self._extract_quic_crypto_frames(remaining) if remaining else None
+
+                packets.append({
+                    "type": packet_type,
+                    "version": f"0x{version:08x}",
+                    "dcid_hex": dcid.hex() if dcid else "",
+                    "scid_hex": scid.hex() if scid else "",
+                    "token_len": token_len,
+                    "payload_len": int(payload_len),
+                    "crypto_parts": crypto_parts,
+                })
+
+                if payload_end <= qstart:
+                    break
+                p = payload_end
+
+                if payload_end == total:
+                    break
+
+            return {"packets": packets} if packets else None
         except Exception:
             self._metrics["parser_errors"] += 1
             return None
@@ -9503,57 +9844,101 @@ class TransportHTTPSManager:
             return None, pos
 
     def _extract_quic_crypto_frames(self, mv: memoryview):
+        """
+        Returns a list of (offset, frag) tuples for QUIC CRYPTO frames.
+        """
         try:
             parts = []
             p = 0
             cap = min(len(mv), self._peek_cap)
+
             while p < cap:
                 ftype, p2 = self._read_quic_varint(mv, p)
                 if ftype is None:
                     break
                 p = p2
 
+                # PADDING
                 if ftype == 0x00:
                     continue
+
+                # PING
                 if ftype == 0x01:
-                    if p + 1 > cap:
+                    continue
+
+                # ACK / ACK_ECN
+                if ftype in (0x02, 0x03):
+                    largest_ack, p = self._read_quic_varint(mv, p)
+                    ack_delay, p = self._read_quic_varint(mv, p)
+                    ack_range_count, p = self._read_quic_varint(mv, p)
+                    first_ack_range, p = self._read_quic_varint(mv, p)
+                    if None in (largest_ack, ack_delay, ack_range_count, first_ack_range):
                         break
-                    p += 1
+                    for _ in range(int(ack_range_count)):
+                        gap, p = self._read_quic_varint(mv, p)
+                        rng, p = self._read_quic_varint(mv, p)
+                        if gap is None or rng is None:
+                            break
+                    if ftype == 0x03:
+                        e1, p = self._read_quic_varint(mv, p)
+                        e2, p = self._read_quic_varint(mv, p)
+                        e3, p = self._read_quic_varint(mv, p)
+                        if None in (e1, e2, e3):
+                            break
                     continue
-                if ftype == 0x02 or ftype == 0x03:
-                    _, p = self._read_quic_varint(mv, p)
-                    continue
+
+                # CRYPTO
                 if ftype == 0x06:
                     offset, p = self._read_quic_varint(mv, p)
                     length, p = self._read_quic_varint(mv, p)
-                    if length is None or p + length > cap:
+                    if offset is None or length is None or p + length > cap:
                         break
-                    frag = bytes(mv[p:p + length])
+                    frag = bytes(mv[p : p + length])
                     p += length
                     if frag:
-                        parts.append((int(offset or 0), frag))
+                        parts.append((int(offset), frag))
                     continue
-                if ftype in (0x08, 0x09):
-                    _, p = self._read_quic_varint(mv, p)
+
+                # NEW_TOKEN
+                if ftype == 0x07:
+                    tok_len, p = self._read_quic_varint(mv, p)
+                    if tok_len is None or p + tok_len > cap:
+                        break
+                    p += tok_len
                     continue
+
+                # STREAM frames 0x08..0x0f
+                if 0x08 <= ftype <= 0x0F:
+                    has_off = bool(ftype & 0x04)
+                    has_len = bool(ftype & 0x02)
+                    sid, p = self._read_quic_varint(mv, p)
+                    if sid is None:
+                        break
+                    if has_off:
+                        off, p = self._read_quic_varint(mv, p)
+                        if off is None:
+                            break
+                    if has_len:
+                        ln, p = self._read_quic_varint(mv, p)
+                        if ln is None or p + ln > cap:
+                            break
+                        p += ln
+                    else:
+                        p = cap
+                    continue
+
+                # CONNECTION_CLOSE transport/app, HANDSHAKE_DONE, others:
+                # stop here because we only want safe best-effort parsing
                 break
 
-            if not parts:
-                return None
-            parts.sort(key=lambda x: x[0])
-            out = bytearray()
-            expected = 0
-            for off, frag in parts:
-                if off > expected:
-                    break
-                if off < expected:
-                    frag = frag[expected - off:]
-                out.extend(frag)
-                expected = len(out)
-            return bytes(out) if out else None
+            return parts or None
         except Exception:
             self._metrics["parser_errors"] += 1
             return None
+
+    # -------------------------------------------------------------------------
+    # Handshake metadata extraction
+    # -------------------------------------------------------------------------
 
     def _peek_client_hello_rich_mv(self, mv):
         try:
@@ -9561,29 +9946,34 @@ class TransportHTTPSManager:
             p = 0
             if p + 2 > cap:
                 return {"client_hello": True}
-            ver_major, ver_minor = int(mv[p]), int(mv[p + 1]); p += 2
+            ver_major, ver_minor = int(mv[p]), int(mv[p + 1])
+            p += 2
             version_name = self._tls_version_tuple_name((ver_major, ver_minor))
 
             p += 32
             if p >= cap:
                 return {"client_hello": True, "version": version_name}
 
-            sid_len = int(mv[p]); p += 1 + sid_len
+            sid_len = int(mv[p])
+            p += 1 + sid_len
             if p + 2 > cap:
                 return {"client_hello": True, "version": version_name}
 
-            cs_len = (int(mv[p]) << 8) | int(mv[p + 1]); p += 2
+            cs_len = (int(mv[p]) << 8) | int(mv[p + 1])
+            p += 2
             cs_count = cs_len // 2
             cs_start = p
             p += cs_len
             if p >= cap:
                 return {"client_hello": True, "version": version_name, "cipher_suites_count": cs_count}
 
-            comp_len = int(mv[p]); p += 1 + comp_len
+            comp_len = int(mv[p])
+            p += 1 + comp_len
             if p + 2 > cap:
                 return {"client_hello": True, "version": version_name, "cipher_suites_count": cs_count}
 
-            ext_total = (int(mv[p]) << 8) | int(mv[p + 1]); p += 2
+            ext_total = (int(mv[p]) << 8) | int(mv[p + 1])
+            p += 2
             end_ext = min(p + ext_total, cap)
 
             sni = None
@@ -9602,7 +9992,7 @@ class TransportHTTPSManager:
                 p += 4
                 if p + elen > end_ext:
                     break
-                edata = mv[p:p + elen]
+                edata = mv[p : p + elen]
                 exts_count += 1
                 ja3_exts.append(str(etype))
 
@@ -9618,7 +10008,7 @@ class TransportHTTPSManager:
                             break
                         if name_type == 0:
                             try:
-                                sni = bytes(edata[q:q + name_len]).decode("idna", errors="ignore")
+                                sni = bytes(edata[q : q + name_len]).decode("idna", errors="ignore")
                             except Exception:
                                 sni = None
                             break
@@ -9629,16 +10019,17 @@ class TransportHTTPSManager:
                     q = 2
                     limit = min(2 + list_len, len(edata))
                     while q < limit:
-                        nlen = int(edata[q]); q += 1
+                        nlen = int(edata[q])
+                        q += 1
                         if q + nlen > limit:
                             break
                         try:
-                            alpn.append(bytes(edata[q:q + nlen]).decode("ascii", errors="ignore"))
+                            alpn.append(bytes(edata[q : q + nlen]).decode("ascii", errors="ignore"))
                         except Exception:
                             pass
                         q += nlen
 
-                elif etype == 0x000a and elen >= 2:
+                elif etype == 0x000A and elen >= 2:
                     glen = (int(edata[0]) << 8) | int(edata[1])
                     q = 2
                     limit = min(2 + glen, len(edata))
@@ -9648,13 +10039,13 @@ class TransportHTTPSManager:
                         groups_count += 1
                         q += 2
 
-                elif etype == 0x000b:
+                elif etype == 0x000B:
                     q = 1
                     while q < len(edata):
                         ja3_ecpf.append(str(int(edata[q])))
                         q += 1
 
-                elif etype == 0x002b and elen >= 3:
+                elif etype == 0x002B and elen >= 3:
                     vlen = int(edata[0])
                     q = 1
                     limit = min(1 + vlen, len(edata))
@@ -9664,7 +10055,7 @@ class TransportHTTPSManager:
                             tls13_capable = True
                         q += 2
 
-                elif etype == 0xfe0d:
+                elif etype == 0xFE0D:
                     ech_seen = True
 
                 p += elen
@@ -9714,15 +10105,18 @@ class TransportHTTPSManager:
             p += 32
             if p + 1 > len(mv):
                 return None
-            sid_len = int(mv[p]); p += 1 + sid_len
+            sid_len = int(mv[p])
+            p += 1 + sid_len
             if p + 2 > len(mv):
                 return None
-            cs = (int(mv[p]) << 8) | int(mv[p + 1]); p += 2
+            cs = (int(mv[p]) << 8) | int(mv[p + 1])
+            p += 2
             p += 1
             if p + 2 > len(mv):
                 return {"cipher": cs, "version": legacy_version}
 
-            ext_total = (int(mv[p]) << 8) | int(mv[p + 1]); p += 2
+            ext_total = (int(mv[p]) << 8) | int(mv[p + 1])
+            p += 2
             end_ext = min(p + ext_total, len(mv))
             negotiated_version = None
 
@@ -9732,8 +10126,8 @@ class TransportHTTPSManager:
                 p += 4
                 if p + elen > end_ext:
                     break
-                edata = mv[p:p + elen]
-                if etype == 0x002b and elen == 2:
+                edata = mv[p : p + elen]
+                if etype == 0x002B and elen == 2:
                     negotiated_version = (int(edata[0]) << 8) | int(edata[1])
                 p += elen
 
@@ -9748,13 +10142,15 @@ class TransportHTTPSManager:
             p = 0
             if len(mv) < 6:
                 return {"sans": None}
-            chain_len = (int(mv[p]) << 16) | (int(mv[p + 1]) << 8) | int(mv[p + 2]); p += 3
+            chain_len = (int(mv[p]) << 16) | (int(mv[p + 1]) << 8) | int(mv[p + 2])
+            p += 3
             if chain_len <= 0 or p + 3 > len(mv):
                 return {"sans": None}
-            cert_len = (int(mv[p]) << 16) | (int(mv[p + 1]) << 8) | int(mv[p + 2]); p += 3
+            cert_len = (int(mv[p]) << 16) | (int(mv[p + 1]) << 8) | int(mv[p + 2])
+            p += 3
             if cert_len <= 0 or p + cert_len > len(mv):
                 return {"sans": None}
-            cert_mv = mv[p:p + cert_len]
+            cert_mv = mv[p : p + cert_len]
             san_oid = b"\x55\x1d\x11"
             idx = bytes(cert_mv).find(san_oid)
             if idx == -1:
@@ -9765,7 +10161,8 @@ class TransportHTTPSManager:
                 tag = int(cert_mv[p_san])
                 if tag == 0x04:
                     p_san += 1
-                    len_byte = int(cert_mv[p_san]); p_san += 1
+                    len_byte = int(cert_mv[p_san])
+                    p_san += 1
                     san_len = len_byte
                     if len_byte & 0x80:
                         len_bytes = len_byte & 0x7F
@@ -9776,17 +10173,18 @@ class TransportHTTPSManager:
                             san_len = (san_len << 8) | int(cert_mv[p_san + i])
                         p_san += len_bytes
 
-                    san_data_mv = cert_mv[p_san:p_san + san_len]
+                    san_data_mv = cert_mv[p_san : p_san + san_len]
                     p_dns = 0
                     while p_dns < len(san_data_mv) - 2:
                         dns_tag = int(san_data_mv[p_dns])
                         if dns_tag == 0x82:
                             p_dns += 1
-                            dns_len = int(san_data_mv[p_dns]); p_dns += 1
+                            dns_len = int(san_data_mv[p_dns])
+                            p_dns += 1
                             if p_dns + dns_len > len(san_data_mv):
                                 break
                             try:
-                                sans.append(bytes(san_data_mv[p_dns:p_dns + dns_len]).decode("ascii"))
+                                sans.append(bytes(san_data_mv[p_dns : p_dns + dns_len]).decode("ascii"))
                             except Exception:
                                 pass
                             p_dns += dns_len
@@ -9803,6 +10201,10 @@ class TransportHTTPSManager:
         except Exception:
             self._metrics["parser_errors"] += 1
             return None
+
+    # -------------------------------------------------------------------------
+    # Packet / layer helpers
+    # -------------------------------------------------------------------------
 
     def _pre_checks(self, pkt) -> bool:
         if TCP is None:
@@ -9876,38 +10278,10 @@ class TransportHTTPSManager:
             else:
                 tcp_type = f"TCP({flags_str})" if flags_str else "TCP"
 
-            ecn_tcp = {"ECE": "E" in flags_set, "CWR": "C" in flags_set}
             sport = int(getattr(t, "sport", 0) or 0)
             dport = int(getattr(t, "dport", 0) or 0)
             seq = int(getattr(t, "seq", 0) or 0)
             ack = int(getattr(t, "ack", 0) or 0)
-
-            try:
-                doff = int(getattr(t, "dataofs", 0) or 0)
-                hdr_len_tcp = 4 * doff if doff > 0 else None
-            except Exception:
-                hdr_len_tcp = None
-
-            hdr_len_ip = None
-            ip_payload_len = None
-            if ip4 is not None:
-                try:
-                    ihl = int(getattr(ip4, "ihl", 0) or 0)
-                    hdr_len_ip = 4 * ihl if ihl > 0 else None
-                except Exception:
-                    hdr_len_ip = None
-                try:
-                    tot = int(getattr(ip4, "len", 0) or 0) or None
-                except Exception:
-                    tot = None
-                if tot is not None and hdr_len_ip is not None:
-                    ip_payload_len = max(tot - hdr_len_ip, 0)
-            elif ip6 is not None:
-                hdr_len_ip = 40
-                try:
-                    ip_payload_len = int(getattr(ip6, "plen", 0) or 0)
-                except Exception:
-                    ip_payload_len = None
 
             try:
                 raw = self._get_raw_bytes(pkt)
@@ -9915,137 +10289,24 @@ class TransportHTTPSManager:
             except Exception:
                 tcp_payload_len = None
 
-            wscale = None
-            mss = None
-            sack_perm = False
-            sack_blocks = []
-            ts_val = None
-            ts_ecr = None
-            tfo_cookie = None
-            options_seen = []
-
-            try:
-                opts = getattr(t, "options", []) or []
-                for name, val in opts:
-                    n = (name or "").lower()
-                    options_seen.append(name)
-                    if n == "wscale":
-                        try:
-                            wscale = int(val)
-                        except Exception:
-                            wscale = None
-                    elif n == "mss":
-                        try:
-                            mss = int(val)
-                        except Exception:
-                            mss = None
-                    elif n == "sackok":
-                        sack_perm = True
-                    elif n == "sack":
-                        try:
-                            blocks = []
-                            for blk in (val or []):
-                                try:
-                                    l, r = int(blk[0]), int(blk[1])
-                                    blocks.append([l, r])
-                                except Exception:
-                                    pass
-                            sack_blocks = blocks or sack_blocks
-                        except Exception:
-                            pass
-                    elif n == "timestamp":
-                        try:
-                            ts_val = int(val[0]) if isinstance(val, (list, tuple)) and len(val) >= 1 else None
-                            ts_ecr = int(val[1]) if isinstance(val, (list, tuple)) and len(val) >= 2 else None
-                        except Exception:
-                            ts_val = ts_val or None
-                            ts_ecr = ts_ecr or None
-                    elif n in ("tfo", "fastopen", "tfo_cookie", "fastopencookie"):
-                        tfo_cookie = val
-            except Exception:
-                pass
-
-            try:
-                win_raw = int(getattr(t, "window", 0) or 0)
-                win_eff = win_raw * (1 << wscale) if (wscale is not None and wscale >= 0) else win_raw
-            except Exception:
-                win_raw = None
-                win_eff = None
-
-            ip_meta = {}
-            if ip4 is not None:
-                try:
-                    flags_val = getattr(ip4, "flags", None)
-                    flags_str_ip = str(flags_val) if flags_val is not None else None
-                    df = bool(getattr(ip4, "flags", 0) & 0x2) if isinstance(flags_val, int) else ("DF" in (flags_str_ip or ""))
-                    mf = bool(getattr(ip4, "flags", 0) & 0x1) if isinstance(flags_val, int) else ("MF" in (flags_str_ip or ""))
-                    tos = getattr(ip4, "tos", None)
-                    dscp = (tos >> 2) & 0x3F if isinstance(tos, int) else None
-                    ecn = tos & 0x03 if isinstance(tos, int) else None
-                    ip_meta = {
-                        "version": 4,
-                        "ttl": getattr(ip4, "ttl", None),
-                        "id": getattr(ip4, "id", None),
-                        "tos": tos,
-                        "dscp": dscp,
-                        "ecn": ecn,
-                        "df": df,
-                        "mf": mf,
-                        "flags": flags_str_ip,
-                        "ihl_bytes": hdr_len_ip,
-                    }
-                except Exception:
-                    ip_meta = {"version": 4}
-            elif ip6 is not None:
-                try:
-                    tclass = getattr(ip6, "tc", None)
-                    ecn = (tclass & 0x03) if isinstance(tclass, int) else None
-                    dscp = ((tclass >> 2) & 0x3F) if isinstance(tclass, int) else None
-                    ip_meta = {
-                        "version": 6,
-                        "hop_limit": getattr(ip6, "hlim", None),
-                        "flow_label": getattr(ip6, "fl", None),
-                        "traffic_class": tclass,
-                        "dscp": dscp,
-                        "ecn": ecn,
-                        "hdr_bytes": hdr_len_ip,
-                    }
-                except Exception:
-                    ip_meta = {"version": 6}
-
             return {
-                "type": tcp_type,
                 "flags": flags_str,
-                "ecn_tcp": ecn_tcp,
+                "type": tcp_type,
                 "sport": sport,
                 "dport": dport,
                 "seq": seq,
                 "ack": ack,
-                "ip_hdr_bytes": hdr_len_ip,
-                "tcp_hdr_bytes": hdr_len_tcp,
-                "ip_payload_bytes": ip_payload_len,
                 "tcp_payload_bytes": tcp_payload_len,
-                "frame_bytes": total_len,
-                "win": win_raw,
-                "wscale": wscale,
-                "win_effective": win_eff,
-                "mss": mss,
-                "sack_perm": sack_perm,
-                "sack_blocks": sack_blocks,
-                "ts_val": ts_val,
-                "ts_ecr": ts_ecr,
-                "tfo_cookie": tfo_cookie,
-                "options": options_seen,
-                "ip": ip_meta,
+                "wirelen": total_len,
+                "ip_version": 4 if ip4 is not None else (6 if ip6 is not None else None),
             }
         except Exception:
+            self._metrics["parser_errors"] += 1
             return None
 
-    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int):
-        a = (str(src_ip), str(int(sport)))
-        b = (str(dst_ip), str(int(dport)))
-        first, second = (a, b) if a <= b else (b, a)
-        return first + second
+    # -------------------------------------------------------------------------
+    # Generic helpers
+    # -------------------------------------------------------------------------
 
     def _classify_tcp_flags(self, pkt) -> str:
         try:
@@ -10072,7 +10333,10 @@ class TransportHTTPSManager:
     def _cipher_name(self, code):
         if code is None:
             return "-"
-        return self._TLS_CIPHERS.get(int(code), f"0x{int(code):04x}")
+        try:
+            return self._TLS_CIPHERS.get(int(code), f"0x{int(code):04x}")
+        except Exception:
+            return "-"
 
     def _tls_hs_msg_name(self, b: int) -> str:
         table = {
@@ -10080,10 +10344,10 @@ class TransportHTTPSManager:
             0x02: "ServerHello",
             0x04: "NewSessionTicket",
             0x08: "EncryptedExtensions",
-            0x0b: "Certificate",
-            0x0c: "ServerKeyExchange",
-            0x0d: "CertificateRequest",
-            0x0e: "ServerHelloDone",
+            0x0B: "Certificate",
+            0x0C: "ServerKeyExchange",
+            0x0D: "CertificateRequest",
+            0x0E: "ServerHelloDone",
             0x10: "ClientKeyExchange",
             0x14: "Finished",
             0x15: "CertificateVerify",
@@ -10158,6 +10422,20 @@ class TransportHTTPSManager:
             return "".join(chr(b) if 32 <= int(b) <= 126 else "." for b in raw[:n])
         except Exception:
             return "-"
+
+    def _flow_key(self, src_ip, sport, dst_ip, dport):
+        a = (str(src_ip), str(int(sport)))
+        b = (str(dst_ip), str(int(dport)))
+        return (a[0], a[1], b[0], b[1]) if a <= b else (b[0], b[1], a[0], a[1])
+
+    def _has_useful_tls_metadata(self, st: dict) -> bool:
+        return bool(
+            st.get("sni")
+            or st.get("alpn")
+            or st.get("cipher") is not None
+            or st.get("sans")
+            or st.get("tls_ver_neg")
+        )
 class TransportStratumManager:
     """
     Advanced Stratum observer/logger for LAN and pool traffic.
@@ -16133,119 +16411,137 @@ class TransportSteamManager:
         }
 class TransportQUICManager:
     """
-    QUIC (UDP/443) parser & logger — advanced, low-overhead observer.
+    QUIC (usually UDP/443) parser, classifier, and low-overhead flow tracker.
 
-    Public API:
+    Goals
+    -----
+    - Correctly identify real QUIC traffic and avoid false positives.
+    - Track handshake stage, migration hints, CID rotation, ACK behavior,
+      path validation, and basic flow health.
+    - Keep parsing cheap enough that it does not become a bottleneck.
+    - Provide better signals to higher layers so noisy / broken traffic
+      causes fewer downstream request and cache errors.
+
+    Public API
+    ----------
         handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
         snapshot_metrics() -> dict
         clear_caches(kind: str | None = None) -> None
         set_detect_non443(enabled: bool) -> None
         set_budgets(bytes_budget: int | None = None, frames_budget: int | None = None) -> None
-        set_hook(name: str, fn: callable|None) -> None   # "qlog","event","anomaly"
+        set_hook(name: str, fn: callable | None) -> None     # "qlog", "event", "anomaly"
 
     Notes
     -----
-    • No decryption, no PN decode — we only peek headers & frame type bytes.
-    • Direction-aware (client→server vs server→client) using long-header type & port hints.
-    • Heuristics: address-validation & potential anti-amplification, GREASE/VN sanity, small Initials,
-      Retry/ODCID, NEW_CONNECTION_ID rotations, migration, loss-ish hints via ACK cadence, spin-bit RTT.
+    - No decryption.
+    - No packet-number decode.
+    - This is a classifier/observer/health tracker, not a full QUIC stack.
     """
 
-    # ---- Tunables ----------------------------------------------------
-    DETECT_NON443_DEFAULT    = False
-    FLOW_TTL_SEC             = 180
-    STREAM_TTL_SEC           = 300
-    CID_MAP_TTL_SEC          = 300
-    RL_INTERVAL_SEC          = 1.0
-    BYTES_BUDGET             = 1024     # bytes in payload tail to peek for frames
-    FRAMES_BUDGET            = 12       # max frames to label per packet
-    GC_PERIOD_SEC            = 60
-    SHORT_DCID_LEN           = 8        # preview only; impl-dependent in practice
-    PROGRESS_PKTS_MOD        = 64
-    PROGRESS_BYTE_MILESTONES = (1024, 4096, 16384, 65536, 262144, 1048576)
+    DETECT_NON443_DEFAULT = False
 
-    # Global token bucket (for *log lines*, not packets)
-    LOG_RPS                  = 4.0
-    LOG_BURST                = 40
+    FLOW_TTL_SEC = 180
+    STREAM_TTL_SEC = 300
+    CID_MAP_TTL_SEC = 300
+    RL_INTERVAL_SEC = 1.0
+    GC_PERIOD_SEC = 60
 
-    # Cadence buckets (ms) for progress logs
-    CADENCE_BUCKETS_MS       = (10, 25, 50, 100, 250, 500, 1000, 2000)
+    BYTES_BUDGET = 1536
+    FRAMES_BUDGET = 16
 
-    # Spec minimum UDP payload for Initial
-    INITIAL_MIN_BYTES        = 1200
+    INITIAL_MIN_BYTES = 1200
+    SHORT_DCID_PREVIEW_LEN = 8
 
-    # Loss-ish hints (very cheap, heuristic)
-    NO_ACK_WINDOW_PKTS       = 120  # if many ack-eliciting frames but no ACK sighted
+    LOG_RPS = 5.0
+    LOG_BURST = 40
 
-    # Amplification heuristic (server must not exceed ~3x before addr validation)
-    AMPLIFICATION_LIMIT      = 3.0
+    PROGRESS_PKTS_MOD = 64
+    PROGRESS_BYTE_MILESTONES = (1200, 4096, 16384, 65536, 262144, 1048576)
 
-    def __init__(self, router_logger, *,
-                 detect_non443_quic: Optional[bool] = None,
-                 bytes_budget: int = BYTES_BUDGET,
-                 frames_budget: int = FRAMES_BUDGET,
-                 hooks: Optional[Dict[str, Any]] = None):
+    AMPLIFICATION_LIMIT = 3.0
+    ACK_ELICITING_NO_ACK_THRESHOLD = 120
+    MAX_UNPARSEABLE_FRAMES_BEFORE_WARN = 8
+    MAX_PADDING_RUN_WARN = 256
+
+    CADENCE_BUCKETS_MS = (5, 10, 25, 50, 100, 250, 500, 1000, 2000)
+
+    def __init__(
+        self,
+        router_logger,
+        *,
+        detect_non443_quic: Optional[bool] = None,
+        bytes_budget: int = BYTES_BUDGET,
+        frames_budget: int = FRAMES_BUDGET,
+        hooks: Optional[Dict[str, Any]] = None,
+    ):
         self.log = router_logger
 
-        # Scapy bindings (guarded)
         try:
             from scapy.layers.inet import UDP as _UDP
             from scapy.packet import Raw as _Raw
-            self._UDP = _UDP; self._Raw = _Raw
+            self._UDP = _UDP
+            self._Raw = _Raw
         except Exception:
-            self._UDP = None; self._Raw = None
+            self._UDP = None
+            self._Raw = None
 
-        self.detect_non443_quic = self.DETECT_NON443_DEFAULT if detect_non443_quic is None else bool(detect_non443_quic)
-        self.bytes_budget  = max(64, int(bytes_budget))
+        self.detect_non443_quic = (
+            self.DETECT_NON443_DEFAULT if detect_non443_quic is None else bool(detect_non443_quic)
+        )
+        self.bytes_budget = max(128, int(bytes_budget))
         self.frames_budget = max(1, int(frames_budget))
 
-        # Flow state: (src,dst,sport,dport) -> dict
         self._flows: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
-
-        # CID -> last seen 5-tuple (migration)
-        self._cid_last_tuple: Dict[Tuple[str, str], Tuple[Tuple[str,str,int,int], float]] = {}
-
-        # First-sighting cache for STREAM* de-dupe
+        self._cid_last_tuple: Dict[Tuple[str, str], Tuple[Tuple[str, str, int, int], float]] = {}
         self.logged_quic_streams: Dict[Tuple[str, str, int], float] = {}
+        self._rl_last: Dict[Tuple[Any, ...], float] = {}
 
-        # Per-key RL (cheap)
-        self._rl_last: Dict[Tuple, float] = {}
-
-        # Global token bucket
-        self._tokens      = float(self.LOG_BURST)
+        self._tokens = float(self.LOG_BURST)
         self._last_refill = _t.time()
+        self._last_gc = _t.time()
 
-        # GC
-        self._last_gc     = _t.time()
+        self._hooks: Dict[str, Any] = hooks or {}
 
-        # Hooks
-        self._hooks: Dict[str, Any] = hooks or {}  # "qlog","event","anomaly"
-
-        # Stats (plus running version histogram)
         self._ver_hist: Dict[str, int] = {}
         self._stats: Dict[str, Any] = {
-            "seen": 0, "logged": 0, "errors": 0,
-            "grease": 0, "vn": 0, "vn_suspect": 0,
-            "retry": 0, "initial_small": 0,
-            "migrations": 0, "cid_rotations": 0,
-            "ack_elines": 0, "loss_hints": 0,
+            "seen": 0,
+            "accepted_quic": 0,
+            "rejected_non_quic": 0,
+            "logged": 0,
+            "errors": 0,
+            "grease": 0,
+            "vn": 0,
+            "retry": 0,
+            "initial_small": 0,
+            "migrations": 0,
+            "cid_rotations": 0,
+            "ack_frames": 0,
+            "ack_eliciting": 0,
+            "loss_hints": 0,
             "amplify_suspect": 0,
-            "suppressed_tokens": 0, "suppressed_cooldown": 0,
-            "gc_flows": 0, "gc_streams": 0, "gc_cids": 0,
+            "malformed": 0,
+            "undecryptable_short": 0,
+            "padding_floods": 0,
+            "suppressed_tokens": 0,
+            "suppressed_cooldown": 0,
+            "gc_flows": 0,
+            "gc_streams": 0,
+            "gc_cids": 0,
         }
 
         try:
-            self.log.log_message("[Transport][🌐 QUIC] Advanced++ manager ready.")
+            self.log.log_message("[Transport][🌐 QUIC] Improved manager ready.")
         except Exception:
             pass
 
     # -------------------- Public API --------------------
+
     def set_detect_non443(self, enabled: bool) -> None:
         self.detect_non443_quic = bool(enabled)
 
     def set_budgets(self, bytes_budget: Optional[int] = None, frames_budget: Optional[int] = None) -> None:
         if bytes_budget is not None:
-            self.bytes_budget = max(64, int(bytes_budget))
+            self.bytes_budget = max(128, int(bytes_budget))
         if frames_budget is not None:
             self.frames_budget = max(1, int(frames_budget))
 
@@ -16256,8 +16552,6 @@ class TransportQUICManager:
             self._hooks[name] = fn
 
     def snapshot_metrics(self) -> dict:
-        # Compact snapshot for dashboards
-        # Includes version histogram and current flow counts
         return {
             **self._stats,
             "flows": len(self._flows),
@@ -16278,11 +16572,13 @@ class TransportQUICManager:
         if kind is None or kind == "rl":
             self._rl_last.clear()
 
-    # -------------------- Public entry --------------------
+    # -------------------- Main entry --------------------
+
     def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
         try:
             self._stats["seen"] += 1
-            if self._UDP is None or self._Raw is None or not packet or not packet.haslayer(self._UDP):
+
+            if self._UDP is None or self._Raw is None or packet is None or not packet.haslayer(self._UDP):
                 return False
 
             on_443 = (sport == 443) or (dport == 443)
@@ -16290,151 +16586,162 @@ class TransportQUICManager:
                 return False
 
             raw = self._get_raw_bytes(packet)
-            mv = memoryview(raw) if raw else None
+            if not raw:
+                return False
+
+            mv = memoryview(raw)
             iface = self._iface_suffix(inbound_iface)
 
-            # Flow record
-            f = self._touch_flow(src_ip, dst_ip, sport, dport)
-            # Direction bytes accounting (rough): treat dst:443 as c→s, src:443 as s→c for non-LH too
-            direction = "c2s" if dport == 443 else ("s2c" if sport == 443 else "unk")
+            if not self._looks_like_quic(mv, sport, dport):
+                self._stats["rejected_non_quic"] += 1
+                return False
 
-            if not mv or len(mv) == 0:
-                self._log_once(("quic-hdr", src_ip, dst_ip, sport, dport),
-                               f"[Transport][🚀 UDP][🌐 QUIC] hdr-only {src_ip}:{sport} → {dst_ip}:{dport} on {iface}")
-                self._maybe_gc()
-                return True
+            self._stats["accepted_quic"] += 1
+
+            direction = "c2s" if dport == 443 else ("s2c" if sport == 443 else "unk")
+            flow = self._touch_flow(src_ip, dst_ip, sport, dport)
+            flow["pkts"] += 1
+            flow["bytes"] += len(raw)
+            self._bump_dir_bytes(flow, direction, len(raw))
+            self._touch_flow_cadence(flow)
 
             first = mv[0]
             is_long = bool(first & 0x80)
 
-            f["pkts"]  = f.get("pkts", 0) + 1
-            f["bytes"] = f.get("bytes", 0) + len(raw)
-            self._bump_dir_bytes(f, direction, len(raw))
-            self._touch_flow_cadence(f)
-
-            # --- Header parse & log ---
             hdr_len = 0
-            mig = False
-            log_suffix = ""
+            header_desc = ""
+            header_meta: Dict[str, Any] = {}
+
             if is_long:
-                msg, hdr_len, meta = self._format_long_header(mv)
-                self._flow_note(f, meta)
-                self._maybe_note_cid(meta, (src_ip, dst_ip, sport, dport))
-                self._maybe_version_hist(f.get("ver"))
+                header_desc, hdr_len, header_meta = self._parse_long_header(mv)
+                self._flow_note(flow, header_meta)
+                self._maybe_note_cid(header_meta, (src_ip, dst_ip, sport, dport))
+                self._maybe_version_hist(flow.get("ver"))
 
-                # Address validation signals
-                if meta.get("ptype") == 0 and dport == 443:
-                    # Client Initial: token_len>0 suggests validated or retry flow; store hint
-                    if meta.get("token_len", 0) > 0:
-                        f["client_token_seen"] = True
-
-                # Small Initial warning (client Initial commonly dport 443)
-                if meta.get("ptype") == 0 and dport == 443 and len(raw) < self.INITIAL_MIN_BYTES:
+                if header_meta.get("ptype") == 0 and dport == 443 and len(raw) < self.INITIAL_MIN_BYTES:
                     self._stats["initial_small"] += 1
-                    self._emit_anom("initial_small", f, src_ip, dst_ip, sport, dport, extra={"len": len(raw)})
-                    if self._allow_log(("quic-init-small", src_ip, dst_ip, sport, dport), cost=0.6):
-                        self._rate_log(f"[Transport][🚀 UDP][🌐 QUIC] Initial too small ({len(raw)}<1200) {src_ip}:{sport} → {dst_ip}:{dport} on {iface}")
-
-                # GREASE & VN
-                ver_raw = meta.get("version_raw")
-                if ver_raw is not None and self._looks_grease_ver(ver_raw):
-                    self._stats["grease"] += 1
-                if meta.get("ptype") == "VN" or meta.get("version") == "VN":
-                    self._stats["vn"] += 1
-                    if f.get("ver") not in (None, "VN") and self._allow_log(("quic-vn-sus", src_ip, dst_ip, sport, dport), 0.6):
-                        self._stats["vn_suspect"] += 1
-                        self._rate_log(f"[Transport][🚀 UDP][🌐 QUIC] VN after real ver — downgrade suspect? {src_ip}:{sport} → {dst_ip}:{dport} on {iface}")
-
-                if meta.get("retry_seen"):
-                    self._stats["retry"] += 1
-                    f["server_retry_seen"] = True
-
-                # Coalesced packet (heuristic): after first long header, see if another LH begins
-                coalesced = self._coalesced_count(mv, hdr_len)
-                if coalesced > 1:
-                    log_suffix += f" | COALESCED×{coalesced}"
-
-                msg_hdr = msg + log_suffix
-                if self._allow_log(("quic-h", src_ip, dst_ip, sport, dport)):
-                    line = f"[Transport][🚀 UDP][🌐 QUIC] {src_ip}:{sport} → {dst_ip}:{dport} on {iface}{msg_hdr}"
-                    self._rate_log(line)
-                    self._stats["logged"] += 1
-
-            else:
-                msg, hdr_len, sh = self._format_short_header(mv, first)
-                self._update_spin_rtt(f, sh.get("spin"))
-                self._update_kp(f, sh.get("kp"))
-                self._flow_note(f, sh)
-                self._maybe_note_cid({"dcid": sh.get("dcid_preview")}, (src_ip, dst_ip, sport, dport))
-                if self._allow_log(("quic-h", src_ip, dst_ip, sport, dport)):
-                    cad = self._cadence_bucket(self._interarrival_ms(f))
-                    line = f"[Transport][🚀 UDP][🌐 QUIC] {src_ip}:{sport} → {dst_ip}:{dport} on {iface}{msg} cadence={cad}"
-                    self._rate_log(line)
-                    self._stats["logged"] += 1
-
-            # Migration detection (same CID, new 5-tuple)
-            mig = self._detect_migration(f, (src_ip, dst_ip, sport, dport))
-            if mig:
-                self._stats["migrations"] += 1
-                self._emit_qlog("connection_migration", {"dcid": f.get("dcid"), "scid": f.get("scid")})
-                if self._allow_log(("quic-mig", src_ip, dst_ip, sport, dport), cost=0.8):
-                    self._rate_log(f"[Transport][🚀 UDP][🌐 QUIC] MIGRATION? {src_ip}:{sport} → {dst_ip}:{dport} on {iface}")
-
-            # --- Frames peek within budgets ---
-            if hdr_len < len(mv):
-                tail = mv[hdr_len:min(len(mv), hdr_len + self.bytes_budget)]
-                frames, hints = self._collect_quic_frames(tail, src_ip, dst_ip, self.frames_budget, f, direction)
-
-                # ack-eliciting heuristic count
-                if hints.get("ack_elines_delta"):
-                    f["ack_elines"] = f.get("ack_elines", 0) + hints["ack_elines_delta"]
-                    self._stats["ack_elines"] += hints["ack_elines_delta"]
-
-                # simple cid rotation detection from NCID sequence bumps
-                if hints.get("ncid_seq_increased"):
-                    self._stats["cid_rotations"] += 1
-
-                # mark last ACK seen time
-                if hints.get("ack_seen"):
-                    f["ack_seen_ts"] = _t.time()
-
-                # cheap loss-ish hint
-                if f.get("ack_seen_ts") is None and f.get("ack_elines", 0) > self.NO_ACK_WINDOW_PKTS:
-                    self._stats["loss_hints"] += 1
-                    self._emit_anom("no_ack_observed", f, src_ip, dst_ip, sport, dport)
-
-                # address validation & amplification heuristic
-                self._check_amplification(f)
-
-                if frames and self._allow_log(("quic-f", src_ip, dst_ip, sport, dport)):
-                    self._rate_log(
-                        f"[Transport][🚀 UDP][🌐 QUIC] {src_ip}:{sport} → {dst_ip}:{dport} on {iface} | " + ",".join(frames)
+                    self._emit_anom(
+                        "initial_too_small",
+                        flow,
+                        src_ip,
+                        dst_ip,
+                        sport,
+                        dport,
+                        {"udp_payload_len": len(raw)},
                     )
 
-            # Periodic progress beacon
-            self._maybe_progress(f, src_ip, dst_ip, sport, dport, iface)
+                if header_meta.get("retry_seen"):
+                    self._stats["retry"] += 1
 
+                if header_meta.get("version_raw") == 0:
+                    self._stats["vn"] += 1
+
+                if self._looks_grease_ver(header_meta.get("version_raw")):
+                    self._stats["grease"] += 1
+
+            else:
+                header_desc, hdr_len, header_meta = self._parse_short_header(mv, first)
+                self._flow_note(flow, header_meta)
+                self._maybe_note_cid({"dcid": header_meta.get("dcid_preview")}, (src_ip, dst_ip, sport, dport))
+                self._update_spin_rtt(flow, header_meta.get("spin"))
+                self._update_kp(flow, header_meta.get("kp"))
+
+            if hdr_len <= 0 or hdr_len > len(mv):
+                self._stats["malformed"] += 1
+                self._emit_anom("bad_header_len", flow, src_ip, dst_ip, sport, dport, {"hdr_len": hdr_len})
+                return True
+
+            migrated = self._detect_migration(flow, (src_ip, dst_ip, sport, dport))
+            if migrated:
+                self._stats["migrations"] += 1
+                self._emit_qlog(
+                    "migration_detected",
+                    {
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "sport": sport,
+                        "dport": dport,
+                        "dcid": flow.get("dcid"),
+                        "scid": flow.get("scid"),
+                    },
+                )
+
+            frames: List[str] = []
+            if hdr_len < len(mv):
+                budget_tail = mv[hdr_len:min(len(mv), hdr_len + self.bytes_budget)]
+                frames, hints = self._collect_quic_frames(
+                    budget_tail,
+                    src_ip,
+                    dst_ip,
+                    self.frames_budget,
+                    flow,
+                    direction,
+                )
+
+                if hints.get("ack_seen"):
+                    flow["ack_seen_ts"] = _t.time()
+                if hints.get("ack_frames"):
+                    self._stats["ack_frames"] += hints["ack_frames"]
+                if hints.get("ack_eliciting"):
+                    flow["ack_eliciting_pkts"] += hints["ack_eliciting"]
+                    self._stats["ack_eliciting"] += hints["ack_eliciting"]
+                if hints.get("cid_rotation"):
+                    self._stats["cid_rotations"] += hints["cid_rotation"]
+                if hints.get("padding_flood"):
+                    self._stats["padding_floods"] += 1
+                if hints.get("unparseable_short"):
+                    flow["undecryptable_short_count"] += hints["unparseable_short"]
+                    self._stats["undecryptable_short"] += hints["unparseable_short"]
+
+                self._check_ack_health(flow, src_ip, dst_ip, sport, dport)
+                self._check_amplification(flow, src_ip, dst_ip, sport, dport)
+
+            self._maybe_log_flow(src_ip, dst_ip, sport, dport, iface, header_desc, frames, flow)
+            self._maybe_progress(flow, src_ip, dst_ip, sport, dport, iface)
             self._maybe_gc()
             return True
 
         except Exception:
             self._stats["errors"] += 1
-            if self._rl(("quic-error", src_ip, dst_ip, sport, dport), 5.0):
-                try:
-                    self._rate_log(f"[Transport][🚀 UDP][🌐 QUIC] parse-error {src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)}")
-                except Exception:
-                    pass
+            if self._allow_log(("quic-error", src_ip, dst_ip, sport, dport), cost=0.6):
+                self._rate_log(
+                    f"[Transport][🚀 UDP][🌐 QUIC] parse-error {src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)}"
+                )
             return False
 
-    # -------------------- Header helpers --------------------
-    def _format_long_header(self, mv: memoryview) -> Tuple[str, int, Dict[str, Any]]:
-        """
-        Long header:
-          first(1) | version(4) | DCID len(1) | DCID | SCID len(1) | SCID | (type-specific…)
-        ptype = (first & 0x30)>>4: 0=Initial,1=0-RTT,2=Handshake,3=Retry
-        """
+    # -------------------- Detection --------------------
+
+    def _looks_like_quic(self, mv: memoryview, sport: int, dport: int) -> bool:
+        if len(mv) < 1:
+            return False
+
+        first = mv[0]
+        is_long = bool(first & 0x80)
+
+        if is_long:
+            if len(mv) < 7:
+                return False
+            version = int.from_bytes(mv[1:5], "big")
+            dcil = mv[5]
+            if dcil > 20:
+                return False
+            if 6 + dcil >= len(mv):
+                return False
+            return True
+
+        # Short header heuristic:
+        # must not look like TLS record header and should be UDP/443-related.
+        if len(mv) >= 3:
+            if mv[0] in (0x14, 0x15, 0x16, 0x17) and mv[1] == 0x03:
+                return False
+
+        return (sport == 443 or dport == 443)
+
+    # -------------------- Parsing --------------------
+
+    def _parse_long_header(self, mv: memoryview) -> Tuple[str, int, Dict[str, Any]]:
         L = len(mv)
-        if L < 6:
+        if L < 7:
             return " Long(malformed)", L, {}
 
         first = mv[0]
@@ -16443,340 +16750,541 @@ class TransportQUICManager:
         ver_name = self._quic_version_name(version)
 
         off = 5
-        dcid_len = mv[off]; off += 1
-        if off + dcid_len > L:
-            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID=?", L, {"ptype": ptype, "version": ver_name, "version_raw": version}
-
-        dcid = mv[off:off+dcid_len].tobytes().hex(); off += dcid_len
-        if off >= L:
-            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid} SCID=?", L, {"ptype": ptype, "version": ver_name, "version_raw": version, "dcid": dcid}
-
-        scid_len = mv[off]; off += 1
-        if off + scid_len > L:
-            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid} SCID=?", L, {"ptype": ptype, "version": ver_name, "version_raw": version, "dcid": dcid}
-
-        scid = mv[off:off+scid_len].tobytes().hex(); off += scid_len
-
-        # Version Negotiation (v==0): list of versions (4B each)
-        if version == 0:
-            vers = []
-            while off + 4 <= L and len(vers) < 16:
-                v = int.from_bytes(mv[off:off+4],'big'); off += 4
-                vers.append(f"0x{v:08x}")
-            msg = f" Long(VN) DCID:{dcid} SCID:{scid} offered={','.join(vers)}"
-            return msg, off, {"ptype": "VN", "version": "VN", "version_raw": 0, "dcid": dcid, "scid": scid}
-
-        # Initial: token_len(vint) + token + length(vint)
-        if ptype == 0:
-            token_len, n = self._read_varint_mv(mv, off)
-            if n == 0:
-                msg = f" Long(Initial) v={ver_name} DCID:{dcid} SCID:{scid}"
-                return msg, off, {"ptype": ptype, "version": ver_name, "version_raw": version, "dcid": dcid, "scid": scid}
-            off += n
-            # Skip token (opaque)
-            tskip = min(token_len, max(0, L - off))
-            off = min(L, off + tskip)
-            pay_len, n2 = self._read_varint_mv(mv, off)
-            if n2: off += n2
-            msg = f" Long(Initial) v={ver_name} DCID:{dcid} SCID:{scid} token_len:{token_len}" + (f" len:{pay_len}" if n2 else "")
-            return msg, off, {
-                "ptype": ptype, "version": ver_name, "version_raw": version,
-                "dcid": dcid, "scid": scid, "token_len": int(token_len)
+        dcil = mv[off]
+        off += 1
+        if off + dcil > L:
+            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} malformed", L, {
+                "ptype": ptype,
+                "version": ver_name,
+                "version_raw": version,
             }
 
-        # Retry: ODCID + token (opaque); ODCID len (impl-specific first byte)
+        dcid = mv[off:off + dcil].tobytes().hex()
+        off += dcil
+
+        if off >= L:
+            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid}", off, {
+                "ptype": ptype,
+                "version": ver_name,
+                "version_raw": version,
+                "dcid": dcid,
+            }
+
+        scil = mv[off]
+        off += 1
+        if off + scil > L:
+            return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid} malformed-scid", L, {
+                "ptype": ptype,
+                "version": ver_name,
+                "version_raw": version,
+                "dcid": dcid,
+            }
+
+        scid = mv[off:off + scil].tobytes().hex()
+        off += scil
+
+        if version == 0:
+            versions = []
+            scan = off
+            while scan + 4 <= L and len(versions) < 16:
+                vv = int.from_bytes(mv[scan:scan + 4], "big")
+                versions.append(f"0x{vv:08x}")
+                scan += 4
+            return (
+                f" Long(VN) DCID:{dcid} SCID:{scid} offered={','.join(versions)}",
+                scan,
+                {
+                    "ptype": "VN",
+                    "version": "VN",
+                    "version_raw": 0,
+                    "dcid": dcid,
+                    "scid": scid,
+                },
+            )
+
+        meta: Dict[str, Any] = {
+            "ptype": ptype,
+            "version": ver_name,
+            "version_raw": version,
+            "dcid": dcid,
+            "scid": scid,
+        }
+
+        if ptype == 0:
+            token_len, n1 = self._read_varint_mv(mv, off)
+            if n1 == 0:
+                return f" Long(Initial) v={ver_name} DCID:{dcid} SCID:{scid}", off, meta
+            off += n1
+            token_skip = min(int(token_len), max(0, L - off))
+            off += token_skip
+            plen, n2 = self._read_varint_mv(mv, off)
+            if n2:
+                off += n2
+            meta["token_len"] = int(token_len)
+            if n2:
+                meta["declared_len"] = int(plen)
+            return (
+                f" Long(Initial) v={ver_name} DCID:{dcid} SCID:{scid} token_len:{int(token_len)}"
+                + (f" len:{int(plen)}" if n2 else ""),
+                off,
+                meta,
+            )
+
+        if ptype == 1:
+            plen, n1 = self._read_varint_mv(mv, off)
+            if n1:
+                off += n1
+                meta["declared_len"] = int(plen)
+            return f" Long(0-RTT) v={ver_name} DCID:{dcid} SCID:{scid}", off, meta
+
+        if ptype == 2:
+            plen, n1 = self._read_varint_mv(mv, off)
+            if n1:
+                off += n1
+                meta["declared_len"] = int(plen)
+            return f" Long(Handshake) v={ver_name} DCID:{dcid} SCID:{scid}", off, meta
+
         if ptype == 3:
-            odcid = None
-            if off < L:
-                odcid_len = mv[off]
-                if 0 < (off + 1 + odcid_len) <= L:
-                    off += 1
-                    odcid = mv[off:off+odcid_len].tobytes().hex()
-                    off = off + odcid_len
-            msg = f" Long(Retry) v={ver_name} DCID:{dcid} SCID:{scid}" + (f" ODCID:{odcid}" if odcid else "")
-            return msg, off, {"ptype": ptype, "version": ver_name, "version_raw": version, "dcid": dcid, "scid": scid, "retry_seen": True}
+            meta["retry_seen"] = True
+            return f" Long(Retry) v={ver_name} DCID:{dcid} SCID:{scid}", off, meta
 
-        # 0-RTT/Handshake
-        msg = f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid} SCID:{scid}"
-        meta = {"ptype": ptype, "version": ver_name, "version_raw": version, "dcid": dcid, "scid": scid}
-        return msg, off, meta
+        return f" Long({self._quic_lh_type_name(ptype)}) v={ver_name} DCID:{dcid} SCID:{scid}", off, meta
 
-    def _format_short_header(self, mv: memoryview, first: int) -> Tuple[str, int, Dict[str, Any]]:
-        """
-        Short header: first(1) | DCID (impl-dependent len, often 8)
-        PN length in low 2 bits ( +1 ). Bits: spin (b5), key phase (b2).
-        """
-        dcid_len = min(self.SHORT_DCID_LEN, max(0, len(mv) - 1))
-        dcid = mv[1:1+dcid_len].tobytes().hex() if dcid_len > 0 else "?"
-        spin  = (first >> 5) & 1
-        kp    = (first >> 2) & 1
-        pnlen = (first & 0x03) + 1
-        msg = f" Short DCID:{dcid} spin:{spin} kp:{kp} pn:{pnlen}"
-        return msg, 1 + dcid_len, {"spin": spin, "kp": kp, "pn_len": pnlen, "dcid_preview": dcid}
+    def _parse_short_header(self, mv: memoryview, first: int) -> Tuple[str, int, Dict[str, Any]]:
+        dcid_len = min(self.SHORT_DCID_PREVIEW_LEN, max(0, len(mv) - 1))
+        dcid_preview = mv[1:1 + dcid_len].tobytes().hex() if dcid_len > 0 else "?"
+        spin = (first >> 5) & 0x01
+        kp = (first >> 2) & 0x01
+        pn_len = (first & 0x03) + 1
 
-    # -------------------- Frames (budgeted) --------------------
-    def _collect_quic_frames(self, mv: memoryview, src_ip: str, dst_ip: str,
-                             frames_budget: int, f: Dict[str, Any], direction: str) -> Tuple[List[str], Dict[str,int]]:
+        return (
+            f" Short DCID:{dcid_preview} spin:{spin} kp:{kp} pn:{pn_len}",
+            1 + dcid_len,
+            {
+                "spin": spin,
+                "kp": kp,
+                "pn_len": pn_len,
+                "dcid_preview": dcid_preview,
+            },
+        )
+
+    # -------------------- Frame parsing --------------------
+
+    def _collect_quic_frames(
+        self,
+        mv: memoryview,
+        src_ip: str,
+        dst_ip: str,
+        frames_budget: int,
+        flow: Dict[str, Any],
+        direction: str,
+    ) -> Tuple[List[str], Dict[str, int]]:
         out: List[str] = []
-        hints: Dict[str,int] = {}
-        i = 0; L = len(mv); parsed = 0
-        ack_seen = False
-        ack_elines_delta = 0
-        ncid_seq_increased = 0
+        hints: Dict[str, int] = {}
+
+        i = 0
+        L = len(mv)
+        parsed = 0
+        ack_seen = 0
+        ack_frames = 0
+        ack_eliciting = 0
+        cid_rotation = 0
+        padding_run = 0
+        unparseable_short = 0
 
         while i < L and parsed < frames_budget:
             fb = mv[i]
 
-            # STREAM 0x08..0x0F
-            if 0x08 <= fb <= 0x0F:
-                has_off = bool(fb & 0x04); has_len = bool(fb & 0x02); fin = bool(fb & 0x01)
-                i += 1
-                sid, n = self._read_varint_mv(mv, i);  i += n or 0
-                if n == 0: break
-                if has_off:
-                    _, n = self._read_varint_mv(mv, i);  i += n or 0
-                    if n == 0: break
-                dlen = None
-                if has_len:
-                    dlen, n = self._read_varint_mv(mv, i);  i += n or 0
-                    if n == 0: break
-                lbl = f"STREAM[{sid}]"
-                key = (src_ip, dst_ip, int(sid))
-                now = _t.time()
-                if key not in self.logged_quic_streams: lbl += "*"
-                self.logged_quic_streams[key] = now
-                if dlen is not None:
-                    lbl += f" len={int(dlen)}"
-                    i = min(L, i + int(dlen))
-                if fin: lbl += " FIN"
-                out.append(lbl); parsed += 1
-                ack_elines_delta += 1  # ack-eliciting
-                continue
-
-            # Cheap one-byte frames
-            if fb == 0x00:  # PADDING
-                out.append("PADDING"); i += 1; parsed += 1; continue
-            if fb == 0x01:  # PING
-                out.append("PING");    i += 1; parsed += 1; ack_elines_delta += 1; continue
-            if fb in (0x02, 0x03):  # ACK / ACK+ECN
-                out.append("ACK" + (" ECN" if fb==0x03 else "") + self._ack_ranges_hint(mv, i, f))
-                ack_seen = True
-                i += 1; parsed += 1; continue
-            if fb == 0x06: out.append("CRYPTO");  i += 1; parsed += 1; ack_elines_delta += 1; continue
-            if fb == 0x07: out.append("NEW_TOKEN"); i += 1; parsed += 1; continue
-            if fb == 0x04: out.append("RESET_STREAM"); i += 1; parsed += 1; ack_elines_delta += 1; continue
-            if fb == 0x05: out.append("STOP_SENDING"); i += 1; parsed += 1; ack_elines_delta += 1; continue
-
-            # Flow control & blocked
-            if fb == 0x10: out.append("MAX_DATA"); i += 1; parsed += 1; continue
-            if fb == 0x11: out.append("MAX_STREAM_DATA"); i += 1; parsed += 1; continue
-            if fb == 0x12: out.append("MAX_STREAMS[bidi]"); i += 1; parsed += 1; continue
-            if fb == 0x13: out.append("MAX_STREAMS[uni]");  i += 1; parsed += 1; continue
-            if fb == 0x14: out.append("DATA_BLOCKED"); i += 1; parsed += 1; continue
-            if fb == 0x15: out.append("STREAM_DATA_BLOCKED"); i += 1; parsed += 1; continue
-            if fb == 0x16: out.append("STREAMS_BLOCKED[bidi]"); i += 1; parsed += 1; continue
-            if fb == 0x17: out.append("STREAMS_BLOCKED[uni]");  i += 1; parsed += 1; continue
-
-            # CIDs & path validation
-            if fb == 0x18:  # NEW_CONNECTION_ID
-                i += 1
-                seq, n1 = self._read_varint_mv(mv, i); i += n1 or 0
-                if n1 == 0: break
-                _, n2 = self._read_varint_mv(mv, i);  i += n2 or 0  # retire_prio
-                if n2 == 0: break
-                if i >= L: break
-                cid_len = mv[i]; i += 1
-                i = min(L, i + cid_len)  # skip CID
-                i = min(L, i + 16)       # skip stateless reset token
-                out.append(f"NEW_CONNECTION_ID seq={seq}")
+            # Padding run compression
+            if fb == 0x00:
+                start = i
+                while i < L and mv[i] == 0x00:
+                    i += 1
+                run = i - start
+                padding_run += run
+                out.append(f"PADDINGx{run}" if run > 1 else "PADDING")
                 parsed += 1
-                ncid_seq_increased += 1
-                continue
-            if fb == 0x19: out.append("RETIRE_CONNECTION_ID"); i += 1; parsed += 1; continue
-            if fb == 0x1A:  # PATH_CHALLENGE
-                out.append("PATH_CHALLENGE"); i += 1; parsed += 1; ack_elines_delta += 1
-                # Sending PATH_CHALLENGE implies addr validation NOT yet confirmed
-                self._mark_addr_unvalidated(f, direction)
-                continue
-            if fb == 0x1B:  # PATH_RESPONSE
-                out.append("PATH_RESPONSE"); i += 1; parsed += 1
-                # Receiving PATH_RESPONSE implies addr validated for sender of CHALLENGE
-                self._mark_addr_validated(f, direction)
                 continue
 
-            # Close / handshake
-            if fb == 0x1C: out.append("CONNECTION_CLOSE[transport]"); i += 1; parsed += 1; break
-            if fb == 0x1D: out.append("CONNECTION_CLOSE[app]");       i += 1; parsed += 1; break
-            if fb == 0x1E: out.append("HANDSHAKE_DONE"); i += 1; parsed += 1; continue
+            if fb == 0x01:
+                out.append("PING")
+                ack_eliciting += 1
+                i += 1
+                parsed += 1
+                continue
 
-            # DATAGRAM extension
+            if fb in (0x02, 0x03):
+                hint = self._ack_ranges_hint(mv, i, flow)
+                out.append("ACK" + (" ECN" if fb == 0x03 else "") + hint)
+                ack_seen = 1
+                ack_frames += 1
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x04:
+                out.append("RESET_STREAM")
+                ack_eliciting += 1
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x05:
+                out.append("STOP_SENDING")
+                ack_eliciting += 1
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x06:
+                out.append("CRYPTO")
+                ack_eliciting += 1
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x07:
+                out.append("NEW_TOKEN")
+                i += 1
+                parsed += 1
+                continue
+
+            if 0x08 <= fb <= 0x0F:
+                i += 1
+                sid, n_sid = self._read_varint_mv(mv, i)
+                if n_sid == 0:
+                    unparseable_short += 1
+                    break
+                i += n_sid
+
+                has_off = bool(fb & 0x04)
+                has_len = bool(fb & 0x02)
+                fin = bool(fb & 0x01)
+
+                if has_off:
+                    _, n_off = self._read_varint_mv(mv, i)
+                    if n_off == 0:
+                        unparseable_short += 1
+                        break
+                    i += n_off
+
+                data_len = None
+                if has_len:
+                    data_len, n_len = self._read_varint_mv(mv, i)
+                    if n_len == 0:
+                        unparseable_short += 1
+                        break
+                    i += n_len
+
+                label = f"STREAM[{int(sid)}]"
+                stream_key = (src_ip, dst_ip, int(sid))
+                now = _t.time()
+                if stream_key not in self.logged_quic_streams:
+                    label += "*"
+                self.logged_quic_streams[stream_key] = now
+
+                if data_len is not None:
+                    label += f" len={int(data_len)}"
+                    i = min(L, i + int(data_len))
+
+                if fin:
+                    label += " FIN"
+
+                out.append(label)
+                ack_eliciting += 1
+                parsed += 1
+                continue
+
+            if fb == 0x10:
+                out.append("MAX_DATA")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x11:
+                out.append("MAX_STREAM_DATA")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x12:
+                out.append("MAX_STREAMS[bidi]")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x13:
+                out.append("MAX_STREAMS[uni]")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x14:
+                out.append("DATA_BLOCKED")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x15:
+                out.append("STREAM_DATA_BLOCKED")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x16:
+                out.append("STREAMS_BLOCKED[bidi]")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x17:
+                out.append("STREAMS_BLOCKED[uni]")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x18:
+                i += 1
+                seq, n1 = self._read_varint_mv(mv, i)
+                if n1 == 0:
+                    unparseable_short += 1
+                    break
+                i += n1
+
+                _, n2 = self._read_varint_mv(mv, i)
+                if n2 == 0:
+                    unparseable_short += 1
+                    break
+                i += n2
+
+                if i >= L:
+                    unparseable_short += 1
+                    break
+
+                cid_len = mv[i]
+                i += 1
+                i = min(L, i + cid_len)
+                i = min(L, i + 16)
+                out.append(f"NEW_CONNECTION_ID seq={int(seq)}")
+                cid_rotation += 1
+                parsed += 1
+                continue
+
+            if fb == 0x19:
+                out.append("RETIRE_CONNECTION_ID")
+                i += 1
+                parsed += 1
+                continue
+
+            if fb == 0x1A:
+                out.append("PATH_CHALLENGE")
+                ack_eliciting += 1
+                i += 1
+                parsed += 1
+                if direction == "s2c":
+                    flow["path_validation_pending"] = True
+                continue
+
+            if fb == 0x1B:
+                out.append("PATH_RESPONSE")
+                i += 1
+                parsed += 1
+                if direction == "c2s":
+                    flow["server_addr_validated"] = True
+                    flow["path_validation_pending"] = False
+                continue
+
+            if fb == 0x1C:
+                out.append("CONNECTION_CLOSE[transport]")
+                i += 1
+                parsed += 1
+                break
+
+            if fb == 0x1D:
+                out.append("CONNECTION_CLOSE[app]")
+                i += 1
+                parsed += 1
+                break
+
+            if fb == 0x1E:
+                out.append("HANDSHAKE_DONE")
+                flow["handshake_confirmed"] = True
+                i += 1
+                parsed += 1
+                continue
+
             if fb in (0x30, 0x31):
-                with_len = (fb == 0x31); i += 1
+                with_len = (fb == 0x31)
+                i += 1
                 if with_len:
                     dlen, n = self._read_varint_mv(mv, i)
-                    if n == 0: break
-                    i += n;  i = min(L, i + int(dlen))
+                    if n == 0:
+                        unparseable_short += 1
+                        break
+                    i += n
+                    i = min(L, i + int(dlen))
                     out.append(f"DATAGRAM len={int(dlen)}")
                 else:
                     out.append("DATAGRAM")
+                ack_eliciting += 1
                 parsed += 1
-                ack_elines_delta += 1
                 continue
 
-            out.append(f"0x{fb:02x}"); break
+            out.append(f"0x{fb:02x}")
+            unparseable_short += 1
+            break
 
         if ack_seen:
             hints["ack_seen"] = 1
-        if ack_elines_delta:
-            hints["ack_elines_delta"] = ack_elines_delta
-        if ncid_seq_increased:
-            hints["ncid_seq_increased"] = ncid_seq_increased
+        if ack_frames:
+            hints["ack_frames"] = ack_frames
+        if ack_eliciting:
+            hints["ack_eliciting"] = ack_eliciting
+        if cid_rotation:
+            hints["cid_rotation"] = cid_rotation
+        if padding_run >= self.MAX_PADDING_RUN_WARN:
+            hints["padding_flood"] = 1
+        if unparseable_short:
+            hints["unparseable_short"] = unparseable_short
+
         return out, hints
 
-    def _ack_ranges_hint(self, mv: memoryview, i: int, f: Dict[str, Any]) -> str:
-        # Try to read AckRangeCount to hint multiplicity; stay cheap
-        p = i + 1; L = len(mv)
-        _, n = self._read_varint_mv(mv, p);  p += n or 0  # LargestAcked
-        if n == 0: return ""
-        _, n = self._read_varint_mv(mv, p);  p += n or 0  # AckDelay
-        if n == 0: return ""
-        cnt, n = self._read_varint_mv(mv, p)
-        if n == 0: return ""
+    def _ack_ranges_hint(self, mv: memoryview, i: int, flow: Dict[str, Any]) -> str:
+        p = i + 1
+        _, n1 = self._read_varint_mv(mv, p)
+        if n1 == 0:
+            return ""
+        p += n1
+
+        _, n2 = self._read_varint_mv(mv, p)
+        if n2 == 0:
+            return ""
+        p += n2
+
+        cnt, n3 = self._read_varint_mv(mv, p)
+        if n3 == 0:
+            return ""
+
         try:
-            f["_last_ack_cnt"] = int(cnt)
+            flow["_last_ack_range_count"] = int(cnt)
         except Exception:
             pass
         return f" ranges={int(cnt)}"
 
-    # -------------------- Flow tracking & heuristics --------------------
+    # -------------------- Flow state --------------------
+
     def _touch_flow(self, src: str, dst: str, sport: int, dport: int) -> Dict[str, Any]:
         now = _t.time()
-        k = (src, dst, int(sport), int(dport))
-        f = self._flows.get(k)
-        if not f:
-            f = self._flows[k] = {
-                "ts": now, "pkts": 0, "bytes": 0,
-                "ver": None, "ptype": None, "dcid": None, "scid": None,
-                "spin": None, "kp": None, "pn_len": None,
+        key = (src, dst, int(sport), int(dport))
+        flow = self._flows.get(key)
+        if flow is None:
+            flow = {
+                "ts": now,
+                "pkts": 0,
+                "bytes": 0,
+                "ver": None,
+                "ver_raw": None,
+                "ptype": None,
+                "dcid": None,
+                "scid": None,
+                "spin": None,
+                "kp": None,
+                "pn_len": None,
                 "ring_ts": [],
                 "ack_seen_ts": None,
-                # Directional byte counters
-                "c2s_bytes": 0, "s2c_bytes": 0,
-                # Address validation heuristic states
+                "ack_eliciting_pkts": 0,
+                "c2s_bytes": 0,
+                "s2c_bytes": 0,
                 "server_addr_validated": False,
+                "path_validation_pending": False,
                 "client_token_seen": False,
                 "server_retry_seen": False,
-                # Spin RTT smoothing
-                "spin_last_val": None, "spin_last_ts": None, "spin_rtt_ms": None,
+                "handshake_confirmed": False,
+                "spin_last_val": None,
+                "spin_last_ts": None,
+                "spin_rtt_ms": None,
                 "kp_flips": 0,
+                "undecryptable_short_count": 0,
             }
+            self._flows[key] = flow
         else:
-            f["ts"] = now
+            flow["ts"] = now
+        return flow
 
-        # If last ACK count was recorded, mark ack sighting
-        if f.pop("_last_ack_cnt", None) is not None:
-            f["ack_seen_ts"] = now
-        return f
+    def _flow_note(self, flow: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        for key in ("version", "version_raw", "ptype", "dcid", "scid", "spin", "kp", "pn_len", "dcid_preview"):
+            if key not in meta:
+                continue
+            val = meta[key]
+            if val is None:
+                continue
+            if key == "version":
+                flow["ver"] = val
+            elif key == "version_raw":
+                flow["ver_raw"] = val
+            elif key == "ptype":
+                flow["ptype"] = val
+            elif key == "dcid_preview":
+                if not flow.get("dcid"):
+                    flow["dcid"] = val
+            else:
+                flow[key] = val
 
-    def _bump_dir_bytes(self, f: Dict[str, Any], direction: str, nbytes: int) -> None:
-        if direction == "c2s":
-            f["c2s_bytes"] = int(f.get("c2s_bytes", 0)) + int(nbytes)
-        elif direction == "s2c":
-            f["s2c_bytes"] = int(f.get("s2c_bytes", 0)) + int(nbytes)
-
-    def _mark_addr_unvalidated(self, f: Dict[str, Any], direction: str) -> None:
-        # If PATH_CHALLENGE is going s→c, server hasn't validated client address yet
-        if direction == "s2c":
-            # not validated until PATH_RESPONSE seen c→s
-            pass
-
-    def _mark_addr_validated(self, f: Dict[str, Any], direction: str) -> None:
-        # If PATH_RESPONSE goes c→s, server presumably validated client's addr
-        if direction == "c2s":
-            f["server_addr_validated"] = True
-
-    def _check_amplification(self, f: Dict[str, Any]) -> None:
-        # If server_address_validated is still False and s2c_bytes > 3 * c2s_bytes, flag
-        if f.get("server_addr_validated"):
-            return
-        c2s = int(f.get("c2s_bytes", 0))
-        s2c = int(f.get("s2c_bytes", 0))
-        if c2s == 0:
-            return
-        ratio = s2c / max(1, c2s)
-        if ratio > self.AMPLIFICATION_LIMIT:
-            self._stats["amplify_suspect"] += 1
-            self._emit_anom("amplification_suspect", f, "-", "-", 0, 0, extra={"ratio": ratio})
-
-    def _touch_flow_cadence(self, f: Dict[str, Any]) -> None:
+    def _touch_flow_cadence(self, flow: Dict[str, Any]) -> None:
         now = _t.time()
-        ring = f.setdefault("ring_ts", [])
+        ring = flow.setdefault("ring_ts", [])
         ring.append(now)
         if len(ring) > 8:
             del ring[0]
 
-    def _interarrival_ms(self, f: Dict[str, Any]) -> Optional[float]:
-        ring = f.get("ring_ts") or []
+    def _interarrival_ms(self, flow: Dict[str, Any]) -> Optional[float]:
+        ring = flow.get("ring_ts") or []
         if len(ring) < 2:
             return None
-        dt = max(0.0, ring[-1] - ring[-2])
-        return dt * 1000.0
+        return max(0.0, ring[-1] - ring[-2]) * 1000.0
 
     def _cadence_bucket(self, ms: Optional[float]) -> str:
         if ms is None:
             return "-"
-        for b in self.CADENCE_BUCKETS_MS:
-            if ms <= b:
-                return f"≤{b}ms"
+        for bucket in self.CADENCE_BUCKETS_MS:
+            if ms <= bucket:
+                return f"≤{bucket}ms"
         return f">{self.CADENCE_BUCKETS_MS[-1]}ms"
 
-    def _flow_note(self, f: Dict[str, Any], meta: Dict[str, Any]) -> None:
-        for k in ("version","version_raw","ptype","dcid","scid","spin","kp","pn_len","dcid_preview"):
-            if k not in meta: continue
-            v = meta[k]
-            if v is None: continue
-            if k == "version":
-                f["ver"] = v
-            elif k == "version_raw":
-                f["ver_raw"] = v
-            elif k == "ptype":
-                f["ptype"] = v
-            elif k == "dcid":
-                f["dcid"] = v
-            elif k == "scid":
-                f["scid"] = v
-            elif k == "dcid_preview" and not f.get("dcid"):
-                f["dcid"] = v
-            else:
-                f[k] = v
+    def _bump_dir_bytes(self, flow: Dict[str, Any], direction: str, nbytes: int) -> None:
+        if direction == "c2s":
+            flow["c2s_bytes"] += int(nbytes)
+        elif direction == "s2c":
+            flow["s2c_bytes"] += int(nbytes)
 
-    def _update_spin_rtt(self, f: Dict[str, Any], spin_bit: Optional[int]) -> None:
+    def _update_spin_rtt(self, flow: Dict[str, Any], spin_bit: Optional[int]) -> None:
         if spin_bit is None:
             return
-        now = _t.time()
-        last_v = f.get("spin_last_val")
-        if last_v is None:
-            f["spin_last_val"] = spin_bit
-            f["spin_last_ts"]  = now
-            return
-        if spin_bit != last_v:
-            last_ts = f.get("spin_last_ts") or now
-            # smooth: average with previous if present
-            rtt = max(0.0, (now - last_ts) * 1000.0)
-            prev = f.get("spin_rtt_ms")
-            f["spin_rtt_ms"] = rtt if prev is None else (0.5 * prev + 0.5 * rtt)
-            f["spin_last_val"] = spin_bit
-            f["spin_last_ts"]  = now
 
-    def _update_kp(self, f: Dict[str, Any], kp: Optional[int]) -> None:
+        now = _t.time()
+        last_val = flow.get("spin_last_val")
+        if last_val is None:
+            flow["spin_last_val"] = spin_bit
+            flow["spin_last_ts"] = now
+            return
+
+        if spin_bit != last_val:
+            last_ts = flow.get("spin_last_ts") or now
+            sample_ms = max(0.0, now - last_ts) * 1000.0
+            prev = flow.get("spin_rtt_ms")
+            flow["spin_rtt_ms"] = sample_ms if prev is None else (prev * 0.6 + sample_ms * 0.4)
+            flow["spin_last_val"] = spin_bit
+            flow["spin_last_ts"] = now
+
+    def _update_kp(self, flow: Dict[str, Any], kp: Optional[int]) -> None:
         if kp is None:
             return
-        last = f.get("kp")
-        if last is not None and kp != last:
-            f["kp_flips"] = int(f.get("kp_flips", 0)) + 1
-        f["kp"] = kp
+        old = flow.get("kp")
+        if old is not None and kp != old:
+            flow["kp_flips"] += 1
+        flow["kp"] = kp
 
-    def _maybe_note_cid(self, meta: Dict[str, Any], tup: Tuple[str,str,int,int]) -> None:
+    def _maybe_note_cid(self, meta: Dict[str, Any], tup: Tuple[str, str, int, int]) -> None:
         now = _t.time()
         dcid = meta.get("dcid")
         scid = meta.get("scid")
@@ -16785,53 +17293,132 @@ class TransportQUICManager:
         if scid:
             self._cid_last_tuple[("scid", scid)] = (tup, now)
 
-    def _detect_migration(self, f: Dict[str, Any], tup: Tuple[str,str,int,int]) -> bool:
+    def _detect_migration(self, flow: Dict[str, Any], tup: Tuple[str, str, int, int]) -> bool:
         now = _t.time()
-        dcid = f.get("dcid")
-        scid = f.get("scid")
-        mig = False
-        for tag, cid in (("dcid", dcid), ("scid", scid)):
-            if not cid: continue
+        migrated = False
+        for tag, cid in (("dcid", flow.get("dcid")), ("scid", flow.get("scid"))):
+            if not cid:
+                continue
             rec = self._cid_last_tuple.get((tag, cid))
             if rec:
-                last_tup, ts = rec
-                if last_tup != tup and (now - ts) < self.CID_MAP_TTL_SEC:
-                    mig = True
-                    self._emit_qlog("migration_detected", {"tag": tag, "cid": cid, "prev": last_tup, "now": tup})
+                old_tup, ts = rec
+                if old_tup != tup and (now - ts) < self.CID_MAP_TTL_SEC:
+                    migrated = True
             self._cid_last_tuple[(tag, cid)] = (tup, now)
-        return mig
+        return migrated
 
-    def _maybe_progress(self, f: Dict[str, Any], src: str, dst: str, sport: int, dport: int, iface: str) -> None:
-        pkts  = f.get("pkts", 0)
-        total = f.get("bytes", 0)
-        emit  = (pkts % self.PROGRESS_PKTS_MOD == 0) or (total in self.PROGRESS_BYTE_MILESTONES)
-        if not emit: return
-        if not self._take_token(): return
-        v = f.get("ver") or "-"
-        p = f.get("ptype")
-        ptxt = {0:"Initial",1:"0-RTT",2:"Handshake",3:"Retry"}.get(p, "-") if isinstance(p,int) else (p or "-")
-        cad = self._cadence_bucket(self._interarrival_ms(f))
-        spin_rtt = f.get("spin_rtt_ms")
-        spin_txt = "" if spin_rtt is None else f" rtt≈{int(spin_rtt)}ms"
-        kp_flips = f.get("kp_flips") or 0
-        kp_txt = f" kpΔ={kp_flips}" if kp_flips else ""
+    # -------------------- Health checks --------------------
+
+    def _check_ack_health(self, flow: Dict[str, Any], src_ip: str, dst_ip: str, sport: int, dport: int) -> None:
+        if flow.get("ack_seen_ts") is None and flow.get("ack_eliciting_pkts", 0) > self.ACK_ELICITING_NO_ACK_THRESHOLD:
+            self._stats["loss_hints"] += 1
+            self._emit_anom(
+                "ack_missing_under_load",
+                flow,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                {"ack_eliciting_pkts": flow.get("ack_eliciting_pkts", 0)},
+            )
+
+        if flow.get("undecryptable_short_count", 0) >= self.MAX_UNPARSEABLE_FRAMES_BEFORE_WARN:
+            self._emit_anom(
+                "excess_short_header_unparsed",
+                flow,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                {"count": flow.get("undecryptable_short_count", 0)},
+            )
+
+    def _check_amplification(self, flow: Dict[str, Any], src_ip: str, dst_ip: str, sport: int, dport: int) -> None:
+        if flow.get("server_addr_validated"):
+            return
+
+        c2s = int(flow.get("c2s_bytes", 0))
+        s2c = int(flow.get("s2c_bytes", 0))
+        if c2s <= 0:
+            return
+
+        ratio = s2c / max(1, c2s)
+        if ratio > self.AMPLIFICATION_LIMIT:
+            self._stats["amplify_suspect"] += 1
+            self._emit_anom(
+                "amplification_ratio_exceeded",
+                flow,
+                src_ip,
+                dst_ip,
+                sport,
+                dport,
+                {"ratio": ratio, "c2s_bytes": c2s, "s2c_bytes": s2c},
+            )
+
+    # -------------------- Logging --------------------
+
+    def _maybe_log_flow(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        iface: str,
+        header_desc: str,
+        frames: List[str],
+        flow: Dict[str, Any],
+    ) -> None:
+        key = ("quic-main", src_ip, dst_ip, sport, dport)
+        if not self._allow_log(key):
+            return
+
+        cadence = self._cadence_bucket(self._interarrival_ms(flow))
+        spin_rtt = flow.get("spin_rtt_ms")
+        spin_txt = f" rtt≈{int(spin_rtt)}ms" if spin_rtt is not None else ""
+        kp_txt = f" kpΔ={flow.get('kp_flips', 0)}" if flow.get("kp_flips", 0) else ""
+        frame_txt = f" | {','.join(frames)}" if frames else ""
+
         self._rate_log(
-            f"[Transport][🚀 UDP][🌐 QUIC] DATA ⏩ {src}:{sport} → {dst}:{dport} on {iface} bytes={total} pkts={pkts} v={v} t={ptxt} cadence={cad}{spin_txt}{kp_txt}"
+            f"[Transport][🚀 UDP][🌐 QUIC] {src_ip}:{sport} → {dst_ip}:{dport} on {iface}"
+            f"{header_desc} cadence={cadence}{spin_txt}{kp_txt}{frame_txt}"
+        )
+        self._stats["logged"] += 1
+
+    def _maybe_progress(self, flow: Dict[str, Any], src: str, dst: str, sport: int, dport: int, iface: str) -> None:
+        pkts = flow.get("pkts", 0)
+        total = flow.get("bytes", 0)
+
+        emit = (pkts % self.PROGRESS_PKTS_MOD == 0) or (total in self.PROGRESS_BYTE_MILESTONES)
+        if not emit:
+            return
+        if not self._take_token():
+            return
+
+        ver = flow.get("ver") or "-"
+        ptype = flow.get("ptype")
+        ptxt = {0: "Initial", 1: "0-RTT", 2: "Handshake", 3: "Retry"}.get(ptype, str(ptype) if ptype is not None else "-")
+        cadence = self._cadence_bucket(self._interarrival_ms(flow))
+        hsd = " confirmed" if flow.get("handshake_confirmed") else ""
+        spin_rtt = flow.get("spin_rtt_ms")
+        spin_txt = f" rtt≈{int(spin_rtt)}ms" if spin_rtt is not None else ""
+
+        self._rate_log(
+            f"[Transport][🚀 UDP][🌐 QUIC] DATA ⏩ {src}:{sport} → {dst}:{dport} on {iface}"
+            f" bytes={total} pkts={pkts} v={ver} t={ptxt}{hsd} cadence={cadence}{spin_txt}"
         )
 
-    # -------------------- Logging control --------------------
-    def _rl(self, key: Tuple, interval: float = RL_INTERVAL_SEC) -> bool:
-        t = _t.time()
+    def _rl(self, key: Tuple[Any, ...], interval: float = RL_INTERVAL_SEC) -> bool:
+        now = _t.time()
         last = self._rl_last.get(key, 0.0)
-        if (t - last) >= interval:
-            self._rl_last[key] = t
+        if (now - last) >= interval:
+            self._rl_last[key] = now
             return True
         return False
 
     def _refill_tokens(self) -> None:
         now = _t.time()
         dt = max(0.0, now - self._last_refill)
-        if dt:
+        if dt > 0:
             self._tokens = min(self.LOG_BURST, self._tokens + dt * self.LOG_RPS)
             self._last_refill = now
 
@@ -16843,17 +17430,13 @@ class TransportQUICManager:
         self._stats["suppressed_tokens"] += 1
         return False
 
-    def _allow_log(self, rl_key: Tuple, cost: float = 1.0) -> bool:
+    def _allow_log(self, rl_key: Tuple[Any, ...], cost: float = 1.0) -> bool:
         ok = self._rl(rl_key, self.RL_INTERVAL_SEC) and self._take_token(cost)
-        if not ok and rl_key in self._rl_last:
+        if not ok:
             self._stats["suppressed_cooldown"] += 1
         return ok
 
-    def _log_once(self, key: Tuple, line: str) -> None:
-        if self._rl(key, interval=5.0) and self._take_token():
-            self._rate_log(line)
-
-    def _rate_log(self, msg: str):
+    def _rate_log(self, msg: str) -> None:
         try:
             self.log.log_message(msg)
             self._emit_event("log", {"msg": msg})
@@ -16861,37 +17444,85 @@ class TransportQUICManager:
             pass
 
     # -------------------- GC --------------------
+
     def _maybe_gc(self) -> None:
         now = _t.time()
         if now - self._last_gc < self.GC_PERIOD_SEC:
             return
 
-        # Flows
-        expired = [k for k,v in self._flows.items() if now - v.get("ts", 0.0) > self.FLOW_TTL_SEC]
-        for k in expired:
+        expired_flows = [k for k, v in self._flows.items() if (now - v.get("ts", 0.0)) > self.FLOW_TTL_SEC]
+        for k in expired_flows:
             self._flows.pop(k, None)
 
-        # Streams
-        exp_s = [k for k, ts in self.logged_quic_streams.items() if now - ts > self.STREAM_TTL_SEC]
-        for k in exp_s:
+        expired_streams = [k for k, ts in self.logged_quic_streams.items() if (now - ts) > self.STREAM_TTL_SEC]
+        for k in expired_streams:
             self.logged_quic_streams.pop(k, None)
 
-        # CID→tuple map
-        exp_c = []
-        for k, (_, ts) in self._cid_last_tuple.items():
-            if now - ts > self.CID_MAP_TTL_SEC:
-                exp_c.append(k)
-        for k in exp_c:
+        expired_cids = [k for k, (_, ts) in self._cid_last_tuple.items() if (now - ts) > self.CID_MAP_TTL_SEC]
+        for k in expired_cids:
             self._cid_last_tuple.pop(k, None)
 
-        if expired or exp_s or exp_c:
-            self._rate_log(f"[Transport][🌐 QUIC] 🧹 GC flows={len(expired)} streams={len(exp_s)} cids={len(exp_c)}")
-        self._stats["gc_flows"] += len(expired)
-        self._stats["gc_streams"] += len(exp_s)
-        self._stats["gc_cids"] += len(exp_c)
+        self._stats["gc_flows"] += len(expired_flows)
+        self._stats["gc_streams"] += len(expired_streams)
+        self._stats["gc_cids"] += len(expired_cids)
+
+        if expired_flows or expired_streams or expired_cids:
+            self._rate_log(
+                f"[Transport][🌐 QUIC] 🧹 GC flows={len(expired_flows)} streams={len(expired_streams)} cids={len(expired_cids)}"
+            )
+
         self._last_gc = now
 
-    # -------------------- Small helpers --------------------
+    # -------------------- Hooks --------------------
+
+    def _emit_qlog(self, event_name: str, fields: Dict[str, Any]) -> None:
+        try:
+            fn = self._hooks.get("qlog")
+            if fn:
+                fn({"ev": event_name, **fields})
+        except Exception:
+            pass
+
+    def _emit_event(self, name: str, payload: Dict[str, Any]) -> None:
+        try:
+            fn = self._hooks.get("event")
+            if fn:
+                fn({"name": name, **payload})
+        except Exception:
+            pass
+
+    def _emit_anom(
+        self,
+        kind: str,
+        flow: Dict[str, Any],
+        sip: str,
+        dip: str,
+        sport: int,
+        dport: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            fn = self._hooks.get("anomaly")
+            if fn:
+                fn(
+                    {
+                        "kind": kind,
+                        "flow": {
+                            "src": sip,
+                            "dst": dip,
+                            "sport": sport,
+                            "dport": dport,
+                        },
+                        "ver": flow.get("ver"),
+                        "ptype": flow.get("ptype"),
+                        **(extra or {}),
+                    }
+                )
+        except Exception:
+            pass
+
+    # -------------------- Utilities --------------------
+
     def _get_raw_bytes(self, pkt) -> bytes:
         if self._Raw is None or not pkt.haslayer(self._Raw):
             return b""
@@ -16901,12 +17532,13 @@ class TransportQUICManager:
             return b""
 
     def _quic_lh_type_name(self, n: int) -> str:
-        return {0:"Initial",1:"0-RTT",2:"Handshake",3:"Retry"}.get(n, f"lh{n}")
+        return {0: "Initial", 1: "0-RTT", 2: "Handshake", 3: "Retry"}.get(n, f"lh{n}")
 
-    def _quic_version_name(self, ver: int) -> str:
+    def _quic_version_name(self, ver: Optional[int]) -> str:
+        if ver is None:
+            return "?"
         if ver == 0:
             return "VN"
-        # Known tags (expandable)
         table = {
             0x00000001: "v1",
             0x00000002: "v2",
@@ -16919,73 +17551,33 @@ class TransportQUICManager:
             return
         self._ver_hist[v] = self._ver_hist.get(v, 0) + 1
 
-    def _looks_grease_ver(self, ver: int) -> bool:
-        # GREASE pattern: 0x?a?a?a?a (each byte low nibble 0xA)
+    def _looks_grease_ver(self, ver: Optional[int]) -> bool:
+        if ver is None:
+            return False
         return (ver & 0x0F0F0F0F) == 0x0A0A0A0A
 
     def _read_varint_mv(self, mv: memoryview, p: int) -> Tuple[int, int]:
         L = len(mv)
-        if p >= L: return 0, 0
-        fb = mv[p]; prefix = fb >> 6; size = (1,2,4,8)[prefix]
-        if p + size > L: return 0, 0
-        if size == 1: return (fb & 0x3F), 1
-        if size == 2: return (int.from_bytes(mv[p:p+2],'big') & 0x3FFF), 2
-        if size == 4: return (int.from_bytes(mv[p:p+4],'big') & 0x3FFFFFFF), 4
-        return (int.from_bytes(mv[p:p+8],'big') & 0x3FFFFFFFFFFFFFFF), 8
+        if p >= L:
+            return 0, 0
+        fb = mv[p]
+        prefix = fb >> 6
+        size = (1, 2, 4, 8)[prefix]
+        if p + size > L:
+            return 0, 0
+        if size == 1:
+            return fb & 0x3F, 1
+        if size == 2:
+            return int.from_bytes(mv[p:p + 2], "big") & 0x3FFF, 2
+        if size == 4:
+            return int.from_bytes(mv[p:p + 4], "big") & 0x3FFFFFFF, 4
+        return int.from_bytes(mv[p:p + 8], "big") & 0x3FFFFFFFFFFFFFFF, 8
 
     def _iface_suffix(self, inbound_iface: Optional[str]) -> str:
         try:
             return (inbound_iface or "-").split("_")[-1]
         except Exception:
             return inbound_iface or "-"
-
-    def _coalesced_count(self, mv: memoryview, off: int) -> int:
-        """
-        Heuristic: count consecutive long-header segments in a coalesced UDP datagram.
-        We don't fully parse each — just spot the LH bit and ensure minimal structure.
-        """
-        cnt = 1
-        i = off
-        L = len(mv)
-        while (i + 6) <= L and (mv[i] & 0x80):
-            # Try to skip a minimally valid long header: 1 + 4 + 1 + dcid + 1 + scid
-            # We don't validate token/len here — purely a coarse indicator.
-            j = i + 1 + 4
-            if j >= L: break
-            if j + 1 > L: break
-            dlen = mv[j]; j += 1
-            if j + dlen + 1 > L: break
-            j += dlen
-            slen = mv[j]; j += 1
-            if j + slen > L: break
-            j += slen
-            cnt += 1
-            i = j
-        return max(1, cnt)
-
-    # -------------------- Hooks --------------------
-    def _emit_qlog(self, event_name: str, fields: Dict[str, Any]) -> None:
-        try:
-            fn = self._hooks.get("qlog")
-            if fn: fn({"ev": event_name, **fields})
-        except Exception:
-            pass
-
-    def _emit_event(self, name: str, payload: Dict[str, Any]) -> None:
-        try:
-            fn = self._hooks.get("event")
-            if fn: fn({"name": name, **payload})
-        except Exception:
-            pass
-
-    def _emit_anom(self, kind: str, f: Dict[str,Any], sip: str, dip: str, sport: int, dport: int, extra: Dict[str,Any] | None = None) -> None:
-        try:
-            fn = self._hooks.get("anomaly")
-            if fn:
-                fn({"kind": kind, "flow": {"src": sip, "dst": dip, "sport": sport, "dport": dport},
-                    "ver": f.get("ver"), "ptype": f.get("ptype"), **(extra or {})})
-        except Exception:
-            pass
 class TransportSSDPManager:
     """
     SSDP/UPnP logger & helper (fast-path).
@@ -18509,7 +19101,7 @@ class TransportMDNSManager:
         # trim cooldowns that are long past
         stale2 = [k for k,t in self._cooldown_until.items() if t < now - 2*self.FLOW_COOLDOWN_S]
         for k in stale2: self._cooldown_until.pop(k, None)
-        self._last_gc = now
+        self._last_gc = now 
 class TransportNBNSManager:
     """
     Minimal NetBIOS Name Service (NBNS, UDP/137) parser & logger.
