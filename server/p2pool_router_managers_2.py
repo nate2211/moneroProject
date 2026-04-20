@@ -27667,7 +27667,109 @@ class PythonServerManager:
         self.remote_ingest_default_iface = "RemoteAPI"
         self.remote_ingest_max_body_bytes = 2 * 1024 * 1024  # 2 MB safety cap
         self.remote_ingest_token = str(os.getenv("PYTHON_ROUTER_REMOTE_TOKEN", "") or "").strip()
-            
+
+        # --- Immortal runtime patch ---
+        self._last_successful_request_ts = time.time()
+        self._server_unhealthy_after_sec = 60.0
+
+        self._sse_client_timeout_sec = 300.0
+        self._sse_max_idle_heartbeats = 30
+
+        self._memory_soft_limit_mb = 1200
+        self._memory_hard_limit_mb = 1800
+        self._memory_last_gc_at = 0.0
+        self._memory_gc_min_interval_sec = 15.0
+
+        self._panic_mode_until = 0.0
+        self._panic_hold_sec = 20.0
+        self._last_overload_snapshot_at = 0.0
+
+        self._fault_snapshot_dir = "runtime_fault_snapshots"
+        try:
+            os.makedirs(self._fault_snapshot_dir, exist_ok=True)
+        except Exception:
+            pass
+    def _mark_server_activity(self) -> None:
+        self._last_successful_request_ts = time.time()
+
+    def _memory_usage_mb(self) -> float:
+        try:
+            import psutil
+            return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    def _write_fault_snapshot(self, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            snapshot = self.get_dashboard_snapshot()
+            payload = {
+                "ts": time.time(),
+                "reason": str(reason or "unknown"),
+                "extra": dict(extra or {}),
+                "snapshot": snapshot,
+            }
+            filename = os.path.join(
+                self._fault_snapshot_dir,
+                f"pythonserver_fault_{int(time.time() * 1000)}.json",
+            )
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_panic_mode_locked(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.time()
+
+        self._panic_mode_until = max(float(self._panic_mode_until), float(now) + float(self._panic_hold_sec))
+
+        self.store_raw_packets = False
+        self._raw_packet_ttl_sec = min(float(self._raw_packet_ttl_sec), 15.0)
+        self._flow_idle_ttl_sec = min(float(self._flow_idle_ttl_sec), 120.0)
+        self._raw_packet_count_limit = min(int(self._raw_packet_count_limit), 64)
+        self.raw_hex_preview_bytes = min(int(self.raw_hex_preview_bytes), 32)
+
+    def _panic_mode_active_locked(self, now: Optional[float] = None) -> bool:
+        if now is None:
+            now = time.time()
+        return float(now) < float(self._panic_mode_until or 0.0)
+
+    def _check_memory_pressure_locked(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.time()
+
+        rss_mb = self._memory_usage_mb()
+        if rss_mb <= 0.0:
+            return
+
+        if rss_mb >= float(self._memory_soft_limit_mb):
+            self._enter_degraded_mode(now, seconds=10.0)
+            self._apply_panic_mode_locked(now)
+
+            if (float(now) - float(self._memory_last_gc_at or 0.0)) >= float(self._memory_gc_min_interval_sec):
+                self._memory_last_gc_at = float(now)
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
+
+        if rss_mb >= float(self._memory_hard_limit_mb):
+            self._write_fault_snapshot("memory_hard_limit", {"rss_mb": round(rss_mb, 2)})
+
+            self._raw_packets.clear()
+            self._raw_packet_total_bytes = 0
+
+            while len(self._events) > max(200, self.max_events // 4):
+                self._events.popleft()
+
+            while len(self._packets) > max(200, self.max_packets // 4):
+                self._packets.popleft()
+
+            while len(self._flows) > max(256, self._max_flows // 4):
+                self._flows.popitem(last=False)
+
+            self._trim_prefix_buckets_locked(now, aggressive=True)
     def _normalize_bind_host(self, host: Any) -> str:
         value = str(host or "").strip()
         if not value or value.lower() in {"127.0.0.1", "localhost", "::1"}:
@@ -27787,18 +27889,52 @@ class PythonServerManager:
                 with self._lock:
                     if self._server_guard_stop.is_set() or self._stop_event.is_set():
                         return
+
                     thread = self._server_thread
+
                     if thread is not None and thread.is_alive():
                         if thread.is_ready():
-                            self._watchdog_backoff_sec = 1.0
-                            self._server_next_restart_not_before = 0.0
+                            idle_for = float(now - float(self._last_successful_request_ts or 0.0))
+                            if idle_for > float(self._server_unhealthy_after_sec):
+                                self._server_restart_count += 1
+                                self._write_fault_snapshot(
+                                    "wedged_live_thread",
+                                    {
+                                        "idle_for_sec": round(idle_for, 3),
+                                        "restart_count": int(self._server_restart_count),
+                                    },
+                                )
+                                try:
+                                    self.display_log(
+                                        "[PythonServer] watchdog detected unhealthy live server; forcing recycle",
+                                        source="PythonServer",
+                                        level="warning",
+                                        extra={"idle_for_sec": round(idle_for, 3)},
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    thread.shutdown()
+                                except Exception:
+                                    pass
+                                self._server_next_restart_not_before = now + 1.0
+                            else:
+                                self._watchdog_backoff_sec = 1.0
+                                self._server_next_restart_not_before = 0.0
                         continue
+
                     if now < float(self._server_next_restart_not_before or 0.0):
                         continue
+
                     self._server_restart_count += 1
+                    self._write_fault_snapshot(
+                        "server_thread_restart",
+                        {"restart_count": int(self._server_restart_count)},
+                    )
                     self._spawn_server_thread_locked(force=True)
                     self._server_next_restart_not_before = now + self._watchdog_backoff_sec
                     self._watchdog_backoff_sec = min(15.0, max(1.0, self._watchdog_backoff_sec * 1.5))
+
             except Exception as exc:
                 with self._lock:
                     self._record_internal_fault_locked("server_watchdog", exc, time.time())
@@ -28233,6 +28369,7 @@ class PythonServerManager:
 
                 if overloaded or (capture_heavy and float(pressure.get("pps") or 0.0) >= float(self._capture_soft_pps)):
                     self._enter_degraded_mode(now, seconds=max(self._overload_min_hold_sec, self.packet_window_sec / 4.0))
+                    self._apply_panic_mode_locked(now)
 
                 keep_flow = important or not capture_heavy or capture_keep or not overloaded
                 if keep_flow:
@@ -28248,7 +28385,14 @@ class PythonServerManager:
                 keep_event = important or capture_focus or not capture_heavy or (sampled_keep and not overloaded)
                 if keep_event:
                     self._push_event_locked(dict(rec))
-
+                if self._panic_mode_active_locked(now) and raw is not None and not important and not capture_focus:
+                    ex = rec.get("extra") if isinstance(rec.get("extra"), dict) else {}
+                    ex = dict(ex or {})
+                    ex.setdefault("raw_store", "skipped_due_to_panic_mode")
+                    ex.setdefault("raw_preview_hex", raw[: self.raw_hex_preview_bytes].hex())
+                    rec["extra"] = self._sanitize_extra(ex)
+                    rec["has_raw"] = False
+                    self._capture_burst_overruns += 1
                 generic_capture = capture_tool in {"wireshark", "tshark", "dumpcap", "capture"} and not capture_focus and not important
                 if raw is not None and not self._should_store_raw_packet_locked(rec, raw, now=now):
                     ex = rec.get("extra") if isinstance(rec.get("extra"), dict) else {}
@@ -28508,6 +28652,7 @@ class PythonServerManager:
 
     def _create_flask_app(self) -> Flask:
         app = Flask(__name__)
+        app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
         app.add_url_rule("/", "dashboard", self._route_dashboard, methods=["GET"])
         app.add_url_rule("/api/health", "api_health", self._route_api_health, methods=["GET"])
         app.add_url_rule("/api/stats", "api_stats", self._route_api_stats, methods=["GET"])
@@ -28555,6 +28700,7 @@ class PythonServerManager:
         return render_template_string(html)
 
     def _route_api_health(self) -> Response:
+        self._mark_server_activity()
         snap = self.get_dashboard_snapshot()
         return jsonify({
             "ok": True,
@@ -28567,12 +28713,15 @@ class PythonServerManager:
         })
 
     def _route_api_stats(self) -> Response:
+        self._mark_server_activity()
         return jsonify(self.get_dashboard_snapshot())
 
     def _route_api_log_prefixes(self) -> Response:
+        self._mark_server_activity()
         return jsonify({"items": self.get_log_prefixes(limit=self._int_arg("limit", 200, 1, 1000))})
 
     def _route_api_logs(self) -> Response:
+        self._mark_server_activity()
         prefix = request.args.get("prefix") or None
         items = self.get_logs(
             limit=self._int_arg("limit", 200, 1, 5000),
@@ -28597,6 +28746,7 @@ class PythonServerManager:
         })
 
     def _route_api_packets(self) -> Response:
+        self._mark_server_activity()
         include_raw = self._bool_arg("include_raw", False)
         include_hex_preview = self._bool_arg("include_hex_preview", True)
         after_id = self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX)
@@ -28622,12 +28772,14 @@ class PythonServerManager:
         })
 
     def _route_api_packet_raw(self, packet_id: int) -> Response:
+        self._mark_server_activity()
         raw = self.get_raw_packet(packet_id)
         if raw is None:
             return Response("packet not found", status=404, mimetype="text/plain")
         return Response(raw, mimetype="application/octet-stream")
 
     def _route_api_events(self) -> Response:
+        self._mark_server_activity()
         return jsonify({
             "items": self.get_events(
                 limit=self._int_arg("limit", 200, 1, 4000),
@@ -28639,22 +28791,49 @@ class PythonServerManager:
         last_id = int(after_id)
         heartbeat_sec = 10.0
         last_beat = time.time()
-        while not self._stop_event.is_set():
-            with self._event_cv:
-                items = [x for x in self._events if int(x.get("event_id", 0)) > int(last_id)]
-                if not items:
-                    self._event_cv.wait(timeout=1.0)
+        started_at = time.time()
+        idle_heartbeats = 0
+
+        try:
+            while not self._stop_event.is_set():
+                with self._event_cv:
                     items = [x for x in self._events if int(x.get("event_id", 0)) > int(last_id)]
-            if items:
-                for item in items:
-                    last_id = max(last_id, int(item.get("event_id", 0)))
-                    yield f"data: {json.dumps(item, separators=(",",":"))}\n\n"
-                last_beat = time.time()
-            elif (time.time() - last_beat) >= heartbeat_sec:
-                yield ": keepalive\n\n"
-                last_beat = time.time()
+                    if not items:
+                        self._event_cv.wait(timeout=1.0)
+                        items = [x for x in self._events if int(x.get("event_id", 0)) > int(last_id)]
+
+                if items:
+                    idle_heartbeats = 0
+                    for item in items:
+                        last_id = max(last_id, int(item.get("event_id", 0)))
+                        self._mark_server_activity()
+                        yield f"data: {json.dumps(item, separators=(',', ':'))}\n\n"
+                    last_beat = time.time()
+                elif (time.time() - last_beat) >= heartbeat_sec:
+                    idle_heartbeats += 1
+                    yield ": keepalive\n\n"
+                    last_beat = time.time()
+
+                if (time.time() - started_at) >= self._sse_client_timeout_sec:
+                    break
+                if idle_heartbeats >= self._sse_max_idle_heartbeats:
+                    break
+
+        except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            try:
+                self.display_log(
+                    f"[PythonServer] SSE stream fault: {type(exc).__name__}: {exc}",
+                    source="PythonServer",
+                    level="warning",
+                )
+            except Exception:
+                pass
+            return
 
     def _route_api_events_stream(self) -> Response:
+        self._mark_server_activity()
         after_id = self._int_arg("after_id", 0, 0, self.SAFE_JS_INT_MAX)
         resp = Response(self._events_stream_generator(after_id), mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -28665,6 +28844,7 @@ class PythonServerManager:
         return resp
 
     def _route_api_test_log(self) -> Response:
+        self._mark_server_activity()
         payload = request.get_json(silent=True) or {}
         item = self.display_log(
             payload.get("message") or "[PythonServer] test log",
@@ -29051,6 +29231,7 @@ class PythonServerManager:
             ?iface=RemoteMonero&delegate_from=WinDivertBridge
             or X-Router-Iface / X-Router-Delegate-From headers
         """
+        self._mark_server_activity()
         if not self._remote_ingest_authorized():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
