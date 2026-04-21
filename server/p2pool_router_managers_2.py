@@ -27886,43 +27886,21 @@ class PythonServerManager:
             try:
                 time.sleep(1.0)
                 now = time.time()
+
                 with self._lock:
                     if self._server_guard_stop.is_set() or self._stop_event.is_set():
                         return
 
                     thread = self._server_thread
 
+                    # Healthy if thread exists, is alive, and has bound successfully.
                     if thread is not None and thread.is_alive():
                         if thread.is_ready():
-                            idle_for = float(now - float(self._last_successful_request_ts or 0.0))
-                            if idle_for > float(self._server_unhealthy_after_sec):
-                                self._server_restart_count += 1
-                                self._write_fault_snapshot(
-                                    "wedged_live_thread",
-                                    {
-                                        "idle_for_sec": round(idle_for, 3),
-                                        "restart_count": int(self._server_restart_count),
-                                    },
-                                )
-                                try:
-                                    self.display_log(
-                                        "[PythonServer] watchdog detected unhealthy live server; forcing recycle",
-                                        source="PythonServer",
-                                        level="warning",
-                                        extra={"idle_for_sec": round(idle_for, 3)},
-                                    )
-                                except Exception:
-                                    pass
-                                try:
-                                    thread.shutdown()
-                                except Exception:
-                                    pass
-                                self._server_next_restart_not_before = now + 1.0
-                            else:
-                                self._watchdog_backoff_sec = 1.0
-                                self._server_next_restart_not_before = 0.0
+                            self._watchdog_backoff_sec = 1.0
+                            self._server_next_restart_not_before = 0.0
                         continue
 
+                    # Only restart dead / missing thread, not merely idle one.
                     if now < float(self._server_next_restart_not_before or 0.0):
                         continue
 

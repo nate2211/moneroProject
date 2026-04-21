@@ -28093,8 +28093,12 @@ class TransportManager:
         if self.packet_writer.should_drop_packet(packet, inbound_iface=iface_short, consume=True):
             return False
         if handler:
-            handler(packet, src_ip, dst_ip, sport, dport, iface_short)
-            self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
+            if handler == self._handle_tcp_ephemeral_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
+            else:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
             return True
 
         return False
@@ -28169,6 +28173,9 @@ class TransportManager:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
                 return True
+            elif handler == self._handle_udp_ephemeral_packet:
+                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+                return False
             else:
                 handler(packet, src_ip, dst_ip, sport, dport, iface_short)
                 self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)

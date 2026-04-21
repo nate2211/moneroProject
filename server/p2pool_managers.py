@@ -4526,38 +4526,355 @@ class WiresharkManager:
                 pass
         return ""
 
-    def _classify_application_layer(self, layers: Dict[str, Any], payload_bytes: bytes) -> tuple[str, str]:
+    def _classify_application_layer(
+            self,
+            layers: Dict[str, Any],
+            payload_bytes: bytes,
+            src_ip: str = "",
+            dst_ip: str = "",
+            src_port: int | str = 0,
+            dst_port: int | str = 0,
+            interface_id: str = "",
+    ) -> tuple[str, str]:
         """
         Returns (app_layer, detail).
-        app_layer examples: HTTP, TLS, DNS, JSON, JSON-RPC, XML, SOAP, MQTT, WS, TEXT, BINARY, UNKNOWN
-        """
-        text = self._decode_best_payload_text(payload_bytes)
-        text_l = text.lstrip() if text else ""
 
-        if "http" in layers:
-            http = layers.get("http", {})
-            if "http.request.method" in http:
-                return "HTTP", f"request {http.get('http.request.method', '')}".strip()
-            if "http.response.code" in http:
-                return "HTTP", f"response {http.get('http.response.code', '')}".strip()
+        app_layer examples:
+          HTTP, HTTP2, WS, TLS, QUIC, DNS, MDNS, SSDP, DHCP, DHCPv6, NTP, STUN,
+          TURN, JSON, JSON-RPC, XML, SOAP, MQTT, AMQP, Redis, Memcached, RTP,
+          RTSP, SIP, SMB, LDAP, KERBEROS, RDP, IKEv2, WireGuard, BitTorrent,
+          STRATUM, MONERO, TEXT, BINARY, UNKNOWN
+        """
+        sp = self._as_int(src_port, 0) or 0
+        dp = self._as_int(dst_port, 0) or 0
+        ports = {sp, dp}
+        text = self._decode_best_payload_text(payload_bytes) if payload_bytes else ""
+        text_l = text.lstrip() if text else ""
+        text_lower = text_l.lower() if text_l else ""
+        payload_len = len(payload_bytes or b"")
+
+        def has_layer(*names: str) -> bool:
+            return any(name in layers for name in names)
+
+        def first_layer(*names: str):
+            for name in names:
+                if name in layers:
+                    return layers.get(name)
+            return {}
+
+        def starts_with_bytes(prefix: bytes) -> bool:
+            return bool(payload_bytes and payload_bytes.startswith(prefix))
+
+        def contains_bytes(fragment: bytes) -> bool:
+            return bool(payload_bytes and fragment in payload_bytes)
+
+        # ----------------------------
+        # 1) tshark-decoded high confidence protocols
+        # ----------------------------
+
+        if has_layer("http2"):
+            h2 = first_layer("http2")
+            stream_id = ""
+            if isinstance(h2, dict):
+                stream_id = str(h2.get("http2.streamid", "") or "")
+            if "content-type" in text_lower and "application/grpc" in text_lower:
+                return "gRPC", f"http2 stream={stream_id}".strip()
+            return "HTTP2", f"stream={stream_id}".strip() if stream_id else "http2"
+
+        if has_layer("websocket"):
+            ws = first_layer("websocket")
+            opcode = ""
+            if isinstance(ws, dict):
+                opcode = str(ws.get("websocket.opcode", "") or "")
+            return "WS", f"opcode={opcode}" if opcode else "websocket"
+
+        if has_layer("http"):
+            http = first_layer("http")
+            if isinstance(http, dict):
+                if "http.request.method" in http:
+                    method = http.get("http.request.method", "")
+                    host = http.get("http.host", "")
+                    uri = http.get("http.request.full_uri", "") or http.get("http.request.uri", "")
+                    detail = f"request {method}".strip()
+                    if host or uri:
+                        detail += f" host={host} uri={uri}".strip()
+                    return "HTTP", detail.strip()
+                if "http.response.code" in http:
+                    code = http.get("http.response.code", "")
+                    return "HTTP", f"response {code}".strip()
             return "HTTP", "http"
 
-        if "ssl" in layers or "tls" in layers:
-            tls = layers.get("ssl", layers.get("tls", {}))
-            sni = tls.get("tls.handshake.extensions_server_name", "")
-            if sni:
-                return "TLS", f"sni={sni}"
+        if has_layer("tls", "ssl"):
+            tls = first_layer("tls", "ssl")
+            if isinstance(tls, dict):
+                sni = str(tls.get("tls.handshake.extensions_server_name", "") or "")
+                content_type = str(tls.get("tls.record.content_type", "") or "")
+                handshake_type = str(tls.get("tls.handshake.type", "") or "")
+                version = str(
+                    tls.get("tls.record.version", "") or
+                    tls.get("tls.handshake.version", "") or
+                    ""
+                )
+                bits = []
+                if sni:
+                    bits.append(f"sni={sni}")
+                if handshake_type:
+                    bits.append(f"hs={handshake_type}")
+                if version:
+                    bits.append(f"ver={version}")
+                if content_type:
+                    bits.append(f"ct={content_type}")
+                return "TLS", " ".join(bits).strip() if bits else "tls"
             return "TLS", "tls"
 
-        if "dns" in layers:
-            dns = layers.get("dns", {})
-            qname = dns.get("dns.qry.name", "")
-            if qname:
-                return "DNS", qname
-            return "DNS", "dns"
+        if has_layer("quic"):
+            quic = first_layer("quic")
+            if isinstance(quic, dict):
+                version = str(quic.get("quic.version", "") or "")
+                dcid = str(quic.get("quic.dcid", "") or "")
+                bits = []
+                if version:
+                    bits.append(f"ver={version}")
+                if dcid:
+                    bits.append(f"dcid={dcid}")
+                return "QUIC", " ".join(bits).strip() if bits else "quic"
+            return "QUIC", "quic"
+
+        if has_layer("dns"):
+            dns = first_layer("dns")
+            qname = ""
+            qtype = ""
+            if isinstance(dns, dict):
+                qname = str(dns.get("dns.qry.name", "") or "")
+                qtype = str(dns.get("dns.qry.type", "") or "")
+            if 5353 in ports:
+                return "MDNS", qname or "mdns"
+            if 5355 in ports:
+                return "LLMNR", qname or "llmnr"
+            return "DNS", f"{qname} ({qtype})".strip() if (qname or qtype) else "dns"
+
+        if has_layer("nbns"):
+            return "NBNS", "netbios-name-service"
+
+        if has_layer("ssdp"):
+            return "SSDP", "ssdp"
+
+        if has_layer("dhcp"):
+            return "DHCP", "dhcp"
+
+        if has_layer("dhcpv6"):
+            return "DHCPv6", "dhcpv6"
+
+        if has_layer("ntp"):
+            return "NTP", "ntp"
+
+        if has_layer("stun"):
+            stun = first_layer("stun")
+            if isinstance(stun, dict):
+                klass = str(stun.get("stun.class", "") or "")
+                method = str(stun.get("stun.method", "") or "")
+                detail = " ".join(x for x in (klass, method) if x).strip()
+                return "STUN", detail or "stun"
+            return "STUN", "stun"
+
+        if has_layer("turnchannel", "turn"):
+            return "TURN", "turn"
+
+        if has_layer("rtp"):
+            return "RTP", "rtp"
+
+        if has_layer("rtcp"):
+            return "RTCP", "rtcp"
+
+        if has_layer("sip"):
+            sip = first_layer("sip")
+            if isinstance(sip, dict):
+                method = str(sip.get("sip.Method", "") or sip.get("sip.method", "") or "")
+                return "SIP", method or "sip"
+            return "SIP", "sip"
+
+        if has_layer("rtsp"):
+            return "RTSP", "rtsp"
+
+        if has_layer("mqtt"):
+            mqtt = first_layer("mqtt")
+            if isinstance(mqtt, dict):
+                msgtype = str(mqtt.get("mqtt.msgtype", "") or "")
+                return "MQTT", f"type={msgtype}" if msgtype else "mqtt"
+            return "MQTT", "mqtt"
+
+        if has_layer("amqp"):
+            return "AMQP", "amqp"
+
+        if has_layer("redis"):
+            return "Redis", "resp"
+
+        if has_layer("memcache"):
+            return "Memcached", "memcache"
+
+        if has_layer("ldap"):
+            return "LDAP", "ldap"
+
+        if has_layer("kerberos"):
+            return "KERBEROS", "kerberos"
+
+        if has_layer("smb", "smb2"):
+            return "SMB", "smb"
+
+        if has_layer("rdp", "tpkt", "t125"):
+            return "RDP", "rdp"
+
+        if has_layer("isakmp", "ikev2"):
+            return "IKEv2", "ike"
+
+        if has_layer("bittorrent"):
+            return "BitTorrent", "bittorrent"
+
+        # ----------------------------
+        # 2) Strong port heuristics + binary signatures
+        # ----------------------------
+
+        # QUIC usually UDP/443 with long-header patterns
+        if "udp" in layers and 443 in ports and payload_len >= 1:
+            first = payload_bytes[0]
+            if first & 0x40 or first & 0x80:
+                return "QUIC", f"udp/443 first=0x{first:02x}"
+
+        # WireGuard: common ports 51820/udp etc. First message type byte often 1..4 in little-endian format
+        if "udp" in layers and any(p in ports for p in {51820, 51821, 51822}) and payload_len >= 4:
+            msg_type = int.from_bytes(payload_bytes[:4], "little", signed=False)
+            if msg_type in {1, 2, 3, 4}:
+                return "WireGuard", f"msg_type={msg_type}"
+
+        # STUN magic cookie 0x2112A442 at bytes 4:8
+        if "udp" in layers and payload_len >= 20 and payload_bytes[4:8] == b"\x21\x12\xa4\x42":
+            return "STUN", "magic-cookie"
+
+        # TLS handshake records
+        if payload_len >= 5:
+            content_type = payload_bytes[0]
+            version_major = payload_bytes[1]
+            version_minor = payload_bytes[2]
+            if content_type in {20, 21, 22, 23, 24} and version_major == 3:
+                if content_type == 22 and payload_len >= 6:
+                    hs_type = payload_bytes[5]
+                    hs_name = {
+                        1: "client_hello",
+                        2: "server_hello",
+                        11: "certificate",
+                        12: "server_key_exchange",
+                        14: "server_hello_done",
+                        16: "client_key_exchange",
+                        20: "finished",
+                    }.get(hs_type, f"hs={hs_type}")
+                    return "TLS", hs_name
+                return "TLS", f"record_type={content_type}"
+
+        # HTTP/2 client preface
+        if payload_bytes.startswith(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"):
+            return "HTTP2", "client-preface"
+
+        # WebSocket upgrade visible in HTTP headers
+        if "upgrade: websocket" in text_lower or "sec-websocket-key:" in text_lower:
+            return "WS", "http-upgrade"
+
+        # SSDP / UPnP
+        if 1900 in ports and (
+                text_l.startswith("M-SEARCH ") or
+                text_l.startswith("NOTIFY ") or
+                "ssdp:discover" in text_lower
+        ):
+            return "SSDP", "upnp"
+
+        # SIP text signaling
+        if 5060 in ports and (
+                text_l.startswith(("INVITE ", "REGISTER ", "ACK ", "BYE ", "OPTIONS ", "SIP/2.0"))
+        ):
+            return "SIP", "sip-text"
+
+        # RTSP text
+        if 554 in ports and (
+                text_l.startswith(("OPTIONS ", "DESCRIBE ", "SETUP ", "PLAY ", "PAUSE ", "TEARDOWN ", "RTSP/"))
+        ):
+            return "RTSP", "rtsp-text"
+
+        # MQTT fixed header heuristic
+        if payload_len >= 2 and any(p in ports for p in {1883, 8883}):
+            packet_type = (payload_bytes[0] >> 4) & 0x0F
+            if 1 <= packet_type <= 14:
+                return "MQTT", f"type={packet_type}"
+
+        # Redis RESP
+        if text_l.startswith(("*", "+", "-", ":", "$")) and any(
+                token in text_l[:64] for token in ["\r\n", "PING", "SET", "GET", "INFO", "AUTH"]
+        ):
+            if any(p in ports for p in {6379, 6380}):
+                return "Redis", "resp"
+
+        # Memcached ASCII
+        if any(p in ports for p in {11211, 11212}) and text_l.startswith(
+                ("get ", "set ", "add ", "replace ", "delete ", "incr ", "decr ", "VALUE ", "STAT ")
+        ):
+            return "Memcached", "ascii"
+
+        # BitTorrent handshake
+        if payload_len >= 20 and payload_bytes[:20].startswith(b"\x13BitTorrent protocol"):
+            return "BitTorrent", "handshake"
+
+        # ----------------------------
+        # 3) Mining / Monero / Stratum heuristics
+        # ----------------------------
+
+        if self._looks_like_json_text(text_l):
+            try:
+                obj = json.loads(text_l)
+                if isinstance(obj, dict):
+                    if "jsonrpc" in obj:
+                        method = str(obj.get("method", "") or "")
+                        params = obj.get("params", {})
+                        method_l = method.lower()
+
+                        if method_l in {"login", "submit", "job", "keepalived", "submit_hashrate"}:
+                            return "STRATUM", f"method={method}" if method else "stratum-jsonrpc"
+
+                        if method_l in {"get_block_template", "submit_block", "get_info", "get_height"}:
+                            return "MONERO", f"rpc={method}"
+
+                        if "blob" in str(text_l) and "target" in str(text_l):
+                            return "STRATUM", f"method={method or 'job'}"
+
+                        return "JSON-RPC", f"method={method}" if method else "json-rpc"
+
+                    if "method" in obj and "params" in obj:
+                        method = str(obj.get("method", "") or "")
+                        if method.lower() in {"mining.subscribe", "mining.authorize", "mining.notify", "mining.submit"}:
+                            return "STRATUM", f"method={method}"
+                        return "JSON", "method+params"
+
+                    if "id" in obj and ("result" in obj or "error" in obj):
+                        if any(k in text_lower for k in ("job", "blob", "target", "seed_hash", "height")):
+                            return "STRATUM", "result"
+                        return "JSON", "id+result"
+            except Exception:
+                pass
+
+        # Binary Monero/P2Pool-ish heuristic
+        if any(p in ports for p in
+               {18080, 28080, 38080, 41257, 37888, 37889, 3333, 4444, 5555, 6666, 7777, 8888, 9999}):
+            if payload_len:
+                if text_l and any(tok in text_lower for tok in
+                                  ("jsonrpc", "login", "submit", "job", "blob", "target", "seed_hash")):
+                    return "STRATUM", "port+json"
+                if contains_bytes(b"top_id") or contains_bytes(b"rpc_port") or contains_bytes(b"pruning_seed"):
+                    return "MONERO", "portable-storage-ish"
+                return "BINARY", f"mining-port {payload_len} bytes"
+
+        # ----------------------------
+        # 4) XML / SOAP / HTTP-ish / plain text
+        # ----------------------------
 
         if "xml" in layers or (text_l and (text_l.startswith("<?xml") or text_l.startswith("<"))):
-            if "soap" in text_l.lower() or ":envelope" in text_l.lower():
+            if "soap" in text_lower or ":envelope" in text_lower:
                 return "SOAP", "xml-soap"
             return "XML", "xml"
 
@@ -4576,17 +4893,44 @@ class WiresharkManager:
             except Exception:
                 return "JSON", "json-text"
 
-        if text_l:
-            if text_l.startswith("<?xml") or text_l.startswith("<"):
-                return "XML", "xml-ish"
+        if self._looks_like_xml_or_http_text(text_l):
             if text_l.startswith(("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "HTTP/")):
                 return "HTTP", "http-text"
-            return "TEXT", "text"
+            if text_l.startswith("<") or text_l.startswith("<?xml"):
+                return "XML", "xml-ish"
+
+        # ----------------------------
+        # 5) Generic text / binary fallback
+        # ----------------------------
+
+        if text_l:
+            printable = sum(1 for ch in text[: min(len(text), 256)] if ch.isprintable() or ch in "\r\n\t")
+            sample_len = max(1, min(len(text), 256))
+            ratio = printable / sample_len
+            if ratio > 0.85:
+                return "TEXT", f"printable={ratio:.2f}"
 
         if payload_bytes:
-            return "BINARY", f"{len(payload_bytes)} bytes"
+            entropy_hint = self._rough_entropy(payload_bytes[:512])
+            if entropy_hint >= 7.2:
+                return "BINARY", f"high-entropy {payload_len} bytes"
+            return "BINARY", f"{payload_len} bytes"
 
         return "UNKNOWN", ""
+
+    def _rough_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        from math import log2
+        counts = {}
+        for b in data:
+            counts[b] = counts.get(b, 0) + 1
+        total = len(data)
+        ent = 0.0
+        for c in counts.values():
+            p = c / total
+            ent -= p * log2(p)
+        return ent
 
     def _extract_best_payload_bytes(self, layers: Dict[str, Any]) -> Optional[bytes]:
         """
@@ -5445,7 +5789,15 @@ class WiresharkManager:
                 decoded_payload = ""
 
             try:
-                app_layer, app_detail = self._classify_application_layer(layers, payload_bytes)
+                app_layer, app_detail = self._classify_application_layer(
+                    layers,
+                    payload_bytes,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    src_port=src_port,
+                    dst_port=dst_port,
+                    interface_id=interface_id,
+                )
             except Exception:
                 app_layer, app_detail = "UNKNOWN", ""
 
