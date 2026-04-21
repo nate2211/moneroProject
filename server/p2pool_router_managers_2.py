@@ -27335,6 +27335,11 @@ class _SpaceSavingCounter:
         return len(self._counts) + (1 if self._other else 0)
 
 
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True          # worker threads won’t block shutdown
+    allow_reuse_address = True     # helps fast restart/rebind on Windows
+    request_queue_size = 256       # optional backlog bump
+
 class QuietWSGIRequestHandler(WSGIRequestHandler):
     """Silence default request/access logging from the embedded server."""
 
@@ -27352,7 +27357,7 @@ class _FlaskServerThread(threading.Thread):
         manager_logger: Optional[Callable[[str, str, Optional[Dict[str, Any]]], None]] = None,
         restart_delay_sec: float = 1.0,
     ) -> None:
-        super().__init__(daemon=True, name="PythonServerManager-Flask")
+        super().__init__(daemon=False, name="PythonServerManager-Flask")
         self._app = app
         self._host = str(host)
         self._port = int(port)
@@ -27389,7 +27394,7 @@ class _FlaskServerThread(threading.Thread):
             server = None
             ctx = None
             try:
-                server = make_server(self._host, self._port, self._app, handler_class=QuietWSGIRequestHandler)
+                server = make_server(self._host, self._port, self._app, handler_class=QuietWSGIRequestHandler, server_class=ThreadingWSGIServer)
                 ctx = self._app.app_context()
                 ctx.push()
                 with self._server_lock:
@@ -27876,7 +27881,7 @@ class PythonServerManager:
             return
         self._server_watchdog_thread = threading.Thread(
             target=self._server_watchdog_loop,
-            daemon=True,
+            daemon=False,
             name="PythonServerManager-Watchdog",
         )
         self._server_watchdog_thread.start()
