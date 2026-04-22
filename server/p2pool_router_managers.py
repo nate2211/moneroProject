@@ -28006,7 +28006,7 @@ class TransportManager:
             )
 
             with self._dispatch_lock:
-                return bool(self._handle_tcp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
+                return False
 
         if isinstance(transport_layer, UDP):
             sport = int(transport_layer.sport)
@@ -28034,7 +28034,7 @@ class TransportManager:
             )
 
             with self._dispatch_lock:
-                return bool(self._handle_udp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
+                return False
 
         try:
             self.transport_ipv6.handle(local_packet, inbound_iface)
