@@ -27335,7 +27335,7 @@ class _SpaceSavingCounter:
         return len(self._counts) + (1 if self._other else 0)
 
 
-class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+class ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
     daemon_threads = True          # worker threads won’t block shutdown
     allow_reuse_address = True     # helps fast restart/rebind on Windows
     request_queue_size = 256       # optional backlog bump
