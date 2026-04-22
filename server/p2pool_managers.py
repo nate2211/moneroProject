@@ -5339,14 +5339,14 @@ class WiresharkManager:
             return a.split("%", 1)[0] if isinstance(a, str) else None
 
         def build_capture_filter() -> str:
+
+            public_ip = str(getattr(self.router_manager, "public_ip_observed", "") or "").strip()
             # A list of BPF parts that will be joined with 'and'
             STR_BCAST_PART1 = 0x5354525f  # Represents "STR_"
             STR_BCAST_PART2 = 0x42434153  # Represents "BCAS"4
             parts = [
                 # 1. Basic IP traffic only
-                "(ip or ip6)",
-                "not arp",
-
+                f"(ip or ip6 or arp or host {public_ip})",
                 # 2. Filter Multicast and common Discovery/Chatter protocols
                 "not (ip multicast or ip6 multicast)",
                 "not (udp port 5353 or udp port 1900 or udp port 3702 or udp port 5355)",
