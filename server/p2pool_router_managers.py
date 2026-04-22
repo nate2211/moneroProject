@@ -27628,6 +27628,887 @@ class TransportUndecodedManager:
             "flows": out,
             "cooldowns": len(self._cooldown_until),
         }
+class TransportIkeManager:
+    """
+    Passive IKE / ISAKMP observer for UDP/500 and UDP/4500.
+
+    What it handles
+    ---------------
+    - IKEv1 / ISAKMP on UDP/500
+    - IKEv2 on UDP/500
+    - IKE over NAT-T on UDP/4500 when the Non-ESP marker is present
+    - NAT-T keepalives on UDP/4500 (single 0xFF)
+
+    What it intentionally does *not* consume
+    ----------------------------------------
+    - ESP-in-UDP on 4500 when there is no Non-ESP marker. That traffic should be
+      left for your ESP / NAT-T observer so managers do not fight each other.
+
+    Public API
+    ----------
+    - handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+    - handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+    - snapshot_metrics() -> dict
+    - snapshot_flows(limit=200) -> dict
+    - clear_caches() -> None
+    - set_hook(name, fn) -> None     # name in {"ike", "keepalive", "anomaly", "summary"}
+    - set_detect_offport(enabled) -> None
+
+    Notes
+    -----
+    - This is budgeted / peek-oriented. It does not attempt full crypto parsing.
+    - It can walk a few generic payload headers when the message is not clearly
+      encrypted, which gives you useful summaries like SA/KE/Nonce/Notify/VendorID.
+    - It recognizes IKEv1 and IKEv2 using the common 28-byte ISAKMP/IKE header.
+    """
+
+    FLOW_TTL_SEC = 15 * 60
+    FLOW_SOFT_MAX = 50_000
+    RL_INTERVAL_SEC = 1.0
+    BYTES_BUDGET = 2048
+    PAYLOAD_WALK_LIMIT = 8
+
+    PORT_IKE = 500
+    PORT_NATT = 4500
+
+    # Common header is always 28 bytes.
+    IKE_HDR_LEN = 28
+
+    IKEV1_EXCHANGE_NAMES = {
+        1: "Base",
+        2: "IdentityProtection",
+        3: "AuthenticationOnly",
+        4: "Aggressive",
+        5: "Informational",
+        32: "QuickMode",
+        33: "NewGroupMode",
+        34: "Acknowledged",
+    }
+
+    IKEV2_EXCHANGE_NAMES = {
+        34: "IKE_SA_INIT",
+        35: "IKE_AUTH",
+        36: "CREATE_CHILD_SA",
+        37: "INFORMATIONAL",
+        38: "IKE_SESSION_RESUME",
+        43: "IKE_INTERMEDIATE",
+    }
+
+    IKEV1_PAYLOAD_NAMES = {
+        0: "None",
+        1: "SA",
+        2: "Proposal",
+        3: "Transform",
+        4: "KE",
+        5: "ID",
+        6: "CERT",
+        7: "CR",
+        8: "HASH",
+        9: "SIG",
+        10: "Nonce",
+        11: "Notify",
+        12: "Delete",
+        13: "VendorID",
+        14: "Attr",
+        15: "NAT-D",
+        16: "NAT-OA",
+    }
+
+    IKEV2_PAYLOAD_NAMES = {
+        0: "None",
+        33: "SA",
+        34: "KE",
+        35: "IDi",
+        36: "IDr",
+        37: "CERT",
+        38: "CERTREQ",
+        39: "AUTH",
+        40: "Nonce",
+        41: "Notify",
+        42: "Delete",
+        43: "VendorID",
+        44: "TSi",
+        45: "TSr",
+        46: "SK",
+        47: "CP",
+        48: "EAP",
+        49: "GSPM",
+        50: "IDG",
+        53: "SKF",
+        54: "PS",
+    }
+
+    IKEV2_NOTIFY_NAMES = {
+        16384: "INITIAL_CONTACT",
+        16386: "SET_WINDOW_SIZE",
+        16387: "ADDITIONAL_TS_POSSIBLE",
+        16388: "NAT_DETECTION_SOURCE_IP",
+        16389: "NAT_DETECTION_DESTINATION_IP",
+        16390: "COOKIE",
+        16391: "USE_TRANSPORT_MODE",
+        16393: "REKEY_SA",
+        16394: "ESP_TFC_PADDING_NOT_SUPPORTED",
+        16396: "NON_FIRST_FRAGMENTS_ALSO",
+        16401: "MOBIKE_SUPPORTED",
+        16403: "NO_ADDITIONAL_ADDRESSES",
+        16404: "UPDATE_SA_ADDRESSES",
+        16405: "COOKIE2",
+        16406: "NO_NATS_ALLOWED",
+        16407: "AUTH_LIFETIME",
+        16417: "SIGNATURE_HASH_ALGORITHMS",
+        16430: "IKEV2_FRAGMENTATION_SUPPORTED",
+        16431: "SIGNATURE_HASH_ALGORITHMS_CERT",
+    }
+
+    def __init__(
+        self,
+        logger,
+        *,
+        detect_offport: bool = False,
+        bytes_budget: int = BYTES_BUDGET,
+        flow_ttl_sec: int = FLOW_TTL_SEC,
+        flow_soft_max: int = FLOW_SOFT_MAX,
+    ):
+        self.logger = logger
+        self.detect_offport = bool(detect_offport)
+        self.peek_cap = max(128, int(bytes_budget or self.BYTES_BUDGET))
+        self.flow_ttl_sec = max(60, int(flow_ttl_sec or self.FLOW_TTL_SEC))
+        self.flow_soft_max = max(1024, int(flow_soft_max or self.FLOW_SOFT_MAX))
+
+        self._lock = threading.RLock()
+        self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._last_gc = time.time()
+        self._last_summary = time.time()
+        self._summary_every = 60.0
+
+        self._metrics = {
+            "seen": 0,
+            "matched_udp": 0,
+            "ikev1": 0,
+            "ikev2": 0,
+            "natt": 0,
+            "natt_keepalive": 0,
+            "natt_non_esp": 0,
+            "partial": 0,
+            "notify": 0,
+            "nat_detect": 0,
+            "vendor_id": 0,
+            "retransmit_suspect": 0,
+            "invalid": 0,
+            "anomalies": 0,
+            "flow_cache_evictions": 0,
+            "active_flows": 0,
+            "errors": 0,
+        }
+
+        self._hooks: Dict[str, Optional[Callable[..., None]]] = {
+            "ike": None,
+            "keepalive": None,
+            "anomaly": None,
+            "summary": None,
+        }
+
+        self._safe_log("[Transport][🔐 IKE] Manager ready.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
+        return self.handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def handle_udp(self, packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
+        try:
+            sport_i = self._safe_port(sport)
+            dport_i = self._safe_port(dport)
+            if sport_i is None or dport_i is None:
+                return False
+
+            payload = self._extract_udp_payload(packet)
+            if payload is None:
+                return False
+
+            on_known_port = self._port_hit(self.PORT_IKE, (sport_i, dport_i)) or self._port_hit(self.PORT_NATT, (sport_i, dport_i))
+            if not on_known_port and not self.detect_offport:
+                return False
+
+            if not on_known_port and self.detect_offport and not self._quick_ike_signature(payload):
+                return False
+
+            parsed = self._parse_datagram(payload, sport_i, dport_i)
+            if not parsed:
+                return False
+
+            # Intentionally leave ESP-in-UDP/4500 to the ESP manager.
+            if parsed.get("kind") == "esp-natt":
+                return False
+
+            now = time.time()
+            key = self._flow_key(src_ip, sport_i, dst_ip, dport_i)
+            iface = self._iface_suffix(inbound_iface)
+
+            with self._lock:
+                st = self._flows.get(key)
+                if st is None:
+                    st = {
+                        "first": now,
+                        "last": now,
+                        "last_log": 0.0,
+                        "hits": 0,
+                        "initiator": None,
+                        "responder": None,
+                        "version": None,
+                        "last_msgid": None,
+                        "last_summary": None,
+                        "nat_t": False,
+                        "is_response_seen": False,
+                        "history": deque(maxlen=12),
+                    }
+                    self._flows[key] = st
+                else:
+                    st["last"] = now
+
+                self._metrics["seen"] += 1
+                st["hits"] = int(st.get("hits", 0) or 0) + 1
+
+                kind = parsed.get("kind")
+                if kind == "keepalive":
+                    self._metrics["matched_udp"] += 1
+                    self._metrics["natt_keepalive"] += 1
+                    st["nat_t"] = True
+                    st["last_summary"] = {
+                        "kind": "keepalive",
+                        "detail": "NAT-T keepalive",
+                    }
+                    do_log = self._should_log_locked(st, now)
+                elif kind == "ike":
+                    info = dict(parsed.get("info") or {})
+                    st["nat_t"] = bool(info.get("nat_t")) or bool(st.get("nat_t"))
+                    st["version"] = info.get("version_name") or st.get("version")
+                    self._learn_orientation_locked(st, src_ip, sport_i, dst_ip, dport_i, info)
+                    self._update_retransmit_locked(st, info)
+                    st["last_summary"] = info
+                    try:
+                        st["history"].append({
+                            "ts": now,
+                            "msgid": info.get("msgid"),
+                            "exchange": info.get("exchange_name"),
+                            "flags": info.get("flags_text"),
+                            "payloads": list(info.get("payload_names") or []),
+                        })
+                    except Exception:
+                        pass
+
+                    version_name = info.get("version_name")
+                    self._metrics["matched_udp"] += 1
+                    if version_name == "IKEv1":
+                        self._metrics["ikev1"] += 1
+                    elif version_name == "IKEv2":
+                        self._metrics["ikev2"] += 1
+                    if info.get("nat_t"):
+                        self._metrics["natt"] += 1
+                        self._metrics["natt_non_esp"] += 1
+                    if info.get("partial"):
+                        self._metrics["partial"] += 1
+                    if info.get("has_notify"):
+                        self._metrics["notify"] += 1
+                    if info.get("nat_detected"):
+                        self._metrics["nat_detect"] += 1
+                    if info.get("vendor_id_count"):
+                        self._metrics["vendor_id"] += int(info.get("vendor_id_count") or 0)
+                    do_log = self._should_log_locked(st, now)
+                else:
+                    self._metrics["invalid"] += 1
+                    do_log = self._should_log_locked(st, now)
+
+                self._metrics["active_flows"] = len(self._flows)
+                self._clean_if_needed_locked(now)
+
+            if parsed.get("kind") == "keepalive":
+                if do_log:
+                    self._safe_log(
+                        f"[Transport][🚀 UDP][🔐 IKE] NAT-T keepalive {src_ip}:{sport_i} → {dst_ip}:{dport_i} on {iface}"
+                    )
+                self._emit_hook("keepalive", {
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "sport": sport_i,
+                    "dport": dport_i,
+                    "iface": iface,
+                })
+                self._maybe_emit_summary(now)
+                return True
+
+            if parsed.get("kind") == "ike":
+                info = dict(parsed.get("info") or {})
+                if do_log:
+                    self._log_ike(src_ip, sport_i, dst_ip, dport_i, iface, info)
+                self._emit_hook("ike", {
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "sport": sport_i,
+                    "dport": dport_i,
+                    "iface": iface,
+                    **info,
+                })
+                if info.get("anomalies"):
+                    self._emit_hook("anomaly", {
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "sport": sport_i,
+                        "dport": dport_i,
+                        "iface": iface,
+                        "anomalies": list(info.get("anomalies") or []),
+                        **info,
+                    })
+                self._maybe_emit_summary(now)
+                return True
+
+            return False
+
+        except Exception:
+            with self._lock:
+                self._metrics["errors"] += 1
+            return False
+
+    def snapshot_metrics(self) -> dict:
+        with self._lock:
+            out = dict(self._metrics)
+            out["active_flows"] = len(self._flows)
+            return out
+
+    def snapshot_flows(self, limit: int = 200) -> dict:
+        with self._lock:
+            items = sorted(
+                self._flows.items(),
+                key=lambda kv: float(kv[1].get("last", 0.0) or 0.0),
+                reverse=True,
+            )[: max(1, int(limit))]
+
+            flows = []
+            for key, st in items:
+                sip, sport, dip, dport = key
+                flows.append({
+                    "src_ip": sip,
+                    "sport": int(sport),
+                    "dst_ip": dip,
+                    "dport": int(dport),
+                    "first": float(st.get("first", 0.0) or 0.0),
+                    "last": float(st.get("last", 0.0) or 0.0),
+                    "hits": int(st.get("hits", 0) or 0),
+                    "initiator": st.get("initiator"),
+                    "responder": st.get("responder"),
+                    "version": st.get("version"),
+                    "nat_t": bool(st.get("nat_t")),
+                    "last_msgid": st.get("last_msgid"),
+                    "last_summary": st.get("last_summary"),
+                    "history": list(st.get("history") or []),
+                })
+
+            return {"flows": flows}
+
+    def clear_caches(self) -> None:
+        with self._lock:
+            self._flows.clear()
+            self._metrics["active_flows"] = 0
+
+    def set_hook(self, name: str, fn: Optional[Callable[..., None]]) -> None:
+        if name not in self._hooks:
+            raise ValueError(f"Unsupported hook '{name}'")
+        self._hooks[name] = fn
+
+    def set_detect_offport(self, enabled: bool) -> None:
+        self.detect_offport = bool(enabled)
+
+    # ------------------------------------------------------------------
+    # Datagram parsing
+    # ------------------------------------------------------------------
+    def _parse_datagram(self, payload: bytes, sport: int, dport: int) -> Optional[Dict[str, Any]]:
+        if payload is None:
+            return None
+
+        raw = bytes(payload[: self.peek_cap])
+        if not raw:
+            return None
+
+        nat_t = False
+        offset = 0
+        on_500 = self._port_hit(self.PORT_IKE, (sport, dport))
+        on_4500 = self._port_hit(self.PORT_NATT, (sport, dport))
+
+        # UDP/4500 NAT-T keepalive is literally one 0xFF byte.
+        if on_4500 and len(raw) == 1 and raw[0] == 0xFF:
+            return {"kind": "keepalive"}
+
+        if on_4500:
+            if len(raw) >= 4 and raw[:4] == b"\x00\x00\x00\x00":
+                nat_t = True
+                offset = 4
+            else:
+                # Likely ESP-in-UDP rather than IKE. Do not consume here.
+                return {"kind": "esp-natt"}
+        elif on_500:
+            offset = 0
+        elif self.detect_offport:
+            if len(raw) >= 4 and raw[:4] == b"\x00\x00\x00\x00":
+                nat_t = True
+                offset = 4
+            else:
+                offset = 0
+        else:
+            return None
+
+        parsed = self._parse_ike_header(raw[offset:])
+        if not parsed:
+            return None
+
+        parsed["nat_t"] = nat_t
+        parsed["udp_offset"] = offset
+        return {"kind": "ike", "info": parsed}
+
+    def _parse_ike_header(self, raw: bytes) -> Optional[Dict[str, Any]]:
+        if len(raw) < self.IKE_HDR_LEN:
+            return None
+
+        try:
+            i_spi = raw[0:8]
+            r_spi = raw[8:16]
+            next_payload = raw[16]
+            ver_byte = raw[17]
+            exch = raw[18]
+            flags = raw[19]
+            msgid = int.from_bytes(raw[20:24], "big", signed=False)
+            total_len = int.from_bytes(raw[24:28], "big", signed=False)
+
+            major = (ver_byte >> 4) & 0x0F
+            minor = ver_byte & 0x0F
+            if major not in (1, 2):
+                return None
+            if total_len < self.IKE_HDR_LEN:
+                return None
+
+            version_name = "IKEv2" if major == 2 else "IKEv1"
+            exchange_name = self._exchange_name(version_name, exch)
+            next_payload_name = self._payload_name(version_name, next_payload)
+            flags_text = self._flags_text(version_name, flags)
+            partial = total_len > len(raw)
+
+            payload_walk = self._walk_payload_chain(
+                raw=raw,
+                version_name=version_name,
+                first_payload=next_payload,
+                header_flags=flags,
+                total_len=min(total_len, len(raw)),
+            )
+
+            payload_names = self._dedup_preserve([p.get("name") for p in payload_walk if p.get("name")])
+            anomalies: List[str] = []
+            if partial:
+                anomalies.append("partial")
+            if total_len > self.peek_cap:
+                anomalies.append("oversize")
+            if version_name == "IKEv1" and major == 1 and minor > 0:
+                anomalies.append("legacy-version")
+
+            notify_names = [p.get("notify_name") for p in payload_walk if p.get("notify_name")]
+            nat_detected = any(
+                name in ("NAT_DETECTION_SOURCE_IP", "NAT_DETECTION_DESTINATION_IP", "NAT-D")
+                for name in notify_names
+            )
+            has_notify = any(p.get("type") == "Notify" for p in payload_walk)
+            vendor_id_count = sum(1 for p in payload_walk if p.get("type") == "VendorID")
+            if nat_detected:
+                anomalies.append("nat-detect")
+
+            info = {
+                "version_name": version_name,
+                "version": f"{major}.{minor}",
+                "major": major,
+                "minor": minor,
+                "exchange": exch,
+                "exchange_name": exchange_name,
+                "next_payload": next_payload,
+                "next_payload_name": next_payload_name,
+                "flags": flags,
+                "flags_text": flags_text,
+                "msgid": msgid,
+                "length": total_len,
+                "partial": partial,
+                "i_spi": i_spi.hex(),
+                "r_spi": r_spi.hex(),
+                "is_response": bool(flags & 0x20) if version_name == "IKEv2" else False,
+                "is_initiator": bool(flags & 0x08) if version_name == "IKEv2" else None,
+                "nat_t": False,
+                "payloads": payload_walk,
+                "payload_names": payload_names,
+                "notify_names": self._dedup_preserve(notify_names),
+                "has_notify": has_notify,
+                "nat_detected": nat_detected,
+                "vendor_id_count": vendor_id_count,
+                "anomalies": self._dedup_preserve(anomalies),
+            }
+            return info
+        except Exception:
+            return None
+
+    def _walk_payload_chain(
+        self,
+        *,
+        raw: bytes,
+        version_name: str,
+        first_payload: int,
+        header_flags: int,
+        total_len: int,
+    ) -> List[Dict[str, Any]]:
+        # If the message is clearly encrypted already, do not pretend we can walk it.
+        if version_name == "IKEv1" and (header_flags & 0x01):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        payload_type = int(first_payload)
+        cursor = self.IKE_HDR_LEN
+        hard_end = min(len(raw), int(total_len))
+        steps = 0
+
+        while payload_type != 0 and steps < self.PAYLOAD_WALK_LIMIT:
+            steps += 1
+            if cursor + 4 > hard_end:
+                break
+
+            next_type = raw[cursor]
+            flags_reserved = raw[cursor + 1]
+            plen = int.from_bytes(raw[cursor + 2:cursor + 4], "big", signed=False)
+            if plen < 4:
+                break
+            if cursor + plen > hard_end:
+                plen = hard_end - cursor
+                if plen < 4:
+                    break
+
+            body = raw[cursor + 4: cursor + plen]
+            name = self._payload_name(version_name, payload_type)
+            entry: Dict[str, Any] = {
+                "id": int(payload_type),
+                "type": name,
+                "name": name,
+                "next": self._payload_name(version_name, next_type),
+                "length": int(plen),
+                "critical": bool(flags_reserved & 0x80) if version_name == "IKEv2" else False,
+            }
+
+            if name == "Notify":
+                notify = self._parse_notify_payload(version_name, body)
+                if notify:
+                    entry.update(notify)
+            elif name == "VendorID":
+                entry["vendor_len"] = len(body)
+            elif name == "Nonce":
+                entry["nonce_len"] = len(body)
+            elif name in ("KE", "SA", "TSi", "TSr", "CP", "EAP", "HASH", "SIG", "CERT"):
+                entry["body_len"] = len(body)
+
+            out.append(entry)
+
+            # In IKEv2, SK / SKF means everything after is encrypted / fragmented.
+            if version_name == "IKEv2" and name in ("SK", "SKF"):
+                break
+
+            payload_type = next_type
+            cursor += plen
+
+        return out
+
+    def _parse_notify_payload(self, version_name: str, body: bytes) -> Optional[Dict[str, Any]]:
+        try:
+            if version_name == "IKEv2":
+                if len(body) < 4:
+                    return None
+                protocol_id = body[0]
+                spi_size = body[1]
+                notify_type = int.from_bytes(body[2:4], "big", signed=False)
+                if len(body) < 4 + spi_size:
+                    return None
+                notify_name = self.IKEV2_NOTIFY_NAMES.get(notify_type, f"Notify({notify_type})")
+                return {
+                    "notify_type": notify_type,
+                    "notify_name": notify_name,
+                    "protocol_id": protocol_id,
+                    "spi_size": spi_size,
+                }
+
+            # IKEv1 Notify payload layout begins with DOI(4), Protocol-ID(1), SPI Size(1), Message Type(2)
+            if version_name == "IKEv1":
+                if len(body) < 8:
+                    return None
+                doi = int.from_bytes(body[0:4], "big", signed=False)
+                protocol_id = body[4]
+                spi_size = body[5]
+                notify_type = int.from_bytes(body[6:8], "big", signed=False)
+                return {
+                    "notify_type": notify_type,
+                    "notify_name": f"Notify({notify_type})",
+                    "protocol_id": protocol_id,
+                    "spi_size": spi_size,
+                    "doi": doi,
+                }
+        except Exception:
+            return None
+        return None
+
+    # ------------------------------------------------------------------
+    # Flow tracking / metrics
+    # ------------------------------------------------------------------
+    def _learn_orientation_locked(self, st: Dict[str, Any], src_ip: str, sport: int, dst_ip: str, dport: int, info: Dict[str, Any]) -> None:
+        version_name = info.get("version_name")
+        if version_name == "IKEv2":
+            if info.get("is_response"):
+                if st.get("initiator") is None:
+                    st["initiator"] = (dst_ip, int(dport))
+                if st.get("responder") is None:
+                    st["responder"] = (src_ip, int(sport))
+                st["is_response_seen"] = True
+            else:
+                if st.get("initiator") is None:
+                    st["initiator"] = (src_ip, int(sport))
+                if st.get("responder") is None:
+                    st["responder"] = (dst_ip, int(dport))
+        else:
+            if st.get("initiator") is None:
+                st["initiator"] = (src_ip, int(sport))
+            if st.get("responder") is None:
+                st["responder"] = (dst_ip, int(dport))
+
+    def _update_retransmit_locked(self, st: Dict[str, Any], info: Dict[str, Any]) -> None:
+        msgid = info.get("msgid")
+        exch = info.get("exchange_name")
+        prev_msgid = st.get("last_msgid")
+        prev_summary = st.get("last_summary") or {}
+
+        if prev_msgid is not None and msgid == prev_msgid:
+            if exch == prev_summary.get("exchange_name") and info.get("flags") == prev_summary.get("flags"):
+                self._metrics["retransmit_suspect"] += 1
+                try:
+                    anoms = list(info.get("anomalies") or [])
+                    anoms.append("retransmit-suspect")
+                    info["anomalies"] = self._dedup_preserve(anoms)
+                except Exception:
+                    pass
+
+        st["last_msgid"] = msgid
+
+    def _should_log_locked(self, st: Dict[str, Any], now: float) -> bool:
+        last = float(st.get("last_log", 0.0) or 0.0)
+        if (now - last) >= self.RL_INTERVAL_SEC:
+            st["last_log"] = now
+            return True
+        return False
+
+    def _clean_if_needed_locked(self, now: float) -> None:
+        if now - self._last_gc < 60.0:
+            return
+
+        stale = [
+            k for k, v in self._flows.items()
+            if now - float(v.get("last", now) or now) > self.flow_ttl_sec
+        ]
+        for k in stale:
+            self._flows.pop(k, None)
+
+        if len(self._flows) > self.flow_soft_max:
+            excess = len(self._flows) - self.flow_soft_max
+            victims = sorted(
+                self._flows.items(),
+                key=lambda kv: float(kv[1].get("last", 0.0) or 0.0),
+            )[:excess]
+            for k, _ in victims:
+                self._flows.pop(k, None)
+            self._metrics["flow_cache_evictions"] += excess
+
+        self._metrics["active_flows"] = len(self._flows)
+        self._last_gc = now
+
+    def _maybe_emit_summary(self, now: float) -> None:
+        if (now - self._last_summary) < self._summary_every:
+            return
+        self._last_summary = now
+        self._emit_hook("summary", self.snapshot_metrics())
+
+    # ------------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------------
+    def _log_ike(self, src_ip: str, sport: int, dst_ip: str, dport: int, iface: str, info: Dict[str, Any]) -> None:
+        bits: List[str] = []
+        bits.append(info.get("version_name") or "IKE")
+        bits.append(info.get("exchange_name") or f"exchange={info.get('exchange')}")
+        bits.append(f"msgid={info.get('msgid')}")
+        bits.append(f"flags={info.get('flags_text') or hex(int(info.get('flags', 0) or 0))}")
+        bits.append(f"next={info.get('next_payload_name') or info.get('next_payload')}")
+        bits.append(f"i_spi={self._short_spi(info.get('i_spi'))}")
+        bits.append(f"r_spi={self._short_spi(info.get('r_spi'))}")
+        if info.get("nat_t"):
+            bits.append("NAT-T")
+        if info.get("payload_names"):
+            bits.append("payloads=" + ",".join(info.get("payload_names") or []))
+        if info.get("notify_names"):
+            bits.append("notify=" + ",".join(info.get("notify_names") or []))
+        if info.get("partial"):
+            bits.append("partial")
+        if info.get("anomalies"):
+            bits.append("anom=" + ",".join(info.get("anomalies") or []))
+
+        self._safe_log(
+            f"[Transport][🚀 UDP][🔐 IKE] {src_ip}:{sport} → {dst_ip}:{dport} on {iface} | " + " ".join(bits)
+        )
+
+    def _safe_log(self, msg: str) -> None:
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            try:
+                self.logger(msg)
+            except Exception:
+                pass
+
+    def _emit_hook(self, name: str, payload: dict) -> None:
+        try:
+            fn = self._hooks.get(name)
+            if fn:
+                fn(payload)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Byte extraction / classification helpers
+    # ------------------------------------------------------------------
+    def _extract_udp_payload(self, packet) -> Optional[bytes]:
+        if packet is None:
+            return None
+
+        if isinstance(packet, (bytes, bytearray, memoryview)):
+            try:
+                raw = bytes(packet)
+                return raw[: self.peek_cap] if raw else b""
+            except Exception:
+                return None
+
+        try:
+            if UDP is not None and hasattr(packet, "haslayer") and packet.haslayer(UDP):
+                raw = bytes(packet[UDP].payload)
+                return raw[: self.peek_cap] if raw else b""
+        except Exception:
+            pass
+
+        try:
+            if Raw is not None and hasattr(packet, "haslayer") and packet.haslayer(Raw):
+                raw = bytes(packet[Raw].load)
+                return raw[: self.peek_cap] if raw else b""
+        except Exception:
+            pass
+
+        return None
+
+    def _quick_ike_signature(self, payload: bytes) -> bool:
+        raw = bytes(payload[: max(self.IKE_HDR_LEN + 4, 64)])
+        if len(raw) < self.IKE_HDR_LEN:
+            return False
+
+        offsets = [0]
+        if len(raw) >= self.IKE_HDR_LEN + 4 and raw[:4] == b"\x00\x00\x00\x00":
+            offsets.insert(0, 4)
+
+        for off in offsets:
+            if len(raw) < off + self.IKE_HDR_LEN:
+                continue
+            ver = raw[off + 17]
+            major = (ver >> 4) & 0x0F
+            total_len = int.from_bytes(raw[off + 24: off + 28], "big", signed=False)
+            if major in (1, 2) and total_len >= self.IKE_HDR_LEN:
+                return True
+        return False
+
+    @staticmethod
+    def _safe_port(value) -> Optional[int]:
+        try:
+            port = int(value)
+            if 0 <= port <= 65535:
+                return port
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _port_hit(port: int, ports: Tuple[int, int]) -> bool:
+        return int(ports[0]) == int(port) or int(ports[1]) == int(port)
+
+    def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple[str, str, str, str]:
+        a = (str(src_ip), str(int(sport)))
+        b = (str(dst_ip), str(int(dport)))
+        first, second = (a, b) if a <= b else (b, a)
+        return first + second
+
+    @staticmethod
+    def _iface_suffix(inbound_iface) -> str:
+        try:
+            s = str(inbound_iface or "")
+            return s.split("_")[-1] if "_" in s else s
+        except Exception:
+            return str(inbound_iface or "")
+
+    def _exchange_name(self, version_name: str, exch: int) -> str:
+        if version_name == "IKEv2":
+            return self.IKEV2_EXCHANGE_NAMES.get(int(exch), f"EXCH({int(exch)})")
+        return self.IKEV1_EXCHANGE_NAMES.get(int(exch), f"EXCH({int(exch)})")
+
+    def _payload_name(self, version_name: str, payload_id: int) -> str:
+        if version_name == "IKEv2":
+            return self.IKEV2_PAYLOAD_NAMES.get(int(payload_id), f"Payload({int(payload_id)})")
+        return self.IKEV1_PAYLOAD_NAMES.get(int(payload_id), f"Payload({int(payload_id)})")
+
+    def _flags_text(self, version_name: str, flags: int) -> str:
+        names: List[str] = []
+        if version_name == "IKEv2":
+            if flags & 0x08:
+                names.append("initiator")
+            if flags & 0x10:
+                names.append("higher-ver")
+            if flags & 0x20:
+                names.append("response")
+            unknown = flags & ~(0x08 | 0x10 | 0x20)
+            if unknown:
+                names.append(f"0x{unknown:02x}")
+        else:
+            if flags & 0x01:
+                names.append("encrypted")
+            if flags & 0x02:
+                names.append("commit")
+            if flags & 0x04:
+                names.append("auth-only")
+            unknown = flags & ~(0x01 | 0x02 | 0x04)
+            if unknown:
+                names.append(f"0x{unknown:02x}")
+        return ",".join(names) if names else "0"
+
+    @staticmethod
+    def _short_spi(spi_hex: Optional[str]) -> str:
+        s = str(spi_hex or "")
+        if not s:
+            return "-"
+        if len(s) <= 16:
+            return s
+        return s[:8] + "…" + s[-4:]
+
+    @staticmethod
+    def _dedup_preserve(items: List[Any]) -> List[Any]:
+        seen = set()
+        out = []
+        for item in items:
+            if item is None:
+                continue
+            key = item if isinstance(item, (str, int, float, bytes, tuple)) else repr(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
 class TransportManager:
     """
     Safer TransportManager for Hyper-V / WinDivert / WinTun environments.
@@ -27711,7 +28592,7 @@ class TransportManager:
             ports={3333, 4444, 5555, 7777, 9999},
             packet_writer=self.packet_writer
         )
-
+        self.transport_ike = TransportIkeManager(self.logger)
         self.transport_monero = TransportMoneroManager(
             self.logger,
             self.packet_writer,
@@ -28195,6 +29076,7 @@ class TransportManager:
         self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=False)
         return True
 
+
     # ---------------- existing protocol handlers ----------------
     def _handle_domain_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_domain.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
@@ -28257,7 +29139,12 @@ class TransportManager:
         self.transport_dns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_esp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_esp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        # First let IKE try:
+        # - UDP/500 IKEv1/IKEv2
+        # - UDP/4500 NAT-T keepalive / Non-ESP-marker IKE
+        handled = self.transport_ike.handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        if not handled:
+            self.transport_esp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_mdns_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_mdns.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
