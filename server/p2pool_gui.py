@@ -1,4 +1,5 @@
 import ctypes
+import os
 import queue
 import threading
 import asyncio
@@ -312,26 +313,58 @@ class P2PoolGUI(QMainWindow):
     def on_services_started(self):
         """
         Enables UI controls after checking for necessary privileges.
+        Allows a safe non-admin test mode for PacketManager / router-injection testing.
         """
         self.p2pool_tab.start_p2pool_button.setEnabled(True)
         self.wireshark_tab.start_wireshark_button.setEnabled(True)
         self.router_tab.start_router_button.setEnabled(True)
 
-        # Check for admin privileges for packet sending
-        if is_admin():
-            self.packet_logger.log_message("[+] Running with Administrator privileges. Packet sender enabled.")
+        packet_manager = self.packet_manager
+
+        # Explicit opt-in test mode
+        non_admin_test_mode = bool(
+            os.environ.get("P2POOL_ALLOW_NONADMIN_PACKET_TESTS", "").strip() == "1"
+        )
+
+        router_injection_available = bool(
+            getattr(packet_manager, "router", None) is not None
+            and hasattr(packet_manager.router, "process_packet")
+        )
+
+        allow_packet_tab = is_admin() or non_admin_test_mode or router_injection_available
+
+        if allow_packet_tab:
             self.packet_sender_tab.send_ping_button.setEnabled(True)
             self.packet_sender_tab.send_tcp_button.setEnabled(True)
             self.packet_sender_tab.send_udp_button.setEnabled(True)
             self.packet_sender_tab.send_dns_button.setEnabled(True)
+
+            if is_admin():
+                self.packet_logger.log_message(
+                    "[+] Running with Administrator privileges. Packet sender enabled."
+                )
+            elif router_injection_available:
+                self.packet_logger.log_message(
+                    "[TEST] Non-admin router-injection mode enabled. "
+                    "Packets will be tested through packet_manager.router.process_packet(...) when possible."
+                )
+            else:
+                self.packet_logger.log_message(
+                    "[TEST] Non-admin packet test mode enabled. "
+                    "Direct raw sends may still fail; use this for UI/queue/PacketManager testing."
+                )
         else:
             self.packet_logger.log_message("=" * 60)
             self.packet_logger.log_message("WARNING: Application not running as Administrator.")
             self.packet_logger.log_message(
-                "Packet sending functionality has been disabled to prevent crashes.")
+                "Packet sending functionality has been disabled to prevent crashes."
+            )
             self.packet_logger.log_message(
-                "Please restart the application with 'Run as Administrator' to use this tab.")
+                "Set P2POOL_ALLOW_NONADMIN_PACKET_TESTS=1 for test mode, "
+                "or run as Administrator for real direct sends."
+            )
             self.packet_logger.log_message("=" * 60)
+
             self.packet_sender_tab.send_ping_button.setEnabled(False)
             self.packet_sender_tab.send_tcp_button.setEnabled(False)
             self.packet_sender_tab.send_udp_button.setEnabled(False)

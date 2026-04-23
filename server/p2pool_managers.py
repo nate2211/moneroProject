@@ -4315,36 +4315,53 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
 class PacketManager:
     """
-    A stateless utility class for discovering network interfaces and sending various
-    types of packets. Each sending function is self-contained and requires
-    the interface to be specified on each call.
+    Packet builder + direct sender + router injector.
+
+    If self.router is bound and has process_packet(), packets are injected into
+    the router pipeline using the selected interface as the inbound interface.
+    Otherwise the manager falls back to direct Scapy send/sr1 behavior.
+
+    Public send_* signatures are preserved so PacketSendingThread can stay unchanged.
     """
 
     def __init__(self, packet_logger):
-        """
-        Initializes the PacketManager.
-        Args:
-            packet_logger: A logger instance for logging messages.
-        """
         self.packet_logger = packet_logger
         self._tshark_interfaces = []
         self._tshark_path = None
+        self.router = None
+        self.sniffer = None
         self._initialize_interface_discovery()
-        print("[PacketManager] Initialized and ready.")
+        self.packet_logger.log_message("[PacketManager] Initialized and ready.")
+
+    def set_router(self, router_instance):
+        self.router = router_instance
+        if router_instance is None:
+            self.packet_logger.log_message("[PacketManager] Router binding cleared.")
+        else:
+            self.packet_logger.log_message(
+                f"[PacketManager] Router bound: {router_instance.__class__.__name__}"
+            )
 
     def get_interfaces(self) -> List[dict]:
-        """Returns the list of discovered network interfaces."""
+        """
+        Prefer router-discovered interfaces when a router is bound and has them,
+        otherwise use PacketManager discovery.
+        """
+        try:
+            if self.router and hasattr(self.router, "_discovered_tshark_interfaces"):
+                router_ifaces = getattr(self.router, "_discovered_tshark_interfaces", None)
+                if router_ifaces:
+                    return list(router_ifaces)
+        except Exception:
+            pass
         return self._tshark_interfaces
 
     def _get_tshark_path(self) -> Optional[str]:
-        """Discovers the path to tshark.exe."""
         if getattr(sys, "frozen", False):
-            # Path for bundled executable
             tshark_exe = Path(sys._MEIPASS) / "tools" / "Wireshark" / "tshark.exe"
             if tshark_exe.exists():
                 return str(tshark_exe)
 
-        # Path for development environment
         server_dir = Path(__file__).resolve().parent
         project_root = server_dir.parent
         tools_dir = project_root / "client" / "tools" / "Wireshark"
@@ -4352,7 +4369,6 @@ class PacketManager:
         if candidate.exists():
             return str(candidate)
 
-        # Fallback to system PATH
         system_tshark = shutil.which("tshark")
         if system_tshark:
             return system_tshark
@@ -4361,113 +4377,293 @@ class PacketManager:
         return None
 
     def _initialize_interface_discovery(self):
-        """Discovers network interfaces using tshark -D and stores them."""
         self._tshark_path = self._get_tshark_path()
         if not self._tshark_path:
             return
+
         self.packet_logger.log_message("[PacketManager] Discovering network interfaces via tshark -D...")
         try:
             proc = subprocess.run(
-                [self._tshark_path, '-D'], capture_output=True, text=True, check=True,
+                [self._tshark_path, "-D"],
+                capture_output=True,
+                text=True,
+                check=True,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             pattern = re.compile(r"(\d+)\.\s+([^(]+)(?:\((.*)\))?")
-            for line in proc.stdout.strip().split('\n'):
+            self._tshark_interfaces.clear()
+
+            for line in proc.stdout.strip().split("\n"):
                 match = pattern.match(line)
                 if match:
                     self._tshark_interfaces.append({
-                        'id': match.group(1),
-                        'full_name': match.group(2).strip(),
-                        'friendly_name': match.group(3).strip() if match.group(3) else match.group(2).strip()
+                        "id": match.group(1),
+                        "full_name": match.group(2).strip(),
+                        "friendly_name": match.group(3).strip() if match.group(3) else match.group(2).strip()
                     })
-            self.packet_logger.log_message(f"[PacketManager] Discovered {len(self._tshark_interfaces)} interfaces.")
+
+            self.packet_logger.log_message(
+                f"[PacketManager] Discovered {len(self._tshark_interfaces)} interfaces."
+            )
         except Exception as e:
             self.packet_logger.log_message(f"[PacketManager] Error during interface discovery: {e}")
 
-    def send_ping(self, target_ip: str, iface: str, src_ip: Optional[str] = None, timeout: int = 2) -> Tuple[
-        str, Optional[Packet]]:
-        """Sends an ICMP Echo Request from a specific interface."""
+    def _resolve_inbound_iface(self, iface: Optional[str]) -> Optional[str]:
+        """
+        Accept either full tshark/scapy name or friendly name and return the
+        full inbound interface name that router.process_packet expects.
+        """
+        if not iface:
+            try:
+                if self.router:
+                    for cand in (
+                        getattr(self.router, "interface_in_full_name", None),
+                        getattr(self.router, "interface_loopback_full_name", None),
+                        getattr(self.router, "interface_ethernet_2_full_name", None),
+                        getattr(self.router, "interface_lac_full_name", None),
+                        getattr(self.router, "interface_lac_2_full_name", None),
+                    ):
+                        if cand:
+                            return cand
+            except Exception:
+                pass
+            return None
+
+        iface_str = str(iface).strip()
+
+        # Exact full-name match
+        for item in self.get_interfaces():
+            if str(item.get("full_name", "")).strip() == iface_str:
+                return iface_str
+
+        # Friendly-name match
+        iface_lower = iface_str.lower()
+        for item in self.get_interfaces():
+            if str(item.get("friendly_name", "")).strip().lower() == iface_lower:
+                return item.get("full_name")
+
+        return iface_str
+
+    def _can_use_router(self) -> bool:
+        return self.router is not None and hasattr(self.router, "process_packet")
+
+    def _inject_into_router(self, packet: Packet, iface: Optional[str], desc: str) -> Tuple[str, Optional[Packet]]:
+        """
+        Push a built packet into the router ingress pipeline.
+        """
+        if not self._can_use_router():
+            return "NO_ROUTER", None
+
+        inbound_iface = self._resolve_inbound_iface(iface)
+        if not inbound_iface:
+            self.packet_logger.log_message(
+                f"[PacketManager] No inbound iface resolved for router injection ({desc})."
+            )
+            return "NO_INTERFACE", None
+
+        try:
+            pkt = packet
+
+            # Reuse router coercion if present
+            coerce = getattr(self.router, "_coerce_ingress_packet", None)
+            if callable(coerce):
+                coerced = coerce(packet)
+                if coerced is not None:
+                    pkt = coerced
+
+            self.router.process_packet(pkt, inbound_iface)
+            self.packet_logger.log_message(
+                f"[PacketManager] Injected {desc} into router via {inbound_iface.split('_')[-1]}"
+            )
+            return "ROUTED", pkt
+
+        except Exception as e:
+            self.packet_logger.log_message(
+                f"[PacketManager] Router injection failed for {desc}: {e}"
+            )
+            return "ERROR", None
+
+    def _direct_sr1(self, packet: Packet, iface: Optional[str], timeout: int):
+        """
+        Prefer self.sniffer.sr1 when available, otherwise use Scapy sr1.
+        """
+        try:
+            if self.sniffer is not None and hasattr(self.sniffer, "sr1"):
+                try:
+                    return self.sniffer.sr1(packet, timeout=timeout, verbose=0, iface=iface)
+                except TypeError:
+                    return self.sniffer.sr1(packet, timeout=timeout, verbose=0)
+        except Exception:
+            pass
+
+        try:
+            return sr1(packet, timeout=timeout, verbose=0, iface=iface)
+        except TypeError:
+            return sr1(packet, timeout=timeout, verbose=0)
+
+    def _direct_send(self, packet: Packet, iface: Optional[str]) -> None:
+        try:
+            if self.sniffer is not None and hasattr(self.sniffer, "send"):
+                try:
+                    self.sniffer.send(packet, iface=iface)
+                    return
+                except TypeError:
+                    self.sniffer.send(packet)
+                    return
+        except Exception:
+            pass
+
+        try:
+            send(packet, verbose=0, iface=iface)
+        except TypeError:
+            send(packet, verbose=0)
+
+    def send_ping(
+        self,
+        target_ip: str,
+        iface: str,
+        src_ip: Optional[str] = None,
+        timeout: int = 2
+    ) -> Tuple[str, Optional[Packet]]:
         self.packet_logger.log_message(f"[PacketManager] Sending Ping to {target_ip} via {iface}...")
+
         try:
             packet = IP(dst=target_ip)
-            if src_ip: packet.src = src_ip
+            if src_ip:
+                packet.src = src_ip
             packet /= ICMP()
 
-            response = self.sniffer.sr1(packet, timeout=timeout, verbose=0)
+            if self._can_use_router():
+                return self._inject_into_router(packet, iface, f"ICMP Echo to {target_ip}")
 
-            if response is None: return 'TIMEOUT', None
-            if response.haslayer(ICMP) and response.getlayer(ICMP).type == 0: return 'REPLY', response
-            return 'UNEXPECTED_RESPONSE', response
+            response = self._direct_sr1(packet, iface, timeout)
+            if response is None:
+                return "TIMEOUT", None
+            if response.haslayer(ICMP) and response.getlayer(ICMP).type == 0:
+                return "REPLY", response
+            return "UNEXPECTED_RESPONSE", response
+
         except Exception as e:
             self.packet_logger.log_message(f"[Ping] Error sending on {iface}: {e}")
-            return 'ERROR', None
+            return "ERROR", None
 
-    def send_tcp_syn(self, target_ip: str, target_port: int, iface: str, src_ip: Optional[str] = None,
-                     timeout: int = 2) -> Tuple[str, Optional[Packet]]:
-        """Performs a TCP SYN scan for a single port from a specific interface."""
-        self.packet_logger.log_message(f"[PacketManager] Sending TCP SYN to {target_ip}:{target_port} via {iface}...")
+    def send_tcp_syn(
+        self,
+        target_ip: str,
+        target_port: int,
+        iface: str,
+        src_ip: Optional[str] = None,
+        timeout: int = 2
+    ) -> Tuple[str, Optional[Packet]]:
+        self.packet_logger.log_message(
+            f"[PacketManager] Sending TCP SYN to {target_ip}:{target_port} via {iface}..."
+        )
+
         try:
             packet = IP(dst=target_ip)
-            if src_ip: packet.src = src_ip
-            packet /= TCP(dport=target_port, sport=54321, flags='S')
+            if src_ip:
+                packet.src = src_ip
+            packet /= TCP(dport=target_port, sport=54321, flags="S")
 
-            response = sr1(packet, timeout=timeout, verbose=0)
+            if self._can_use_router():
+                return self._inject_into_router(packet, iface, f"TCP SYN to {target_ip}:{target_port}")
 
-            if response is None: return 'FILTERED', None
+            response = self._direct_sr1(packet, iface, timeout)
+
+            if response is None:
+                return "FILTERED", None
 
             if response.haslayer(TCP):
                 tcp_layer = response.getlayer(TCP)
-                if tcp_layer.flags == 0x12:  # SYN/ACK
+
+                if tcp_layer.flags == 0x12:  # SYN+ACK
                     rst_src_ip = response[IP].dst
                     rst_packet = IP(dst=target_ip, src=rst_src_ip) / TCP(
-                        dport=target_port, sport=packet[TCP].sport, flags='R', seq=tcp_layer.ack
+                        dport=target_port,
+                        sport=packet[TCP].sport,
+                        flags="R",
+                        seq=tcp_layer.ack
                     )
-                    send(rst_packet, verbose=0)
-                    return 'OPEN', response
-                elif tcp_layer.flags & 0x04:  # RST
-                    return 'CLOSED', response
+                    self._direct_send(rst_packet, iface)
+                    return "OPEN", response
 
-            return 'UNEXPECTED_RESPONSE', response
+                if tcp_layer.flags & 0x04:
+                    return "CLOSED", response
+
+            return "UNEXPECTED_RESPONSE", response
+
         except Exception as e:
             self.packet_logger.log_message(f"[TCP-SYN] Error sending on {iface}: {e}")
-            return 'ERROR', None
+            return "ERROR", None
 
-    def send_udp_packet(self, target_ip: str, target_port: int, payload: bytes, iface: str,
-                        src_ip: Optional[str] = None, timeout: int = 2) -> Tuple[str, Optional[Packet]]:
-        """Sends a UDP packet from a specific interface."""
-        self.packet_logger.log_message(f"[PacketManager] Sending UDP to {target_ip}:{target_port} via {iface}...")
+    def send_udp_packet(
+        self,
+        target_ip: str,
+        target_port: int,
+        payload: bytes,
+        iface: str,
+        src_ip: Optional[str] = None,
+        timeout: int = 2
+    ) -> Tuple[str, Optional[Packet]]:
+        self.packet_logger.log_message(
+            f"[PacketManager] Sending UDP to {target_ip}:{target_port} via {iface}..."
+        )
+
         try:
             packet = IP(dst=target_ip)
-            if src_ip: packet.src = src_ip
+            if src_ip:
+                packet.src = src_ip
             packet /= UDP(dport=target_port, sport=54322) / payload
 
-            response = sr1(packet, timeout=timeout, verbose=0)
+            if self._can_use_router():
+                return self._inject_into_router(packet, iface, f"UDP to {target_ip}:{target_port}")
 
-            if response is None: return 'NO_RESPONSE', None
-            if response.haslayer(ICMP): return 'ICMP_RESPONSE', response
-            return 'REPLY', response
+            response = self._direct_sr1(packet, iface, timeout)
+            if response is None:
+                return "NO_RESPONSE", None
+            if response.haslayer(ICMP):
+                return "ICMP_RESPONSE", response
+            return "REPLY", response
+
         except Exception as e:
             self.packet_logger.log_message(f"[UDP] Error sending on {iface}: {e}")
-            return 'ERROR', None
+            return "ERROR", None
 
-    def send_dns_query(self, target_dns_server: str, domain: str, record_type: str, iface: str,
-                       src_ip: Optional[str] = None, timeout: int = 2) -> Tuple[str, Optional[Packet]]:
-        """Sends a DNS query from a specific interface."""
+    def send_dns_query(
+        self,
+        dns_server: str,
+        domain: str,
+        record_type: str,
+        iface: str,
+        src_ip: Optional[str] = None,
+        timeout: int = 2
+    ) -> Tuple[str, Optional[Packet]]:
         self.packet_logger.log_message(
-            f"[PacketManager] Sending DNS Query for {domain} to {target_dns_server} via {iface}...")
+            f"[PacketManager] Sending DNS Query for {domain} ({record_type}) to {dns_server} via {iface}..."
+        )
+
         try:
-            packet = IP(dst=target_dns_server)
-            if src_ip: packet.src = src_ip
-            packet /= UDP(dport=53) / DNS(rd=1, qd=DNSQR(qname=domain, qtype=record_type))
+            packet = IP(dst=dns_server)
+            if src_ip:
+                packet.src = src_ip
+            packet /= UDP(dport=53, sport=54323) / DNS(
+                rd=1,
+                qd=DNSQR(qname=domain, qtype=record_type)
+            )
 
-            response = sr1(packet, timeout=timeout, verbose=0)
+            if self._can_use_router():
+                return self._inject_into_router(packet, iface, f"DNS {record_type} query for {domain}")
 
-            if response is None: return 'TIMEOUT', None
-            if response.haslayer(DNS): return 'REPLY', response
-            return 'UNEXPECTED_RESPONSE', response
+            response = self._direct_sr1(packet, iface, timeout)
+            if response is None:
+                return "TIMEOUT", None
+            if response.haslayer(DNS):
+                return "REPLY", response
+            return "UNEXPECTED_RESPONSE", response
+
         except Exception as e:
             self.packet_logger.log_message(f"[DNS] Error sending on {iface}: {e}")
-            return 'ERROR', None
+            return "ERROR", None
 
 class WiresharkManager:
 

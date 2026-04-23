@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import ctypes
 import datetime
 import multiprocessing
 import os
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -29,7 +31,7 @@ from p2pool_gui import (
 )
 from p2pool_helper import p2pool_helper
 from p2pool_managers import PythonRouterManager
-
+from server.p2pool_managers import PacketManager
 
 _non_qt_background_threads: list[threading.Thread] = []
 _flask_thread: Optional[threading.Thread] = None
@@ -134,6 +136,7 @@ async def application_main_loop(stop_event=None):
 
     if p2pool_helper.router_manager is None:
         p2pool_helper.router_manager = PythonRouterManager(router_logger)
+        p2pool_helper.packet_manager.router = p2pool_helper.router_manager
     p2pool_helper.set_router_logger(router_logger)
 
     p2pool_helper.create_process_manager(
@@ -263,6 +266,65 @@ def cleanup_on_exit():
     if logger:
         logger.log_message("[atexit] Cleanup attempted.")
 
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin() -> bool:
+    """
+    Relaunch the current program elevated on Windows.
+    Returns True if an elevation request was launched.
+    Returns False if launch failed.
+    """
+    try:
+        if os.name != "nt":
+            return False
+
+        # Prevent accidental relaunch loops
+        if os.environ.get("P2POOL_ELEVATED_RELAUNCH") == "1":
+            return False
+
+        params = sys.argv[:]
+
+        if getattr(sys, "frozen", False):
+            # PyInstaller / frozen exe
+            exe = sys.executable
+            arg_str = subprocess.list2cmdline(params[1:])
+        else:
+            # Running from python script
+            exe = sys.executable
+            arg_str = subprocess.list2cmdline(params)
+
+        env_flag = "set P2POOL_ELEVATED_RELAUNCH=1 && "
+        cmd = f'/c {env_flag}"{exe}" {arg_str}'
+
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            "cmd.exe",
+            cmd,
+            os.getcwd(),
+            1,
+        )
+
+        return rc > 32
+    except Exception as e:
+        log_to_file(f"[FATAL] Elevation relaunch failed: {e}")
+        return False
+
+
+def ensure_admin_or_relaunch() -> None:
+    if is_admin():
+        return
+
+    launched = relaunch_as_admin()
+    if launched:
+        sys.exit(0)
+
+    raise RuntimeError("Administrator privileges are required, and elevation was cancelled or failed.")
 
 if __name__ == "__main__":
     try:
