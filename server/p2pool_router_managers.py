@@ -6990,7 +6990,7 @@ class TransportRDPManager:
         )
         self._cooldown_until: dict[tuple, float] = {}
         self._flow_cool = float(flow_cooldown_s or self.FLOW_COOLDOWN_S)
-        self._emit("[Transport][🖥️ RDP manager ready.")
+        self._emit("[Transport][🖥️ RDP] manager ready.")
 
     # ---- Public API ----
     def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
@@ -28509,6 +28509,1141 @@ class TransportIkeManager:
             seen.add(key)
             out.append(item)
         return out
+
+class TransportSNMPManager:
+        """
+        SNMP transport observer for TransportManager.
+
+        Watches:
+          - UDP/161  SNMP agent requests/responses
+          - UDP/162  SNMP traps/informs
+          - TCP/161  rare SNMP-over-TCP
+          - TCP/162  rare trap/inform-over-TCP
+          - TCP/UDP 10161/10162 secure SNMP ports are classified but not decoded
+
+        Public API:
+          - handle(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+          - handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool
+          - snapshot_metrics() -> dict
+        """
+
+        # -------------------------
+        # Tunables
+        # -------------------------
+        FLOW_TTL_SEC = 10 * 60
+        FLOW_SOFT_MAX = 20_000
+        RL_INTERVAL_SEC = 1.0
+        BYTES_BUDGET = 4096
+
+        PORT_SNMP = 161
+        PORT_SNMP_TRAP = 162
+
+        # SNMP over TLS/DTLS ports. These are usually encrypted, so this manager
+        # logs them as SNMP-secure transport hints instead of trying to BER-parse them.
+        PORT_SNMP_TLS = 10161
+        PORT_SNMP_TLS_TRAP = 10162
+
+        DETECT_OFFPORT_SNMP = False
+        MAX_VARBINDS_LOG = 8
+        MAX_OID_TEXT = 96
+        MAX_VALUE_TEXT = 120
+        REDACT_COMMUNITY = True
+
+        PDU_TYPES = {
+            0xA0: "GetRequest",
+            0xA1: "GetNextRequest",
+            0xA2: "Response",
+            0xA3: "SetRequest",
+            0xA4: "TrapV1",
+            0xA5: "GetBulkRequest",
+            0xA6: "InformRequest",
+            0xA7: "TrapV2",
+            0xA8: "Report",
+        }
+
+        VERSION_NAMES = {
+            0: "v1",
+            1: "v2c",
+            3: "v3",
+        }
+
+        ERROR_STATUS = {
+            0: "noError",
+            1: "tooBig",
+            2: "noSuchName",
+            3: "badValue",
+            4: "readOnly",
+            5: "genErr",
+            6: "noAccess",
+            7: "wrongType",
+            8: "wrongLength",
+            9: "wrongEncoding",
+            10: "wrongValue",
+            11: "noCreation",
+            12: "inconsistentValue",
+            13: "resourceUnavailable",
+            14: "commitFailed",
+            15: "undoFailed",
+            16: "authorizationError",
+            17: "notWritable",
+            18: "inconsistentName",
+        }
+
+        COMMON_OIDS = {
+            "1.3.6.1.2.1.1.1": "sysDescr",
+            "1.3.6.1.2.1.1.2": "sysObjectID",
+            "1.3.6.1.2.1.1.3": "sysUpTime",
+            "1.3.6.1.2.1.1.4": "sysContact",
+            "1.3.6.1.2.1.1.5": "sysName",
+            "1.3.6.1.2.1.1.6": "sysLocation",
+            "1.3.6.1.2.1.2.2.1.1": "ifIndex",
+            "1.3.6.1.2.1.2.2.1.2": "ifDescr",
+            "1.3.6.1.2.1.2.2.1.3": "ifType",
+            "1.3.6.1.2.1.2.2.1.4": "ifMtu",
+            "1.3.6.1.2.1.2.2.1.5": "ifSpeed",
+            "1.3.6.1.2.1.2.2.1.6": "ifPhysAddress",
+            "1.3.6.1.2.1.2.2.1.7": "ifAdminStatus",
+            "1.3.6.1.2.1.2.2.1.8": "ifOperStatus",
+            "1.3.6.1.2.1.2.2.1.10": "ifInOctets",
+            "1.3.6.1.2.1.2.2.1.16": "ifOutOctets",
+            "1.3.6.1.6.3.1.1.4.1": "snmpTrapOID",
+            "1.3.6.1.6.3.1.1.4.3": "snmpTrapEnterprise",
+            "1.3.6.1.2.1.25": "hostResources",
+            "1.3.6.1.4.1": "enterprise",
+        }
+
+        def __init__(self, logger):
+            self.logger = logger
+            self._peek_cap = int(self.BYTES_BUDGET)
+            self.logging_enabled = True
+            self.flow_cache_ttl = int(self.FLOW_TTL_SEC)
+            self.flow_cache_max = int(self.FLOW_SOFT_MAX)
+
+            self._lock = threading.RLock()
+            self._flows: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+
+            self._metrics = {
+                "seen_tcp": 0,
+                "seen_udp": 0,
+                "matched_tcp": 0,
+                "matched_udp": 0,
+                "v1": 0,
+                "v2c": 0,
+                "v3": 0,
+                "secure_transport": 0,
+                "get": 0,
+                "getnext": 0,
+                "getbulk": 0,
+                "set": 0,
+                "response": 0,
+                "trap": 0,
+                "inform": 0,
+                "report": 0,
+                "malformed": 0,
+                "errors": 0,
+                "flow_cache_evictions": 0,
+                "active_flows": 0,
+            }
+
+            self._safe_log("[Transport][📡 SNMP] Manager ready")
+
+        # ------------------------------------------------------------------
+        # Public entrypoints
+        # ------------------------------------------------------------------
+
+        def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
+            """TCP SNMP observer. SNMP is usually UDP, but TCP/161 exists."""
+            try:
+                sport_i = self._safe_port(sport)
+                dport_i = self._safe_port(dport)
+                if sport_i is None or dport_i is None:
+                    return False
+
+                if not self._is_snmp_port(sport_i, dport_i) and not self.DETECT_OFFPORT_SNMP:
+                    return False
+
+                payload = self._extract_payload(packet, want_udp=False)
+                if payload is None:
+                    return False
+
+                now = time.time()
+                key = self._flow_key(src_ip, sport_i, dst_ip, dport_i, "tcp")
+                st = self._touch_flow_locked(key, now)
+
+                with self._lock:
+                    self._metrics["seen_tcp"] += 1
+
+                handled, info = self._classify_payload(payload, sport_i, dport_i, proto="tcp")
+                if not handled:
+                    return False
+
+                with self._lock:
+                    self._metrics["matched_tcp"] += 1
+                    self._bump_metrics_from_info(info)
+                    do_log = self._should_log_locked(st, now)
+                    self._clean_if_needed_locked(now)
+
+                if do_log:
+                    self._log_line("TCP", src_ip, sport_i, dst_ip, dport_i, inbound_iface, info)
+
+                return True
+
+            except Exception:
+                with self._lock:
+                    self._metrics["errors"] += 1
+                return False
+
+        def handle_udp(self, packet, src_ip, dst_ip, sport, dport, inbound_iface=None) -> bool:
+            """UDP SNMP observer."""
+            try:
+                sport_i = self._safe_port(sport)
+                dport_i = self._safe_port(dport)
+                if sport_i is None or dport_i is None:
+                    return False
+
+                if not self._is_snmp_port(sport_i, dport_i) and not self.DETECT_OFFPORT_SNMP:
+                    return False
+
+                payload = self._extract_payload(packet, want_udp=True)
+                if payload is None:
+                    return False
+
+                now = time.time()
+                key = self._flow_key(src_ip, sport_i, dst_ip, dport_i, "udp")
+                st = self._touch_flow_locked(key, now)
+
+                with self._lock:
+                    self._metrics["seen_udp"] += 1
+
+                handled, info = self._classify_payload(payload, sport_i, dport_i, proto="udp")
+                if not handled:
+                    return False
+
+                with self._lock:
+                    self._metrics["matched_udp"] += 1
+                    self._bump_metrics_from_info(info)
+                    do_log = self._should_log_locked(st, now)
+                    self._clean_if_needed_locked(now)
+
+                if do_log:
+                    self._log_line("UDP", src_ip, sport_i, dst_ip, dport_i, inbound_iface, info)
+
+                return True
+
+            except Exception:
+                with self._lock:
+                    self._metrics["errors"] += 1
+                return False
+
+        def snapshot_metrics(self) -> dict:
+            with self._lock:
+                out = dict(self._metrics)
+                out["active_flows"] = len(self._flows)
+                return out
+
+        # ------------------------------------------------------------------
+        # Classification
+        # ------------------------------------------------------------------
+
+        def _classify_payload(self, raw: bytes, sport: int, dport: int, proto: str) -> Tuple[bool, Dict[str, Any]]:
+            if self._is_snmp_secure_port(sport, dport):
+                return True, {
+                    "kind": "snmp-secure",
+                    "version": "-",
+                    "version_name": "secure",
+                    "pdu": "encrypted-or-dtls",
+                    "direction": self._direction_from_ports(sport, dport),
+                    "flags": "secure-port,no-ber-decode",
+                    "varbinds": [],
+                }
+
+            if not raw:
+                return True, {
+                    "kind": "snmp-empty",
+                    "version": "-",
+                    "version_name": "-",
+                    "pdu": "empty",
+                    "direction": self._direction_from_ports(sport, dport),
+                    "flags": "empty-payload",
+                    "varbinds": [],
+                }
+
+            parsed = self._parse_snmp_message(raw)
+            if not parsed.get("ok"):
+                if self._is_snmp_port(sport, dport):
+                    with self._lock:
+                        self._metrics["malformed"] += 1
+                    return True, {
+                        "kind": "snmp-malformed",
+                        "version": "?",
+                        "version_name": "?",
+                        "pdu": "malformed",
+                        "direction": self._direction_from_ports(sport, dport),
+                        "flags": parsed.get("reason", "parse-failed"),
+                        "varbinds": [],
+                        "payload_len": len(raw),
+                    }
+                return False, {}
+
+            info = parsed["info"]
+            info["direction"] = self._direction_from_ports(sport, dport)
+            info["payload_len"] = len(raw)
+
+            flags = []
+            if dport == self.PORT_SNMP:
+                flags.append("agent-port")
+            elif sport == self.PORT_SNMP:
+                flags.append("agent-response")
+            if dport == self.PORT_SNMP_TRAP:
+                flags.append("trap-port")
+            elif sport == self.PORT_SNMP_TRAP:
+                flags.append("trap-source")
+
+            if proto == "tcp":
+                flags.append("tcp-snmp")
+            else:
+                flags.append("udp-snmp")
+
+            if info.get("truncated"):
+                flags.append("truncated-log")
+
+            info["flags"] = self._join_flags(info.get("flags"), ",".join(flags))
+            return True, info
+
+        # ------------------------------------------------------------------
+        # SNMP BER parser
+        # ------------------------------------------------------------------
+
+        def _parse_snmp_message(self, raw: bytes) -> Dict[str, Any]:
+            """
+            Minimal SNMP BER parser.
+
+            Supports:
+              - v1/v2c top-level: SEQUENCE -> version, community, PDU
+              - v3 top-level: SEQUENCE -> version, headerData, securityParams, scopedPDU/encryptedPDU
+            """
+            try:
+                top = self._read_tlv(raw, 0, len(raw))
+                if not top:
+                    return {"ok": False, "reason": "no-top-tlv"}
+
+                if top["tag"] != 0x30:
+                    return {"ok": False, "reason": f"top-tag-0x{top['tag']:02x}-not-sequence"}
+
+                children = self._read_children(top["value"], max_children=8)
+                if len(children) < 2:
+                    return {"ok": False, "reason": "short-message"}
+
+                version_tlv = children[0]
+                if version_tlv["tag"] != 0x02:
+                    return {"ok": False, "reason": "missing-version-int"}
+
+                version = self._ber_int(version_tlv["value"])
+                version_name = self.VERSION_NAMES.get(version, f"v{version}")
+
+                if version in (0, 1):
+                    return self._parse_v1_v2c(version, version_name, children)
+
+                if version == 3:
+                    return self._parse_v3(version, version_name, children)
+
+                return {
+                    "ok": True,
+                    "info": {
+                        "kind": "snmp",
+                        "version": version,
+                        "version_name": version_name,
+                        "community": "-",
+                        "pdu": "unknown-version",
+                        "request_id": None,
+                        "varbinds": [],
+                        "flags": "unknown-version",
+                    },
+                }
+
+            except Exception as e:
+                return {"ok": False, "reason": f"exception:{type(e).__name__}"}
+
+        def _parse_v1_v2c(self, version: int, version_name: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
+            if len(children) < 3:
+                return {"ok": False, "reason": "short-v1-v2c-message"}
+
+            community_tlv = children[1]
+            if community_tlv["tag"] != 0x04:
+                return {"ok": False, "reason": "missing-community"}
+
+            community_raw = community_tlv["value"]
+            community = self._render_community(community_raw)
+
+            pdu_tlv = children[2]
+            if pdu_tlv["tag"] not in self.PDU_TYPES:
+                return {"ok": False, "reason": f"unknown-pdu-tag-0x{pdu_tlv['tag']:02x}"}
+
+            pdu_info = self._parse_pdu(pdu_tlv)
+
+            return {
+                "ok": True,
+                "info": {
+                    "kind": "snmp",
+                    "version": version,
+                    "version_name": version_name,
+                    "community": community,
+                    **pdu_info,
+                },
+            }
+
+        def _parse_v3(self, version: int, version_name: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
+            info: Dict[str, Any] = {
+                "kind": "snmp",
+                "version": version,
+                "version_name": version_name,
+                "community": "-",
+                "pdu": "v3",
+                "request_id": None,
+                "varbinds": [],
+                "flags": "v3",
+            }
+
+            # SNMPv3 layout:
+            # version, headerData, securityParameters, data
+            if len(children) < 4:
+                info["flags"] = self._join_flags(info.get("flags"), "short-v3")
+                return {"ok": True, "info": info}
+
+            header_tlv = children[1]
+            security_tlv = children[2]
+            data_tlv = children[3]
+
+            if header_tlv["tag"] == 0x30:
+                header = self._read_children(header_tlv["value"], max_children=6)
+                if len(header) >= 4:
+                    info["msg_id"] = self._ber_int(header[0]["value"]) if header[0]["tag"] == 0x02 else None
+                    info["max_size"] = self._ber_int(header[1]["value"]) if header[1]["tag"] == 0x02 else None
+                    info["msg_flags"] = self._render_octets(header[2]["value"], maxlen=16) if header[2][
+                                                                                                  "tag"] == 0x04 else None
+                    info["sec_model"] = self._ber_int(header[3]["value"]) if header[3]["tag"] == 0x02 else None
+
+            if security_tlv["tag"] == 0x04:
+                usm = self._parse_v3_usm_security_parameters(security_tlv["value"])
+                if usm:
+                    info.update(usm)
+
+            # Encrypted scopedPDU is usually OCTET STRING.
+            if data_tlv["tag"] == 0x04:
+                info["pdu"] = "encrypted-scopedPDU"
+                info["flags"] = self._join_flags(info.get("flags"), "privacy/encrypted")
+                return {"ok": True, "info": info}
+
+            # Plaintext scopedPDU is SEQUENCE: contextEngineID, contextName, PDU
+            if data_tlv["tag"] == 0x30:
+                scoped = self._read_children(data_tlv["value"], max_children=6)
+                if len(scoped) >= 3:
+                    if scoped[1]["tag"] == 0x04:
+                        info["context"] = self._safe_text(scoped[1]["value"], 64) or "-"
+                    pdu_tlv = scoped[2]
+                    if pdu_tlv["tag"] in self.PDU_TYPES:
+                        pdu_info = self._parse_pdu(pdu_tlv)
+                        info.update(pdu_info)
+                        info["flags"] = self._join_flags(info.get("flags"), "plaintext-scopedPDU")
+                        return {"ok": True, "info": info}
+
+            # Fallback: recursively hunt a PDU tag in the v3 data area.
+            found = self._find_first_pdu_tlv(data_tlv)
+            if found:
+                pdu_info = self._parse_pdu(found)
+                info.update(pdu_info)
+                info["flags"] = self._join_flags(info.get("flags"), "pdu-found-recursive")
+                return {"ok": True, "info": info}
+
+            info["flags"] = self._join_flags(info.get("flags"), f"data-tag-0x{data_tlv['tag']:02x}")
+            return {"ok": True, "info": info}
+
+        def _parse_pdu(self, pdu_tlv: Dict[str, Any]) -> Dict[str, Any]:
+            pdu_tag = int(pdu_tlv["tag"])
+            pdu_name = self.PDU_TYPES.get(pdu_tag, f"PDU-0x{pdu_tag:02x}")
+
+            if pdu_tag == 0xA4:
+                return self._parse_v1_trap_pdu(pdu_tlv)
+
+            children = self._read_children(pdu_tlv["value"], max_children=8)
+
+            request_id = None
+            error_status = None
+            error_index = None
+            non_repeaters = None
+            max_repetitions = None
+            varbinds: List[Dict[str, Any]] = []
+
+            if len(children) >= 1 and children[0]["tag"] == 0x02:
+                request_id = self._ber_int(children[0]["value"])
+
+            if pdu_tag == 0xA5:
+                # GetBulk: request-id, non-repeaters, max-repetitions, varbind-list
+                if len(children) >= 2 and children[1]["tag"] == 0x02:
+                    non_repeaters = self._ber_int(children[1]["value"])
+                if len(children) >= 3 and children[2]["tag"] == 0x02:
+                    max_repetitions = self._ber_int(children[2]["value"])
+                if len(children) >= 4 and children[3]["tag"] == 0x30:
+                    varbinds = self._parse_varbind_list(children[3])
+            else:
+                # Standard PDU: request-id, error-status, error-index, varbind-list
+                if len(children) >= 2 and children[1]["tag"] == 0x02:
+                    error_status = self._ber_int(children[1]["value"])
+                if len(children) >= 3 and children[2]["tag"] == 0x02:
+                    error_index = self._ber_int(children[2]["value"])
+                if len(children) >= 4 and children[3]["tag"] == 0x30:
+                    varbinds = self._parse_varbind_list(children[3])
+
+            flags = []
+            if error_status not in (None, 0):
+                flags.append(f"error={self.ERROR_STATUS.get(error_status, error_status)}")
+            if len(varbinds) >= self.MAX_VARBINDS_LOG:
+                flags.append("varbind-log-capped")
+
+            out = {
+                "pdu": pdu_name,
+                "request_id": request_id,
+                "error_status": error_status,
+                "error_index": error_index,
+                "varbinds": varbinds[: self.MAX_VARBINDS_LOG],
+                "truncated": len(varbinds) > self.MAX_VARBINDS_LOG,
+                "flags": ",".join(flags) if flags else None,
+            }
+
+            if non_repeaters is not None:
+                out["non_repeaters"] = non_repeaters
+            if max_repetitions is not None:
+                out["max_repetitions"] = max_repetitions
+
+            return out
+
+        def _parse_v1_trap_pdu(self, pdu_tlv: Dict[str, Any]) -> Dict[str, Any]:
+            children = self._read_children(pdu_tlv["value"], max_children=12)
+
+            enterprise = None
+            agent_addr = None
+            generic_trap = None
+            specific_trap = None
+            uptime = None
+            varbinds: List[Dict[str, Any]] = []
+
+            if len(children) >= 1 and children[0]["tag"] == 0x06:
+                enterprise = self._decode_oid(children[0]["value"])
+            if len(children) >= 2 and children[1]["tag"] == 0x40:
+                agent_addr = self._decode_ipaddress(children[1]["value"])
+            if len(children) >= 3 and children[2]["tag"] == 0x02:
+                generic_trap = self._ber_int(children[2]["value"])
+            if len(children) >= 4 and children[3]["tag"] == 0x02:
+                specific_trap = self._ber_int(children[3]["value"])
+            if len(children) >= 5 and children[4]["tag"] == 0x43:
+                uptime = self._ber_uint(children[4]["value"])
+            if len(children) >= 6 and children[5]["tag"] == 0x30:
+                varbinds = self._parse_varbind_list(children[5])
+
+            return {
+                "pdu": "TrapV1",
+                "request_id": None,
+                "enterprise": self._name_oid(enterprise) if enterprise else None,
+                "agent_addr": agent_addr,
+                "generic_trap": generic_trap,
+                "specific_trap": specific_trap,
+                "uptime": uptime,
+                "varbinds": varbinds[: self.MAX_VARBINDS_LOG],
+                "truncated": len(varbinds) > self.MAX_VARBINDS_LOG,
+                "flags": "v1-trap",
+            }
+
+        def _parse_varbind_list(self, seq_tlv: Dict[str, Any]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            vb_tlvs = self._read_children(seq_tlv["value"], max_children=64)
+
+            for vb in vb_tlvs:
+                if vb["tag"] != 0x30:
+                    continue
+
+                parts = self._read_children(vb["value"], max_children=4)
+                if len(parts) < 2:
+                    continue
+
+                oid_tlv = parts[0]
+                val_tlv = parts[1]
+
+                if oid_tlv["tag"] != 0x06:
+                    continue
+
+                oid = self._decode_oid(oid_tlv["value"])
+                value = self._render_value_tlv(val_tlv)
+
+                out.append({
+                    "oid": self._name_oid(oid),
+                    "raw_oid": oid,
+                    "value": value,
+                    "tag": f"0x{val_tlv['tag']:02x}",
+                })
+
+            return out
+
+        def _parse_v3_usm_security_parameters(self, raw: bytes) -> Dict[str, Any]:
+            """
+            USM securityParameters is an OCTET STRING containing encoded BER.
+            This safely parses common fields when present:
+              engineID, boots, time, username, authParams, privParams
+            """
+            try:
+                top = self._read_tlv(raw, 0, len(raw))
+                if not top or top["tag"] != 0x30:
+                    return {}
+
+                children = self._read_children(top["value"], max_children=8)
+                out: Dict[str, Any] = {}
+
+                if len(children) >= 4:
+                    if children[3]["tag"] == 0x04:
+                        user = self._safe_text(children[3]["value"], 64)
+                        if user:
+                            out["user"] = user
+
+                if len(children) >= 2 and children[1]["tag"] == 0x02:
+                    out["engine_boots"] = self._ber_int(children[1]["value"])
+
+                if len(children) >= 3 and children[2]["tag"] == 0x02:
+                    out["engine_time"] = self._ber_int(children[2]["value"])
+
+                return out
+
+            except Exception:
+                return {}
+
+        def _find_first_pdu_tlv(self, tlv: Dict[str, Any], depth: int = 0) -> Optional[Dict[str, Any]]:
+            if depth > 4:
+                return None
+
+            if tlv["tag"] in self.PDU_TYPES:
+                return tlv
+
+            if tlv["tag"] not in (0x30,):
+                return None
+
+            for child in self._read_children(tlv["value"], max_children=16):
+                found = self._find_first_pdu_tlv(child, depth + 1)
+                if found:
+                    return found
+
+            return None
+
+        # ------------------------------------------------------------------
+        # BER helpers
+        # ------------------------------------------------------------------
+
+        def _read_tlv(self, buf: bytes, off: int, end: int) -> Optional[Dict[str, Any]]:
+            if off < 0 or off >= end or off >= len(buf):
+                return None
+
+            start = off
+            tag = buf[off]
+            off += 1
+
+            if off >= end or off >= len(buf):
+                return None
+
+            first_len = buf[off]
+            off += 1
+
+            if first_len & 0x80:
+                n = first_len & 0x7F
+                if n == 0:
+                    return None
+                if n > 4:
+                    return None
+                if off + n > end or off + n > len(buf):
+                    return None
+                length = int.from_bytes(buf[off:off + n], "big", signed=False)
+                off += n
+            else:
+                length = first_len
+
+            val_start = off
+            val_end = off + length
+            if val_end > end or val_end > len(buf):
+                return None
+
+            return {
+                "tag": tag,
+                "start": start,
+                "value_start": val_start,
+                "end": val_end,
+                "length": length,
+                "value": buf[val_start:val_end],
+            }
+
+        def _read_children(self, value: bytes, max_children: int = 32) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            off = 0
+            end = len(value)
+
+            while off < end and len(out) < max_children:
+                tlv = self._read_tlv(value, off, end)
+                if not tlv:
+                    break
+                out.append(tlv)
+                if tlv["end"] <= off:
+                    break
+                off = tlv["end"]
+
+            return out
+
+        @staticmethod
+        def _ber_int(value: bytes) -> int:
+            if not value:
+                return 0
+            return int.from_bytes(value, "big", signed=bool(value[0] & 0x80))
+
+        @staticmethod
+        def _ber_uint(value: bytes) -> int:
+            if not value:
+                return 0
+            return int.from_bytes(value, "big", signed=False)
+
+        def _decode_oid(self, value: bytes) -> str:
+            if not value:
+                return ""
+
+            nums: List[int] = []
+            first = value[0]
+            if first < 40:
+                nums.extend([0, first])
+            elif first < 80:
+                nums.extend([1, first - 40])
+            else:
+                nums.extend([2, first - 80])
+
+            n = 0
+            for b in value[1:]:
+                n = (n << 7) | (b & 0x7F)
+                if not (b & 0x80):
+                    nums.append(n)
+                    n = 0
+
+            if n:
+                nums.append(n)
+
+            return ".".join(str(x) for x in nums)
+
+        def _name_oid(self, oid: Optional[str]) -> str:
+            if not oid:
+                return "-"
+
+            oid = str(oid)
+            best_name = None
+            best_prefix = ""
+
+            for prefix, name in self.COMMON_OIDS.items():
+                if oid == prefix or oid.startswith(prefix + "."):
+                    if len(prefix) > len(best_prefix):
+                        best_prefix = prefix
+                        best_name = name
+
+            if best_name:
+                suffix = oid[len(best_prefix):].lstrip(".")
+                named = f"{best_name}.{suffix}" if suffix else best_name
+            else:
+                named = oid
+
+            if len(named) > self.MAX_OID_TEXT:
+                named = named[: self.MAX_OID_TEXT] + "…"
+
+            return named
+
+        def _render_value_tlv(self, tlv: Dict[str, Any]) -> str:
+            tag = int(tlv["tag"])
+            val = tlv["value"]
+
+            try:
+                if tag == 0x05:
+                    return "NULL"
+                if tag == 0x02:
+                    return str(self._ber_int(val))
+                if tag == 0x06:
+                    return self._name_oid(self._decode_oid(val))
+                if tag == 0x04:
+                    return self._render_octets(val, self.MAX_VALUE_TEXT)
+                if tag == 0x40:
+                    return self._decode_ipaddress(val)
+                if tag == 0x41:
+                    return f"Counter32={self._ber_uint(val)}"
+                if tag == 0x42:
+                    return f"Gauge32={self._ber_uint(val)}"
+                if tag == 0x43:
+                    return f"TimeTicks={self._ber_uint(val)}"
+                if tag == 0x44:
+                    return f"Opaque[{len(val)}]"
+                if tag == 0x46:
+                    return f"Counter64={self._ber_uint(val)}"
+                if tag == 0x80:
+                    return "noSuchObject"
+                if tag == 0x81:
+                    return "noSuchInstance"
+                if tag == 0x82:
+                    return "endOfMibView"
+                return f"tag=0x{tag:02x}[{len(val)}B]"
+            except Exception:
+                return f"tag=0x{tag:02x}[decode-error]"
+
+        def _render_octets(self, raw: bytes, maxlen: int = 64) -> str:
+            if raw is None:
+                return "-"
+
+            if not raw:
+                return '""'
+
+            printable = True
+            for b in raw:
+                if b in (9, 10, 13):
+                    continue
+                if b < 32 or b > 126:
+                    printable = False
+                    break
+
+            if printable:
+                s = raw.decode("utf-8", "ignore").replace("\r", "\\r").replace("\n", "\\n")
+                if len(s) > maxlen:
+                    s = s[:maxlen] + "…"
+                return f'"{s}"'
+
+            hx = raw[: max(1, maxlen // 2)].hex()
+            if len(raw) > max(1, maxlen // 2):
+                hx += "…"
+            return f"hex:{hx}"
+
+        def _render_community(self, raw: bytes) -> str:
+            if not self.REDACT_COMMUNITY:
+                return self._safe_text(raw, 64) or "-"
+
+            try:
+                import hashlib
+                digest = hashlib.sha1(raw or b"").hexdigest()[:10]
+                return f"redacted(len={len(raw)},sha1={digest})"
+            except Exception:
+                return f"redacted(len={len(raw)})"
+
+        def _decode_ipaddress(self, raw: bytes) -> str:
+            if len(raw) == 4:
+                return ".".join(str(b) for b in raw)
+            return self._render_octets(raw, 32)
+
+        def _safe_text(self, raw: bytes, maxlen: int = 64) -> Optional[str]:
+            if raw is None:
+                return None
+            try:
+                s = raw.decode("utf-8", "ignore")
+                s = "".join(ch for ch in s if ch >= " " or ch == "\t").strip()
+                if not s:
+                    return None
+                if len(s) > maxlen:
+                    s = s[:maxlen] + "…"
+                return s
+            except Exception:
+                return None
+
+        # ------------------------------------------------------------------
+        # Logging
+        # ------------------------------------------------------------------
+
+        def _log_line(self, proto_label: str, sip, sport, dip, dport, iface, info: Dict[str, Any]) -> None:
+            arrow = "→"
+            icon = "🚀 UDP" if proto_label.upper() == "UDP" else "🧵 TCP"
+            iface_s = self._iface_suffix(iface)
+
+            version = info.get("version_name", "?")
+            pdu = info.get("pdu", "?")
+            direction = info.get("direction", "?")
+            request_id = info.get("request_id")
+            community = info.get("community")
+            flags = info.get("flags") or "-"
+            payload_len = info.get("payload_len")
+
+            bits = [
+                f"[Transport][{icon}][📡 SNMP]",
+                f"{version}",
+                f"{pdu}",
+                f"{sip}:{sport} {arrow} {dip}:{dport}",
+                f"on {iface_s}",
+                f"| dir={direction}",
+            ]
+
+            if request_id is not None:
+                bits.append(f"req={request_id}")
+
+            if community and community != "-":
+                bits.append(f"community={community}")
+
+            if info.get("user"):
+                bits.append(f"user={info.get('user')}")
+
+            if info.get("context"):
+                bits.append(f"context={info.get('context')}")
+
+            if info.get("msg_id") is not None:
+                bits.append(f"msgid={info.get('msg_id')}")
+
+            if info.get("error_status") not in (None, 0):
+                es = info.get("error_status")
+                bits.append(f"error={self.ERROR_STATUS.get(es, es)}")
+
+            if info.get("non_repeaters") is not None:
+                bits.append(f"nonrep={info.get('non_repeaters')}")
+
+            if info.get("max_repetitions") is not None:
+                bits.append(f"maxrep={info.get('max_repetitions')}")
+
+            if info.get("enterprise"):
+                bits.append(f"enterprise={info.get('enterprise')}")
+
+            if info.get("agent_addr"):
+                bits.append(f"agent={info.get('agent_addr')}")
+
+            if info.get("uptime") is not None:
+                bits.append(f"uptime={info.get('uptime')}")
+
+            varbinds = info.get("varbinds") or []
+            if varbinds:
+                vb_text = self._format_varbinds(varbinds)
+                bits.append(f"varbinds={vb_text}")
+
+            if payload_len is not None:
+                bits.append(f"bytes={payload_len}")
+
+            bits.append(f"flags={flags}")
+
+            self._safe_log(" ".join(str(x) for x in bits if x is not None))
+
+        def _format_varbinds(self, varbinds: List[Dict[str, Any]]) -> str:
+            out = []
+            for vb in varbinds[: self.MAX_VARBINDS_LOG]:
+                oid = vb.get("oid") or "-"
+                val = vb.get("value") or "-"
+                text = f"{oid}={val}"
+                if len(text) > 180:
+                    text = text[:180] + "…"
+                out.append(text)
+            return ";".join(out) if out else "-"
+
+        # ------------------------------------------------------------------
+        # Metrics / flow helpers
+        # ------------------------------------------------------------------
+
+        def _bump_metrics_from_info(self, info: Dict[str, Any]) -> None:
+            version = info.get("version")
+            pdu = str(info.get("pdu") or "").lower()
+
+            if info.get("kind") == "snmp-secure":
+                self._metrics["secure_transport"] += 1
+
+            if version == 0:
+                self._metrics["v1"] += 1
+            elif version == 1:
+                self._metrics["v2c"] += 1
+            elif version == 3:
+                self._metrics["v3"] += 1
+
+            if "getbulk" in pdu:
+                self._metrics["getbulk"] += 1
+            elif "getnext" in pdu:
+                self._metrics["getnext"] += 1
+            elif "getrequest" in pdu:
+                self._metrics["get"] += 1
+            elif "setrequest" in pdu:
+                self._metrics["set"] += 1
+            elif "response" in pdu:
+                self._metrics["response"] += 1
+            elif "inform" in pdu:
+                self._metrics["inform"] += 1
+            elif "trap" in pdu:
+                self._metrics["trap"] += 1
+            elif "report" in pdu:
+                self._metrics["report"] += 1
+
+            self._metrics["active_flows"] = len(self._flows)
+
+        def _touch_flow_locked(self, key, now: float) -> Dict[str, Any]:
+            with self._lock:
+                st = self._flows.get(key)
+                if st is None:
+                    st = {
+                        "first": now,
+                        "last": now,
+                        "last_log": 0.0,
+                        "hits": 0,
+                    }
+                    self._flows[key] = st
+                st["last"] = now
+                st["hits"] = int(st.get("hits", 0) or 0) + 1
+                return st
+
+        def _should_log_locked(self, st: Dict[str, Any], now: float) -> bool:
+            last = float(st.get("last_log", 0.0) or 0.0)
+            if (now - last) >= self.RL_INTERVAL_SEC:
+                st["last_log"] = now
+                return True
+            return False
+
+        def _clean_if_needed_locked(self, now_ts: float) -> None:
+            total_seen = int(self._metrics.get("seen_tcp", 0) or 0) + int(self._metrics.get("seen_udp", 0) or 0)
+
+            if total_seen > 0 and total_seen % 2048 == 0:
+                ttl = int(self.flow_cache_ttl or 0)
+                if ttl > 0:
+                    stale = [
+                        k for k, v in self._flows.items()
+                        if (now_ts - float(v.get("last", now_ts) or now_ts)) > ttl
+                    ]
+                    for k in stale:
+                        self._flows.pop(k, None)
+
+            if len(self._flows) > self.flow_cache_max:
+                excess = len(self._flows) - self.flow_cache_max
+                victims = sorted(
+                    self._flows.items(),
+                    key=lambda kv: float(kv[1].get("last", 0.0) or 0.0)
+                )[:excess]
+
+                for k, _ in victims:
+                    self._flows.pop(k, None)
+
+                self._metrics["flow_cache_evictions"] += excess
+
+            self._metrics["active_flows"] = len(self._flows)
+
+        # ------------------------------------------------------------------
+        # Packet helpers
+        # ------------------------------------------------------------------
+
+        def _extract_payload(self, pkt, *, want_udp: bool) -> Optional[bytes]:
+            """
+            Returns transport payload bytes.
+
+            Accepts:
+              - Scapy Packet
+              - bytes / bytearray / memoryview payload
+            """
+            if pkt is None:
+                return None
+
+            if isinstance(pkt, (bytes, bytearray, memoryview)):
+                try:
+                    raw = bytes(pkt)
+                    return raw[: self._peek_cap] if raw else b""
+                except Exception:
+                    return None
+
+            layer = UDP if want_udp else TCP
+
+            try:
+                if layer is not None and hasattr(pkt, "haslayer") and pkt.haslayer(layer):
+                    trans = pkt[layer]
+                    if hasattr(trans, "payload"):
+                        raw = bytes(trans.payload)
+                        return raw[: self._peek_cap] if raw else b""
+            except Exception:
+                pass
+
+            try:
+                if Raw is not None and hasattr(pkt, "haslayer") and pkt.haslayer(Raw):
+                    raw = bytes(pkt[Raw].load)
+                    return raw[: self._peek_cap] if raw else b""
+            except Exception:
+                pass
+
+            return None
+
+        @staticmethod
+        def _safe_port(port_val) -> Optional[int]:
+            try:
+                p = int(port_val)
+                if 0 <= p <= 65535:
+                    return p
+                return None
+            except Exception:
+                return None
+
+        def _is_snmp_port(self, sport: int, dport: int) -> bool:
+            ports = (int(sport), int(dport))
+            return (
+                    self.PORT_SNMP in ports
+                    or self.PORT_SNMP_TRAP in ports
+                    or self.PORT_SNMP_TLS in ports
+                    or self.PORT_SNMP_TLS_TRAP in ports
+            )
+
+        def _is_snmp_secure_port(self, sport: int, dport: int) -> bool:
+            ports = (int(sport), int(dport))
+            return self.PORT_SNMP_TLS in ports or self.PORT_SNMP_TLS_TRAP in ports
+
+        def _direction_from_ports(self, sport: int, dport: int) -> str:
+            sport = int(sport)
+            dport = int(dport)
+
+            if dport == self.PORT_SNMP:
+                return "manager-to-agent"
+            if sport == self.PORT_SNMP:
+                return "agent-to-manager"
+            if dport == self.PORT_SNMP_TRAP:
+                return "agent-to-manager-trap"
+            if sport == self.PORT_SNMP_TRAP:
+                return "manager-to-agent-trap-reply"
+
+            if dport == self.PORT_SNMP_TLS:
+                return "manager-to-agent-secure"
+            if sport == self.PORT_SNMP_TLS:
+                return "agent-to-manager-secure"
+            if dport == self.PORT_SNMP_TLS_TRAP:
+                return "agent-to-manager-secure-trap"
+            if sport == self.PORT_SNMP_TLS_TRAP:
+                return "manager-to-agent-secure-trap-reply"
+
+            return "unknown"
+
+        def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int, proto: str):
+            a = (str(src_ip), str(int(sport)))
+            b = (str(dst_ip), str(int(dport)))
+            first, second = (a, b) if a <= b else (b, a)
+            return first + second + (str(proto),)
+
+        def _iface_suffix(self, inbound_iface) -> str:
+            try:
+                s = str(inbound_iface or "")
+                return s.split("_")[-1] if "_" in s else s
+            except Exception:
+                return str(inbound_iface or "")
+
+        def _safe_log(self, msg: str) -> None:
+            if not self.logging_enabled:
+                return
+            try:
+                self.logger.log_message(msg)
+            except Exception:
+                try:
+                    self.logger(msg)
+                except Exception:
+                    pass
+
+        @staticmethod
+        def _join_flags(*flags: Optional[str]) -> Optional[str]:
+            flat: List[str] = []
+            for item in flags:
+                if not item:
+                    continue
+                parts = [p.strip() for p in str(item).split(",") if p.strip()]
+                flat.extend(parts)
+
+            seen = set()
+            out: List[str] = []
+            for p in flat:
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+
+            return ",".join(out) if out else None
 class TransportManager:
     """
     Safer TransportManager for Hyper-V / WinDivert / WinTun environments.
@@ -28600,7 +29735,7 @@ class TransportManager:
         self.transport_scada = TransportSCADAManager(self.logger)
         self.transport_rip = TransportRIPManager(self.logger)
         self.transport_domain = TransportDomainManager(self.logger)
-
+        self.transport_snmp = TransportSNMPManager(self.logger)
     # ------------------------------------------------------------------
     # Safety helpers
     # ------------------------------------------------------------------
@@ -28955,6 +30090,7 @@ class TransportManager:
             ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),
             ([(1024, 65535)], self._handle_high_server_packet),
             ([445, 139, 62078], self._handle_files_packet),
+            ([161, 162, 10161, 10162], self._handle_snmp_tcp_packet),
         ]
 
         handler = None
@@ -29011,6 +30147,7 @@ class TransportManager:
             ([20000, 47808], self._handle_scada_udp_packet),
             ([(27000, 27100), 4380, 27036, 27037], self._handle_udp_steam_packet),
             ([(49152, 65535), 3478, 5349], self._handle_udp_ephemeral_packet),
+            ([161, 162, 10161, 10162], self._handle_snmp_udp_packet),
         ]
 
         def _match(ports_or_ranges, s, d):
@@ -29078,6 +30215,12 @@ class TransportManager:
 
 
     # ---------------- existing protocol handlers ----------------
+    def _handle_snmp_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_snmp.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_snmp_udp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_snmp.handle_udp(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_domain_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_domain.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
         self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, inbound_iface)
