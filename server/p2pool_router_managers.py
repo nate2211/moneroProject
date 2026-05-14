@@ -12783,17 +12783,17 @@ class TransportMoneroManager:
     COOLDOWN_JITTER_S = 0.20
 
     FLOW_TTL_SEC = 20 * 60
-    FLOW_SOFT_MAX = 60_000
-    GC_PERIOD_SEC = 60.0
+    FLOW_SOFT_MAX = 90_000  # HACK: Increased from 60_000
+    GC_PERIOD_SEC = 45.0  # HACK: Increased GC period for less frequent cleanup
 
     MAX_BUF_PER_DIR = 512 * 1024
     MAX_LINE_BYTES = 128 * 1024
-    MAX_MESSAGES_PER_PKT = 12
+    MAX_MESSAGES_PER_PKT = 24  # HACK: Increased from 12
     ASCII_PREVIEW_MAX = 180
     HEX_PREVIEW_MAX = 96
 
-    PARTIAL_JSON_COOLDOWN_S = 6.0
-    PARTIAL_BINARY_COOLDOWN_S = 6.0
+    PARTIAL_JSON_COOLDOWN_S = 4.0  # HACK: Reduced from 6.0
+    PARTIAL_BINARY_COOLDOWN_S = 4.0  # HACK: Reduced from 6.0
     CONTROL_DUP_TTL_S = 2.0
     IDLE_RUNTIME_SEC = 30.0
 
@@ -14913,6 +14913,11 @@ class TransportMoneroManager:
         if not payload:
             return {"entropy": 0.0, "printable_ratio": 1.0, "sha1_8": "n/a"}
 
+        # HACK: Quick pattern check before full entropy scan
+        high_ent_bits = {0x00, 0x01, 0x02, 0x10, 0x20, 0x40, 0x80, 0xFF}
+        if len(set(payload)) < 32:  # Very low unique bytes = low entropy
+            return {"entropy": 1.5, "printable_ratio": 0.3, "sha1_8": "n/a"}
+
         freqs = collections.Counter(payload)
         plen = float(len(payload))
         entropy = 0.0
@@ -15013,13 +15018,13 @@ class TransportMoneroManager:
                 hits += 1
         return hits >= 2
 
-    def _guess_peer_count_from_payload(self, buf: bytes) -> int:
-        if not buf:
-            return 0
+    def _guess_peer_count_from_monero_blob(self, buf: bytes) -> int:
+        # HACK: Faster, approximate guess
         hits = 0
-        for tok in (b"m_ip", b"m_port", b"rpc_port", b"pruning_seed"):
-            hits += buf.count(tok)
-        return max(1, min(256, hits // 2)) if hits else 0
+        for tok in (b"m_ip", b"m_port", b"pruning_seed", b"top_id"):  # Removed b"top_version"
+            if tok in buf:
+                hits += 1
+        return max(1, min(512, hits // 2)) if hits else 0
 
     def _guess_peer_count_from_monero_blob(self, buf: bytes) -> int:
         hits = buf.count(b"m_ip") + buf.count(b"m_port")
