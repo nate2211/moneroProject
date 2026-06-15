@@ -5521,7 +5521,7 @@ class NATManager:
     TRUST_REQUIRED_HITS = 8
     AUTO_PROMOTE_TO_DYNAMIC = True
     AUTO_PROMOTE_TO_STATIC = False
-
+    INTERLAN_FORWARD_ENABLED = True
     TEMP_LEASE_SERVICE_POLICY: Dict[int, Dict] = {
         80: {"mode": "allow", "max_per_ip": 2, "lease_secs": 90, "cooldown_secs": 10},
         443: {"mode": "allow", "max_per_ip": 2, "lease_secs": 120, "cooldown_secs": 10},
@@ -6208,22 +6208,39 @@ class NATManager:
         lan_ifaces: set[str] | None,
     ) -> str:
         is_wan = inbound_iface in wan_ifaces
+        is_lan = bool((lan_ifaces and inbound_iface in lan_ifaces) or not is_wan)
+
         is_dst_ours = (
             (dst_ip == self.public_ip) or
             (dst_ip in self.PUBLIC_VIPS) or
             (dst_ip in router_ips) or
             (dst_ip in self._public_ips_on_lan)
         )
-        src_is_private = not self._is_global(src_ip)
 
+        src_is_private = not self._is_global(src_ip)
+        dst_is_private = not self._is_global(dst_ip)
+
+        # Public/VIP/router destination.
         if is_dst_ours:
             if src_is_private and not is_wan:
                 return "hairpin"
             return "inbound"
 
-        if (lan_ifaces and inbound_iface in lan_ifaces) or (not is_wan):
+        # Fast path: LAN/private -> LAN/private.
+        # This avoids NAT, grayprobe, lease checks, DNAT checks, and port-probe banning.
+        if (
+            self.INTERLAN_FORWARD_ENABLED
+            and is_lan
+            and src_is_private
+            and dst_is_private
+        ):
+            return "interlan"
+
+        # LAN/private -> public internet.
+        if is_lan:
             if self._is_global(dst_ip):
                 return "outbound"
+
             r = self._safe_route_lookup(dst_ip)
             if r and r.get("interface") in (wan_ifaces or set()):
                 return "outbound"
@@ -6462,7 +6479,34 @@ class NATManager:
             f"[NAT][WAN] 🌐 synced public_ip={public_ip or self.public_ip} "
             f"gateway={gateway_ip or '-'} iface={iface_name or '-'} dns={list(dns_tuple)} epoch={self._wan_epoch}"
         )
+    def _should_passthrough_private_wan_return(
+        self,
+        inbound_iface: str,
+        src_ip: str,
+        dst_ip: str,
+        dst_port: int,
+        wan_ifaces: set[str],
+    ) -> bool:
+        try:
+            # Only traffic arriving from WAN/uplink.
+            if inbound_iface not in (wan_ifaces or set()):
+                return False
 
+            # Source should be public internet.
+            if not self._is_global(src_ip):
+                return False
+
+            # Destination is your private/CGN WAN/router address.
+            if not self._is_private_or_cgn(dst_ip):
+                return False
+
+            # Only ephemeral return ports, not service ports.
+            if int(dst_port) < 49152:
+                return False
+
+            return True
+        except Exception:
+            return False
     # ------------------------------------------------------------------
     # Entry
     # ------------------------------------------------------------------
@@ -6536,6 +6580,10 @@ class NATManager:
             direction = self._classify_direction(inbound_iface, src_ip, dst_ip, all_our_public_ips, wan_ifaces, lan_ifaces)
             self._log_debug(f"DIR: {direction} for {src_ip} → {dst_ip}")
 
+            if direction == "interlan":
+                self._log_debug(f"[NAT][INTERLAN] bypass NAT {src_ip} → {dst_ip} on {inbound_iface}")
+                return None
+
             if direction == "hairpin":
                 if not (has_tcp or has_udp):
                     return None
@@ -6577,7 +6625,28 @@ class NATManager:
             if direction == "inbound" and (has_tcp or has_udp):
                 trans = packet[TCP] if has_tcp else packet[UDP]
                 ext_port = int(trans.dport)
+
                 if not self._has_dnat_mapping(dst_ip, ext_port, src_ip):
+
+                    # Private-WAN return traffic.
+                    # Example:
+                    #   74.125.155.194 → 172.24.56.138:56359
+                    #
+                    # This is probably a reply to local/router-originated traffic
+                    # or private-WAN traffic. Do not DNAT-probe it and do not send ICMP.
+                    if self._should_passthrough_private_wan_return(
+                        inbound_iface,
+                        src_ip,
+                        dst_ip,
+                        ext_port,
+                        wan_ifaces,
+                    ):
+                        self._log_debug(
+                            f"[NAT][WAN-PASS] passthrough unmatched private-WAN return "
+                            f"{src_ip} → {dst_ip}:{ext_port}"
+                        )
+                        return None
+
                     direction = "grayprobe"
 
             if direction == "grayprobe":
@@ -6881,6 +6950,13 @@ class NATManager:
             self._apply_alg(packet, "inbound")
             self._bump_gray_score(src_ip, external_ip, ext_port, reason="hit")
             self._recalc_checksums(packet)
+            return True
+
+        if self._is_global(src_ip) and self._is_private_or_cgn(external_ip) and int(ext_port) >= 49152:
+            self._log_debug(
+                f"[NAT][WAN-PASS] no DNAT mapping, passing private-WAN high-port return "
+                f"{src_ip} → {external_ip}:{ext_port}"
+            )
             return True
 
         self._log_rl(
