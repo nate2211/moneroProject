@@ -31,6 +31,7 @@ import hashlib
 import html
 import json
 import queue
+import re
 import threading
 import time
 import traceback
@@ -70,6 +71,7 @@ try:
         QPushButton,
         QSizePolicy,
         QSplitter,
+        QTabWidget,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -79,7 +81,7 @@ except Exception:  # pragma: no cover
     QThread = QTimer = Qt = QTextCursor = None
     pyqtSignal = pyqtSlot = None
     QApplication = QCheckBox = QComboBox = QFormLayout = QGridLayout = QGroupBox = QHBoxLayout = QLabel = QLineEdit = None
-    QMessageBox = QPlainTextEdit = QPushButton = QSizePolicy = QSplitter = QTextEdit = QVBoxLayout = QWidget = None
+    QMessageBox = QPlainTextEdit = QPushButton = QSizePolicy = QSplitter = QTabWidget = QTextEdit = QVBoxLayout = QWidget = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,8 @@ class OllamaConfig:
     temperature: float = 0.25
     num_ctx: int = 8192
     max_context_chars: int = 14000
+    extract_visible_thinking: bool = True
+    max_visible_thinking_chars: int = 12000
     system_prompt: str = (
         "You are a local router assistant for Nate's Python P2Pool router project. "
         "Use the router context only as evidence. Do not invent packet facts. "
@@ -622,17 +626,24 @@ class RouterPacketMemory:
 # Router bridge
 # ---------------------------------------------------------------------------
 
+
+
 class OllamaRouterBridge:
     """
-    Hooks Ollama memory into PythonRouterManager without requiring you to rewrite
-    the router packet hot path.
+    Hooks Ollama memory into PythonRouterManager without requiring router rewrites.
 
-    Strategy:
-    - Wrap router.code_output_manager.submit_packet().
-    - First send a sanitized fact to RouterPacketMemory.
-    - Then call the original submit_packet() unchanged.
-    - Periodically pull manager.health_snapshot()/correlation_snapshot()/export_knowledge().
+    Crash-safe changes:
+    - The wrapper is transparent: it accepts *args/**kwargs and calls the original
+      submit_packet() with the exact same arguments.
+    - Packet-memory ingest is best-effort only. It can never change the return code
+      of the router packet path.
+    - Binding is idempotent and refuses to stack wrappers on top of wrappers.
+    - Unbind only restores the original method when this bridge owns the wrapper.
     """
+
+    _WRAPPED_ATTR = "_ollama_bridge_wrapped"
+    _OWNER_ATTR = "_ollama_bridge_owner"
+    _ORIGINAL_ATTR = "_ollama_bridge_original_submit_packet"
 
     def __init__(self, memory: RouterPacketMemory, logger: Any = None) -> None:
         self.memory = memory
@@ -642,6 +653,7 @@ class OllamaRouterBridge:
         self._co_ref: Any = None
         self._orig_submit_packet: Optional[Callable[..., Any]] = None
         self._bound = False
+        self._owns_wrapper = False
         self._stop_event = threading.Event()
         self._snapshot_thread: Optional[threading.Thread] = None
         self.snapshot_every_s = 8.0
@@ -652,63 +664,159 @@ class OllamaRouterBridge:
 
     def bind_to_router(self, router_manager: Any) -> bool:
         if router_manager is None:
-            _safe_log(self.logger, "[OllamaBridge] Router manager is None; cannot bind.", "error")
+            _safe_log(self.logger, "[OllamaBridge] Router manager is None; init-managed bind skipped.", "info")
             return False
 
         co = getattr(router_manager, "code_output_manager", None)
-        if co is None or not callable(getattr(co, "submit_packet", None)):
-            _safe_log(self.logger, "[OllamaBridge] Router has no usable code_output_manager.submit_packet.", "error")
+        submit = getattr(co, "submit_packet", None) if co is not None else None
+        if co is None or not callable(submit):
+            _safe_log(self.logger, "[OllamaBridge] Router has no usable code_output_manager.submit_packet; bind skipped.", "error")
             return False
 
         with self._lock:
             if self._bound and self._co_ref is co:
                 return True
+
             if self._bound:
                 self.unbind()
 
+            current_submit = getattr(co, "submit_packet", None)
+            owner = getattr(current_submit, self._OWNER_ATTR, None)
+            already_wrapped = bool(getattr(current_submit, self._WRAPPED_ATTR, False))
+
             self._router_ref = router_manager
             self._co_ref = co
-            self._orig_submit_packet = co.submit_packet
 
-            def wrapped_submit_packet(packet: Any, inbound_iface: Optional[str] = None, **context: Any) -> Any:
+            # Another Ollama bridge already owns the hot-path wrapper. Do not stack
+            # another wrapper; stacked wrappers are exactly how exit-code crashes and
+            # odd packet-path behavior start.
+            if already_wrapped and owner is not self:
+                self._orig_submit_packet = getattr(current_submit, self._ORIGINAL_ATTR, current_submit)
+                self._bound = True
+                self._owns_wrapper = False
+                self._start_snapshot_thread_locked()
+                _safe_log(self.logger, "[OllamaBridge] Existing Ollama packet wrapper detected; reusing init-managed bridge without double wrapping.", "info")
+                return True
+
+            original_submit = current_submit
+            self._orig_submit_packet = original_submit
+
+            def wrapped_submit_packet(*args: Any, **kwargs: Any) -> Any:
+                packet = None
+                inbound_iface = None
+                context: Dict[str, Any] = {}
                 try:
-                    self.memory.ingest_packet(packet, inbound_iface=inbound_iface, **context)
+                    packet, inbound_iface, context = self._extract_packet_call(args, kwargs)
+                    if packet is not None:
+                        self.memory.ingest_packet(packet, inbound_iface=inbound_iface, **context)
                 except Exception as ex:
-                    _safe_log(self.logger, f"[OllamaBridge] packet memory ingest failed: {ex}", "error")
-                return self._orig_submit_packet(packet, inbound_iface=inbound_iface, **context)
+                    # Never let Ollama memory affect routing success/exit code.
+                    _safe_log(self.logger, f"[OllamaBridge] packet memory ingest skipped safely: {type(ex).__name__}: {ex}", "error")
 
-            co.submit_packet = wrapped_submit_packet
+                # Preserve original submit_packet behavior exactly. If the original
+                # method raises, let the original error surface rather than masking it.
+                return original_submit(*args, **kwargs)
+
+            try:
+                setattr(wrapped_submit_packet, self._WRAPPED_ATTR, True)
+                setattr(wrapped_submit_packet, self._OWNER_ATTR, self)
+                setattr(wrapped_submit_packet, self._ORIGINAL_ATTR, original_submit)
+                setattr(co, "submit_packet", wrapped_submit_packet)
+            except Exception as ex:
+                self._bound = False
+                self._owns_wrapper = False
+                self._orig_submit_packet = None
+                _safe_log(self.logger, f"[OllamaBridge] Failed to install safe wrapper: {type(ex).__name__}: {ex}", "error")
+                return False
+
             self._bound = True
-            self._stop_event.clear()
-            self._snapshot_thread = threading.Thread(
-                target=self._snapshot_loop,
-                name="OllamaRouterSnapshotLoop",
-                daemon=True,
-            )
-            self._snapshot_thread.start()
+            self._owns_wrapper = True
+            self._start_snapshot_thread_locked()
 
-        _safe_log(self.logger, "[OllamaBridge] ✅ Bound to router CodeOutputManager.submit_packet().", "info")
+        _safe_log(self.logger, "[OllamaBridge] ✅ Init-managed safe packet bridge installed.", "info")
         return True
 
     def unbind(self) -> None:
         with self._lock:
             self._stop_event.set()
             co = self._co_ref
-            if co is not None and self._orig_submit_packet is not None:
+            orig = self._orig_submit_packet
+            owns_wrapper = self._owns_wrapper
+            current_submit = getattr(co, "submit_packet", None) if co is not None else None
+
+            if co is not None and orig is not None and owns_wrapper:
                 try:
-                    co.submit_packet = self._orig_submit_packet
+                    if getattr(current_submit, self._OWNER_ATTR, None) is self:
+                        setattr(co, "submit_packet", orig)
                 except Exception:
                     pass
+
             t = self._snapshot_thread
             self._bound = False
+            self._owns_wrapper = False
             self._router_ref = None
             self._co_ref = None
             self._orig_submit_packet = None
             self._snapshot_thread = None
 
-        if t and t.is_alive():
+        if t and t.is_alive() and threading.current_thread() is not t:
             t.join(timeout=1.5)
-        _safe_log(self.logger, "[OllamaBridge] Unbound.", "info")
+        _safe_log(self.logger, "[OllamaBridge] Unbound safely.", "info")
+
+    def _start_snapshot_thread_locked(self) -> None:
+        if self._snapshot_thread is not None and self._snapshot_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._snapshot_thread = threading.Thread(
+            target=self._snapshot_loop,
+            name="OllamaRouterSnapshotLoop",
+            daemon=True,
+        )
+        self._snapshot_thread.start()
+
+    def _extract_packet_call(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Any, Optional[str], Dict[str, Any]]:
+        context = dict(kwargs or {})
+        inbound_iface = (
+            context.pop("inbound_iface", None)
+            or context.get("iface")
+            or context.get("interface")
+            or context.get("in_iface")
+        )
+
+        packet = None
+        if args:
+            # Normal instance-attribute function call after monkey patch:
+            #     co.submit_packet(packet, inbound_iface=...)
+            packet = args[0]
+
+            # Defensive support for unusual class-style call:
+            #     CodeOutputManager.submit_packet(co, packet, ...)
+            if packet is self._co_ref and len(args) > 1:
+                packet = args[1]
+                if inbound_iface is None and len(args) > 2 and isinstance(args[2], str):
+                    inbound_iface = args[2]
+            elif inbound_iface is None and len(args) > 1 and isinstance(args[1], str):
+                inbound_iface = args[1]
+
+        if packet is None:
+            packet = context.get("packet") or context.get("pkt") or context.get("frame")
+
+        if inbound_iface is not None:
+            inbound_iface = str(inbound_iface)
+
+        # Keep only lightweight contextual values so hot path stays cheap.
+        safe_context: Dict[str, Any] = {}
+        for key in (
+            "phase", "path_stage", "component", "component_name", "direction",
+            "route", "source", "reason", "verdict", "iface", "interface",
+        ):
+            if key in context:
+                try:
+                    safe_context[key] = str(context.get(key))[:180]
+                except Exception:
+                    pass
+
+        return packet, inbound_iface, safe_context
 
     def _snapshot_loop(self) -> None:
         while not self._stop_event.wait(self.snapshot_every_s):
@@ -717,18 +825,21 @@ class OllamaRouterBridge:
                 if co is not None:
                     self.memory.learn_from_code_output_manager(co)
             except Exception as ex:
-                _safe_log(self.logger, f"[OllamaBridge] snapshot failed: {ex}", "error")
+                _safe_log(self.logger, f"[OllamaBridge] snapshot skipped safely: {type(ex).__name__}: {ex}", "error")
 
 
 # ---------------------------------------------------------------------------
 # Assistant backend
 # ---------------------------------------------------------------------------
 
+
 class OllamaModelAssistant:
     """
     Stateful assistant backend. It keeps message history, attaches router memory,
     and talks to the local Ollama server.
     """
+
+    _THINK_RE = re.compile(r"<think(?:ing)?[^>]*>(.*?)</think(?:ing)?>", re.IGNORECASE | re.DOTALL)
 
     def __init__(self, logger: Any = None, config: Optional[OllamaConfig] = None) -> None:
         self.logger = logger or _NullLogger()
@@ -739,6 +850,12 @@ class OllamaModelAssistant:
         self._lock = threading.RLock()
         self.messages: List[Dict[str, str]] = []
         self._last_model_list: List[Dict[str, Any]] = []
+        self.last_visible_thinking: str = ""
+        self.last_response_raw: str = ""
+        self.last_response_text: str = ""
+        self.last_context_preview: str = ""
+        self.last_latency_s: float = 0.0
+        self.last_model: str = ""
 
     def set_base_url(self, base_url: str) -> None:
         self.client.set_base_url(base_url)
@@ -764,6 +881,9 @@ class OllamaModelAssistant:
     def clear_history(self) -> None:
         with self._lock:
             self.messages.clear()
+            self.last_visible_thinking = ""
+            self.last_response_raw = ""
+            self.last_response_text = ""
 
     def clear_router_memory(self) -> None:
         self.memory.clear()
@@ -780,6 +900,7 @@ class OllamaModelAssistant:
 
     def health_text(self) -> str:
         health = self.client.health()
+        running = self.client.running_models()
         model_names = []
         try:
             model_names = self.refresh_models()
@@ -787,17 +908,34 @@ class OllamaModelAssistant:
             model_names = [f"model refresh error: {ex}"]
 
         mem = self.memory.snapshot()
+        bridge = {
+            "bound": bool(getattr(self.bridge, "bound", False)),
+            "owns_wrapper": bool(getattr(self.bridge, "_owns_wrapper", False)),
+            "snapshot_every_s": getattr(self.bridge, "snapshot_every_s", None),
+        }
         return (
             "Ollama health:\n"
             + json.dumps(health, indent=2, default=str)
-            + "\n\nModels:\n"
+            + "\n\nRunning models:\n"
+            + json.dumps(running[:16], indent=2, default=str)
+            + "\n\nInstalled models:\n"
             + "\n".join(f"- {m}" for m in model_names[:64])
+            + "\n\nRouter bridge:\n"
+            + json.dumps(bridge, indent=2, default=str)
             + "\n\nRouter memory:\n"
-            + json.dumps(mem, indent=2, default=str)[:4000]
+            + json.dumps(mem, indent=2, default=str)[:6000]
         )
 
     def router_context_text(self, router_manager: Any = None) -> str:
+        # If the actual router was already initialized with use_ollama=True, prefer
+        # its init-managed memory instead of making the GUI install another wrapper.
         if router_manager is not None:
+            try:
+                router_memory = getattr(router_manager, "ollama_packet_memory", None)
+                if router_memory is not None and router_memory is not self.memory and callable(getattr(router_memory, "context_text", None)):
+                    return str(router_memory.context_text(max_chars=self.config.max_context_chars))
+            except Exception:
+                pass
             try:
                 co = getattr(router_manager, "code_output_manager", None)
                 if co:
@@ -813,10 +951,13 @@ class OllamaModelAssistant:
             return ""
 
         model_name = model or self.config.default_model
+        self.last_model = model_name
 
         system = self.config.system_prompt
+        context_preview = ""
         if use_router_context:
             ctx = self.router_context_text(router_manager)
+            context_preview = ctx
             system = f"{system}\n\n{ctx}"
 
         with self._lock:
@@ -828,7 +969,7 @@ class OllamaModelAssistant:
 
         started = time.time()
         try:
-            response = self.client.chat(model_name, outbound, stream=False)
+            response_raw = self.client.chat(model_name, outbound, stream=False)
         except requests.exceptions.ConnectionError as ex:
             raise RuntimeError(
                 f"Cannot connect to Ollama at {self.client.base_url}. Start it with `ollama serve` "
@@ -838,16 +979,78 @@ class OllamaModelAssistant:
             raise
 
         elapsed = time.time() - started
+        visible_thinking, response = self._split_visible_thinking(response_raw)
+
         with self._lock:
+            self.last_visible_thinking = visible_thinking
+            self.last_response_raw = response_raw
+            self.last_response_text = response
+            self.last_context_preview = context_preview[-self.config.max_context_chars:] if context_preview else ""
+            self.last_latency_s = elapsed
             self.messages.append({"role": "user", "content": user_message})
             self.messages.append({"role": "assistant", "content": response})
-        _safe_log(self.logger, f"[Ollama] model={model_name} answered in {elapsed:.2f}s chars={len(response)}", "info")
+
+        _safe_log(self.logger, f"[Ollama] model={model_name} answered in {elapsed:.2f}s chars={len(response)} think_chars={len(visible_thinking)}", "info")
         return response
+
+    def runtime_summary(self) -> Dict[str, Any]:
+        with self._lock:
+            mem = self.memory.snapshot()
+            return {
+                "model": self.last_model or self.config.default_model,
+                "base_url": self.client.base_url,
+                "bridge_bound": bool(self.bridge.bound),
+                "bridge_owns_wrapper": bool(getattr(self.bridge, "_owns_wrapper", False)),
+                "last_latency_s": round(float(self.last_latency_s or 0.0), 3),
+                "last_answer_chars": len(self.last_response_text or ""),
+                "last_thinking_chars": len(self.last_visible_thinking or ""),
+                "memory": {
+                    "stored_events": mem.get("stored_events", 0),
+                    "packet_total": mem.get("packet_total", 0),
+                    "packet_dropped": mem.get("packet_dropped", 0),
+                    "top_protocols": mem.get("top_protocols", [])[:8],
+                    "top_ports": mem.get("top_ports", [])[:8],
+                    "top_ifaces": mem.get("top_ifaces", [])[:8],
+                },
+            }
+
+    def _split_visible_thinking(self, response: str) -> Tuple[str, str]:
+        response = str(response or "")
+        if not getattr(self.config, "extract_visible_thinking", True):
+            return "", response
+
+        chunks: List[str] = []
+        def repl(match: Any) -> str:
+            part = str(match.group(1) or "").strip()
+            if part:
+                chunks.append(part)
+            return ""
+
+        cleaned = self._THINK_RE.sub(repl, response).strip()
+        thinking = "\n\n".join(chunks).strip()
+
+        # Some reasoning models stream an opening <think> and omit a closing tag
+        # when interrupted. Surface it without crashing and keep the answer part clean.
+        lower = cleaned.lower()
+        idx = lower.find("<think>")
+        if idx >= 0:
+            before = cleaned[:idx].strip()
+            after = cleaned[idx + len("<think>"):].strip()
+            if after:
+                thinking = (thinking + "\n\n" + after).strip()
+            cleaned = before
+
+        max_think = int(getattr(self.config, "max_visible_thinking_chars", 12000) or 12000)
+        if len(thinking) > max_think:
+            thinking = "[visible model thinking truncated]\n" + thinking[-max_think:]
+
+        return thinking, cleaned or response.strip()
 
 
 # ---------------------------------------------------------------------------
 # GUI classes
 # ---------------------------------------------------------------------------
+
 
 if pyqtSignal is not None:
     class OllamaLogger(QObject):
@@ -867,6 +1070,8 @@ if pyqtSignal is not None:
         error_occurred = pyqtSignal(str)
         thinking_started = pyqtSignal()
         thinking_finished = pyqtSignal()
+        thinking_trace_received = pyqtSignal(str, str)
+        runtime_received = pyqtSignal(dict)
         models_received = pyqtSignal(list)
         health_received = pyqtSignal(str)
 
@@ -875,6 +1080,10 @@ if pyqtSignal is not None:
             self.assistant = assistant
             self.logger = logger or _NullLogger()
             self._router_provider: Optional[Callable[[], Any]] = None
+
+        def set_assistant(self, assistant: OllamaModelAssistant) -> None:
+            if assistant is not None:
+                self.assistant = assistant
 
         def set_router_provider(self, provider: Optional[Callable[[], Any]]) -> None:
             self._router_provider = provider
@@ -893,7 +1102,6 @@ if pyqtSignal is not None:
                 model = str(payload.get("model") or "").strip()
                 text = str(payload.get("message") or "").strip()
                 use_context = bool(payload.get("use_router_context", True))
-                auto_bind = bool(payload.get("auto_bind_router", True))
 
                 if base_url:
                     self.assistant.set_base_url(base_url)
@@ -901,15 +1109,21 @@ if pyqtSignal is not None:
                     self.assistant.set_model(model)
 
                 router = self._router()
-                if auto_bind and router is not None:
-                    self.assistant.bind_router(router)
 
+                # Important: no GUI-triggered binding here. Binding is init-managed by
+                # PythonRouterManager only when use_ollama=True. The GUI may adopt that
+                # existing assistant, but it never hot-patches submit_packet itself.
                 response = self.assistant.send_message(
                     text,
                     model=model or None,
                     router_manager=router,
                     use_router_context=use_context,
                 )
+                self.thinking_trace_received.emit(
+                    str(getattr(self.assistant, "last_visible_thinking", "") or ""),
+                    str(getattr(self.assistant, "last_context_preview", "") or ""),
+                )
+                self.runtime_received.emit(self.assistant.runtime_summary())
                 self.response_received.emit(response)
             except Exception as ex:
                 err = f"{type(ex).__name__}: {ex}"
@@ -924,6 +1138,7 @@ if pyqtSignal is not None:
                 if base_url:
                     self.assistant.set_base_url(base_url)
                 self.models_received.emit(self.assistant.refresh_models())
+                self.runtime_received.emit(self.assistant.runtime_summary())
             except Exception as ex:
                 self.error_occurred.emit(f"Model refresh failed: {type(ex).__name__}: {ex}")
 
@@ -933,16 +1148,19 @@ if pyqtSignal is not None:
                 if base_url:
                     self.assistant.set_base_url(base_url)
                 self.health_received.emit(self.assistant.health_text())
+                self.runtime_received.emit(self.assistant.runtime_summary())
             except Exception as ex:
                 self.error_occurred.emit(f"Health check failed: {type(ex).__name__}: {ex}")
 
         @pyqtSlot()
         def clear_history(self) -> None:
             self.assistant.clear_history()
+            self.runtime_received.emit(self.assistant.runtime_summary())
 
         @pyqtSlot()
         def clear_router_memory(self) -> None:
             self.assistant.clear_router_memory()
+            self.runtime_received.emit(self.assistant.runtime_summary())
 
 
     class OllamaModelTab(QWidget):
@@ -962,13 +1180,22 @@ if pyqtSignal is not None:
             self.worker: Optional[OllamaChatWorker] = None
             self.thinking_timer = QTimer(self)
             self.thinking_animation_state = 0
+            self._adopted_router_assistant = False
+            self._last_runtime: Dict[str, Any] = {}
 
             self._create_widgets()
             self._configure_layout()
             self._connect_signals()
             self._setup_worker_thread()
 
+            self.router_attach_timer = QTimer(self)
+            self.router_attach_timer.setInterval(1500)
+            self.router_attach_timer.timeout.connect(self._adopt_router_assistant_if_ready)
+            self.router_attach_timer.start()
+
+            QTimer.singleShot(100, self._adopt_router_assistant_if_ready)
             QTimer.singleShot(250, self._refresh_models_clicked)
+            QTimer.singleShot(500, self._health_clicked)
 
         def _create_widgets(self) -> None:
             self.base_url_input = QLineEdit("http://127.0.0.1:11434")
@@ -980,26 +1207,56 @@ if pyqtSignal is not None:
 
             self.refresh_models_button = QPushButton("🔄 Refresh Models")
             self.health_button = QPushButton("🩺 Health")
-            self.bind_router_button = QPushButton("🔗 Bind Router")
-            self.clear_history_button = QPushButton("Clear Chat")
-            self.clear_router_memory_button = QPushButton("Clear Router Memory")
+            self.clear_history_button = QPushButton("🧹 Clear Chat")
+            self.clear_router_memory_button = QPushButton("🧠 Clear Router Memory")
 
-            self.use_router_context_checkbox = QCheckBox("Use router packet memory/context")
+            # Deprecated compatibility attributes. They are intentionally not added
+            # to the layout, so there is no manual bind/unbind button in the GUI.
+            self.bind_router_button = QPushButton("Init-managed")
+            self.bind_router_button.setVisible(False)
+            self.auto_bind_router_checkbox = QCheckBox("Init-managed router binding")
+            self.auto_bind_router_checkbox.setChecked(False)
+            self.auto_bind_router_checkbox.setVisible(False)
+
+            self.use_router_context_checkbox = QCheckBox("Use sanitized router packet memory")
             self.use_router_context_checkbox.setChecked(True)
-            self.auto_bind_router_checkbox = QCheckBox("Auto-bind to running router")
-            self.auto_bind_router_checkbox.setChecked(True)
+            self.use_router_context_checkbox.setToolTip("Uses metadata only: layers/endpoints/ports/DNS names/summaries/hashes. No raw payload secrets.")
 
             self.status_label = QLabel("Ready")
             self.status_label.setStyleSheet("color: #dcdcdc; font-style: italic;")
 
+            self.connection_status_label = QLabel("Ollama: unknown")
+            self.model_status_label = QLabel("Model: llama3.1:8b")
+            self.router_status_label = QLabel("Router bridge: init-managed / waiting")
+            self.memory_status_label = QLabel("Memory: 0 packets")
+            self.latency_status_label = QLabel("Latency: -")
+
             self.chat_output = QTextEdit()
             self.chat_output.setReadOnly(True)
             self.chat_output.setAcceptRichText(True)
-            self.chat_output.setPlaceholderText("Ollama responses and router-learning status will appear here...")
+            self.chat_output.setPlaceholderText("Ollama chat will appear here. Model-provided <think> traces are surfaced separately.")
+
+            self.thinking_output = QPlainTextEdit()
+            self.thinking_output.setReadOnly(True)
+            self.thinking_output.setPlaceholderText(
+                "Visible model thinking appears here only when the local model returns <think>...</think> text. "
+                "This is not hidden system reasoning."
+            )
+            self.thinking_output.setMaximumBlockCount(2000)
+
+            self.context_output = QPlainTextEdit()
+            self.context_output.setReadOnly(True)
+            self.context_output.setPlaceholderText("Router memory/context preview used for the latest request.")
+            self.context_output.setMaximumBlockCount(3000)
+
+            self.telemetry_output = QPlainTextEdit()
+            self.telemetry_output.setReadOnly(True)
+            self.telemetry_output.setPlaceholderText("Runtime telemetry, bridge state, packet memory counters.")
+            self.telemetry_output.setMaximumBlockCount(3000)
 
             self.user_input = QPlainTextEdit()
             self.user_input.setPlaceholderText(
-                "Ask your local Ollama model about router behavior, packet flow, NAT, DNS, p2pool, etc."
+                "Ask the local model about router behavior, packet flow, NAT, DNS, p2pool, Ollama logs, or recent packet memory."
             )
 
             self.send_button = QPushButton("Send to Ollama")
@@ -1007,27 +1264,34 @@ if pyqtSignal is not None:
 
         def _configure_layout(self) -> None:
             main_layout = QVBoxLayout(self)
-            main_layout.setContentsMargins(6, 6, 6, 6)
+            main_layout.setContentsMargins(8, 8, 8, 8)
 
-            config_group = QGroupBox("Ollama Model")
-            config_layout = QGridLayout(config_group)
-            config_layout.addWidget(QLabel("Base URL:"), 0, 0)
-            config_layout.addWidget(self.base_url_input, 0, 1, 1, 3)
-            config_layout.addWidget(QLabel("Model:"), 1, 0)
-            config_layout.addWidget(self.model_combo, 1, 1)
-            config_layout.addWidget(self.refresh_models_button, 1, 2)
-            config_layout.addWidget(self.health_button, 1, 3)
-            config_layout.addWidget(self.use_router_context_checkbox, 2, 0, 1, 2)
-            config_layout.addWidget(self.auto_bind_router_checkbox, 2, 2)
-            config_layout.addWidget(self.bind_router_button, 2, 3)
-            config_layout.addWidget(self.clear_history_button, 3, 0)
-            config_layout.addWidget(self.clear_router_memory_button, 3, 1)
-            config_layout.addWidget(self.status_label, 3, 2, 1, 2)
-            main_layout.addWidget(config_group)
+            top_group = QGroupBox("Enterprise Ollama Control Plane")
+            top_layout = QGridLayout(top_group)
+            top_layout.addWidget(QLabel("Base URL:"), 0, 0)
+            top_layout.addWidget(self.base_url_input, 0, 1, 1, 3)
+            top_layout.addWidget(QLabel("Model:"), 1, 0)
+            top_layout.addWidget(self.model_combo, 1, 1)
+            top_layout.addWidget(self.refresh_models_button, 1, 2)
+            top_layout.addWidget(self.health_button, 1, 3)
+            top_layout.addWidget(self.use_router_context_checkbox, 2, 0, 1, 2)
+            top_layout.addWidget(self.clear_history_button, 2, 2)
+            top_layout.addWidget(self.clear_router_memory_button, 2, 3)
+            main_layout.addWidget(top_group)
 
-            self.splitter = QSplitter(Qt.Vertical)
-            self.splitter.setHandleWidth(8)
-            self.splitter.setStyleSheet("""
+            status_group = QGroupBox("Live Status")
+            status_layout = QGridLayout(status_group)
+            status_layout.addWidget(self.connection_status_label, 0, 0)
+            status_layout.addWidget(self.model_status_label, 0, 1)
+            status_layout.addWidget(self.router_status_label, 1, 0)
+            status_layout.addWidget(self.memory_status_label, 1, 1)
+            status_layout.addWidget(self.latency_status_label, 2, 0)
+            status_layout.addWidget(self.status_label, 2, 1)
+            main_layout.addWidget(status_group)
+
+            self.outer_splitter = QSplitter(Qt.Horizontal)
+            self.outer_splitter.setHandleWidth(8)
+            self.outer_splitter.setStyleSheet("""
                 QSplitter::handle {
                     background-color: #444;
                     border: 1px solid #222;
@@ -1037,26 +1301,49 @@ if pyqtSignal is not None:
                 }
             """)
 
-            self.splitter.addWidget(self.chat_output)
+            left_widget = QWidget()
+            left_layout = QVBoxLayout(left_widget)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+
+            self.chat_splitter = QSplitter(Qt.Vertical)
+            self.chat_splitter.setHandleWidth(8)
+            self.chat_splitter.addWidget(self.chat_output)
 
             input_widget = QWidget()
             input_layout = QVBoxLayout(input_widget)
             input_layout.setContentsMargins(0, 0, 0, 0)
             input_layout.addWidget(self.user_input)
+
             bottom = QHBoxLayout()
             bottom.addStretch()
             bottom.addWidget(self.send_button)
             input_layout.addLayout(bottom)
-            self.splitter.addWidget(input_widget)
-            self.splitter.setSizes([620, 180])
 
-            main_layout.addWidget(self.splitter, 1)
+            self.chat_splitter.addWidget(input_widget)
+            self.chat_splitter.setSizes([650, 170])
+            left_layout.addWidget(self.chat_splitter)
+
+            right_widget = QWidget()
+            right_layout = QVBoxLayout(right_widget)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+
+            self.side_tabs = QTabWidget()
+            self.side_tabs.addTab(self.thinking_output, "🧠 Visible Thinking")
+            self.side_tabs.addTab(self.context_output, "📡 Router Context")
+            self.side_tabs.addTab(self.telemetry_output, "📊 Telemetry")
+            right_layout.addWidget(self.side_tabs)
+
+            self.outer_splitter.addWidget(left_widget)
+            self.outer_splitter.addWidget(right_widget)
+            self.outer_splitter.setSizes([760, 420])
+            self.outer_splitter.setStretchFactor(0, 3)
+            self.outer_splitter.setStretchFactor(1, 2)
+            main_layout.addWidget(self.outer_splitter, 1)
 
         def _connect_signals(self) -> None:
             self.send_button.clicked.connect(self._send_clicked)
             self.refresh_models_button.clicked.connect(self._refresh_models_clicked)
             self.health_button.clicked.connect(self._health_clicked)
-            self.bind_router_button.clicked.connect(self._bind_router_clicked)
             self.clear_history_button.clicked.connect(self._clear_history_clicked)
             self.clear_router_memory_button.clicked.connect(self._clear_router_memory_clicked)
             self.thinking_timer.timeout.connect(self._update_thinking_animation)
@@ -1077,6 +1364,8 @@ if pyqtSignal is not None:
             self.worker.error_occurred.connect(self._on_error)
             self.worker.thinking_started.connect(self._on_thinking_started)
             self.worker.thinking_finished.connect(self._on_thinking_finished)
+            self.worker.thinking_trace_received.connect(self._on_thinking_trace)
+            self.worker.runtime_received.connect(self._on_runtime)
             self.worker.models_received.connect(self._on_models)
             self.worker.health_received.connect(self._on_health)
 
@@ -1084,7 +1373,15 @@ if pyqtSignal is not None:
 
         def shutdown(self) -> None:
             try:
-                self.assistant.unbind_router()
+                if getattr(self, "router_attach_timer", None):
+                    self.router_attach_timer.stop()
+            except Exception:
+                pass
+            try:
+                # Only unbind wrappers owned by this GUI assistant. The normal router
+                # init-managed assistant remains controlled by router lifecycle.
+                if not self._adopted_router_assistant:
+                    self.assistant.unbind_router()
             except Exception:
                 pass
             try:
@@ -1100,10 +1397,11 @@ if pyqtSignal is not None:
                 "model": self.model_combo.currentText().strip(),
                 "message": self.user_input.toPlainText().strip(),
                 "use_router_context": self.use_router_context_checkbox.isChecked(),
-                "auto_bind_router": self.auto_bind_router_checkbox.isChecked(),
+                "auto_bind_router": False,
             }
 
         def _send_clicked(self) -> None:
+            self._adopt_router_assistant_if_ready()
             payload = self._payload()
             if not payload["message"]:
                 return
@@ -1118,27 +1416,58 @@ if pyqtSignal is not None:
             self.health_requested.emit(self.base_url_input.text().strip())
 
         def _bind_router_clicked(self) -> None:
-            try:
-                router = self.router_provider() if callable(self.router_provider) else None
-                if router is None:
-                    self.log_message("Router manager is not available yet. Start the router first or pass a router_provider.", "error")
-                    return
-                ok = self.assistant.bind_router(router)
-                if ok:
-                    self.log_message("Bound to router. Ollama will now learn from sanitized packet metadata.", "info")
-                else:
-                    self.log_message("Failed to bind to router.", "error")
-            except Exception as ex:
-                self.log_message(f"Bind failed: {type(ex).__name__}: {ex}", "error")
+            # Kept as a no-op compatibility method. The button is not displayed.
+            self.log_message(
+                "Manual router binding is disabled. Start the router with use_ollama=True so binding happens once during router init.",
+                "info",
+            )
 
         def _clear_history_clicked(self) -> None:
             self.clear_history_requested.emit()
             self.chat_output.clear()
+            self.thinking_output.clear()
             self.log_message("Chat history cleared.", "info")
 
         def _clear_router_memory_clicked(self) -> None:
             self.clear_router_memory_requested.emit()
+            self.context_output.clear()
+            self.telemetry_output.clear()
             self.log_message("Router packet memory cleared.", "info")
+
+        def _adopt_router_assistant_if_ready(self) -> None:
+            try:
+                router = self.router_provider() if callable(self.router_provider) else None
+                router_assistant = getattr(router, "ollama_assistant", None) if router is not None else None
+                if isinstance(router_assistant, OllamaModelAssistant) and router_assistant is not self.assistant:
+                    self.assistant = router_assistant
+                    self._adopted_router_assistant = True
+                    if self.worker is not None:
+                        self.worker.set_assistant(router_assistant)
+                    self.log_message("Adopted init-managed router Ollama assistant. No GUI bind action was run.", "info")
+                self._update_router_status(router)
+            except Exception as ex:
+                self.router_status_label.setText(f"Router bridge: status error {type(ex).__name__}")
+
+        def _update_router_status(self, router: Any = None) -> None:
+            try:
+                if router is None:
+                    router = self.router_provider() if callable(self.router_provider) else None
+                bridge = getattr(router, "ollama_router_bridge", None) if router is not None else None
+                memory = getattr(router, "ollama_packet_memory", None) if router is not None else None
+                if bridge is not None:
+                    bound = bool(getattr(bridge, "bound", False))
+                    self.router_status_label.setText(f"Router bridge: {'bound on init' if bound else 'installed / not bound'}")
+                elif router is not None:
+                    self.router_status_label.setText("Router bridge: not installed; start router with use_ollama=True")
+                else:
+                    self.router_status_label.setText("Router bridge: waiting for router")
+                if memory is not None and callable(getattr(memory, "snapshot", None)):
+                    snap = memory.snapshot()
+                    self.memory_status_label.setText(
+                        f"Memory: {snap.get('stored_events', 0)} stored / {snap.get('packet_total', 0)} seen"
+                    )
+            except Exception:
+                pass
 
         @pyqtSlot(str)
         def _on_response(self, text: str) -> None:
@@ -1147,6 +1476,40 @@ if pyqtSignal is not None:
         @pyqtSlot(str)
         def _on_error(self, text: str) -> None:
             self.log_message(text, "error")
+
+        @pyqtSlot(str, str)
+        def _on_thinking_trace(self, thinking: str, context: str) -> None:
+            thinking = str(thinking or "").strip()
+            context = str(context or "").strip()
+
+            if thinking:
+                self.thinking_output.setPlainText(thinking)
+                self.log_message(thinking, "thinking")
+            else:
+                self.thinking_output.setPlainText(
+                    "No explicit <think>...</think> trace was returned by this local model for the last answer."
+                )
+
+            if context:
+                self.context_output.setPlainText(context)
+            else:
+                self.context_output.setPlainText("No router context was attached to the last request.")
+
+        @pyqtSlot(dict)
+        def _on_runtime(self, runtime: Dict[str, Any]) -> None:
+            self._last_runtime = runtime or {}
+            try:
+                self.model_status_label.setText(f"Model: {self._last_runtime.get('model', '-')}")
+                self.connection_status_label.setText(f"Ollama: {self._last_runtime.get('base_url', '-')}")
+                latency = self._last_runtime.get("last_latency_s", 0.0)
+                self.latency_status_label.setText(f"Latency: {latency}s")
+                mem = self._last_runtime.get("memory", {}) or {}
+                self.memory_status_label.setText(
+                    f"Memory: {mem.get('stored_events', 0)} stored / {mem.get('packet_total', 0)} seen"
+                )
+                self.telemetry_output.setPlainText(json.dumps(self._last_runtime, indent=2, default=str))
+            except Exception:
+                pass
 
         @pyqtSlot(list)
         def _on_models(self, models: List[str]) -> None:
@@ -1169,6 +1532,7 @@ if pyqtSignal is not None:
         @pyqtSlot(str)
         def _on_health(self, text: str) -> None:
             self.log_message(text, "info")
+            self.telemetry_output.setPlainText(str(text or ""))
 
         @pyqtSlot()
         def _on_thinking_started(self) -> None:
@@ -1187,6 +1551,7 @@ if pyqtSignal is not None:
             self.status_label.setText("Ready")
             self.status_label.setStyleSheet("color: #dcdcdc; font-style: italic;")
             self.send_button.setText("Send to Ollama")
+            self._adopt_router_assistant_if_ready()
 
         def _update_thinking_animation(self) -> None:
             dots = "." * ((self.thinking_animation_state % 3) + 1)
@@ -1203,6 +1568,7 @@ if pyqtSignal is not None:
             label = {
                 "user": "You",
                 "ollama": "Ollama",
+                "thinking": "Visible model thinking",
                 "error": "ERROR",
                 "info": "Info",
             }.get(message_type, "Info")
@@ -1210,6 +1576,7 @@ if pyqtSignal is not None:
             color = {
                 "user": "#87CEEB",
                 "ollama": "#90EE90",
+                "thinking": "#d7b8ff",
                 "error": "#FF6347",
                 "info": "#dcdcdc",
             }.get(message_type, "#dcdcdc")
@@ -1241,19 +1608,42 @@ def install_ollama_on_router(router_manager: Any, logger: Any = None,
     """
     Attach an Ollama assistant directly to a PythonRouterManager instance.
 
-    Usage inside PythonRouterManager.start_routing or GUI start_router:
-        from p2pool_ollama import install_ollama_on_router
-        self.ollama_assistant = install_ollama_on_router(self, self.router_logger)
+    This is intentionally safe to call from router init when use_ollama=True:
+    - no new patches outside this file are required
+    - no manual GUI bind button is required
+    - binding failures are logged and returned as an unbound assistant instead of
+      throwing through the router startup path
     """
-    assistant = OllamaModelAssistant(logger=logger or getattr(router_manager, "router_logger", None), config=config)
-    ok = assistant.bind_router(router_manager)
+    actual_logger = logger or getattr(router_manager, "router_logger", None)
+    existing = getattr(router_manager, "ollama_assistant", None) if router_manager is not None else None
+
+    if isinstance(existing, OllamaModelAssistant):
+        assistant = existing
+        if config is not None:
+            assistant.config = config
+            assistant.client.config = config
+    else:
+        assistant = OllamaModelAssistant(logger=actual_logger, config=config)
+
+    ok = False
+    try:
+        ok = assistant.bind_router(router_manager)
+    except Exception as ex:
+        _safe_log(actual_logger, f"[Ollama] ⚠️ Init-managed bridge bind failed safely: {type(ex).__name__}: {ex}", "error")
+        ok = False
+
+    try:
+        setattr(router_manager, "ollama_assistant", assistant)
+        setattr(router_manager, "ollama_packet_memory", assistant.memory)
+        setattr(router_manager, "ollama_router_bridge", assistant.bridge)
+    except Exception:
+        pass
+
     if ok:
-        try:
-            setattr(router_manager, "ollama_assistant", assistant)
-            setattr(router_manager, "ollama_packet_memory", assistant.memory)
-            setattr(router_manager, "ollama_router_bridge", assistant.bridge)
-        except Exception:
-            pass
+        _safe_log(actual_logger, "[Ollama] ✅ Init-managed router bridge ready.", "info")
+    else:
+        _safe_log(actual_logger, "[Ollama] ⚠️ Assistant created, but router bridge is not bound. Chat still works without packet learning.", "error")
+
     return assistant
 
 
