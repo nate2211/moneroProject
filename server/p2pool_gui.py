@@ -7,7 +7,7 @@ import asyncio
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
-    PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab
+    PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab, OllamaModelTab, OllamaLogger
 
 
 def is_admin():
@@ -180,6 +180,7 @@ class P2PoolGUI(QMainWindow):
         self.gobuster_logger = gobuster_logger # Store gobuster_logger
         self.scraping_logger = scraping_logger
 
+        self.ollama_logger = OllamaLogger()
         self.helper = p2pool_helper
         self.packet_manager = self.helper.packet_manager
         self.application_main_loop = application_main_loop
@@ -259,6 +260,11 @@ class P2PoolGUI(QMainWindow):
         self.nmap_tab = NmapTab(self.nmap_logger, self.async_worker.loop)
         self.gobuster_tab = GobusterTab(self.gobuster_logger, self.async_worker.loop)
         self.scraping_tab = ScrapingTab(self.scraping_logger, self.async_worker.loop)
+        self.ollama_model_tab = OllamaModelTab(
+            self.ollama_logger,
+            router_provider=lambda: self.helper.router_manager,
+        )
+
         self.tabs.addTab(self.p2pool_tab, "P2Pool")
         self.tabs.addTab(self.wireshark_tab, "Wireshark Capture")
         self.tabs.addTab(self.packet_sender_tab, "Send Packets")
@@ -267,6 +273,7 @@ class P2PoolGUI(QMainWindow):
         self.tabs.addTab(self.nmap_tab, "Nmap Scan")
         self.tabs.addTab(self.gobuster_tab, "Gobuster Scan")
         self.tabs.addTab(self.scraping_tab, "Scraping")
+        self.tabs.addTab(self.ollama_model_tab, "Ollama Model")
 
     def connect_signals(self):
         """Connects signals from UI elements to backend logic."""
@@ -277,6 +284,7 @@ class P2PoolGUI(QMainWindow):
         self.nmap_logger.message_signal.connect(self.nmap_tab.log_message)
         self.gobuster_logger.message_signal.connect(self.gobuster_tab.log_message) # Connect Gobuster logger to its tab's log
         self.scraping_logger.message_signal.connect(self.scraping_tab.log_message)
+        self.ollama_logger.message_signal.connect(self.ollama_model_tab.log_message)
         self.p2pool_tab.start_p2pool_button.clicked.connect(self.start_p2pool)
         self.p2pool_tab.stop_p2pool_button.clicked.connect(self.stop_p2pool)
 
@@ -439,6 +447,7 @@ class P2PoolGUI(QMainWindow):
         python_server = self.router_tab.python_server_checkbox.isChecked()
         promisc = self.router_tab.promisc_checkbox.isChecked()
         use_socket = self.router_tab.use_socket.isChecked()
+        use_ollama = self.router_tab.ollama_checkbox.isChecked()
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
@@ -467,6 +476,7 @@ class P2PoolGUI(QMainWindow):
                 python_server=python_server,
                 promisc=promisc,
                 use_socket=use_socket,
+                use_ollama=use_ollama,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
@@ -501,7 +511,7 @@ class P2PoolGUI(QMainWindow):
                 f"static={use_static}, "
                 f"hyperv={use_hyperv}"
             )
-
+            use_ollama = self.router_tab.ollama_checkbox.isChecked()
             self.helper.router_manager.stop_routing(
                 use_dhcp_out,
                 use_dhcp_in,
@@ -510,6 +520,7 @@ class P2PoolGUI(QMainWindow):
                 use_stratum_comm,
                 use_netroute,
                 nat_os,
+                use_ollama,
             )
 
             self.router_tab.start_router_button.setEnabled(True)
@@ -571,6 +582,11 @@ class P2PoolGUI(QMainWindow):
             if self.background_thread.isRunning():
                 self.gui_logger.log_message("[GUI] Main application background thread did not terminate gracefully.")
 
+        try:
+            if getattr(self, "ollama_model_tab", None):
+                self.ollama_model_tab.shutdown()
+        except Exception as e:
+            self.gui_logger.log_message(f"[GUI] Ollama tab shutdown error: {e}")
 
         self.gui_logger.log_message("[GUI] All GUI-managed threads cleanup attempted.")
         event.accept()

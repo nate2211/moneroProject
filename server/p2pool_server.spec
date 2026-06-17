@@ -50,6 +50,7 @@ datas_list = [
     ('p2pool_endpoints.py', '.'),
     ('p2pool_hyperv.py', '.'),
     ('p2pool_java.py', '.'),
+    ('p2pool_ollama.py', '.'),
     ('randomx_ctypes.py', '.'),
 ]
 

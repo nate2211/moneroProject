@@ -66,7 +66,10 @@ from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
 from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
-
+try:
+    from p2pool_ollama import install_ollama_on_router
+except Exception:
+    install_ollama_on_router = None
 
 class PythonRouterManager:
 
@@ -210,7 +213,9 @@ class PythonRouterManager:
             "https://ipv4.icanhazip.com",
             "https://ifconfig.me/ip",
         )
-
+        self.ollama_assistant = None
+        self.ollama_packet_memory = None
+        self.ollama_router_bridge = None
         # Tracks the extra on-link WAN address we may publish to NAT in double-NAT cases
         self._nat_last_marked_public_on_lan: Optional[str] = None
 
@@ -2692,7 +2697,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket, use_ollama):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2945,6 +2950,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             else:
                 self.netroute_manager = False
             self.code_output_manager.start()
+            if install_ollama_on_router is not None and self.ollama_assistant is None and use_ollama:
+                try:
+                    self.ollama_assistant = install_ollama_on_router(self, self.router_logger)
+                    self.router_logger.log_message("[Ollama] ✅ Router packet learning bridge installed.")
+                except Exception as e:
+                    self.router_logger.log_message(f"[Ollama] ⚠️ Failed to install bridge: {e}")
+
             self.code_output_manager.set_verbose(2)
             self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
 
@@ -3013,7 +3025,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os):
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os, use_ollama):
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
@@ -3032,6 +3044,12 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     self.daemon_manager.stop()
                 self.stratum_connection_manager.stop()
             self.code_output_manager.stop()
+            try:
+                if self.ollama_assistant and use_ollama:
+                    self.ollama_assistant.unbind_router()
+                    self.ollama_assistant = None
+            except Exception as e:
+                self.router_logger.log_message(f"[Ollama] ⚠️ Unbind failed: {e}")
             if use_static:
                 self._deconfigure_interface_settings()
             self._stop_sniffing_event.set()
