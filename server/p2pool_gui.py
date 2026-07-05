@@ -451,32 +451,48 @@ class P2PoolGUI(QMainWindow):
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
+        use_remote_uplink = self.use_remote_uplink_checkbox.isChecked()
+        remote_uplink_mode = self.remote_uplink_mode_combo.currentText().strip().lower()
+        remote_uplink_lan_ip = self.remote_uplink_lan_ip_input.text().strip()
+        remote_uplink_key = self.remote_uplink_key_input.text().strip()
+        remote_uplink_enable_proxy = self.remote_uplink_proxy_checkbox.isChecked()
 
         try:
-            self.helper.router_manager.start_routing(
-                use_dhcp_out=use_dhcp_out,
-                use_dhcp_in=use_dhcp_in,
-                router_ip_out=lan_ip,
-                netmask_out=netmask_out,
-                use_static=use_static,
-                use_hyperv=use_hyperv,
-                use_stratum_comm=use_stratum_comm,
-                p2pool_server_ip=p2pool_server_ip,
-                ipc_emit_host=ipc_emit_host,
-                use_peer_to_peer=use_peer_to_peer,
-                use_blocknet=use_blocknet,
-                blocknet_relay=blocknet_relay,
-                blocknet_token=blocknet_token,
-                use_netroute=use_netroute,
-                use_hostbypass=use_hostbypass,
-                use_gateway=use_gateway,
-                use_lan=use_lan,
-                use_uplink=use_uplink,
-                nat_os=nat_os,
-                python_server=python_server,
-                promisc=promisc,
-                use_socket=use_socket,
-                use_ollama=use_ollama,
+            remote_uplink_port = int(self.remote_uplink_port_input.text().strip() or "47820")
+        except ValueError:
+            remote_uplink_port = 47820
+            self.router_logger.log_message("[RemoteUplink] ⚠️ Invalid port entered; using 47820.")
+        try:
+            self.router.start_routing(
+                use_dhcp_out=self.dhcp_out_checkbox.isChecked(),
+                use_dhcp_in=self.dhcp_in_checkbox.isChecked(),
+                router_ip_out=self.router_ip_out_input.text().strip(),
+                netmask_out=self.router_netmask_out_input.text().strip(),
+                use_static=self.use_static_checkbox.isChecked(),
+                use_hyperv=self.use_hyperv_checkbox.isChecked(),
+                use_stratum_comm=self.stratum_comm_checkbox.isChecked(),
+                p2pool_server_ip=self.p2pool_server_ip_input.text().strip(),
+                ipc_emit_host=self.ipc_host_input.text().strip(),
+                use_peer_to_peer=self.peer_to_peer_checkbox.isChecked(),
+                use_blocknet=self.blocknet_checkbox.isChecked(),
+                blocknet_relay=self.blocknet_relay_input.text().strip(),
+                blocknet_token=self.blocknet_token_input.text().strip(),
+                use_netroute=self.use_netroute_checkbox.isChecked(),
+                use_hostbypass=self.use_hostbypass_checkbox.isChecked(),
+                use_gateway=self.use_gateway_checkbox.isChecked(),
+                use_lan=self.use_lan_checkbox.isChecked(),
+                use_uplink=self.use_uplink_checkbox.isChecked(),
+                nat_os=self.nat_os_checkbox.isChecked(),
+                python_server=self.python_server_checkbox.isChecked(),
+                promisc=self.promisc_checkbox.isChecked(),
+                use_socket=self.use_socket.isChecked(),
+                use_ollama=self.ollama_checkbox.isChecked(),
+                use_remote_uplink=use_remote_uplink,
+                remote_uplink_mode=remote_uplink_mode,
+                remote_uplink_lan_ip=remote_uplink_lan_ip,
+                remote_uplink_port=remote_uplink_port,
+                remote_uplink_key=remote_uplink_key,
+                remote_uplink_enable_proxy=remote_uplink_enable_proxy,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")

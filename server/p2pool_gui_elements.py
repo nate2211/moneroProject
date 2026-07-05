@@ -1836,7 +1836,26 @@ class RouterTab(QWidget):
 
         self.add_pane_input = QLineEdit()
         self.add_pane_input.setPlaceholderText("Add Pane")
+        self.use_remote_uplink_checkbox = QCheckBox("Use Remote Uplink")
+        self.use_remote_uplink_checkbox.setChecked(False)
 
+        self.remote_uplink_mode_combo = QComboBox()
+        self.remote_uplink_mode_combo.addItems(["client", "server"])
+        self.remote_uplink_mode_combo.setCurrentText("client")
+
+        self.remote_uplink_lan_ip_input = QLineEdit()
+        self.remote_uplink_lan_ip_input.setPlaceholderText("Server LAN IP, example: 192.168.1.55")
+
+        self.remote_uplink_port_input = QLineEdit()
+        self.remote_uplink_port_input.setText("47820")
+        self.remote_uplink_port_input.setPlaceholderText("Tunnel Port")
+
+        self.remote_uplink_key_input = QLineEdit()
+        self.remote_uplink_key_input.setPlaceholderText("Shared key/password")
+        self.remote_uplink_key_input.setEchoMode(QLineEdit.Password)
+
+        self.remote_uplink_proxy_checkbox = QCheckBox("Enable Windows Proxy")
+        self.remote_uplink_proxy_checkbox.setChecked(True)
         self.add_pane_button = QPushButton("➕")
         self.remove_pane_button = QPushButton("➖")
 
@@ -1902,11 +1921,18 @@ class RouterTab(QWidget):
         blocknet_form.addRow(self.blocknet_checkbox)
         blocknet_form.addRow(QLabel("Relay:"), self.blocknet_relay_input)
         blocknet_form.addRow(QLabel("Token:"), self.blocknet_token_input)
-
+        remote_uplink_box = QGroupBox("Remote Uplink")
+        remote_uplink_form = QFormLayout(remote_uplink_box)
+        remote_uplink_form.addRow(self.use_remote_uplink_checkbox)
+        remote_uplink_form.addRow(QLabel("Mode:"), self.remote_uplink_mode_combo)
+        remote_uplink_form.addRow(QLabel("LAN IP:"), self.remote_uplink_lan_ip_input)
+        remote_uplink_form.addRow(QLabel("Port:"), self.remote_uplink_port_input)
+        remote_uplink_form.addRow(QLabel("Key:"), self.remote_uplink_key_input)
+        remote_uplink_form.addRow(self.remote_uplink_proxy_checkbox)
         group_row.addWidget(routing_box, 2)
         group_row.addWidget(comms_box, 2)
         group_row.addWidget(blocknet_box, 2)
-
+        group_row.addWidget(remote_uplink_box, 2)
         layout.addLayout(group_row)
 
         pane_row = QHBoxLayout()
@@ -1930,6 +1956,8 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox.stateChanged.connect(self._sync_enable_states)
         self.blocknet_checkbox.stateChanged.connect(self._sync_enable_states)
         self.stratum_comm_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.use_remote_uplink_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.remote_uplink_mode_combo.currentTextChanged.connect(self._sync_enable_states)
 
     def _sync_enable_states(self):
         use_static = self.use_static_checkbox.isChecked()
@@ -1953,7 +1981,20 @@ class RouterTab(QWidget):
 
         if not use_stratum:
             self.p2pool_server_ip_input.setText("")
+        use_remote_uplink = self.use_remote_uplink_checkbox.isChecked()
+        remote_mode = self.remote_uplink_mode_combo.currentText().strip().lower()
 
+        self.remote_uplink_mode_combo.setEnabled(use_remote_uplink)
+        self.remote_uplink_lan_ip_input.setEnabled(use_remote_uplink and remote_mode == "client")
+        self.remote_uplink_port_input.setEnabled(use_remote_uplink)
+        self.remote_uplink_key_input.setEnabled(use_remote_uplink)
+        self.remote_uplink_proxy_checkbox.setEnabled(use_remote_uplink and remote_mode == "client")
+
+        if remote_mode == "server":
+            self.remote_uplink_lan_ip_input.setPlaceholderText("Not needed in server mode")
+            self.remote_uplink_proxy_checkbox.setChecked(False)
+        else:
+            self.remote_uplink_lan_ip_input.setPlaceholderText("Server LAN IP, example: 192.168.1.55")
     def _on_preset_selected(self, preset_name: str):
         self._load_presets(preset_name)
 
