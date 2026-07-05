@@ -70,7 +70,7 @@ try:
     from p2pool_ollama import install_ollama_on_router
 except Exception:
     install_ollama_on_router = None
-from remote_uplink import RemoteUplink
+
 class PythonRouterManager:
 
     """
@@ -138,7 +138,7 @@ class PythonRouterManager:
         self._sniff_threads_lock = threading.Lock() # Lock for _sniff_threads dictionary
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
-        self.remote_uplink = None
+
         self.function_call_tracker = FunctionCallTracker(router_logger)
 
         self.sniffer = None
@@ -221,69 +221,6 @@ class PythonRouterManager:
 
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
 
-    def start_remote_uplink(
-            self,
-            *,
-            mode: str,
-            server_lan_ip: str = "",
-            bind_ip: str = "0.0.0.0",
-            port: int = 47820,
-            shared_key: str = "CHANGE_THIS_REMOTE_UPLINK_KEY",
-            enable_system_proxy: bool = False,
-            socks_port: int = 1080,
-            http_port: int = 8080,
-    ):
-        """
-        Starts RemoteUplink as a router-managed component.
-
-        mode="server":
-            Run on the computer WITH internet.
-            Other LAN computer connects to this machine.
-
-        mode="client":
-            Run on the computer/router WITHOUT internet.
-            server_lan_ip must be the LAN IP of the internet computer.
-
-        No port forwards are needed when both computers are on the same LAN.
-        """
-        try:
-            if getattr(self, "remote_uplink", None):
-                self.remote_uplink.stop()
-                self.remote_uplink = None
-
-            self.remote_uplink = RemoteUplink(
-                mode=mode,
-                server_lan_ip=server_lan_ip,
-                bind_ip=bind_ip,
-                port=int(port),
-                shared_key=shared_key,
-                socks_port=int(socks_port),
-                http_port=int(http_port),
-                enable_system_proxy=bool(enable_system_proxy),
-                router_logger=self.router_logger,
-            )
-            self.remote_uplink.start()
-
-            self.router_logger.log_message(
-                f"[RemoteUplink] ✅ started mode={mode} server={server_lan_ip or '-'} "
-                f"bind={bind_ip} port={port} http=127.0.0.1:{http_port} socks=127.0.0.1:{socks_port}"
-            )
-            return True
-        except Exception as e:
-            self.router_logger.log_message(f"[RemoteUplink] ❌ start failed: {type(e).__name__}: {e}")
-            return False
-
-    def stop_remote_uplink(self):
-        """Stops RemoteUplink safely."""
-        try:
-            if getattr(self, "remote_uplink", None):
-                self.remote_uplink.stop()
-                self.remote_uplink = None
-                self.router_logger.log_message("[RemoteUplink] ✅ stopped")
-            return True
-        except Exception as e:
-            self.router_logger.log_message(f"[RemoteUplink] ⚠️ stop failed: {type(e).__name__}: {e}")
-            return False
     # --- add this helper inside PythonRouterManager ---
     def _boundary_transit_ifaces(self) -> set[str]:
         out = {SocketInterface.IFACE_NAME}
@@ -2760,12 +2697,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
 
 
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket, use_ollama,    use_remote_uplink=False,
-    remote_uplink_mode="client",
-    remote_uplink_lan_ip="",
-    remote_uplink_port=47820,
-    remote_uplink_key="",
-    remote_uplink_enable_proxy=True,):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket, use_ollama):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2836,15 +2768,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 )
                 self.python_server_manager.start()
                 self.arp_manager.add_trusted_port("Miner")
-            if use_remote_uplink:
-                self.start_remote_uplink(
-                    use_remote_uplink=bool(use_remote_uplink),
-                    remote_uplink_mode=remote_uplink_mode,
-                    remote_uplink_lan_ip=remote_uplink_lan_ip,
-                    remote_uplink_port=remote_uplink_port,
-                    remote_uplink_key=remote_uplink_key,
-                    remote_uplink_enable_proxy=remote_uplink_enable_proxy,
-                )
             if use_lan:
                 self.lan_manager = LanManager(self, DHCPServer, gateway_manager=self.gateway_manager)
                 self.lan_manager.configure(
@@ -3138,8 +3061,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()
-            if getattr(self, "remote_uplink", None):
-                self.stop_remote_uplink()
             if nat_os:
                 self._disable_nat_forwarding()
             if self.nat_manager:
