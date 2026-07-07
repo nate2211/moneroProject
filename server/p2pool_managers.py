@@ -56,7 +56,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
     P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, \
-    HyperVRouterManager, PythonServerManager
+    HyperVRouterManager, PythonServerManager,ScrapeWebsiteManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -66,6 +66,7 @@ from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
 from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
+
 try:
     from p2pool_ollama import install_ollama_on_router
 except Exception:
@@ -138,7 +139,7 @@ class PythonRouterManager:
         self._sniff_threads_lock = threading.Lock() # Lock for _sniff_threads dictionary
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
-
+        self.scrapewebsite_manager = None
         self.function_call_tracker = FunctionCallTracker(router_logger)
 
         self.sniffer = None
@@ -2696,8 +2697,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             component="packet-writer",
         )
 
-
-    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv, use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay, blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os, python_server, promisc, use_socket, use_ollama):
+    def start_routing(self, use_dhcp_out, use_dhcp_in, router_ip_out, netmask_out, use_static, use_hyperv,
+                      use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay,
+                      blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os,
+                      python_server, promisc, use_socket, use_ollama, use_scrapewebsite=False,
+                      scrapewebsite_endpoint=None):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -2978,7 +2982,14 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.parallel_python.increase_ram_usage(1000)
             pcores = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # example: your P-cores (adjust for your CPU)
             unhinge_process(cores=pcores, high_priority=True, disable_eco=True)
-
+            if use_scrapewebsite:
+                self.scrapewebsite_manager = ScrapeWebsiteManager(
+                    self.router_logger,
+                    endpoint=scrapewebsite_endpoint or ScrapeWebsiteManager.DEFAULT_ENDPOINT,
+                    router_id="main",
+                    allow_private_dst=False,
+                )
+                self.scrapewebsite_manager.start()
             start_cpu_boost(threads=len(pcores), target_util=0.75, cores=pcores, pin_per_thread=True, unhinge=True)
             if use_hyperv:
                 # after creating managers
@@ -3036,7 +3047,12 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.hyperv_manager.teardown()
                 self.hyperv_enabled = False
             self.parallel_python.release_ram_usage()
-
+            try:
+                if self.scrapewebsite_manager:
+                    self.scrapewebsite_manager.stop()
+                    self.scrapewebsite_manager = None
+            except Exception as e:
+                self.router_logger.log_message(f"[ScrapeWebsite] Stop error: {e}")
             if self.socket_interface:
                 self.socket_interface.stop()
             if use_stratum_comm:

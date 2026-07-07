@@ -1792,7 +1792,12 @@ class RouterTab(QWidget):
 
         self.use_static_checkbox = QCheckBox("Use Static (all)")
         self.use_static_checkbox.setChecked(False)
+        self.use_scrapewebsite_checkbox = QCheckBox("Accept ScrapeWebsite Requests")
+        self.use_scrapewebsite_checkbox.setChecked(False)
 
+        self.scrapewebsite_endpoint_input = QLineEdit()
+        self.scrapewebsite_endpoint_input.setText("https://scrapewebsite.pages.dev/api/router/router")
+        self.scrapewebsite_endpoint_input.setPlaceholderText("ScrapeWebsite router API endpoint")
         self.use_netroute_checkbox = QCheckBox("Use NetRoute")
         self.use_netroute_checkbox.setChecked(False)
         self.use_hostbypass_checkbox = QCheckBox("Use Host Bypass")
@@ -1902,7 +1907,12 @@ class RouterTab(QWidget):
         blocknet_form.addRow(self.blocknet_checkbox)
         blocknet_form.addRow(QLabel("Relay:"), self.blocknet_relay_input)
         blocknet_form.addRow(QLabel("Token:"), self.blocknet_token_input)
+        scrape_box = QGroupBox("ScrapeWebsite")
+        scrape_form = QFormLayout(scrape_box)
+        scrape_form.addRow(self.use_scrapewebsite_checkbox)
+        scrape_form.addRow(QLabel("Endpoint:"), self.scrapewebsite_endpoint_input)
 
+        group_row.addWidget(scrape_box, 2)
         group_row.addWidget(routing_box, 2)
         group_row.addWidget(comms_box, 2)
         group_row.addWidget(blocknet_box, 2)
@@ -1930,6 +1940,7 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox.stateChanged.connect(self._sync_enable_states)
         self.blocknet_checkbox.stateChanged.connect(self._sync_enable_states)
         self.stratum_comm_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.use_scrapewebsite_checkbox.stateChanged.connect(self._sync_enable_states)
 
     def _sync_enable_states(self):
         use_static = self.use_static_checkbox.isChecked()
@@ -1946,7 +1957,7 @@ class RouterTab(QWidget):
         use_blocknet = self.blocknet_checkbox.isChecked()
         self.blocknet_relay_input.setEnabled(use_blocknet)
         self.blocknet_token_input.setEnabled(use_blocknet)
-
+        self.scrapewebsite_endpoint_input.setEnabled(self.use_scrapewebsite_checkbox.isChecked())
         if not use_blocknet:
             self.blocknet_relay_input.setText("")
             self.blocknet_token_input.setText("")

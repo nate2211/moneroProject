@@ -30853,5 +30853,152 @@ async function fetchJson(url) {
             return None
 
 
+class ScrapeWebsiteManager:
+    DEFAULT_ENDPOINT = "https://scrapewebsite.pages.dev/api/router/router"
 
+    def __init__(self, router_logger, endpoint=None, router_id="main",
+                 poll_interval=1.5, request_timeout=20.0, allow_private_dst=False):
+        self.router_logger = router_logger
+        self.endpoint = (endpoint or self.DEFAULT_ENDPOINT).strip()
+        self.router_id = router_id or "main"
+        self.poll_interval = max(float(poll_interval), 5)
+        self.request_timeout = max(float(request_timeout), 1.0)
+        self.allow_private_dst = bool(allow_private_dst)
+        self._stop = threading.Event()
+        self._thread = None
+        self._session = requests.Session()
 
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="ScrapeWebsiteManager")
+        self._thread.start()
+        self._log(f"[ScrapeWebsite] Started: {self.endpoint} routerId={self.router_id}")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._log("[ScrapeWebsite] Stopped.")
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                for job in self._claim_jobs():
+                    if self._stop.is_set():
+                        break
+                    self._handle_job(job)
+            except Exception as e:
+                self._log(f"[ScrapeWebsite] Poll error: {e}")
+            self._stop.wait(self.poll_interval)
+
+    def _claim_jobs(self):
+        response = self._session.get(
+            self.endpoint,
+            params={
+                "routerId": self.router_id,
+                "claim": "1",
+                "limit": "10",
+            },
+            timeout=10,
+        )
+
+        text = response.text or ""
+
+        try:
+            data = response.json()
+        except Exception:
+            preview = text[:500].replace("\n", "\\n")
+            raise RuntimeError(
+                f"Non-JSON response from scrapewebsite. "
+                f"status={response.status_code} url={response.url} body={preview!r}"
+            )
+
+        if not response.ok or not data.get("ok"):
+            raise RuntimeError(
+                data.get("error") or f"scrapewebsite returned HTTP {response.status_code}"
+            )
+
+        return data.get("jobs") or []
+
+    def _handle_job(self, job):
+        job_id = job.get("id")
+        url = job.get("url")
+        method = str(job.get("method") or "GET").upper()
+        started = time.time()
+
+        try:
+            self._validate_url(url)
+            headers = job.get("headers") if isinstance(job.get("headers"), dict) else {}
+            body = job.get("body")
+
+            self._log(f"[ScrapeWebsite] Sending {method} {url}")
+
+            resp = self._session.request(
+                method,
+                url,
+                headers=self._clean_headers(headers),
+                data=None if method in ("GET", "HEAD") else body,
+                timeout=self.request_timeout,
+                allow_redirects=False,
+            )
+
+            self._report(job_id, {
+                "status": "completed",
+                "responseStatus": resp.status_code,
+                "responseBody": resp.text[:512000],
+                "durationMs": int((time.time() - started) * 1000),
+            })
+        except Exception as e:
+            self._report(job_id, {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+            })
+
+    def _report(self, job_id, payload):
+        if not job_id:
+            return
+        payload = {"id": job_id, **payload}
+        self._session.patch(
+            self.endpoint,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=10,
+        )
+
+    def _validate_url(self, url):
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme != "https":
+            raise ValueError("Only https:// URLs are allowed")
+        if not parsed.hostname:
+            raise ValueError("Missing hostname")
+
+        for ip in self._resolve(parsed.hostname):
+            addr = ipaddress.ip_address(ip)
+            if not self.allow_private_dst and (
+                addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified
+            ):
+                raise ValueError(f"Blocked private/special destination: {ip}")
+
+    def _resolve(self, host):
+        return sorted(set(
+            item[4][0] for item in socket.getaddrinfo(host, None)
+            if item[0] in (socket.AF_INET, socket.AF_INET6)
+        ))
+
+    def _clean_headers(self, headers):
+        blocked = {"authorization", "cookie", "host", "connection", "content-length", "transfer-encoding"}
+        out = {"User-Agent": "PythonRouter-ScrapeWebsiteManager/1.0"}
+        for k, v in headers.items():
+            if str(k).lower() not in blocked:
+                out[str(k)] = str(v)
+        return out
+
+    def _log(self, msg):
+        try:
+            self.router_logger.log_message(msg)
+        except Exception:
+            print(msg)

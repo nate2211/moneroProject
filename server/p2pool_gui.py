@@ -451,7 +451,8 @@ class P2PoolGUI(QMainWindow):
         if use_blocknet and not blocknet_relay:
             self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
             return
-
+        use_scrapewebsite = self.router_tab.use_scrapewebsite_checkbox.isChecked()
+        scrapewebsite_endpoint = self.router_tab.scrapewebsite_endpoint_input.text().strip()
         try:
             self.helper.router_manager.start_routing(
                 use_dhcp_out=use_dhcp_out,
@@ -477,6 +478,8 @@ class P2PoolGUI(QMainWindow):
                 promisc=promisc,
                 use_socket=use_socket,
                 use_ollama=use_ollama,
+                use_scrapewebsite=use_scrapewebsite,
+                scrapewebsite_endpoint=scrapewebsite_endpoint,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
