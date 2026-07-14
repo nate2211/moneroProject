@@ -31957,17 +31957,13 @@ class PacketWriter:
 
         if not no_consume:
             if not self.rate_limiter.consume(str(dst_ip)):
-                #self.logger.log_message(f"[PacketWriter] 🚫 Rate limit exceeded for {dst_ip}. Dropping packet.")
+                self.logger.log_message(f"[PacketWriter] 🚫 Rate limit exceeded for {dst_ip}. Dropping packet.")
                 return False
 
         try:
-            if chosen:
-                egress_iface = interface
-            else:
-                egress_iface = self.outbound_load_balancer.get_next_interface(packet)
+            egress_iface = interface
             if not egress_iface:
-                self.logger.log_message("[PacketWriter] ❌ No egress interface selected.")
-                return False
+                egress_iface = self.outbound_load_balancer.get_next_interface(packet)
 
             self.logger.log_message(
                 RouterRandomMessages(

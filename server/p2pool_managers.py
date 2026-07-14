@@ -1867,6 +1867,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             # --- early in the router packet-processing path ---
             if self.socket_interface and self.socket_interface.handle_packet(packet, inbound_iface):
                 return True
+            if self.packet_writer and self.packet_writer.observe_inbound_packet(packet, inbound_iface=inbound_iface, source="router-sniffer"):
+                pass
             # ==========================================================
             # ✅ ARP HANDLING BLOCK (reply/learn) BEFORE "no IP layer" drop
             # ==========================================================
@@ -2740,20 +2742,46 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.dns_manager.router_ipv4_out = self.router_ip_out
             if use_gateway:
                 self.gateway_manager = GatewayManager(self, DNSManager)
+
                 self.gateway_manager.configure(
+                    packet_writer=self.packet_writer,
+                    nat_manager=self.nat_manager,
+                    dns_manager=getattr(self, "dns_manager", None),
+                    arp_manager=self.arp_manager,
+                    ndp_manager=self.ndp_manager,
+                    icmp_manager=self.icmp_manager,
+                    netroute_manager=self.netroute_manager,
+                    rip_manager=getattr(self, "rip_manager", None),
+                    ethernet_manager=getattr(self, "ethernet_manager", None),
+                    dhcp_manager=getattr(self, "dhcp_manager", None),
+                    sendback_manager=getattr(self, "sendback_manager", None),
+
+                    # Additional custom managers can also participate.
+                    manager_inputs={
+                        # "firewall_manager": self.firewall_manager,
+                        # "tunnel_manager": self.tunnel_manager,
+                    },
+
+                    attach_managers_to_router=True,
+                    manage_dns_lifecycle=True,
+                    stop_injected_managers_on_stop=False,
+                    sync_managers_on_gateway_change=True,
+                    dispatch_gateway_packets_to_managers=True,
+
                     auto_configure_router_interfaces=False,
                     use_dhcp_out=use_dhcp_out,
                     use_dhcp_in=use_dhcp_in,
                     router_ip_out=router_ip_out,
                     router_netmask_out=netmask_out,
-                    force_wan_to_dhcp_on_start=bool(use_dhcp_out),
-                    ensure_host_dns_from_wan=True,
+                    force_wan_to_dhcp_on_start=False,
+                    ensure_host_dns_from_wan=False,
                     repair_on_failure=True,
                     pin_gateway_arp=True,
                     runtime_set_wan_to_dhcp=bool(use_dhcp_out),
                     disable_netroute_default_sync=True,
                     disable_netroute_metric_tuning=True,
                 )
+
                 self.gateway_manager.start()
             if python_server:
                 self.python_server_manager = PythonServerManager(
