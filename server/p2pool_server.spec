@@ -52,7 +52,6 @@ datas_list = [
     ('p2pool_java.py', '.'),
     ('p2pool_ollama.py', '.'),
     ('randomx_ctypes.py', '.'),
-    ('remote_uplink.py', '.'),
 ]
 
 # Identify all Python files to scan for imports.
