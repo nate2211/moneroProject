@@ -17,6 +17,8 @@ import traceback
 import uuid
 import zlib
 from collections import defaultdict, deque, OrderedDict, Counter
+import concurrent
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from functools import reduce
@@ -7625,12 +7627,19 @@ class DNSManager:
       - terminal reply dedupe to suppress repeated SERVFAIL/NXDOMAIN spam
       - more stable reply path selection back to the client
 
-    Small patch additions:
-      - strips stale Layer-2 headers before sending upstream or client replies
-      - avoids answering obviously non-local DNS queries when enough local context exists
-      - learns likely local upstream resolvers from observed client query destinations
-      - tags common Windows/Microsoft connectivity-check domains in logs
-      - includes reply L2 mode in terminal-reply logging
+    Browser/OS resolver additions:
+      - accepts query and response packets directly from PacketHandler through process_packet()
+      - resolves upstream DNS through bounded OS UDP sockets by default
+      - automatically retries another resolver and falls back to DNS-over-TCP when UDP is truncated
+      - preserves the complete DNS wire query, including EDNS, DNSSEC flags, HTTPS/SVCB, SRV, TXT, MX, and CNAME
+      - replies from the exact resolver address the client queried, which prevents Windows/browser rejection
+      - keeps raw packet forwarding as a compatibility fallback
+      - chooses a separate upstream interface when a route/interface selector is configured
+      - protects against learning the router's own listener address as an upstream and creating a DNS loop
+      - does not consume unrelated DNS replies merely because they were observed by PacketHandler
+      - ages cached TTL values before returning cached responses
+      - strips stale Layer-2 headers correctly before every rewritten send
+      - exposes browser-resolution, socket transport, retry, TCP fallback, and failure counters
     """
 
     DNS_CACHE_TTL                  = 300
@@ -7686,6 +7695,29 @@ class DNSManager:
         "www.msftncsi.com",
     }
 
+    # Browser-ready resolver transport.  "prefer" uses normal OS sockets first,
+    # allowing Windows to perform routing, ARP/ND, fragmentation and return-path
+    # handling.  "disabled" preserves the original raw-packet-only behavior.
+    OS_SOCKET_RESOLUTION_MODE      = "prefer"   # "prefer" | "disabled"
+    OS_SOCKET_WORKERS              = 12
+    OS_SOCKET_QUEUE_LIMIT          = 2048
+    OS_SOCKET_UPSTREAM_ATTEMPTS    = 3
+    OS_SOCKET_RETRIES_PER_SERVER   = 1
+    OS_SOCKET_UDP_RECV_BYTES       = 65535
+    OS_SOCKET_TCP_MAX_BYTES        = 65535
+    OS_SOCKET_TIMEOUT_SEC          = 2.5
+    OS_SOCKET_ENABLE_TCP_FALLBACK  = True
+
+    # DNS clients validate the source of a reply.  In transparent-router mode,
+    # the safest source is the destination address from the original query.
+    REPLY_SOURCE_POLICY            = "query-destination"  # query-destination | router-address | upstream
+    PASSIVE_CACHE_UNMATCHED_RESPONSES = False
+    CACHE_AGE_TTLS                 = True
+
+    # Known modern browser/OS query types are forwarded unchanged.  The set is
+    # used only for diagnostics; unknown types are also forwarded unchanged.
+    BROWSER_RELEVANT_QTYPES        = {1, 2, 5, 6, 12, 15, 16, 28, 33, 41, 43, 48, 64, 65, 255}
+
     def __init__(self, router_logger, packet_writer, router_ipv6_ll):
         self.logger = router_logger
         self.pw = packet_writer
@@ -7711,6 +7743,20 @@ class DNSManager:
         # Background health probe thread
         self._stop_event = threading.Event()
         self._probe_thread: Optional[threading.Thread] = None
+
+        # Bounded OS-socket resolver execution.  This is deliberately separate
+        # from PacketHandler so a blocked capture/recapture path cannot prevent
+        # browsers from receiving DNS answers.
+        self._socket_executor: Optional[ThreadPoolExecutor] = None
+        self._socket_slots = threading.BoundedSemaphore(max(1, int(self.OS_SOCKET_QUEUE_LIMIT)))
+        self._socket_generation = 0
+        self._socket_source_ipv4: Optional[str] = None
+        self._socket_source_ipv6: Optional[str] = None
+
+        # Optional control-plane hooks configured by GatewayManager/RouteManager.
+        self._upstream_iface: Optional[str] = None
+        self._upstream_iface_selector: Optional[Callable[[str, Optional[str]], Optional[str]]] = None
+        self._packet_context_provider: Optional[Callable[[Packet, str], Dict[str, Any]]] = None
 
         # Router addresses
         self.router_ipv4_out = None
@@ -7752,6 +7798,21 @@ class DNSManager:
             "upstream_probe_fail": 0,
             "fallback_question_match": 0,
             "terminal_reply_suppressed": 0,
+            "packet_dispatch_query": 0,
+            "packet_dispatch_response": 0,
+            "socket_jobs_submitted": 0,
+            "socket_jobs_rejected": 0,
+            "socket_udp_success": 0,
+            "socket_tcp_success": 0,
+            "socket_tcp_fallback": 0,
+            "socket_retry": 0,
+            "socket_resolution_fail": 0,
+            "browser_answers_sent": 0,
+            "reply_source_query_destination": 0,
+            "reply_source_router": 0,
+            "unmatched_response_ignored": 0,
+            "local_upstream_loop_prevented": 0,
+            "self_originated_query_passed": 0,
         }
 
         self._last_health_summary = 0.0
@@ -7836,6 +7897,89 @@ class DNSManager:
             ["🌐", "🛰️", "🧭"]
         )
 
+    def configure_runtime(
+        self,
+        *,
+        upstream_iface: Optional[str] = None,
+        upstream_iface_selector: Optional[Callable[[str, Optional[str]], Optional[str]]] = None,
+        packet_context_provider: Optional[Callable[[Packet, str], Dict[str, Any]]] = None,
+        socket_source_ipv4: Optional[str] = None,
+        socket_source_ipv6: Optional[str] = None,
+        socket_resolution_mode: Optional[str] = None,
+        reply_source_policy: Optional[str] = None,
+    ):
+        """Attach the DNS data plane to the router's control-plane managers.
+
+        upstream_iface_selector(target_ip, inbound_iface) may consult a gateway,
+        route, interface, or neighbor manager and return the interface used for
+        raw upstream DNS.  OS-socket mode does not require this hook because the
+        operating system routing table chooses the path.
+        """
+        mode = str(socket_resolution_mode or self.OS_SOCKET_RESOLUTION_MODE).strip().lower()
+        if mode not in {"prefer", "disabled"}:
+            raise ValueError("socket_resolution_mode must be 'prefer' or 'disabled'")
+
+        reply_policy = str(reply_source_policy or self.REPLY_SOURCE_POLICY).strip().lower()
+        if reply_policy not in {"query-destination", "router-address", "upstream"}:
+            raise ValueError("reply_source_policy must be query-destination, router-address, or upstream")
+
+        with self._lock:
+            self._upstream_iface = upstream_iface
+            self._upstream_iface_selector = upstream_iface_selector
+            self._packet_context_provider = packet_context_provider
+            self._socket_source_ipv4 = socket_source_ipv4
+            self._socket_source_ipv6 = socket_source_ipv6
+            self.OS_SOCKET_RESOLUTION_MODE = mode
+            self.REPLY_SOURCE_POLICY = reply_policy
+
+        self._ensure_socket_executor()
+        self._elog(
+            "config",
+            f"Runtime configured socket_mode={mode} reply_source={reply_policy} upstream_iface={upstream_iface}",
+            ["🧠", "🧭", "🖥️"],
+        )
+
+    def process_packet(self, packet: Packet, inbound_iface: str, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Single PacketHandler entry point for DNS queries and responses.
+
+        PacketHandler can call this for every captured packet.  The method only
+        consumes UDP/53 DNS traffic that belongs to this manager; unrelated
+        traffic returns False and remains available to other managers.
+        """
+        if DNS is None or packet is None or not packet.haslayer(DNS):
+            return False
+        if UDP not in packet:
+            return False
+
+        try:
+            dns = packet[DNS]
+            sport = int(packet[UDP].sport)
+            dport = int(packet[UDP].dport)
+        except Exception:
+            return False
+
+        if context is None and self._packet_context_provider is not None:
+            try:
+                context = dict(self._packet_context_provider(packet, inbound_iface) or {})
+            except Exception as exc:
+                self._elog("dispatch", f"Context provider failed: {exc}", ["⚠️", "🧩"])
+                context = {}
+
+        try:
+            setattr(packet, "_dns_packet_context", context or {})
+        except Exception:
+            pass
+
+        if int(getattr(dns, "qr", 0)) == 0 and dport == 53:
+            self._stat_inc("packet_dispatch_query")
+            return self.handle_query(packet, inbound_iface)
+
+        if int(getattr(dns, "qr", 0)) == 1 and (sport == 53 or dport >= 1024):
+            self._stat_inc("packet_dispatch_response")
+            return self.handle_response(packet)
+
+        return False
+
     def set_blacklist(self, rules: List[Dict[str, Any]]):
         with self._lock:
             self.blacklist_rules = list(rules or [])
@@ -7847,7 +7991,8 @@ class DNSManager:
         self._elog("policy", f"Forwarding rules updated: {len(self.forward_rules)} rule(s).", ["➿", "🧭", "📨"])
 
     def start(self):
-        """Starts the background health probe thread."""
+        """Starts health probing and ensures OS-socket resolver workers exist."""
+        self._ensure_socket_executor()
         if self._probe_thread and self._probe_thread.is_alive():
             self._elog("lifecycle", "Start skipped because probe thread is already running.", ["🔁", "📬"])
             return
@@ -7862,13 +8007,27 @@ class DNSManager:
         self._elog("lifecycle", "DNS manager started.", ["🚀", "📬", "🟢"])
 
     def stop(self):
-        """Stops the background thread."""
-        if not self._probe_thread or not self._probe_thread.is_alive():
-            self._elog("lifecycle", "Stop skipped because probe thread is not running.", ["🌙", "📭"])
-            return
-
+        """Stops health probing and prevents new OS-socket DNS jobs."""
         self._stop_event.set()
-        self._probe_thread.join(timeout=2.0)
+        if self._probe_thread and self._probe_thread.is_alive():
+            self._probe_thread.join(timeout=2.0)
+
+        executor = None
+        with self._lock:
+            executor = self._socket_executor
+            self._socket_executor = None
+            self._socket_generation += 1
+            for inflight in self._inflight.values():
+                if inflight.get("resolution_mode") == "os-socket":
+                    inflight["resolution_token"] = -1
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+
         self._elog("lifecycle", "DNS manager stopped.", ["🛑", "🌙", "📪"])
 
     def snapshot_stats(self) -> Dict[str, Any]:
@@ -7881,6 +8040,10 @@ class DNSManager:
                 "inflight_keys": len(self._inflight),
                 "cache_entries": len(self._dns_cache),
                 "recent_terminal_replies": len(self._recent_terminal_replies),
+                "socket_resolution_mode": self.OS_SOCKET_RESOLUTION_MODE,
+                "reply_source_policy": self.REPLY_SOURCE_POLICY,
+                "socket_executor_running": self._socket_executor is not None,
+                "upstream_iface": self._upstream_iface,
                 "upstreams": [
                     {
                         "ip": u.get("ip"),
@@ -8028,7 +8191,9 @@ class DNSManager:
                 if x:
                     router_ips.add(str(x).split("%", 1)[0])
 
-            # Router-originated DNS is allowed unless it matches a known forwarded in-flight query.
+            # Router-originated DNS must not be proxied again.  OS-socket resolver
+            # jobs and ordinary applications on the router already use the host
+            # network stack; PacketHandler should merely let those packets pass.
             if IP in packet:
                 maybe_key = ("4", pkt_src_ip, int(sport), int(packet[DNS].id))
             elif IPv6 in packet:
@@ -8053,6 +8218,15 @@ class DNSManager:
                                 ["🧲", "🪞", "🚫"]
                             )
                             return True
+
+                self._stat_inc("self_originated_query_passed")
+                self._elog(
+                    "query",
+                    f"Passing router-originated DNS to the OS stack q={self._safe_qname(packet)} "
+                    f"{pkt_src_ip}:{sport} -> {pkt_dst_ip}:{dport}",
+                    ["🖥️", "↗️", "🧭"],
+                )
+                return False
 
             # Also skip if this exact src/port/txid already exists in pending_requests.
             if IP in packet:
@@ -8205,17 +8379,42 @@ class DNSManager:
             self._send_servfail(packet)
             return True
 
+        resolution_token = self._next_socket_token()
         with self._lock:
             self._inflight[qkey] = {
                 "waiters": [(packet, inbound_iface)],
                 "outstanding": [],
                 "created": time.time(),
+                "resolution_token": resolution_token,
+                "resolution_mode": "starting",
             }
 
+        # Prefer OS sockets.  The complete DNS wire request is sent unchanged,
+        # so browser-oriented HTTPS/SVCB, DNSSEC and EDNS queries remain intact.
+        socket_targets = upstream_list[: max(1, int(self.OS_SOCKET_UPSTREAM_ATTEMPTS))]
+        if self.OS_SOCKET_RESOLUTION_MODE == "prefer":
+            if self._submit_socket_resolution(
+                packet,
+                inbound_iface,
+                qkey=qkey,
+                upstreams=socket_targets,
+                token=resolution_token,
+            ):
+                self._elog(
+                    "resolve",
+                    f"OS-socket job accepted q={qname} type={qtype} upstreams={socket_targets}",
+                    ["🖥️", "🌐", "📨"],
+                )
+                return True
+
         chosen = upstream_list[: (2 if self.ENABLE_HEDGE and len(upstream_list) > 1 else 1)]
+        with self._lock:
+            infl = self._inflight.get(qkey)
+            if infl:
+                infl["resolution_mode"] = "raw"
         self._elog(
             "forward",
-            f"Forward q={qname} type={qtype} chosen={chosen}{' hedge' if len(chosen) > 1 else ''}",
+            f"Raw forward q={qname} type={qtype} chosen={chosen}{' hedge' if len(chosen) > 1 else ''}",
             ["➡️", "🌐", "📤"]
         )
 
@@ -8275,39 +8474,25 @@ class DNSManager:
             pass
 
         matched_primary, info, matched_via = self._find_pending_match(packet, pk_primary, pk_secondary)
-        # Only trust passive RTT updates for exact primary/secondary matches.
-        try:
-            if matched_via in ("primary", "secondary"):
-                rtt_ms = max(0.0, (time.time() - float(info.get("timestamp", time.time()))) * 1000.0)
-                upstream_ip = str(info.get("upstream_ip", ""))
-                self._mark_upstream_success(upstream_ip, rtt_ms)
-                self._elog("health", f"Marked upstream success ip={upstream_ip} rtt={rtt_ms:.2f} ms", ["✅", "📈", "🩺"])
-            else:
-                self._elog(
-                    "health",
-                    f"Skipping passive RTT update for fallback-matched response q={self._safe_qname(packet)}",
-                    ["🧭", "⏭️", "🩺"]
-                )
-        except Exception as e:
-            self._elog("health", f"Failed passive RTT update: {e}", ["⚠️", "📉", "🩺"])
         if not matched_primary or not info:
-            try:
-                dns = packet[DNS]
-                is_negative = (
+            if self.PASSIVE_CACHE_UNMATCHED_RESPONSES:
+                try:
+                    dns = packet[DNS]
+                    is_negative = (
                         int(dns.rcode) in (2, 3)
                         or (int(dns.rcode) == 0 and int(getattr(dns, "ancount", 0)) == 0)
-                )
-                self._cache_put_from_response(packet, negative=is_negative)
-            except Exception:
-                pass
-
+                    )
+                    self._cache_put_from_response(packet, negative=is_negative)
+                except Exception:
+                    pass
+            self._stat_inc("unmatched_response_ignored")
             self._elog(
                 "response",
-                f"Accepted non-proxied upstream response primary={pk_primary} secondary={pk_secondary} "
+                f"Ignoring unrelated DNS response primary={pk_primary} secondary={pk_secondary} "
                 f"q={self._safe_qname(packet)} id={int(packet[DNS].id)}",
-                ["📬", "🌐", "✅"]
+                ["👀", "↩️", "🧭"],
             )
-            return True
+            return False
         if self.REQUIRE_QUESTION_MATCH and not self._question_match_info_vs_packet(info, packet):
             self._elog(
                 "response",
@@ -8351,7 +8536,7 @@ class DNSManager:
         try:
             dns = final_resp[DNS]
             is_negative = (int(dns.rcode) in (2, 3)) or (int(dns.rcode) == 0 and int(getattr(dns, "ancount", 0)) == 0)
-            self._cache_put_from_response(final_resp, negative=is_negative)
+            self._cache_put_from_response(final_resp, negative=is_negative, qkey_override=qkey)
             self._elog(
                 "cache",
                 f"Cached upstream response negative={is_negative} ancount={int(getattr(dns, 'ancount', 0))}",
@@ -8377,6 +8562,317 @@ class DNSManager:
 
         return True
 
+    # ===================== OS Socket Resolution =====================
+
+    def _ensure_socket_executor(self):
+        if self.OS_SOCKET_RESOLUTION_MODE == "disabled":
+            return
+        with self._lock:
+            if self._socket_executor is not None:
+                return
+            self._socket_slots = threading.BoundedSemaphore(max(1, int(self.OS_SOCKET_QUEUE_LIMIT)))
+            self._socket_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, int(self.OS_SOCKET_WORKERS)),
+                thread_name_prefix="DNSOSResolver",
+            )
+
+    def _next_socket_token(self) -> int:
+        with self._lock:
+            self._socket_generation += 1
+            return int(self._socket_generation)
+
+    def _submit_socket_resolution(
+        self,
+        original_packet: Packet,
+        inbound_iface: str,
+        *,
+        qkey: str,
+        upstreams: List[str],
+        token: int,
+    ) -> bool:
+        if not upstreams or self.OS_SOCKET_RESOLUTION_MODE == "disabled":
+            return False
+        if not self._socket_slots.acquire(blocking=False):
+            self._stat_inc("socket_jobs_rejected")
+            self._elog("overload", f"OS-socket DNS queue full qkey={qkey}", ["🚧", "🖥️", "📭"])
+            return False
+
+        self._ensure_socket_executor()
+        with self._lock:
+            executor = self._socket_executor
+            infl = self._inflight.get(qkey)
+            if infl is not None:
+                infl["resolution_mode"] = "os-socket"
+
+        if executor is None:
+            self._socket_slots.release()
+            return False
+
+        try:
+            executor.submit(
+                self._socket_resolution_worker,
+                original_packet.copy(),
+                str(inbound_iface or ""),
+                str(qkey),
+                list(upstreams),
+                int(token),
+            )
+            self._stat_inc("socket_jobs_submitted")
+            return True
+        except Exception as exc:
+            self._socket_slots.release()
+            self._stat_inc("socket_jobs_rejected")
+            self._elog("resolve", f"Failed to submit OS-socket DNS job: {exc}", ["⚠️", "🖥️", "💥"])
+            return False
+
+    def _socket_resolution_worker(
+        self,
+        original_packet: Packet,
+        inbound_iface: str,
+        qkey: str,
+        upstreams: List[str],
+        token: int,
+    ):
+        last_error = "no upstream attempted"
+        try:
+            if DNS not in original_packet:
+                self._complete_socket_failure(qkey, token, "query had no DNS layer")
+                return
+
+            query_wire = bytes(original_packet[DNS])
+            for server_index, upstream in enumerate(upstreams):
+                for retry_index in range(max(1, int(self.OS_SOCKET_RETRIES_PER_SERVER))):
+                    if server_index or retry_index:
+                        self._stat_inc("socket_retry")
+                    try:
+                        wire, transport, rtt_ms = self._dns_exchange_with_upstream(query_wire, upstream)
+                        if not self._dns_wire_matches_request(wire, original_packet):
+                            raise ValueError("upstream response failed transaction/question validation")
+
+                        self._mark_upstream_success(upstream, rtt_ms)
+                        if transport == "tcp":
+                            self._stat_inc("socket_tcp_success")
+                        else:
+                            self._stat_inc("socket_udp_success")
+
+                        response_packet = self._packet_from_dns_wire(original_packet, wire)
+                        self._complete_socket_success(
+                            qkey=qkey,
+                            token=token,
+                            response_packet=response_packet,
+                            upstream=upstream,
+                            transport=transport,
+                            rtt_ms=rtt_ms,
+                        )
+                        return
+                    except Exception as exc:
+                        last_error = f"{upstream}: {exc}"
+                        self._mark_upstream_failure(upstream)
+                        self._elog(
+                            "resolve",
+                            f"OS-socket attempt failed q={self._safe_qname(original_packet)} {last_error}",
+                            ["⚠️", "🔁", "🌐"],
+                        )
+
+            self._complete_socket_failure(qkey, token, last_error)
+        except Exception as exc:
+            self._complete_socket_failure(qkey, token, str(exc))
+        finally:
+            try:
+                self._socket_slots.release()
+            except Exception:
+                pass
+
+    def _dns_exchange_with_upstream(self, query_wire: bytes, upstream: str) -> Tuple[bytes, str, float]:
+        family, sockaddr = self._resolve_upstream_sockaddr(upstream, socket.SOCK_DGRAM)
+        udp = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            udp.settimeout(float(self.OS_SOCKET_TIMEOUT_SEC))
+            self._bind_socket_source(udp, family)
+            udp.connect(sockaddr)
+            started = time.perf_counter()
+            udp.send(query_wire)
+            wire = udp.recv(int(self.OS_SOCKET_UDP_RECV_BYTES))
+            rtt_ms = max(0.1, (time.perf_counter() - started) * 1000.0)
+        finally:
+            try:
+                udp.close()
+            except Exception:
+                pass
+
+        if len(wire) < 12:
+            raise ValueError("UDP DNS response shorter than 12 bytes")
+
+        flags = struct.unpack("!H", wire[2:4])[0]
+        truncated = bool(flags & 0x0200)
+        if truncated and self.OS_SOCKET_ENABLE_TCP_FALLBACK:
+            self._stat_inc("socket_tcp_fallback")
+            tcp_wire, tcp_rtt = self._dns_exchange_tcp(query_wire, upstream)
+            return tcp_wire, "tcp", tcp_rtt
+
+        return wire, "udp", rtt_ms
+
+    def _dns_exchange_tcp(self, query_wire: bytes, upstream: str) -> Tuple[bytes, float]:
+        family, sockaddr = self._resolve_upstream_sockaddr(upstream, socket.SOCK_STREAM)
+        tcp = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            tcp.settimeout(float(self.OS_SOCKET_TIMEOUT_SEC))
+            self._bind_socket_source(tcp, family)
+            started = time.perf_counter()
+            tcp.connect(sockaddr)
+            tcp.sendall(struct.pack("!H", len(query_wire)) + query_wire)
+            length_wire = self._recv_exact(tcp, 2)
+            response_len = struct.unpack("!H", length_wire)[0]
+            if response_len <= 0 or response_len > int(self.OS_SOCKET_TCP_MAX_BYTES):
+                raise ValueError(f"invalid DNS-over-TCP response length {response_len}")
+            wire = self._recv_exact(tcp, response_len)
+            rtt_ms = max(0.1, (time.perf_counter() - started) * 1000.0)
+            return wire, rtt_ms
+        finally:
+            try:
+                tcp.close()
+            except Exception:
+                pass
+
+    def _resolve_upstream_sockaddr(self, upstream: str, socktype: int) -> Tuple[int, Tuple]:
+        host = str(upstream).strip()
+        if not host:
+            raise ValueError("empty upstream")
+        infos = socket.getaddrinfo(host, 53, socket.AF_UNSPEC, socktype)
+        if not infos:
+            raise OSError(f"no address information for upstream {host}")
+        family, _socktype, _proto, _canonname, sockaddr = infos[0]
+        return family, sockaddr
+
+    def _bind_socket_source(self, sock: socket.socket, family: int):
+        source = self._socket_source_ipv4 if family == socket.AF_INET else self._socket_source_ipv6
+        if not source:
+            return
+        source = str(source).split("%", 1)[0]
+        if family == socket.AF_INET:
+            sock.bind((source, 0))
+        elif family == socket.AF_INET6:
+            sock.bind((source, 0, 0, 0))
+
+    def _recv_exact(self, sock: socket.socket, length: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < int(length):
+            part = sock.recv(int(length) - len(chunks))
+            if not part:
+                raise ConnectionError("DNS-over-TCP peer closed early")
+            chunks.extend(part)
+        return bytes(chunks)
+
+    def _dns_wire_matches_request(self, wire: bytes, original_packet: Packet) -> bool:
+        try:
+            if len(wire) < 12 or DNS not in original_packet:
+                return False
+            response_dns = DNS(wire)
+            request_dns = original_packet[DNS]
+            if int(response_dns.id) != int(request_dns.id) or int(response_dns.qr) != 1:
+                return False
+            if not response_dns.qd or not request_dns.qd:
+                return False
+            response_name = bytes(response_dns.qd.qname).rstrip(b".").lower()
+            request_name = bytes(request_dns.qd.qname).rstrip(b".").lower()
+            return response_name == request_name and int(response_dns.qd.qtype) == int(request_dns.qd.qtype)
+        except Exception:
+            return False
+
+    def _packet_from_dns_wire(self, original_request: Packet, wire: bytes) -> Packet:
+        dns_layer = DNS(wire)
+        if IP in original_request:
+            packet = (
+                IP(src=str(original_request[IP].dst), dst=str(original_request[IP].src), ttl=64)
+                / UDP(sport=53, dport=int(original_request[UDP].sport))
+                / dns_layer
+            )
+        elif IPv6 in original_request:
+            packet = (
+                IPv6(
+                    src=str(original_request[IPv6].dst).split("%", 1)[0],
+                    dst=str(original_request[IPv6].src).split("%", 1)[0],
+                    hlim=64,
+                )
+                / UDP(sport=53, dport=int(original_request[UDP].sport))
+                / dns_layer
+            )
+        else:
+            raise ValueError("cannot build DNS response packet without IP family")
+        self._normalize_checksums(packet)
+        return packet
+
+    def _socket_token_is_current(self, qkey: str, token: int) -> bool:
+        with self._lock:
+            infl = self._inflight.get(qkey)
+            return bool(infl and int(infl.get("resolution_token", -1)) == int(token))
+
+    def _complete_socket_success(
+        self,
+        *,
+        qkey: str,
+        token: int,
+        response_packet: Packet,
+        upstream: str,
+        transport: str,
+        rtt_ms: float,
+    ):
+        if not self._socket_token_is_current(qkey, token):
+            self._elog("resolve", f"Discarded late OS-socket DNS completion qkey={qkey}", ["⏭️", "⌛", "🧭"])
+            return
+
+        final_resp = self._apply_dns64_if_needed(response_packet)
+        try:
+            dns = final_resp[DNS]
+            negative = (
+                int(dns.rcode) in (2, 3)
+                or (int(dns.rcode) == 0 and int(getattr(dns, "ancount", 0)) == 0)
+            )
+            self._cache_put_from_response(final_resp, negative=negative, qkey_override=qkey)
+        except Exception as exc:
+            self._elog("cache", f"OS-socket response cache failed: {exc}", ["⚠️", "📦"])
+
+        waiters = self._pop_waiters(qkey)
+        for client_packet, _client_iface in waiters:
+            self._send_response_to_client(final_resp, client_packet)
+
+        self._elog(
+            "resolve",
+            f"Resolved qkey={qkey} upstream={upstream} transport={transport} rtt={rtt_ms:.2f}ms fanout={len(waiters)}",
+            ["✅", "🖥️", "🌐"],
+        )
+
+    def _complete_socket_failure(self, qkey: str, token: int, error: str):
+        if not self._socket_token_is_current(qkey, token):
+            return
+        self._stat_inc("socket_resolution_fail")
+        waiters = self._pop_waiters(qkey)
+        stale = self._cache_get_stale(qkey, max_age=self.STALE_IF_ERROR_MAX_AGE_SEC) if self.ENABLE_STALE_IF_ERROR else None
+        if stale:
+            response, _negative = stale
+            for client_packet, _client_iface in waiters:
+                self._stat_inc("cache_hit_stale")
+                self._send_response_to_client(response, client_packet)
+            self._elog("resolve", f"Socket resolution failed; served stale qkey={qkey}: {error}", ["🛟", "📦", "⚠️"])
+            return
+
+        for client_packet, _client_iface in waiters:
+            self._send_servfail(client_packet)
+        self._elog("resolve", f"Socket resolution failed qkey={qkey}: {error}", ["❌", "🖥️", "📭"])
+
+    def _select_upstream_iface(self, target_ip: str, inbound_iface: Optional[str]) -> Optional[str]:
+        selector = self._upstream_iface_selector
+        if selector is not None:
+            try:
+                selected = selector(str(target_ip), inbound_iface)
+                if selected:
+                    return str(selected)
+            except Exception as exc:
+                self._elog("route", f"Upstream interface selector failed: {exc}", ["⚠️", "🧭"])
+        if self._upstream_iface:
+            return self._upstream_iface
+        return inbound_iface
+
     # ===================== DNS64 =====================
 
     def _apply_dns64_if_needed(self, response_packet: Packet) -> Packet:
@@ -8394,7 +8890,7 @@ class DNSManager:
 
             prefix = ipaddress.IPv6Network(self._dns64_prefix)
             v6 = str(ipaddress.IPv6Address(int(prefix.network_address) + int(ipaddress.IPv4Address(v4))))
-            synth = DNSRR_AAAA(rrname=dns.qd.qname, ttl=self._ttl_from_response(dns), rdata=v6)
+            synth = DNSRR(rrname=dns.qd.qname, type="AAAA", ttl=self._ttl_from_response(dns), rdata=v6)
             dns.ancount += 1
             dns.an = synth if dns.an is None else (dns.an / synth)
             dns.rcode = 0
@@ -8516,10 +9012,11 @@ class DNSManager:
         )
 
         try:
-            self._drop_l2_header_for_send(fwd)
-            self.pw._send_raw_packet(fwd, inbound_iface)
+            fwd = self._drop_l2_header_for_send(fwd)
+            out_iface = self._select_upstream_iface(target_ip, inbound_iface)
+            self.pw._send_raw_packet(fwd, out_iface)
             self._stat_inc("forwarded")
-            self._elog("forward", f"Sent upstream query q={qname} to {target_ip}", ["✅", "📨", "🌐"])
+            self._elog("forward", f"Sent upstream query q={qname} to {target_ip} iface={out_iface}", ["✅", "📨", "🌐"])
             return True
         except Exception as e:
             self._elog("forward", f"Upstream send failed to {target_ip}: {e}", ["❗", "💥", "📭"])
@@ -8546,41 +9043,37 @@ class DNSManager:
         log_message: Optional[str] = None,
         log_emojis: Optional[List[str]] = None,
     ):
+        """Return a DNS reply in the form the requesting OS will accept.
+
+        In transparent-router mode, Windows, Chromium, Firefox, Safari and most
+        stub resolvers expect the response source address to equal the resolver
+        address used in the query.  Therefore query-destination is the default.
         """
-        Send the DNS reply back to the original client.
+        resp = self._drop_l2_header_for_send(response_packet.copy())
+        l2_mode = self._packet_l2_mode(response_packet)
 
-        IPv4: source = router_ip_out (if set), UDP sport = 53.
-        IPv6: source = router_ipv6_ll ONLY (link-local) unless router_ipv6_out exists.
-
-        Reply path preference:
-          1) explicit _dns_inbound_iface
-          2) sniffed_on
-        """
-        resp = response_packet.copy()
-
-        l2_mode = self._packet_l2_mode(resp)
-        self._drop_l2_header_for_send(resp)
-
-        if IP in original_request and IP in resp:
-            resp[IP].dst = original_request[IP].src
+        if IP in original_request:
+            if IP not in resp:
+                resp = IP() / UDP() / resp[DNS].copy()
+            resp[IP].dst = str(original_request[IP].src)
+            resp[IP].src = self._select_ipv4_reply_source(original_request, response_packet)
             resp[UDP].dport = int(original_request[UDP].sport)
-            resp[DNS].id = original_request[DNS].id
-            if self.router_ip_out:
-                resp[IP].src = self.router_ip_out
-            elif self.router_ipv4_out:
-                resp[IP].src = self.router_ipv4_out
             resp[UDP].sport = 53
+            resp[DNS].id = int(original_request[DNS].id)
             self._normalize_checksums(resp)
 
-        elif IPv6 in original_request and IPv6 in resp:
-            resp[IPv6].dst = original_request[IPv6].src
+        elif IPv6 in original_request:
+            if IPv6 not in resp:
+                resp = IPv6() / UDP() / resp[DNS].copy()
+            resp[IPv6].dst = str(original_request[IPv6].src).split("%", 1)[0]
+            resp[IPv6].src = self._select_ipv6_reply_source(original_request, response_packet)
             resp[UDP].dport = int(original_request[UDP].sport)
-            resp[DNS].id = original_request[DNS].id
-            src_v6 = self.router_ipv6_link_local_out or self.router_ipv6_out or self.router_ipv6_ll
-            if src_v6:
-                resp[IPv6].src = str(src_v6).split("%", 1)[0]
             resp[UDP].sport = 53
+            resp[DNS].id = int(original_request[DNS].id)
             self._normalize_checksums(resp)
+        else:
+            self._elog("reply", "Cannot return DNS response without IPv4/IPv6 client layer.", ["⚠️", "📭"])
+            return
 
         out_iface = (
             getattr(original_request, "_dns_inbound_iface", None)
@@ -8589,10 +9082,36 @@ class DNSManager:
 
         try:
             self.pw._send_raw_packet(resp, out_iface)
-            msg = log_message or f"Sent reply to client={self._client_ip(original_request)} iface={out_iface} l2_before={l2_mode}"
-            self._elog("reply", msg, log_emojis or ["📬", "✅", "🏠"])
+            self._stat_inc("browser_answers_sent")
+            msg = log_message or (
+                f"Sent browser-ready reply client={self._client_ip(original_request)} "
+                f"source={resp[IP].src if IP in resp else resp[IPv6].src} "
+                f"iface={out_iface} l2_before={l2_mode}"
+            )
+            self._elog("reply", msg, log_emojis or ["📬", "✅", "🖥️"])
         except Exception as e:
             self._elog("reply", f"Failed sending reply to client: {e}", ["❗", "💥", "📭"])
+
+    def _select_ipv4_reply_source(self, original_request: Packet, upstream_response: Packet) -> str:
+        policy = str(self.REPLY_SOURCE_POLICY).lower()
+        if policy == "query-destination":
+            self._stat_inc("reply_source_query_destination")
+            return str(original_request[IP].dst)
+        if policy == "upstream" and IP in upstream_response:
+            return str(upstream_response[IP].src)
+        self._stat_inc("reply_source_router")
+        return str(self.router_ip_out or self.router_ipv4_out or original_request[IP].dst)
+
+    def _select_ipv6_reply_source(self, original_request: Packet, upstream_response: Packet) -> str:
+        policy = str(self.REPLY_SOURCE_POLICY).lower()
+        if policy == "query-destination":
+            self._stat_inc("reply_source_query_destination")
+            return str(original_request[IPv6].dst).split("%", 1)[0]
+        if policy == "upstream" and IPv6 in upstream_response:
+            return str(upstream_response[IPv6].src).split("%", 1)[0]
+        self._stat_inc("reply_source_router")
+        src = self.router_ipv6_link_local_out or self.router_ipv6_out or self.router_ipv6_ll
+        return str(src or original_request[IPv6].dst).split("%", 1)[0]
 
     # ===================== Pending Match Helpers =====================
 
@@ -8827,7 +9346,28 @@ class DNSManager:
             qtype = int(pkt[DNS].qd.qtype)
         except Exception:
             qtype = 1
-        return qname, qtype, f"{qname}:{qtype}"
+        return qname, qtype, self._dns_cache_key(pkt[DNS])
+
+    def _dns_cache_key(self, dns) -> str:
+        try:
+            qname = bytes(dns.qd.qname).decode(errors="ignore").rstrip(".").lower()
+            qtype = int(dns.qd.qtype)
+            qclass = int(getattr(dns.qd, "qclass", 1))
+            checking_disabled = int(getattr(dns, "cd", 0))
+            dnssec_ok = 0
+            for rr in self._iter_dns_records(dns, sections=("ar",)):
+                if int(getattr(rr, "type", -1)) == 41:
+                    dnssec_ok = 1 if (int(getattr(rr, "z", 0)) & 0x8000) else 0
+                    break
+            return f"{qname}:{qtype}:c{qclass}:do{dnssec_ok}:cd{checking_disabled}"
+        except Exception:
+            return f"{self._safe_dns_qname(dns)}:1:c1:do0:cd0"
+
+    def _safe_dns_qname(self, dns) -> str:
+        try:
+            return bytes(dns.qd.qname).decode(errors="ignore").rstrip(".").lower()
+        except Exception:
+            return "<unknown>"
 
     def _client_ip(self, pkt: Packet) -> Optional[str]:
         if IP in pkt:
@@ -8853,18 +9393,54 @@ class DNSManager:
             self._elog("response", f"Key resolution failed: {e}", ["⚠️", "🧩", "💥"])
         return None, None
 
+    def _iter_dns_records(self, dns, sections: Tuple[str, ...] = ("an", "ns", "ar")):
+        """Yield records across old chained-Scapy and new list-backed Scapy DNS fields."""
+        for section_name in sections:
+            section = getattr(dns, section_name, None)
+            if section is None:
+                continue
+
+            if isinstance(section, (list, tuple)):
+                for rr in section:
+                    if rr is not None and hasattr(rr, "type"):
+                        yield rr
+                continue
+
+            # Newer Scapy packet-list fields are iterable but are not plain lists.
+            if not hasattr(section, "type") and hasattr(section, "__iter__") and not isinstance(section, (bytes, bytearray, str)):
+                try:
+                    emitted = False
+                    for rr in section:
+                        if rr is not None and hasattr(rr, "type"):
+                            emitted = True
+                            yield rr
+                    if emitted:
+                        continue
+                except Exception:
+                    pass
+
+            rr = section
+            seen_ids = set()
+            for _ in range(256):
+                if rr is None or not hasattr(rr, "type"):
+                    break
+                marker = id(rr)
+                if marker in seen_ids:
+                    break
+                seen_ids.add(marker)
+                yield rr
+                payload = getattr(rr, "payload", None)
+                if payload is None or payload is rr or payload.__class__.__name__ == "NoPayload":
+                    break
+                rr = payload
+
     def _extract_any_A_from_sections(self, dns) -> Optional[str]:
         try:
-            for sect in ("an", "ns", "ar"):
-                rr = getattr(dns, sect, None)
-                seen = 0
-                while rr is not None and seen < 64:
-                    if getattr(rr, "type", None) == 1:
-                        v4 = getattr(rr, "rdata", None)
-                        if v4:
-                            return str(v4)
-                    rr = getattr(rr, "payload", None)
-                    seen += 1
+            for rr in self._iter_dns_records(dns):
+                if int(getattr(rr, "type", -1)) == 1:
+                    v4 = getattr(rr, "rdata", None)
+                    if v4:
+                        return str(v4)
         except Exception:
             pass
         return None
@@ -8873,32 +9449,48 @@ class DNSManager:
         fb = fallback if (fallback is not None) else self.DNS_CACHE_TTL
         try:
             ttls = []
-            for sect in ("an", "ns", "ar"):
-                rr = getattr(dns, sect, None)
-                seen = 0
-                while rr is not None and seen < 128:
-                    t = getattr(rr, "ttl", None)
-                    if isinstance(t, int):
-                        ttls.append(t)
-                    rr = getattr(rr, "payload", None)
-                    seen += 1
+            for rr in self._iter_dns_records(dns):
+                rr_type = int(getattr(rr, "type", -1))
+                ttl = getattr(rr, "ttl", None)
+                if rr_type != 41 and isinstance(ttl, int):
+                    ttls.append(ttl)
             ttl = min(ttls) if ttls else int(fb)
-            ttl = max(1, min(int(ttl), self.DNS_CACHE_TTL_CAP))
-            return ttl
+            return max(1, min(int(ttl), self.DNS_CACHE_TTL_CAP))
         except Exception:
             return int(fb)
 
-    def _cache_put_from_response(self, resp: Packet, *, negative: bool):
+    def _negative_ttl_from_response(self, dns) -> int:
+        """Use RFC-style SOA negative lifetime when Scapy exposes it."""
+        candidates = [int(self.DNS_CACHE_TTL_NEG)]
+        try:
+            for rr in self._iter_dns_records(dns, sections=("ns",)):
+                if int(getattr(rr, "type", -1)) != 6:
+                    continue
+                rr_ttl = getattr(rr, "ttl", None)
+                minimum = getattr(rr, "minimum", None)
+                if isinstance(rr_ttl, int):
+                    candidates.append(max(1, rr_ttl))
+                if isinstance(minimum, int):
+                    candidates.append(max(1, minimum))
+        except Exception:
+            pass
+        return max(1, min(candidates))
+
+    def _cache_put_from_response(
+        self,
+        resp: Packet,
+        *,
+        negative: bool,
+        qkey_override: Optional[str] = None,
+    ):
         try:
             dns = resp[DNS]
             if not getattr(dns, "qd", None):
                 return
-            qname = bytes(dns.qd.qname).decode(errors="ignore").rstrip(".").lower()
-            qtype = int(dns.qd.qtype)
-            qkey = f"{qname}:{qtype}"
+            qkey = str(qkey_override or self._dns_cache_key(dns))
             ttl = self._ttl_from_response(dns)
             if negative:
-                ttl = min(ttl, self.DNS_CACHE_TTL_NEG)
+                ttl = min(ttl, self._negative_ttl_from_response(dns))
             self._cache_put(qkey, resp, ttl, negative=negative)
         except Exception as e:
             self._elog("cache", f"Cache put from response failed: {e}", ["⚠️", "📦", "💥"])
@@ -8926,7 +9518,10 @@ class DNSManager:
                 return None
             self._dns_cache.pop(qkey, None)
             self._dns_cache[qkey] = (pkt, expiry, negative, inserted)
-            return pkt.copy(), bool(negative)
+            out = pkt.copy()
+            if self.CACHE_AGE_TTLS:
+                self._age_dns_ttls(out, max(0, int(now - float(inserted))))
+            return out, bool(negative)
 
     def _cache_get_stale(self, qkey: str, *, max_age: float) -> Optional[Tuple[Packet, bool]]:
         now = time.time()
@@ -8937,10 +9532,30 @@ class DNSManager:
             pkt, expiry, negative, inserted = ent
             age_since_expire = now - float(expiry)
             if age_since_expire < 0:
-                return pkt.copy(), bool(negative)
+                out = pkt.copy()
+                if self.CACHE_AGE_TTLS:
+                    self._age_dns_ttls(out, max(0, int(now - float(inserted))))
+                return out, bool(negative)
             if age_since_expire <= float(max_age):
-                return pkt.copy(), bool(negative)
+                out = pkt.copy()
+                if self.CACHE_AGE_TTLS:
+                    self._age_dns_ttls(out, max(0, int(now - float(inserted))))
+                return out, bool(negative)
             return None
+
+    def _age_dns_ttls(self, pkt: Packet, elapsed_seconds: int):
+        """Reduce cached RR TTLs while preserving EDNS OPT flags."""
+        try:
+            if DNS not in pkt:
+                return
+            for rr in self._iter_dns_records(pkt[DNS]):
+                rr_type = int(getattr(rr, "type", -1))
+                ttl = getattr(rr, "ttl", None)
+                if rr_type != 41 and isinstance(ttl, int):
+                    rr.ttl = max(0, int(ttl) - int(elapsed_seconds))
+            self._normalize_checksums(pkt)
+        except Exception:
+            pass
 
     def _cache_trim_locked(self):
         removed = 0
@@ -9428,6 +10043,23 @@ class DNSManager:
             if not addr:
                 return
 
+            excluded = {
+                str(x).split("%", 1)[0]
+                for x in (
+                    self.router_ip_out,
+                    self.router_ipv4_out,
+                    self.router_ipv6_out,
+                    self.router_ipv6_ll,
+                    self.router_ipv6_link_local_out,
+                    self._client_ip(pkt),
+                )
+                if x
+            }
+            if str(addr).split("%", 1)[0] in excluded:
+                self._stat_inc("local_upstream_loop_prevented")
+                self._elog("upstream", f"Did not learn local listener/client {addr} as an upstream", ["🛑", "🔁", "🧭"])
+                return
+
             with self._lock:
                 self._learned_local_upstreams.pop(addr, None)
                 self._learned_local_upstreams[addr] = time.time()
@@ -9479,20 +10111,17 @@ class DNSManager:
             return "unknown"
 
     def _drop_l2_header_for_send(self, pkt: Packet):
-        """
-        Prevent inherited client/server Ethernet headers from leaking into rewritten
-        DNS packets. Let the packet writer rebuild L2 for the chosen interface.
-        """
+        """Return a copy beginning at IP/IPv6 so PacketWriter can rebuild L2."""
+        if pkt is None:
+            return pkt
         try:
             ether_cls = globals().get("Ether")
             if ether_cls is not None and ether_cls in pkt:
+                payload = pkt[ether_cls].payload
                 try:
-                    pkt = pkt[ether_cls].payload
+                    return payload.copy()
                 except Exception:
-                    try:
-                        del pkt[ether_cls]
-                    except Exception:
-                        pass
+                    return payload
         except Exception:
             pass
         return pkt

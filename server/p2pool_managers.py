@@ -2737,9 +2737,18 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if use_socket:
                 self.socket_interface = SocketInterface(self, self.router_logger)
                 self.socket_interface.start()
-            self.dns_manager = DNSManager(self.router_logger, self.packet_writer, self.router_ipv6_link_local_out)
+            self.dns_manager = DNSManager(
+                self.router_logger,
+                self.packet_writer,
+                self.router_ipv6_link_local_out,
+            )
+
             self.dns_manager.router_ip_out = self.router_ip_out
             self.dns_manager.router_ipv4_out = self.router_ip_out
+            self.dns_manager.router_ipv6_out = self.router_ipv6_out
+            self.dns_manager.router_ipv6_link_local_out = (
+                self.router_ipv6_link_local_out
+            )
             if use_gateway:
                 self.gateway_manager = GatewayManager(self, DNSManager)
 
@@ -2906,7 +2915,14 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     ("8.8.8.8", [53, 80]),
                     ("1.1.1.1", [443]),
                 ],scan_interval=300)
-
+            self.dns_manager.configure_runtime(
+                upstream_iface=self.interface_out_full_name,
+                upstream_iface_selector=self._select_dns_upstream_iface,
+                socket_source_ipv4=self.router_ip_out,
+                socket_source_ipv6=self.router_ipv6_out,
+                socket_resolution_mode="prefer",
+                reply_source_policy="query-destination",
+            )
 
             self.syn_scanner.start()
             self.rip_manager.start()
@@ -3157,6 +3173,119 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         except Exception as e:
             self.router_logger.log_message(f"[Router] Error shutting down {e}")
 
+    def _select_dns_upstream_iface(
+            self,
+            target_ip: str,
+            inbound_iface: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Select the interface used to send a raw upstream DNS query.
+
+        This implementation does not depend on GatewayManager.
+
+        Selection order:
+          1. Loopback targets use the loopback interface.
+          2. Targets located on a directly connected network use that interface.
+          3. Public, private, and unmatched upstream resolvers use the WAN interface.
+          4. The inbound interface is used only as a final fallback.
+
+        DNSManager's preferred OS-socket mode normally allows Windows to select
+        the route. This selector is primarily used by the raw-packet fallback.
+        """
+        target_text = str(target_ip or "").strip()
+
+        if not target_text:
+            return self.interface_out_full_name or inbound_iface
+
+        # Remove an IPv6 scope suffix before parsing, such as:
+        # fe80::1%12 -> fe80::1
+        target_host = target_text.split("%", 1)[0]
+
+        try:
+            target = ipaddress.ip_address(target_host)
+        except ValueError:
+            self.router_logger.log_message(
+                f"[DNS][ROUTE] ⚠️ Invalid upstream address '{target_text}'; "
+                f"using WAN interface."
+            )
+            return self.interface_out_full_name or inbound_iface
+
+        # A resolver explicitly configured on localhost must use loopback.
+        if target.is_loopback:
+            return (
+                    self.interface_loopback_full_name
+                    or self.interface_out_full_name
+                    or inbound_iface
+            )
+
+        connected_matches = []
+
+        # Find the interface whose configured network contains the resolver.
+        for iface_name, iface_config in list(self._interfaces_config.items()):
+            if not iface_name or not isinstance(iface_config, dict):
+                continue
+
+            network = iface_config.get("network")
+            if network is None:
+                continue
+
+            try:
+                if not isinstance(
+                        network,
+                        (ipaddress.IPv4Network, ipaddress.IPv6Network),
+                ):
+                    network = ipaddress.ip_network(str(network), strict=False)
+            except (TypeError, ValueError):
+                continue
+
+            if network.version != target.version:
+                continue
+
+            try:
+                if target not in network:
+                    continue
+            except TypeError:
+                continue
+
+            # Do not select loopback for a non-loopback resolver.
+            if (
+                    self.interface_loopback_full_name
+                    and iface_name == self.interface_loopback_full_name
+            ):
+                continue
+
+            connected_matches.append(
+                (
+                    int(network.prefixlen),
+                    1 if iface_name == self.interface_out_full_name else 0,
+                    iface_name,
+                )
+            )
+
+        if connected_matches:
+            # Prefer the most specific connected network.
+            # Prefer WAN if two entries have the same prefix length.
+            connected_matches.sort(reverse=True)
+            selected_iface = connected_matches[0][2]
+
+            return selected_iface
+
+        # Unscoped link-local DNS normally belongs to the active WAN.
+        # A scoped address is also sent through WAN unless it matched a
+        # directly connected configured network above.
+        if target.version == 6 and target.is_link_local:
+            return self.interface_out_full_name or inbound_iface
+
+        # Public resolvers such as 1.1.1.1, 8.8.8.8 and 9.9.9.9 use WAN.
+        if target.is_global:
+            return self.interface_out_full_name or inbound_iface
+
+        # A private resolver that did not match a LAN network is most likely
+        # the upstream gateway/router DNS server on the WAN side.
+        if target.is_private or target.is_link_local:
+            return self.interface_out_full_name or inbound_iface
+
+        return self.interface_out_full_name or inbound_iface
     # -----------------------------
     # add inside PythonRouterManager
     # -----------------------------
