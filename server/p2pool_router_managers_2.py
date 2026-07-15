@@ -14182,6 +14182,12 @@ class DHCPServer:
         in_mac=None,
         dns_v6=None,
         search_domains=None,
+        allowed_ifaces=None,
+        denied_ifaces=None,
+        observe_only_ifaces=None,
+        interface_roles=None,
+        control_plane_name: str = "dhcp",
+        preserve_leases_on_policy_update: bool = True,
     ):
         import ipaddress, threading, time
         from typing import Dict, Tuple, Set
@@ -14213,6 +14219,36 @@ class DHCPServer:
         self._static_leases: Dict[str, ipaddress.IPv4Address] = {}  # mac -> ip
         self._lease_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
+
+        # Interface policy is a live control-plane policy. Updating it never
+        # restarts DHCP, resets an adapter, flushes NAT, or discards leases.
+        self._policy_lock = threading.RLock()
+        self.control_plane_name = str(control_plane_name or "dhcp")
+        self.preserve_leases_on_policy_update = bool(preserve_leases_on_policy_update)
+        self._explicit_interface_policy = allowed_ifaces is not None
+        self._allowed_ifaces = self._normalize_iface_set(allowed_ifaces)
+        self._denied_ifaces = self._normalize_iface_set(denied_ifaces)
+        self._observe_only_ifaces = self._normalize_iface_set(observe_only_ifaces)
+        self._interface_roles = {
+            self._normalize_iface_name(k): str(v or "").strip().lower()
+            for k, v in dict(interface_roles or {}).items()
+            if self._normalize_iface_name(k)
+        }
+        self._policy_generation = 1
+        self._policy_last_log = {}
+        self._policy_counters = {
+            "served": 0,
+            "observed": 0,
+            "passed": 0,
+            "denied": 0,
+            "policy_updates": 0,
+        }
+
+        # Public compatibility views. Existing code may inspect these names.
+        self.allowed_ifaces = set(str(x) for x in (allowed_ifaces or []) if x)
+        self.denied_ifaces = set(str(x) for x in (denied_ifaces or []) if x)
+        self.observe_only_ifaces = set(str(x) for x in (observe_only_ifaces or []) if x)
+
         self.LEASE_DURATION_SECONDS = 600
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
 
@@ -14251,8 +14287,223 @@ class DHCPServer:
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
             f"out_of_pool={self.allow_out_of_pool} same_subnet={self.enforce_same_subnet} "
             f"serve_all_ifaces={self.serve_on_all_ifaces} authoritative={self.authoritative} "
-            f"rogue_policy={self.rogue_policy}"
+            f"rogue_policy={self.rogue_policy} policy={self.interface_policy_snapshot()}"
         )
+
+    # ---------------- interface control plane ----------------
+
+    @staticmethod
+    def _normalize_iface_name(iface) -> str:
+        return " ".join(str(iface or "").strip().casefold().split())
+
+    @classmethod
+    def _normalize_iface_set(cls, ifaces) -> set[str]:
+        if ifaces is None:
+            return set()
+        if isinstance(ifaces, str):
+            ifaces = [ifaces]
+        out = set()
+        for iface in ifaces:
+            norm = cls._normalize_iface_name(iface)
+            if norm:
+                out.add(norm)
+        return out
+
+    def _iface_aliases(self, inbound_iface: str) -> set[str]:
+        raw = str(inbound_iface or "").strip()
+        aliases = {self._normalize_iface_name(raw)} if raw else set()
+
+        cfg = self._interfaces_config.get(raw)
+        if isinstance(cfg, dict):
+            for key in ("friendly_name", "name", "alias", "full_name", "guid", "ifname"):
+                value = cfg.get(key)
+                norm = self._normalize_iface_name(value)
+                if norm:
+                    aliases.add(norm)
+
+        # Also resolve a friendly name or alias back to its configured full key.
+        inbound_norm = self._normalize_iface_name(raw)
+        for cfg_key, cfg_value in (self._interfaces_config or {}).items():
+            values = [cfg_key]
+            if isinstance(cfg_value, dict):
+                values.extend(
+                    cfg_value.get(k)
+                    for k in ("friendly_name", "name", "alias", "full_name", "guid", "ifname")
+                )
+            norms = {self._normalize_iface_name(v) for v in values if v}
+            if inbound_norm and inbound_norm in norms:
+                aliases.update(n for n in norms if n)
+        return aliases
+
+    def _policy_matches(self, policy_set: set[str], inbound_iface: str) -> bool:
+        if not policy_set:
+            return False
+        return bool(self._iface_aliases(inbound_iface).intersection(policy_set))
+
+    def configure_interface_policy(
+        self,
+        *,
+        allowed_ifaces=None,
+        denied_ifaces=None,
+        observe_only_ifaces=None,
+        interface_roles=None,
+        replace: bool = True,
+        reason: str = "runtime",
+    ) -> dict:
+        """
+        Atomically update DHCP interface ownership without restarting the server.
+
+        Deny always wins, then observe-only, then allow. When allowed_ifaces is
+        explicitly supplied, interfaces not in that set are passed to other
+        managers instead of being falsely consumed.
+        """
+        new_allowed = self._normalize_iface_set(allowed_ifaces)
+        new_denied = self._normalize_iface_set(denied_ifaces)
+        new_observe = self._normalize_iface_set(observe_only_ifaces)
+        new_roles = {
+            self._normalize_iface_name(k): str(v or "").strip().lower()
+            for k, v in dict(interface_roles or {}).items()
+            if self._normalize_iface_name(k)
+        }
+
+        with self._policy_lock:
+            before = (
+                frozenset(self._allowed_ifaces),
+                frozenset(self._denied_ifaces),
+                frozenset(self._observe_only_ifaces),
+                tuple(sorted(self._interface_roles.items())),
+                self._explicit_interface_policy,
+            )
+
+            if replace:
+                if allowed_ifaces is not None:
+                    self._allowed_ifaces = new_allowed
+                    self._explicit_interface_policy = True
+                if denied_ifaces is not None:
+                    self._denied_ifaces = new_denied
+                if observe_only_ifaces is not None:
+                    self._observe_only_ifaces = new_observe
+                if interface_roles is not None:
+                    self._interface_roles = new_roles
+            else:
+                if allowed_ifaces is not None:
+                    self._allowed_ifaces.update(new_allowed)
+                    self._explicit_interface_policy = True
+                if denied_ifaces is not None:
+                    self._denied_ifaces.update(new_denied)
+                if observe_only_ifaces is not None:
+                    self._observe_only_ifaces.update(new_observe)
+                if interface_roles is not None:
+                    self._interface_roles.update(new_roles)
+
+            # A denied interface can never be served or observed by this server.
+            self._allowed_ifaces.difference_update(self._denied_ifaces)
+            self._observe_only_ifaces.difference_update(self._denied_ifaces)
+
+            self.allowed_ifaces = set(self._allowed_ifaces)
+            self.denied_ifaces = set(self._denied_ifaces)
+            self.observe_only_ifaces = set(self._observe_only_ifaces)
+
+            after = (
+                frozenset(self._allowed_ifaces),
+                frozenset(self._denied_ifaces),
+                frozenset(self._observe_only_ifaces),
+                tuple(sorted(self._interface_roles.items())),
+                self._explicit_interface_policy,
+            )
+            changed = before != after
+            if changed:
+                self._policy_generation += 1
+                self._policy_counters["policy_updates"] += 1
+
+        if changed:
+            self.logger.log_message(
+                f"[DHCP][ControlPlane] 🔐 policy generation={self._policy_generation} "
+                f"reason={reason} snapshot={self.interface_policy_snapshot()}"
+            )
+        return self.interface_policy_snapshot()
+
+    def allow_interface(self, iface: str, *, role: str = "lan", reason: str = "allow") -> dict:
+        norm = self._normalize_iface_name(iface)
+        roles = {iface: role} if iface else None
+        with self._policy_lock:
+            self._denied_ifaces.discard(norm)
+            self._observe_only_ifaces.discard(norm)
+        return self.configure_interface_policy(
+            allowed_ifaces=[iface], interface_roles=roles, replace=False, reason=reason
+        )
+
+    def deny_interface(self, iface: str, *, reason: str = "deny") -> dict:
+        norm = self._normalize_iface_name(iface)
+        with self._policy_lock:
+            self._allowed_ifaces.discard(norm)
+            self._observe_only_ifaces.discard(norm)
+        return self.configure_interface_policy(
+            denied_ifaces=[iface], interface_roles={iface: "wan"}, replace=False, reason=reason
+        )
+
+    def observe_interface(self, iface: str, *, reason: str = "observe") -> dict:
+        norm = self._normalize_iface_name(iface)
+        with self._policy_lock:
+            self._allowed_ifaces.discard(norm)
+            self._denied_ifaces.discard(norm)
+        return self.configure_interface_policy(
+            observe_only_ifaces=[iface], interface_roles={iface: "observe"}, replace=False, reason=reason
+        )
+
+    def interface_policy_decision(self, inbound_iface: str) -> str:
+        """Return one of: serve, observe, pass, deny."""
+        aliases = self._iface_aliases(inbound_iface)
+        with self._policy_lock:
+            roles = {self._interface_roles.get(alias, "") for alias in aliases}
+
+            if roles.intersection({"wan", "blocked", "deny"}):
+                return "deny"
+            if self._policy_matches(self._denied_ifaces, inbound_iface):
+                return "deny"
+            if roles.intersection({"observe", "observer", "monitor"}):
+                return "observe"
+            if self._policy_matches(self._observe_only_ifaces, inbound_iface):
+                return "observe"
+            if self._explicit_interface_policy:
+                return "serve" if self._policy_matches(self._allowed_ifaces, inbound_iface) else "pass"
+
+            # Legacy behavior remains available when no explicit policy was supplied.
+            if self.serve_on_all_ifaces:
+                return "serve"
+            return "serve" if self._normalize_iface_name(self.in_iface) in aliases else "pass"
+
+    def can_serve_interface(self, inbound_iface: str) -> bool:
+        return self.interface_policy_decision(inbound_iface) == "serve"
+
+    def can_observe_interface(self, inbound_iface: str) -> bool:
+        return self.interface_policy_decision(inbound_iface) == "observe"
+
+    def owns_interface(self, inbound_iface: str) -> bool:
+        return self.interface_policy_decision(inbound_iface) in ("serve", "observe")
+
+    def interface_policy_snapshot(self) -> dict:
+        with self._policy_lock:
+            return {
+                "name": self.control_plane_name,
+                "generation": int(self._policy_generation),
+                "explicit": bool(self._explicit_interface_policy),
+                "allowed": sorted(self._allowed_ifaces),
+                "denied": sorted(self._denied_ifaces),
+                "observe_only": sorted(self._observe_only_ifaces),
+                "roles": dict(sorted(self._interface_roles.items())),
+                "counters": dict(self._policy_counters),
+                "preserve_leases": bool(self.preserve_leases_on_policy_update),
+            }
+
+    def _policy_log_limited(self, key: str, message: str, cooldown: float = 10.0) -> None:
+        now = self.time.time()
+        with self._policy_lock:
+            last = float(self._policy_last_log.get(key, 0.0))
+            if now - last < cooldown:
+                return
+            self._policy_last_log[key] = now
+        self.logger.log_message(message)
 
     # ---------------- admin APIs ----------------
 
@@ -14353,6 +14604,7 @@ class DHCPServer:
                 "declined_v6": [str(ip) for ip in self._v6_declined],
                 "seen_server_offers": len(self._seen_server_offers),
                 "seen_v6_replies": len(self._seen_v6_replies),
+                "interface_policy": self.interface_policy_snapshot(),
             }
 
     # ---------------- internals ----------------
@@ -14823,8 +15075,31 @@ class DHCPServer:
     # ---------------- main packet handler ----------------
 
     def handle_packet(self, pkt, inbound_iface: str, find_route_function) -> bool:
-        if not self.serve_on_all_ifaces and inbound_iface != self.in_iface:
-            self.logger.log_message(f"[DHCP] 🚪 Ignoring on non-LAN iface {inbound_iface} (serve_on_all_ifaces=False).")
+        version, direction = self._classify_dhcp(pkt)
+        if version is None:
+            return False  # not DHCP
+
+        policy_decision = self.interface_policy_decision(inbound_iface)
+        if policy_decision in ("pass", "deny"):
+            with self._policy_lock:
+                self._policy_counters["denied" if policy_decision == "deny" else "passed"] += 1
+            self._policy_log_limited(
+                f"{policy_decision}:{self._normalize_iface_name(inbound_iface)}",
+                f"[DHCP][ControlPlane] 🚪 {policy_decision.upper()} DHCP on {inbound_iface}; "
+                f"server={self.control_plane_name} policy_generation={self._policy_generation}",
+            )
+            # False is intentional: this server does not own this interface. It
+            # allows a dispatcher or another DHCP instance to make the decision.
+            return False
+
+        observe_only = policy_decision == "observe"
+        if observe_only and direction != "server":
+            with self._policy_lock:
+                self._policy_counters["observed"] += 1
+            self._policy_log_limited(
+                f"observe-client:{self._normalize_iface_name(inbound_iface)}",
+                f"[DHCP][ControlPlane] 👀 observing only on {inbound_iface}; no DHCP reply will be sent.",
+            )
             return True
 
         in_cfg = self._iface_cfg_for(inbound_iface)
@@ -14849,9 +15124,8 @@ class DHCPServer:
         except Exception:
             net = None
 
-        version, direction = self._classify_dhcp(pkt)
-        if version is None:
-            return False  # not DHCP
+        with self._policy_lock:
+            self._policy_counters["observed" if observe_only else "served"] += 1
 
         is_loopback_request = not pkt.haslayer(Ether)
 

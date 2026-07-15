@@ -164,6 +164,7 @@ class PythonRouterManager:
         self.icmp_manager = None
         self.dhcp_server_in = None
         self.dhcp_server_out = None
+        self._dhcp_control_plane_signature = None
         self.firewall_manager = FirewallManager(router_logger)
         self.syn_scanner = None
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
@@ -1555,57 +1556,406 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         sniffer_thread.start()
 
         self.router_logger.log_message(f"[Router] Sniffing started on {iface_name.split('_')[-1]}.")
-    def _start_dhcp_servers(self):
-        if self.router_network_in:
-            def generate_full_pool(network, router_ip):
-                return [
-                    str(ip) for ip in network.hosts()
-                    if str(ip) != str(router_ip)
-                ]
 
-            # Get the router-assigned IPs (already set during interface setup)
-            in_iface_ip = self._interfaces_config.get(self.interface_in_full_name, {}).get("ip_addr")
-            out_iface_ip = self._interfaces_config.get(self.interface_out_full_name, {}).get("ip_addr")
-            in_mac = self._interfaces_config.get(self.interface_in_full_name, {}).get("mac")
-            # Use full dynamic ranges (excluding router's own IP)
-            dhcp_pool_in = generate_full_pool(self.router_network_in, in_iface_ip)
-            dhcp_pool_out = generate_full_pool(self.router_network_out, out_iface_ip)
+    def _dhcp_control_plane_iface_sets(self) -> tuple[set[str], set[str]]:
+        """
+        Build explicit DHCP service and deny sets.
 
-            self.dhcp_server_in = DHCPServer(
-                self.router_logger,
-                self.packet_writer,
+        DHCP can serve only known LAN-facing interfaces. WAN, loopback, socket,
+        and outbound interfaces are always denied.
+        """
+        allowed: set[str] = set()
+        denied: set[str] = set()
+
+        def add_iface(target: set[str], value) -> None:
+            value = str(value or "").strip()
+            if value:
+                target.add(value)
+
+        # DHCP must never respond on these interfaces.
+        add_iface(denied, self.interface_out_full_name)
+        add_iface(denied, self.interface_out_friendly_name)
+        add_iface(denied, self.interface_loopback_full_name)
+        add_iface(denied, SocketInterface.IFACE_NAME)
+
+        try:
+            configured_outbound = (
+                self.outbound_load_balancer.get_configured_interfaces()
+            )
+
+            if isinstance(configured_outbound, (set, list, tuple)):
+                for iface in configured_outbound:
+                    add_iface(denied, iface)
+        except Exception:
+            pass
+
+        # Known LAN-facing capture interfaces.
+        for iface in (
                 self.interface_in_full_name,
-                dhcp_pool_in[0],
-                dhcp_pool_in[-1],
-                self._interfaces_config,
-                in_mac=in_mac,
-                enforce_same_subnet=False,
-                dns_v6 = ["fd00::1", "fd00::2"],  # Class default DNSv6
-                search_domains = ["lan.local"]  # Class default domains
+                self.interface_ethernet_2_full_name,
+                self.interface_lac_full_name,
+                self.interface_lac_2_full_name,
+        ):
+            add_iface(allowed, iface)
+
+        # Include interfaces currently owned by LanManager.
+        try:
+            lan_ifaces = getattr(self.lan_manager, "lan_ifaces", None)
+
+            if isinstance(lan_ifaces, (set, list, tuple)):
+                for iface in lan_ifaces:
+                    add_iface(allowed, iface)
+        except Exception:
+            pass
+
+        # Include current software-bridge members.
+        try:
+            bridge_members = self.ethernet_manager.get_bridge_members()
+
+            if isinstance(bridge_members, (set, list, tuple)):
+                for iface in bridge_members:
+                    add_iface(allowed, iface)
+        except Exception:
+            pass
+
+        # A deny rule always overrides an allow rule.
+        denied_normalized = {
+            str(iface).casefold()
+            for iface in denied
+        }
+
+        allowed = {
+            iface
+            for iface in allowed
+            if str(iface).casefold() not in denied_normalized
+        }
+
+        return allowed, denied
+
+    def _configure_dhcp_control_plane(
+            self,
+            *,
+            reason: str = "runtime",
+    ) -> dict:
+        """
+        Atomically update DHCP interface ownership without restarting the server,
+        clearing leases, resetting NAT, or changing Windows interface state.
+        """
+        server = getattr(self, "dhcp_server_in", None)
+
+        if server is None:
+            return {
+                "configured": False,
+                "reason": "no-server",
+            }
+
+        allowed, denied = self._dhcp_control_plane_iface_sets()
+
+        interface_roles = {
+            iface: "lan"
+            for iface in allowed
+        }
+
+        interface_roles.update({
+            iface: "wan"
+            for iface in denied
+        })
+
+        signature = (
+            id(server),
+            tuple(sorted(
+                str(iface).casefold()
+                for iface in allowed
+            )),
+            tuple(sorted(
+                str(iface).casefold()
+                for iface in denied
+            )),
+        )
+
+        previous_signature = getattr(
+            self,
+            "_dhcp_control_plane_signature",
+            None,
+        )
+
+        changed = signature != previous_signature
+
+        configure_policy = getattr(
+            server,
+            "configure_interface_policy",
+            None,
+        )
+
+        if callable(configure_policy):
+            policy_snapshot = configure_policy(
+                allowed_ifaces=allowed,
+                denied_ifaces=denied,
+                observe_only_ifaces=set(),
+                interface_roles=interface_roles,
+                replace=True,
+                reason=reason,
             )
-            self.dhcp_server_in.sniffer = self.sniffer
-            self.dhcp_server_in.router_ipv6_link_local_out = self.router_ipv6_link_local_out
-            self.dhcp_server_out = DHCPServer(
-                self.router_logger,
-                self.packet_writer,
-                self.interface_loopback_full_name,
-                dhcp_pool_out[0],
-                dhcp_pool_out[-1],
-                self._interfaces_config,
-                in_mac=in_mac,
-                enforce_same_subnet=False,
-                dns_v6 = ["fd00::1", "fd00::2"],  # Class default DNSv6
-                search_domains = ["lan.local"]  # Class default domains
-            )
-            self.dhcp_server_out.sniffer = self.sniffer
-            self.dhcp_server_out.router_ipv6_link_local_out = self.router_ipv6_link_local_out
-            self.arp_manager.set_dhcp_server_reference(self.dhcp_server_in, self.dhcp_server_out)
         else:
-            self.router_logger.log_message("[DHCP] DHCP Server not initialized: Router IN network not configured.")
-        if self.dhcp_server_in:
-            self.dhcp_server_in.start()
-        if self.dhcp_server_out:
-            self.dhcp_server_out.start()
+            # Compatibility fallback for an older DHCPServer implementation.
+            server.serve_on_all_ifaces = False
+            server.allowed_ifaces = set(allowed)
+            server.denied_ifaces = set(denied)
+
+            policy_snapshot = {
+                "legacy": True,
+                "allowed": sorted(allowed),
+                "denied": sorted(denied),
+            }
+
+        self._dhcp_control_plane_signature = signature
+
+        if changed:
+            self.router_logger.log_message(
+                f"[DHCP][ControlPlane] ✅ Configured reason={reason} "
+                f"allowed={sorted(allowed)} "
+                f"denied={sorted(denied)}"
+            )
+
+        return {
+            "configured": True,
+            "changed": changed,
+            "policy": policy_snapshot,
+        }
+
+    def _start_dhcp_servers(self):
+        """
+        Start exactly one DHCP server for LAN-facing interfaces.
+
+        If LanManager has already created a DHCPServer, adopt it. Do not create
+        another DHCP server and never create a DHCP server for the WAN.
+        """
+        if not self.router_network_in:
+            self.router_logger.log_message(
+                "[DHCP] DHCP server not initialized because the "
+                "router LAN network is unavailable."
+            )
+            return
+
+        existing_server = getattr(self, "dhcp_server_in", None)
+
+        if existing_server is not None:
+            existing_server.sniffer = self.sniffer
+            existing_server.router_ipv6_link_local_out = (
+                self.router_ipv6_link_local_out
+            )
+
+            # Never run a DHCP server on the WAN.
+            self.dhcp_server_out = None
+
+            self._configure_dhcp_control_plane(
+                reason="adopt-lan-manager-server"
+            )
+
+            # The upgraded DHCPServer start method is idempotent.
+            existing_server.start()
+
+            try:
+                self.arp_manager.set_dhcp_server_reference(
+                    existing_server,
+                    None,
+                )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[DHCP] ⚠️ Could not update ARP DHCP reference: {exc}"
+                )
+
+            self.router_logger.log_message(
+                "[DHCP][ControlPlane] ♻️ Adopted the existing LAN DHCP "
+                "server; duplicate creation was skipped."
+            )
+            return
+
+        def generate_full_pool(network, router_ip):
+            return [
+                str(ip)
+                for ip in network.hosts()
+                if str(ip) != str(router_ip)
+            ]
+
+        interface_config = self._interfaces_config.get(
+            self.interface_in_full_name,
+            {},
+        )
+
+        router_lan_ip = (
+                interface_config.get("ip_addr")
+                or self.router_ip_in
+        )
+
+        router_lan_mac = (
+                interface_config.get("mac")
+                or self.mac_in
+        )
+
+        dhcp_pool = generate_full_pool(
+            self.router_network_in,
+            router_lan_ip,
+        )
+
+        if not dhcp_pool:
+            self.router_logger.log_message(
+                "[DHCP] ❌ The LAN network has no usable DHCP addresses."
+            )
+            return
+
+        allowed_ifaces, denied_ifaces = (
+            self._dhcp_control_plane_iface_sets()
+        )
+
+        interface_roles = {
+            iface: "lan"
+            for iface in allowed_ifaces
+        }
+
+        interface_roles.update({
+            iface: "wan"
+            for iface in denied_ifaces
+        })
+
+        self.dhcp_server_in = DHCPServer(
+            self.router_logger,
+            self.packet_writer,
+            self.interface_in_full_name,
+            dhcp_pool[0],
+            dhcp_pool[-1],
+            self._interfaces_config,
+            in_mac=router_lan_mac,
+
+            # Lease and subnet safety.
+            allow_out_of_pool=False,
+            enforce_same_subnet=True,
+
+            # Interface control plane.
+            serve_on_all_ifaces=False,
+            allowed_ifaces=allowed_ifaces,
+            denied_ifaces=denied_ifaces,
+            observe_only_ifaces=set(),
+            interface_roles=interface_roles,
+            control_plane_name="router-lan-dhcp",
+            preserve_leases_on_policy_update=True,
+
+            # Do not attack or NAK upstream/Windows DHCP servers.
+            authoritative=True,
+            rogue_policy="log",
+
+            # Existing IPv6 configuration.
+            dns_v6=[
+                "fd00::1",
+                "fd00::2",
+            ],
+            search_domains=[
+                "lan.local",
+            ],
+        )
+
+        self.dhcp_server_in.sniffer = self.sniffer
+        self.dhcp_server_in.router_ipv6_link_local_out = (
+            self.router_ipv6_link_local_out
+        )
+
+        # The operating system is the DHCP client on Wi-Fi.
+        # This application must not serve DHCP on that interface.
+        self.dhcp_server_out = None
+
+        try:
+            self.arp_manager.set_dhcp_server_reference(
+                self.dhcp_server_in,
+                None,
+            )
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[DHCP] ⚠️ Could not update ARP DHCP reference: {exc}"
+            )
+
+        self.dhcp_server_in.start()
+
+        self._configure_dhcp_control_plane(
+            reason="standalone-server-start"
+        )
+
+    def _dispatch_dhcp_packet(
+            self,
+            packet,
+            inbound_iface: str,
+    ) -> bool:
+        """
+        Dispatch DHCP only to the server that owns the inbound interface.
+
+        Returns True when the packet is consumed by the DHCP control plane.
+        Returns False when the packet should continue through the normal pipeline.
+        """
+        server = getattr(self, "dhcp_server_in", None)
+
+        if server is None:
+            return False
+
+        # Refresh interface ownership in case Windows changed the active
+        # Wi-Fi Direct hotspot adapter.
+        self._configure_dhcp_control_plane(
+            reason="dhcp-dispatch-refresh"
+        )
+
+        server = getattr(self, "dhcp_server_in", None)
+
+        if server is None:
+            return False
+
+        policy_decision = getattr(
+            server,
+            "interface_policy_decision",
+            None,
+        )
+
+        if callable(policy_decision):
+            decision = policy_decision(inbound_iface)
+        else:
+            decision = (
+                "serve"
+                if inbound_iface == getattr(server, "in_iface", None)
+                else "pass"
+            )
+
+        if decision in ("serve", "observe"):
+            return bool(
+                server.handle_packet(
+                    packet,
+                    inbound_iface,
+                    self.rip_manager.find_route,
+                )
+            )
+
+        allowed, denied = self._dhcp_control_plane_iface_sets()
+
+        del allowed
+
+        denied_normalized = {
+            str(iface).casefold()
+            for iface in denied
+        }
+
+        inbound_normalized = str(
+            inbound_iface or ""
+        ).casefold()
+
+        if (
+                decision == "deny"
+                or inbound_normalized in denied_normalized
+        ):
+            self.router_logger.log_message(
+                f"[DHCP][ControlPlane] 🛡️ Suppressed DHCP service "
+                f"handling on denied interface {inbound_iface}."
+            )
+
+            # Consume the DHCP packet without generating any reply.
+            return True
+
+        return False
 
     def process_packet(self, packet, inbound_iface: str):
         """
@@ -2159,24 +2509,27 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         f"[DNS] ❗ Early DNS intercept exception on {iface_short}: {e}"
                     )
 
-            if packet.haslayer(DHCP) or packet.haslayer(DHCP6) or packet.haslayer(DHCP6_Solicit) or packet.haslayer(DHCP6_InfoRequest) or packet.haslayer(DHCP6_Reply):
-                self.router_logger.log_message(f"[DHCP] 📦 DHCP packet detected on {iface_short} for router")
-                if self.dhcp_server_in and self.dhcp_server_in.handle_packet(packet, inbound_iface,
-                                                                             self.rip_manager.find_route):
+            if (
+                    packet.haslayer(DHCP)
+                    or packet.haslayer(DHCP6)
+                    or packet.haslayer(DHCP6_Solicit)
+                    or packet.haslayer(DHCP6_InfoRequest)
+                    or packet.haslayer(DHCP6_Reply)
+            ):
+                self.router_logger.log_message(
+                    f"[DHCP] 📦 DHCP packet detected on "
+                    f"{iface_short} for router"
+                )
+
+                if self._dispatch_dhcp_packet(
+                        packet,
+                        inbound_iface,
+                ):
                     self.code_output_manager.submit_packet(
                         packet,
                         inbound_iface=inbound_iface,
                         phase="handled",
-                        component="dhcp-in-router",
-                    )
-                    return
-                if self.dhcp_server_out and self.dhcp_server_out.handle_packet(packet, inbound_iface,
-                                                                               self.rip_manager.find_route):
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="dhcp-out-router",
+                        component="dhcp-control-plane",
                     )
                     return
             if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
@@ -2810,19 +3163,38 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.python_server_manager.start()
                 self.arp_manager.add_trusted_port("Miner")
             if use_lan:
-                self.lan_manager = LanManager(self, DHCPServer, gateway_manager=self.gateway_manager)
+                self.lan_manager = LanManager(
+                    self,
+                    DHCPServer,
+                    gateway_manager=self.gateway_manager,
+                )
+
                 self.lan_manager.configure(
                     bridge_name="ManagedLANBridge",
                     create_bridge=True,
+
+                    # DHCP is restricted by the explicit control-plane allow-set.
                     serve_on_all_lan_ifaces=False,
+
                     authoritative=True,
-                    rogue_policy="nak_on_mismatch",
+
+                    # Observe competing servers without sending disruptive NAK replies.
+                    rogue_policy="log",
+
                     enforce_same_subnet=True,
                     allow_out_of_pool=False,
-                    start_transport_dhcp_client=True,
+
+                    # The LAN is a DHCP-server domain, not a DHCP-client domain.
+                    start_transport_dhcp_client=False,
+
                     handle_icmp=True,
                 )
+
                 self.lan_manager.start()
+
+                self._configure_dhcp_control_plane(
+                    reason="lan-manager-start"
+                )
             if use_uplink:
                 self.uplink_manager = UplinkManager(self, gateway_manager=self.gateway_manager)
                 self.uplink_manager.configure(
@@ -3114,10 +3486,28 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self._deconfigure_interface_settings()
             self._stop_sniffing_event.set()
             self.parallel_python.stop()
-            if self.dhcp_server_in:
-                self.dhcp_server_in.stop()
-            if self.dhcp_server_out:
-                self.dhcp_server_out.stop()
+            stopped_dhcp_ids = set()
+
+            for dhcp_server in (
+                    self.dhcp_server_in,
+                    self.dhcp_server_out,
+            ):
+                if dhcp_server is None:
+                    continue
+
+                server_id = id(dhcp_server)
+
+                if server_id in stopped_dhcp_ids:
+                    continue
+
+                stopped_dhcp_ids.add(server_id)
+
+                try:
+                    dhcp_server.stop()
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[DHCP] ⚠️ Error stopping DHCP server: {exc}"
+                    )
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()
