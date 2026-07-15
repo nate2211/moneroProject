@@ -453,6 +453,47 @@ class P2PoolGUI(QMainWindow):
             return
         use_scrapewebsite = self.router_tab.use_scrapewebsite_checkbox.isChecked()
         scrapewebsite_endpoint = self.router_tab.scrapewebsite_endpoint_input.text().strip()
+        use_wifi_host = (
+            self.router_tab.use_wifi_host_checkbox.isChecked()
+        )
+
+        wifi_ssid = (
+            self.router_tab.wifi_ssid_input.text().strip()
+        )
+
+        wifi_password = (
+            self.router_tab.wifi_password_input.text()
+        )
+        if use_wifi_host:
+            if not wifi_ssid:
+                self.router_logger.log_message(
+                    "[RouterTab][WiFi] ❌ Enter a wireless network name."
+                )
+                return
+
+            try:
+                ssid_length = len(wifi_ssid.encode("utf-8"))
+            except Exception:
+                ssid_length = 0
+
+            if not 1 <= ssid_length <= 32:
+                self.router_logger.log_message(
+                    "[RouterTab][WiFi] ❌ The SSID must contain "
+                    "between 1 and 32 UTF-8 bytes."
+                )
+                return
+
+            if not 8 <= len(wifi_password) <= 63:
+                self.router_logger.log_message(
+                    "[RouterTab][WiFi] ❌ The wireless password must "
+                    "contain between 8 and 63 characters."
+                )
+                return
+
+            self.router_logger.log_message(
+                "[RouterTab][WiFi] 📶 Wireless hosting enabled for "
+                f"SSID '{wifi_ssid}'."
+            )
         try:
             self.helper.router_manager.start_routing(
                 use_dhcp_out=use_dhcp_out,
@@ -480,6 +521,14 @@ class P2PoolGUI(QMainWindow):
                 use_ollama=use_ollama,
                 use_scrapewebsite=use_scrapewebsite,
                 scrapewebsite_endpoint=scrapewebsite_endpoint,
+                use_wifi_host=use_wifi_host,
+                wifi_ssid=wifi_ssid,
+                wifi_password=(
+                    wifi_password
+                    if use_wifi_host
+                    else None
+                ),
+                wifi_executable_path=None,
             )
         except Exception as e:
             self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")

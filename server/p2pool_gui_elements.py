@@ -1820,6 +1820,28 @@ class RouterTab(QWidget):
         self.promisc_checkbox.setChecked(False)
         self.ollama_checkbox = QCheckBox("Ollama")
         self.ollama_checkbox.setChecked(False)
+        self.use_wifi_host_checkbox = QCheckBox("Host Wireless Network")
+        self.use_wifi_host_checkbox.setChecked(False)
+        self.use_wifi_host_checkbox.setToolTip(
+            "Starts PythonRouterWirelessHost.exe and creates a "
+            "discoverable Wi-Fi Direct network."
+        )
+
+        self.wifi_ssid_input = QLineEdit()
+        self.wifi_ssid_input.setText("NateRouter")
+        self.wifi_ssid_input.setMaxLength(32)
+        self.wifi_ssid_input.setPlaceholderText("Wireless network name")
+
+        self.wifi_password_input = QLineEdit()
+        self.wifi_password_input.setEchoMode(QLineEdit.Password)
+        self.wifi_password_input.setMaxLength(63)
+        self.wifi_password_input.setPlaceholderText(
+            "8-63 character wireless password"
+        )
+        self.wifi_password_input.setToolTip(
+            "The password is passed to the wireless-host process "
+            "and is not written to the router log."
+        )
         self.router_ip_out_input = QLineEdit()
         self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
 
@@ -1918,7 +1940,32 @@ class RouterTab(QWidget):
         group_row.addWidget(blocknet_box, 2)
 
         layout.addLayout(group_row)
+        wireless_box = QGroupBox("Wireless Access Point")
+        wireless_form = QFormLayout(wireless_box)
+        wireless_form.setContentsMargins(8, 8, 8, 8)
+        wireless_form.setHorizontalSpacing(12)
+        wireless_form.setVerticalSpacing(8)
 
+        wireless_form.addRow(self.use_wifi_host_checkbox)
+        wireless_form.addRow(
+            QLabel("SSID:"),
+            self.wifi_ssid_input,
+        )
+        wireless_form.addRow(
+            QLabel("Password:"),
+            self.wifi_password_input,
+        )
+
+        wireless_exe_label = QLabel(
+            "Executable: tools/PythonRouterWirelessHost.exe"
+        )
+        wireless_exe_label.setWordWrap(True)
+        wireless_exe_label.setToolTip(
+            "WifiManager searches the application tools directory automatically."
+        )
+        wireless_form.addRow(wireless_exe_label)
+
+        layout.addWidget(wireless_box)
         pane_row = QHBoxLayout()
         pane_row.addWidget(QLabel("Pane:"))
         pane_row.addWidget(self.add_pane_input)
@@ -1941,6 +1988,9 @@ class RouterTab(QWidget):
         self.blocknet_checkbox.stateChanged.connect(self._sync_enable_states)
         self.stratum_comm_checkbox.stateChanged.connect(self._sync_enable_states)
         self.use_scrapewebsite_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.use_wifi_host_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
 
     def _sync_enable_states(self):
         use_static = self.use_static_checkbox.isChecked()
@@ -1964,6 +2014,10 @@ class RouterTab(QWidget):
 
         if not use_stratum:
             self.p2pool_server_ip_input.setText("")
+        use_wifi_host = self.use_wifi_host_checkbox.isChecked()
+
+        self.wifi_ssid_input.setEnabled(use_wifi_host)
+        self.wifi_password_input.setEnabled(use_wifi_host)
 
     def _on_preset_selected(self, preset_name: str):
         self._load_presets(preset_name)

@@ -12,6 +12,7 @@ import re
 import socketserver
 import ssl
 import subprocess
+import sys
 import tempfile
 import traceback
 import uuid
@@ -68,6 +69,7 @@ from randomx_ctypes import RandomX, RxUtils
 from scapy.layers.inet6 import ICMPv6NDOptPrefixInfo
 
 from p2pool_sniffer import DNSRR_AAAA, ICMPv6
+from pathlib import Path
 
 
 bind_layers(ICMPv6ND_RA, ICMPv6NDOptPrefixInfo)
@@ -34293,3 +34295,1439 @@ class ScrapeWebsiteManager:
             self.router_logger.log_message(msg)
         except Exception:
             print(msg)
+            
+            
+            
+class WifiManager:
+    """
+    Lifecycle/control-plane wrapper for PythonRouterWirelessHost.exe.
+
+    Ownership model:
+      * PythonRouterWirelessHost.exe creates and maintains the Wi-Fi Direct
+        legacy access point.
+      * Windows Wi-Fi Direct owns association security and DHCP on that link.
+      * PythonRouter owns packet capture, DNS policy, routing, NAT and firewall
+        processing for traffic arriving on the Wi-Fi Direct adapter.
+
+    The manager never enables Internet Connection Sharing and never assigns a
+    replacement static IPv4 address to the Wi-Fi Direct adapter.
+    """
+
+    EXECUTABLE_NAME = "PythonRouterWirelessHost.exe"
+
+    def __init__(
+        self,
+        router: Any,
+        router_logger: Any,
+        executable_path: Optional[str | os.PathLike[str]] = None,
+    ) -> None:
+        self.router = router
+        self.router_logger = router_logger
+        self._configured_executable = (
+            Path(executable_path).expanduser()
+            if executable_path
+            else None
+        )
+
+        self.ssid = "PythonRouter"
+        self.password = ""
+        self.state_file: Optional[Path] = None
+        self.start_timeout = 35.0
+        self.adapter_timeout = 45.0
+        self.adapter_poll_interval = 1.0
+        self.enable_windows_forwarding = True
+
+        self.process: Optional[subprocess.Popen[str]] = None
+        self.latest_state: dict[str, Any] = {}
+        self.latest_adapter: dict[str, Any] = {}
+        self.latest_clients: list[dict[str, Any]] = []
+        self.managed_ifaces: set[str] = set()
+
+        self._baseline_adapters: list[dict[str, Any]] = []
+        self._ready_event = threading.Event()
+        self._adapter_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._process_exited_event = threading.Event()
+        self._lock = threading.RLock()
+
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._adapter_thread: Optional[threading.Thread] = None
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._fatal_error: Optional[str] = None
+        self._last_adapter_identity: Optional[tuple[Any, ...]] = None
+
+    # ------------------------------------------------------------------
+    # Configuration and discovery
+    # ------------------------------------------------------------------
+
+    def configure(
+        self,
+        *,
+        ssid: str,
+        password: str,
+        executable_path: Optional[str | os.PathLike[str]] = None,
+        state_file: Optional[str | os.PathLike[str]] = None,
+        start_timeout: float = 35.0,
+        adapter_timeout: float = 45.0,
+        adapter_poll_interval: float = 1.0,
+        enable_windows_forwarding: bool = True,
+    ) -> None:
+        ssid = str(ssid or "").strip()
+        password = str(password or "")
+
+        ssid_bytes = ssid.encode("utf-8")
+        if not 1 <= len(ssid_bytes) <= 32:
+            raise ValueError("Wi-Fi SSID must contain 1-32 UTF-8 bytes.")
+        if not 8 <= len(password) <= 63:
+            raise ValueError("Wi-Fi password must contain 8-63 characters.")
+
+        self.ssid = ssid
+        self.password = password
+        self.start_timeout = max(5.0, float(start_timeout))
+        self.adapter_timeout = max(5.0, float(adapter_timeout))
+        self.adapter_poll_interval = max(0.5, float(adapter_poll_interval))
+        self.enable_windows_forwarding = bool(enable_windows_forwarding)
+
+        if executable_path:
+            self._configured_executable = Path(executable_path).expanduser()
+
+        if state_file:
+            self.state_file = Path(state_file).expanduser()
+        else:
+            program_data = Path(
+                os.environ.get("ProgramData", r"C:\ProgramData")
+            )
+            self.state_file = (
+                program_data
+                / "PythonRouter"
+                / "wireless_state.json"
+            )
+
+    def resolve_executable(self) -> Path:
+        candidates: list[Path] = []
+
+        if self._configured_executable is not None:
+            candidates.append(self._configured_executable)
+
+        executable_env = os.environ.get(
+            "PYTHONROUTER_WIRELESS_HOST_EXE",
+            "",
+        ).strip()
+        if executable_env:
+            candidates.append(Path(executable_env).expanduser())
+
+        module_dir = Path(__file__).resolve().parent
+        cwd = Path.cwd()
+
+        base_dirs: list[Path] = [
+            module_dir / "tools",
+            module_dir.parent / "tools",
+            module_dir.parent / "client" / "tools",
+            cwd / "tools",
+            cwd / "client" / "tools",
+        ]
+
+        if getattr(sys, "frozen", False):
+            frozen_root = Path(
+                getattr(sys, "_MEIPASS", Path(sys.executable).parent)
+            )
+            base_dirs.insert(0, frozen_root / "tools")
+            base_dirs.insert(1, Path(sys.executable).resolve().parent / "tools")
+
+        for base in base_dirs:
+            candidates.extend(
+                [
+                    base / self.EXECUTABLE_NAME,
+                    base / "PythonRouterWirelessHost" / self.EXECUTABLE_NAME,
+                    base / "WirelessHost" / self.EXECUTABLE_NAME,
+                ]
+            )
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate.absolute()
+
+            key = os.path.normcase(str(resolved))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if resolved.is_file():
+                return resolved
+
+        rendered = "\n  ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            "PythonRouterWirelessHost.exe was not found. Checked:\n  "
+            + rendered
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> dict[str, Any]:
+        with self._lock:
+            if self.is_running():
+                return self.status()
+
+            executable = self.resolve_executable()
+            self._baseline_adapters = self._snapshot_adapters(executable)
+
+            if self.state_file is not None:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+            self._ready_event.clear()
+            self._adapter_event.clear()
+            self._stop_event.clear()
+            self._process_exited_event.clear()
+            self._fatal_error = None
+            self.latest_state = {}
+            self.latest_adapter = {}
+            self.latest_clients = []
+            self._last_adapter_identity = None
+
+            command = [
+                str(executable),
+                "serve",
+                "--ssid",
+                self.ssid,
+                "--password",
+                self.password,
+                "--start-timeout",
+                str(max(1, int(self.start_timeout))),
+                "--adapter-wait",
+                str(max(1, int(self.adapter_timeout))),
+            ]
+
+            if self.state_file is not None:
+                command.extend(
+                    ["--state-file", str(self.state_file)]
+                )
+
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(
+                    subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0,
+                )
+
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+
+            self._stdout_thread = threading.Thread(
+                target=self._read_stdout,
+                name="WifiManager-stdout",
+                daemon=True,
+            )
+            self._stderr_thread = threading.Thread(
+                target=self._read_stderr,
+                name="WifiManager-stderr",
+                daemon=True,
+            )
+            self._adapter_thread = threading.Thread(
+                target=self._adapter_discovery_loop,
+                name="WifiManager-adapter-discovery",
+                daemon=True,
+            )
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_process,
+                name="WifiManager-process-monitor",
+                daemon=True,
+            )
+
+            self._stdout_thread.start()
+            self._stderr_thread.start()
+            self._adapter_thread.start()
+            self._monitor_thread.start()
+
+        if not self._ready_event.wait(self.start_timeout + 8.0):
+            exit_code = self.process.poll() if self.process else None
+            self.stop(force=True)
+            raise RuntimeError(
+                "Wireless host did not report ready before the timeout "
+                f"(exit_code={exit_code})."
+            )
+
+        if self._fatal_error:
+            message = self._fatal_error
+            self.stop(force=True)
+            raise RuntimeError(
+                f"Wireless host failed to start: {message}"
+            )
+
+        self._log(
+            f"[WiFiManager] ✅ Wireless network '{self.ssid}' started."
+        )
+
+        return self.status()
+
+    def stop(
+        self,
+        *,
+        force: bool = False,
+        timeout: float = 12.0,
+        detach_router: bool = True,
+    ) -> None:
+        self._stop_event.set()
+
+        with self._lock:
+            process = self.process
+
+        if process is not None and process.poll() is None:
+            if not force:
+                try:
+                    self.command("stop")
+                except Exception:
+                    pass
+            else:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+
+            try:
+                process.wait(timeout=4.0 if force else timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.terminate()
+                    process.wait(timeout=4.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=4.0)
+                except Exception:
+                    pass
+
+        if detach_router:
+            self._detach_adapter_from_router()
+
+        with self._lock:
+            exit_code = process.returncode if process else None
+            self.process = None
+
+        self._process_exited_event.set()
+        self._log(
+            f"[WiFiManager] 🛑 Wireless host stopped "
+            f"(exit_code={exit_code})."
+        )
+
+    def restart(self) -> dict[str, Any]:
+        self.stop()
+        return self.start()
+
+    def is_running(self) -> bool:
+        process = self.process
+        return process is not None and process.poll() is None
+
+    def command(self, command: str) -> None:
+        command = str(command or "").strip()
+        if not command:
+            return
+
+        with self._lock:
+            process = self.process
+            if (
+                process is None
+                or process.poll() is not None
+                or process.stdin is None
+            ):
+                raise RuntimeError("Wireless host is not running.")
+
+            process.stdin.write(command + "\n")
+            process.stdin.flush()
+
+    def request_status(self) -> None:
+        self.command("status")
+
+    def request_clients(self) -> None:
+        self.command("clients")
+
+    def status(self) -> dict[str, Any]:
+        process = self.process
+        return {
+            "running": self.is_running(),
+            "pid": process.pid if process and process.poll() is None else None,
+            "ssid": self.ssid,
+            "state_file": str(self.state_file) if self.state_file else None,
+            "state": dict(self.latest_state),
+            "adapter": dict(self.latest_adapter),
+            "clients": list(self.latest_clients),
+            "managed_ifaces": sorted(self.managed_ifaces),
+            "fatal_error": self._fatal_error,
+        }
+
+    def wait_for_adapter(
+        self,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        wait_timeout = (
+            self.adapter_timeout
+            if timeout is None
+            else max(0.0, float(timeout))
+        )
+        if not self._adapter_event.wait(wait_timeout):
+            raise TimeoutError(
+                "The Wi-Fi Direct adapter has not appeared yet. "
+                "Some drivers create it only when the first client joins."
+            )
+        return dict(self.latest_adapter)
+
+    # ------------------------------------------------------------------
+    # Interface ownership
+    # ------------------------------------------------------------------
+
+    def is_managed_interface(
+        self,
+        full_name: Optional[str] = None,
+        friendly_name: Optional[str] = None,
+        adapter_name: Optional[str] = None,
+    ) -> bool:
+        candidates = {
+            str(value or "").strip().casefold()
+            for value in (
+                full_name,
+                friendly_name,
+                adapter_name,
+            )
+            if str(value or "").strip()
+        }
+        if not candidates:
+            return False
+
+        managed = {
+            str(value).strip().casefold()
+            for value in self.managed_ifaces
+            if str(value).strip()
+        }
+        return bool(candidates & managed)
+
+    def refresh_router_binding(self) -> None:
+        if self.latest_adapter:
+            self._apply_adapter_to_router(self.latest_adapter)
+
+    # ------------------------------------------------------------------
+    # Child process readers
+    # ------------------------------------------------------------------
+
+    def _read_stdout(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            return
+
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                self._log(
+                    f"[WiFiManager][stdout] {line}"
+                )
+                continue
+
+            try:
+                self._handle_payload(payload)
+            except Exception as exc:
+                self._log(
+                    f"[WiFiManager] ⚠️ Event handling failed: {exc}"
+                )
+
+        self._process_exited_event.set()
+        self._ready_event.set()
+
+    def _read_stderr(self) -> None:
+        process = self.process
+        if process is None or process.stderr is None:
+            return
+
+        for raw_line in process.stderr:
+            line = raw_line.rstrip()
+            if line:
+                self._log(
+                    f"[WiFiManager][stderr] {line}"
+                )
+
+    def _handle_payload(self, payload: Any) -> None:
+        if isinstance(payload, list):
+            adapter = self._select_wifi_direct_adapter(payload)
+            if adapter:
+                self._accept_adapter(adapter)
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        event_type = str(payload.get("event") or "").strip()
+
+        if event_type == "fatal_error":
+            self._fatal_error = str(
+                payload.get("message")
+                or "Unknown wireless host error."
+            )
+            self.latest_state.update(payload)
+            self._ready_event.set()
+            self._log(
+                f"[WiFiManager] ❌ {self._fatal_error}"
+            )
+            return
+
+        if event_type == "ready":
+            self.latest_state.update(payload)
+            adapter = payload.get("adapter")
+            if isinstance(adapter, dict) and adapter:
+                self._accept_adapter(adapter)
+            self._ready_event.set()
+            return
+
+        if event_type == "clients":
+            clients = payload.get("clients")
+            if isinstance(clients, list):
+                self.latest_clients = [
+                    dict(client)
+                    for client in clients
+                    if isinstance(client, dict)
+                ]
+            return
+
+        if event_type == "client_connected":
+            client = payload.get("client")
+            if isinstance(client, dict):
+                device_id = str(
+                    client.get("device_id")
+                    or client.get("name")
+                    or client.get("remote_address")
+                    or ""
+                )
+                existing = {
+                    str(
+                        item.get("device_id")
+                        or item.get("name")
+                        or item.get("remote_address")
+                        or ""
+                    ): item
+                    for item in self.latest_clients
+                }
+                existing[device_id] = dict(client)
+                self.latest_clients = list(existing.values())
+                self._log(
+                    "[WiFiManager] 📶 Client connected: "
+                    f"{client.get('name') or client.get('remote_address') or device_id}"
+                )
+
+                # Windows commonly assigns the Wi-Fi Direct interface's
+                # client-facing IPv4 address only after the first peer joins.
+                # Refresh repeatedly so PythonRouter receives the subnet,
+                # installs a direct return route and permits it through NAT.
+                threading.Thread(
+                    target=self._refresh_after_client_connect,
+                    name="WifiManager-client-route-refresh",
+                    daemon=True,
+                ).start()
+            return
+
+        if event_type == "client_disconnected":
+            client = payload.get("client")
+            if isinstance(client, dict):
+                device_id = str(
+                    client.get("device_id")
+                    or client.get("name")
+                    or client.get("remote_address")
+                    or ""
+                )
+                self.latest_clients = [
+                    item
+                    for item in self.latest_clients
+                    if str(
+                        item.get("device_id")
+                        or item.get("name")
+                        or item.get("remote_address")
+                        or ""
+                    ) != device_id
+                ]
+            return
+
+        # A "status" command returns a state object without an event name.
+        if "state" in payload or "adapter" in payload:
+            self.latest_state.update(payload)
+            adapter = payload.get("adapter")
+            if isinstance(adapter, dict) and adapter:
+                self._accept_adapter(adapter)
+
+    def _refresh_after_client_connect(self) -> None:
+        """
+        Refresh adapter addressing after a peer joins.
+
+        Wi-Fi Direct legacy AP adapters often transition through:
+            adapter exists -> peer connects -> IPv4 subnet appears.
+        """
+        for delay in (0.35, 0.75, 1.5, 2.5, 4.0, 6.0):
+            if self._stop_event.wait(delay):
+                return
+            try:
+                self.command("adapters")
+            except Exception:
+                return
+
+    def _monitor_process(self) -> None:
+        process = self.process
+        if process is None:
+            return
+
+        exit_code = process.wait()
+        self._process_exited_event.set()
+        self._ready_event.set()
+
+        if not self._stop_event.is_set() and exit_code != 0:
+            self._fatal_error = (
+                self._fatal_error
+                or f"Wireless host exited unexpectedly with code {exit_code}."
+            )
+            self._log(
+                f"[WiFiManager] ❌ {self._fatal_error}"
+            )
+
+    def _adapter_discovery_loop(self) -> None:
+        """
+        Keep refreshing adapter state for the life of the AP.
+
+        The Wi-Fi Direct adapter may exist before it owns an IPv4 address.
+        Once a client joins, Windows can add or change the adapter address.
+        Continuing to poll lets PythonRouter receive that updated state.
+        """
+        warning_deadline = time.monotonic() + self.adapter_timeout
+
+        while (
+            not self._stop_event.is_set()
+            and self.is_running()
+        ):
+            try:
+                self.command("adapters")
+            except Exception:
+                pass
+
+            if (
+                not self._adapter_event.is_set()
+                and time.monotonic() >= warning_deadline
+            ):
+                self._log(
+                    "[WiFiManager] ⚠️ Access point is running, but its "
+                    "virtual adapter has not been identified yet. It may "
+                    "appear when the first client connects."
+                )
+                warning_deadline = (
+                    time.monotonic() + self.adapter_timeout
+                )
+
+            self._stop_event.wait(self.adapter_poll_interval)
+
+    # ------------------------------------------------------------------
+    # Adapter selection and router binding
+    # ------------------------------------------------------------------
+
+    def _snapshot_adapters(
+        self,
+        executable: Path,
+    ) -> list[dict[str, Any]]:
+        try:
+            result = subprocess.run(
+                [str(executable), "adapters"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15.0,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+            if result.returncode != 0:
+                return []
+
+            for line in reversed(
+                (result.stdout or "").splitlines()
+            ):
+                try:
+                    payload = json.loads(line.strip())
+                except Exception:
+                    continue
+                if isinstance(payload, list):
+                    return [
+                        dict(item)
+                        for item in payload
+                        if isinstance(item, dict)
+                    ]
+        except Exception as exc:
+            self._log(
+                f"[WiFiManager] Adapter baseline unavailable: {exc}"
+            )
+        return []
+
+    @staticmethod
+    def _extract_adapter_guid(value: Any) -> str:
+        match = re.search(
+            r"\{[0-9a-fA-F-]{36}\}",
+            str(value or ""),
+        )
+        return match.group(0).upper() if match else ""
+
+    @staticmethod
+    def _normalize_npcap_name(value: Any) -> str:
+        """
+        Normalize to the Npcap spelling used by tshark and Scapy:
+        exactly one leading backslash before Device.
+        """
+        name = str(value or "").strip().strip('"')
+        name = name.replace("/", "\\")
+
+        lowered = name.casefold()
+        while lowered.startswith("\\\\device\\npf_"):
+            name = name[1:]
+            lowered = name.casefold()
+
+        guid = WifiManager._extract_adapter_guid(name)
+        if guid:
+            return "\\Device\\NPF_" + guid
+
+        return name
+
+    def _resolve_capture_name(
+        self,
+        adapter: dict[str, Any],
+    ) -> str:
+        """
+        Prefer the exact capture name already returned by tshark -D.
+        Fall back to a normalized name made from the interface GUID.
+        """
+        adapter_guid = self._extract_adapter_guid(
+            adapter.get("adapter_name")
+            or adapter.get("npcap_name")
+        )
+
+        discovered = getattr(
+            self.router,
+            "_discovered_tshark_interfaces",
+            [],
+        )
+
+        if isinstance(discovered, list):
+            for item in discovered:
+                if not isinstance(item, dict):
+                    continue
+
+                discovered_full = str(
+                    item.get("full_name") or ""
+                ).strip()
+                discovered_guid = self._extract_adapter_guid(
+                    discovered_full
+                )
+
+                if (
+                    adapter_guid
+                    and discovered_guid == adapter_guid
+                ):
+                    return self._normalize_npcap_name(
+                        discovered_full
+                    )
+
+        raw_name = (
+            adapter.get("npcap_name")
+            or adapter.get("adapter_name")
+            or ""
+        )
+        normalized = self._normalize_npcap_name(raw_name)
+
+        if normalized:
+            return normalized
+
+        if adapter_guid:
+            return "\\Device\\NPF_" + adapter_guid
+
+        return ""
+
+    def _select_wifi_direct_adapter(
+        self,
+        adapters: list[Any],
+    ) -> Optional[dict[str, Any]]:
+        baseline_names = {
+            str(item.get("adapter_name") or "").casefold()
+            for item in self._baseline_adapters
+            if isinstance(item, dict)
+        }
+
+        wan_names = {
+            str(value or "").strip().casefold()
+            for value in (
+                getattr(
+                    self.router,
+                    "interface_out_full_name",
+                    None,
+                ),
+                getattr(
+                    self.router,
+                    "interface_out_friendly_name",
+                    None,
+                ),
+            )
+            if str(value or "").strip()
+        }
+
+        best_adapter: Optional[dict[str, Any]] = None
+        best_score = -10000
+
+        for raw in adapters:
+            if not isinstance(raw, dict):
+                continue
+
+            adapter = dict(raw)
+            adapter_name = str(
+                adapter.get("adapter_name") or ""
+            )
+            full_name = str(
+                adapter.get("npcap_name") or adapter_name
+            )
+            friendly = str(
+                adapter.get("friendly_name") or ""
+            )
+            description = str(
+                adapter.get("description") or ""
+            )
+            searchable = (
+                f"{friendly} {description} {adapter_name}"
+            ).casefold()
+
+            score = 0
+            if adapter_name.casefold() not in baseline_names:
+                score += 100
+            if "wi-fi direct" in searchable:
+                score += 100
+            if "wifi direct" in searchable:
+                score += 100
+            if "local area connection*" in searchable:
+                score += 65
+            if "virtual adapter" in searchable:
+                score += 30
+            if int(adapter.get("if_type") or 0) == 71:
+                score += 20
+            if bool(adapter.get("is_up")):
+                score += 20
+
+            for address in adapter.get("addresses") or []:
+                if not isinstance(address, dict):
+                    continue
+                value = str(
+                    address.get("address") or ""
+                ).split("%", 1)[0]
+                if (
+                    value.startswith("192.168.137.")
+                    or value.startswith("192.168.49.")
+                ):
+                    score += 40
+
+            if "bluetooth" in searchable:
+                score -= 150
+            if "loopback" in searchable:
+                score -= 150
+            if (
+                "vpn" in searchable
+                or "tunnel" in searchable
+                or "wintun" in searchable
+            ):
+                score -= 80
+
+            if (
+                full_name.casefold() in wan_names
+                or friendly.casefold() in wan_names
+            ):
+                score -= 500
+
+            if score > best_score:
+                best_score = score
+                best_adapter = adapter
+
+        if best_adapter is None or best_score < 60:
+            return None
+
+        return best_adapter
+
+    def _accept_adapter(
+        self,
+        adapter: dict[str, Any],
+    ) -> None:
+        address_identity = []
+
+        for address in adapter.get("addresses") or []:
+            if not isinstance(address, dict):
+                continue
+            address_identity.append(
+                (
+                    address.get("family"),
+                    address.get("address"),
+                    address.get("prefix_length"),
+                )
+            )
+
+        identity = (
+            adapter.get("adapter_name"),
+            adapter.get("npcap_name"),
+            adapter.get("if_index"),
+            adapter.get("luid"),
+            tuple(sorted(address_identity, key=str)),
+        )
+
+        self.latest_adapter = dict(adapter)
+        self.latest_state["adapter"] = dict(adapter)
+        self._adapter_event.set()
+
+        if identity != self._last_adapter_identity:
+            self._last_adapter_identity = identity
+            self._apply_adapter_to_router(adapter)
+
+    def _apply_adapter_to_router(
+        self,
+        adapter: dict[str, Any],
+    ) -> None:
+        router = self.router
+        normalized_adapter = dict(adapter)
+
+        adapter_name = str(
+            normalized_adapter.get("adapter_name") or ""
+        ).strip()
+        full_name = self._resolve_capture_name(
+            normalized_adapter
+        )
+        friendly_name = str(
+            normalized_adapter.get("friendly_name") or ""
+        ).strip()
+        mac = str(
+            normalized_adapter.get("physical_address") or ""
+        ).strip()
+
+        if not full_name:
+            self._log(
+                "[WiFiManager] ⚠️ Wi-Fi Direct adapter was found, "
+                "but no usable Npcap capture name could be created."
+            )
+            return
+
+        normalized_adapter["npcap_name"] = full_name
+        self.latest_adapter = dict(normalized_adapter)
+        self.latest_state["adapter"] = dict(normalized_adapter)
+
+        identities = {
+            value
+            for value in (
+                adapter_name,
+                full_name,
+                friendly_name,
+            )
+            if value
+        }
+        self.managed_ifaces.update(identities)
+
+        router.wifi_host_managed_ifaces = set(
+            self.managed_ifaces
+        )
+        router.interface_wifi_full_name = full_name
+        router.interface_wifi_friendly_name = friendly_name
+        router.wifi_host_state = {
+            "mode": "wifi_direct_legacy_ap",
+            "dhcp_owner": "windows_wifi_direct",
+            "routing_owner": "pythonrouter",
+            "adapter": dict(normalized_adapter),
+        }
+
+        ipv4_address: Optional[str] = None
+        ipv4_network: Optional[ipaddress.IPv4Network] = None
+
+        for address in normalized_adapter.get("addresses") or []:
+            if not isinstance(address, dict):
+                continue
+            try:
+                if int(address.get("family") or 0) != 2:
+                    continue
+
+                value = str(
+                    address.get("address") or ""
+                ).split("%", 1)[0]
+                ip_value = ipaddress.IPv4Address(value)
+
+                if ip_value.is_loopback:
+                    continue
+
+                prefix = int(
+                    address.get("prefix_length") or 24
+                )
+
+                ipv4_address = str(ip_value)
+                ipv4_network = ipaddress.ip_network(
+                    f"{ip_value}/{prefix}",
+                    strict=False,
+                )
+                break
+            except Exception:
+                continue
+
+        broadcast = (
+            str(ipv4_network.broadcast_address)
+            if ipv4_network is not None
+            else "255.255.255.255"
+        )
+
+        current = dict(
+            router._interfaces_config.get(
+                full_name,
+                {},
+            )
+        )
+        current.update(
+            {
+                "friendly_name": friendly_name,
+                "ip_addr": ipv4_address or "0.0.0.0",
+                "network": ipv4_network,
+                "mac": mac or current.get("mac"),
+                "broadcast": broadcast,
+                "gateway": None,
+                "is_default_gateway_iface": False,
+                "wireless_host_managed": True,
+                "dhcp_owner": "windows_wifi_direct",
+                "routing_owner": "pythonrouter",
+                "if_index": normalized_adapter.get("if_index"),
+                "ipv6_if_index": normalized_adapter.get(
+                    "ipv6_if_index"
+                ),
+                "luid": normalized_adapter.get("luid"),
+            }
+        )
+        router._interfaces_config[full_name] = current
+
+        try:
+            router.interface_macs[full_name] = mac
+        except Exception:
+            pass
+
+        try:
+            router.router_macs = set(
+                router.router_macs or set()
+            )
+            if mac:
+                router.router_macs.add(mac)
+        except Exception:
+            pass
+
+        discovered = getattr(
+            router,
+            "_discovered_tshark_interfaces",
+            None,
+        )
+        if isinstance(discovered, list):
+            matching_item = None
+
+            for item in discovered:
+                if not isinstance(item, dict):
+                    continue
+                if self._extract_adapter_guid(
+                    item.get("full_name")
+                ) == self._extract_adapter_guid(full_name):
+                    matching_item = item
+                    break
+
+            if matching_item is None:
+                discovered.append(
+                    {
+                        "id": str(
+                            normalized_adapter.get("if_index")
+                            or ""
+                        ),
+                        "full_name": full_name,
+                        "friendly_name": friendly_name,
+                    }
+                )
+            else:
+                matching_item["full_name"] = full_name
+                matching_item["friendly_name"] = friendly_name
+
+        self._update_router_consumers()
+
+        if ipv4_address is not None and ipv4_network is not None:
+            ready_handler = getattr(
+                router,
+                "_on_wifi_host_network_ready",
+                None,
+            )
+            if callable(ready_handler):
+                try:
+                    ready_handler(
+                        iface_full_name=full_name,
+                        iface_friendly_name=friendly_name,
+                        router_ip=ipv4_address,
+                        network=ipv4_network,
+                        adapter=dict(normalized_adapter),
+                    )
+                except Exception as exc:
+                    self._log(
+                        "[WiFiManager] Wi-Fi LAN/NAT route sync failed: "
+                        f"{exc}"
+                    )
+        else:
+            self._log(
+                "[WiFiManager] ⏳ Waiting for Windows to publish the "
+                "Wi-Fi Direct client-facing IPv4 subnet."
+            )
+
+        if self.enable_windows_forwarding and friendly_name:
+            self._configure_windows_adapter_policy(
+                normalized_adapter,
+                friendly_name,
+            )
+
+        try:
+            add_trusted = getattr(
+                router,
+                "add_trusted_arp_port",
+                None,
+            )
+            if callable(add_trusted):
+                add_trusted(full_name)
+        except Exception as exc:
+            self._log(
+                f"[WiFiManager] ARP trust update failed: {exc}"
+            )
+
+        try:
+            configure_dhcp = getattr(
+                router,
+                "_configure_dhcp_control_plane",
+                None,
+            )
+            if callable(configure_dhcp):
+                configure_dhcp(reason="wifi-host-adapter")
+        except Exception as exc:
+            self._log(
+                f"[WiFiManager] DHCP policy refresh failed: {exc}"
+            )
+
+        try:
+            if (
+                getattr(router, "started", False)
+                and getattr(router, "sniffer", None) is not None
+                and not router._stop_sniffing_event.is_set()
+            ):
+                sniff_threads = getattr(
+                    router,
+                    "_sniff_threads",
+                    {},
+                )
+                if full_name not in sniff_threads:
+                    router._start_single_sniffer(
+                        full_name,
+                        promisc=False,
+                    )
+        except Exception as exc:
+            self._log(
+                f"[WiFiManager] Dynamic sniffer start failed: {exc}"
+            )
+
+        self._log(
+            "[WiFiManager] ✅ Attached Wi-Fi Direct adapter: "
+            f"friendly='{friendly_name or '-'}' "
+            f"full='{full_name}' "
+            f"ipv4='{ipv4_address or '-'}'. "
+            "Windows Wi-Fi Direct owns association/DHCP; "
+            "PythonRouter owns routing/NAT."
+        )
+
+    def _update_router_consumers(self) -> None:
+        router = self.router
+
+        consumers = (
+            getattr(router, "packet_writer", None),
+            getattr(router, "igmp_manager", None),
+            getattr(router, "nat_manager", None),
+            getattr(router, "netroute_manager", None),
+        )
+
+        for consumer in consumers:
+            if consumer is None:
+                continue
+
+            for method_name in (
+                "update_interfaces",
+                "set_interfaces_config",
+                "configure_interfaces",
+            ):
+                method = getattr(
+                    consumer,
+                    method_name,
+                    None,
+                )
+                if not callable(method):
+                    continue
+                try:
+                    method(router._interfaces_config)
+                    break
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    self._log(
+                        "[WiFiManager] Interface update failed for "
+                        f"{consumer.__class__.__name__}: {exc}"
+                    )
+                    break
+
+        lan_manager = getattr(router, "lan_manager", None)
+        if lan_manager is not None:
+            lan_ifaces = getattr(
+                lan_manager,
+                "lan_ifaces",
+                None,
+            )
+            if isinstance(lan_ifaces, set):
+                full_name = getattr(
+                    router,
+                    "interface_wifi_full_name",
+                    None,
+                )
+                if full_name:
+                    lan_ifaces.add(full_name)
+
+    def _detach_adapter_from_router(self) -> None:
+        router = self.router
+        full_name = getattr(
+            router,
+            "interface_wifi_full_name",
+            None,
+        )
+
+        if full_name:
+            config = router._interfaces_config.get(
+                full_name
+            )
+            if (
+                isinstance(config, dict)
+                and config.get("wireless_host_managed")
+            ):
+                router._interfaces_config.pop(
+                    full_name,
+                    None,
+                )
+
+        stopped_handler = getattr(
+            router,
+            "_on_wifi_host_network_stopped",
+            None,
+        )
+        if callable(stopped_handler):
+            try:
+                stopped_handler(full_name)
+            except Exception:
+                pass
+
+        router.interface_wifi_full_name = None
+        router.interface_wifi_friendly_name = None
+        router.wifi_host_managed_ifaces = set()
+        router.wifi_host_state = {
+            "state": "stopped",
+            "adapter": None,
+        }
+
+        self.managed_ifaces.clear()
+        self.latest_adapter = {}
+        self._last_adapter_identity = None
+        self._adapter_event.clear()
+
+        self._update_router_consumers()
+
+        try:
+            configure_dhcp = getattr(
+                router,
+                "_configure_dhcp_control_plane",
+                None,
+            )
+            if callable(configure_dhcp):
+                configure_dhcp(
+                    reason="wifi-host-stopped"
+                )
+        except Exception:
+            pass
+
+    def _configure_windows_adapter_policy(
+        self,
+        adapter: dict[str, Any],
+        friendly_name: str,
+    ) -> None:
+        """
+        Apply policy by exact interface index, not wildcard-sensitive alias.
+
+        Remove only stale manually assigned 169.254/16 addresses created by
+        the old LAC auto-configuration. Do not enable ICS and do not force a
+        replacement address.
+        """
+        if os.name != "nt":
+            return
+
+        quoted = friendly_name.replace("'", "''")
+
+        try:
+            interface_index = int(
+                adapter.get("if_index") or 0
+            )
+        except Exception:
+            interface_index = 0
+
+        script = rf"""
+    $ErrorActionPreference = 'Stop'
+    $interfaceAlias = '{quoted}'
+    $interfaceIndex = {interface_index}
+
+    $netAdapter = $null
+
+    if ($interfaceIndex -gt 0) {{
+        $netAdapter = Get-NetAdapter `
+            -InterfaceIndex $interfaceIndex `
+            -ErrorAction SilentlyContinue
+    }}
+
+    if (-not $netAdapter) {{
+        $netAdapter = Get-NetAdapter |
+            Where-Object {{ $_.Name -eq $interfaceAlias }} |
+            Select-Object -First 1
+    }}
+
+    if (-not $netAdapter) {{
+        throw "Wi-Fi Direct adapter was not found by exact alias/index."
+    }}
+
+    $interfaceIndex = [int]$netAdapter.ifIndex
+
+    Get-NetIPAddress `
+        -InterfaceIndex $interfaceIndex `
+        -AddressFamily IPv4 `
+        -ErrorAction SilentlyContinue |
+        Where-Object {{
+            $_.PrefixOrigin -eq 'Manual' -and
+            $_.IPAddress -like '169.254.*'
+        }} |
+        Remove-NetIPAddress `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+
+    $ipv4Interface = Get-NetIPInterface `
+        -InterfaceIndex $interfaceIndex `
+        -AddressFamily IPv4 `
+        -ErrorAction Stop
+
+    $ipv4Interface | Set-NetIPInterface `
+        -Forwarding Enabled `
+        -AutomaticMetric Disabled `
+        -InterfaceMetric 600 `
+        -IgnoreDefaultRoutes Enabled `
+        -ErrorAction Stop
+
+    $ipv6Interface = Get-NetIPInterface `
+        -InterfaceIndex $interfaceIndex `
+        -AddressFamily IPv6 `
+        -ErrorAction SilentlyContinue
+
+    if ($ipv6Interface) {{
+        $ipv6Interface | Set-NetIPInterface `
+            -Forwarding Enabled `
+            -AutomaticMetric Disabled `
+            -InterfaceMetric 610 `
+            -IgnoreDefaultRoutes Enabled `
+            -ErrorAction SilentlyContinue
+    }}
+
+    Get-NetRoute `
+        -InterfaceIndex $interfaceIndex `
+        -DestinationPrefix '0.0.0.0/0' `
+        -ErrorAction SilentlyContinue |
+        Remove-NetRoute `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+
+    Get-NetRoute `
+        -InterfaceIndex $interfaceIndex `
+        -DestinationPrefix '::/0' `
+        -ErrorAction SilentlyContinue |
+        Remove-NetRoute `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+
+    Write-Output (
+        "Configured Wi-Fi Direct interface index {0} alias '{1}'" `
+        -f $interfaceIndex, $interfaceAlias
+    )
+    """
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20.0,
+                creationflags=getattr(
+                    subprocess,
+                    "CREATE_NO_WINDOW",
+                    0,
+                ),
+            )
+
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+
+            if result.returncode == 0:
+                if stdout:
+                    self._log(f"[WiFiManager] {stdout}")
+            else:
+                self._log(
+                    "[WiFiManager] ⚠️ Windows forwarding/address "
+                    f"repair returned code {result.returncode}: "
+                    f"{stderr or stdout or 'no error text'}"
+                )
+        except Exception as exc:
+            self._log(
+                "[WiFiManager] Windows adapter policy failed: "
+                f"{exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _log(self, message: str) -> None:
+        try:
+            logger = self.router_logger
+            if logger is not None and hasattr(
+                logger,
+                "log_message",
+            ):
+                logger.log_message(message)
+            elif callable(logger):
+                logger(message)
+            else:
+                print(message)
+        except Exception:
+            pass

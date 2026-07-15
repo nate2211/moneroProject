@@ -56,7 +56,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
     P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, \
-    HyperVRouterManager, PythonServerManager,ScrapeWebsiteManager
+    HyperVRouterManager, PythonServerManager,ScrapeWebsiteManager, WifiManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -124,6 +124,18 @@ class PythonRouterManager:
         self.interface_lac_friendly_name = None
         self.interface_lac_2_full_name = None
         self.interface_lac_2_friendly_name = None
+        self.interface_wifi_full_name = None
+        self.interface_wifi_friendly_name = None
+        self.wifi_host_managed_ifaces: set[str] = set()
+        self.wifi_host_state: dict = {}
+        self.wifi_manager = WifiManager(
+            router=self,
+            router_logger=self.router_logger,
+        )
+        self.wifi_router_ip: Optional[str] = None
+        self.wifi_router_network: Optional[ipaddress.IPv4Network] = None
+        self._wifi_firewall_networks: set[str] = set()
+
         self.router_ip_in = None
         self.router_ip_out = None
         self.router_ipv6_out = None
@@ -223,6 +235,283 @@ class PythonRouterManager:
 
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
 
+    def _current_lan_transit_ifaces(self) -> set[str]:
+        """
+        Return every interface that may originate downstream client traffic.
+
+        The Wi-Fi Direct adapter is routed, not added to the outbound LAG.
+        """
+        result: set[str] = set()
+
+        def add(value) -> None:
+            value = str(value or "").strip()
+            if value:
+                result.add(value)
+
+        add(getattr(self, "interface_in_full_name", None))
+        add(getattr(self, "interface_ethernet_2_full_name", None))
+        add(getattr(self, "interface_lac_full_name", None))
+        add(getattr(self, "interface_lac_2_full_name", None))
+        add(getattr(self, "interface_wifi_full_name", None))
+
+        try:
+            for iface in getattr(
+                    self,
+                    "wifi_host_managed_ifaces",
+                    set(),
+            ):
+                add(iface)
+        except Exception:
+            pass
+
+        try:
+            members = self.ethernet_manager.get_bridge_members()
+            if isinstance(members, (set, list, tuple)):
+                for iface in members:
+                    add(iface)
+        except Exception:
+            pass
+
+        try:
+            lan_ifaces = getattr(self.lan_manager, "lan_ifaces", None)
+            if isinstance(lan_ifaces, (set, list, tuple)):
+                for iface in lan_ifaces:
+                    add(iface)
+        except Exception:
+            pass
+
+        # WAN must never be classified as downstream LAN.
+        wan_names = {
+            str(value or "").strip().casefold()
+            for value in (
+                getattr(self, "interface_out_full_name", None),
+                getattr(self, "interface_out_friendly_name", None),
+            )
+            if str(value or "").strip()
+        }
+
+        return {
+            iface
+            for iface in result
+            if iface.casefold() not in wan_names
+        }
+
+    def _on_wifi_host_network_ready(
+            self,
+            *,
+            iface_full_name: str,
+            iface_friendly_name: str,
+            router_ip: str,
+            network,
+            adapter: Optional[dict] = None,
+    ) -> None:
+        """
+        Complete the routed LAN path after Windows gives the Wi-Fi Direct
+        adapter its client-facing IPv4 subnet.
+        """
+        iface_full_name = str(iface_full_name or "").strip()
+        iface_friendly_name = str(iface_friendly_name or "").strip()
+        router_ip = str(router_ip or "").strip()
+
+        if not iface_full_name or not router_ip:
+            return
+
+        try:
+            wifi_network = (
+                network
+                if isinstance(network, ipaddress.IPv4Network)
+                else ipaddress.ip_network(str(network), strict=False)
+            )
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[WiFiManager][Route] ❌ Invalid Wi-Fi network '{network}': {exc}"
+            )
+            return
+
+        if not isinstance(wifi_network, ipaddress.IPv4Network):
+            return
+
+        previous_network = getattr(self, "wifi_router_network", None)
+
+        self.interface_wifi_full_name = iface_full_name
+        self.interface_wifi_friendly_name = iface_friendly_name
+        self.wifi_router_ip = router_ip
+        self.wifi_router_network = wifi_network
+
+        config = dict(self._interfaces_config.get(iface_full_name, {}))
+        config.update({
+            "friendly_name": iface_friendly_name,
+            "ip_addr": router_ip,
+            "network": wifi_network,
+            "broadcast": str(wifi_network.broadcast_address),
+            "gateway": None,
+            "is_default_gateway_iface": False,
+            "wireless_host_managed": True,
+            "dhcp_owner": "windows_wifi_direct",
+            "routing_owner": "pythonrouter",
+        })
+        self._interfaces_config[iface_full_name] = config
+
+        # Make the adapter a LAN/transit interface for LanManager.
+        try:
+            if self.lan_manager is not None:
+                lan_ifaces = getattr(self.lan_manager, "lan_ifaces", None)
+                if isinstance(lan_ifaces, set):
+                    lan_ifaces.add(iface_full_name)
+        except Exception:
+            pass
+
+        # Install a direct route so translated return traffic goes back to
+        # the wireless client instead of following the WAN default route.
+        try:
+            if (
+                    previous_network is not None
+                    and previous_network != wifi_network
+                    and self.rip_manager is not None
+            ):
+                self.rip_manager.remove_static_route(str(previous_network))
+        except Exception:
+            pass
+
+        try:
+            if self.rip_manager is not None:
+                self.rip_manager.add_static_route(
+                    network_str=str(wifi_network),
+                    next_hop="0.0.0.0",
+                    interface=iface_full_name,
+                    cost=1,
+                )
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[WiFiManager][Route] ⚠️ Could not install direct Wi-Fi route: {exc}"
+            )
+
+        # Refresh manager copies of _interfaces_config.
+        for manager in (
+                getattr(self, "packet_writer", None),
+                getattr(self, "igmp_manager", None),
+                getattr(self, "netroute_manager", None),
+        ):
+            if manager is None:
+                continue
+
+            for method_name in (
+                    "update_interfaces",
+                    "set_interfaces_config",
+                    "configure_interfaces",
+            ):
+                method = getattr(manager, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    method(self._interfaces_config)
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+
+        # The existing dynamic firewall setup covers only router_network_in.
+        # Add a bounded permit pair for the separate Wi-Fi Direct LAN.
+        network_text = str(wifi_network)
+
+        if network_text not in self._wifi_firewall_networks:
+            try:
+                self.firewall_manager.add_rule(
+                    action="permit",
+                    protocol="any",
+                    src_ip=network_text,
+                    dst_ip="any",
+                    src_port="any",
+                    dst_port="any",
+                    position=0,
+                )
+            except TypeError:
+                self.firewall_manager.add_rule(
+                    action="permit",
+                    protocol="any",
+                    src_ip=network_text,
+                    dst_ip="any",
+                    src_port="any",
+                    dst_port="any",
+                )
+
+            try:
+                self.firewall_manager.add_rule(
+                    action="permit",
+                    protocol="any",
+                    src_ip="any",
+                    dst_ip=network_text,
+                    src_port="any",
+                    dst_port="any",
+                    position=0,
+                )
+            except TypeError:
+                self.firewall_manager.add_rule(
+                    action="permit",
+                    protocol="any",
+                    src_ip="any",
+                    dst_ip=network_text,
+                    src_port="any",
+                    dst_port="any",
+                )
+
+            self._wifi_firewall_networks.add(network_text)
+
+        # Keep NAT's internal self-address useful for replies to services
+        # addressed to the Wi-Fi gateway without changing the WAN identity.
+        try:
+            if self.nat_manager is not None:
+                setter = getattr(
+                    self.nat_manager,
+                    "set_router_internal_ip",
+                    None,
+                )
+                if callable(setter):
+                    setter(router_ip)
+        except Exception:
+            pass
+
+        self.wifi_host_state = {
+            "state": "ready",
+            "mode": "wifi_direct_legacy_ap",
+            "dhcp_owner": "windows_wifi_direct",
+            "routing_owner": "pythonrouter",
+            "router_ip": router_ip,
+            "network": network_text,
+            "interface": iface_full_name,
+            "friendly_name": iface_friendly_name,
+            "adapter": dict(adapter or {}),
+        }
+
+        self.router_logger.log_message(
+            "[WiFiManager][Route] ✅ Wireless internet path ready: "
+            f"network={wifi_network} gateway={router_ip} "
+            f"lan_iface={iface_full_name} wan_iface={self.interface_out_full_name}"
+        )
+
+    def _on_wifi_host_network_stopped(
+            self,
+            iface_full_name: Optional[str] = None,
+    ) -> None:
+        old_network = getattr(self, "wifi_router_network", None)
+
+        try:
+            if old_network is not None and self.rip_manager is not None:
+                self.rip_manager.remove_static_route(str(old_network))
+        except Exception:
+            pass
+
+        try:
+            if self.lan_manager is not None:
+                lan_ifaces = getattr(self.lan_manager, "lan_ifaces", None)
+                if isinstance(lan_ifaces, set) and iface_full_name:
+                    lan_ifaces.discard(iface_full_name)
+        except Exception:
+            pass
+
+        self.wifi_router_ip = None
+        self.wifi_router_network = None
     # --- add this helper inside PythonRouterManager ---
     def _boundary_transit_ifaces(self) -> set[str]:
         out = {SocketInterface.IFACE_NAME}
@@ -233,20 +522,72 @@ class PythonRouterManager:
                 getattr(self, "interface_ethernet_2_full_name", None),
                 getattr(self, "interface_lac_full_name", None),
                 getattr(self, "interface_lac_2_full_name", None),
+                getattr(self, "interface_wifi_full_name", None),
         ):
             if cand:
                 out.add(cand)
 
         try:
+            out.update(
+                str(value).strip()
+                for value in getattr(
+                    self,
+                    "wifi_host_managed_ifaces",
+                    set(),
+                )
+                if str(value).strip()
+            )
+        except Exception:
+            pass
+
+        try:
             members = self.ethernet_manager.get_bridge_members()
             if isinstance(members, (list, tuple, set)):
-                for m in members:
-                    if m:
-                        out.add(str(m))
+                for member in members:
+                    if member:
+                        out.add(str(member))
         except Exception:
             pass
 
         return out
+
+    def _is_wifi_host_interface(
+            self,
+            iface_full_name: str | None,
+            iface_friendly_name: str | None,
+    ) -> bool:
+        manager = getattr(self, "wifi_manager", None)
+
+        if manager is not None:
+            try:
+                if manager.is_managed_interface(
+                        full_name=iface_full_name,
+                        friendly_name=iface_friendly_name,
+                ):
+                    return True
+            except Exception:
+                pass
+
+        candidates = {
+            str(value or "").strip().casefold()
+            for value in (
+                iface_full_name,
+                iface_friendly_name,
+            )
+            if str(value or "").strip()
+        }
+
+        managed = {
+            str(value).strip().casefold()
+            for value in getattr(
+                self,
+                "wifi_host_managed_ifaces",
+                set(),
+            )
+            if str(value).strip()
+        }
+
+        return bool(candidates & managed)
     def _is_public_ipv4_text(self, ip: Optional[str]) -> bool:
         try:
             x = ipaddress.IPv4Address(str(ip or "").strip())
@@ -711,6 +1052,7 @@ class PythonRouterManager:
                 self.interface_ethernet_2_friendly_name,
                 self.interface_lac_friendly_name,
                 self.interface_lac_2_friendly_name,
+                self.interface_wifi_friendly_name,
         ):
             alias = (alias or "").strip()
             if alias and alias.lower() != wan_alias.lower() and alias not in lan_router_aliases:
@@ -830,6 +1172,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         self.router_logger.log_message("[Router] Attempting to auto-configure IN, OUT, and Loopback interfaces...")
 
         for iface in self._discovered_tshark_interfaces:
+            if self._is_wifi_host_interface(
+                    iface.get("full_name"),
+                    iface.get("friendly_name"),
+            ):
+                self.router_logger.log_message(
+                    "[Router][WiFi] Keeping the Wi-Fi Direct host adapter "
+                    f"out of LAC/static-IP auto-configuration: "
+                    f"{iface.get('friendly_name') or iface.get('full_name')}"
+                )
+                continue
             name = iface['friendly_name'].lower()
             match = re.search(r'\*[\s]?(\d+)$', name)
             if match and int(match.group(1)) == 1:
@@ -848,6 +1200,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.router_logger.log_message(
                 f"[Router] Found second-lowest-numbered LAC: {lac_2_info_2['friendly_name']}")
         for iface_info in self._discovered_tshark_interfaces:
+            if self._is_wifi_host_interface(
+                    iface_info.get("full_name"),
+                    iface_info.get("friendly_name"),
+            ):
+                continue
             # Check for IN interface
             if self.DEFAULT_IN_IFACE_FRIENDLY_NAME.lower() == iface_info[
                 'friendly_name'].lower() and in_iface_info is None:
@@ -1318,10 +1675,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         self.create_l2_bridge("MyLANBridge", bridge_members)
         self.add_outbound_load_balancing_interface(self.interface_out_full_name)
         link_group = [self.interface_out_full_name]
-        if self.interface_lac_full_name:
-            link_group.append(self.interface_lac_full_name)
-        if self.interface_lac_2_full_name:
-            link_group.append(self.interface_lac_2_full_name)
+
+        self.create_link_aggregation_group(
+            "MyLANAggregation",
+            link_group,
+        )
 
         self.broadcast_manager.ensure_broadcast_for_pcap(self.interface_out_full_name)
 
@@ -1590,13 +1948,21 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             pass
 
         # Known LAN-facing capture interfaces.
-        for iface in (
-                self.interface_in_full_name,
-                self.interface_ethernet_2_full_name,
-                self.interface_lac_full_name,
-                self.interface_lac_2_full_name,
+        for iface in getattr(
+                self,
+                "wifi_host_managed_ifaces",
+                set(),
         ):
-            add_iface(allowed, iface)
+            add_iface(denied, iface)
+
+        add_iface(
+            denied,
+            getattr(self, "interface_wifi_full_name", None),
+        )
+        add_iface(
+            denied,
+            getattr(self, "interface_wifi_friendly_name", None),
+        )
 
         # Include interfaces currently owned by LanManager.
         try:
@@ -2300,9 +2666,12 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 packet,
                 inbound_iface,
                 router_ips=self._get_all_local_ips(),
-                wan_ifaces=set(self.outbound_load_balancer.get_configured_interfaces()),
-                lan_ifaces=set(self.ethernet_manager.get_bridge_members())  # or your LAN iface set
+                wan_ifaces=set(
+                    self.outbound_load_balancer.get_configured_interfaces()
+                ),
+                lan_ifaces=self._current_lan_transit_ifaces(),
             )
+
             if nat_decision is False:
                 # Dropped (e.g., banned or ICMP sent)
                 return
@@ -3056,13 +3425,47 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                       use_stratum_comm, p2pool_server_ip, ipc_emit_host, use_peer_to_peer, use_blocknet, blocknet_relay,
                       blocknet_token, use_netroute, use_hostbypass, use_gateway, use_lan, use_uplink, nat_os,
                       python_server, promisc, use_socket, use_ollama, use_scrapewebsite=False,
-                      scrapewebsite_endpoint=None):
+                      scrapewebsite_endpoint=None,
+                      use_wifi_host=False,
+                      wifi_ssid="PythonRouter",
+                      wifi_password=None,
+                      wifi_executable_path=None,):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
                 self.router_logger.log_message("[Router] Start requested while already running; ignoring.")
                 return
             self.started = True
+            if use_wifi_host:
+                try:
+                    resolved_wifi_password = (
+                            wifi_password
+                            or os.environ.get(
+                        "PYTHONROUTER_WIFI_PASSWORD",
+                        "",
+                    )
+                    )
+
+                    if not resolved_wifi_password:
+                        raise ValueError(
+                            "No wireless password was provided. Pass "
+                            "wifi_password=... or define "
+                            "PYTHONROUTER_WIFI_PASSWORD."
+                        )
+
+                    self.wifi_manager.configure(
+                        ssid=wifi_ssid,
+                        password=resolved_wifi_password,
+                        executable_path=wifi_executable_path,
+                        start_timeout=35.0,
+                        adapter_timeout=45.0,
+                        enable_windows_forwarding=True,
+                    )
+                    self.wifi_manager.start()
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[WiFiManager] ❌ Wireless host startup failed: {exc}"
+                    )
             try:
                 self._initialize_interface_discovery()
                 if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
@@ -3087,6 +3490,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     transit_ifaces_fn=self._boundary_transit_ifaces,  # <-- add this
                 )
                 self.host_connectivity_boundary.start()
+
             if use_socket:
                 self.socket_interface = SocketInterface(self, self.router_logger)
                 self.socket_interface.start()
@@ -3245,6 +3649,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             )
             self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.outbound_load_balancer, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager, use_hyperv)
             self._inject_dependencies()
+            if use_wifi_host and self.wifi_manager:
+                try:
+                    self.wifi_manager.refresh_router_binding()
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[WiFiManager] ⚠️ Router binding refresh failed: {exc}"
+                    )
 
             self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
 
@@ -3482,6 +3893,16 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     self.ollama_assistant = None
             except Exception as e:
                 self.router_logger.log_message(f"[Ollama] ⚠️ Unbind failed: {e}")
+            try:
+                if self.wifi_manager:
+                    self.wifi_manager.stop(
+                        force=False,
+                        detach_router=True,
+                    )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[WiFiManager] ⚠️ Wireless host stop failed: {exc}"
+                )
             if use_static:
                 self._deconfigure_interface_settings()
             self._stop_sniffing_event.set()
