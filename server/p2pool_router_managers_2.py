@@ -34300,20 +34300,31 @@ class ScrapeWebsiteManager:
             
 class WifiManager:
     """
-    Lifecycle/control-plane wrapper for PythonRouterWirelessHost.exe.
+    Startup-only fixed-address control plane for PythonRouterWirelessHost.exe.
 
     Ownership model:
       * PythonRouterWirelessHost.exe creates and maintains the Wi-Fi Direct
-        legacy access point.
-      * Windows Wi-Fi Direct owns association security and DHCP on that link.
-      * PythonRouter owns packet capture, DNS policy, routing, NAT and firewall
-        processing for traffic arriving on the Wi-Fi Direct adapter.
+        legacy access point and association security.
+      * WifiManager installs one RFC1918 router address, disables DHCP client
+        addressing on that adapter, removes every competing IPv4 address and
+        locks the original adapter identity for the running session.
+      * PythonRouter owns DHCP, DNS policy, routing, NAT and firewall handling
+        for clients arriving on the Wi-Fi Direct adapter.
+      * Internet Connection Sharing is never enabled by this class.
 
-    The manager never enables Internet Connection Sharing and never assigns a
-    replacement static IPv4 address to the Wi-Fi Direct adapter.
+    Adapter discovery runs only until 192.168.190.1/24 (or the configured
+    private address) is verified. The steady-state manager sends no recurring
+    `adapters` or `status` commands and performs no recurring PowerShell
+    address checks. Public or malformed values such as 190.168.190.0 and
+    160.168.190.0 are never published to routing, NAT or DHCP.
+
+    Run the process elevated on Windows. Static NetTCPIP configuration requires
+    administrator privileges.
     """
 
     EXECUTABLE_NAME = "PythonRouterWirelessHost.exe"
+    DEFAULT_HOTSPOT_ROUTER_IP = "192.168.190.1"
+    DEFAULT_HOTSPOT_PREFIX_LENGTH = 24
 
     def __init__(
         self,
@@ -34336,6 +34347,28 @@ class WifiManager:
         self.adapter_timeout = 45.0
         self.adapter_poll_interval = 1.0
         self.enable_windows_forwarding = True
+        self.auto_restart = True
+        self.restart_backoff = 2.0
+        self.max_restart_backoff = 30.0
+
+        # Retained as compatibility attributes for callers that configured
+        # older versions. They no longer drive a periodic probe loop.
+        self.status_poll_interval = 5.0
+        self.address_verify_interval = 5.0
+
+        self.hotspot_router_ip = ipaddress.IPv4Address(
+            self.DEFAULT_HOTSPOT_ROUTER_IP
+        )
+        self.hotspot_prefix_length = self.DEFAULT_HOTSPOT_PREFIX_LENGTH
+        self.hotspot_network = ipaddress.IPv4Network(
+            f"{self.hotspot_router_ip}/{self.hotspot_prefix_length}",
+            strict=False,
+        )
+        self.enforce_fixed_hotspot_address = True
+        self.require_address_before_ready = True
+        self.address_policy_timeout = 25.0
+        self.restore_dynamic_address_on_stop = False
+        self.dhcp_owner = "pythonrouter"
 
         self.process: Optional[subprocess.Popen[str]] = None
         self.latest_state: dict[str, Any] = {}
@@ -34346,16 +34379,37 @@ class WifiManager:
         self._baseline_adapters: list[dict[str, Any]] = []
         self._ready_event = threading.Event()
         self._adapter_event = threading.Event()
+        self._address_ready_event = threading.Event()
+        self._binding_locked_event = threading.Event()
         self._stop_event = threading.Event()
+        self._intentional_stop_event = threading.Event()
         self._process_exited_event = threading.Event()
+
         self._lock = threading.RLock()
+        self._recovery_lock = threading.Lock()
+        self._binding_lock = threading.RLock()
+        self._address_policy_lock = threading.Lock()
 
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._adapter_thread: Optional[threading.Thread] = None
         self._monitor_thread: Optional[threading.Thread] = None
+
         self._fatal_error: Optional[str] = None
         self._last_adapter_identity: Optional[tuple[Any, ...]] = None
+        self._locked_adapter_hardware_key: Optional[tuple[Any, ...]] = None
+        self._locked_adapter_instance_key: Optional[tuple[Any, ...]] = None
+
+        self._bound_wifi_iface: Optional[str] = None
+        self._bound_wifi_router_ip: Optional[str] = None
+        self._bound_wifi_network: Optional[ipaddress.IPv4Network] = None
+
+        self._last_address_policy_check = 0.0
+        self._last_successful_address_verification = 0.0
+        self._last_address_policy_error: Optional[str] = None
+        self._last_address_wait_log = 0.0
+        self._last_binding_log_identity: Optional[tuple[Any, ...]] = None
+        self._rejected_adapter_switches: set[tuple[Any, ...]] = set()
 
     # ------------------------------------------------------------------
     # Configuration and discovery
@@ -34372,7 +34426,24 @@ class WifiManager:
         adapter_timeout: float = 45.0,
         adapter_poll_interval: float = 1.0,
         enable_windows_forwarding: bool = True,
+        auto_restart: bool = True,
+        restart_backoff: float = 2.0,
+        max_restart_backoff: float = 30.0,
+        status_poll_interval: float = 5.0,
+        hotspot_router_ip: str = DEFAULT_HOTSPOT_ROUTER_IP,
+        hotspot_prefix_length: int = DEFAULT_HOTSPOT_PREFIX_LENGTH,
+        enforce_fixed_hotspot_address: bool = True,
+        require_address_before_ready: bool = True,
+        address_verify_interval: float = 5.0,
+        address_policy_timeout: float = 25.0,
+        restore_dynamic_address_on_stop: bool = False,
     ) -> None:
+        if self.is_running():
+            raise RuntimeError(
+                "WifiManager cannot be reconfigured while the hotspot is "
+                "running. Stop it first so the session address cannot change."
+            )
+
         ssid = str(ssid or "").strip()
         password = str(password or "")
 
@@ -34382,12 +34453,96 @@ class WifiManager:
         if not 8 <= len(password) <= 63:
             raise ValueError("Wi-Fi password must contain 8-63 characters.")
 
+        if not enforce_fixed_hotspot_address:
+            raise ValueError(
+                "This WifiManager requires fixed hotspot addressing. "
+                "enforce_fixed_hotspot_address must remain True."
+            )
+
         self.ssid = ssid
         self.password = password
         self.start_timeout = max(5.0, float(start_timeout))
         self.adapter_timeout = max(5.0, float(adapter_timeout))
-        self.adapter_poll_interval = max(0.5, float(adapter_poll_interval))
+        self.adapter_poll_interval = max(0.25, float(adapter_poll_interval))
         self.enable_windows_forwarding = bool(enable_windows_forwarding)
+        self.auto_restart = bool(auto_restart)
+        self.restart_backoff = max(0.5, float(restart_backoff))
+        self.max_restart_backoff = max(
+            self.restart_backoff,
+            float(max_restart_backoff),
+        )
+
+        # Accepted only for backward compatibility. This version performs no
+        # recurring address or status probes after the first verified bind.
+        self.status_poll_interval = max(
+            self.adapter_poll_interval,
+            float(status_poll_interval),
+        )
+        self.address_verify_interval = max(
+            1.0,
+            float(address_verify_interval),
+        )
+
+        try:
+            preferred_ip = ipaddress.IPv4Address(
+                str(hotspot_router_ip).strip()
+            )
+            prefix_length = int(hotspot_prefix_length)
+            preferred_network = ipaddress.IPv4Network(
+                f"{preferred_ip}/{prefix_length}",
+                strict=False,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Invalid hotspot_router_ip or hotspot_prefix_length."
+            ) from exc
+
+        if not 1 <= prefix_length <= 30:
+            raise ValueError(
+                "Hotspot prefix length must be between 1 and 30."
+            )
+
+        rfc1918_networks = (
+            ipaddress.IPv4Network("10.0.0.0/8"),
+            ipaddress.IPv4Network("172.16.0.0/12"),
+            ipaddress.IPv4Network("192.168.0.0/16"),
+        )
+        if not any(preferred_ip in block for block in rfc1918_networks):
+            raise ValueError(
+                "The hotspot router address must be an RFC1918 private IPv4 "
+                "address such as 192.168.190.1."
+            )
+        if (
+            preferred_ip.is_loopback
+            or preferred_ip.is_link_local
+            or preferred_ip.is_multicast
+            or preferred_ip.is_unspecified
+            or preferred_ip in {
+                preferred_network.network_address,
+                preferred_network.broadcast_address,
+            }
+        ):
+            raise ValueError(
+                "The hotspot router address must be a usable unicast host "
+                "address, not a network, broadcast, loopback or link-local "
+                "address."
+            )
+
+        self.hotspot_router_ip = preferred_ip
+        self.hotspot_prefix_length = prefix_length
+        self.hotspot_network = preferred_network
+        self.enforce_fixed_hotspot_address = True
+        self.require_address_before_ready = bool(
+            require_address_before_ready
+        )
+        self.address_policy_timeout = max(
+            12.0,
+            float(address_policy_timeout),
+        )
+        self.restore_dynamic_address_on_stop = bool(
+            restore_dynamic_address_on_stop
+        )
+        self.dhcp_owner = "pythonrouter"
 
         if executable_path:
             self._configured_executable = Path(executable_path).expanduser()
@@ -34482,13 +34637,34 @@ class WifiManager:
 
             self._ready_event.clear()
             self._adapter_event.clear()
+            self._address_ready_event.clear()
+            self._binding_locked_event.clear()
             self._stop_event.clear()
+            self._intentional_stop_event.clear()
             self._process_exited_event.clear()
+
             self._fatal_error = None
-            self.latest_state = {}
+            self.latest_state = {
+                "address_state": "starting",
+                "expected_router_ip": str(self.hotspot_router_ip),
+                "expected_network": str(self.hotspot_network),
+                "periodic_probing": False,
+            }
             self.latest_adapter = {}
             self.latest_clients = []
             self._last_adapter_identity = None
+            self._locked_adapter_hardware_key = None
+            self._locked_adapter_instance_key = None
+            self._last_address_policy_check = 0.0
+            self._last_successful_address_verification = 0.0
+            self._last_address_policy_error = None
+            self._last_binding_log_identity = None
+            self._rejected_adapter_switches.clear()
+
+            with self._binding_lock:
+                self._bound_wifi_iface = None
+                self._bound_wifi_router_ip = None
+                self._bound_wifi_network = None
 
             command = [
                 str(executable),
@@ -34504,9 +34680,7 @@ class WifiManager:
             ]
 
             if self.state_file is not None:
-                command.extend(
-                    ["--state-file", str(self.state_file)]
-                )
+                command.extend(["--state-file", str(self.state_file)])
 
             creationflags = 0
             if os.name == "nt":
@@ -34540,7 +34714,7 @@ class WifiManager:
             )
             self._adapter_thread = threading.Thread(
                 target=self._adapter_discovery_loop,
-                name="WifiManager-adapter-discovery",
+                name="WifiManager-startup-adapter-discovery",
                 daemon=True,
             )
             self._monitor_thread = threading.Thread(
@@ -34556,7 +34730,7 @@ class WifiManager:
 
         if not self._ready_event.wait(self.start_timeout + 8.0):
             exit_code = self.process.poll() if self.process else None
-            self.stop(force=True)
+            self.stop(force=True, intentional=False)
             raise RuntimeError(
                 "Wireless host did not report ready before the timeout "
                 f"(exit_code={exit_code})."
@@ -34564,13 +34738,37 @@ class WifiManager:
 
         if self._fatal_error:
             message = self._fatal_error
-            self.stop(force=True)
+            self.stop(force=True, intentional=False)
             raise RuntimeError(
                 f"Wireless host failed to start: {message}"
             )
 
+        if self.require_address_before_ready:
+            address_wait = self.adapter_timeout + self.address_policy_timeout
+            if not self._address_ready_event.wait(address_wait):
+                error = (
+                    self._last_address_policy_error
+                    or "the fixed hotspot address was not established"
+                )
+                self.stop(force=True, intentional=False)
+                raise RuntimeError(
+                    "Wireless host started, but its LAN address was not "
+                    f"made ready: {error}. Expected "
+                    f"{self.hotspot_router_ip}/"
+                    f"{self.hotspot_prefix_length}."
+                )
+
+        if not self._binding_locked_event.is_set():
+            self.stop(force=True, intentional=False)
+            raise RuntimeError(
+                "The hotspot address was prepared but the adapter binding "
+                "was not locked."
+            )
+
         self._log(
-            f"[WiFiManager] ✅ Wireless network '{self.ssid}' started."
+            f"[WiFiManager] ✅ Wireless network '{self.ssid}' started on "
+            f"{self.hotspot_router_ip}/{self.hotspot_prefix_length}. "
+            "Startup discovery is complete; periodic adapter probing is off."
         )
 
         return self.status()
@@ -34581,7 +34779,10 @@ class WifiManager:
         force: bool = False,
         timeout: float = 12.0,
         detach_router: bool = True,
+        intentional: bool = True,
     ) -> None:
+        if intentional:
+            self._intentional_stop_event.set()
         self._stop_event.set()
 
         with self._lock:
@@ -34610,6 +34811,24 @@ class WifiManager:
                     process.wait(timeout=4.0)
                 except Exception:
                     pass
+
+        adapter_before_detach = dict(self.latest_adapter)
+
+        if (
+            intentional
+            and self.restore_dynamic_address_on_stop
+            and adapter_before_detach
+        ):
+            try:
+                self._restore_windows_dynamic_address(
+                    adapter_before_detach,
+                    str(adapter_before_detach.get("friendly_name") or ""),
+                )
+            except Exception as exc:
+                self._log(
+                    "[WiFiManager] Dynamic-address restore failed: "
+                    f"{exc}"
+                )
 
         if detach_router:
             self._detach_adapter_from_router()
@@ -34667,6 +34886,32 @@ class WifiManager:
             "clients": list(self.latest_clients),
             "managed_ifaces": sorted(self.managed_ifaces),
             "fatal_error": self._fatal_error,
+            "auto_restart": self.auto_restart,
+            "address_ready": self._address_ready_event.is_set(),
+            "binding_locked": self._binding_locked_event.is_set(),
+            "periodic_probing": False,
+            "expected_hotspot_router_ip": str(self.hotspot_router_ip),
+            "expected_hotspot_network": str(self.hotspot_network),
+            "enforce_fixed_hotspot_address": True,
+            "dhcp_owner": self.dhcp_owner,
+            "last_address_policy_error": self._last_address_policy_error,
+            "bound_wifi_iface": self._bound_wifi_iface,
+            "bound_wifi_router_ip": self._bound_wifi_router_ip,
+            "bound_wifi_network": (
+                str(self._bound_wifi_network)
+                if self._bound_wifi_network is not None
+                else None
+            ),
+            "locked_adapter_hardware_key": (
+                list(self._locked_adapter_hardware_key)
+                if self._locked_adapter_hardware_key is not None
+                else None
+            ),
+            "locked_adapter_instance_key": (
+                list(self._locked_adapter_instance_key)
+                if self._locked_adapter_instance_key is not None
+                else None
+            ),
         }
 
     def wait_for_adapter(
@@ -34715,8 +34960,50 @@ class WifiManager:
         return bool(candidates & managed)
 
     def refresh_router_binding(self) -> None:
-        if self.latest_adapter:
-            self._apply_adapter_to_router(self.latest_adapter)
+        """
+        Refresh only PythonRouter consumers from the already locked binding.
+
+        This method deliberately does not ask the wireless host for adapters
+        and does not run the Windows address policy again.
+        """
+        if not self._binding_locked_event.is_set():
+            return
+        self._update_router_consumers()
+
+    def repair_address_now(self) -> bool:
+        """
+        Explicitly reassert the locked address once.
+
+        This is a manual recovery operation. It does not enable any periodic
+        probe or background address verification.
+        """
+        adapter = dict(self.latest_adapter)
+        if not adapter:
+            return False
+
+        with self._binding_lock:
+            hardware_key = self._locked_adapter_hardware_key
+
+        self._address_ready_event.clear()
+        self._binding_locked_event.clear()
+        self._last_address_policy_error = None
+        self._last_address_policy_check = 0.0
+
+        self._apply_adapter_to_router(adapter)
+
+        if self._address_ready_event.is_set():
+            self._binding_locked_event.set()
+            with self._binding_lock:
+                self._locked_adapter_hardware_key = (
+                    hardware_key
+                    or self._adapter_hardware_key(adapter)
+                )
+                self._locked_adapter_instance_key = (
+                    self._adapter_instance_key(adapter)
+                )
+            return True
+        return False
+
 
     # ------------------------------------------------------------------
     # Child process readers
@@ -34781,9 +35068,7 @@ class WifiManager:
             )
             self.latest_state.update(payload)
             self._ready_event.set()
-            self._log(
-                f"[WiFiManager] ❌ {self._fatal_error}"
-            )
+            self._log(f"[WiFiManager] ❌ {self._fatal_error}")
             return
 
         if event_type == "ready":
@@ -34826,18 +35111,10 @@ class WifiManager:
                 self.latest_clients = list(existing.values())
                 self._log(
                     "[WiFiManager] 📶 Client connected: "
-                    f"{client.get('name') or client.get('remote_address') or device_id}"
+                    f"{client.get('name') or client.get('remote_address') or device_id}. "
+                    f"Locked LAN remains {self.hotspot_router_ip}/"
+                    f"{self.hotspot_prefix_length}; no adapter probe started."
                 )
-
-                # Windows commonly assigns the Wi-Fi Direct interface's
-                # client-facing IPv4 address only after the first peer joins.
-                # Refresh repeatedly so PythonRouter receives the subnet,
-                # installs a direct return route and permits it through NAT.
-                threading.Thread(
-                    target=self._refresh_after_client_connect,
-                    name="WifiManager-client-route-refresh",
-                    daemon=True,
-                ).start()
             return
 
         if event_type == "client_disconnected":
@@ -34861,7 +35138,9 @@ class WifiManager:
                 ]
             return
 
-        # A "status" command returns a state object without an event name.
+        # Manual status responses or unsolicited host events may include an
+        # adapter. Once locked, _accept_adapter keeps the canonical address
+        # and rejects a different virtual adapter.
         if "state" in payload or "adapter" in payload:
             self.latest_state.update(payload)
             adapter = payload.get("adapter")
@@ -34870,18 +35149,13 @@ class WifiManager:
 
     def _refresh_after_client_connect(self) -> None:
         """
-        Refresh adapter addressing after a peer joins.
+        Compatibility no-op.
 
-        Wi-Fi Direct legacy AP adapters often transition through:
-            adapter exists -> peer connects -> IPv4 subnet appears.
+        Older versions repeatedly requested adapter snapshots after each peer
+        joined. The address is now installed statically before the hotspot is
+        declared ready, so client association does not start a probe sequence.
         """
-        for delay in (0.35, 0.75, 1.5, 2.5, 4.0, 6.0):
-            if self._stop_event.wait(delay):
-                return
-            try:
-                self.command("adapters")
-            except Exception:
-                return
+        return
 
     def _monitor_process(self) -> None:
         process = self.process
@@ -34892,48 +35166,141 @@ class WifiManager:
         self._process_exited_event.set()
         self._ready_event.set()
 
-        if not self._stop_event.is_set() and exit_code != 0:
-            self._fatal_error = (
-                self._fatal_error
-                or f"Wireless host exited unexpectedly with code {exit_code}."
-            )
-            self._log(
-                f"[WiFiManager] ❌ {self._fatal_error}"
-            )
+        unexpected = not self._intentional_stop_event.is_set()
+        if not unexpected:
+            return
+
+        self._fatal_error = (
+            self._fatal_error
+            or f"Wireless host exited unexpectedly with code {exit_code}."
+        )
+        self._log(f"[WiFiManager] ❌ {self._fatal_error}")
+
+        if self.auto_restart:
+            threading.Thread(
+                target=self._recover_wireless_host,
+                name="WifiManager-auto-recovery",
+                daemon=True,
+            ).start()
+
+    def _recover_wireless_host(self) -> None:
+        if not self._recovery_lock.acquire(blocking=False):
+            return
+
+        try:
+            attempt = 0
+
+            while (
+                self.auto_restart
+                and not self._intentional_stop_event.is_set()
+            ):
+                delay = min(
+                    self.max_restart_backoff,
+                    self.restart_backoff * (2 ** attempt),
+                )
+                self._log(
+                    "[WiFiManager] ♻️ Restarting wireless host in "
+                    f"{delay:.1f}s (attempt {attempt + 1})."
+                )
+
+                if self._intentional_stop_event.wait(delay):
+                    return
+
+                with self._lock:
+                    running_process = self.process
+                    if (
+                        running_process is not None
+                        and running_process.poll() is None
+                    ):
+                        return
+                    self.process = None
+
+                try:
+                    self._detach_adapter_from_router()
+                except Exception as exc:
+                    self._log(
+                        "[WiFiManager] Recovery detach failed: "
+                        f"{exc}"
+                    )
+
+                try:
+                    self.start()
+                    self._fatal_error = None
+                    self._log(
+                        "[WiFiManager] ✅ Wireless host recovered."
+                    )
+                    return
+                except Exception as exc:
+                    attempt += 1
+                    self._log(
+                        "[WiFiManager] Recovery attempt failed: "
+                        f"{exc}"
+                    )
+
+                    # start() performs an internal cleanup stop on failure.
+                    # Clear only the transient stop flag; preserve an actual
+                    # user-requested stop through _intentional_stop_event.
+                    if not self._intentional_stop_event.is_set():
+                        self._stop_event.clear()
+        finally:
+            self._recovery_lock.release()
 
     def _adapter_discovery_loop(self) -> None:
         """
-        Keep refreshing adapter state for the life of the AP.
+        Discover and bind the Wi-Fi Direct adapter only during startup.
 
-        The Wi-Fi Direct adapter may exist before it owns an IPv4 address.
-        Once a client joins, Windows can add or change the adapter address.
-        Continuing to poll lets PythonRouter receive that updated state.
+        The loop exits permanently as soon as the configured address is
+        verified and the adapter identity is locked. There is no steady-state
+        `adapters` or `status` polling.
         """
-        warning_deadline = time.monotonic() + self.adapter_timeout
+        deadline = (
+            time.monotonic()
+            + self.adapter_timeout
+            + self.address_policy_timeout
+        )
+        next_warning = time.monotonic() + self.adapter_timeout
 
         while (
             not self._stop_event.is_set()
             and self.is_running()
+            and not self._binding_locked_event.is_set()
         ):
             try:
                 self.command("adapters")
-            except Exception:
-                pass
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    self._last_address_policy_error = str(exc)
+
+            if time.monotonic() >= deadline:
+                self._last_address_policy_error = (
+                    self._last_address_policy_error
+                    or "Startup adapter discovery timed out."
+                )
+                self._log(
+                    "[WiFiManager] ❌ Startup adapter discovery ended "
+                    "without a locked hotspot binding."
+                )
+                return
 
             if (
                 not self._adapter_event.is_set()
-                and time.monotonic() >= warning_deadline
+                and time.monotonic() >= next_warning
             ):
                 self._log(
-                    "[WiFiManager] ⚠️ Access point is running, but its "
-                    "virtual adapter has not been identified yet. It may "
-                    "appear when the first client connects."
+                    "[WiFiManager] ⚠️ Waiting for the Wi-Fi Direct "
+                    "adapter so the initial fixed address can be installed."
                 )
-                warning_deadline = (
-                    time.monotonic() + self.adapter_timeout
-                )
+                next_warning = time.monotonic() + self.adapter_timeout
 
             self._stop_event.wait(self.adapter_poll_interval)
+
+        if self._binding_locked_event.is_set():
+            self.latest_state["startup_discovery_complete"] = True
+            self.latest_state["periodic_probing"] = False
+            self._log(
+                "[WiFiManager] 🔒 Initial hotspot binding locked; "
+                "startup adapter probing stopped."
+            )
 
     # ------------------------------------------------------------------
     # Adapter selection and router binding
@@ -35134,11 +35501,16 @@ class WifiManager:
                 value = str(
                     address.get("address") or ""
                 ).split("%", 1)[0]
-                if (
-                    value.startswith("192.168.137.")
-                    or value.startswith("192.168.49.")
-                ):
-                    score += 40
+                try:
+                    candidate_ip = ipaddress.IPv4Address(value)
+                except Exception:
+                    continue
+                if candidate_ip == self.hotspot_router_ip:
+                    score += 80
+                elif candidate_ip.is_private:
+                    score += 20
+                elif not candidate_ip.is_loopback:
+                    score -= 60
 
             if "bluetooth" in searchable:
                 score -= 150
@@ -35166,38 +35538,322 @@ class WifiManager:
 
         return best_adapter
 
+    def _adapter_hardware_key(
+        self,
+        adapter: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """
+        Stable adapter identity used to reject a different virtual adapter.
+
+        Prefer the interface GUID. Fall back to LUID, adapter name and friendly
+        name only when the executable did not provide a GUID.
+        """
+        guid = self._extract_adapter_guid(
+            adapter.get("adapter_name")
+            or adapter.get("npcap_name")
+        )
+        if guid:
+            return ("guid", guid)
+
+        luid = str(adapter.get("luid") or "").strip()
+        if luid:
+            return ("luid", luid)
+
+        return (
+            "names",
+            str(adapter.get("adapter_name") or "").strip().casefold(),
+            str(adapter.get("friendly_name") or "").strip().casefold(),
+        )
+
+    def _adapter_instance_key(
+        self,
+        adapter: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        return (
+            self._adapter_hardware_key(adapter),
+            int(adapter.get("if_index") or 0),
+            str(adapter.get("luid") or "").strip(),
+        )
+
     def _accept_adapter(
         self,
         adapter: dict[str, Any],
     ) -> None:
-        address_identity = []
+        raw_adapter = dict(adapter)
+        hardware_key = self._adapter_hardware_key(raw_adapter)
+        instance_key = self._adapter_instance_key(raw_adapter)
+
+        if self._binding_locked_event.is_set():
+            with self._binding_lock:
+                locked_hardware = self._locked_adapter_hardware_key
+                locked_instance = self._locked_adapter_instance_key
+
+            if locked_hardware is not None and hardware_key != locked_hardware:
+                if hardware_key not in self._rejected_adapter_switches:
+                    self._rejected_adapter_switches.add(hardware_key)
+                    self._log(
+                        "[WiFiManager] ⛔ Ignored a different Wi-Fi Direct "
+                        "adapter after startup. The original adapter and "
+                        "address remain locked."
+                    )
+                return
+
+            if locked_instance is not None and instance_key != locked_instance:
+                # A driver can recreate the same GUID with a new ifIndex. This
+                # is an event-driven rebind to the same address, not a probe.
+                self._log(
+                    "[WiFiManager] ♻️ The locked Wi-Fi Direct adapter "
+                    "instance changed. Reapplying the same fixed address once."
+                )
+                self._address_ready_event.clear()
+                self._binding_locked_event.clear()
+                self._last_address_policy_error = None
+                self._apply_adapter_to_router(raw_adapter)
+                if self._address_ready_event.is_set():
+                    with self._binding_lock:
+                        self._locked_adapter_hardware_key = hardware_key
+                        self._locked_adapter_instance_key = instance_key
+                    self._binding_locked_event.set()
+                return
+
+            # Do not replace the canonical expected address with an executable
+            # snapshot that may be stale or malformed. Merge metadata only.
+            canonical = self._replace_adapter_ipv4_binding(raw_adapter)
+            canonical["npcap_name"] = (
+                self.latest_adapter.get("npcap_name")
+                or self._resolve_capture_name(raw_adapter)
+            )
+            self.latest_adapter.update(canonical)
+            self.latest_state["adapter"] = dict(self.latest_adapter)
+            self._adapter_event.set()
+            return
+
+        self.latest_adapter = dict(raw_adapter)
+        self.latest_state["adapter"] = dict(raw_adapter)
+        self._adapter_event.set()
+        self._last_adapter_identity = instance_key
+
+        self._apply_adapter_to_router(raw_adapter)
+
+        if self._address_ready_event.is_set():
+            with self._binding_lock:
+                self._locked_adapter_hardware_key = hardware_key
+                self._locked_adapter_instance_key = instance_key
+            self._binding_locked_event.set()
+
+    def _reported_ipv4_bindings(
+        self,
+        adapter: dict[str, Any],
+    ) -> list[tuple[ipaddress.IPv4Address, int, ipaddress.IPv4Network]]:
+        bindings: list[
+            tuple[ipaddress.IPv4Address, int, ipaddress.IPv4Network]
+        ] = []
 
         for address in adapter.get("addresses") or []:
             if not isinstance(address, dict):
                 continue
-            address_identity.append(
-                (
-                    address.get("family"),
-                    address.get("address"),
-                    address.get("prefix_length"),
+            try:
+                if int(address.get("family") or 0) != 2:
+                    continue
+                raw = str(address.get("address") or "").split("%", 1)[0]
+                ip_value = ipaddress.IPv4Address(raw.strip())
+                prefix = int(address.get("prefix_length") or 24)
+                network = ipaddress.IPv4Network(
+                    f"{ip_value}/{prefix}",
+                    strict=False,
                 )
-            )
+                bindings.append((ip_value, prefix, network))
+            except Exception:
+                continue
 
-        identity = (
-            adapter.get("adapter_name"),
-            adapter.get("npcap_name"),
-            adapter.get("if_index"),
-            adapter.get("luid"),
-            tuple(sorted(address_identity, key=str)),
+        return bindings
+
+    def _binding_is_expected(
+        self,
+        ip_value: ipaddress.IPv4Address,
+        prefix: int,
+        network: ipaddress.IPv4Network,
+    ) -> bool:
+        return (
+            ip_value == self.hotspot_router_ip
+            and prefix == self.hotspot_prefix_length
+            and network == self.hotspot_network
         )
 
-        self.latest_adapter = dict(adapter)
-        self.latest_state["adapter"] = dict(adapter)
-        self._adapter_event.set()
+    def _reported_expected_binding(
+        self,
+        adapter: dict[str, Any],
+    ) -> bool:
+        return any(
+            self._binding_is_expected(ip_value, prefix, network)
+            for ip_value, prefix, network
+            in self._reported_ipv4_bindings(adapter)
+        )
 
-        if identity != self._last_adapter_identity:
-            self._last_adapter_identity = identity
-            self._apply_adapter_to_router(adapter)
+    def _replace_adapter_ipv4_binding(
+        self,
+        adapter: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(adapter)
+        addresses = [
+            dict(item)
+            for item in normalized.get("addresses") or []
+            if isinstance(item, dict)
+            and int(item.get("family") or 0) != 2
+        ]
+        addresses.append(
+            {
+                "family": 2,
+                "address": str(self.hotspot_router_ip),
+                "prefix_length": self.hotspot_prefix_length,
+                "source": "wifimanager-fixed-policy",
+            }
+        )
+        normalized["addresses"] = addresses
+        return normalized
+
+    def _select_valid_dynamic_binding(
+        self,
+        adapter: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[ipaddress.IPv4Network]]:
+        """
+        Conservative fallback used only when fixed-address enforcement is off.
+
+        Public, link-local, loopback, multicast, unspecified, network and
+        broadcast addresses are never accepted as hotspot router addresses.
+        """
+        for ip_value, _prefix, network in self._reported_ipv4_bindings(adapter):
+            if (
+                not ip_value.is_private
+                or ip_value.is_loopback
+                or ip_value.is_link_local
+                or ip_value.is_multicast
+                or ip_value.is_unspecified
+                or ip_value in {
+                    network.network_address,
+                    network.broadcast_address,
+                }
+            ):
+                continue
+            return str(ip_value), network
+        return None, None
+
+    def _ensure_hotspot_binding(
+        self,
+        adapter: dict[str, Any],
+        friendly_name: str,
+    ) -> tuple[
+        Optional[str],
+        Optional[ipaddress.IPv4Network],
+        bool,
+    ]:
+        """
+        Establish the configured address once and then trust the locked state.
+
+        Windows is configured with DHCP disabled on the hotspot interface and
+        every competing IPv4 address is removed. After OS verification
+        succeeds, no periodic address policy checks are scheduled.
+        """
+        if self._binding_locked_event.is_set():
+            return (
+                str(self.hotspot_router_ip),
+                self.hotspot_network,
+                False,
+            )
+
+        if os.name != "nt":
+            if self._reported_expected_binding(adapter):
+                self._last_address_policy_error = None
+                self._last_successful_address_verification = time.monotonic()
+                self._address_ready_event.set()
+                return (
+                    str(self.hotspot_router_ip),
+                    self.hotspot_network,
+                    False,
+                )
+            self._last_address_policy_error = (
+                "Fixed hotspot addressing can only be installed "
+                "automatically on Windows."
+            )
+            self._address_ready_event.clear()
+            return None, None, False
+
+        if not self._address_policy_lock.acquire(blocking=False):
+            return None, None, False
+
+        try:
+            self._last_address_policy_check = time.monotonic()
+            binding = self._configure_windows_adapter_policy(
+                adapter,
+                friendly_name,
+            )
+            if binding is None:
+                self._address_ready_event.clear()
+                return None, None, False
+
+            actual_ip, actual_network, policy_changed = binding
+            if (
+                actual_ip != str(self.hotspot_router_ip)
+                or actual_network != self.hotspot_network
+            ):
+                self._last_address_policy_error = (
+                    "Windows returned an unexpected hotspot binding: "
+                    f"{actual_ip} on {actual_network}."
+                )
+                self._address_ready_event.clear()
+                return None, None, False
+
+            self._last_address_policy_error = None
+            self._last_successful_address_verification = time.monotonic()
+            self._address_ready_event.set()
+            return actual_ip, actual_network, policy_changed
+        finally:
+            self._address_policy_lock.release()
+
+    def _notify_network_change(
+        self,
+        *,
+        old_iface: Optional[str],
+        old_router_ip: Optional[str],
+        old_network: Optional[ipaddress.IPv4Network],
+        new_iface: str,
+        new_router_ip: str,
+        new_network: ipaddress.IPv4Network,
+        adapter: dict[str, Any],
+    ) -> None:
+        if (
+            old_network is None
+            or (
+                old_iface == new_iface
+                and old_router_ip == new_router_ip
+                and old_network == new_network
+            )
+        ):
+            return
+
+        handler = getattr(
+            self.router,
+            "_on_wifi_host_network_changed",
+            None,
+        )
+        if not callable(handler):
+            self._log(
+                "[WiFiManager] ⚠️ Wi-Fi subnet changed from "
+                f"{old_network} to {new_network}, but the router has no "
+                "_on_wifi_host_network_changed callback. Old NAT/routes "
+                "may remain installed."
+            )
+            return
+
+        handler(
+            old_iface_full_name=old_iface,
+            old_router_ip=old_router_ip,
+            old_network=old_network,
+            new_iface_full_name=new_iface,
+            new_router_ip=new_router_ip,
+            new_network=new_network,
+            adapter=dict(adapter),
+        )
 
     def _apply_adapter_to_router(
         self,
@@ -35209,9 +35865,7 @@ class WifiManager:
         adapter_name = str(
             normalized_adapter.get("adapter_name") or ""
         ).strip()
-        full_name = self._resolve_capture_name(
-            normalized_adapter
-        )
+        full_name = self._resolve_capture_name(normalized_adapter)
         friendly_name = str(
             normalized_adapter.get("friendly_name") or ""
         ).strip()
@@ -35220,98 +35874,155 @@ class WifiManager:
         ).strip()
 
         if not full_name:
+            self._last_address_policy_error = (
+                "The Wi-Fi Direct adapter has no usable Npcap name."
+            )
+            self._address_ready_event.clear()
             self._log(
                 "[WiFiManager] ⚠️ Wi-Fi Direct adapter was found, "
                 "but no usable Npcap capture name could be created."
             )
             return
 
+        ipv4_address, ipv4_network, repaired = (
+            self._ensure_hotspot_binding(
+                normalized_adapter,
+                friendly_name,
+            )
+        )
+
+        if ipv4_address is None or ipv4_network is None:
+            rejected = [
+                f"{ip_value}/{prefix}"
+                for ip_value, prefix, _network
+                in self._reported_ipv4_bindings(normalized_adapter)
+            ]
+            self.latest_state.update(
+                {
+                    "address_state": "repairing",
+                    "expected_router_ip": str(self.hotspot_router_ip),
+                    "expected_network": str(self.hotspot_network),
+                    "rejected_ipv4_bindings": rejected,
+                    "address_error": self._last_address_policy_error,
+                }
+            )
+            now = time.monotonic()
+            reported_expected = self._reported_expected_binding(
+                normalized_adapter
+            )
+            if reported_expected:
+                # Do not describe a correctly reported address as invalid. The
+                # remaining issue is only Windows CIM verification settling.
+                if now - self._last_address_wait_log >= 5.0:
+                    self._last_address_wait_log = now
+                    self._log(
+                        "[WiFiManager] ⏳ Hotspot reports the expected "
+                        f"{self.hotspot_router_ip}/"
+                        f"{self.hotspot_prefix_length}, but Windows has not "
+                        "finished publishing the binding yet. Retrying "
+                        "without rebinding NAT or DHCP."
+                    )
+            else:
+                self._log(
+                    "[WiFiManager] ❌ Hotspot address rejected. "
+                    f"Reported={rejected or ['none']}; expected="
+                    f"{self.hotspot_router_ip}/"
+                    f"{self.hotspot_prefix_length}. NAT and DHCP were not "
+                    "rebound to the invalid address."
+                )
+            return
+
+        normalized_adapter = self._replace_adapter_ipv4_binding(
+            normalized_adapter
+        )
         normalized_adapter["npcap_name"] = full_name
         self.latest_adapter = dict(normalized_adapter)
-        self.latest_state["adapter"] = dict(normalized_adapter)
+        self.latest_state.update(
+            {
+                "adapter": dict(normalized_adapter),
+                "address_state": "ready",
+                "expected_router_ip": str(self.hotspot_router_ip),
+                "expected_network": str(self.hotspot_network),
+                "rejected_ipv4_bindings": [],
+                "address_error": None,
+                "binding_locked": True,
+                "periodic_probing": False,
+            }
+        )
 
         identities = {
             value
-            for value in (
-                adapter_name,
-                full_name,
-                friendly_name,
-            )
+            for value in (adapter_name, full_name, friendly_name)
             if value
         }
         self.managed_ifaces.update(identities)
 
-        router.wifi_host_managed_ifaces = set(
-            self.managed_ifaces
-        )
+        router.wifi_host_managed_ifaces = set(self.managed_ifaces)
         router.interface_wifi_full_name = full_name
         router.interface_wifi_friendly_name = friendly_name
+        router.wifi_host_expected_router_ip = str(self.hotspot_router_ip)
+        router.wifi_host_expected_network = self.hotspot_network
         router.wifi_host_state = {
             "mode": "wifi_direct_legacy_ap",
-            "dhcp_owner": "windows_wifi_direct",
+            "address_mode": (
+                "fixed" if self.enforce_fixed_hotspot_address else "dynamic"
+            ),
+            "dhcp_owner": self.dhcp_owner,
             "routing_owner": "pythonrouter",
+            "router_ip": ipv4_address,
+            "network": str(ipv4_network),
+            "binding_locked": True,
+            "periodic_probing": False,
             "adapter": dict(normalized_adapter),
         }
 
-        ipv4_address: Optional[str] = None
-        ipv4_network: Optional[ipaddress.IPv4Network] = None
+        broadcast = str(ipv4_network.broadcast_address)
 
-        for address in normalized_adapter.get("addresses") or []:
-            if not isinstance(address, dict):
-                continue
-            try:
-                if int(address.get("family") or 0) != 2:
-                    continue
-
-                value = str(
-                    address.get("address") or ""
-                ).split("%", 1)[0]
-                ip_value = ipaddress.IPv4Address(value)
-
-                if ip_value.is_loopback:
-                    continue
-
-                prefix = int(
-                    address.get("prefix_length") or 24
-                )
-
-                ipv4_address = str(ip_value)
-                ipv4_network = ipaddress.ip_network(
-                    f"{ip_value}/{prefix}",
-                    strict=False,
-                )
-                break
-            except Exception:
-                continue
-
-        broadcast = (
-            str(ipv4_network.broadcast_address)
-            if ipv4_network is not None
-            else "255.255.255.255"
-        )
-
-        current = dict(
-            router._interfaces_config.get(
-                full_name,
-                {},
+        with self._binding_lock:
+            old_iface = self._bound_wifi_iface
+            old_router_ip = self._bound_wifi_router_ip
+            old_network = self._bound_wifi_network
+            binding_changed = (
+                old_iface != full_name
+                or old_router_ip != ipv4_address
+                or old_network != ipv4_network
             )
-        )
+
+        if binding_changed:
+            try:
+                self._notify_network_change(
+                    old_iface=old_iface,
+                    old_router_ip=old_router_ip,
+                    old_network=old_network,
+                    new_iface=full_name,
+                    new_router_ip=ipv4_address,
+                    new_network=ipv4_network,
+                    adapter=normalized_adapter,
+                )
+            except Exception as exc:
+                self._log(
+                    "[WiFiManager] Wi-Fi subnet transition cleanup "
+                    f"failed: {exc}"
+                )
+
+        current = dict(router._interfaces_config.get(full_name, {}))
         current.update(
             {
                 "friendly_name": friendly_name,
-                "ip_addr": ipv4_address or "0.0.0.0",
+                "ip_addr": ipv4_address,
                 "network": ipv4_network,
                 "mac": mac or current.get("mac"),
                 "broadcast": broadcast,
                 "gateway": None,
                 "is_default_gateway_iface": False,
                 "wireless_host_managed": True,
-                "dhcp_owner": "windows_wifi_direct",
+                "fixed_address_enforced": (
+                    self.enforce_fixed_hotspot_address
+                ),
+                "dhcp_owner": self.dhcp_owner,
                 "routing_owner": "pythonrouter",
                 "if_index": normalized_adapter.get("if_index"),
-                "ipv6_if_index": normalized_adapter.get(
-                    "ipv6_if_index"
-                ),
+                "ipv6_if_index": normalized_adapter.get("ipv6_if_index"),
                 "luid": normalized_adapter.get("luid"),
             }
         )
@@ -35323,9 +36034,7 @@ class WifiManager:
             pass
 
         try:
-            router.router_macs = set(
-                router.router_macs or set()
-            )
+            router.router_macs = set(router.router_macs or set())
             if mac:
                 router.router_macs.add(mac)
         except Exception:
@@ -35338,7 +36047,6 @@ class WifiManager:
         )
         if isinstance(discovered, list):
             matching_item = None
-
             for item in discovered:
                 if not isinstance(item, dict):
                     continue
@@ -35351,10 +36059,7 @@ class WifiManager:
             if matching_item is None:
                 discovered.append(
                     {
-                        "id": str(
-                            normalized_adapter.get("if_index")
-                            or ""
-                        ),
+                        "id": str(normalized_adapter.get("if_index") or ""),
                         "full_name": full_name,
                         "friendly_name": friendly_name,
                     }
@@ -35365,7 +36070,8 @@ class WifiManager:
 
         self._update_router_consumers()
 
-        if ipv4_address is not None and ipv4_network is not None:
+        should_sync_router = binding_changed or repaired
+        if should_sync_router:
             ready_handler = getattr(
                 router,
                 "_on_wifi_host_network_ready",
@@ -35380,35 +36086,26 @@ class WifiManager:
                         network=ipv4_network,
                         adapter=dict(normalized_adapter),
                     )
+                    self.latest_state["router_binding_state"] = "ready"
                 except Exception as exc:
+                    self.latest_state["router_binding_state"] = "error"
+                    self.latest_state["router_binding_error"] = str(exc)
                     self._log(
                         "[WiFiManager] Wi-Fi LAN/NAT route sync failed: "
                         f"{exc}"
                     )
-        else:
-            self._log(
-                "[WiFiManager] ⏳ Waiting for Windows to publish the "
-                "Wi-Fi Direct client-facing IPv4 subnet."
-            )
 
-        if self.enable_windows_forwarding and friendly_name:
-            self._configure_windows_adapter_policy(
-                normalized_adapter,
-                friendly_name,
-            )
+        with self._binding_lock:
+            self._bound_wifi_iface = full_name
+            self._bound_wifi_router_ip = ipv4_address
+            self._bound_wifi_network = ipv4_network
 
         try:
-            add_trusted = getattr(
-                router,
-                "add_trusted_arp_port",
-                None,
-            )
+            add_trusted = getattr(router, "add_trusted_arp_port", None)
             if callable(add_trusted):
                 add_trusted(full_name)
         except Exception as exc:
-            self._log(
-                f"[WiFiManager] ARP trust update failed: {exc}"
-            )
+            self._log(f"[WiFiManager] ARP trust update failed: {exc}")
 
         try:
             configure_dhcp = getattr(
@@ -35417,7 +36114,13 @@ class WifiManager:
                 None,
             )
             if callable(configure_dhcp):
-                configure_dhcp(reason="wifi-host-adapter")
+                configure_dhcp(
+                    reason=(
+                        "wifi-host-address-repaired"
+                        if repaired
+                        else "wifi-host-adapter"
+                    )
+                )
         except Exception as exc:
             self._log(
                 f"[WiFiManager] DHCP policy refresh failed: {exc}"
@@ -35429,29 +36132,30 @@ class WifiManager:
                 and getattr(router, "sniffer", None) is not None
                 and not router._stop_sniffing_event.is_set()
             ):
-                sniff_threads = getattr(
-                    router,
-                    "_sniff_threads",
-                    {},
-                )
+                sniff_threads = getattr(router, "_sniff_threads", {})
                 if full_name not in sniff_threads:
-                    router._start_single_sniffer(
-                        full_name,
-                        promisc=False,
-                    )
+                    router._start_single_sniffer(full_name, promisc=False)
         except Exception as exc:
             self._log(
                 f"[WiFiManager] Dynamic sniffer start failed: {exc}"
             )
 
-        self._log(
-            "[WiFiManager] ✅ Attached Wi-Fi Direct adapter: "
-            f"friendly='{friendly_name or '-'}' "
-            f"full='{full_name}' "
-            f"ipv4='{ipv4_address or '-'}'. "
-            "Windows Wi-Fi Direct owns association/DHCP; "
-            "PythonRouter owns routing/NAT."
+        log_identity = (
+            full_name,
+            ipv4_address,
+            str(ipv4_network),
+            repaired,
         )
+        if log_identity != self._last_binding_log_identity:
+            self._last_binding_log_identity = log_identity
+            action = "repaired and attached" if repaired else "attached"
+            self._log(
+                f"[WiFiManager] ✅ Wi-Fi Direct adapter {action}: "
+                f"friendly='{friendly_name or '-'}' full='{full_name}' "
+                f"router='{ipv4_address}' network='{ipv4_network}'. "
+                f"DHCP owner={self.dhcp_owner}; "
+                "PythonRouter owns routing/NAT."
+            )
 
     def _update_router_consumers(self) -> None:
         router = self.router
@@ -35516,17 +36220,12 @@ class WifiManager:
         )
 
         if full_name:
-            config = router._interfaces_config.get(
-                full_name
-            )
+            config = router._interfaces_config.get(full_name)
             if (
                 isinstance(config, dict)
                 and config.get("wireless_host_managed")
             ):
-                router._interfaces_config.pop(
-                    full_name,
-                    None,
-                )
+                router._interfaces_config.pop(full_name, None)
 
         stopped_handler = getattr(
             router,
@@ -35550,7 +36249,21 @@ class WifiManager:
         self.managed_ifaces.clear()
         self.latest_adapter = {}
         self._last_adapter_identity = None
+        self._locked_adapter_hardware_key = None
+        self._locked_adapter_instance_key = None
         self._adapter_event.clear()
+        self._address_ready_event.clear()
+        self._binding_locked_event.clear()
+        self._last_address_policy_check = 0.0
+        self._last_successful_address_verification = 0.0
+        self._last_address_wait_log = 0.0
+        self._last_binding_log_identity = None
+        self._rejected_adapter_switches.clear()
+
+        with self._binding_lock:
+            self._bound_wifi_iface = None
+            self._bound_wifi_router_ip = None
+            self._bound_wifi_network = None
 
         self._update_router_consumers()
 
@@ -35561,9 +36274,7 @@ class WifiManager:
                 None,
             )
             if callable(configure_dhcp):
-                configure_dhcp(
-                    reason="wifi-host-stopped"
-                )
+                configure_dhcp(reason="wifi-host-stopped")
         except Exception:
             pass
 
@@ -35571,115 +36282,276 @@ class WifiManager:
         self,
         adapter: dict[str, Any],
         friendly_name: str,
-    ) -> None:
+    ) -> Optional[tuple[str, ipaddress.IPv4Network, bool]]:
         """
-        Apply policy by exact interface index, not wildcard-sensitive alias.
+        Pin the Wi-Fi Direct adapter to the configured private LAN address.
 
-        Remove only stale manually assigned 169.254/16 addresses created by
-        the old LAC auto-configuration. Do not enable ICS and do not force a
-        replacement address.
+        The operation is idempotent. It disables DHCP client configuration on
+        this LAN-only interface, removes every competing IPv4 address, installs
+        the preferred address, enables forwarding and removes default routes.
+        It never enables Internet Connection Sharing.
         """
         if os.name != "nt":
-            return
+            self._last_address_policy_error = (
+                "Windows adapter policy is unavailable on this platform."
+            )
+            return None
 
-        quoted = friendly_name.replace("'", "''")
+        quoted_alias = friendly_name.replace("'", "''")
+        expected_ip = str(self.hotspot_router_ip)
+        expected_network = str(self.hotspot_network)
 
         try:
-            interface_index = int(
-                adapter.get("if_index") or 0
-            )
+            interface_index = int(adapter.get("if_index") or 0)
         except Exception:
             interface_index = 0
 
         script = rf"""
-    $ErrorActionPreference = 'Stop'
-    $interfaceAlias = '{quoted}'
-    $interfaceIndex = {interface_index}
+$ErrorActionPreference = 'Stop'
+$interfaceAlias = '{quoted_alias}'
+$interfaceIndex = {interface_index}
+$expectedIp = '{expected_ip}'
+$prefixLength = {self.hotspot_prefix_length}
 
-    $netAdapter = $null
+$netAdapter = $null
+if ($interfaceIndex -gt 0) {{
+    $netAdapter = Get-NetAdapter `
+        -InterfaceIndex $interfaceIndex `
+        -ErrorAction SilentlyContinue
+}}
+if (-not $netAdapter -and $interfaceAlias) {{
+    $netAdapter = Get-NetAdapter |
+        Where-Object {{ $_.Name -eq $interfaceAlias }} |
+        Select-Object -First 1
+}}
+if (-not $netAdapter) {{
+    throw 'Wi-Fi Direct adapter was not found by exact index or alias.'
+}}
 
-    if ($interfaceIndex -gt 0) {{
-        $netAdapter = Get-NetAdapter `
-            -InterfaceIndex $interfaceIndex `
-            -ErrorAction SilentlyContinue
-    }}
+$interfaceIndex = [int]$netAdapter.ifIndex
 
-    if (-not $netAdapter) {{
-        $netAdapter = Get-NetAdapter |
-            Where-Object {{ $_.Name -eq $interfaceAlias }} |
-            Select-Object -First 1
-    }}
+$duplicateOwner = Get-NetIPAddress `
+    -AddressFamily IPv4 `
+    -IPAddress $expectedIp `
+    -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.InterfaceIndex -ne $interfaceIndex }} |
+    Select-Object -First 1
+if ($duplicateOwner) {{
+    throw (
+        "Preferred hotspot address $expectedIp is already owned by " +
+        "interface index $($duplicateOwner.InterfaceIndex)."
+    )
+}}
 
-    if (-not $netAdapter) {{
-        throw "Wi-Fi Direct adapter was not found by exact alias/index."
-    }}
+$ipv4Interface = Get-NetIPInterface `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -ErrorAction Stop
 
-    $interfaceIndex = [int]$netAdapter.ifIndex
-
+$addressesBefore = @(
     Get-NetIPAddress `
         -InterfaceIndex $interfaceIndex `
         -AddressFamily IPv4 `
-        -ErrorAction SilentlyContinue |
+        -ErrorAction SilentlyContinue
+)
+$hadExpectedBefore = @(
+    $addressesBefore |
         Where-Object {{
-            $_.PrefixOrigin -eq 'Manual' -and
-            $_.IPAddress -like '169.254.*'
-        }} |
+            $_.IPAddress -eq $expectedIp -and
+            $_.PrefixLength -eq $prefixLength
+        }}
+).Count -gt 0
+$hadUnexpectedBefore = @(
+    $addressesBefore |
+        Where-Object {{
+            $_.IPAddress -ne $expectedIp -or
+            $_.PrefixLength -ne $prefixLength
+        }}
+).Count -gt 0
+$dhcpWasEnabled = ($ipv4Interface.Dhcp -eq 'Enabled')
+$policyChanged = (
+    (-not $hadExpectedBefore) -or
+    $hadUnexpectedBefore -or
+    $dhcpWasEnabled
+)
+
+$ipv4Interface | Set-NetIPInterface `
+    -Dhcp Disabled `
+    -Forwarding Enabled `
+    -AutomaticMetric Disabled `
+    -InterfaceMetric 600 `
+    -IgnoreDefaultRoutes Enabled `
+    -ErrorAction Stop
+
+Get-NetIPAddress `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.IPAddress -ne $expectedIp }} |
+    Remove-NetIPAddress `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+
+$binding = Get-NetIPAddress `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -IPAddress $expectedIp `
+    -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.PrefixLength -eq $prefixLength }} |
+    Select-Object -First 1
+
+if (-not $binding) {{
+    Get-NetIPAddress `
+        -InterfaceIndex $interfaceIndex `
+        -AddressFamily IPv4 `
+        -IPAddress $expectedIp `
+        -ErrorAction SilentlyContinue |
         Remove-NetIPAddress `
             -Confirm:$false `
             -ErrorAction SilentlyContinue
 
-    $ipv4Interface = Get-NetIPInterface `
+    New-NetIPAddress `
         -InterfaceIndex $interfaceIndex `
+        -IPAddress $expectedIp `
+        -PrefixLength $prefixLength `
         -AddressFamily IPv4 `
-        -ErrorAction Stop
+        -Type Unicast `
+        -SkipAsSource $false `
+        -ErrorAction Stop | Out-Null
+}}
 
-    $ipv4Interface | Set-NetIPInterface `
-        -Forwarding Enabled `
-        -AutomaticMetric Disabled `
-        -InterfaceMetric 600 `
-        -IgnoreDefaultRoutes Enabled `
-        -ErrorAction Stop
-
-    $ipv6Interface = Get-NetIPInterface `
-        -InterfaceIndex $interfaceIndex `
-        -AddressFamily IPv6 `
+Get-NetRoute `
+    -InterfaceIndex $interfaceIndex `
+    -DestinationPrefix '0.0.0.0/0' `
+    -ErrorAction SilentlyContinue |
+    Remove-NetRoute `
+        -Confirm:$false `
         -ErrorAction SilentlyContinue
 
-    if ($ipv6Interface) {{
-        $ipv6Interface | Set-NetIPInterface `
-            -Forwarding Enabled `
-            -AutomaticMetric Disabled `
-            -InterfaceMetric 610 `
-            -IgnoreDefaultRoutes Enabled `
-            -ErrorAction SilentlyContinue
+$ipv6Interface = Get-NetIPInterface `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv6 `
+    -ErrorAction SilentlyContinue
+if ($ipv6Interface) {{
+    $ipv6Interface | Set-NetIPInterface `
+        -Forwarding Enabled `
+        -AutomaticMetric Disabled `
+        -InterfaceMetric 610 `
+        -IgnoreDefaultRoutes Enabled `
+        -ErrorAction SilentlyContinue
+}}
+
+Get-NetRoute `
+    -InterfaceIndex $interfaceIndex `
+    -DestinationPrefix '::/0' `
+    -ErrorAction SilentlyContinue |
+    Remove-NetRoute `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+
+# NetTCPIP updates are not atomic. Immediately after New-NetIPAddress,
+# the CIM provider may briefly return no MSFT_NetIPAddress object even
+# though the binding is being installed. Poll with SilentlyContinue rather
+# than converting this normal transition into a fatal PowerShell error.
+$verified = $null
+$verificationDeadline = [DateTime]::UtcNow.AddSeconds(10)
+
+do {{
+    $verified = @(
+        Get-NetIPAddress `
+            -InterfaceIndex $interfaceIndex `
+            -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+        Where-Object {{
+            $_.IPAddress -eq $expectedIp -and
+            $_.PrefixLength -eq $prefixLength
+        }} |
+        Select-Object -First 1
+    ) | Select-Object -First 1
+
+    if (-not $verified) {{
+        Start-Sleep -Milliseconds 250
     }}
+}} while (
+    (-not $verified) -and
+    ([DateTime]::UtcNow -lt $verificationDeadline)
+)
 
-    Get-NetRoute `
-        -InterfaceIndex $interfaceIndex `
-        -DestinationPrefix '0.0.0.0/0' `
-        -ErrorAction SilentlyContinue |
-        Remove-NetRoute `
-            -Confirm:$false `
-            -ErrorAction SilentlyContinue
+if (-not $verified) {{
+    $observed = @(
+        Get-NetIPAddress `
+            -InterfaceIndex $interfaceIndex `
+            -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+        ForEach-Object {{
+            "$($_.IPAddress)/$($_.PrefixLength)"
+        }}
+    ) -join ', '
 
-    Get-NetRoute `
-        -InterfaceIndex $interfaceIndex `
-        -DestinationPrefix '::/0' `
-        -ErrorAction SilentlyContinue |
-        Remove-NetRoute `
-            -Confirm:$false `
-            -ErrorAction SilentlyContinue
-
-    Write-Output (
-        "Configured Wi-Fi Direct interface index {0} alias '{1}'" `
-        -f $interfaceIndex, $interfaceAlias
+    throw (
+        "The fixed hotspot address could not be verified after repair. " +
+        "Observed bindings: $observed"
     )
-    """
+}}
+
+# Perform a final exclusivity pass after the expected address is visible.
+# This closes the small race where Windows publishes an automatic address
+# while New-NetIPAddress is settling.
+Get-NetIPAddress `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.IPAddress -ne $expectedIp -or
+        $_.PrefixLength -ne $prefixLength
+    }} |
+    Remove-NetIPAddress `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+
+Start-Sleep -Milliseconds 150
+
+$unexpected = @(
+    Get-NetIPAddress `
+        -InterfaceIndex $interfaceIndex `
+        -AddressFamily IPv4 `
+        -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.IPAddress -ne $expectedIp -or
+        $_.PrefixLength -ne $prefixLength
+    }}
+)
+
+if ($unexpected.Count -gt 0) {{
+    $unexpectedText = @(
+        $unexpected |
+        ForEach-Object {{
+            "$($_.IPAddress)/$($_.PrefixLength)"
+        }}
+    ) -join ', '
+
+    throw (
+        "Competing IPv4 addresses remained on the hotspot adapter: " +
+        $unexpectedText
+    )
+}}
+
+[PSCustomObject]@{{
+    ok = $true
+    interface_index = $interfaceIndex
+    interface_alias = $netAdapter.Name
+    ip_address = $verified.IPAddress
+    prefix_length = [int]$verified.PrefixLength
+    changed = [bool]$policyChanged
+}} | ConvertTo-Json -Compress
+"""
+
         try:
             result = subprocess.run(
                 [
                     "powershell.exe",
                     "-NoProfile",
+                    "-NonInteractive",
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
@@ -35687,31 +36559,146 @@ class WifiManager:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=20.0,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.address_policy_timeout,
                 creationflags=getattr(
                     subprocess,
                     "CREATE_NO_WINDOW",
                     0,
                 ),
             )
-
-            stdout = (result.stdout or "").strip()
-            stderr = (result.stderr or "").strip()
-
-            if result.returncode == 0:
-                if stdout:
-                    self._log(f"[WiFiManager] {stdout}")
-            else:
-                self._log(
-                    "[WiFiManager] ⚠️ Windows forwarding/address "
-                    f"repair returned code {result.returncode}: "
-                    f"{stderr or stdout or 'no error text'}"
-                )
         except Exception as exc:
+            self._last_address_policy_error = (
+                f"Windows address policy execution failed: {exc}"
+            )
             self._log(
-                "[WiFiManager] Windows adapter policy failed: "
+                "[WiFiManager] Windows address policy failed: "
                 f"{exc}"
             )
+            return None
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if result.returncode != 0:
+            self._last_address_policy_error = (
+                stderr
+                or stdout
+                or f"PowerShell exited with code {result.returncode}."
+            )
+            self._log(
+                "[WiFiManager] ❌ Fixed-address repair failed: "
+                f"{self._last_address_policy_error}"
+            )
+            return None
+
+        payload: Optional[dict[str, Any]] = None
+        for line in reversed(stdout.splitlines()):
+            try:
+                candidate = json.loads(line.strip())
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+
+        if payload is None:
+            self._last_address_policy_error = (
+                "PowerShell did not return a verifiable address payload."
+            )
+            return None
+
+        try:
+            actual_ip = ipaddress.IPv4Address(
+                str(payload.get("ip_address") or "")
+            )
+            actual_prefix = int(payload.get("prefix_length"))
+            actual_network = ipaddress.IPv4Network(
+                f"{actual_ip}/{actual_prefix}",
+                strict=False,
+            )
+            policy_changed = bool(payload.get("changed", False))
+        except Exception as exc:
+            self._last_address_policy_error = (
+                f"Invalid address verification payload: {exc}"
+            )
+            return None
+
+        if (
+            actual_ip != self.hotspot_router_ip
+            or actual_prefix != self.hotspot_prefix_length
+            or actual_network != self.hotspot_network
+        ):
+            self._last_address_policy_error = (
+                "Address verification mismatch: expected "
+                f"{self.hotspot_router_ip}/{self.hotspot_prefix_length} "
+                f"({expected_network}), received "
+                f"{actual_ip}/{actual_prefix} ({actual_network})."
+            )
+            return None
+
+        self._last_address_policy_error = None
+        return str(actual_ip), actual_network, policy_changed
+
+    def _restore_windows_dynamic_address(
+        self,
+        adapter: dict[str, Any],
+        friendly_name: str,
+    ) -> None:
+        """Optionally restore DHCP client addressing when the manager stops."""
+        if os.name != "nt":
+            return
+
+        quoted_alias = friendly_name.replace("'", "''")
+        try:
+            interface_index = int(adapter.get("if_index") or 0)
+        except Exception:
+            interface_index = 0
+
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+$interfaceAlias = '{quoted_alias}'
+$interfaceIndex = {interface_index}
+$netAdapter = $null
+if ($interfaceIndex -gt 0) {{
+    $netAdapter = Get-NetAdapter `
+        -InterfaceIndex $interfaceIndex `
+        -ErrorAction SilentlyContinue
+}}
+if (-not $netAdapter -and $interfaceAlias) {{
+    $netAdapter = Get-NetAdapter |
+        Where-Object {{ $_.Name -eq $interfaceAlias }} |
+        Select-Object -First 1
+}}
+if (-not $netAdapter) {{ exit 0 }}
+$interfaceIndex = [int]$netAdapter.ifIndex
+Get-NetIPAddress `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -IPAddress '{str(self.hotspot_router_ip)}' `
+    -ErrorAction SilentlyContinue |
+    Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Set-NetIPInterface `
+    -InterfaceIndex $interfaceIndex `
+    -AddressFamily IPv4 `
+    -Dhcp Enabled `
+    -ErrorAction SilentlyContinue
+"""
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=self.address_policy_timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
     # ------------------------------------------------------------------
     # Logging
