@@ -2087,159 +2087,209 @@ class mDNSManager:
 HandshakeState = Literal["SYN_SENT", "SYN_ACK_RECEIVED", "ESTABLISHED", "CLOSING", "CLOSED"]
 
 TLS_HANDSHAKE_TYPES = {
-    0:  "HelloRequest",          # TLS 1.0–1.2, obsolete in TLS 1.3
-    1:  "ClientHello",
-    2:  "ServerHello",
-    3:  "HelloVerifyRequest",    # DTLS
-    4:  "NewSessionTicket",      # TLS 1.3: NewSessionTicket
-    8:  "EncryptedExtensions",   # TLS 1.3
+    0: "HelloRequest",
+    1: "ClientHello",
+    2: "ServerHello",
+    3: "HelloVerifyRequest",
+    4: "NewSessionTicket",
+    5: "EndOfEarlyData",  # RFC 8446 uses 5; retain 26 below for compatibility.
+    8: "EncryptedExtensions",
     11: "Certificate",
-    12: "ServerKeyExchange",     # TLS ≤1.2
+    12: "ServerKeyExchange",
     13: "CertificateRequest",
-    14: "ServerHelloDone",       # TLS ≤1.2
+    14: "ServerHelloDone",
     15: "CertificateVerify",
-    16: "ClientKeyExchange",     # TLS ≤1.2
+    16: "ClientKeyExchange",
     20: "Finished",
-    21: "CertificateURL",        # experimental / unused
-    22: "CertificateStatus",     # OCSP stapling
-    23: "SupplementalData",      # old extension point
-    24: "KeyUpdate",             # TLS 1.3
-    25: "CompressedCertificate", # TLS 1.3 extension
-    26: "EndOfEarlyData",        # TLS 1.3
-    27: "HelloRetryRequest",     # TLS 1.3 (encoded as SH + special marker)
+    21: "CertificateURL",
+    22: "CertificateStatus",
+    23: "SupplementalData",
+    24: "KeyUpdate",
+    25: "CompressedCertificate",
+    26: "EndOfEarlyData",
+    27: "HelloRetryRequest",
+    254: "MessageHash",
 }
+
+_TLS_VERSION_NAMES = {
+    (2, 0): "SSLv2",
+    (3, 0): "SSLv3",
+    (3, 1): "TLS1.0",
+    (3, 2): "TLS1.1",
+    (3, 3): "TLS1.2",
+    (3, 4): "TLS1.3",
+}
+
+_TLS_ALERT_LEVELS = {1: "warning", 2: "fatal"}
+_TLS_ALERT_DESCRIPTIONS = {
+    0: "close_notify",
+    10: "unexpected_message",
+    20: "bad_record_mac",
+    21: "decryption_failed",
+    22: "record_overflow",
+    30: "decompression_failure",
+    40: "handshake_failure",
+    41: "no_certificate",
+    42: "bad_certificate",
+    43: "unsupported_certificate",
+    44: "certificate_revoked",
+    45: "certificate_expired",
+    46: "certificate_unknown",
+    47: "illegal_parameter",
+    48: "unknown_ca",
+    49: "access_denied",
+    50: "decode_error",
+    51: "decrypt_error",
+    60: "export_restriction",
+    70: "protocol_version",
+    71: "insufficient_security",
+    80: "user_canceled",
+    86: "inappropriate_fallback",
+    90: "user_canceled",
+    100: "no_renegotiation",
+    109: "missing_extension",
+    110: "unsupported_extension",
+    112: "unrecognized_name",
+    113: "bad_certificate_status_response",
+    115: "unknown_psk_identity",
+    116: "certificate_required",
+    120: "no_application_protocol",
+}
+
+
 def _get_canonical_session_key(ip1: str, port1: int, ip2: str, port2: int) -> Tuple[Tuple[str, int], Tuple[str, int]]:
     """Returns a canonical session key that is order-independent."""
-
-    x, y = sorted([(ip1, port1), (ip2, port2)])
+    x, y = sorted([(str(ip1), int(port1)), (str(ip2), int(port2))])
     return x, y
 
 
+def _is_grease(value: int) -> bool:
+    value &= 0xFFFF
+    return (value & 0x0F0F) == 0x0A0A and ((value >> 8) & 0xFF) == (value & 0xFF)
+
+
+def _version_name(version: Optional[Tuple[int, int]]) -> Optional[str]:
+    if version is None:
+        return None
+    return _TLS_VERSION_NAMES.get(tuple(version), f"{version[0]}.{version[1]}")
 
 
 class TLSPolicyDecision:
     __slots__ = ("action", "reason", "tags")
+
     def __init__(self, action: str, reason: str = "", tags: Optional[List[str]] = None):
-        self.action = action          # "allow" | "alert" | "block" | "quarantine"
+        self.action = action
         self.reason = reason
         self.tags = tags or []
 
+
 class TLSPolicyEngine:
-    """
-    Tiny, tunable rule engine used by TLSRecordManager on every TLS record.
-    Integrates TLSCipherManager for weak/acceptable cipher logic.
-    """
+    """Small passive policy engine used by ``TLSRecordManager``."""
+
     def __init__(self):
-        # Base constraints / toggles
-        self.min_tls_version = (3, 3)     # default: TLS 1.2 (3,3) minimum
+        self.min_tls_version = (3, 3)
         self.block_legacy_ssl = True
-        # Historic hard blocklist (kept for continuity); treated as manual blocks in cipher manager
         self.block_weak_ciphers = {0x0004, 0x0005, 0x000A, 0x002F, 0x0035}
-        self.sni_denylist = set()          # {"bad.example", ".malware.tld"}
-        self.ja3_denylist = set()          # {"<md5>"}
+        self.sni_denylist = set()
+        self.ja3_denylist = set()
         self.alert_on_tls11_or_lower = True
 
-        # Cipher helper and policy
         self.ciphers = TLSCipherManager()
         for cid in self.block_weak_ciphers:
             self.ciphers.block_suite(cid)
-        # Defaults (tweak anytime at runtime)
         self.ciphers.set_requirements(
             require_pfs=False,
             require_aead=False,
-            forbid_cbc_sha1=False
+            forbid_cbc_sha1=False,
         )
 
-    # --- admin helpers (optional, nice to have) ---
     def set_min_tls(self, major: int, minor: int):
         self.min_tls_version = (major, minor)
 
     def add_blocked_sni(self, s: str): self.sni_denylist.add(s.lower())
     def add_blocked_ja3(self, j: str): self.ja3_denylist.add(j.lower())
-    def add_blocked_cipher(self, c: int):
-        self.block_weak_ciphers.add(int(c) & 0xFFFF)
-        self.ciphers.block_suite(int(c) & 0xFFFF)
 
-    # --- internals ---
+    def add_blocked_cipher(self, c: int):
+        suite = int(c) & 0xFFFF
+        self.block_weak_ciphers.add(suite)
+        self.ciphers.block_suite(suite)
+
     def _sni_is_blocked(self, sni: Optional[str]) -> Optional[str]:
         if not sni:
             return None
         q = sni.lower().strip(".")
-        for pat in self.sni_denylist:
-            if pat.startswith("."):
-                if q.endswith(pat[1:]):
-                    return f"SNI endswith {pat}"
-            elif q == pat or q.endswith("." + pat):
-                return f"SNI matches {pat}"
+        for raw_pattern in self.sni_denylist:
+            pattern = raw_pattern.lower().strip()
+            if not pattern:
+                continue
+            if pattern.startswith("."):
+                suffix = pattern[1:]
+                if q == suffix or q.endswith("." + suffix):
+                    return f"SNI endswith {pattern}"
+            elif q == pattern or q.endswith("." + pattern):
+                return f"SNI matches {pattern}"
         return None
 
-    # --- MAIN: called by TLSRecordManager on every TLS record ---
     def evaluate(self, meta: Dict, rec: "TLSRecord", extra: Optional[Dict]) -> TLSPolicyDecision:
-        """
-        Decide: allow | alert | block | quarantine.
-        Uses per-session 'meta' (built by TLSRecordManager) and the current record.
-        """
-        # 1) Legacy SSL (incl. SSLv2 hello) -> block if enabled
         if meta.get("legacy_ssl") and self.block_legacy_ssl:
             return TLSPolicyDecision("block", "Legacy SSL detected", ["legacy"])
 
-        # 2) ClientHello-derived checks
         ch = meta.get("client_hello")
         if ch:
-            # min version (client legacy_version or negotiated if already known)
-            ver = ch.get("version_tuple") or meta.get("negotiated_version_tuple")
-            if ver and ver < self.min_tls_version:
-                return TLSPolicyDecision("block", f"TLS version too low {ver}", ["min-tls"])
+            # ClientHello legacy_version is 3.3 even for TLS 1.3.  Prefer the
+            # supported_versions maximum and only fall back to legacy_version.
+            ver = (
+                meta.get("negotiated_version_tuple")
+                or ch.get("highest_supported_version_tuple")
+                or ch.get("version_tuple")
+            )
+            if ver and tuple(ver) < tuple(self.min_tls_version):
+                return TLSPolicyDecision("block", f"TLS version too low {tuple(ver)}", ["min-tls"])
 
-            # SNI denylist
-            sni = meta.get("sni")
-            sni_reason = self._sni_is_blocked(sni)
-            if sni_reason:
-                return TLSPolicyDecision("block", sni_reason, ["sni"])
+            reason = self._sni_is_blocked(meta.get("sni"))
+            if reason:
+                return TLSPolicyDecision("block", reason, ["sni"])
 
-            # JA3 denylist
-            if ch.get("ja3_md5") and ch["ja3_md5"].lower() in self.ja3_denylist:
-                return TLSPolicyDecision("block", f"JA3 {ch['ja3_md5']} denylisted", ["ja3"])
+            ja3 = ch.get("ja3_md5")
+            if ja3 and ja3.lower() in self.ja3_denylist:
+                return TLSPolicyDecision("block", f"JA3 {ja3} denylisted", ["ja3"])
 
-            # Offered-only-weak (heads-up alert, do not block yet)
             suites = set(ch.get("cipher_suites") or [])
             try:
                 if suites and self.ciphers.all_weak(suites):
                     return TLSPolicyDecision("alert", "Only weak ciphers offered", ["weak-ciphers"])
             except Exception:
-                # If anything goes wrong in classification, don't over-block
                 pass
 
-        # 3) ServerHello-derived checks
         sh = meta.get("server_hello")
         if sh:
-            # Negotiated cipher strength
             cs_int = sh.get("cipher_suite_int")
             if cs_int is not None:
                 weak, reasons = self.ciphers.is_weak(cs_int, negotiated=True)
                 if weak:
-                    tag_str = ["weak-cipher"] + (reasons or [])
                     return TLSPolicyDecision(
                         "block",
                         f"Weak negotiated cipher ({', '.join(reasons)})" if reasons else "Weak negotiated cipher",
-                        tag_str
+                        ["weak-cipher"] + list(reasons or []),
                     )
 
-            # Alert on negotiated TLS ≤ 1.1 (if toggle enabled)
             nv = sh.get("version_tuple")
-            if self.alert_on_tls11_or_lower and nv and nv < (3, 3):
-                return TLSPolicyDecision("alert", f"Negotiated {nv} (TLS<=1.1)", ["old-tls"])
+            if self.alert_on_tls11_or_lower and nv and tuple(nv) < (3, 3):
+                return TLSPolicyDecision("alert", f"Negotiated {tuple(nv)} (TLS<=1.1)", ["old-tls"])
 
-            # JA3S denylist
-            if sh.get("ja3s_md5") and sh["ja3s_md5"].lower() in self.ja3_denylist:
-                return TLSPolicyDecision("block", f"JA3S {sh['ja3s_md5']} denylisted", ["ja3s"])
+            ja3s = sh.get("ja3s_md5")
+            if ja3s and ja3s.lower() in self.ja3_denylist:
+                return TLSPolicyDecision("block", f"JA3S {ja3s} denylisted", ["ja3s"])
 
-        # 4) Default
         return TLSPolicyDecision("allow")
 
+
 class TLSRecord:
-    __slots__ = ("content_type", "version", "length", "payload", "ts",
-                 "src", "dst", "src_port", "dst_port", "direction")
+    __slots__ = (
+        "content_type", "version", "length", "payload", "ts",
+        "src", "dst", "src_port", "dst_port", "direction",
+    )
+
     def __init__(self, content_type: int, version: Tuple[int, int], length: int, payload: bytes,
                  ts: float, src: str, dst: str, src_port: int, dst_port: int, direction: str):
         self.content_type = content_type
@@ -2251,62 +2301,36 @@ class TLSRecord:
         self.dst = dst
         self.src_port = src_port
         self.dst_port = dst_port
-        self.direction = direction  # "c2s" or "s2c"
+        self.direction = direction
+
 
 class TLSCipherManager:
-    """
-    Registry + policy helpers for TLS cipher suites.
-
-    • get_info(id)         -> details for a suite (name, flags)
-    • is_weak(id, …)       -> (bool, reasons[]) under current policy toggles
-    • acceptable(id, …)    -> bool (inverse of is_weak)
-    • all_weak(ids, …)     -> True iff NO acceptable suite exists in 'ids'
-    • to_name(id) / from_name(name)
-
-    Policy toggles (per-instance):
-      - require_pfs (default False)
-      - require_aead (default False)
-      - forbid_rsa_kx (default False)
-      - forbid_rc4 / forbid_3des / forbid_null / forbid_export / forbid_des40
-      - forbid_cbc_sha1 (treat CBC+SHA1 as weak)
-    """
+    """Cipher registry and policy helper, retaining the original public API."""
 
     def __init__(self):
-        # Minimal but practical registry. Extend as needed.
-        # Flags: pfs,aead,rc4,3des,cbc,null,export,des40,md5,sha1,rsa_kx,tls13
         self._db = {
-            # --- TLS 1.3 ---
-            0x1301: {"name":"TLS_AES_128_GCM_SHA256",       "flags":{"aead","pfs","tls13"}},
-            0x1302: {"name":"TLS_AES_256_GCM_SHA384",       "flags":{"aead","pfs","tls13"}},
-            0x1303: {"name":"TLS_CHACHA20_POLY1305_SHA256", "flags":{"aead","pfs","tls13"}},
-
-            # --- AEAD ECDHE (good) ---
-            0xC02F: {"name":"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",       "flags":{"aead","pfs"}},
-            0xC030: {"name":"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",       "flags":{"aead","pfs"}},
-            0xC02B: {"name":"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",     "flags":{"aead","pfs"}},
-            0xC02C: {"name":"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",     "flags":{"aead","pfs"}},
-            0xCCA8: {"name":"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "flags":{"aead","pfs"}},
-            0xCCA9: {"name":"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256","flags":{"aead","pfs"}},
-
-            # --- Legacy RSA CBC (no PFS) ---
-            0x002F: {"name":"TLS_RSA_WITH_AES_128_CBC_SHA",         "flags":{"cbc","sha1","rsa_kx"}},
-            0x0035: {"name":"TLS_RSA_WITH_AES_256_CBC_SHA",         "flags":{"cbc","sha1","rsa_kx"}},
-
-            # --- Really old / bad ---
-            0x0004: {"name":"TLS_RSA_WITH_RC4_128_MD5",             "flags":{"rc4","md5","rsa_kx"}},
-            0x0005: {"name":"TLS_RSA_WITH_RC4_128_SHA",             "flags":{"rc4","sha1","rsa_kx"}},
-            0x000A: {"name":"TLS_RSA_WITH_3DES_EDE_CBC_SHA",        "flags":{"3des","cbc","sha1","rsa_kx"}},
-            # a few “marker” suites
-            0x0000: {"name":"TLS_NULL_WITH_NULL_NULL",              "flags":{"null"}},
+            0x1301: {"name": "TLS_AES_128_GCM_SHA256", "flags": {"aead", "pfs", "tls13"}},
+            0x1302: {"name": "TLS_AES_256_GCM_SHA384", "flags": {"aead", "pfs", "tls13"}},
+            0x1303: {"name": "TLS_CHACHA20_POLY1305_SHA256", "flags": {"aead", "pfs", "tls13"}},
+            0x1304: {"name": "TLS_AES_128_CCM_SHA256", "flags": {"aead", "pfs", "tls13"}},
+            0x1305: {"name": "TLS_AES_128_CCM_8_SHA256", "flags": {"aead", "pfs", "tls13"}},
+            0xC02F: {"name": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "flags": {"aead", "pfs"}},
+            0xC030: {"name": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", "flags": {"aead", "pfs"}},
+            0xC02B: {"name": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "flags": {"aead", "pfs"}},
+            0xC02C: {"name": "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "flags": {"aead", "pfs"}},
+            0xCCA8: {"name": "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "flags": {"aead", "pfs"}},
+            0xCCA9: {"name": "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "flags": {"aead", "pfs"}},
+            0x009C: {"name": "TLS_RSA_WITH_AES_128_GCM_SHA256", "flags": {"aead", "rsa_kx"}},
+            0x009D: {"name": "TLS_RSA_WITH_AES_256_GCM_SHA384", "flags": {"aead", "rsa_kx"}},
+            0x002F: {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "flags": {"cbc", "sha1", "rsa_kx"}},
+            0x0035: {"name": "TLS_RSA_WITH_AES_256_CBC_SHA", "flags": {"cbc", "sha1", "rsa_kx"}},
+            0x0004: {"name": "TLS_RSA_WITH_RC4_128_MD5", "flags": {"rc4", "md5", "rsa_kx"}},
+            0x0005: {"name": "TLS_RSA_WITH_RC4_128_SHA", "flags": {"rc4", "sha1", "rsa_kx"}},
+            0x000A: {"name": "TLS_RSA_WITH_3DES_EDE_CBC_SHA", "flags": {"3des", "cbc", "sha1", "rsa_kx"}},
+            0x0000: {"name": "TLS_NULL_WITH_NULL_NULL", "flags": {"null"}},
         }
-
-        # Quick reverse index by name (case-insensitive)
         self._by_name = {v["name"].lower(): k for k, v in self._db.items()}
-
-        # Manual blocklist you can add to at runtime (IDs)
         self.manual_block: set[int] = set()
-
-        # Policy toggles (defaults conservative but not too strict)
         self.require_pfs = False
         self.require_aead = False
         self.forbid_rsa_kx = False
@@ -2315,9 +2339,8 @@ class TLSCipherManager:
         self.forbid_null = True
         self.forbid_export = True
         self.forbid_des40 = True
-        self.forbid_cbc_sha1 = False  # set True to nudge away from CBC/SHA1
+        self.forbid_cbc_sha1 = False
 
-    # ---------- Admin / Lookup ----------
     def add_suite(self, suite_id: int, name: str, *, flags: set[str]):
         suite_id = int(suite_id) & 0xFFFF
         self._db[suite_id] = {"name": name, "flags": set(flags)}
@@ -2331,14 +2354,13 @@ class TLSCipherManager:
 
     def to_name(self, suite_id: int) -> str:
         info = self._db.get(int(suite_id) & 0xFFFF)
-        return info["name"] if info else f"0x{int(suite_id)&0xFFFF:04x}"
+        return info["name"] if info else f"0x{int(suite_id) & 0xFFFF:04x}"
 
     def get_info(self, suite_id: int) -> Dict[str, object]:
         suite_id = int(suite_id) & 0xFFFF
         info = self._db.get(suite_id, {"name": f"0x{suite_id:04x}", "flags": set()})
         return {"id": suite_id, "name": info["name"], "flags": set(info["flags"])}
 
-    # ---------- Policy Evaluation ----------
     def set_requirements(self, *, require_pfs: Optional[bool] = None,
                          require_aead: Optional[bool] = None,
                          forbid_rsa_kx: Optional[bool] = None,
@@ -2348,153 +2370,155 @@ class TLSCipherManager:
                          forbid_export: Optional[bool] = None,
                          forbid_des40: Optional[bool] = None,
                          forbid_cbc_sha1: Optional[bool] = None):
-        for k, v in locals().items():
-            if k in ("self",) or v is None: continue
-            setattr(self, k, v)
+        for key, value in locals().items():
+            if key != "self" and value is not None:
+                setattr(self, key, bool(value))
 
     def _reasons_for_suite(self, suite_id: int, *, negotiated: bool = False) -> list[str]:
+        suite_id = int(suite_id) & 0xFFFF
         info = self.get_info(suite_id)
-        f = info["flags"]
-        reasons = []
-
+        flags = info["flags"]
+        reasons: List[str] = []
         if suite_id in self.manual_block:
             reasons.append("manual-block")
-
-        if self.forbid_null and ("null" in f):
+        if self.forbid_null and "null" in flags:
             reasons.append("null-cipher")
-        if self.forbid_export and ("export" in f):
+        if self.forbid_export and "export" in flags:
             reasons.append("export-cipher")
-        if self.forbid_des40 and ("des40" in f):
+        if self.forbid_des40 and "des40" in flags:
             reasons.append("des40")
-        if self.forbid_rc4 and ("rc4" in f):
+        if self.forbid_rc4 and "rc4" in flags:
             reasons.append("rc4")
-        if self.forbid_3des and ("3des" in f):
+        if self.forbid_3des and "3des" in flags:
             reasons.append("3des")
-        if self.forbid_cbc_sha1 and ("cbc" in f and "sha1" in f):
+        if self.forbid_cbc_sha1 and "cbc" in flags and "sha1" in flags:
             reasons.append("cbc+sha1")
-
-        if self.require_aead and ("aead" not in f):
+        if self.require_aead and "aead" not in flags:
             reasons.append("no-aead")
-        if self.require_pfs:
-            # TLS1.3 implies PFS; for <=1.2 we rely on ECDHE/DHE flag 'pfs'
-            if ("pfs" not in f) and ("tls13" not in f):
-                reasons.append("no-pfs")
-
-        if self.forbid_rsa_kx and ("rsa_kx" in f):
+        if self.require_pfs and "pfs" not in flags and "tls13" not in flags:
+            reasons.append("no-pfs")
+        if self.forbid_rsa_kx and "rsa_kx" in flags:
             reasons.append("rsa-kx")
-
         return reasons
 
     def is_weak(self, suite_id: int, *, negotiated: bool = False) -> tuple[bool, list[str]]:
         reasons = self._reasons_for_suite(suite_id, negotiated=negotiated)
-        return (len(reasons) > 0, reasons)
+        return len(reasons) > 0, reasons
 
     def acceptable(self, suite_id: int) -> bool:
         weak, _ = self.is_weak(suite_id)
         return not weak
 
     def all_weak(self, suites: set[int] | list[int]) -> bool:
-        """
-        True if NONE of the suites satisfy current policy (i.e., client only offers weak).
-        Unknown suites are treated as 'possibly acceptable' (don’t cause false alerts).
-        """
-        any_ok = False
-        for s in suites or []:
-            s = int(s) & 0xFFFF
-            # Unknown suite: err on the side of 'maybe OK' (treat as acceptable)
-            if s not in self._db and s not in self.manual_block:
-                any_ok = True
-                break
-            if self.acceptable(s):
-                any_ok = True
-                break
-        return not any_ok
+        offered = list(suites or [])
+        if not offered:
+            return False
+        for suite in offered:
+            suite = int(suite) & 0xFFFF
+            if _is_grease(suite):
+                continue
+            if suite not in self._db and suite not in self.manual_block:
+                return False
+            if self.acceptable(suite):
+                return False
+        return True
+
 
 class TLSRecordManager:
-    """
-    Passive TLS/SSL record parser with TCP-stream-aware reassembly… now with:
-      • Per-flow session metadata (SNI/ALPN/version/cipher/JA3/JA3S/counters)
-      • Lightweight policy engine -> decisions (allow/alert/block/quarantine)
-      • Event queue + callbacks (on_event/on_decision) for your app to act on
-      • Optional soft enforcement: suppress app-data callback when blocked
+    """Passive, stream-aware TLS record and handshake processor."""
 
-    Also integrates TLSCipherManager for:
-      • Naming negotiated cipher suites
-      • Weak/acceptable evaluation of offered and negotiated suites
-      • Heads-up policy_alert events when only-weak offered or weak cipher negotiated
-    """
-
-    # Content types
     CHANGE_CIPHER_SPEC = 20
-    ALERT               = 21
-    HANDSHAKE           = 22
-    APPLICATION_DATA    = 23
+    ALERT = 21
+    HANDSHAKE = 22
+    APPLICATION_DATA = 23
 
-    # Direction keys
     C2S = "c2s"
     S2C = "s2c"
+
+    MAX_RECORD_LENGTH = 18432
+    MAX_STREAM_BUFFER = 4 * 1024 * 1024
+    MAX_HANDSHAKE_MESSAGE = 4 * 1024 * 1024
+    MAX_EVENT_QUEUE = 4096
 
     def __init__(self, logger, on_record: Optional[Callable[[TLSRecord], None]] = None):
         self.log = logger
         self.on_record = on_record or (lambda rec: None)
-
-        # Buffers keyed by canonical session key and direction
-        self._buffers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, bytearray]] = \
-            defaultdict(lambda: {self.C2S: bytearray(), self.S2C: bytearray()})
-
-        # Minimal stats per session (kept for compatibility)
-        self._stats: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, int]] = \
-            defaultdict(lambda: {"records": 0, "handshakes": 0, "alerts": 0, "appdata": 0, "ccs": 0, "legacy": 0})
-
-        # Per-session metadata (higher-level state)
-        self._meta: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Dict] = defaultdict(lambda: {
-            "first_seen": time.time(), "last_seen": None,
-            "client": None, "server": None,  # (ip,port) filled on first ClientHello or first direction seen
-            "sni": None, "alpn": [],
-            "client_hello": None,   # parsed dict + ja3
-            "server_hello": None,   # parsed dict + ja3s
-            "negotiated_version": None, "negotiated_version_tuple": None,
-            "negotiated_cipher": None,
-            "negotiated_cipher_name": None,
-            "negotiated_cipher_weak": None,
-            "negotiated_cipher_reasons": [],
-            "offered_only_weak": None,
-            "app_bytes": {self.C2S: 0, self.S2C: 0},
-            "alerts": [], "ccs_seen": False, "legacy_ssl": False,
-            "blocked": False, "quarantined": False,
-            "tags": set()
-        })
-
-        # Optional specialized hooks (set by user)
+        self._buffers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, bytearray]] = defaultdict(
+            lambda: {self.C2S: bytearray(), self.S2C: bytearray()}
+        )
+        self._handshake_buffers: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, bytearray]] = defaultdict(
+            lambda: {self.C2S: bytearray(), self.S2C: bytearray()}
+        )
+        self._stats: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, int]] = defaultdict(
+            lambda: {
+                "records": 0, "handshakes": 0, "handshake_messages": 0,
+                "alerts": 0, "appdata": 0, "ccs": 0, "legacy": 0,
+                "desync_bytes": 0, "malformed": 0,
+            }
+        )
+        self._meta: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict] = defaultdict(self._new_meta)
         self.on_handshake: Optional[Callable[[TLSRecord, Dict], None]] = None
         self.on_application_data: Optional[Callable[[TLSRecord], None]] = None
         self.on_alert: Optional[Callable[[TLSRecord, Dict], None]] = None
         self.on_change_cipher_spec: Optional[Callable[[TLSRecord], None]] = None
         self.on_legacy_ssl: Optional[Callable[[TLSRecord], None]] = None
-
-        # Policy engine + callbacks + event queue
-        # NOTE: Code expects TLSPolicyEngine defined elsewhere with `.evaluate(meta, rec, extra)`
-        self.policy = TLSPolicyEngine()  # provided in your codebase
+        self.policy = TLSPolicyEngine()
         self.on_decision: Optional[Callable[[Tuple, TLSRecord, "TLSPolicyDecision"], None]] = None
         self.on_event: Optional[Callable[[Dict], None]] = None
-        self._event_queue: List[Dict] = []
-
-        # Cipher helper (naming + weak/acceptable checks)
+        self._event_queue = deque(maxlen=self.MAX_EVENT_QUEUE)
         self.ciphers = TLSCipherManager()
+        # Keep policy and metadata classification on the same cipher settings.
+        self.policy.ciphers = self.ciphers
+        for suite in self.policy.block_weak_ciphers:
+            self.ciphers.block_suite(suite)
+        self._lock = threading.RLock()
 
-    # ------------- Utilities -------------
+    @staticmethod
+    def _new_meta() -> Dict[str, Any]:
+        return {
+            "first_seen": time.time(), "last_seen": None,
+            "client": None, "server": None,
+            "sni": None, "alpn": [],
+            "client_hello": None, "server_hello": None,
+            "negotiated_version": None, "negotiated_version_tuple": None,
+            "negotiated_cipher": None, "negotiated_cipher_name": None,
+            "negotiated_cipher_weak": None, "negotiated_cipher_reasons": [],
+            "offered_only_weak": None,
+            "app_bytes": {"c2s": 0, "s2c": 0},
+            "alerts": [], "ccs_seen": False, "legacy_ssl": False,
+            "blocked": False, "quarantined": False, "tags": set(),
+            "last_decision": None, "tls_detected": False,
+            "handshake_complete": False,
+        }
+
+    def _log_message(self, message: str):
+        try:
+            if hasattr(self.log, "log_message"):
+                self.log.log_message(message)
+            elif callable(self.log):
+                self.log(message)
+        except Exception:
+            pass
 
     @staticmethod
     def _looks_like_tls_header(buf: bytes) -> bool:
         if len(buf) < 5:
             return False
-        ct, ver = buf[0], (buf[1] << 8) | buf[2]
-        if ct not in (0x14, 0x15, 0x16, 0x17):  # CCS, Alert, Handshake, AppData
+        content_type = buf[0]
+        version = (buf[1], buf[2])
+        length = (buf[3] << 8) | buf[4]
+        if content_type not in (20, 21, 22, 23):
             return False
-        if ver not in (0x0301, 0x0302, 0x0303, 0x0304):  # TLS1.0 .. TLS1.3
+        if version[0] != 3 or not (0 <= version[1] <= 4):
             return False
-        rlen = (buf[3] << 8) | buf[4]
-        return 0 < rlen <= 18432
+        return 0 <= length <= TLSRecordManager.MAX_RECORD_LENGTH
+
+    @staticmethod
+    def _looks_like_sslv2_client_hello(buf: bytes) -> bool:
+        if len(buf) < 3 or not (buf[0] & 0x80):
+            return False
+        record_length = ((buf[0] & 0x7F) << 8) | buf[1]
+        return 3 <= record_length <= 32767 and buf[2] == 1
 
     def _emit_event(self, key, kind: str, payload: Dict):
         evt = {"ts": time.time(), "flow": key, "kind": kind, "data": payload}
@@ -2502,12 +2526,14 @@ class TLSRecordManager:
         if self.on_event:
             try:
                 self.on_event(evt)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_message(f"[TLS] callback on_event failed: {exc}")
 
     def pop_events(self) -> List[Dict]:
-        out, self._event_queue = self._event_queue, []
-        return out
+        with self._lock:
+            out = list(self._event_queue)
+            self._event_queue.clear()
+            return out
 
     @staticmethod
     def _md5(s: str) -> str:
@@ -2515,65 +2541,101 @@ class TLSRecordManager:
 
     @staticmethod
     def _u16(b: bytes, i: int) -> int:
-        return struct.unpack("!H", b[i:i+2])[0]
+        if i < 0 or i + 2 > len(b):
+            raise ValueError("u16 outside buffer")
+        return struct.unpack("!H", b[i:i + 2])[0]
 
     def _hs_name(self, t: int) -> str:
-        if "TLS_HANDSHAKE_TYPES" in globals():
-            return globals()["TLS_HANDSHAKE_TYPES"].get(t, f"Unknown({t})")
         return TLS_HANDSHAKE_TYPES.get(t, f"Unknown({t})")
 
-    # ------------- Parser core -------------
+    def _record_endpoints(self, key, direction: str, meta: Dict[str, Any]) -> Tuple[str, int, str, int]:
+        session = self._meta[key]
+        client = session.get("client")
+        server = session.get("server")
+        if client and server:
+            if direction == self.C2S:
+                return client[0], int(client[1]), server[0], int(server[1])
+            return server[0], int(server[1]), client[0], int(client[1])
+        return (
+            str(meta["src_ip"]), int(meta["src_port"]),
+            str(meta["dst_ip"]), int(meta["dst_port"]),
+        )
+
+    def _find_next_tls_header(self, buf: bytearray) -> Optional[int]:
+        upper = min(max(0, len(buf) - 4), 65536)
+        for index in range(1, upper + 1):
+            if self._looks_like_tls_header(buf[index:index + 5]):
+                return index
+            if self._looks_like_sslv2_client_hello(buf[index:index + 3]):
+                return index
+        return None
 
     def _parse_records_from_buffer(self, key, direction, ts, meta):
         buf = self._buffers[key][direction]
         out: List[TLSRecord] = []
+        stats = self._stats[key]
 
-        def _ssl_v2_hello_possible(b: bytes) -> bool:
-            return bool(b) and (b[0] & 0x80) and len(b) >= 3
+        if len(buf) > self.MAX_STREAM_BUFFER:
+            drop = len(buf) - self.MAX_STREAM_BUFFER
+            del buf[:drop]
+            stats["desync_bytes"] += drop
+            stats["malformed"] += 1
 
         while True:
-            if len(buf) < 5:
-                if _ssl_v2_hello_possible(buf):
-                    break
-                return out
-
-            if not self._looks_like_tls_header(buf):
-                if _ssl_v2_hello_possible(buf):
-                    rec_len = ((buf[0] & 0x7F) << 8) | buf[1]
-                    total_len = 2 + rec_len
-                    if len(buf) < total_len:
-                        break
-                    payload = bytes(buf[2:total_len]); del buf[:total_len]
-                    rec = TLSRecord(
-                        content_type=0x80, version=(2, 0),
-                        length=len(payload), payload=payload,
-                        ts=ts, src=meta["src_ip"], dst=meta["dst_ip"],
-                        src_port=meta["src_port"], dst_port=meta["dst_port"],
-                        direction=direction
-                    )
-                    out.append(rec)
-                    # mark legacy in meta
-                    self._meta[key]["legacy_ssl"] = True
-                    continue
-                # try to re-sync
-                del buf[:1]
-                continue
-
-            ct, vmaj, vmin = buf[0], buf[1], buf[2]
-            rec_len = struct.unpack("!H", buf[3:5])[0]
-            total_len = 5 + rec_len
-            if len(buf) < total_len:
+            if len(buf) < 3:
                 break
 
-            payload = bytes(buf[5:total_len])
-            del buf[:total_len]
-            rec = TLSRecord(
-                content_type=ct, version=(vmaj, vmin), length=rec_len, payload=payload,
-                ts=ts, src=meta["src_ip"], dst=meta["dst_ip"],
-                src_port=meta["src_port"], dst_port=meta["dst_port"],
-                direction=direction
-            )
-            out.append(rec)
+            if self._looks_like_sslv2_client_hello(buf):
+                record_length = ((buf[0] & 0x7F) << 8) | buf[1]
+                total = 2 + record_length
+                if len(buf) < total:
+                    break
+                payload = bytes(buf[2:total])
+                del buf[:total]
+                src, src_port, dst, dst_port = self._record_endpoints(key, direction, meta)
+                out.append(TLSRecord(0x80, (2, 0), len(payload), payload, ts, src, dst, src_port, dst_port, direction))
+                self._meta[key]["legacy_ssl"] = True
+                continue
+
+            if len(buf) < 5:
+                break
+
+            if not self._looks_like_tls_header(buf):
+                next_header = self._find_next_tls_header(buf)
+                if next_header is not None:
+                    del buf[:next_header]
+                    stats["desync_bytes"] += next_header
+                    continue
+                # Search long plaintext/garbage streams incrementally without
+                # discarding a TLS header that lies beyond the first scan window.
+                drop = min(max(0, len(buf) - 4), 65536)
+                if drop:
+                    del buf[:drop]
+                    stats["desync_bytes"] += drop
+                    continue
+                break
+
+            content_type, major, minor = buf[0], buf[1], buf[2]
+            record_length = (buf[3] << 8) | buf[4]
+            total = 5 + record_length
+            if len(buf) < total:
+                break
+
+            payload = bytes(buf[5:total])
+            del buf[:total]
+            src, src_port, dst, dst_port = self._record_endpoints(key, direction, meta)
+            out.append(TLSRecord(
+                content_type=content_type,
+                version=(major, minor),
+                length=record_length,
+                payload=payload,
+                ts=ts,
+                src=src,
+                dst=dst,
+                src_port=src_port,
+                dst_port=dst_port,
+                direction=direction,
+            ))
         return out
 
     def feed_tcp_segment(self, canonical_key, is_c2s: bool, payload: bytes,
@@ -2581,319 +2643,547 @@ class TLSRecordManager:
                          ts: Optional[float] = None):
         if not payload:
             return
-        ts = ts or time.time()
+        timestamp = time.time() if ts is None else float(ts)
         direction = self.C2S if is_c2s else self.S2C
 
-        # Session meta init/update
-        m = self._meta[canonical_key]
-        m["last_seen"] = ts
-        if m["client"] is None and m["server"] is None:
-            # Seed roles with first direction we see
-            m["client"] = (src_ip, src_port) if is_c2s else (dst_ip, dst_port)
-            m["server"] = (dst_ip, dst_port) if is_c2s else (src_ip, src_port)
-
-        self._buffers[canonical_key][direction].extend(payload)
-        meta = {"src_ip": src_ip, "src_port": src_port, "dst_ip": dst_ip, "dst_port": dst_port}
-        records = self._parse_records_from_buffer(canonical_key, direction, ts, meta)
-
-        for rec in records:
-            self._stats[canonical_key]["records"] += 1
-            self.on_record(rec)
-
-            decision_extra = None
-
-            if rec.content_type == self.HANDSHAKE:
-                self._stats[canonical_key]["handshakes"] += 1
-                hs_info = self._parse_handshake_best_effort(rec.payload, canonical_key, direction)
-                decision_extra = {"handshake": hs_info}
-                if self.on_handshake:
-                    self.on_handshake(rec, hs_info)
-                # Emit high-level event (first time we learn SNI/JA3 etc.)
-                if hs_info.get("messages"):
-                    self._emit_event(canonical_key, "handshake", {"dir": direction, "info": hs_info})
-
-            elif rec.content_type == self.APPLICATION_DATA:
-                self._stats[canonical_key]["appdata"] += 1
-                m["app_bytes"][direction] += rec.length
-                # Soft enforcement: suppress app-data callback if blocked/quarantined
-                if not (m["blocked"] or m["quarantined"]):
-                    if self.on_application_data:
-                        self.on_application_data(rec)
-
-            elif rec.content_type == self.ALERT:
-                self._stats[canonical_key]["alerts"] += 1
-                alert = self._parse_alert(rec.payload)
-                m["alerts"].append(alert)
-                decision_extra = {"alert": alert}
-                if self.on_alert:
-                    self.on_alert(rec, alert)
-                self._emit_event(canonical_key, "alert", {"dir": direction, "alert": alert})
-
-            elif rec.content_type == self.CHANGE_CIPHER_SPEC:
-                self._stats[canonical_key]["ccs"] += 1
-                m["ccs_seen"] = True
-                if self.on_change_cipher_spec:
-                    self.on_change_cipher_spec(rec)
-
-            else:  # legacy / unknown
-                self._stats[canonical_key]["legacy"] += 1
-                m["legacy_ssl"] = True
-                if self.on_legacy_ssl:
-                    self.on_legacy_ssl(rec)
-
-            # Run policy on every record
-            decision = self.policy.evaluate(m, rec, decision_extra)
-            if self.on_decision:
-                try:
-                    self.on_decision(canonical_key, rec, decision)
-                except Exception:
-                    pass
-
-            if decision.action in ("block", "quarantine"):
-                # mark meta; let outer system actually enforce (drop/ban/etc.)
-                if decision.action == "block":
-                    m["blocked"] = True
+        with self._lock:
+            meta = self._meta[canonical_key]
+            if meta.get("last_seen") is None:
+                meta["first_seen"] = timestamp
+            meta["last_seen"] = timestamp
+            if meta["client"] is None or meta["server"] is None:
+                if is_c2s:
+                    meta["client"] = (str(src_ip), int(src_port))
+                    meta["server"] = (str(dst_ip), int(dst_port))
                 else:
-                    m["quarantined"] = True
-                m["tags"].update(decision.tags)
+                    meta["client"] = (str(dst_ip), int(dst_port))
+                    meta["server"] = (str(src_ip), int(src_port))
+
+            self._buffers[canonical_key][direction].extend(bytes(payload))
+            packet_meta = {
+                "src_ip": str(src_ip), "src_port": int(src_port),
+                "dst_ip": str(dst_ip), "dst_port": int(dst_port),
+            }
+            records = self._parse_records_from_buffer(canonical_key, direction, timestamp, packet_meta)
+
+            for rec in records:
+                self._process_record(canonical_key, rec)
+
+    def _process_record(self, canonical_key, rec: TLSRecord):
+        stats = self._stats[canonical_key]
+        meta = self._meta[canonical_key]
+        stats["records"] += 1
+        meta["tls_detected"] = True
+        if rec.version == (3, 0):
+            meta["legacy_ssl"] = True
+
+        try:
+            self.on_record(rec)
+        except Exception as exc:
+            self._log_message(f"[TLS] callback on_record failed: {exc}")
+
+        decision_extra = None
+        if rec.content_type == self.HANDSHAKE:
+            stats["handshakes"] += 1
+            hs_info = self._parse_handshake_best_effort(rec.payload, canonical_key, rec.direction)
+            stats["handshake_messages"] += len(hs_info.get("messages") or [])
+            decision_extra = {"handshake": hs_info}
+            if hs_info.get("messages"):
+                if self.on_handshake:
+                    try:
+                        self.on_handshake(rec, hs_info)
+                    except Exception as exc:
+                        self._log_message(f"[TLS] callback on_handshake failed: {exc}")
+                self._emit_event(canonical_key, "handshake", {"dir": rec.direction, "info": hs_info})
+
+        elif rec.content_type == self.APPLICATION_DATA:
+            stats["appdata"] += 1
+            meta["app_bytes"][rec.direction] += rec.length
+            if not (meta["blocked"] or meta["quarantined"]) and self.on_application_data:
+                try:
+                    self.on_application_data(rec)
+                except Exception as exc:
+                    self._log_message(f"[TLS] callback on_application_data failed: {exc}")
+
+        elif rec.content_type == self.ALERT:
+            stats["alerts"] += 1
+            alert = self._parse_alert(rec.payload)
+            meta["alerts"].append(alert)
+            decision_extra = {"alert": alert}
+            if self.on_alert:
+                try:
+                    self.on_alert(rec, alert)
+                except Exception as exc:
+                    self._log_message(f"[TLS] callback on_alert failed: {exc}")
+            self._emit_event(canonical_key, "alert", {"dir": rec.direction, "alert": alert})
+
+        elif rec.content_type == self.CHANGE_CIPHER_SPEC:
+            stats["ccs"] += 1
+            meta["ccs_seen"] = True
+            if self.on_change_cipher_spec:
+                try:
+                    self.on_change_cipher_spec(rec)
+                except Exception as exc:
+                    self._log_message(f"[TLS] callback on_change_cipher_spec failed: {exc}")
+
+        else:
+            stats["legacy"] += 1
+            meta["legacy_ssl"] = True
+            if self.on_legacy_ssl:
+                try:
+                    self.on_legacy_ssl(rec)
+                except Exception as exc:
+                    self._log_message(f"[TLS] callback on_legacy_ssl failed: {exc}")
+
+        decision = self.policy.evaluate(meta, rec, decision_extra)
+        if self.on_decision:
+            try:
+                self.on_decision(canonical_key, rec, decision)
+            except Exception as exc:
+                self._log_message(f"[TLS] callback on_decision failed: {exc}")
+
+        decision_key = (decision.action, decision.reason, tuple(decision.tags))
+        changed = decision_key != meta.get("last_decision")
+        meta["last_decision"] = decision_key
+        if decision.action in ("block", "quarantine"):
+            meta["blocked"] = decision.action == "block" or meta["blocked"]
+            meta["quarantined"] = decision.action == "quarantine" or meta["quarantined"]
+            meta["tags"].update(decision.tags)
+            if changed:
                 self._emit_event(canonical_key, decision.action, {
-                    "reason": decision.reason, "tags": decision.tags,
-                    "snapshot": self.get_session_summary(canonical_key)
+                    "reason": decision.reason,
+                    "tags": decision.tags,
+                    "snapshot": self.get_session_summary(canonical_key),
                 })
-            elif decision.action == "alert":
-                self._emit_event(canonical_key, "policy_alert", {
-                    "reason": decision.reason, "tags": decision.tags
-                })
+        elif decision.action == "alert" and changed:
+            self._emit_event(canonical_key, "policy_alert", {
+                "reason": decision.reason,
+                "tags": decision.tags,
+            })
 
     def _parse_alert(self, payload: bytes) -> Dict:
         level = payload[0] if len(payload) > 0 else None
-        desc  = payload[1] if len(payload) > 1 else None
-        return {"level": level, "description": desc}
-
-    # ---------------- Handshake (best-effort) ----------------
+        desc = payload[1] if len(payload) > 1 else None
+        return {
+            "level": level,
+            "level_name": _TLS_ALERT_LEVELS.get(level, f"unknown({level})" if level is not None else None),
+            "description": desc,
+            "description_name": _TLS_ALERT_DESCRIPTIONS.get(desc, f"unknown({desc})" if desc is not None else None),
+            "encrypted_or_truncated": len(payload) not in (0, 2),
+        }
 
     def _compute_ja3(self, ver_u16: int, ciphers: List[int], exts: List[int],
                      groups: List[int], ecpts: List[int]) -> Tuple[str, str]:
-        # JA3 string: SSLVersion,CipherSuites,Extensions,EllipticCurves,EllipticCurvePointFormats
-        cs = "-".join(str(x) for x in ciphers)
-        ex = "-".join(str(x) for x in exts)
-        gr = "-".join(str(x) for x in groups)
-        pf = "-".join(str(x) for x in ecpts)
-        ja3 = f"{ver_u16},{cs},{ex},{gr},{pf}"
+        clean_ciphers = [x for x in ciphers if not _is_grease(x)]
+        clean_exts = [x for x in exts if not _is_grease(x)]
+        clean_groups = [x for x in groups if not _is_grease(x)]
+        ja3 = (
+            f"{ver_u16},"
+            f"{'-'.join(str(x) for x in clean_ciphers)},"
+            f"{'-'.join(str(x) for x in clean_exts)},"
+            f"{'-'.join(str(x) for x in clean_groups)},"
+            f"{'-'.join(str(x) for x in ecpts)}"
+        )
         return ja3, self._md5(ja3)
 
     def _compute_ja3s(self, ver_u16: int, cipher: int, exts: List[int]) -> Tuple[str, str]:
-        # JA3S string: SSLVersion,Cipher,Extensions
-        ex = "-".join(str(x) for x in exts)
-        ja3s = f"{ver_u16},{cipher},{ex}"
+        clean_exts = [x for x in exts if not _is_grease(x)]
+        ja3s = f"{ver_u16},{cipher},{'-'.join(str(x) for x in clean_exts)}"
         return ja3s, self._md5(ja3s)
 
     def _parse_handshake_best_effort(self, payload: bytes, key, direction) -> Dict:
-        info = {"messages": []}
-        i = 0
-        while i + 4 <= len(payload):
-            msg_type = payload[i]
-            msg_len = int.from_bytes(payload[i+1:i+4], "big")
-            i += 4
-            if i + msg_len > len(payload):
+        info: Dict[str, Any] = {"messages": [], "partial_bytes": 0}
+        hs_buf = self._handshake_buffers[key][direction]
+        hs_buf.extend(payload)
+
+        if len(hs_buf) > self.MAX_STREAM_BUFFER:
+            self._stats[key]["malformed"] += 1
+            del hs_buf[:-4]
+
+        while len(hs_buf) >= 4:
+            msg_type = hs_buf[0]
+            msg_len = int.from_bytes(hs_buf[1:4], "big")
+            if msg_len > self.MAX_HANDSHAKE_MESSAGE:
+                del hs_buf[0]
+                self._stats[key]["malformed"] += 1
+                continue
+            total = 4 + msg_len
+            if len(hs_buf) < total:
                 break
-            body = payload[i:i+msg_len]; i += msg_len
 
-            entry = {"type_id": msg_type, "type": self._hs_name(msg_type)}
-            if msg_type == 1:  # ClientHello
-                ch = self._parse_client_hello(body)
-                entry.update(ch)
-                # update session meta
-                m = self._meta[key]
-                m["client_hello"] = ch
-                m["sni"] = ch.get("sni") or m.get("sni")
-                if ch.get("alpn"):
-                    m["alpn"] = ch["alpn"]
-                if ch.get("version_tuple"):
-                    m["negotiated_version"] = ch["version"]
-                    m["negotiated_version_tuple"] = ch["version_tuple"]
+            body = bytes(hs_buf[4:total])
+            del hs_buf[:total]
+            entry: Dict[str, Any] = {
+                "type_id": msg_type,
+                "type": self._hs_name(msg_type),
+                "length": msg_len,
+            }
+            meta = self._meta[key]
 
-                # Offered-only-weak detection -> heads-up event
-                m["offered_only_weak"] = ch.get("only_weak_offered")
-                if ch.get("only_weak_offered") is True:
-                    self._emit_event(
-                        key, "policy_alert",
-                        {"reason": "Only weak ciphers offered", "tags": ["weak-ciphers"]}
-                    )
+            if msg_type == 1:
+                parsed = self._parse_client_hello(body)
+                entry.update(parsed)
+                info["client_hello"] = parsed
+                meta["client_hello"] = parsed
+                meta["sni"] = parsed.get("sni") or meta.get("sni")
+                if parsed.get("alpn"):
+                    meta["alpn"] = list(parsed["alpn"])
+                meta["offered_only_weak"] = parsed.get("only_weak_offered")
+                self._emit_event(key, "client_hello", {
+                    "dir": direction,
+                    "sni": meta.get("sni"),
+                    "ja3": parsed.get("ja3_md5"),
+                    "versions": parsed.get("supported_versions"),
+                })
 
-                self._emit_event(key, "client_hello",
-                                 {"dir": direction, "sni": m["sni"], "ja3": ch.get("ja3_md5")})
+            elif msg_type == 2:
+                parsed = self._parse_server_hello(body)
+                entry.update(parsed)
+                info["server_hello"] = parsed
+                meta["server_hello"] = parsed
+                if parsed.get("version_tuple"):
+                    meta["negotiated_version_tuple"] = parsed["version_tuple"]
+                    meta["negotiated_version"] = parsed.get("version_name") or parsed.get("version")
+                meta["negotiated_cipher"] = parsed.get("cipher_suite")
+                meta["negotiated_cipher_name"] = parsed.get("cipher_suite_name")
+                meta["negotiated_cipher_weak"] = parsed.get("cipher_weak")
+                meta["negotiated_cipher_reasons"] = list(parsed.get("cipher_reasons") or [])
+                self._emit_event(key, "server_hello", {
+                    "dir": direction,
+                    "ja3s": parsed.get("ja3s_md5"),
+                    "version": parsed.get("version_name"),
+                    "cipher": parsed.get("cipher_suite_name"),
+                    "hello_retry_request": parsed.get("hello_retry_request", False),
+                })
 
-            elif msg_type == 2:  # ServerHello
-                sh = self._parse_server_hello(body)
-                entry.update(sh)
-                m = self._meta[key]
-                m["server_hello"] = sh
-                if sh.get("version_tuple"):
-                    m["negotiated_version"] = sh["version"]
-                    m["negotiated_version_tuple"] = sh["version_tuple"]
-                m["negotiated_cipher"] = sh.get("cipher_suite")
-
-                # Name + weakness classification of negotiated cipher
-                cs_int = sh.get("cipher_suite_int")
-                if cs_int is not None:
-                    name = self.ciphers.to_name(cs_int)
-                    weak, reasons = self.ciphers.is_weak(cs_int, negotiated=True)
-                    m["negotiated_cipher_name"] = name
-                    m["negotiated_cipher_weak"] = weak
-                    m["negotiated_cipher_reasons"] = reasons or []
-                    if weak:
-                        self._emit_event(
-                            key, "policy_alert",
-                            {"reason": f"Weak negotiated cipher ({','.join(reasons)})" if reasons else "Weak negotiated cipher",
-                             "tags": ["weak-cipher"], "cipher": name}
-                        )
-
-                self._emit_event(key, "server_hello",
-                                 {"dir": direction, "ja3s": sh.get("ja3s_md5")})
+            elif msg_type == 11:
+                entry.update(self._parse_certificate_summary(body, meta))
+            elif msg_type == 20:
+                meta["handshake_complete"] = True
+            elif msg_type == 24 and body:
+                entry["request_update"] = bool(body[0])
+            elif msg_type == 4:
+                entry.update(self._parse_new_session_ticket_summary(body, meta))
 
             info["messages"].append(entry)
+
+        info["partial_bytes"] = len(hs_buf)
         return info
 
     def _parse_client_hello(self, body: bytes) -> Dict:
-        out = {"hello": "client", "sni": None, "version": None, "version_tuple": None,
-               "cipher_suites_count": None, "cipher_suites": [], "extensions": [],
-               "groups": [], "ec_point_formats": [], "alpn": [], "ja3": None, "ja3_md5": None,
-               "only_weak_offered": None}
+        out: Dict[str, Any] = {
+            "hello": "client", "sni": None,
+            "version": None, "version_name": None, "version_tuple": None,
+            "supported_versions": [], "supported_version_tuples": [],
+            "highest_supported_version": None, "highest_supported_version_tuple": None,
+            "cipher_suites_count": None, "cipher_suites": [], "cipher_suite_names": [],
+            "extensions": [], "groups": [], "ec_point_formats": [], "alpn": [],
+            "signature_algorithms": [], "key_share_groups": [],
+            "ja3": None, "ja3_md5": None, "only_weak_offered": None,
+        }
         try:
-            if len(body) < 38:
+            if len(body) < 34:
                 return out
-            # legacy_version
-            ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
-            idx = 2 + 32  # random
-            sid_len = body[idx]; idx += 1 + sid_len
-            cs_len = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
-            out["cipher_suites_count"] = cs_len // 2
-            suites = []
-            for j in range(0, cs_len, 2):
-                suites.append(struct.unpack("!H", body[idx+j:idx+j+2])[0])
-            out["cipher_suites"] = suites
-            idx += cs_len
-            comp_len = body[idx]; idx += 1 + comp_len
+            legacy_version = (body[0], body[1])
+            out["version"] = f"{legacy_version[0]}.{legacy_version[1]}"
+            out["version_name"] = _version_name(legacy_version)
+            out["version_tuple"] = legacy_version
+            idx = 34
+
+            if idx >= len(body):
+                return out
+            sid_len = body[idx]
+            idx += 1
+            if idx + sid_len > len(body):
+                return out
+            idx += sid_len
+
             if idx + 2 > len(body):
                 return out
-            ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
-            end = idx + ext_total
-            ext_types = []
-            groups, ecpts, alpn = [], [], []
+            cs_len = self._u16(body, idx)
+            idx += 2
+            if cs_len % 2 or idx + cs_len > len(body):
+                return out
+            suites = [self._u16(body, pos) for pos in range(idx, idx + cs_len, 2)]
+            idx += cs_len
+            out["cipher_suites_count"] = len(suites)
+            out["cipher_suites"] = suites
+            out["cipher_suite_names"] = [self.ciphers.to_name(s) for s in suites if not _is_grease(s)]
+
+            if idx >= len(body):
+                return out
+            comp_len = body[idx]
+            idx += 1
+            if idx + comp_len > len(body):
+                return out
+            idx += comp_len
+
+            if idx == len(body):
+                ext_total = 0
+            elif idx + 2 <= len(body):
+                ext_total = self._u16(body, idx)
+                idx += 2
+            else:
+                return out
+            end = min(len(body), idx + ext_total)
+
+            ext_types: List[int] = []
+            groups: List[int] = []
+            ecpts: List[int] = []
+            alpn: List[str] = []
+            supported_versions: List[Tuple[int, int]] = []
+            signature_algorithms: List[int] = []
+            key_share_groups: List[int] = []
             sni = None
-            while idx + 4 <= end and end <= len(body):
-                ext_type = struct.unpack("!H", body[idx:idx+2])[0]
-                ext_len  = struct.unpack("!H", body[idx+2:idx+4])[0]
-                ext_data = body[idx+4:idx+4+ext_len]
-                idx += 4 + ext_len
+
+            while idx + 4 <= end:
+                ext_type = self._u16(body, idx)
+                ext_len = self._u16(body, idx + 2)
+                idx += 4
+                if idx + ext_len > end:
+                    break
+                ext_data = body[idx:idx + ext_len]
+                idx += ext_len
                 ext_types.append(ext_type)
-                # SNI (type 0)
-                if ext_type == 0 and len(ext_data) >= 5:
-                    j = 2
-                    while j + 3 < len(ext_data):
-                        name_type = ext_data[j]; j += 1
-                        nlen = struct.unpack("!H", ext_data[j:j+2])[0]; j += 2
-                        if j + nlen > len(ext_data):
+
+                if ext_type == 0 and len(ext_data) >= 2:
+                    list_len = self._u16(ext_data, 0)
+                    pos = 2
+                    limit = min(len(ext_data), 2 + list_len)
+                    while pos + 3 <= limit:
+                        name_type = ext_data[pos]
+                        name_len = self._u16(ext_data, pos + 1)
+                        pos += 3
+                        if pos + name_len > limit:
                             break
-                        servername = ext_data[j:j+nlen].decode("idna", errors="ignore"); j += nlen
-                        if name_type == 0 and servername:
-                            sni = servername; break
-                # supported_groups (10)
+                        raw_name = ext_data[pos:pos + name_len]
+                        pos += name_len
+                        if name_type == 0 and raw_name:
+                            try:
+                                sni = raw_name.decode("idna").rstrip(".")
+                            except Exception:
+                                sni = raw_name.decode("utf-8", "replace").rstrip(".")
+                            break
+
                 elif ext_type == 10 and len(ext_data) >= 2:
-                    ln = struct.unpack("!H", ext_data[:2])[0]
-                    for k in range(0, min(ln, len(ext_data)-2), 2):
-                        groups.append(struct.unpack("!H", ext_data[2+k:2+k+2])[0])
-                # ec_point_formats (11)
-                elif ext_type == 11 and len(ext_data) >= 1:
-                    ln = ext_data[0]
-                    for k in range(ln):
-                        if 1+k < len(ext_data):
-                            ecpts.append(ext_data[1+k])
-                # ALPN (16)
+                    list_len = self._u16(ext_data, 0)
+                    limit = min(len(ext_data), 2 + list_len)
+                    groups.extend(self._u16(ext_data, pos) for pos in range(2, limit - 1, 2))
+
+                elif ext_type == 11 and ext_data:
+                    list_len = ext_data[0]
+                    ecpts.extend(ext_data[1:1 + min(list_len, len(ext_data) - 1)])
+
+                elif ext_type == 13 and len(ext_data) >= 2:
+                    list_len = self._u16(ext_data, 0)
+                    limit = min(len(ext_data), 2 + list_len)
+                    signature_algorithms.extend(self._u16(ext_data, pos) for pos in range(2, limit - 1, 2))
+
                 elif ext_type == 16 and len(ext_data) >= 2:
-                    ln = struct.unpack("!H", ext_data[:2])[0]
-                    j = 2
-                    while j < 2+ln and j < len(ext_data):
-                        l = ext_data[j]; j += 1
-                        proto = ext_data[j:j+l]
-                        alpn.append(proto.decode("utf-8", "ignore"))
-                        j += l
+                    list_len = self._u16(ext_data, 0)
+                    pos = 2
+                    limit = min(len(ext_data), 2 + list_len)
+                    while pos < limit:
+                        proto_len = ext_data[pos]
+                        pos += 1
+                        if pos + proto_len > limit:
+                            break
+                        alpn.append(ext_data[pos:pos + proto_len].decode("ascii", "replace"))
+                        pos += proto_len
+
+                elif ext_type == 43 and ext_data:
+                    list_len = ext_data[0]
+                    limit = min(len(ext_data), 1 + list_len)
+                    for pos in range(1, limit - 1, 2):
+                        supported_versions.append((ext_data[pos], ext_data[pos + 1]))
+
+                elif ext_type == 51 and len(ext_data) >= 2:
+                    list_len = self._u16(ext_data, 0)
+                    pos = 2
+                    limit = min(len(ext_data), 2 + list_len)
+                    while pos + 4 <= limit:
+                        group = self._u16(ext_data, pos)
+                        key_len = self._u16(ext_data, pos + 2)
+                        pos += 4
+                        if pos + key_len > limit:
+                            break
+                        key_share_groups.append(group)
+                        pos += key_len
+
             out["extensions"] = ext_types
             out["groups"] = groups
             out["ec_point_formats"] = ecpts
             out["alpn"] = alpn
             out["sni"] = sni
-            # JA3 uses u16 TLS version (legacy_version here)
-            ver_u16 = (ver[0] << 8) | ver[1]
-            ja3, jmd5 = self._compute_ja3(ver_u16, suites, ext_types, groups, ecpts)
-            out["ja3"] = ja3; out["ja3_md5"] = jmd5
+            out["signature_algorithms"] = signature_algorithms
+            out["key_share_groups"] = key_share_groups
+            out["supported_version_tuples"] = supported_versions
+            out["supported_versions"] = [_version_name(v) for v in supported_versions]
+            non_grease_versions = [v for v in supported_versions if not _is_grease((v[0] << 8) | v[1])]
+            highest = max(non_grease_versions, default=legacy_version)
+            out["highest_supported_version_tuple"] = highest
+            out["highest_supported_version"] = _version_name(highest)
 
-            # Classify the offered list against current cipher policy
-            try:
-                out["only_weak_offered"] = self.ciphers.all_weak(set(suites))
-            except Exception:
-                out["only_weak_offered"] = None
+            ja3, ja3_md5 = self._compute_ja3(
+                (legacy_version[0] << 8) | legacy_version[1],
+                suites, ext_types, groups, ecpts,
+            )
+            out["ja3"] = ja3
+            out["ja3_md5"] = ja3_md5
+            out["only_weak_offered"] = self.ciphers.all_weak(set(suites))
         except Exception:
             pass
         return out
 
     def _parse_server_hello(self, body: bytes) -> Dict:
-        out = {"hello": "server", "version": None, "version_tuple": None,
-               "cipher_suite": None, "cipher_suite_int": None, "cipher_suite_name": None,
-               "cipher_weak": None, "cipher_reasons": [],
-               "extensions": [], "ja3s": None, "ja3s_md5": None}
+        out: Dict[str, Any] = {
+            "hello": "server", "version": None, "version_name": None,
+            "version_tuple": None, "legacy_version_tuple": None,
+            "cipher_suite": None, "cipher_suite_int": None, "cipher_suite_name": None,
+            "cipher_weak": None, "cipher_reasons": [], "extensions": [],
+            "selected_alpn": None, "selected_group": None,
+            "ja3s": None, "ja3s_md5": None, "hello_retry_request": False,
+        }
         try:
             if len(body) < 38:
                 return out
-            ver = (body[0], body[1]); out["version"] = f"{ver[0]}.{ver[1]}"; out["version_tuple"] = ver
-            idx = 2 + 32
-            sid_len = body[idx]; idx += 1 + sid_len
-            cs = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
-            out["cipher_suite_int"] = cs
-            out["cipher_suite"] = f"0x{cs:04x}"
-            # compression(1)
-            if idx < len(body):
-                idx += 1
-            # extensions
+            legacy_version = (body[0], body[1])
+            random_bytes = body[2:34]
+            hrr_random = bytes.fromhex(
+                "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"
+            )
+            out["hello_retry_request"] = random_bytes == hrr_random
+            idx = 34
+            sid_len = body[idx]
+            idx += 1
+            if idx + sid_len + 3 > len(body):
+                return out
+            idx += sid_len
+            cipher = self._u16(body, idx)
+            idx += 2
+            idx += 1  # legacy compression
+
+            ext_types: List[int] = []
+            selected_version = legacy_version
+            selected_alpn = None
+            selected_group = None
             if idx + 2 <= len(body):
-                ext_total = struct.unpack("!H", body[idx:idx+2])[0]; idx += 2
+                ext_total = self._u16(body, idx)
+                idx += 2
                 end = min(len(body), idx + ext_total)
-                ext_types = []
                 while idx + 4 <= end:
-                    et = struct.unpack("!H", body[idx:idx+2])[0]
-                    el = struct.unpack("!H", body[idx+2:idx+4])[0]
-                    idx += 4 + el
-                    ext_types.append(et)
-                out["extensions"] = ext_types
+                    ext_type = self._u16(body, idx)
+                    ext_len = self._u16(body, idx + 2)
+                    idx += 4
+                    if idx + ext_len > end:
+                        break
+                    ext_data = body[idx:idx + ext_len]
+                    idx += ext_len
+                    ext_types.append(ext_type)
+                    if ext_type == 43 and len(ext_data) == 2:
+                        selected_version = (ext_data[0], ext_data[1])
+                    elif ext_type == 16 and len(ext_data) >= 3:
+                        list_len = self._u16(ext_data, 0)
+                        if list_len >= 1 and len(ext_data) >= 3:
+                            proto_len = ext_data[2]
+                            if 3 + proto_len <= len(ext_data):
+                                selected_alpn = ext_data[3:3 + proto_len].decode("ascii", "replace")
+                    elif ext_type == 51 and len(ext_data) >= 2:
+                        selected_group = self._u16(ext_data, 0)
 
-            # Human-friendly name + weakness classification
-            try:
-                name = self.ciphers.to_name(cs)
-                weak, reasons = self.ciphers.is_weak(cs, negotiated=True)
-            except Exception:
-                name, weak, reasons = f"0x{cs:04x}", None, []
-            out["cipher_suite_name"] = name
-            out["cipher_weak"] = weak
-            out["cipher_reasons"] = reasons
-
-            ver_u16 = (ver[0] << 8) | ver[1]
-            ja3s, jmd5 = self._compute_ja3s(ver_u16, cs, out.get("extensions", []))
-            out["ja3s"] = ja3s; out["ja3s_md5"] = jmd5
+            weak, reasons = self.ciphers.is_weak(cipher, negotiated=True)
+            out.update({
+                "legacy_version_tuple": legacy_version,
+                "version_tuple": selected_version,
+                "version": f"{selected_version[0]}.{selected_version[1]}",
+                "version_name": _version_name(selected_version),
+                "cipher_suite_int": cipher,
+                "cipher_suite": f"0x{cipher:04x}",
+                "cipher_suite_name": self.ciphers.to_name(cipher),
+                "cipher_weak": weak,
+                "cipher_reasons": reasons,
+                "extensions": ext_types,
+                "selected_alpn": selected_alpn,
+                "selected_group": selected_group,
+            })
+            ja3s, ja3s_md5 = self._compute_ja3s(
+                (legacy_version[0] << 8) | legacy_version[1], cipher, ext_types
+            )
+            out["ja3s"] = ja3s
+            out["ja3s_md5"] = ja3s_md5
         except Exception:
             pass
         return out
 
-    # -------- Introspection / Control --------
+    def _parse_certificate_summary(self, body: bytes, meta: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"certificate_count": None, "certificate_bytes": None}
+        try:
+            tls13 = meta.get("negotiated_version_tuple") == (3, 4)
+            idx = 0
+            if tls13:
+                if not body:
+                    return result
+                context_len = body[0]
+                idx = 1 + context_len
+            if idx + 3 > len(body):
+                return result
+            list_len = int.from_bytes(body[idx:idx + 3], "big")
+            idx += 3
+            end = min(len(body), idx + list_len)
+            count = 0
+            cert_bytes = 0
+            while idx + 3 <= end:
+                cert_len = int.from_bytes(body[idx:idx + 3], "big")
+                idx += 3
+                if idx + cert_len > end:
+                    break
+                idx += cert_len
+                count += 1
+                cert_bytes += cert_len
+                if tls13:
+                    if idx + 2 > end:
+                        break
+                    ext_len = self._u16(body, idx)
+                    idx += 2 + ext_len
+            result["certificate_count"] = count
+            result["certificate_bytes"] = cert_bytes
+        except Exception:
+            pass
+        return result
+
+    def _parse_new_session_ticket_summary(self, body: bytes, meta: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        try:
+            if meta.get("negotiated_version_tuple") == (3, 4) and len(body) >= 9:
+                result["ticket_lifetime"] = int.from_bytes(body[0:4], "big")
+                result["ticket_age_add"] = int.from_bytes(body[4:8], "big")
+                nonce_len = body[8]
+                idx = 9 + nonce_len
+                if idx + 2 <= len(body):
+                    ticket_len = self._u16(body, idx)
+                    result["ticket_length"] = ticket_len
+            elif len(body) >= 6:
+                result["ticket_lifetime"] = int.from_bytes(body[0:4], "big")
+                result["ticket_length"] = self._u16(body, 4)
+        except Exception:
+            pass
+        return result
+
     def get_stats(self, canonical_key) -> Dict[str, int]:
-        return dict(self._stats.get(canonical_key, {}))
+        with self._lock:
+            return dict(self._stats.get(canonical_key, {}))
 
     def get_session_meta(self, canonical_key) -> Dict:
-        m = self._meta.get(canonical_key, {})
-        # make tags printable
-        if "tags" in m and isinstance(m["tags"], set):
-            m = dict(m); m["tags"] = sorted(m["tags"])
-        return m
+        with self._lock:
+            raw = self._meta.get(canonical_key, {})
+            result = dict(raw)
+            if isinstance(result.get("tags"), set):
+                result["tags"] = sorted(result["tags"])
+            if isinstance(result.get("app_bytes"), dict):
+                result["app_bytes"] = dict(result["app_bytes"])
+            if isinstance(result.get("alerts"), list):
+                result["alerts"] = list(result["alerts"])
+            return result
 
     def get_session_summary(self, canonical_key) -> Dict:
         m = self.get_session_meta(canonical_key)
@@ -2913,74 +3203,77 @@ class TLSRecordManager:
             "ccs_seen": m.get("ccs_seen"), "legacy_ssl": m.get("legacy_ssl"),
             "blocked": m.get("blocked"), "quarantined": m.get("quarantined"),
             "tags": m.get("tags"),
+            "tls_detected": m.get("tls_detected"),
+            "handshake_complete": m.get("handshake_complete"),
+            "stats": self.get_stats(canonical_key),
         }
 
     def sessions(self) -> List[Tuple]:
-        return list(self._meta.keys())
+        with self._lock:
+            return list(self._meta.keys())
 
     def reset_session(self, canonical_key):
-        self._buffers.pop(canonical_key, None)
-        self._stats.pop(canonical_key, None)
-        self._meta.pop(canonical_key, None)
+        with self._lock:
+            self._buffers.pop(canonical_key, None)
+            self._handshake_buffers.pop(canonical_key, None)
+            self._stats.pop(canonical_key, None)
+            self._meta.pop(canonical_key, None)
 
-    # --- Administrative helpers for “doing more” programmatically ---
     def block_session(self, canonical_key, reason="manual block"):
-        m = self._meta.get(canonical_key)
-        if not m:
-            return
-        m["blocked"] = True
-        self._emit_event(canonical_key, "block", {"reason": reason})
+        with self._lock:
+            m = self._meta.get(canonical_key)
+            if not m:
+                return
+            m["blocked"] = True
+            self._emit_event(canonical_key, "block", {"reason": reason})
 
     def quarantine_session(self, canonical_key, reason="manual quarantine"):
-        m = self._meta.get(canonical_key)
-        if not m:
-            return
-        m["quarantined"] = True
-        self._emit_event(canonical_key, "quarantine", {"reason": reason})
+        with self._lock:
+            m = self._meta.get(canonical_key)
+            if not m:
+                return
+            m["quarantined"] = True
+            self._emit_event(canonical_key, "quarantine", {"reason": reason})
 
     def allow_session(self, canonical_key, reason="manual allow"):
-        m = self._meta.get(canonical_key)
-        if not m:
-            return
-        m["blocked"] = False
-        m["quarantined"] = False
-        self._emit_event(canonical_key, "allow", {"reason": reason})
+        with self._lock:
+            m = self._meta.get(canonical_key)
+            if not m:
+                return
+            m["blocked"] = False
+            m["quarantined"] = False
+            m["last_decision"] = None
+            self._emit_event(canonical_key, "allow", {"reason": reason})
 
-    # --- Convenience: tweak cipher policy at runtime ---
     def set_cipher_requirements(self, **kwargs):
-        """
-        Proxy to TLSCipherManager.set_requirements(require_pfs=..., require_aead=...,
-        forbid_cbc_sha1=..., forbid_rc4=..., etc.)
-        """
         self.ciphers.set_requirements(**kwargs)
 
 
 class HandshakeManager:
-    """
-    Tracks TCP 3-way handshakes/teardowns and pipes TLS bytes into TLSRecordManager.
-    Modular helpers and rich analytics (RTT/DUP-ACK/OOO/retransmits/options).
-    """
-    COMMON_TLS_PORTS = {443, 444, 8443, 9443, 10443, 4443}
+    """TCP state tracker and duplicate-safe TLS stream feeder."""
 
-    # State labels
+    COMMON_TLS_PORTS = {
+        443, 444, 465, 563, 636, 853, 989, 990, 992, 993, 994, 995,
+        2083, 2087, 2096, 5223, 5443, 5986, 6443, 7443, 8443, 8883,
+        9443, 10443, 4443,
+    }
+
     SYN_SENT = "SYN_SENT"
-    SYN_ACK  = "SYN_ACK_RECEIVED"
-    EST      = "ESTABLISHED"
-    CLOSING  = "CLOSING"
-    CLOSED   = "CLOSED"
+    SYN_ACK = "SYN_ACK_RECEIVED"
+    EST = "ESTABLISHED"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
 
     def __init__(self, router_logger, arp_manager, nat_manager, rip_manager, packet_writer,
                  tls_record_manager=None,
                  timeout_half_open: int = 60,
                  timeout_established: int = 300):
-        # deps
         self.logger = router_logger
         self.arp_manager = arp_manager
         self.nat_manager = nat_manager
         self.rip_manager = rip_manager
         self.packet_writer = packet_writer
 
-        # TLS plumbing
         self._tls_mgr = tls_record_manager or TLSRecordManager(self.logger)
         self._tls_mgr.on_record = self._on_tls_record
         self._tls_mgr.on_handshake = self._on_tls_handshake
@@ -2989,113 +3282,126 @@ class HandshakeManager:
         self._tls_mgr.on_event = self._on_tls_event
         self._tls_mgr.on_decision = self._on_tls_decision
 
-        # Flow state: key -> dict
-        self._flows: Dict[Tuple[Tuple[str,int],Tuple[str,int]], Dict[str, Any]] = {}
-
-        # last seen TCP pkt per direction for forwarding
+        self._flows: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, Any]] = {}
         self._last_tcp_pkt: Dict[Tuple[Tuple, str], Packet] = {}
-
-        # timeouts
         self.timeout_half_open = int(timeout_half_open)
         self.timeout_established = int(timeout_established)
-
-        # abuse/ban
         self.ban_duration = 300
         self.rate_limit_threshold = 20
         self.rate_limit_period = 60
         self._ban_list: Dict[str, float] = {}
         self._conn_rate: Dict[str, List[float]] = defaultdict(list)
-
-        # threading
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
         self._cleanup_thread.start()
-
-        # optional sender
         self.sniffer = None
+        self.on_flow_new = None
+        self.on_flow_established = None
+        self.on_flow_closed = None
+        self.on_flow_timeout = None
 
-        # external hooks
-        self.on_flow_new = None               # (key, meta) -> None
-        self.on_flow_established = None       # (key, meta) -> None
-        self.on_flow_closed = None            # (key, meta, reason) -> None
-        self.on_flow_timeout = None           # (key, meta, state) -> None
+        # Runtime switches; no constructor signature changes.
+        self.log_tcp_lifecycle = True
+        self.log_non_tls_tcp = False
+        self.log_tls_records = True
+        self.log_tls_application_data = False
+        self.reinject_tls_application_data = False
+        self._log_message("[Handshake] Manager ready (TCP reassembly + passive TLS processing).")
 
-        self.logger.log_message("[Handshake] Manager ready (modular).")
+    def _log_message(self, message: str):
+        try:
+            if hasattr(self.logger, "log_message"):
+                self.logger.log_message(message)
+            elif callable(self.logger):
+                self.logger(message)
+        except Exception:
+            pass
 
-    # ===== public lifecycle =====
     def start(self):
         if not self._cleanup_thread.is_alive():
+            self._stop_event.clear()
             self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
             self._cleanup_thread.start()
-            self.logger.log_message("[Handshake] Cleanup thread started.")
+            self._log_message("[Handshake] Cleanup thread started.")
 
     def stop(self):
         self._stop_event.set()
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=2)
-        self.logger.log_message("[Handshake] Manager stopped.")
+        self._log_message("[Handshake] Manager stopped.")
 
-    # ===== core handler =====
     def handle_packet(self, pkt: Packet, inbound_iface: str) -> bool:
         ip, tcp = self._extract_layers(pkt)
-        if not ip or not tcp:
+        if ip is None or tcp is None:
             return False
 
         now = time.time()
-        src_ip, dst_ip = ip.src, ip.dst
+        src_ip, dst_ip = str(ip.src), str(ip.dst)
         sport, dport = int(tcp.sport), int(tcp.dport)
+        flags = int(tcp.flags)
 
-        # banned src?
         if self._is_banned(src_ip, now):
             return False
 
-        # rate-limit (per FIN close hint later too)
-        self._track_connection_rate(src_ip, now, initial=(tcp.flags & 0x02) != 0)
+        logical_dst_ip, logical_dport = self._nat_reverse_if_needed(ip, tcp, src_ip, sport, dst_ip, dport)
+        key = _get_canonical_session_key(src_ip, sport, logical_dst_ip, logical_dport)
+        with self._lock:
+            is_new_flow = key not in self._flows
+        # Count only a new initial SYN, not SYN-ACKs or SYN retransmissions.
+        self._track_connection_rate(
+            src_ip, now,
+            initial=bool(is_new_flow and flags & 0x02 and not flags & 0x10),
+        )
+        flow = self._get_or_init_flow(key, src_ip, sport, logical_dst_ip, logical_dport, inbound_iface, now)
 
-        # NAT reverse if destined to our public
-        dst_ip, dport = self._nat_reverse_if_needed(ip, tcp, src_ip, sport, dst_ip, dport)
+        flow["last_seen"] = now
+        flow["iface"] = inbound_iface or flow.get("iface")
+        flow["_packet_src"] = (src_ip, sport)
+        flow["_packet_dst"] = (logical_dst_ip, logical_dport)
+        self._refine_roles(flow, src_ip, sport, logical_dst_ip, logical_dport, flags)
 
-        key = _get_canonical_session_key(src_ip, sport, dst_ip, dport)
-        flow = self._get_or_init_flow(key, src_ip, sport, dst_ip, dport, inbound_iface, now)
+        direction = "c2s" if self._is_c2s(flow, src_ip, sport) else "s2c"
+        packet_payload = bytes(tcp.payload) if tcp.payload else b""
+        fingerprint = (
+            direction, int(tcp.seq), int(tcp.ack), flags, len(packet_payload),
+            hashlib.blake2s(packet_payload, digest_size=8).digest() if packet_payload else b"",
+        )
+        duplicate_capture = self._is_duplicate_capture(flow, fingerprint, now)
+        if duplicate_capture:
+            flow["counters"]["duplicate_capture"] += 1
+            return bool(flow.get("tls_detected"))
 
-        # TCP options & metrics (once per direction)
-        self._parse_tcp_options(flow, tcp, src_ip, sport, dst_ip, dport)
-
-        # TCP state machine & metrics
+        self._parse_tcp_options(flow, tcp, src_ip, sport, logical_dst_ip, logical_dport)
         progressed = self._advance_fsm(flow, tcp, now, inbound_iface)
         if progressed == "closed":
             self._close_flow(key, flow, reason="teardown")
             return False
 
-        # TLS feed (post-FSM)
         fed = self._maybe_feed_tls(flow, key, pkt, ip, tcp, now)
-
-        # track last pkt for forwarding
-        direction = "c2s" if self._is_c2s(flow, src_ip, sport) else "s2c"
         self._last_tcp_pkt[(key, direction)] = pkt
-
         return fed
 
-    # ===== helpers: extraction / NAT / flow init =====
     def _extract_layers(self, pkt: Packet):
-        if not (pkt and (pkt.haslayer(IP) or pkt.haslayer(IPv6)) and pkt.haslayer(TCP)):
+        if not pkt or TCP is None:
             return None, None
-        ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
-        tcp = pkt[TCP]
-        return ip, tcp
+        try:
+            if not pkt.haslayer(TCP) or not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
+                return None, None
+            ip = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
+            return ip, pkt[TCP]
+        except Exception:
+            return None, None
 
     def _nat_reverse_if_needed(self, ip, tcp, src_ip, sport, dst_ip, dport):
         try:
-            pub = getattr(self.nat_manager, "public_ip", None)
-            if pub and dst_ip == pub:
+            public_ip = getattr(self.nat_manager, "public_ip", None)
+            if public_ip and dst_ip == public_ip:
                 internal = self.nat_manager.get_internal_from_external(dport, src_ip)
                 if internal:
-                    nid, npt = internal
-                    self.logger.log_message(
-                        f"[Handshake] NAT reverse: {dst_ip}:{dport} -> {nid}:{npt}"
-                    )
-                    return nid, int(npt)
+                    internal_ip, internal_port = internal
+                    self._log_message(f"[Handshake] NAT reverse: {dst_ip}:{dport} -> {internal_ip}:{internal_port}")
+                    return str(internal_ip), int(internal_port)
         except Exception:
             pass
         return dst_ip, dport
@@ -3109,335 +3415,511 @@ class HandshakeManager:
                 "state": None,
                 "first_seen": now,
                 "last_seen": now,
-                "client": (sip, sport),  # initial guess; refined by FSM
-                "server": (dip, dport),
+                "client": (str(sip), int(sport)),
+                "server": (str(dip), int(dport)),
                 "iface": iface,
-                "syn_ts": None,          # for RTT
+                "syn_ts": None,
                 "synack_ts": None,
                 "rtt_smoothed": None,
                 "counters": defaultdict(int),
-                "tcp_opts": {"c2s": {}, "s2c": {}},  # MSS/WS/SACK/TS per dir
+                "tcp_opts": {"c2s": {}, "s2c": {}},
                 "dup_acks": {"c2s": 0, "s2c": 0},
-                "seq_track": {           # per-dir sequence tracking
-                    "c2s": {"last_seq": None, "seen": set()},
-                    "s2c": {"last_seq": None, "seen": set()},
+                "seq_track": {
+                    "c2s": {"last_seq": None, "last_ack": None, "expected": None, "seen": set()},
+                    "s2c": {"last_seq": None, "last_ack": None, "expected": None, "seen": set()},
+                },
+                "tls_stream": {
+                    "c2s": {"next_seq": None, "pending": {}, "pending_bytes": 0},
+                    "s2c": {"next_seq": None, "pending": {}, "pending_bytes": 0},
                 },
                 "app_bytes": {"c2s": 0, "s2c": 0},
+                "fin_seen": set(),
+                "directions_seen": set(),
+                "recent_packets": {},
+                "tls_detected": False,
+                "tls_candidate": False,
+                "established_notified": False,
+                "midstream": False,
             }
             self._flows[key] = flow
         if callable(self.on_flow_new):
-            try: self.on_flow_new(key, flow)
-            except Exception: pass
+            try:
+                self.on_flow_new(key, flow)
+            except Exception:
+                pass
         return flow
 
-    # ===== helpers: TCP option parsing / RTT =====
+    def _refine_roles(self, flow, sip, sport, dip, dport, flags: int):
+        src = (str(sip), int(sport))
+        dst = (str(dip), int(dport))
+        if flags & 0x02 and not flags & 0x10:
+            flow["client"], flow["server"] = src, dst
+            return
+        if flags & 0x02 and flags & 0x10:
+            flow["client"], flow["server"] = dst, src
+            return
+        current_client = flow.get("client")
+        current_server = flow.get("server")
+        if src == current_client or src == current_server:
+            return
+        if dport in self.COMMON_TLS_PORTS and sport not in self.COMMON_TLS_PORTS:
+            flow["client"], flow["server"] = src, dst
+        elif sport in self.COMMON_TLS_PORTS and dport not in self.COMMON_TLS_PORTS:
+            flow["client"], flow["server"] = dst, src
+
+    def _is_duplicate_capture(self, flow: Dict[str, Any], fingerprint: Tuple[Any, ...], now: float) -> bool:
+        recent = flow["recent_packets"]
+        previous = recent.get(fingerprint)
+        recent[fingerprint] = now
+        if len(recent) > 2048:
+            cutoff = now - 5.0
+            for key, timestamp in list(recent.items()):
+                if timestamp < cutoff:
+                    recent.pop(key, None)
+        # Same TCP packet observed on another capture interface within 250 ms.
+        return previous is not None and now - previous <= 0.250
+
     def _parse_tcp_options(self, flow, tcp, sip, sport, dip, dport):
         try:
-            opts = tcp.options or []
+            options = tcp.options or []
         except Exception:
-            opts = []
+            options = []
         direction = "c2s" if self._is_c2s(flow, sip, sport) else "s2c"
         store = flow["tcp_opts"][direction]
         updated = False
-        for k, v in opts:
-            if k == "MSS" and "mss" not in store:
-                store["mss"] = int(v); updated = True
-            elif k == "WScale" and "wscale" not in store:
-                store["wscale"] = int(v); updated = True
-            elif k == "SAckOK" and "sack_ok" not in store:
+        for key, value in options:
+            if key == "MSS" and "mss" not in store:
+                store["mss"] = int(value); updated = True
+            elif key == "WScale" and "wscale" not in store:
+                store["wscale"] = int(value); updated = True
+            elif key == "SAckOK" and "sack_ok" not in store:
                 store["sack_ok"] = True; updated = True
-            elif k == "Timestamp" and "ts" not in store and isinstance(v, tuple) and len(v) == 2:
-                store["ts"] = {"tsval": int(v[0]), "tsecr": int(v[1])}; updated = True
-        if updated:
-            self.logger.log_message(
-                f"[Handshake] ⚙️ TCP opts {direction} mss={store.get('mss')} ws={store.get('wscale')} "
-                f"sack={store.get('sack_ok')} ts={store.get('ts') is not None}"
+            elif key == "Timestamp" and "ts" not in store and isinstance(value, tuple) and len(value) == 2:
+                store["ts"] = {"tsval": int(value[0]), "tsecr": int(value[1])}; updated = True
+        if updated and self._should_log_flow(flow):
+            self._log_message(
+                f"[Handshake] TCP opts {direction} mss={store.get('mss')} "
+                f"ws={store.get('wscale')} sack={store.get('sack_ok')} ts={store.get('ts') is not None}"
             )
 
     def _update_rtt(self, flow, now, reason: str):
-        """Update smoothed RTT using SYN/SYN-ACK or TS echo."""
         rtt = None
-        # handshake-based
-        if flow["syn_ts"] and flow["synack_ts"] and reason == "handshake":
-            rtt = max(0.0, flow["synack_ts"] - flow["syn_ts"])
-        # TS-based (best-effort): if we ever had TS both ways, use echo diff
-        # (left as placeholder for your advanced TS tracking if desired)
+        if flow.get("syn_ts") is not None and flow.get("synack_ts") is not None and reason == "handshake":
+            rtt = max(0.0, float(flow["synack_ts"]) - float(flow["syn_ts"]))
         if rtt is None:
             return
-        alpha = 0.125
         if flow["rtt_smoothed"] is None:
             flow["rtt_smoothed"] = rtt
         else:
-            flow["rtt_smoothed"] = (1 - alpha) * flow["rtt_smoothed"] + alpha * rtt
-        self.logger.log_message(f"[Handshake] ⏱️ RTT update ({reason}): {flow['rtt_smoothed']:.4f}s")
+            flow["rtt_smoothed"] = 0.875 * flow["rtt_smoothed"] + 0.125 * rtt
+        if self._should_log_flow(flow):
+            self._log_message(f"[Handshake] RTT ({reason}) {flow['rtt_smoothed'] * 1000.0:.2f} ms")
 
-    # ===== helpers: FSM / metrics =====
     def _advance_fsm(self, flow, tcp, now, iface) -> Optional[str]:
-        st = flow["state"]
-        src, sport = tcp.sport, tcp.sport  # keep for logs (ints already)
+        state = flow["state"]
         flags = int(tcp.flags)
-
-        # retransmit/OOO quick checks (per-dir)
-        direction = "c2s" if self._is_c2s(flow, flow['client'][0], flow['client'][1]) else "s2c"
+        packet_src = flow.get("_packet_src")
+        direction = "c2s" if packet_src and packet_src == flow.get("client") else "s2c"
+        flow["directions_seen"].add(direction)
         self._track_seq(flow, direction, tcp)
 
-        # FSM
-        if flags == 0x02:  # SYN
-            if st is None:
-                flow["state"] = self.SYN_SENT
-                flow["syn_ts"] = now
-                flow["last_seen"] = now
-                self.logger.log_message(f"[Handshake] 🔓 SYN {flow['client'][0]}:{flow['client'][1]} -> {flow['server'][0]}:{flow['server'][1]} on {iface}")
-            else:
-                flow["counters"]["syn_retx"] += 1
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] 🔁 SYN retransmit")
-            return None
+        syn = bool(flags & 0x02)
+        ack = bool(flags & 0x10)
+        fin = bool(flags & 0x01)
+        rst = bool(flags & 0x04)
+        payload_len = len(bytes(tcp.payload) if tcp.payload else b"")
 
-        if flags == 0x12:  # SYN+ACK
-            if st == self.SYN_SENT:
-                flow["state"] = self.SYN_ACK
-                flow["synack_ts"] = now
-                flow["last_seen"] = now
-                self._update_rtt(flow, now, "handshake")
-                self.logger.log_message("[Handshake] 🔐 SYN-ACK received")
-            elif st == self.SYN_ACK:
-                flow["counters"]["synack_retx"] += 1
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] 🔁 SYN-ACK retransmit")
-            else:
-                # midstream (didn't see SYN) → infer ESTABLISHED
-                flow["state"] = self.EST
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] ✅ Inferred ESTABLISHED by SYN-ACK (midstream)")
-                self._on_established(flow)
-            return None
-
-        if flags & 0x10 and not (flags & 0x01) and not (flags & 0x04):  # ACK (pure)
-            if st == self.SYN_ACK:
-                flow["state"] = self.EST
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] ✅ ESTABLISHED")
-                self._on_established(flow)
-            elif st in (self.EST, self.CLOSING):
-                flow["last_seen"] = now
-            else:
-                # midstream pickup: ACK-only
-                if st is None:
-                    flow["state"] = self.EST
-                    flow["last_seen"] = now
-                    self.logger.log_message("[Handshake] ✅ Implicit ESTABLISHED by ACK-only (midstream)")
-                    self._on_established(flow)
-            return None
-
-        if flags & 0x01:  # FIN
-            if st == self.EST:
-                flow["state"] = self.CLOSING
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] 🔻 CLOSING (FIN)")
-            elif st == self.CLOSING:
-                flow["state"] = self.CLOSED
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] ❎ CLOSED (ACK after FIN)")
-                return "closed"
-            else:
-                self.logger.log_message(f"[Handshake] ⚠️ FIN in state {st or 'None'}")
-            return None
-
-        if flags & 0x04:  # RST
+        if rst:
             flow["state"] = self.CLOSED
             flow["last_seen"] = now
-            self.logger.log_message("[Handshake] ❌ CLOSED (RST)")
+            if self._should_log_flow(flow):
+                self._log_message("[Handshake] CLOSED (RST)")
             return "closed"
 
-        # data-bearing ACK/PSH combinations → keep alive freshness
-        if (flags & 0x10) and (len(bytes(tcp.payload) or b"") > 0):
+        if syn and not ack:
+            stream = flow["tls_stream"][direction]
+            initial_next = (int(tcp.seq) + 1) & 0xFFFFFFFF
+            if state in (None, self.CLOSED):
+                flow["state"] = self.SYN_SENT
+                flow["syn_ts"] = now
+                stream["next_seq"] = initial_next
+                if self._should_log_flow(flow):
+                    c_ip, c_port = flow["client"]
+                    s_ip, s_port = flow["server"]
+                    self._log_message(f"[Handshake] SYN {c_ip}:{c_port} -> {s_ip}:{s_port} on {iface}")
+            else:
+                flow["counters"]["syn_retx"] += 1
             flow["last_seen"] = now
+            return None
 
+        if syn and ack:
+            stream = flow["tls_stream"][direction]
+            stream["next_seq"] = (int(tcp.seq) + 1) & 0xFFFFFFFF
+            if state == self.SYN_SENT:
+                flow["state"] = self.SYN_ACK
+                flow["synack_ts"] = now
+                self._update_rtt(flow, now, "handshake")
+                if self._should_log_flow(flow):
+                    self._log_message("[Handshake] SYN-ACK received")
+            elif state == self.SYN_ACK:
+                flow["counters"]["synack_retx"] += 1
+            else:
+                flow["state"] = self.SYN_ACK
+                flow["midstream"] = True
+            flow["last_seen"] = now
+            return None
+
+        if fin:
+            flow["fin_seen"].add(direction)
+            flow["state"] = self.CLOSING
+            flow["last_seen"] = now
+            if self._should_log_flow(flow):
+                self._log_message(f"[Handshake] FIN ({direction})")
+            if len(flow["fin_seen"]) >= 2:
+                flow["state"] = self.CLOSED
+                return "closed"
+            return None
+
+        if ack:
+            if state == self.SYN_ACK and direction == "c2s":
+                flow["state"] = self.EST
+                flow["last_seen"] = now
+                if self._should_log_flow(flow):
+                    self._log_message("[Handshake] ESTABLISHED")
+                self._on_established(flow)
+            elif state in (self.EST, self.CLOSING):
+                flow["last_seen"] = now
+            elif state is None and (payload_len > 0 or len(flow["directions_seen"]) >= 2):
+                flow["state"] = self.EST
+                flow["midstream"] = True
+                flow["last_seen"] = now
+                self._on_established(flow)
         return None
 
     def _track_seq(self, flow, direction: str, tcp):
-        """Simple sequence/retransmit/out-of-order heuristics."""
         seq = int(tcp.seq)
         ack = int(tcp.ack)
-        payload_len = len(bytes(tcp.payload) or b"")
-        last_seq = flow["seq_track"][direction]["last_seq"]
+        flags = int(tcp.flags)
+        payload_len = len(bytes(tcp.payload) if tcp.payload else b"")
+        state = flow["seq_track"][direction]
+        last_seq = state.get("last_seq")
+        last_ack = state.get("last_ack")
 
-        # DUP-ACK: ack same, no payload, ACK flag
-        if (int(tcp.flags) & 0x10) and payload_len == 0 and seq == last_seq:
+        if flags & 0x10 and payload_len == 0 and last_ack == ack:
             flow["dup_acks"][direction] += 1
-            if flow["dup_acks"][direction] >= 3:
-                self.logger.log_message(f"[Handshake] 📎 {direction} potential fast-retransmit (>=3 DUP-ACK)")
+            if flow["dup_acks"][direction] == 3 and self._should_log_flow(flow):
+                self._log_message(f"[Handshake] {direction} three duplicate ACKs (ack={ack})")
         else:
             flow["dup_acks"][direction] = 0
 
-        # retransmit/OOO (very light heuristic)
-        if last_seq is not None and seq < last_seq:
-            flow["counters"][f"{direction}_ooo"] += 1
-        if last_seq is not None and seq == last_seq and payload_len > 0:
-            flow["counters"][f"{direction}_retrans"] += 1
+        segment_advance = payload_len + (1 if flags & 0x02 else 0) + (1 if flags & 0x01 else 0)
+        expected = state.get("expected")
+        if payload_len:
+            if expected is not None and seq < expected:
+                flow["counters"][f"{direction}_retrans_or_overlap"] += 1
+            elif expected is not None and seq > expected:
+                flow["counters"][f"{direction}_ooo"] += 1
+            state["expected"] = max(expected or 0, seq + segment_advance)
 
-        flow["seq_track"][direction]["last_seq"] = seq
-
-        # keepalive heuristic: zero payload, seq = prev ack - 1, ACK set (not fully enforced here)
-        # (left as a log-only: detailed keepalive pattern might be added if needed)
+        state["last_seq"] = seq
+        state["last_ack"] = ack
+        if last_seq == seq and payload_len:
+            flow["counters"][f"{direction}_same_seq"] += 1
 
     def _on_established(self, flow):
-        # NAT stateful mapping hint (optional)
+        if flow.get("established_notified"):
+            return
+        flow["established_notified"] = True
         try:
-            (c_ip, c_pt), (s_ip, s_pt) = flow["client"], flow["server"]
+            (client_ip, client_port), (server_ip, server_port) = flow["client"], flow["server"]
             if hasattr(self.nat_manager, "add_stateful_mapping"):
-                self.nat_manager.add_stateful_mapping(src_ip=c_ip, src_port=c_pt, dst_ip=s_ip, dst_port=s_pt)
+                self.nat_manager.add_stateful_mapping(
+                    src_ip=client_ip, src_port=client_port,
+                    dst_ip=server_ip, dst_port=server_port,
+                )
         except Exception:
             pass
         if callable(self.on_flow_established):
-            try: self.on_flow_established(None, flow)
-            except Exception: pass
+            try:
+                self.on_flow_established(None, flow)
+            except Exception:
+                pass
 
-    # ===== helpers: TLS feed =====
+    @staticmethod
+    def _seq_less(a: int, b: int) -> bool:
+        return ((a - b) & 0xFFFFFFFF) > 0x7FFFFFFF
+
+    def _reassemble_payload(self, flow: Dict[str, Any], direction: str, seq: int, payload: bytes) -> bytes:
+        if not payload:
+            return b""
+        stream = flow["tls_stream"][direction]
+        next_seq = stream.get("next_seq")
+        pending: Dict[int, bytes] = stream["pending"]
+
+        if next_seq is None:
+            next_seq = seq
+            stream["next_seq"] = next_seq
+
+        # Trim bytes already delivered (retransmission or overlap).
+        if seq != next_seq and self._seq_less(seq, next_seq):
+            overlap = (next_seq - seq) & 0xFFFFFFFF
+            if overlap >= len(payload):
+                flow["counters"][f"{direction}_tls_duplicate"] += 1
+                return b""
+            payload = payload[overlap:]
+            seq = next_seq
+            flow["counters"][f"{direction}_tls_overlap_trim"] += 1
+
+        if seq != next_seq:
+            old = pending.get(seq)
+            if old is None or len(payload) > len(old):
+                pending[seq] = payload
+            stream["pending_bytes"] = sum(len(v) for v in pending.values())
+            if stream["pending_bytes"] > 2 * 1024 * 1024:
+                # Bound memory on a permanently missing segment.
+                oldest = sorted(pending)[: max(1, len(pending) // 2)]
+                for key in oldest:
+                    pending.pop(key, None)
+                stream["pending_bytes"] = sum(len(v) for v in pending.values())
+                flow["counters"][f"{direction}_tls_pending_drop"] += 1
+            return b""
+
+        chunks = [payload]
+        next_seq = (next_seq + len(payload)) & 0xFFFFFFFF
+        while True:
+            exact = pending.pop(next_seq, None)
+            if exact is not None:
+                chunks.append(exact)
+                next_seq = (next_seq + len(exact)) & 0xFFFFFFFF
+                continue
+
+            # Handle a pending segment that overlaps next_seq.
+            overlap_key = None
+            overlap_data = None
+            for candidate_seq, candidate_data in pending.items():
+                if self._seq_less(candidate_seq, next_seq):
+                    overlap = (next_seq - candidate_seq) & 0xFFFFFFFF
+                    if overlap < len(candidate_data):
+                        overlap_key = candidate_seq
+                        overlap_data = candidate_data[overlap:]
+                        break
+            if overlap_key is None:
+                break
+            pending.pop(overlap_key, None)
+            chunks.append(overlap_data)
+            next_seq = (next_seq + len(overlap_data)) & 0xFFFFFFFF
+
+        stream["next_seq"] = next_seq
+        stream["pending_bytes"] = sum(len(v) for v in pending.values())
+        return b"".join(chunks)
+
     def _maybe_feed_tls(self, flow, key, pkt, ip, tcp, now) -> bool:
-        st = flow["state"]
-        if st != self.EST:
-            # midstream pickup if bytes look TLS-ish
-            payload = bytes(tcp.payload) if tcp.payload else b""
-            if payload and self._looks_tlsish(payload):
-                flow["state"] = self.EST
-                flow["last_seen"] = now
-                self.logger.log_message("[Handshake] ✅ Implicit ESTABLISHED by TLS payload")
-            else:
-                return False
-
         payload = bytes(tcp.payload) if tcp.payload else b""
         if not payload:
             return False
 
-        is_c2s = self._is_c2s(flow, ip.src, tcp.sport)
-        dir_key = "c2s" if is_c2s else "s2c"
+        src_ip, src_port = str(ip.src), int(tcp.sport)
+        is_c2s = self._is_c2s(flow, src_ip, src_port)
+        direction = "c2s" if is_c2s else "s2c"
+        server_port = int(flow.get("server", ("", 0))[1])
 
-        # remember last packet for optional forwarding
-        self._last_tcp_pkt[(key, dir_key)] = pkt
+        should_inspect = (
+            bool(flow.get("tls_detected"))
+            or bool(flow.get("tls_candidate"))
+            or server_port in self.COMMON_TLS_PORTS
+            or self._looks_tlsish(payload)
+            or bool(flow["tls_stream"][direction]["pending"])
+        )
+        if not should_inspect:
+            return False
 
-        # feed to TLS manager
+        contiguous = self._reassemble_payload(flow, direction, int(tcp.seq), payload)
+        if not contiguous:
+            return bool(flow.get("tls_detected"))
+
+        if self._looks_tlsish(contiguous):
+            flow["tls_candidate"] = True
+
+        before = self._tls_mgr.get_stats(key).get("records", 0)
+        client = flow.get("client")
+        server = flow.get("server")
+        if is_c2s and client and server:
+            feed_src_ip, feed_src_port = client
+            feed_dst_ip, feed_dst_port = server
+        elif client and server:
+            feed_src_ip, feed_src_port = server
+            feed_dst_ip, feed_dst_port = client
+        else:
+            feed_src_ip, feed_src_port = str(ip.src), int(tcp.sport)
+            feed_dst_ip, feed_dst_port = str(ip.dst), int(tcp.dport)
+
         try:
             self._tls_mgr.feed_tcp_segment(
                 canonical_key=key,
                 is_c2s=is_c2s,
-                payload=payload,
-                src_ip=ip.src, src_port=int(tcp.sport),
-                dst_ip=ip.dst, dst_port=int(tcp.dport),
-                ts=time.time()
+                payload=contiguous,
+                src_ip=feed_src_ip, src_port=int(feed_src_port),
+                dst_ip=feed_dst_ip, dst_port=int(feed_dst_port),
+                ts=now,
             )
-        except Exception as e:
-            self.logger.log_message(f"[TLS] ❌ feed error: {e}")
+        except Exception as exc:
+            self._log_message(f"[TLS] feed error: {exc}")
             return False
 
-        # simple bytes accounting
-        flow["app_bytes"][dir_key] += len(payload)
-        return True
+        after = self._tls_mgr.get_stats(key).get("records", 0)
+        parsed = after > before
+        if parsed:
+            flow["tls_detected"] = True
+            if flow.get("state") not in (self.EST, self.CLOSING):
+                flow["state"] = self.EST
+                flow["midstream"] = True
+                self._on_established(flow)
+        flow["app_bytes"][direction] += len(contiguous)
+        self._last_tcp_pkt[(key, direction)] = pkt
+        return parsed or bool(flow.get("tls_detected"))
 
     @staticmethod
     def _looks_tlsish(b: bytes) -> bool:
         if len(b) >= 5 and TLSRecordManager._looks_like_tls_header(b):
             return True
-        # SSLv2 hello possibility
-        return bool(b) and (b[0] & 0x80) and len(b) >= 3
+        return TLSRecordManager._looks_like_sslv2_client_hello(b)
 
     def _is_c2s(self, flow, src_ip, src_port) -> bool:
-        # prefer stored roles if established
-        c = flow.get("client")
-        if c and (src_ip, int(src_port)) == c:
+        endpoint = (str(src_ip), int(src_port))
+        client = flow.get("client")
+        server = flow.get("server")
+        if client and endpoint == client:
             return True
-        # heuristic by port
-        dport = flow.get("server", ("", 0))[1]
-        if dport in self.COMMON_TLS_PORTS and int(src_port) not in self.COMMON_TLS_PORTS:
+        if server and endpoint == server:
+            return False
+        if server and int(server[1]) in self.COMMON_TLS_PORTS and int(src_port) not in self.COMMON_TLS_PORTS:
             return True
-        return False
+        if int(src_port) in self.COMMON_TLS_PORTS:
+            return False
+        return True
 
-    # ===== cleanup / bans / rate =====
+    def _should_log_flow(self, flow: Dict[str, Any]) -> bool:
+        if not self.log_tcp_lifecycle:
+            return False
+        if self.log_non_tls_tcp:
+            return True
+        server_port = int(flow.get("server", ("", 0))[1])
+        return bool(flow.get("tls_detected") or flow.get("tls_candidate") or server_port in self.COMMON_TLS_PORTS)
+
     def _cleanup_loop(self):
         while not self._stop_event.is_set():
             now = time.time()
-            timed_out: List[Tuple] = []
+            expired_bans: List[str] = []
+            timed_out: List[Tuple[Any, Dict[str, Any], str]] = []
             with self._lock:
-                # bans expire
-                for ip, exp in list(self._ban_list.items()):
-                    if now >= exp:
-                        del self._ban_list[ip]
-                        self.logger.log_message(f"[Handshake][BAN] ✅ Ban expired for {ip}")
+                for ip, expires in list(self._ban_list.items()):
+                    if now >= expires:
+                        self._ban_list.pop(ip, None)
+                        expired_bans.append(ip)
 
-                # flows timeout
                 for key, flow in list(self._flows.items()):
-                    st = flow["state"]
-                    tmo = self.timeout_half_open if st in (None, self.SYN_SENT, self.SYN_ACK) else self.timeout_established
-                    if (now - flow["last_seen"]) > tmo:
-                        timed_out.append((key, flow))
-                        del self._flows[key]
+                    state = flow.get("state")
+                    if state == self.CLOSED:
+                        timed_out.append((key, flow, state))
+                        continue
+                    timeout = self.timeout_half_open if state in (None, self.SYN_SENT, self.SYN_ACK) else self.timeout_established
+                    if now - float(flow.get("last_seen", now)) > timeout:
+                        timed_out.append((key, flow, state or "UNKNOWN"))
 
-            for key, flow in timed_out:
-                self.logger.log_message(f"[Handshake] ⌛ Timeout {flow.get('state')} for {key}")
-                if callable(self.on_flow_timeout):
-                    try: self.on_flow_timeout(key, flow, flow.get("state"))
-                    except Exception: pass
+            for ip in expired_bans:
+                self._log_message(f"[Handshake][BAN] Ban expired for {ip}")
+            for key, flow, state in timed_out:
+                if state != self.CLOSED and self._should_log_flow(flow):
+                    self._log_message(f"[Handshake] Timeout {state} for {key}")
+                if state != self.CLOSED and callable(self.on_flow_timeout):
+                    try:
+                        self.on_flow_timeout(key, flow, state)
+                    except Exception:
+                        pass
+                self._close_flow(key, flow, reason="timeout" if state != self.CLOSED else "closed")
 
             self._stop_event.wait(1.0)
 
     def _is_banned(self, ip: str, now: float) -> bool:
-        exp = self._ban_list.get(ip)
-        return bool(exp and now < exp)
+        expires = self._ban_list.get(ip)
+        return bool(expires and now < expires)
 
     def _track_connection_rate(self, ip: str, now: float, initial: bool):
         if not initial:
             return
-        q = self._conn_rate[ip]
-        q.append(now)
-        # keep only recent
-        self._conn_rate[ip] = [t for t in q if now - t <= self.rate_limit_period]
-        if len(self._conn_rate[ip]) > self.rate_limit_threshold:
+        queue = self._conn_rate[ip]
+        cutoff = now - self.rate_limit_period
+        queue[:] = [timestamp for timestamp in queue if timestamp >= cutoff]
+        queue.append(now)
+        if len(queue) > self.rate_limit_threshold:
             self._ban_list[ip] = now + self.ban_duration
-            del self._conn_rate[ip]
-            self.logger.log_message(f"[Handshake][BAN] 🚫 {ip} banned ({self.ban_duration}s) for connection burst")
+            self._conn_rate.pop(ip, None)
+            self._log_message(f"[Handshake][BAN] {ip} banned for {self.ban_duration}s after connection burst")
 
-    # ===== flow close / snapshots / admin =====
     def _close_flow(self, key, flow, reason="closed"):
+        try:
+            flow["tls"] = self._tls_mgr.get_session_summary(key)
+        except Exception:
+            flow["tls"] = None
         if callable(self.on_flow_closed):
-            try: self.on_flow_closed(key, flow, reason)
-            except Exception: pass
-        # nothing else—GC handled in caller or cleanup
+            try:
+                self.on_flow_closed(key, flow, reason)
+            except Exception:
+                pass
+        with self._lock:
+            if self._flows.get(key) is flow:
+                self._flows.pop(key, None)
+            self._last_tcp_pkt.pop((key, "c2s"), None)
+            self._last_tcp_pkt.pop((key, "s2c"), None)
+        self._tls_mgr.reset_session(key)
 
     def snapshot_flow(self, key) -> Optional[Dict[str, Any]]:
-        f = self._flows.get(key)
-        if not f:
-            return None
-        return {
-            "state": f["state"],
-            "first_seen": f["first_seen"],
-            "last_seen": f["last_seen"],
-            "client": f["client"],
-            "server": f["server"],
-            "rtt": f["rtt_smoothed"],
-            "counters": dict(f["counters"]),
-            "dup_acks": dict(f["dup_acks"]),
-            "tcp_opts": {
-                "c2s": dict(f["tcp_opts"]["c2s"]),
-                "s2c": dict(f["tcp_opts"]["s2c"]),
-            },
-            "app_bytes": dict(f["app_bytes"]),
-        }
+        with self._lock:
+            flow = self._flows.get(key)
+            if not flow:
+                return None
+            result = {
+                "state": flow["state"],
+                "first_seen": flow["first_seen"],
+                "last_seen": flow["last_seen"],
+                "client": flow["client"],
+                "server": flow["server"],
+                "rtt": flow["rtt_smoothed"],
+                "counters": dict(flow["counters"]),
+                "dup_acks": dict(flow["dup_acks"]),
+                "tcp_opts": {
+                    "c2s": dict(flow["tcp_opts"]["c2s"]),
+                    "s2c": dict(flow["tcp_opts"]["s2c"]),
+                },
+                "app_bytes": dict(flow["app_bytes"]),
+                "tls_detected": bool(flow.get("tls_detected")),
+                "midstream": bool(flow.get("midstream")),
+            }
+        result["tls"] = self._tls_mgr.get_session_summary(key) if flow.get("tls_detected") else None
+        return result
 
     def snapshot_all(self) -> List[Dict[str, Any]]:
-        return [self.snapshot_flow(k) for k in list(self._flows.keys()) if self.snapshot_flow(k)]
+        with self._lock:
+            keys = list(self._flows.keys())
+        snapshots = []
+        for key in keys:
+            snapshot = self.snapshot_flow(key)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
 
     def export_json(self) -> str:
         return json.dumps(self.snapshot_all(), indent=2, default=str)
 
     def block_ip(self, ip: str, seconds: Optional[int] = None):
-        self._ban_list[ip] = time.time() + (seconds or self.ban_duration)
-        self.logger.log_message(f"[Handshake][BAN] ⛔ Manually blocked {ip} for {seconds or self.ban_duration}s")
+        duration = int(seconds or self.ban_duration)
+        self._ban_list[ip] = time.time() + duration
+        self._log_message(f"[Handshake][BAN] Manually blocked {ip} for {duration}s")
 
     def allow_ip(self, ip: str):
         if ip in self._ban_list:
-            del self._ban_list[ip]
-            self.logger.log_message(f"[Handshake][BAN] ✅ Unblocked {ip}")
+            self._ban_list.pop(ip, None)
+            self._log_message(f"[Handshake][BAN] Unblocked {ip}")
 
     def set_thresholds(self, *, rate_limit_threshold: Optional[int] = None,
                        rate_limit_period: Optional[int] = None,
@@ -3455,78 +3937,81 @@ class HandshakeManager:
         if timeout_established is not None:
             self.timeout_established = int(timeout_established)
 
-    # ===== TLS callbacks =====
     def _on_tls_record(self, rec: "TLSRecord"):
-        # lightweight first-records log
-        self.logger.log_message(
-            f"[TLS] 📄 ct={rec.content_type} ver={rec.version} len={rec.length} "
-            f"{rec.direction} {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+        if not self.log_tls_records:
+            return
+        type_name = {
+            20: "ChangeCipherSpec", 21: "Alert", 22: "Handshake", 23: "ApplicationData", 0x80: "SSLv2",
+        }.get(rec.content_type, f"type-{rec.content_type}")
+        if rec.content_type == TLSRecordManager.APPLICATION_DATA and not self.log_tls_application_data:
+            return
+        self._log_message(
+            f"[TLS][Record] {type_name} {_version_name(rec.version)} len={rec.length} "
+            f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
         )
 
     def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
-        # compact summary
-        for msg in info.get("messages", []):
-            t = msg.get("type")
-            if t == "client_hello":
-                sni = (msg.get("sni") or (info.get("client_hello") or {}).get("sni"))
-                ja3 = (info.get("client_hello") or {}).get("ja3_md5")
-                ver = (info.get("client_hello") or {}).get("version")
-                alpn = (info.get("client_hello") or {}).get("alpn") or []
-                self.logger.log_message(f"[TLS][CH] SNI={sni or 'N/A'} JA3={ja3 or 'N/A'} ver={ver or 'N/A'} ALPN={','.join(alpn) or 'N/A'}")
-            elif t == "server_hello":
-                ver = (info.get("server_hello") or {}).get("version")
-                cipher = (info.get("server_hello") or {}).get("cipher_suite")
-                ja3s = (info.get("server_hello") or {}).get("ja3s_md5")
-                self.logger.log_message(f"[TLS][SH] ver={ver or 'N/A'} cipher={cipher or 'N/A'} JA3S={ja3s or 'N/A'}")
+        for message in info.get("messages", []):
+            message_type = message.get("type")
+            prefix = (
+                f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} "
+                f"len={message.get('length')}"
+            )
+            if message_type == "ClientHello":
+                alpn = ",".join(message.get("alpn") or []) or "N/A"
+                versions = ",".join(v for v in (message.get("supported_versions") or []) if v) or message.get("version_name") or "N/A"
+                self._log_message(
+                    f"[TLS][ClientHello] {prefix} SNI={message.get('sni') or 'N/A'} "
+                    f"versions={versions} ALPN={alpn} ciphers={message.get('cipher_suites_count') or 0} "
+                    f"JA3={message.get('ja3_md5') or 'N/A'}"
+                )
+            elif message_type == "ServerHello":
+                label = "HelloRetryRequest" if message.get("hello_retry_request") else "ServerHello"
+                self._log_message(
+                    f"[TLS][{label}] {prefix} version={message.get('version_name') or message.get('version') or 'N/A'} "
+                    f"cipher={message.get('cipher_suite_name') or message.get('cipher_suite') or 'N/A'} "
+                    f"JA3S={message.get('ja3s_md5') or 'N/A'}"
+                )
+            elif message_type == "Certificate":
+                self._log_message(
+                    f"[TLS][Certificate] {prefix} certificates={message.get('certificate_count')} "
+                    f"bytes={message.get('certificate_bytes')}"
+                )
+            else:
+                self._log_message(f"[TLS][Handshake] {message_type} {prefix}")
 
     def _on_tls_alert(self, rec: "TLSRecord", alert: Dict):
-        self.logger.log_message(
-            f"[TLS][Alert] level={alert.get('level')} desc={alert.get('description')} "
-            f"{rec.direction} {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}"
+        self._log_message(
+            f"[TLS][Alert] {alert.get('level_name')} {alert.get('description_name')} "
+            f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
         )
 
     def _on_tls_application_data(self, rec: "TLSRecord"):
-        # Optional: forward AppData using last TCP context
-        key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
-        dir_key = (key, rec.direction)
-        last_pkt = self._last_tcp_pkt.get(dir_key)
-        if not last_pkt:
-            self.logger.log_message(f"[TLS] 🔒 AppData {len(rec.payload)}B (no TCP ctx) {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}")
-            return
-        try:
-            ether = last_pkt[Ether] if last_pkt.haslayer(Ether) else None
-            base_eth = Ether(dst=ether.dst, src=ether.src) if ether else Ether()
-            is_v6 = last_pkt.haslayer(IPv6)
-            ip_layer = (IPv6(src=rec.src, dst=rec.dst) if is_v6 else IP(src=rec.src, dst=rec.dst))
-            tcp_prev = last_pkt[TCP]
-            seg = TCP(sport=rec.src_port, dport=rec.dst_port, flags="PA",
-                      seq=int(tcp_prev.seq), ack=int(tcp_prev.ack), window=int(tcp_prev.window))
-            out = base_eth / ip_layer / seg / Raw(load=rec.payload)
-            # Replace with packet_writer if needed:
-            if self.sniffer:
-                self.sniffer.send(out)
-            else:
-                # try PacketWriter if provided
-                try:
-                    self.packet_writer._send_raw_packet(out, flow_iface := self._flows.get(key, {}).get("iface", None), allow_dst_ours=True, no_consume=False)
-                except Exception:
-                    pass
-            self.logger.log_message(f"[TLS] 🔁 Fwd AppData {len(rec.payload)}B {rec.src}:{rec.src_port}->{rec.dst}:{rec.dst_port}")
-        except Exception as e:
-            self.logger.log_message(f"[TLS] ❌ Forward error: {e}")
+        # Passive packet capture must never fabricate and re-send encrypted TCP
+        # payload.  Doing so duplicates sequence numbers, creates capture loops,
+        # and corrupts live connections.  The original callback signature is
+        # retained so callers can still observe application-data records.
+        if self.log_tls_application_data:
+            self._log_message(
+                f"[TLS][ApplicationData] len={rec.length} {rec.direction} "
+                f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
+            )
 
     def _on_tls_event(self, evt: Dict):
         kind = evt.get("kind")
         if kind in ("block", "quarantine", "policy_alert"):
-            self.logger.log_message(f"[TLS][Policy] {kind.upper()} {evt.get('data', {})}")
+            data = evt.get("data", {})
+            self._log_message(
+                f"[TLS][Policy] {str(kind).upper()} reason={data.get('reason')} tags={data.get('tags')}"
+            )
 
     def _on_tls_decision(self, flow_key, rec: "TLSRecord", decision):
         if decision.action != "allow":
-            self.logger.log_message(
-                f"[TLS][Decision] {decision.action.upper()} flow={flow_key} reason={decision.reason} tags={decision.tags}"
+            self._log_message(
+                f"[TLS][Decision] {decision.action.upper()} flow={flow_key} "
+                f"reason={decision.reason} tags={decision.tags}"
             )
 
-    # ===== misc =====
     def normalize_mac(self, mac: str) -> str:
         return mac.replace('-', ':').lower()
 
@@ -28887,6 +29372,15 @@ class _Peer:
     discovery_success_count: int = 0
     last_hello_id: str = ""
 
+    # Multiple-path peer learning.  Never collapse a peer to one address only.
+    candidate_ips: Dict[str, float] = field(default_factory=dict)
+    candidate_data_ports: Dict[str, int] = field(default_factory=dict)
+    confirmed_ips: Set[str] = field(default_factory=set)
+    path_successes: Dict[str, int] = field(default_factory=dict)
+    path_failures: Dict[str, int] = field(default_factory=dict)
+    last_success_ip: str = ""
+    last_success_port: int = 0
+
 
 @dataclass
 class _RemoteEndpoint:
@@ -29021,9 +29515,9 @@ class HyperVRouterManager:
 
         self._pending_frames: Dict[str, Dict[str, Any]] = {}
         self._pending_lock = threading.RLock()
-        self._frame_ack_timeout_sec = max(6.0, self.peer_timeout_sec)
+        self._frame_ack_timeout_sec = max(4.0, min(8.0, self.heartbeat_sec * 0.5))
         self._frame_retry_interval_sec = max(1.0, min(2.5, self.heartbeat_sec / 4.0))
-        self._frame_retry_limit = 0
+        self._frame_retry_limit = 2
         self._pending_frame_cap = max(32, min(self.max_network_queue, 128))
 
         self._router_ingress_queue_size = max(16, min(self.max_network_queue, 64))
@@ -29057,7 +29551,9 @@ class HyperVRouterManager:
         self._socket_close_wait_sec = 0.05
 
         self._wire_payload_compress_over = 1200
-        self._wire_payload_max_bytes = 48 * 1024
+        # Keep the JSON/base64 envelope below the maximum UDP payload.
+        self._wire_payload_max_bytes = 44 * 1024
+        self._wire_message_max_bytes = 65507
         self._mirror_payload_soft_limit = 4096
         self._consumer_flow_bytes_per_window = 64 * 1024
         self._consumer_flow_packets_per_window = 48
@@ -29075,6 +29571,7 @@ class HyperVRouterManager:
         self._startup_hello_gap_sec = 0.0
         self._last_hello_id: str = ""
         self._last_hello_ts: float = 0.0
+        self._hello_challenges: Dict[str, float] = {}
         self._implicit_ack_grace_sec = max(0.35, min(1.25, self.heartbeat_sec))
         self._assume_delivery_on_peer_contact = False
         self._assume_delivery_on_online_peer = False
@@ -29085,10 +29582,24 @@ class HyperVRouterManager:
         self._send_direct_hello = False
         self._send_global_broadcast = False
         self._send_subnet_broadcast = False
-        self._peer_target_limit = 1
-        self._ack_target_limit = 1
+        # Keep several candidates and rotate them after missing ACKs.
+        self._peer_target_limit = 3
+        self._ack_target_limit = 2
         self._log_wire_messages = False
         self._control_payload_scan_limit = 2048
+
+        # Wire hardening. Authentication remains optional for compatibility.
+        self._wire_shared_secret: bytes = b""
+        self._wire_require_auth = False
+        self._wire_max_clock_skew_sec = max(90.0, self.peer_timeout_sec * 2.0)
+        self._wire_require_known_peer_for_data = True
+        self._allow_peer_ip_migration = True
+        self._allow_cross_subnet_private_peer_hints = True
+        self._peer_path_ttl_sec = max(180.0, self.peer_timeout_sec * 4.0)
+        self._wire_rx_rate: Dict[str, Dict[str, float]] = {}
+        self._wire_rx_rate_cap = 2048
+        self._wire_control_per_sec = 48
+        self._wire_frames_per_sec = 256
         self._recent_origin_frames: Dict[str, float] = {}
         self._recent_origin_order: Deque[Tuple[str, float]] = deque()
 
@@ -29147,6 +29658,7 @@ class HyperVRouterManager:
             self._mirror_payload_soft_limit = 4096
             self._consumer_flow_bytes_per_window = 64 * 1024
             self._consumer_flow_packets_per_window = 48
+
     def _remember_recent_value(
             self,
             store: Dict[str, float],
@@ -29190,12 +29702,13 @@ class HyperVRouterManager:
             order.popleft()
             if cur <= now:
                 store.pop(key, None)
+
     def configure(
-        self,
-        *,
-        segment_id: str,
-        bind_ip: str = "0.0.0.0",
-        node_id: Optional[str] = None,
+            self,
+            *,
+            segment_id: str,
+            bind_ip: str = "0.0.0.0",
+            node_id: Optional[str] = None,
     ) -> None:
         self.segment_id = str(segment_id or "default").strip() or "default"
         self.bind_ip = str(bind_ip or "").strip()
@@ -29212,15 +29725,14 @@ class HyperVRouterManager:
             ["🧠", "📝"],
         )
 
-
     def register_hyperv_backend(
-        self,
-        sender_id: str,
-        backend: Any,
-        *,
-        allow_protocols: Optional[Set[str]] = None,
-        enabled: bool = True,
-        start_backend: bool = False,
+            self,
+            sender_id: str,
+            backend: Any,
+            *,
+            allow_protocols: Optional[Set[str]] = None,
+            enabled: bool = True,
+            start_backend: bool = False,
     ) -> None:
         send_fn = getattr(backend, "send_packet", None)
         if not callable(send_fn):
@@ -29255,15 +29767,15 @@ class HyperVRouterManager:
         )
 
     def attach_wintun_manager(
-        self,
-        wintun_manager: Any,
-        *,
-        sender_id: str = "wintun-local",
-        allow_protocols: Optional[Set[str]] = None,
-        start_manager: bool = False,
-        expose_as_sender: bool = False,
-        wintun_send: Optional[Callable[[Any], bool]] = None,
-        iface_name: Optional[str] = None,
+            self,
+            wintun_manager: Any,
+            *,
+            sender_id: str = "wintun-local",
+            allow_protocols: Optional[Set[str]] = None,
+            start_manager: bool = False,
+            expose_as_sender: bool = False,
+            wintun_send: Optional[Callable[[Any], bool]] = None,
+            iface_name: Optional[str] = None,
     ) -> None:
         self._wintun_manager = wintun_manager
         self._manage_wintun_lifecycle = bool(start_manager)
@@ -29288,15 +29800,15 @@ class HyperVRouterManager:
             )
 
     def attach_windivert_manager(
-        self,
-        windivert_manager: Any,
-        *,
-        sender_id: str = "windivert-local",
-        allow_protocols: Optional[Set[str]] = None,
-        start_manager: bool = False,
-        expose_as_sender: bool = False,
-        windivert_send: Optional[Callable[[Any], bool]] = None,
-        iface_names: Optional[Set[str]] = None,
+            self,
+            windivert_manager: Any,
+            *,
+            sender_id: str = "windivert-local",
+            allow_protocols: Optional[Set[str]] = None,
+            start_manager: bool = False,
+            expose_as_sender: bool = False,
+            windivert_send: Optional[Callable[[Any], bool]] = None,
+            iface_names: Optional[Set[str]] = None,
     ) -> None:
         self._windivert_manager = windivert_manager
         self._manage_windivert_lifecycle = bool(start_manager)
@@ -29326,15 +29838,15 @@ class HyperVRouterManager:
         self._log_evt("attach", "attached HostConnectivityBoundaryManager", ["🛡️", "🤝"])
 
     def _register_generic_sender(
-        self,
-        *,
-        sender_id: str,
-        kind: str,
-        send_callable: Callable[[Any], bool],
-        allow_protocols: Optional[Set[str]],
-        start_fn: Optional[Callable[[], Any]],
-        stop_fn: Optional[Callable[[], Any]],
-        enabled: bool,
+            self,
+            *,
+            sender_id: str,
+            kind: str,
+            send_callable: Callable[[Any], bool],
+            allow_protocols: Optional[Set[str]],
+            start_fn: Optional[Callable[[], Any]],
+            stop_fn: Optional[Callable[[], Any]],
+            enabled: bool,
     ) -> None:
         state = _LocalSender(
             sender_id=str(sender_id),
@@ -29365,6 +29877,7 @@ class HyperVRouterManager:
             if callable(fn):
                 return fn
         return None
+
     # ---------------------------------------------------------
     # lifecycle
     # ---------------------------------------------------------
@@ -29408,7 +29921,8 @@ class HyperVRouterManager:
         self._recv_thread = threading.Thread(target=self._recv_loop, name="HyperVRouterRecv", daemon=True)
         self._health_thread = threading.Thread(target=self._health_loop, name="HyperVRouterHealth", daemon=True)
         self._net_thread = threading.Thread(target=self._network_sender_loop, name="HyperVRouterWireSend", daemon=True)
-        self._router_thread = threading.Thread(target=self._router_ingress_loop, name="HyperVRouterIngress", daemon=True)
+        self._router_thread = threading.Thread(target=self._router_ingress_loop, name="HyperVRouterIngress",
+                                               daemon=True)
 
         self._hello_thread.start()
         self._recv_thread.start()
@@ -29637,7 +30151,6 @@ class HyperVRouterManager:
                 every=2.0,
             )
             return False
-
 
     def _consult_hostboundary(self, packet, inbound_iface: str) -> str:
         mgr = self._hostboundary_manager
@@ -29868,7 +30381,8 @@ class HyperVRouterManager:
             if "default" not in peer_sender_kinds:
                 peer_sender_kinds["default"] = "hyperv"
 
-            if not self._transport_ip_allowed(peer.listen_ip, discovery=False) and not self._transport_ip_allowed(peer.last_data_from_ip, discovery=False):
+            if not self._transport_ip_allowed(peer.listen_ip, discovery=False) and not self._transport_ip_allowed(
+                    peer.last_data_from_ip, discovery=False):
                 continue
 
             for sender_id in peer_sender_ids:
@@ -30056,7 +30570,6 @@ class HyperVRouterManager:
             )
             raise
 
-
     def _close_sockets(self) -> None:
         with self._sock_lock:
             self._close_sockets_locked()
@@ -30126,7 +30639,7 @@ class HyperVRouterManager:
             for sock_obj in ready:
                 which = "discovery" if sock_obj is self._discovery_sock else "data"
                 try:
-                    data, addr = sock_obj.recvfrom(min(65535, int(self._wire_payload_max_bytes) + 4096))
+                    data, addr = sock_obj.recvfrom(int(self._wire_message_max_bytes))
                 except socket.timeout:
                     continue
                 except OSError:
@@ -30374,6 +30887,13 @@ class HyperVRouterManager:
         hello_id = uuid.uuid4().hex
         self._last_hello_id = hello_id
         self._last_hello_ts = time.time()
+        challenge_expiry = self._last_hello_ts + float(self._wire_max_clock_skew_sec)
+        self._hello_challenges[hello_id] = challenge_expiry
+        if len(self._hello_challenges) > 64:
+            now_ts = time.time()
+            for old_id, expiry in sorted(self._hello_challenges.items(), key=lambda kv: kv[1]):
+                if expiry <= now_ts or len(self._hello_challenges) > 64:
+                    self._hello_challenges.pop(old_id, None)
 
         adv_ip = self._advertise_ip()
         msg = {
@@ -30396,10 +30916,11 @@ class HyperVRouterManager:
             "allow_protocols": allow_protocols,
             "public_ok": False,
             "gateway_ok": True,
+            "address_hints": [adv_ip] if adv_ip else [],
             "ts": time.time(),
         }
 
-        raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        raw = self._encode_wire_message(msg)
 
         targets: List[Tuple[str, int, str]] = []
         if self._transport_ip_allowed(self.discovery_group, discovery=True):
@@ -30445,7 +30966,6 @@ class HyperVRouterManager:
                 every=10.0,
             )
 
-
     def _flush_network_queue(self) -> None:
         while True:
             try:
@@ -30457,26 +30977,39 @@ class HyperVRouterManager:
             self._send_network_item_inline(item)
 
     def _handle_wire_message(self, raw: bytes, from_ip: str, from_port: int, which: str) -> None:
-        msg = None
         raw_bytes = bytes(raw or b"")
-        candidates = [raw_bytes]
+        if not raw_bytes or len(raw_bytes) > int(self._wire_message_max_bytes):
+            return
 
+        from_ip = str(from_ip or "").strip()
+        try:
+            from_port = int(from_port or 0)
+        except Exception:
+            return
+        if not self._is_usable_unicast_ipv4(from_ip) or not (1 <= from_port <= 65535):
+            return
+
+        msg = None
         stripped = raw_bytes.strip(b"\x00\r\n\t ")
+        candidates = [raw_bytes]
         if stripped and stripped != raw_bytes:
             candidates.append(stripped)
 
         for blob in candidates:
             try:
-                msg = json.loads(blob.decode("utf-8"))
+                decoded = blob.decode("utf-8", errors="strict")
+                msg = json.loads(decoded)
                 break
             except Exception:
                 pass
 
         if msg is None:
             try:
-                text_blob = stripped.decode("utf-8", errors="ignore").lstrip("\ufeff\r\n\t \x00")
+                text_blob = stripped.decode("utf-8", errors="strict").lstrip("\ufeff\r\n\t \x00")
                 decoder = json.JSONDecoder()
-                msg, _ = decoder.raw_decode(text_blob)
+                msg, end_idx = decoder.raw_decode(text_blob)
+                if text_blob[end_idx:].strip():
+                    return
             except Exception:
                 return
 
@@ -30484,12 +31017,14 @@ class HyperVRouterManager:
             return
 
         magic = str(msg.get("magic") or "").strip()
-        if magic and magic not in self.ACCEPT_MAGICS:
+        if magic not in self.ACCEPT_MAGICS:
             return
         if str(msg.get("segment_id") or "") != self.segment_id:
             return
+        if not self._verify_wire_message_auth(msg):
+            return
 
-        node_like = str(msg.get("node_id") or msg.get("src_node_id") or "")
+        node_like = self._bounded_text(msg.get("node_id") or msg.get("src_node_id"), 128)
         if not node_like or node_like == self.node_id:
             return
 
@@ -30516,6 +31051,52 @@ class HyperVRouterManager:
             "raw_frame": "frame",
         }
         mtype = type_aliases.get(raw_type, raw_type)
+        if mtype not in self.HVRM_CONTROL_TYPES:
+            return
+
+        if mtype == "hello_ack":
+            hello_id = self._bounded_text(msg.get("hello_id"), 128)
+            expiry = float(self._hello_challenges.get(hello_id, 0.0) or 0.0)
+            if not hello_id or expiry < time.time():
+                return
+
+        # Reject stale/replayed envelopes when a timestamp is present. Legacy
+        # peers without a timestamp still work unless authentication is required.
+        ts_val = msg.get("ts")
+        if ts_val is not None:
+            try:
+                if abs(time.time() - float(ts_val)) > float(self._wire_max_clock_skew_sec):
+                    return
+            except Exception:
+                return
+        elif self._wire_require_auth:
+            return
+
+        if not self._wire_rate_allowed(from_ip, mtype):
+            self._log_sparse(
+                f"wire-rate:{from_ip}:{mtype}",
+                "security",
+                f"wire rate limit hit source={from_ip} type={mtype}",
+                ["🛡️", "🚦", "🛑"],
+                every=2.0,
+            )
+            return
+
+        # Discovery may arrive on either bound socket for compatibility. Data
+        # messages must identify a known peer and come from a plausible learned
+        # path, unless they are a verifiable ACK for an outstanding frame.
+        if mtype in {"frame", "ack"}:
+            if which != "data" and self._data_sock is not None:
+                return
+            if not self._wire_source_matches_peer(node_like, from_ip, from_port, mtype, msg):
+                self._log_sparse(
+                    f"wire-source-reject:{node_like}:{from_ip}",
+                    "security",
+                    f"rejected unbound peer source node={node_like} source={from_ip}:{from_port} type={mtype}",
+                    ["🛡️", "🚫", "🌐"],
+                    every=2.0,
+                )
+                return
 
         if mtype in {"hello", "hello_ack"}:
             self._stats["peer_discovery_rx"] = int(self._stats.get("peer_discovery_rx", 0)) + 1
@@ -30547,24 +31128,25 @@ class HyperVRouterManager:
             self._handle_remote_frame(msg, from_ip, from_port)
             return
 
-        if mtype in {"ack", "frame_ack", "frame_status", "received", "processed", "success", "ok"}:
+        if mtype == "ack":
             self._handle_frame_ack(msg, from_ip, from_port)
             return
 
     def _mark_discovery_success(
-        self,
-        *,
-        node_id: str,
-        from_ip: str,
-        from_port: int,
-        which: str,
-        hello_id: str = "",
-        was_reply: bool = False,
+            self,
+            *,
+            node_id: str,
+            from_ip: str,
+            from_port: int,
+            which: str,
+            hello_id: str = "",
+            was_reply: bool = False,
     ) -> None:
         if not node_id or node_id == self.node_id:
             return
 
         now = time.time()
+        ip = self._sanitize_peer_ip(from_ip)
         with self._lock:
             peer = self._peers.get(str(node_id))
             if peer is None:
@@ -30575,14 +31157,22 @@ class HyperVRouterManager:
             peer.last_discovery_success_ts = now
             peer.discovery_success_count = int(peer.discovery_success_count or 0) + 1
             if hello_id:
-                peer.last_hello_id = str(hello_id)
-            if from_ip:
-                peer.last_hello_from_ip = str(from_ip)
-            if int(from_port or 0) > 0:
+                peer.last_hello_id = self._bounded_text(hello_id, 128)
+            if ip:
+                peer.last_hello_from_ip = ip
+            if 1 <= int(from_port or 0) <= 65535:
                 peer.last_hello_from_port = int(from_port)
-                if which == "data":
-                    peer.last_data_from_port = int(from_port)
-                    peer.last_data_from_ip = str(from_ip or peer.last_data_from_ip or "")
+            self._record_peer_path_locked(
+                peer,
+                ip,
+                peer.data_port,
+                confirmed=bool(was_reply or which == "data"),
+                data_path=(which == "data"),
+            )
+            if which == "data" and ip:
+                peer.last_data_from_ip = ip
+                peer.last_data_from_port = int(from_port)
+            peer.listen_ip = self._best_peer_ip_locked(peer)
             peer.last_ack_ts = now
 
         self._stats["peer_discovery_success"] = int(self._stats.get("peer_discovery_success", 0)) + 1
@@ -30595,51 +31185,52 @@ class HyperVRouterManager:
         self._log_sparse(
             f"discovery-success:{node_id}",
             "peer",
-            f"discovery success node={node_id} ip={from_ip}:{from_port} via={which} hello_id={(hello_id or '-')[:12]} reply={int(bool(was_reply))}",
+            f"discovery success node={node_id} source={from_ip}:{from_port} via={which} hello_id={(hello_id or '-')[:12]} reply={int(bool(was_reply))}",
             ["✅", "📡", "🤝"],
             every=3.0,
         )
 
     def _update_peer_from_hello(self, msg: dict, from_ip: str, from_port: int = 0, which: str = "") -> None:
-        node_id = str(msg.get("node_id") or msg.get("src_node_id") or "")
+        node_id = self._bounded_text(msg.get("node_id") or msg.get("src_node_id"), 128)
         if not node_id or node_id == self.node_id:
             return
 
+        now = time.time()
+        advertised_ip = self._sanitize_peer_ip(
+            msg.get("listen_ip") or msg.get("reply_to_ip") or msg.get("advertised_ip")
+        )
+        observed_ip = self._sanitize_peer_ip(from_ip)
+
+        advertised_data_port = self._safe_port(
+            msg.get("reply_data_port") or msg.get("data_port"), self.data_port
+        )
+        advertised_discovery_port = self._safe_port(
+            msg.get("reply_discovery_port") or msg.get("discovery_port"), self.discovery_port
+        )
+
+        raw_hints = msg.get("address_hints") or []
+        if not isinstance(raw_hints, (list, tuple, set)):
+            raw_hints = []
+        address_hints = []
+        for value in list(raw_hints)[:8]:
+            ip = self._sanitize_peer_ip(value)
+            if ip and ip not in address_hints:
+                address_hints.append(ip)
+
         changed = False
         is_new = False
-        now = time.time()
-
-        advertised_ip = str(
-            msg.get("listen_ip")
-            or msg.get("reply_to_ip")
-            or msg.get("advertised_ip")
-            or from_ip
-            or ""
-        ).strip()
-
-        advertised_data_port = int(
-            msg.get("reply_data_port")
-            or msg.get("data_port")
-            or self.data_port
-        )
-
-        advertised_discovery_port = int(
-            msg.get("reply_discovery_port")
-            or msg.get("discovery_port")
-            or self.discovery_port
-        )
-
         with self._lock:
             peer = self._peers.get(node_id)
             if peer is None:
+                initial_ip = self._choose_peer_ip(advertised_ip, observed_ip, "", "")
                 peer = _Peer(
                     node_id=node_id,
-                    host_name=str(msg.get("host_name") or node_id),
-                    listen_ip=str(advertised_ip or from_ip),
-                    data_port=int(advertised_data_port or self.data_port),
-                    segment_id=str(msg.get("segment_id") or self.segment_id),
-                    advertised_ip=str(advertised_ip or ""),
-                    last_hello_from_ip=str(from_ip or ""),
+                    host_name=self._bounded_text(msg.get("host_name") or node_id, 255) or node_id,
+                    listen_ip=initial_ip,
+                    data_port=advertised_data_port,
+                    segment_id=self.segment_id,
+                    advertised_ip=advertised_ip,
+                    last_hello_from_ip=observed_ip,
                     last_hello_from_port=int(from_port or 0),
                 )
                 self._peers[node_id] = peer
@@ -30650,69 +31241,99 @@ class HyperVRouterManager:
                 peer.data_port,
                 peer.discovery_port,
                 peer.host_name,
-                set(peer.sender_ids),
-                dict(peer.sender_kinds),
-                peer.last_hello_from_ip,
-                peer.last_data_from_ip,
-                peer.discovery_success_count,
+                tuple(sorted(peer.sender_ids)),
+                tuple(sorted(peer.sender_kinds.items())),
+                tuple(sorted(peer.candidate_ips)),
+                tuple(sorted(peer.confirmed_ips)),
             )
 
-            peer.host_name = str(msg.get("host_name") or peer.host_name or node_id)
-            peer.segment_id = str(msg.get("segment_id") or peer.segment_id or self.segment_id)
-            peer.advertised_ip = str(advertised_ip or peer.advertised_ip or from_ip or "")
-            peer.last_hello_from_ip = str(from_ip or peer.last_hello_from_ip or "")
-            if int(from_port or 0) > 0:
+            peer.host_name = self._bounded_text(msg.get("host_name") or peer.host_name or node_id, 255) or node_id
+            peer.segment_id = self.segment_id
+            if advertised_ip:
+                peer.advertised_ip = advertised_ip
+            if observed_ip:
+                peer.last_hello_from_ip = observed_ip
+            if 1 <= int(from_port or 0) <= 65535:
                 peer.last_hello_from_port = int(from_port)
 
-            if which == "data":
-                peer.last_data_from_ip = str(from_ip or peer.last_data_from_ip or "")
-                if int(from_port or 0) > 0:
-                    peer.last_data_from_port = int(from_port)
+            peer.data_port = advertised_data_port
+            peer.discovery_port = advertised_discovery_port
 
-            peer.listen_ip = self._choose_peer_ip(
-                peer.advertised_ip,
-                peer.last_hello_from_ip,
-                peer.last_data_from_ip,
-                peer.listen_ip,
+            self._record_peer_path_locked(
+                peer,
+                advertised_ip,
+                advertised_data_port,
+                confirmed=False,
+                data_path=True,
             )
+            self._record_peer_path_locked(
+                peer,
+                observed_ip,
+                advertised_data_port,
+                confirmed=(which == "data" or str(msg.get("type") or "").lower() in {"hello_ack", "helloack",
+                                                                                     "hello-response"}),
+                data_path=(which == "data"),
+            )
+            for hint in address_hints:
+                self._record_peer_path_locked(peer, hint, advertised_data_port, confirmed=False, data_path=True)
 
-            peer.data_port = int(advertised_data_port or peer.data_port or self.data_port)
-            peer.discovery_port = int(advertised_discovery_port or peer.discovery_port or self.discovery_port)
-            peer.sender_ids = set(str(x) for x in (msg.get("sender_ids") or []))
-            peer.sender_kinds = {str(k): str(v) for k, v in (msg.get("sender_kinds") or {}).items()}
-            peer.allow_protocols = set(str(x) for x in (msg.get("allow_protocols") or []))
+            if which == "data" and observed_ip:
+                peer.last_data_from_ip = observed_ip
+                peer.last_data_from_port = int(from_port or advertised_data_port)
+
+            peer.listen_ip = self._best_peer_ip_locked(peer)
+
+            sender_ids = msg.get("sender_ids")
+            if isinstance(sender_ids, (list, tuple, set)):
+                peer.sender_ids = {
+                    self._bounded_text(x, 128) for x in list(sender_ids)[:64] if self._bounded_text(x, 128)
+                }
+            sender_kinds = msg.get("sender_kinds")
+            if isinstance(sender_kinds, dict):
+                peer.sender_kinds = {
+                    self._bounded_text(k, 128): self._bounded_text(v, 32)
+                    for k, v in list(sender_kinds.items())[:64]
+                    if self._bounded_text(k, 128) and self._bounded_text(v, 32)
+                }
+            allow_protocols = msg.get("allow_protocols")
+            if isinstance(allow_protocols, (list, tuple, set)):
+                peer.allow_protocols = {
+                    self._bounded_text(x, 32) for x in list(allow_protocols)[:64]
+                    if self._bounded_text(x, 32) in self.DEFAULT_PROTOCOLS
+                }
+
             peer.public_ok = bool(msg.get("public_ok", False))
             peer.gateway_ok = bool(msg.get("gateway_ok", False))
             peer.last_seen = now
             peer.online = True
             peer.hello_count += 1
             peer.last_discovery_rx_ts = now
-            if str(msg.get("hello_id") or "").strip():
-                peer.last_hello_id = str(msg.get("hello_id") or "").strip()
+            hello_id = self._bounded_text(msg.get("hello_id"), 128)
+            if hello_id:
+                peer.last_hello_id = hello_id
 
             new_tuple = (
                 peer.listen_ip,
                 peer.data_port,
                 peer.discovery_port,
                 peer.host_name,
-                set(peer.sender_ids),
-                dict(peer.sender_kinds),
-                peer.last_hello_from_ip,
-                peer.last_data_from_ip,
-                peer.discovery_success_count,
+                tuple(sorted(peer.sender_ids)),
+                tuple(sorted(peer.sender_kinds.items())),
+                tuple(sorted(peer.candidate_ips)),
+                tuple(sorted(peer.confirmed_ips)),
             )
             changed = new_tuple != old_tuple
 
         if is_new:
             self._log_evt(
                 "peer",
-                f"peer discovered node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} discovery={peer.discovery_port} senders={sorted(peer.sender_ids)} protocols={sorted(peer.allow_protocols)}",
+                f"peer discovered node={node_id} host={peer.host_name} best={peer.listen_ip or '-'}:{peer.data_port} candidates={sorted(peer.candidate_ips)} senders={sorted(peer.sender_ids)}",
                 ["🤝", "🌐", "✅"],
             )
         elif changed:
             self._log_evt(
                 "peer",
-                f"peer updated node={node_id} host={peer.host_name} listen={peer.listen_ip}:{peer.data_port} discovery={peer.discovery_port} senders={sorted(peer.sender_ids)}",
+                f"peer updated node={node_id} host={peer.host_name} best={peer.listen_ip or '-'}:{peer.data_port} candidates={sorted(peer.candidate_ips)} confirmed={sorted(peer.confirmed_ips)}",
                 ["🔄", "🌐", "📝"],
             )
 
@@ -30728,7 +31349,7 @@ class HyperVRouterManager:
         msg = {
             "magic": self.MAGIC,
             "type": "hello_ack",
-            "hello_id": str(hello_msg.get("hello_id") or ""),
+            "hello_id": self._bounded_text(hello_msg.get("hello_id"), 128),
             "node_id": self.node_id,
             "segment_id": self.segment_id,
             "host_name": self.host_name,
@@ -30743,47 +31364,73 @@ class HyperVRouterManager:
             "allow_protocols": allow_protocols,
             "public_ok": False,
             "gateway_ok": True,
+            "address_hints": [adv_ip] if adv_ip else [],
             "ts": time.time(),
         }
-        raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        raw = self._encode_wire_message(msg)
 
-        preferred_port = 0
-        if int(from_port or 0) == int(self.discovery_port) or int(from_port or 0) == int(self._bound_discovery_port):
-            preferred_port = int(hello_msg.get("reply_discovery_port") or hello_msg.get("discovery_port") or from_port or self.discovery_port)
-        else:
-            preferred_port = int(hello_msg.get("reply_data_port") or hello_msg.get("data_port") or from_port or self.data_port)
-
-        if not self._transport_ip_allowed(from_ip, discovery=(preferred_port == self.discovery_port or preferred_port == self._bound_discovery_port)):
-            return
-
-        ok = self._queue_network_message(
-            raw=raw,
-            ip=from_ip,
-            port=preferred_port,
-            mtype="hello_reply",
-            peer_node_id=str(hello_msg.get("node_id") or ""),
+        peer_data_port = self._safe_port(
+            hello_msg.get("reply_data_port") or hello_msg.get("data_port"), self.data_port
         )
-        if ok:
-            self._stats["peer_discovery_reply"] = int(self._stats.get("peer_discovery_reply", 0)) + 1
+        peer_discovery_port = self._safe_port(
+            hello_msg.get("reply_discovery_port") or hello_msg.get("discovery_port"), self.discovery_port
+        )
+        reply_port = peer_discovery_port if int(from_port or 0) in {
+            int(self.discovery_port), int(self._bound_discovery_port)
+        } else peer_data_port
+
+        candidates = []
+        observed = self._sanitize_peer_ip(from_ip)
+        advertised = self._sanitize_peer_ip(
+            hello_msg.get("reply_to_ip") or hello_msg.get("listen_ip") or hello_msg.get("advertised_ip")
+        )
+        for ip in (observed, advertised):
+            if not ip or not self._transport_ip_allowed(ip, discovery=(reply_port == peer_discovery_port)):
+                continue
+            if ip != observed and not self._advertised_fallback_plausible(observed, ip):
+                continue
+            item = (ip, reply_port)
+            if item not in candidates:
+                candidates.append(item)
+
+        sent = 0
+        for ip, port in candidates[:2]:
+            if self._queue_network_message(
+                    raw=raw,
+                    ip=ip,
+                    port=port,
+                    mtype="hello_reply",
+                    peer_node_id=self._bounded_text(hello_msg.get("node_id"), 128),
+            ):
+                sent += 1
+
+        if sent:
+            self._stats["peer_discovery_reply"] = int(self._stats.get("peer_discovery_reply", 0)) + sent
             self._log_sparse(
                 f"hello-reply:{from_ip}",
                 "peer",
-                f"hello reply queued to node={str(hello_msg.get('node_id') or '?')} ip={from_ip}:{preferred_port}",
+                f"hello reply queued node={self._bounded_text(hello_msg.get('node_id'), 128) or '?'} targets={candidates[:2]}",
                 ["📡", "↩️", "✅"],
                 every=3.0,
             )
 
     def _handle_remote_frame(self, msg: dict, from_ip: str, from_port: int) -> None:
-        frame_id = str(msg.get("frame_id") or msg.get("id") or "")
-        trace_id = str(msg.get("trace_id") or msg.get("trace") or "")
-        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or "")
-        src_host_name = str(msg.get("src_host_name") or msg.get("host_name") or src_node_id)
-        src_sender_id = str(msg.get("src_sender_id") or msg.get("sender_id") or "")
-        protocol_tag = str(msg.get("protocol_tag") or msg.get("protocol") or msg.get("proto") or "RAW")
+        frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id"), 128)
+        trace_id = self._bounded_text(msg.get("trace_id") or msg.get("trace"), 128)
+        src_node_id = self._bounded_text(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id"), 128)
+        src_host_name = self._bounded_text(msg.get("src_host_name") or msg.get("host_name") or src_node_id, 255)
+        src_sender_id = self._bounded_text(msg.get("src_sender_id") or msg.get("sender_id"), 128)
+        protocol_tag = self._bounded_text(msg.get("protocol_tag") or msg.get("protocol") or msg.get("proto") or "RAW",
+                                          32)
+        if protocol_tag not in self.DEFAULT_PROTOCOLS:
+            protocol_tag = "RAW"
 
         ack_targets = self._candidate_ack_targets_from_message(msg, from_ip, from_port, src_node_id)
-        ack_ip = ack_targets[0][0] if ack_targets else str(from_ip or "")
-        ack_port = ack_targets[0][1] if ack_targets else int(from_port or 0)
+        ack_ip = ack_targets[0][0] if ack_targets else ""
+        ack_port = ack_targets[0][1] if ack_targets else 0
+
+        if not src_node_id:
+            return
 
         if self._is_remote_ingress_breaker_open():
             self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
@@ -30793,42 +31440,38 @@ class HyperVRouterManager:
                     dst_ip=ack_ip,
                     dst_port=ack_port,
                     dst_node_id=src_node_id,
-                    frame_id=frame_id or "-",
+                    frame_id=frame_id,
                     status="busy",
-                    detail=(
-                        f"breaker_open=1 src_node={src_node_id or '-'} proto={protocol_tag} "
-                        f"payload_len={int(msg.get('payload_len') or 0)}"
-                    ),
+                    detail=f"breaker_open=1 src_node={src_node_id} proto={protocol_tag}",
                 )
             return
 
-        if not src_node_id:
-            self._send_frame_ack(
-                dst_ip=ack_ip,
-                dst_port=ack_port,
-                dst_node_id=src_node_id,
-                frame_id=frame_id or "-",
-                status="bad_frame",
-                detail="missing src_node_id",
-            )
-            return
-
         self._note_peer_data_path(src_node_id, from_ip, from_port)
-
         raw = self._unpack_payload_bytes(msg)
         if raw is None:
-            origin_node_id = str(msg.get("origin_node_id") or src_node_id or "")
-            origin_frame_id = str(msg.get("origin_frame_id") or frame_id or "")
-            content_hash = str(msg.get("content_hash") or msg.get("payload_sha256") or "")
+            self._stats["remote_ingress_decode_fail"] = int(self._stats.get("remote_ingress_decode_fail", 0)) + 1
+            if ack_ip and ack_port:
+                self._send_frame_ack(
+                    dst_ip=ack_ip,
+                    dst_port=ack_port,
+                    dst_node_id=src_node_id,
+                    frame_id=frame_id or "-",
+                    status="bad_frame",
+                    detail="invalid, oversized, or corrupt payload",
+                )
+            return
 
-            if not origin_frame_id:
-                origin_frame_id = hashlib.blake2b(
-                    (origin_node_id.encode("utf-8", "ignore") + b"|" + raw),
-                    digest_size=16,
-                ).hexdigest()
+        origin_node_id = self._bounded_text(msg.get("origin_node_id") or src_node_id, 128)
+        origin_frame_id = self._bounded_text(msg.get("origin_frame_id") or frame_id, 128)
+        content_hash = self._bounded_text(msg.get("content_hash") or msg.get("payload_sha256"), 128)
+        if not origin_frame_id:
+            origin_frame_id = hashlib.blake2b(
+                origin_node_id.encode("utf-8", "ignore") + b"|" + raw,
+                digest_size=16,
+            ).hexdigest()
 
-            # hard drop if our own frame came back from another machine
-            if origin_node_id and origin_node_id == self.node_id:
+        if origin_node_id == self.node_id:
+            if ack_ip and ack_port:
                 self._send_frame_ack(
                     dst_ip=ack_ip,
                     dst_port=ack_port,
@@ -30837,16 +31480,16 @@ class HyperVRouterManager:
                     status="observed",
                     detail="duplicate self-origin frame dropped",
                 )
-                return
+            return
 
-            # drop exact distributed duplicate by original frame identity
-            origin_key = f"{origin_node_id}|{origin_frame_id}"
-            if self._remember_recent_value(
-                    self._recent_origin_frames,
-                    self._recent_origin_order,
-                    origin_key,
-                    ttl_sec=self.dedupe_ttl_sec * 2.0,
-            ):
+        origin_key = f"{origin_node_id}|{origin_frame_id}"
+        if self._remember_recent_value(
+                self._recent_origin_frames,
+                self._recent_origin_order,
+                origin_key,
+                ttl_sec=self.dedupe_ttl_sec * 2.0,
+        ):
+            if ack_ip and ack_port:
                 self._send_frame_ack(
                     dst_ip=ack_ip,
                     dst_port=ack_port,
@@ -30855,15 +31498,15 @@ class HyperVRouterManager:
                     status="observed",
                     detail="duplicate origin frame dropped",
                 )
-                return
+            return
 
-            # optional second guard: same payload hash seen recently
-            if content_hash and self._remember_recent_value(
-                    self._recent_content_hashes,
-                    self._recent_content_order,
-                    content_hash,
-                    ttl_sec=self.dedupe_ttl_sec,
-            ):
+        if content_hash and self._remember_recent_value(
+                self._recent_content_hashes,
+                self._recent_content_order,
+                content_hash,
+                ttl_sec=self.dedupe_ttl_sec,
+        ):
+            if ack_ip and ack_port:
                 self._send_frame_ack(
                     dst_ip=ack_ip,
                     dst_port=ack_port,
@@ -30872,12 +31515,12 @@ class HyperVRouterManager:
                     status="observed",
                     detail="duplicate content hash dropped",
                 )
-                return
             return
 
         if not frame_id:
             frame_id = hashlib.blake2b(
-                (src_node_id.encode("utf-8", "ignore") + b"|" + raw), digest_size=16
+                src_node_id.encode("utf-8", "ignore") + b"|" + raw,
+                digest_size=16,
             ).hexdigest()
 
         duplicate_hint = False
@@ -30892,15 +31535,16 @@ class HyperVRouterManager:
 
         pkt = self._decode_wire_packet(raw, protocol_tag)
         if pkt is None:
-            self._stats["remote_ingress_decode_fail"] += 1
-            self._send_frame_ack(
-                dst_ip=ack_ip,
-                dst_port=ack_port,
-                dst_node_id=src_node_id,
-                frame_id=frame_id,
-                status="decode_failed",
-                detail="could not decode packet bytes",
-            )
+            self._stats["remote_ingress_decode_fail"] = int(self._stats.get("remote_ingress_decode_fail", 0)) + 1
+            if ack_ip and ack_port:
+                self._send_frame_ack(
+                    dst_ip=ack_ip,
+                    dst_port=ack_port,
+                    dst_node_id=src_node_id,
+                    frame_id=frame_id,
+                    status="decode_failed",
+                    detail="could not decode packet bytes",
+                )
             return
 
         setattr(pkt, "_hyperv_remote_frame", True)
@@ -30912,7 +31556,6 @@ class HyperVRouterManager:
         setattr(pkt, "sniffed_on", self.INBOUND_IFACE_NAME)
 
         _ = self._consult_hostboundary(pkt, self.INBOUND_IFACE_NAME)
-
         queued = self._enqueue_router_ingress(
             packet=pkt,
             raw=raw,
@@ -30926,41 +31569,43 @@ class HyperVRouterManager:
             reply_ip=ack_ip,
             reply_port=ack_port,
         )
-
         if queued:
             self._stats["remote_ingress_queued"] = int(self._stats.get("remote_ingress_queued", 0)) + 1
             return
 
         self._stats["remote_ingress_failed"] = int(self._stats.get("remote_ingress_failed", 0)) + 1
         self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
-        detail = (
-            f"queue_full=1 src_node={src_node_id} proto={protocol_tag} iface={self.INBOUND_IFACE_NAME} "
-            f"duplicate_hint={int(duplicate_hint)} payload_len={len(raw)}"
-        )
-        self._send_frame_ack(
-            dst_ip=ack_ip,
-            dst_port=ack_port,
-            dst_node_id=src_node_id,
-            frame_id=frame_id,
-            status="queue_full",
-            detail=detail,
-        )
-
+        if ack_ip and ack_port:
+            self._send_frame_ack(
+                dst_ip=ack_ip,
+                dst_port=ack_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="queue_full",
+                detail=f"queue_full=1 src_node={src_node_id} proto={protocol_tag} payload_len={len(raw)}",
+            )
 
     def _handle_frame_ack(self, msg: dict, from_ip: str, from_port: int) -> None:
-        frame_id = str(msg.get("frame_id") or msg.get("id") or msg.get("ref") or "")
-        src_node_id = str(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or msg.get("sender_node_id") or "")
-        raw_type = str(msg.get("type") or "").strip().lower()
-        status = str(
-            msg.get("status")
-            or msg.get("ack_status")
-            or msg.get("state")
-            or msg.get("result")
-            or raw_type
-            or "processed"
-        ).strip().lower()
-        detail = str(msg.get("detail") or msg.get("message") or msg.get("reason") or "")
+        frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128)
+        src_node_id = self._bounded_text(
+            msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or msg.get("sender_node_id"),
+            128,
+        )
+        if not frame_id or not src_node_id:
+            return
 
+        with self._pending_lock:
+            pending = self._pending_frames.get(frame_id)
+            if pending is None or str(pending.get("peer_node_id") or "") != src_node_id:
+                return
+
+        raw_type = str(msg.get("type") or "").strip().lower()
+        status = self._bounded_text(
+            msg.get("status") or msg.get("ack_status") or msg.get("state") or msg.get(
+                "result") or raw_type or "processed",
+            32,
+        ).lower()
+        detail = self._bounded_text(msg.get("detail") or msg.get("message") or msg.get("reason"), 512)
         if status in {"ack", "frame_ack", "frame_status", "status"}:
             detail_l = detail.lower()
             if "processed" in detail_l:
@@ -30974,13 +31619,8 @@ class HyperVRouterManager:
             else:
                 status = "processed"
 
-        if src_node_id:
-            self._note_peer_ack(src_node_id)
-            self._note_peer_data_path(src_node_id, from_ip, from_port)
-
-        if not frame_id:
-            return
-
+        self._note_peer_ack(src_node_id)
+        self._note_peer_data_path(src_node_id, from_ip, from_port)
         terminal_success = {"processed", "observed", "ok", "success", "accepted"}
         terminal_failure = {"busy", "queue_full", "decode_failed", "bad_frame", "failed", "error"}
 
@@ -30991,7 +31631,9 @@ class HyperVRouterManager:
             pending["last_ack_status"] = status
             pending["last_ack_detail"] = detail
             pending["last_ack_ts"] = time.time()
-            pending["acked_by"] = src_node_id or pending.get("acked_by")
+            pending["acked_by"] = src_node_id
+            pending["acked_from_ip"] = str(from_ip or "")
+            pending["acked_from_port"] = int(from_port or 0)
             if status in terminal_success or status in terminal_failure:
                 self._pending_frames.pop(frame_id, None)
 
@@ -31040,7 +31682,7 @@ class HyperVRouterManager:
             "origin_frame_id": origin_frame_id,
             "content_hash": content_hash,
         }
-        return [json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")]
+        return [self._encode_wire_message(msg)]
 
     def _make_frame_ack_messages(self, *, frame_id: str, status: str, detail: str = "") -> List[bytes]:
         msg = {
@@ -31057,16 +31699,16 @@ class HyperVRouterManager:
             "reply_ip": self._advertise_ip(),
             "reply_port": int(self._bound_data_port or self.data_port or 0),
         }
-        return [json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")]
+        return [self._encode_wire_message(msg)]
 
     def _enqueue_remote(
-        self,
-        *,
-        protocol_tag: str,
-        raw: bytes,
-        inbound_iface: str,
-        dst_node_id: str,
-        dst_sender_id: str,
+            self,
+            *,
+            protocol_tag: str,
+            raw: bytes,
+            inbound_iface: str,
+            dst_node_id: str,
+            dst_sender_id: str,
     ) -> bool:
         if self._is_remote_ingress_breaker_open():
             return False
@@ -31080,12 +31722,11 @@ class HyperVRouterManager:
 
         if not peer_targets:
             return False
-
         target_ip, target_port = peer_targets[0]
 
         frame_id = uuid.uuid4().hex
         trace_id = hashlib.blake2b(
-            (f"{self.node_id}|{dst_node_id}|{protocol_tag}|{len(raw)}|{time.time()}").encode("utf-8"),
+            f"{self.node_id}|{dst_node_id}|{protocol_tag}|{len(raw)}|{time.time()}".encode("utf-8"),
             digest_size=8,
         ).hexdigest()
         raw_msg = self._make_frame_messages(
@@ -31116,7 +31757,8 @@ class HyperVRouterManager:
                 "peer_host_name": peer_host,
                 "peer_ip": target_ip,
                 "peer_port": target_port,
-                "peer_targets": [(target_ip, target_port)],
+                "peer_targets": list(peer_targets),
+                "target_index": 0,
                 "dst_sender_id": dst_sender_id,
                 "protocol_tag": protocol_tag,
                 "created_ts": time.time(),
@@ -31146,16 +31788,15 @@ class HyperVRouterManager:
                 self._pending_frames.pop(frame_id, None)
         return ok
 
-
     def _send_frame_ack(
-        self,
-        *,
-        dst_ip: str,
-        dst_port: int,
-        dst_node_id: str,
-        frame_id: str,
-        status: str,
-        detail: str = "",
+            self,
+            *,
+            dst_ip: str,
+            dst_port: int,
+            dst_node_id: str,
+            frame_id: str,
+            status: str,
+            detail: str = "",
     ) -> bool:
         raws = self._make_frame_ack_messages(frame_id=frame_id, status=status, detail=detail)
         targets = self._candidate_reply_targets(dst_node_id=dst_node_id, dst_ip=dst_ip, dst_port=int(dst_port or 0))
@@ -31173,126 +31814,135 @@ class HyperVRouterManager:
             status=status,
         )
 
-
-    def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[Tuple[str, int]]:
+    def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[
+        Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
+        observed_ip = self._sanitize_peer_ip(from_ip)
+        observed_port = self._safe_port(from_port, 0)
 
-        def _push(ip_val: Any, port_val: Any) -> None:
-            ip_s = str(ip_val or "").strip()
-            try:
-                port_i = int(port_val or 0)
-            except Exception:
-                port_i = 0
-            if ip_s and port_i > 0:
-                out.append((ip_s, port_i))
+        if observed_ip and observed_port and self._transport_ip_allowed(observed_ip, discovery=False):
+            out.append((observed_ip, observed_port))
 
-        explicit_ips = [
-            msg.get("reply_ip"),
-            msg.get("reply_to_ip"),
-            msg.get("ack_ip"),
-            from_ip,
-        ]
-        explicit_ports = [
-            msg.get("reply_port"),
-            msg.get("ack_port"),
-            msg.get("reply_data_port"),
-            msg.get("src_data_port"),
-            from_port,
-        ]
-
-        for ip_val in explicit_ips:
-            for port_val in explicit_ports:
-                _push(ip_val, port_val)
-
-        for ip_val, port_val in self._candidate_reply_targets(
-            dst_node_id=src_node_id,
-            dst_ip=str(from_ip or ""),
-            dst_port=int(from_port or 0),
+        for item in self._candidate_reply_targets(
+                dst_node_id=src_node_id,
+                dst_ip=observed_ip,
+                dst_port=observed_port,
         ):
-            _push(ip_val, port_val)
+            if item not in out:
+                out.append(item)
 
-        deduped: List[Tuple[str, int]] = []
-        seen: Set[Tuple[str, int]] = set()
-        for item in out:
-            if item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        return deduped[: max(1, int(self._ack_target_limit or 1))]
+        # Message-supplied reply fields are accepted only when they match an
+        # already learned address for this peer.
+        hinted_ip = self._sanitize_peer_ip(msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip"))
+        hinted_port = self._safe_port(
+            msg.get("reply_port") or msg.get("ack_port") or msg.get("reply_data_port") or msg.get("src_data_port"),
+            0,
+        )
+        if hinted_ip and hinted_port and self._peer_knows_ip(src_node_id, hinted_ip):
+            item = (hinted_ip, hinted_port)
+            if self._transport_ip_allowed(hinted_ip, discovery=False) and item not in out:
+                out.append(item)
+
+        return out[: max(1, int(self._ack_target_limit or 1))]
 
     def _candidate_reply_targets(self, *, dst_node_id: str, dst_ip: str, dst_port: int) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
-
-        if dst_ip and int(dst_port or 0) > 0:
-            if self._transport_ip_allowed(
-                dst_ip,
-                discovery=(int(dst_port) == self.discovery_port or int(dst_port) == self._bound_discovery_port)
-            ):
-                out.append((str(dst_ip), int(dst_port)))
+        ip = self._sanitize_peer_ip(dst_ip)
+        port = self._safe_port(dst_port, 0)
+        if ip and port and self._transport_ip_allowed(ip, discovery=False):
+            out.append((ip, port))
 
         with self._lock:
             peer = self._peers.get(str(dst_node_id)) if dst_node_id else None
+            if peer is not None:
+                for item in self._candidate_peer_targets(peer):
+                    if item not in out:
+                        out.append(item)
 
-        if peer is not None:
-            for ip, port in [
-                (peer.last_data_from_ip, peer.last_data_from_port or peer.data_port),
-                (peer.listen_ip, peer.data_port),
-                (peer.last_hello_from_ip, peer.discovery_port),
-            ]:
-                if ip and int(port or 0) > 0 and self._transport_ip_allowed(ip, discovery=(int(port) == peer.discovery_port)):
-                    out.append((str(ip), int(port)))
-
-        deduped: List[Tuple[str, int]] = []
-        seen: Set[Tuple[str, int]] = set()
-        for item in out:
-            if item[0] and item[1] > 0 and item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        return deduped[: max(1, int(self._ack_target_limit or 1))]
+        return out[: max(1, int(self._ack_target_limit or 1))]
 
     def _candidate_peer_targets(self, peer: _Peer) -> List[Tuple[str, int]]:
-        out: List[Tuple[str, int]] = []
-        for ip, port in [
-            (peer.last_data_from_ip, peer.last_data_from_port or peer.data_port),
-            (peer.listen_ip, peer.data_port),
-            (peer.advertised_ip, peer.data_port),
-        ]:
-            if not ip:
-                continue
-            if int(port or 0) <= 0:
-                continue
-            if not self._transport_ip_allowed(ip, discovery=False):
-                continue
-            out.append((str(ip), int(port)))
+        now = time.time()
+        candidates: List[Tuple[int, str, int]] = []
+        ips: Set[str] = set(peer.candidate_ips.keys())
+        for ip in (
+                peer.last_success_ip,
+                peer.last_data_from_ip,
+                peer.listen_ip,
+                peer.last_hello_from_ip,
+                peer.advertised_ip,
+        ):
+            if ip:
+                ips.add(str(ip))
 
-        deduped: List[Tuple[str, int]] = []
-        seen: Set[Tuple[str, int]] = set()
-        for item in out:
-            if item[0] and item[1] > 0 and item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        return deduped[: max(1, int(self._peer_target_limit or 1))]
+        for ip in ips:
+            ip = self._sanitize_peer_ip(ip)
+            if not ip or not self._transport_ip_allowed(ip, discovery=False):
+                continue
+            seen_ts = float(peer.candidate_ips.get(ip, 0.0) or 0.0)
+            if seen_ts and (now - seen_ts) > float(self._peer_path_ttl_sec):
+                continue
+
+            port = int(peer.data_port or self.data_port)
+            if ip == peer.last_data_from_ip and int(peer.last_data_from_port or 0) > 0:
+                port = int(peer.last_data_from_port)
+            elif ip == peer.last_success_ip and int(peer.last_success_port or 0) > 0:
+                port = int(peer.last_success_port)
+            elif int(peer.candidate_data_ports.get(ip, 0) or 0) > 0:
+                port = int(peer.candidate_data_ports[ip])
+            if not (1 <= port <= 65535):
+                continue
+
+            score = 0
+            if ip in peer.confirmed_ips:
+                score += 1000
+            if ip == peer.last_success_ip:
+                score += 900
+            if ip == peer.last_data_from_ip:
+                score += 800
+            if ip == peer.last_hello_from_ip:
+                score += 500
+            if ip == peer.listen_ip:
+                score += 450
+            if ip == peer.advertised_ip:
+                score += 300
+            if self._same_ipv4_subnet(ip, self.bind_ip):
+                score += 250
+            elif self._same_private_scope(ip, self.bind_ip):
+                score += 100
+            score += min(100, int(peer.path_successes.get(ip, 0) or 0) * 10)
+            score -= min(300, int(peer.path_failures.get(ip, 0) or 0) * 40)
+            if seen_ts:
+                score += max(0, int(60 - (now - seen_ts)))
+            candidates.append((score, ip, port))
+
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        out: List[Tuple[str, int]] = []
+        for _, ip, port in candidates:
+            item = (ip, port)
+            if item not in out:
+                out.append(item)
+        return out[: max(1, int(self._peer_target_limit or 1))]
 
     def _can_assume_delivery(self, info: Dict[str, Any], now: Optional[float] = None) -> bool:
         return False
 
-
     def _complete_pending_frames_for_peer(self, node_id: str, *, reason: str, min_age_sec: float = 0.0) -> int:
         return 0
 
-
     def _queue_network_message(
-        self,
-        *,
-        raw: bytes,
-        ip: str,
-        port: int,
-        mtype: str,
-        peer_node_id: str = "",
-        frame_id: str = "",
-        trace_id: str = "",
-        status: str = "",
-        protocol_tag: str = "",
-        dst_sender_id: str = "",
+            self,
+            *,
+            raw: bytes,
+            ip: str,
+            port: int,
+            mtype: str,
+            peer_node_id: str = "",
+            frame_id: str = "",
+            trace_id: str = "",
+            status: str = "",
+            protocol_tag: str = "",
+            dst_sender_id: str = "",
     ) -> bool:
         item = {
             "raw": raw,
@@ -31330,8 +31980,9 @@ class HyperVRouterManager:
             return False
 
         if not self._transport_ip_allowed(
-            ip,
-            discovery=(mtype in {"hello", "hello_reply"} or port == self.discovery_port or port == self._bound_discovery_port)
+                ip,
+                discovery=(mtype in {"hello",
+                                     "hello_reply"} or port == self.discovery_port or port == self._bound_discovery_port)
         ):
             return False
 
@@ -31396,26 +32047,42 @@ class HyperVRouterManager:
         now = time.time()
         retry_items: List[Dict[str, Any]] = []
         expired: List[Dict[str, Any]] = []
+        failed_paths: List[Tuple[str, str]] = []
 
         with self._pending_lock:
             for frame_id, info in list(self._pending_frames.items()):
-                created_ts = float(info.get("created_ts", now))
                 last_send_ts = float(info.get("last_send_ts", 0.0))
                 retry_count = int(info.get("retry_count", 0))
-
                 if last_send_ts <= 0.0:
                     continue
 
-                age = now - created_ts
-                if age > self._frame_ack_timeout_sec:
-                    if retry_count >= self._frame_retry_limit:
-                        expired.append(info)
-                        self._pending_frames.pop(frame_id, None)
-                        continue
-                    if (now - last_send_ts) >= self._frame_retry_interval_sec:
-                        info["retry_count"] = retry_count + 1
-                        info["last_send_ts"] = now
-                        retry_items.append(dict(info))
+                if (now - last_send_ts) < self._frame_ack_timeout_sec:
+                    continue
+                if retry_count >= self._frame_retry_limit:
+                    expired.append(dict(info))
+                    self._pending_frames.pop(frame_id, None)
+                    continue
+
+                targets = list(info.get("peer_targets") or [])
+                if not targets:
+                    targets = [(str(info.get("peer_ip") or ""), int(info.get("peer_port") or 0))]
+                failed_paths.append((
+                    str(info.get("peer_node_id") or ""),
+                    str(info.get("peer_ip") or ""),
+                ))
+
+                next_index = (int(info.get("target_index", 0)) + 1) % max(1, len(targets))
+                target_ip, target_port = targets[next_index]
+                info["target_index"] = next_index
+                info["peer_ip"] = str(target_ip)
+                info["peer_port"] = int(target_port)
+                info["retry_count"] = retry_count + 1
+                info["last_send_ts"] = now
+                retry_items.append(dict(info))
+
+        # Preserve lock order: peer lock is never acquired while pending_lock is held.
+        for node_id, ip in failed_paths:
+            self._note_peer_path_failure(node_id, ip)
 
         for info in retry_items:
             self._stats["peer_send_retry"] += 1
@@ -31430,47 +32097,37 @@ class HyperVRouterManager:
                 protocol_tag=str(info.get("protocol_tag") or ""),
                 dst_sender_id=str(info.get("dst_sender_id") or ""),
             )
-            if queued:
-                self._log_sparse(
-                    f"ack-retry:{info.get('peer_node_id') or '?'}",
-                    "ack",
-                    f"retrying unacked frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retry={info.get('retry_count')}",
-                    ["🔁", "📡", "🧠"],
-                    every=1.5,
-                )
-            else:
-                self._log_sparse(
-                    f"ack-retry-drop:{info.get('peer_node_id') or '?'}",
-                    "ack",
-                    f"retry dropped because network queue is full frame_id={info.get('frame_id')} peer={info.get('peer_node_id') or '?'}",
-                    ["⚠️", "📡", "🧯"],
-                    every=1.5,
-                )
+            self._log_sparse(
+                f"ack-retry:{info.get('peer_node_id') or '?'}",
+                "ack",
+                f"retry frame={info.get('frame_id')} peer={info.get('peer_node_id') or '?'} target={info.get('peer_ip')}:{info.get('peer_port')} retry={info.get('retry_count')} queued={int(bool(queued))}",
+                ["🔁", "📡", "🧭"],
+                every=1.5,
+            )
 
         for info in expired:
             self._log_sparse(
                 f"ack-expire:{info.get('peer_node_id') or '?'}",
                 "ack",
-                f"stopping delivery tracking for frame frame_id={info.get('frame_id')} trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} retries={info.get('retry_count')}",
+                f"delivery tracking expired frame={info.get('frame_id')} peer={info.get('peer_node_id') or '?'} targets={info.get('peer_targets') or []}",
                 ["⌛", "📡", "⚠️"],
                 every=1.5,
             )
 
-
     def _enqueue_router_ingress(
-        self,
-        *,
-        packet,
-        raw: bytes,
-        frame_id: str,
-        trace_id: str,
-        src_node_id: str,
-        src_host_name: str,
-        src_sender_id: str,
-        protocol_tag: str,
-        duplicate_hint: bool,
-        reply_ip: str = "",
-        reply_port: int = 0,
+            self,
+            *,
+            packet,
+            raw: bytes,
+            frame_id: str,
+            trace_id: str,
+            src_node_id: str,
+            src_host_name: str,
+            src_sender_id: str,
+            protocol_tag: str,
+            duplicate_hint: bool,
+            reply_ip: str = "",
+            reply_port: int = 0,
     ) -> bool:
         if self._is_remote_ingress_breaker_open():
             self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
@@ -31519,7 +32176,6 @@ class HyperVRouterManager:
                 every=2.0,
             )
             return False
-
 
     def _router_ingress_loop(self) -> None:
         self._log_evt("worker", "router ingress worker started", ["🧵", "📥", "🧠"])
@@ -31613,7 +32269,6 @@ class HyperVRouterManager:
                     )
                 continue
 
-
     def _prune_pending_frames(self) -> None:
         now = time.time()
         expired: List[Dict[str, Any]] = []
@@ -31686,7 +32341,7 @@ class HyperVRouterManager:
             key, ts = self._recent_content_order.popleft()
             if self._recent_content_hashes.get(key) == ts:
                 self._recent_content_hashes.pop(key, None)
-                
+
     def _note_peer_frame_rx(self, node_id: str, size_bytes: int) -> None:
         if not node_id:
             return
@@ -31719,16 +32374,22 @@ class HyperVRouterManager:
             peer.last_ack_ts = time.time()
 
     def _note_peer_data_path(self, node_id: str, from_ip: str, from_port: int = 0) -> None:
-        if not node_id or not from_ip:
+        ip = self._sanitize_peer_ip(from_ip)
+        if not node_id or not ip:
             return
         with self._lock:
-            peer = self._peers.get(node_id)
+            peer = self._peers.get(str(node_id))
             if peer is None:
                 return
-            peer.last_data_from_ip = str(from_ip)
-            if from_port > 0:
-                peer.last_data_from_port = int(from_port)
-            peer.listen_ip = self._choose_peer_ip(peer.advertised_ip, peer.last_hello_from_ip, peer.last_data_from_ip, peer.listen_ip)
+            port = self._safe_port(from_port, peer.data_port or self.data_port)
+            peer.last_data_from_ip = ip
+            peer.last_data_from_port = port
+            peer.last_success_ip = ip
+            peer.last_success_port = port
+            peer.path_successes[ip] = int(peer.path_successes.get(ip, 0) or 0) + 1
+            peer.path_failures[ip] = 0
+            self._record_peer_path_locked(peer, ip, port, confirmed=True, data_path=True)
+            peer.listen_ip = self._best_peer_ip_locked(peer)
 
     # ---------------------------------------------------------
     # decode / encode / router feed
@@ -31866,13 +32527,13 @@ class HyperVRouterManager:
         def _call_ingest(target) -> bool:
             nonlocal tried_any
             for fn_name in (
-                "process_packet",
-                "handle_packet",
-                "_process_packet",
-                "route_packet",
-                "ingest_packet",
-                "on_packet",
-                "receive_packet",
+                    "process_packet",
+                    "handle_packet",
+                    "_process_packet",
+                    "route_packet",
+                    "ingest_packet",
+                    "on_packet",
+                    "receive_packet",
             ):
                 fn = getattr(target, fn_name, None)
                 if not callable(fn):
@@ -31922,7 +32583,8 @@ class HyperVRouterManager:
         if router is not None and _call_ingest(router):
             return True
 
-        for obj in (self._windivert_manager, self._wintun_manager, self._hostboundary_manager, *list(self._hyperv_managers.values())):
+        for obj in (self._windivert_manager, self._wintun_manager, self._hostboundary_manager,
+                    *list(self._hyperv_managers.values())):
             if obj is None or obj is router:
                 continue
             if _call_ingest(obj):
@@ -31951,10 +32613,10 @@ class HyperVRouterManager:
             return self._router_ref
 
         candidates = [
-            self._windivert_manager,
-            self._wintun_manager,
-            self._hostboundary_manager,
-        ] + list(self._hyperv_managers.values())
+                         self._windivert_manager,
+                         self._wintun_manager,
+                         self._hostboundary_manager,
+                     ] + list(self._hyperv_managers.values())
 
         for obj in candidates:
             found = self._extract_router_from_object(obj)
@@ -31979,8 +32641,8 @@ class HyperVRouterManager:
             try:
                 cand = getattr(obj, attr, None)
                 if cand is not None and (
-                    callable(getattr(cand, "process_packet", None))
-                    or callable(getattr(cand, "handle_packet", None))
+                        callable(getattr(cand, "process_packet", None))
+                        or callable(getattr(cand, "handle_packet", None))
                 ):
                     return cand
             except Exception:
@@ -32237,10 +32899,10 @@ class HyperVRouterManager:
             pass
 
         return (
-            b'"type":"hello"' in preview
-            or b'"type":"hello_ack"' in preview
-            or b'"type":"frame"' in preview
-            or b'"type":"ack"' in preview
+                b'"type":"hello"' in preview
+                or b'"type":"hello_ack"' in preview
+                or b'"type":"frame"' in preview
+                or b'"type":"ack"' in preview
         )
 
     def _control_ports(self) -> Set[int]:
@@ -32352,7 +33014,6 @@ class HyperVRouterManager:
 
         return False
 
-
     def _requeue_router_ingress_item(self, item: _RouterIngressItem) -> bool:
         try:
             self._router_ingress_q.put_nowait(item)
@@ -32384,16 +33045,11 @@ class HyperVRouterManager:
             self._pending_frames.pop(frame_id, None)
             self._stats["pending_pruned"] = int(self._stats.get("pending_pruned", 0)) + 1
 
-
     def _is_valid_bind_ip(self, ip: str) -> bool:
         ip_s = str(ip or "").strip()
-        if not ip_s or ip_s in {"0.0.0.0", "127.0.0.1"}:
+        if not self._is_usable_unicast_ipv4(ip_s):
             return False
-        try:
-            parts = [int(x) for x in ip_s.split(".")]
-            return len(parts) == 4 and all(0 <= x <= 255 for x in parts)
-        except Exception:
-            return False
+        return ip_s != "127.0.0.1"
 
     def _is_broadcast_or_multicast_packet(self, packet) -> bool:
         try:
@@ -32516,7 +33172,8 @@ class HyperVRouterManager:
 
         return ""
 
-    def _record_remote_ingress_queue_full(self, *, src_node_id: str, src_sender_id: str, protocol_tag: str, payload_len: int) -> None:
+    def _record_remote_ingress_queue_full(self, *, src_node_id: str, src_sender_id: str, protocol_tag: str,
+                                          payload_len: int) -> None:
         now = time.time()
         window_start = now - float(self._remote_ingress_breaker_window_sec or 15.0)
         dq = self._remote_ingress_queue_full_events
@@ -32539,7 +33196,6 @@ class HyperVRouterManager:
     def _is_remote_ingress_breaker_open(self) -> bool:
         return time.time() < float(getattr(self, "_remote_ingress_breaker_open_until", 0.0) or 0.0)
 
-
     def _log_evt(self, event: str, message: str, emojis: Optional[list[str]] = None) -> None:
         self._log(f"[{str(event or 'evt').upper()}] {message}", emojis)
 
@@ -32557,12 +33213,12 @@ class HyperVRouterManager:
             pass
 
     def _log_sparse(
-        self,
-        bucket: str,
-        event: str,
-        message: str,
-        emojis: Optional[list[str]] = None,
-        every: float = 5.0,
+            self,
+            bucket: str,
+            event: str,
+            message: str,
+            emojis: Optional[list[str]] = None,
+            every: float = 5.0,
     ) -> None:
         now = time.time()
         last = float(self._log_throttle.get(bucket, 0.0))
@@ -32591,19 +33247,26 @@ class HyperVRouterManager:
         return base64.b64encode(payload).decode("ascii"), codec, payload_sha256
 
     def _unpack_payload_bytes(self, msg: Dict[str, Any]) -> Optional[bytes]:
-        payload = None
         codec = str(msg.get("payload_codec") or msg.get("codec") or "plain").strip().lower()
+        if codec not in {"plain", "zlib", "deflate", "gzip"}:
+            return None
+
+        payload: Optional[bytes] = None
 
         def _try_b64(val):
             if not isinstance(val, str) or not val:
                 return None
+            if len(val) > int(self._wire_message_max_bytes):
+                return None
             try:
-                return base64.b64decode(val.encode("ascii"), validate=False)
+                return base64.b64decode(val.encode("ascii"), validate=True)
             except Exception:
                 return None
 
         def _try_hex(val):
             if not isinstance(val, str) or not val:
+                return None
+            if len(val) > int(self._wire_payload_max_bytes) * 2:
                 return None
             try:
                 return bytes.fromhex(val)
@@ -32614,39 +33277,47 @@ class HyperVRouterManager:
             payload = _try_b64(msg.get(key))
             if payload is not None:
                 break
-
         if payload is None:
             for key in ("payload_hex", "raw_hex", "data_hex", "frame_hex"):
                 payload = _try_hex(msg.get(key))
                 if payload is not None:
                     break
-
         if payload is None:
             arr = msg.get("payload_bytes")
-            if isinstance(arr, list):
+            if isinstance(arr, list) and len(arr) <= int(self._wire_payload_max_bytes):
                 try:
                     payload = bytes(int(x) & 0xFF for x in arr)
                 except Exception:
                     payload = None
-
         if payload is None:
             return None
 
-        if codec in {"zlib", "deflate"}:
+        max_out = int(self._wire_payload_max_bytes)
+        if codec in {"zlib", "deflate", "gzip"}:
             try:
-                payload = zlib.decompress(payload)
+                wbits = (zlib.MAX_WBITS | 16) if codec == "gzip" else zlib.MAX_WBITS
+                dec = zlib.decompressobj(wbits)
+                out = dec.decompress(payload, max_out + 1)
+                if len(out) > max_out or dec.unconsumed_tail or not dec.eof:
+                    return None
+                payload = out
             except Exception:
                 return None
-        elif codec == "gzip":
-            try:
-                payload = zlib.decompress(payload, zlib.MAX_WBITS | 16)
-            except Exception:
-                return None
+        elif len(payload) > max_out:
+            return None
 
-        want_sha = str(msg.get("payload_sha256") or msg.get("sha256") or "")
+        try:
+            declared_len = int(msg.get("payload_len")) if msg.get("payload_len") is not None else len(payload)
+        except Exception:
+            return None
+        if declared_len != len(payload) or declared_len < 0 or declared_len > max_out:
+            return None
+
+        want_sha = str(msg.get("payload_sha256") or msg.get("sha256") or "").strip().lower()
         if want_sha:
-            have_sha = hashlib.sha256(payload).hexdigest()
-            if have_sha != want_sha:
+            if len(want_sha) != 64 or any(ch not in "0123456789abcdef" for ch in want_sha):
+                return None
+            if hashlib.sha256(payload).hexdigest() != want_sha:
                 return None
         return payload
 
@@ -32698,20 +33369,18 @@ class HyperVRouterManager:
         for peer in peers:
             if (now - peer.last_seen) > max(self.peer_timeout_sec, self._direct_hello_every_sec * 2.0):
                 continue
-            target_ips = [peer.last_hello_from_ip, peer.listen_ip, peer.advertised_ip]
-            for ip in target_ips:
-                if not ip:
+            ips = [peer.last_success_ip, peer.last_data_from_ip, peer.last_hello_from_ip, peer.listen_ip,
+                   peer.advertised_ip]
+            ips.extend(peer.candidate_ips.keys())
+            for ip in ips:
+                ip = self._sanitize_peer_ip(ip)
+                if not ip or not self._transport_ip_allowed(ip, discovery=True):
                     continue
-                if self._transport_ip_allowed(ip, discovery=True):
-                    out.append((ip, int(peer.discovery_port or self.discovery_port)))
+                item = (ip, int(peer.discovery_port or self.discovery_port))
+                if item not in out:
+                    out.append(item)
 
-        deduped: List[Tuple[str, int]] = []
-        seen: Set[Tuple[str, int]] = set()
-        for item in out:
-            if item not in seen and item[1] > 0:
-                seen.add(item)
-                deduped.append(item)
-        return deduped[: max(1, int(self._peer_target_limit or 1))]
+        return out[: max(1, int(self._peer_target_limit or 1))]
 
     def _peer_last_seen(self, node_id: str) -> float:
         with self._lock:
@@ -32721,67 +33390,300 @@ class HyperVRouterManager:
             return float(peer.last_seen or 0.0)
 
     def _choose_peer_ip(self, advertised_ip: str, hello_ip: str, data_ip: str, current_ip: str = "") -> str:
-        candidates = [
-            str(data_ip or "").strip(),
-            str(hello_ip or "").strip(),
-            str(advertised_ip or "").strip(),
-            str(current_ip or "").strip(),
-        ]
-        bind_ip = str(self.bind_ip or "").strip()
+        candidates = []
+        for value in (data_ip, hello_ip, advertised_ip, current_ip):
+            ip = self._sanitize_peer_ip(value)
+            if ip and ip not in candidates and self._transport_ip_allowed(ip, discovery=False):
+                candidates.append(ip)
         for ip in candidates:
-            if self._same_ipv4_subnet(ip, bind_ip):
+            if self._same_ipv4_subnet(ip, self.bind_ip):
                 return ip
         for ip in candidates:
-            if self._is_private_ipv4(ip):
+            if self._same_private_scope(ip, self.bind_ip):
                 return ip
-        for ip in candidates:
-            if ip:
-                return ip
-        return ""
+        return candidates[0] if candidates else ""
 
     def _same_ipv4_subnet(self, ip_a: str, ip_b: str) -> bool:
-        try:
-            a = str(ip_a or "").split(".")
-            b = str(ip_b or "").split(".")
-            return len(a) == 4 and len(b) == 4 and a[:3] == b[:3]
-        except Exception:
-            return False
+        a = self._ipv4_parts(ip_a)
+        b = self._ipv4_parts(ip_b)
+        return bool(a and b and a[:3] == b[:3])
 
     def _is_private_ipv4(self, ip: str) -> bool:
-        try:
-            parts = [int(x) for x in str(ip or "").split(".")]
-            if len(parts) != 4:
-                return False
-            if parts[0] == 10:
-                return True
-            if parts[0] == 172 and 16 <= parts[1] <= 31:
-                return True
-            if parts[0] == 192 and parts[1] == 168:
-                return True
+        parts = self._ipv4_parts(ip)
+        if not parts:
             return False
-        except Exception:
-            return False
+        if parts[0] == 10:
+            return True
+        if parts[0] == 172 and 16 <= parts[1] <= 31:
+            return True
+        if parts[0] == 192 and parts[1] == 168:
+            return True
+        if parts[0] == 100 and 64 <= parts[1] <= 127:  # RFC 6598 CGNAT
+            return True
+        return False
 
     def _transport_ip_allowed(self, ip: str, *, discovery: bool) -> bool:
         ip_s = str(ip or "").strip()
-        if not ip_s:
-            return False
-
         if discovery and ip_s == self.discovery_group:
             return True
-
-        if ip_s in {"255.255.255.255"}:
+        if ip_s == "255.255.255.255":
             return bool(self._send_global_broadcast)
-
+        if not self._is_usable_unicast_ipv4(ip_s):
+            return False
         if self._is_private_ipv4(ip_s):
             return True
-
-        if self._same_ipv4_subnet(ip_s, self._advertise_ip()):
+        parts = self._ipv4_parts(ip_s)
+        bind_parts = self._ipv4_parts(self.bind_ip)
+        if parts and bind_parts and parts[:2] == [169, 254] and bind_parts[:2] == [169, 254]:
             return True
+        return bool(self._allow_public_discovery if discovery else self._allow_public_peer_data)
 
-        if discovery:
-            return bool(self._allow_public_discovery)
-        return bool(self._allow_public_peer_data)
+    def configure_wire_security(
+            self,
+            *,
+            shared_secret: Optional[str] = None,
+            require_auth: bool = False,
+            allow_public_peer_data: Optional[bool] = None,
+            allow_public_discovery: Optional[bool] = None,
+            allow_cross_subnet_private_hints: Optional[bool] = None,
+    ) -> None:
+        secret = str(shared_secret or "").encode("utf-8")
+        if require_auth and not secret:
+            raise ValueError("require_auth=True requires a non-empty shared_secret")
+        self._wire_shared_secret = secret
+        self._wire_require_auth = bool(require_auth)
+        if allow_public_peer_data is not None:
+            self._allow_public_peer_data = bool(allow_public_peer_data)
+        if allow_public_discovery is not None:
+            self._allow_public_discovery = bool(allow_public_discovery)
+        if allow_cross_subnet_private_hints is not None:
+            self._allow_cross_subnet_private_peer_hints = bool(allow_cross_subnet_private_hints)
+        self._log_evt(
+            "security",
+            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} public_data={int(self._allow_public_peer_data)} public_discovery={int(self._allow_public_discovery)} cross_subnet_private_hints={int(self._allow_cross_subnet_private_peer_hints)}",
+            ["🛡️", "🔐", "🌐"],
+        )
+
+    def _bounded_text(self, value: Any, max_len: int) -> str:
+        text = str(value or "").strip()
+        if len(text) > int(max_len):
+            return ""
+        return text
+
+    def _safe_port(self, value: Any, default: int = 0) -> int:
+        try:
+            port = int(value or 0)
+        except Exception:
+            port = 0
+        if 1 <= port <= 65535:
+            return port
+        try:
+            default_port = int(default or 0)
+        except Exception:
+            default_port = 0
+        return default_port if 1 <= default_port <= 65535 else 0
+
+    def _ipv4_parts(self, ip: Any) -> Optional[List[int]]:
+        text = str(ip or "").strip()
+        try:
+            parts = [int(x) for x in text.split(".")]
+        except Exception:
+            return None
+        if len(parts) != 4 or any(x < 0 or x > 255 for x in parts):
+            return None
+        return parts
+
+    def _is_usable_unicast_ipv4(self, ip: Any) -> bool:
+        parts = self._ipv4_parts(ip)
+        if not parts:
+            return False
+        if parts[0] in {0, 127} or parts[0] >= 224:
+            return False
+        if parts == [255, 255, 255, 255]:
+            return False
+        if parts[-1] == 255 and self._same_ipv4_subnet(str(ip), self.bind_ip):
+            return False
+        return True
+
+    def _sanitize_peer_ip(self, value: Any) -> str:
+        text = str(value or "").strip()
+        return text if self._is_usable_unicast_ipv4(text) else ""
+
+    def _same_private_scope(self, ip_a: str, ip_b: str) -> bool:
+        a = self._ipv4_parts(ip_a)
+        b = self._ipv4_parts(ip_b)
+        if not a or not b:
+            return False
+        if a[0] == b[0] == 10:
+            return True
+        if a[0] == b[0] == 172 and 16 <= a[1] <= 31 and 16 <= b[1] <= 31:
+            return True
+        if a[:2] == b[:2] == [192, 168]:
+            return True
+        if a[0] == b[0] == 100 and 64 <= a[1] <= 127 and 64 <= b[1] <= 127:
+            return True
+        return False
+
+    def _advertised_fallback_plausible(self, observed_ip: str, advertised_ip: str) -> bool:
+        if not advertised_ip or not self._transport_ip_allowed(advertised_ip, discovery=True):
+            return False
+        if advertised_ip == observed_ip or self._same_ipv4_subnet(advertised_ip, observed_ip):
+            return True
+        return bool(
+            self._allow_cross_subnet_private_peer_hints
+            and self._is_private_ipv4(advertised_ip)
+            and (not observed_ip or self._is_private_ipv4(observed_ip))
+        )
+
+    def _record_peer_path_locked(
+            self,
+            peer: _Peer,
+            ip: str,
+            port: int,
+            *,
+            confirmed: bool,
+            data_path: bool,
+    ) -> None:
+        ip = self._sanitize_peer_ip(ip)
+        if not ip:
+            return
+        peer.candidate_ips[ip] = time.time()
+        if data_path and 1 <= int(port or 0) <= 65535:
+            peer.candidate_data_ports[ip] = int(port)
+        if confirmed:
+            peer.confirmed_ips.add(ip)
+        if len(peer.candidate_ips) > 8:
+            keep = sorted(peer.candidate_ips.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            keep_ips = {ip for ip, _ in keep}
+            peer.candidate_ips = dict(keep)
+            peer.candidate_data_ports = {ip: p for ip, p in peer.candidate_data_ports.items() if ip in keep_ips}
+            peer.confirmed_ips.intersection_update(keep_ips)
+            peer.path_successes = {ip: n for ip, n in peer.path_successes.items() if ip in keep_ips}
+            peer.path_failures = {ip: n for ip, n in peer.path_failures.items() if ip in keep_ips}
+
+    def _best_peer_ip_locked(self, peer: _Peer) -> str:
+        targets = self._candidate_peer_targets(peer)
+        return targets[0][0] if targets else ""
+
+    def _peer_knows_ip(self, node_id: str, ip: str) -> bool:
+        ip = self._sanitize_peer_ip(ip)
+        if not node_id or not ip:
+            return False
+        with self._lock:
+            peer = self._peers.get(str(node_id))
+            if peer is None:
+                return False
+            return ip in {
+                peer.listen_ip,
+                peer.advertised_ip,
+                peer.last_hello_from_ip,
+                peer.last_data_from_ip,
+                peer.last_success_ip,
+                *peer.candidate_ips.keys(),
+            }
+
+    def _wire_source_matches_peer(
+            self,
+            node_id: str,
+            from_ip: str,
+            from_port: int,
+            mtype: str,
+            msg: Dict[str, Any],
+    ) -> bool:
+        ip = self._sanitize_peer_ip(from_ip)
+        if not ip or not self._transport_ip_allowed(ip, discovery=False):
+            return False
+        with self._lock:
+            peer = self._peers.get(str(node_id))
+            if peer is None:
+                return not self._wire_require_known_peer_for_data
+            known_ips = {
+                peer.listen_ip,
+                peer.advertised_ip,
+                peer.last_hello_from_ip,
+                peer.last_data_from_ip,
+                peer.last_success_ip,
+                *peer.candidate_ips.keys(),
+            }
+            if ip in known_ips:
+                return True
+            if mtype == "ack":
+                frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128)
+                with self._pending_lock:
+                    pending = self._pending_frames.get(frame_id)
+                    if pending is not None and str(pending.get("peer_node_id") or "") == str(node_id):
+                        return True
+            if self._allow_peer_ip_migration and self._is_private_ipv4(ip):
+                for known in known_ips:
+                    if known and (self._same_ipv4_subnet(ip, known) or self._same_private_scope(ip, known)):
+                        return True
+        return False
+
+    def _wire_rate_allowed(self, from_ip: str, mtype: str) -> bool:
+        now = time.monotonic()
+        key = f"{from_ip}|{mtype}"
+        limit = self._wire_frames_per_sec if mtype == "frame" else self._wire_control_per_sec
+        bucket = self._wire_rx_rate.get(key)
+        if not isinstance(bucket, dict) or (now - float(bucket.get("start", 0.0))) >= 1.0:
+            self._wire_rx_rate[key] = {"start": now, "count": 1.0}
+            return True
+        count = int(bucket.get("count", 0.0)) + 1
+        bucket["count"] = float(count)
+        if len(self._wire_rx_rate) > self._wire_rx_rate_cap:
+            stale = sorted(self._wire_rx_rate.items(), key=lambda kv: float(kv[1].get("start", 0.0)))
+            for stale_key, _ in stale[: len(stale) - self._wire_rx_rate_cap]:
+                self._wire_rx_rate.pop(stale_key, None)
+        return count <= int(limit)
+
+    def _wire_message_mac(self, msg: Dict[str, Any]) -> str:
+        if not self._wire_shared_secret:
+            return ""
+        unsigned = {k: v for k, v in msg.items() if k not in {"auth", "auth_v"}}
+        canonical = json.dumps(unsigned, separators=(",", ":"), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.blake2s(canonical, key=self._wire_shared_secret, digest_size=16).hexdigest()
+
+    def _constant_time_text_equal(self, left: str, right: str) -> bool:
+        a = str(left or "").encode("ascii", errors="ignore")
+        b = str(right or "").encode("ascii", errors="ignore")
+        if len(a) != len(b):
+            return False
+        diff = 0
+        for x, y in zip(a, b):
+            diff |= x ^ y
+        return diff == 0
+
+    def _encode_wire_message(self, msg: Dict[str, Any]) -> bytes:
+        out = dict(msg)
+        if self._wire_shared_secret:
+            out["auth_v"] = 1
+            out["auth"] = self._wire_message_mac(out)
+        raw = json.dumps(out, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(raw) > int(self._wire_message_max_bytes):
+            raise ValueError(f"wire message too large: {len(raw)} bytes")
+        return raw
+
+    def _verify_wire_message_auth(self, msg: Dict[str, Any]) -> bool:
+        supplied = str(msg.get("auth") or "").strip().lower()
+        if not self._wire_shared_secret:
+            return not self._wire_require_auth
+        if not supplied:
+            return not self._wire_require_auth
+        expected = self._wire_message_mac(msg)
+        return self._constant_time_text_equal(supplied, expected)
+
+    def _note_peer_path_failure(self, node_id: str, ip: str) -> None:
+        ip = self._sanitize_peer_ip(ip)
+        if not node_id or not ip:
+            return
+        with self._lock:
+            peer = self._peers.get(str(node_id))
+            if peer is None:
+                return
+            peer.path_failures[ip] = int(peer.path_failures.get(ip, 0) or 0) + 1
+            if peer.path_failures[ip] >= 3 and ip not in peer.confirmed_ips:
+                peer.candidate_ips.pop(ip, None)
+                peer.candidate_data_ports.pop(ip, None)
+            peer.listen_ip = self._best_peer_ip_locked(peer)
 
 
 @dataclass

@@ -66,7 +66,7 @@ from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
 from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
-
+import struct
 try:
     from p2pool_ollama import install_ollama_on_router
 except Exception:
@@ -2249,80 +2249,832 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self,
             packet,
             inbound_iface: str,
-    ) -> bool:
+    ) -> str:
         """
-        Dispatch DHCP only to the server that owns the inbound interface.
-
-        Returns True when the packet is consumed by the DHCP control plane.
-        Returns False when the packet should continue through the normal pipeline.
+        Results:
+            served   - Python DHCP owns the interface and handled the packet.
+            bypass   - Windows, ICS, or an upstream DHCP server owns it.
+            not-dhcp - No DHCP action was taken.
         """
         server = getattr(self, "dhcp_server_in", None)
 
         if server is None:
-            return False
+            return "not-dhcp"
 
-        # Refresh interface ownership in case Windows changed the active
-        # Wi-Fi Direct hotspot adapter.
         self._configure_dhcp_control_plane(
             reason="dhcp-dispatch-refresh"
         )
 
         server = getattr(self, "dhcp_server_in", None)
-
         if server is None:
-            return False
+            return "not-dhcp"
 
-        policy_decision = getattr(
-            server,
-            "interface_policy_decision",
-            None,
+        decision = server.interface_policy_decision(
+            inbound_iface
         )
 
-        if callable(policy_decision):
-            decision = policy_decision(inbound_iface)
-        else:
-            decision = (
-                "serve"
-                if inbound_iface == getattr(server, "in_iface", None)
-                else "pass"
+        if decision == "serve":
+            handled = server.handle_packet(
+                packet,
+                inbound_iface,
+                self.rip_manager.find_route,
             )
+            return "served" if handled else "not-dhcp"
 
-        if decision in ("serve", "observe"):
-            return bool(
-                server.handle_packet(
-                    packet,
-                    inbound_iface,
-                    self.rip_manager.find_route,
-                )
+        if decision == "observe":
+            # Permit server responses to be recorded, but never generate
+            # an OFFER, ACK, NAK, or relay message.
+            server.handle_packet(
+                packet,
+                inbound_iface,
+                self.rip_manager.find_route,
             )
+            return "bypass"
 
-        allowed, denied = self._dhcp_control_plane_iface_sets()
+        # Both deny and pass mean that this DHCP server does not own the
+        # interface. Do not send replies and do not feed the packet into
+        # normal routing/NAT/firewall handling.
+        server._policy_log_limited(
+            f"bypass:{server._normalize_iface_name(inbound_iface)}",
+            (
+                f"[DHCP][ControlPlane] 🚪 BYPASS DHCP on "
+                f"{inbound_iface}; owner=Windows/upstream"
+            ),
+            cooldown=15.0,
+        )
 
-        del allowed
+        return "bypass"
 
-        denied_normalized = {
-            str(iface).casefold()
-            for iface in denied
-        }
+    # DNS dispatcher results.
+    DNS_DISPOSITION_NOT_DNS = "not-dns"
+    DNS_DISPOSITION_HANDLED = "handled"
+    DNS_DISPOSITION_HOST_PASSTHROUGH = "host-passthrough"
+    DNS_DISPOSITION_TRANSIT_PASSTHROUGH = "transit-passthrough"
+    DNS_DISPOSITION_SPECIAL_NAME_SERVICE = "special-name-service"
+    DNS_DISPOSITION_DROP = "drop"
 
-        inbound_normalized = str(
-            inbound_iface or ""
-        ).casefold()
+    def _dns_normalize_ip(self, value) -> str:
+        try:
+            return str(value or "").strip().split("%", 1)[0].lower()
+        except Exception:
+            return ""
 
-        if (
-                decision == "deny"
-                or inbound_normalized in denied_normalized
+    def _dns_safe_int(self, value, default: int = 0) -> int:
+        try:
+            value = getattr(value, "value", value)
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+
+    def _dns_router_ip_set(self) -> set[str]:
+        result: set[str] = set()
+
+        try:
+            addresses = self._get_all_local_ips() or []
+        except Exception:
+            addresses = []
+
+        for address in addresses:
+            normalized = self._dns_normalize_ip(address)
+            if normalized:
+                result.add(normalized)
+
+        for attribute_name in (
+                "router_ip_out",
+                "router_ipv4_out",
+                "router_ipv6_out",
+                "router_ipv6_link_local_out",
         ):
-            self.router_logger.log_message(
-                f"[DHCP][ControlPlane] 🛡️ Suppressed DHCP service "
-                f"handling on denied interface {inbound_iface}."
+            normalized = self._dns_normalize_ip(
+                getattr(self, attribute_name, None)
             )
+            if normalized:
+                result.add(normalized)
 
-            # Consume the DHCP packet without generating any reply.
-            return True
+        return result
+
+    def _dns_is_fragmented_packet(self, packet) -> bool:
+        """
+        DNS carried in fragmented IP packets must not be parsed as an independent
+        complete DNS message. Let the host stack or normal forwarding path perform
+        reassembly.
+        """
+        try:
+            if packet.haslayer(IP):
+                ip = packet[IP]
+
+                fragment_offset = self._dns_safe_int(
+                    getattr(ip, "frag", 0),
+                    0,
+                )
+
+                try:
+                    more_fragments = bool(
+                        int(getattr(ip, "flags", 0)) & 0x01
+                    )
+                except Exception:
+                    more_fragments = "MF" in str(
+                        getattr(ip, "flags", "")
+                    )
+
+                if fragment_offset != 0 or more_fragments:
+                    return True
+
+            ipv6_fragment_class = globals().get("IPv6ExtHdrFragment")
+            if (
+                    ipv6_fragment_class is not None
+                    and packet.haslayer(ipv6_fragment_class)
+            ):
+                return True
+        except Exception:
+            return False
 
         return False
 
+    def _dns_extract_packet_metadata(self, packet) -> dict:
+        """
+        Identify DNS using ports and direct wire decoding.
+
+        Direct DNS wire decoding is authoritative for QR/RCODE because Scapy may
+        leave a valid UDP/53 payload as Raw.
+        """
+        udp = packet.getlayer(UDP)
+        tcp = packet.getlayer(TCP)
+
+        if udp is not None:
+            transport = "udp"
+            transport_layer = udp
+        elif tcp is not None:
+            transport = "tcp"
+            transport_layer = tcp
+        else:
+            return {
+                "is_dns_related": False,
+                "is_standard_dns": False,
+                "transport": None,
+                "sport": 0,
+                "dport": 0,
+                "dns": None,
+                "dispatch_packet": packet,
+                "qr": None,
+                "rcode": None,
+                "special": None,
+                "fragmented": False,
+                "decoded_from_wire": False,
+                "direction_mismatch": False,
+            }
+
+        sport = self._dns_safe_int(
+            getattr(transport_layer, "sport", 0),
+            0,
+        )
+        dport = self._dns_safe_int(
+            getattr(transport_layer, "dport", 0),
+            0,
+        )
+
+        special = None
+
+        if sport == 5353 or dport == 5353:
+            special = "mdns"
+        elif sport == 5355 or dport == 5355:
+            special = "llmnr"
+        elif sport in (137, 138) or dport in (137, 138):
+            special = "nbns"
+
+        is_standard_dns = sport == 53 or dport == 53
+        is_dns_related = bool(is_standard_dns or special)
+
+        existing_dns = packet.getlayer(DNS)
+        wire_result = None
+
+        # Only ordinary UDP/53 uses RFC 1035 DNS wire decoding here.
+        # mDNS and LLMNR remain owned by their dedicated managers.
+        if (
+                transport == "udp"
+                and is_standard_dns
+                and special is None
+        ):
+            wire_result = self._dns_decode_udp_wire(packet)
+
+        decoded_from_wire = wire_result is not None
+
+        if wire_result is not None:
+            dns = wire_result["dns"]
+            qr = int(wire_result["qr"])
+            rcode = int(wire_result["rcode"])
+
+            dispatch_packet = self._dns_make_decoded_packet(
+                packet,
+                dns,
+            )
+        else:
+            dns = existing_dns
+            dispatch_packet = packet
+
+            if dns is not None:
+                qr = self._dns_safe_int(
+                    getattr(dns, "qr", 0),
+                    0,
+                )
+                rcode = self._dns_safe_int(
+                    getattr(dns, "rcode", 0),
+                    0,
+                )
+            else:
+                qr = None
+                rcode = None
+
+        # Port-based direction is only a hint. The DNS QR bit is authoritative.
+        port_direction = None
+
+        if dport == 53 and sport != 53:
+            port_direction = 0
+        elif sport == 53 and dport != 53:
+            port_direction = 1
+
+        direction_mismatch = bool(
+            qr is not None
+            and port_direction is not None
+            and int(qr) != int(port_direction)
+        )
+
+        return {
+            "is_dns_related": is_dns_related,
+            "is_standard_dns": is_standard_dns,
+            "transport": transport,
+            "sport": sport,
+            "dport": dport,
+            "dns": dns,
+            "dispatch_packet": dispatch_packet,
+            "qr": qr,
+            "rcode": rcode,
+            "special": special,
+            "fragmented": self._dns_is_fragmented_packet(packet),
+            "decoded_from_wire": decoded_from_wire,
+            "direction_mismatch": direction_mismatch,
+            "wire_result": wire_result,
+        }
+
+    def _dns_dispatch_log_limited(
+            self,
+            key: str,
+            message: str,
+            interval_sec: float = 5.0,
+    ):
+        """
+        Avoid printing a warning for every host resolver packet.
+        """
+        now = time.monotonic()
+
+        table = getattr(self, "_dns_dispatch_log_times", None)
+        if table is None:
+            table = {}
+            self._dns_dispatch_log_times = table
+
+        last = float(table.get(key, 0.0))
+
+        if now - last < float(interval_sec):
+            return
+
+        table[key] = now
+
+        # Keep the lazy table bounded.
+        if len(table) > 256:
+            cutoff = now - max(float(interval_sec) * 4.0, 30.0)
+
+            for existing_key, timestamp in list(table.items()):
+                if float(timestamp) < cutoff:
+                    table.pop(existing_key, None)
+
+        self.router_logger.log_message(message)
+
+    def _dispatch_dns_packet(
+            self,
+            packet,
+            inbound_iface: str,
+            *,
+            src_ip=None,
+            dst_ip=None,
+    ) -> str:
+        """
+        Route one DNS-related packet to the correct owner.
+
+        DNSManager returning False means it did not consume the packet. It does not
+        automatically mean the packet is invalid.
+
+        Results:
+          handled:
+              DNSManager consumed or answered the packet.
+
+          host-passthrough:
+              The packet belongs to a router-owned socket or local TCP DNS listener.
+              The router pipeline must stop without forwarding it as transit traffic.
+
+          transit-passthrough:
+              DNSManager did not consume it. Continue normal router forwarding.
+
+          special-name-service:
+              mDNS, LLMNR or NBNS must go to their dedicated manager.
+
+          not-dns:
+              Continue the ordinary packet pipeline.
+        """
+        metadata = self._dns_extract_packet_metadata(packet)
+        dns_packet = metadata.get("dispatch_packet") or packet
+        if not metadata["is_dns_related"]:
+            return self.DNS_DISPOSITION_NOT_DNS
+
+        if metadata["special"] is not None:
+            return self.DNS_DISPOSITION_SPECIAL_NAME_SERVICE
+
+        src_ip = self._dns_normalize_ip(src_ip)
+        dst_ip = self._dns_normalize_ip(dst_ip)
+
+        if not src_ip or not dst_ip:
+            if packet.haslayer(IP):
+                src_ip = self._dns_normalize_ip(packet[IP].src)
+                dst_ip = self._dns_normalize_ip(packet[IP].dst)
+            elif packet.haslayer(IPv6):
+                src_ip = self._dns_normalize_ip(packet[IPv6].src)
+                dst_ip = self._dns_normalize_ip(packet[IPv6].dst)
+
+        local_ips = self._dns_router_ip_set()
+
+        source_is_router = src_ip in local_ips
+        destination_is_router = dst_ip in local_ips
+        belongs_to_host = source_is_router or destination_is_router
+
+        transport = metadata["transport"]
+        sport = metadata["sport"]
+        dport = metadata["dport"]
+        dns = metadata["dns"]
+        qr = metadata["qr"]
+        fragmented = metadata["fragmented"]
+
+        # TCP DNS is a byte stream. Individual captured TCP segments must not be
+        # passed to the UDP packet resolver. The DNSManager TCP listener handles
+        # router-destined TCP/53 through the host socket stack.
+        if transport == "tcp":
+            if belongs_to_host:
+                self._dns_dispatch_log_limited(
+                    key=f"tcp-host:{src_ip}:{dst_ip}",
+                    message=(
+                        f"[DNS] 🧵 TCP/53 host-stack pass-through on "
+                        f"{inbound_iface}: "
+                        f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                    ),
+                )
+                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+            self._dns_dispatch_log_limited(
+                key=f"tcp-transit:{inbound_iface}",
+                message=(
+                    f"[DNS] 🚚 TCP/53 transit forwarding on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                ),
+            )
+            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+
+        # Let IP reassembly happen before DNS parsing.
+        if fragmented:
+            if belongs_to_host:
+                self._dns_dispatch_log_limited(
+                    key=f"fragment-host:{src_ip}:{dst_ip}",
+                    message=(
+                        f"[DNS] 🧩 Fragmented DNS host-stack pass-through on "
+                        f"{inbound_iface}: "
+                        f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                    ),
+                )
+                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+            self._dns_dispatch_log_limited(
+                key=f"fragment-transit:{inbound_iface}",
+                message=(
+                    f"[DNS] 🧩 Fragmented DNS transit pass-through on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                ),
+            )
+            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+
+        # UDP/53 was recognized by its ports, but Scapy could not decode a complete
+        # DNS layer. Do not accidentally feed it to a normal DNS handler.
+        if dns is None:
+            payload_length = 0
+
+            if transport == "udp":
+                payload_length = len(
+                    self._dns_udp_payload_bytes(packet)
+                )
+
+            self._dns_dispatch_log_limited(
+                key=f"invalid-dns-wire:{transport}:{inbound_iface}",
+                message=(
+                    f"[DNS] ⚠️ Port-53 packet has no valid DNS message on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"payload_bytes={payload_length}"
+                ),
+                interval_sec=5.0,
+            )
+
+            if belongs_to_host:
+                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+        if metadata.get("decoded_from_wire"):
+            self._dns_dispatch_log_limited(
+                key=f"wire-recovered:{inbound_iface}",
+                message=(
+                    f"[DNS] 🧬 Recovered DNS from raw UDP payload on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
+                    f"qr={qr} "
+                    f"rcode={metadata.get('rcode')} "
+                    f"q={self._dns_safe_question_name(dns)}"
+                ),
+                interval_sec=2.0,
+            )
+
+        if metadata.get("direction_mismatch"):
+            port_direction = (
+                "query"
+                if dport == 53 and sport != 53
+                else "response"
+                if sport == 53 and dport != 53
+                else "unknown"
+            )
+
+            dns_direction = "response" if qr == 1 else "query"
+
+            self._dns_dispatch_log_limited(
+                key=(
+                    f"dns-direction-mismatch:"
+                    f"{src_ip}:{sport}:{dst_ip}:{dport}"
+                ),
+                message=(
+                    f"[DNS] 🔄 DNS direction mismatch on {inbound_iface}: "
+                    f"ports imply {port_direction}, "
+                    f"wire QR implies {dns_direction}; "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
+                    f"q={self._dns_safe_question_name(dns)}"
+                ),
+                interval_sec=5.0,
+            )
+
+        context = {
+            "capture_phase": "pre-nat",
+            "inbound_iface": inbound_iface,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "source_is_router": source_is_router,
+            "destination_is_router": destination_is_router,
+            "is_transit": not belongs_to_host,
+            "transport": transport,
+            "sport": sport,
+            "dport": dport,
+        }
+
+        manager = getattr(self, "dns_manager", None)
+
+        if manager is None:
+            if belongs_to_host:
+                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+
+        handled = False
+
+        try:
+            manager_process_packet = getattr(
+                manager,
+                "process_packet",
+                None,
+            )
+
+            if callable(manager_process_packet):
+                try:
+                    handled = bool(
+                        manager_process_packet(
+                            dns_packet,
+                            inbound_iface,
+                            context=context,
+                        )
+                    )
+                except TypeError as exc:
+                    if "context" not in str(exc):
+                        raise
+
+                    handled = bool(
+                        manager_process_packet(
+                            dns_packet,
+                            inbound_iface,
+                        )
+                    )
+            elif qr == 0:
+                handled = bool(
+                    manager.handle_query(
+                        dns_packet,
+                        inbound_iface,
+                    )
+                )
+            else:
+                handled = bool(
+                    manager.handle_response(dns_packet)
+                )
+
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[DNS] ❗ DNS manager dispatch failed on "
+                f"{inbound_iface}: {exc}"
+            )
+
+            # Fail open for ordinary DNS connectivity. A manager exception should
+            # not convert every DNS packet into a router-wide outage.
+            if belongs_to_host:
+                direction = (
+                    "response"
+                    if qr == 1
+                    else "query"
+                    if qr == 0
+                    else "message"
+                )
+
+                self._dns_dispatch_log_limited(
+                    key=f"host-dns:{direction}:{src_ip}:{dst_ip}",
+                    message=(
+                        f"[DNS] 🖥️ Host DNS {direction} pass-through on "
+                        f"{inbound_iface}: "
+                        f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                        f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
+                        f"rcode={metadata.get('rcode')} "
+                        f"q={self._dns_safe_question_name(dns)}"
+                    ),
+                    interval_sec=3.0,
+                )
+
+                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+
+        if handled:
+            return self.DNS_DISPOSITION_HANDLED
+
+        # Unmatched query sourced from the router:
+        # ordinary host resolver query or OS-socket upstream transport.
+        if qr == 0 and source_is_router:
+            self._dns_dispatch_log_limited(
+                key=f"os-query:{src_ip}:{dst_ip}",
+                message=(
+                    f"[DNS] 🖥️ Host resolver query pass-through on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                ),
+            )
+            return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+        # Unmatched answer destined for a router address:
+        # usually a reply to a Windows resolver socket, UDP transport, probe,
+        # DNSSEC backend, DoH bootstrap lookup, or another local application.
+        if qr == 1 and destination_is_router:
+            self._dns_dispatch_log_limited(
+                key=f"os-response:{src_ip}:{dst_ip}",
+                message=(
+                    f"[DNS] 🖥️ Host resolver response pass-through on "
+                    f"{inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                ),
+            )
+            return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+        # A query directed to the router was not claimed by DNSManager. Let a local
+        # socket listener receive it instead of forwarding it back onto the network.
+        if qr == 0 and destination_is_router:
+            self._dns_dispatch_log_limited(
+                key=f"local-listener-query:{dst_ip}",
+                message=(
+                    f"[DNS] 🎧 Unclaimed local DNS query passed to host listener "
+                    f"on {inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                ),
+            )
+            return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+
+        # Any other unclaimed response/query is transit traffic. It may be:
+        #   - direct client DNS intentionally not intercepted
+        #   - an ordinary NATed response
+        #   - traffic whose raw pending entry expired
+        # Continue the standard forwarding pipeline.
+        self._dns_dispatch_log_limited(
+            key=f"transit:{qr}:{inbound_iface}",
+            message=(
+                f"[DNS] ↪️ Unclaimed DNS transit packet continuing normally on "
+                f"{inbound_iface}: "
+                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+            ),
+        )
+
+        return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+
+    def _dns_udp_payload_bytes(self, packet) -> bytes:
+        """
+        Extract exactly the UDP application payload.
+
+        UDP.len includes the eight-byte UDP header. Trimming to UDP.len avoids
+        accidentally feeding Ethernet padding or capture padding into DNS().
+        """
+        udp = packet.getlayer(UDP)
+        if udp is None:
+            return b""
+
+        try:
+            payload = bytes(udp.payload)
+        except Exception:
+            return b""
+
+        if not payload:
+            return b""
+
+        udp_length = self._dns_safe_int(
+            getattr(udp, "len", 0),
+            0,
+        )
+
+        if udp_length >= 8:
+            expected_payload_length = udp_length - 8
+
+            if expected_payload_length <= len(payload):
+                payload = payload[:expected_payload_length]
+
+        return payload
+
+    def _dns_decode_udp_wire(self, packet) -> dict | None:
+        """
+        Decode DNS directly from a UDP payload even when Scapy did not bind DNS.
+
+        Returns normalized DNS metadata or None when the payload is not a
+        structurally plausible DNS message.
+        """
+        udp = packet.getlayer(UDP)
+        if udp is None:
+            return None
+
+        sport = self._dns_safe_int(
+            getattr(udp, "sport", 0),
+            0,
+        )
+        dport = self._dns_safe_int(
+            getattr(udp, "dport", 0),
+            0,
+        )
+
+        if sport != 53 and dport != 53:
+            return None
+
+        wire = self._dns_udp_payload_bytes(packet)
+
+        # RFC 1035 DNS header is exactly 12 bytes.
+        if len(wire) < 12:
+            return None
+
+        try:
+            (
+                transaction_id,
+                flags,
+                question_count,
+                answer_count,
+                authority_count,
+                additional_count,
+            ) = struct.unpack("!HHHHHH", wire[:12])
+        except struct.error:
+            return None
+
+        # Bound counts before allowing Scapy to traverse the message.
+        # Ordinary DNS generally has one question. A higher small value may still
+        # be decoded here so the DNSManager can reject it using its own policy.
+        if question_count > 16:
+            return None
+
+        if any(
+                count > 4096
+                for count in (
+                        answer_count,
+                        authority_count,
+                        additional_count,
+                )
+        ):
+            return None
+
+        if (
+                question_count
+                + answer_count
+                + authority_count
+                + additional_count
+        ) > 8192:
+            return None
+
+        try:
+            decoded_dns = DNS(wire)
+        except Exception:
+            return None
+
+        try:
+            decoded_id = self._dns_safe_int(
+                getattr(decoded_dns, "id", -1),
+                -1,
+            )
+            decoded_qr = self._dns_safe_int(
+                getattr(decoded_dns, "qr", -1),
+                -1,
+            )
+
+            header_qr = (flags >> 15) & 0x01
+
+            if decoded_id != transaction_id:
+                return None
+
+            if decoded_qr != header_qr:
+                return None
+
+            if question_count > 0 and getattr(decoded_dns, "qd", None) is None:
+                return None
+        except Exception:
+            return None
+
+        return {
+            "dns": decoded_dns,
+            "wire": wire,
+            "transaction_id": transaction_id,
+            "flags": flags,
+            "qr": (flags >> 15) & 0x01,
+            "opcode": (flags >> 11) & 0x0F,
+            "aa": (flags >> 10) & 0x01,
+            "tc": (flags >> 9) & 0x01,
+            "rd": (flags >> 8) & 0x01,
+            "ra": (flags >> 7) & 0x01,
+            "ad": (flags >> 5) & 0x01,
+            "cd": (flags >> 4) & 0x01,
+            "rcode": flags & 0x0F,
+            "question_count": question_count,
+            "answer_count": answer_count,
+            "authority_count": authority_count,
+            "additional_count": additional_count,
+        }
+
+    def _dns_make_decoded_packet(self, packet, decoded_dns):
+        """
+        Create a DNS-normalized copy for DNSManager.
+
+        The original captured packet remains untouched so normal forwarding still
+        uses the exact captured bytes when DNSManager does not consume it.
+        """
+        if decoded_dns is None or packet.getlayer(UDP) is None:
+            return packet
+
+        try:
+            normalized = packet.copy()
+            udp = normalized.getlayer(UDP)
+
+            if udp is None:
+                return packet
+
+            udp.remove_payload()
+            udp.add_payload(DNS(bytes(decoded_dns)))
+
+            return normalized
+        except Exception as exc:
+            self._dns_dispatch_log_limited(
+                key="dns-normalized-packet-failure",
+                message=(
+                    f"[DNS] ⚠️ Could not create normalized DNS packet: {exc}"
+                ),
+                interval_sec=10.0,
+            )
+            return packet
+
+    def _dns_safe_question_name(self, dns) -> str:
+        try:
+            question = getattr(dns, "qd", None)
+
+            if question is None:
+                return "<no-question>"
+
+            qname = getattr(question, "qname", b"")
+
+            if isinstance(qname, bytes):
+                return (
+                    qname.decode("idna", errors="replace")
+                    .rstrip(".")
+                    .lower()
+                )
+
+            return str(qname).rstrip(".").lower()
+        except Exception:
+            return "<unknown>"
     def process_packet(self, packet, inbound_iface: str):
         """
         Main packet processing pipeline with a clear separation for router-destined
@@ -2652,6 +3404,107 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 packet,
                 params=self.default_analysis_extras
             )
+            # ==========================================================
+            # DNS CONTROL-PLANE DISPATCH — BEFORE HANDSHAKE AND NAT
+            # ==========================================================
+            dns_metadata = self._dns_extract_packet_metadata(packet)
+
+            if dns_metadata["is_dns_related"]:
+                # Dedicated multicast/local name-service protocols remain separate.
+                if dns_metadata["special"] == "mdns":
+                    if self.mdns_manager.handle_packet(packet):
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="mdns",
+                        )
+                        return
+
+                elif dns_metadata["special"] == "llmnr":
+                    llmnr_manager = getattr(self, "llmnr_manager", None)
+
+                    if (
+                            llmnr_manager is not None
+                            and llmnr_manager.handle_packet(packet, inbound_iface)
+                    ):
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="llmnr",
+                        )
+                        return
+
+                elif dns_metadata["special"] == "nbns":
+                    nbns_manager = getattr(self, "nbns_manager", None)
+
+                    if (
+                            nbns_manager is not None
+                            and nbns_manager.handle_packet(packet, inbound_iface)
+                    ):
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="nbns",
+                        )
+                        return
+
+                else:
+                    dns_disposition = self._dispatch_dns_packet(
+                        packet,
+                        inbound_iface,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                    )
+
+                    if dns_disposition == self.DNS_DISPOSITION_HANDLED:
+                        try:
+                            dns_qr = self._dns_safe_int(
+                                getattr(packet[DNS], "qr", 0)
+                            )
+                        except Exception:
+                            dns_qr = 0
+
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="handled",
+                            component=(
+                                "dns-response"
+                                if dns_qr == 1
+                                else "dns-query"
+                            ),
+                        )
+                        return
+
+                    if (
+                            dns_disposition
+                            == self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                    ):
+                        # This traffic belongs to Windows, the local DNS TCP listener,
+                        # or a DNSManager OS-socket transport. Do not NAT it, duplicate it,
+                        # or send it through _forward_general_ip_packet().
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="bypass",
+                            component="dns-host-stack",
+                        )
+                        return
+
+                    if dns_disposition == self.DNS_DISPOSITION_DROP:
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="dropped",
+                            component="dns-invalid",
+                        )
+                        return
+
+                    # transit-passthrough intentionally falls through to handshake,
+                    # NAT, transport and ordinary router forwarding.
             transport_layer = self.sniffer._find_transport_layer(packet)
             if isinstance(transport_layer, TCP):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
@@ -2775,108 +3628,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             is_for_router = dst_ip in self._get_all_local_ips()
 
 
-            if UDP in packet and int(packet[UDP].dport) == 5353:
-                if self.mdns_manager.handle_packet(packet):
-                    self.code_output_manager.submit_packet(
-                        packet, inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="mdns"
-                    )
-                    return
-            if packet.haslayer(DNS):
-                try:
-                    dns = packet[DNS]
 
-                    udp = packet.getlayer(UDP)
-                    tcp = packet.getlayer(TCP)
-
-                    if udp is not None:
-                        try:
-                            sport = getattr(udp, "sport", 0)
-                            sport = getattr(sport, "value", sport)
-                            sport = sport if isinstance(sport, int) else int(str(sport))
-                        except Exception:
-                            sport = 0
-
-                        try:
-                            dport = getattr(udp, "dport", 0)
-                            dport = getattr(dport, "value", dport)
-                            dport = dport if isinstance(dport, int) else int(str(dport))
-                        except Exception:
-                            dport = 0
-
-                    elif tcp is not None:
-                        try:
-                            sport = getattr(tcp, "sport", 0)
-                            sport = getattr(sport, "value", sport)
-                            sport = sport if isinstance(sport, int) else int(str(sport))
-                        except Exception:
-                            sport = 0
-
-                        try:
-                            dport = getattr(tcp, "dport", 0)
-                            dport = getattr(dport, "value", dport)
-                            dport = dport if isinstance(dport, int) else int(str(dport))
-                        except Exception:
-                            dport = 0
-                    else:
-                        sport = 0
-                        dport = 0
-
-                    is_mdns = (sport == 5353 or dport == 5353)
-                    is_llmnr = (sport == 5355 or dport == 5355)
-                    is_nbns = (sport in (137, 138) or dport in (137, 138))
-
-                    if not is_mdns and not is_llmnr and not is_nbns:
-                        try:
-                            qr = getattr(dns, "qr", 0)
-                            qr = getattr(qr, "value", qr)
-                            qr = qr if isinstance(qr, int) else int(str(qr))
-                        except Exception:
-                            qr = 0
-
-                        if qr == 0:
-                            self.router_logger.log_message(
-                                f"[DNS] 🗺️ Early DNS query intercept on {iface_short} "
-                                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                            )
-
-                            if self.dns_manager.handle_query(packet, inbound_iface):
-                                self.code_output_manager.submit_packet(
-                                    packet,
-                                    inbound_iface=inbound_iface,
-                                    phase="handled",
-                                    component="dns-query",
-                                )
-                                return
-                            else:
-                                self.router_logger.log_message(
-                                    f"[DNS] ⚠️ Early DNS query not handled on {iface_short}: {packet.summary()}"
-                                )
-
-                        else:
-                            self.router_logger.log_message(
-                                f"[DNS] ⬅️ Early DNS response intercept on {iface_short} "
-                                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                            )
-
-                            if self.dns_manager.handle_response(packet):
-                                self.code_output_manager.submit_packet(
-                                    packet,
-                                    inbound_iface=inbound_iface,
-                                    phase="handled",
-                                    component="dns-response",
-                                )
-                                return
-                            else:
-                                self.router_logger.log_message(
-                                    f"[DNS] ⚠️ Early DNS response not handled on {iface_short}: {packet.summary()}"
-                                )
-
-                except Exception as e:
-                    self.router_logger.log_message(
-                        f"[DNS] ❗ Early DNS intercept exception on {iface_short}: {e}"
-                    )
 
             if (
                     packet.haslayer(DHCP)
@@ -2890,16 +3642,21 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     f"{iface_short} for router"
                 )
 
-                if self._dispatch_dhcp_packet(
-                        packet,
-                        inbound_iface,
-                ):
+                dhcp_result = self._dispatch_dhcp_packet(
+                    packet,
+                    inbound_iface,
+                )
+
+                if dhcp_result == "served":
                     self.code_output_manager.submit_packet(
                         packet,
                         inbound_iface=inbound_iface,
                         phase="handled",
                         component="dhcp-control-plane",
                     )
+                    return
+
+                if dhcp_result == "bypass":
                     return
             if packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
                 self.router_logger.log_message(f"[ICMP] 📶 Processing ICMP on {iface_short} Packet: {packet.summary()}")
