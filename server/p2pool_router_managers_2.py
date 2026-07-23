@@ -3254,9 +3254,44 @@ class HandshakeManager:
 
     COMMON_TLS_PORTS = {
         443, 444, 465, 563, 636, 853, 989, 990, 992, 993, 994, 995,
-        2083, 2087, 2096, 5223, 5443, 5986, 6443, 7443, 8443, 8883,
-        9443, 10443, 4443,
+        2083, 2087, 2096, 5223, 5228, 5229, 5230, 5443, 5986, 6443,
+        7443, 8443, 8883, 9443, 10443, 4443,
     }
+
+    # These are transport hints, not a hardcoded destination-IP allowlist.
+    # TCP/443 carries Microsoft Authenticator HTTPS operations, TCP/5223 is
+    # commonly used by Apple push, and TCP/5228-5230 by Firebase/Google push.
+    MICROSOFT_AUTHENTICATOR_TCP_PORTS = {443, 5223, 5228, 5229, 5230}
+    MICROSOFT_AUTHENTICATOR_DEDICATED_PUSH_PORTS = {5223, 5228, 5229, 5230}
+
+    # SNI classification is intentionally conservative. It only labels flows;
+    # it never decrypts, rewrites, blocks, or redirects Microsoft traffic.
+    MICROSOFT_AUTHENTICATOR_SNI_RULES = (
+        (
+            "microsoft-authenticator",
+            (
+                "login.microsoftonline.com",
+                "device.login.microsoftonline.com",
+                "login.live.com",
+                "microsoftonline.com",
+                "msauth.net",
+                "msftauth.net",
+            ),
+        ),
+        (
+            "apple-push",
+            (
+                "push.apple.com",
+            ),
+        ),
+        (
+            "firebase-push",
+            (
+                "fcm.googleapis.com",
+                "mtalk.google.com",
+            ),
+        ),
+    )
 
     SYN_SENT = "SYN_SENT"
     SYN_ACK = "SYN_ACK_RECEIVED"
@@ -3307,7 +3342,15 @@ class HandshakeManager:
         self.log_tls_records = True
         self.log_tls_application_data = False
         self.reinject_tls_application_data = False
-        self._log_message("[Handshake] Manager ready (TCP reassembly + passive TLS processing).")
+
+        # Microsoft Authenticator support is passive. The manager recognizes and
+        # records relevant Microsoft/APNs/FCM TLS flows, but never re-sends or
+        # consumes the original encrypted packet.
+        self.log_microsoft_authenticator = True
+        self._log_message(
+            "[Handshake] Manager ready "
+            "(TCP reassembly + passive TLS + Microsoft Authenticator classification)."
+        )
 
     def _log_message(self, message: str):
         try:
@@ -3360,6 +3403,7 @@ class HandshakeManager:
         flow["_packet_src"] = (src_ip, sport)
         flow["_packet_dst"] = (logical_dst_ip, logical_dport)
         self._refine_roles(flow, src_ip, sport, logical_dst_ip, logical_dport, flags)
+        self._refresh_microsoft_authenticator_port_hint(flow)
 
         direction = "c2s" if self._is_c2s(flow, src_ip, sport) else "s2c"
         packet_payload = bytes(tcp.payload) if tcp.payload else b""
@@ -3438,6 +3482,12 @@ class HandshakeManager:
                 "recent_packets": {},
                 "tls_detected": False,
                 "tls_candidate": False,
+                "microsoft_authenticator_candidate": False,
+                "microsoft_authenticator_detected": False,
+                "microsoft_authenticator_service": None,
+                "microsoft_authenticator_sni": None,
+                "microsoft_authenticator_detection_source": None,
+                "microsoft_authenticator_logged": False,
                 "established_notified": False,
                 "midstream": False,
             }
@@ -3466,6 +3516,100 @@ class HandshakeManager:
             flow["client"], flow["server"] = src, dst
         elif sport in self.COMMON_TLS_PORTS and dport not in self.COMMON_TLS_PORTS:
             flow["client"], flow["server"] = dst, src
+
+    @staticmethod
+    def _normalize_tls_sni(value: Optional[str]) -> str:
+        try:
+            return str(value or "").strip().rstrip(".").lower()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _classify_microsoft_authenticator_sni(cls, sni: Optional[str]) -> Optional[str]:
+        """
+        Return a passive service label for a recognized Authenticator/push SNI.
+
+        This is deliberately a classifier rather than an allowlist. Microsoft,
+        Apple, and Google can change destination IPs without requiring a code
+        update, while unknown TLS traffic continues through the normal path.
+        """
+        host = cls._normalize_tls_sni(sni)
+        if not host:
+            return None
+
+        for service, suffixes in cls.MICROSOFT_AUTHENTICATOR_SNI_RULES:
+            for suffix in suffixes:
+                suffix = cls._normalize_tls_sni(suffix)
+                if host == suffix or host.endswith("." + suffix):
+                    return service
+        return None
+
+    def _refresh_microsoft_authenticator_port_hint(self, flow: Dict[str, Any]) -> None:
+        """
+        Apply a transport-level hint after client/server roles are known.
+
+        Port 443 is only marked as a candidate because it is shared by normal
+        HTTPS. Dedicated APNs/FCM ports are strong enough to classify directly.
+        """
+        try:
+            server_port = int(flow.get("server", ("", 0))[1])
+        except Exception:
+            server_port = 0
+
+        if server_port not in self.MICROSOFT_AUTHENTICATOR_TCP_PORTS:
+            return
+
+        flow["microsoft_authenticator_candidate"] = True
+
+        if server_port == 5223:
+            self._mark_microsoft_authenticator_flow(
+                flow,
+                service="apple-push",
+                sni=None,
+                source="tcp-port-5223",
+            )
+        elif server_port in (5228, 5229, 5230):
+            self._mark_microsoft_authenticator_flow(
+                flow,
+                service="firebase-push",
+                sni=None,
+                source=f"tcp-port-{server_port}",
+            )
+
+    def _mark_microsoft_authenticator_flow(
+            self,
+            flow: Dict[str, Any],
+            *,
+            service: str,
+            sni: Optional[str],
+            source: str,
+    ) -> None:
+        flow["microsoft_authenticator_candidate"] = True
+        flow["microsoft_authenticator_detected"] = True
+        flow["microsoft_authenticator_service"] = str(service or "unknown")
+        flow["microsoft_authenticator_detection_source"] = str(source or "unknown")
+
+        normalized_sni = self._normalize_tls_sni(sni)
+        if normalized_sni:
+            flow["microsoft_authenticator_sni"] = normalized_sni
+
+        if self.log_microsoft_authenticator and not flow.get("microsoft_authenticator_logged"):
+            flow["microsoft_authenticator_logged"] = True
+            client = flow.get("client") or ("?", 0)
+            server = flow.get("server") or ("?", 0)
+            self._log_message(
+                "[Authenticator] ✅ Microsoft Authenticator/push flow recognized: "
+                f"service={flow.get('microsoft_authenticator_service')} "
+                f"source={flow.get('microsoft_authenticator_detection_source')} "
+                f"sni={flow.get('microsoft_authenticator_sni') or 'encrypted/unknown'} "
+                f"{client[0]}:{client[1]} -> {server[0]}:{server[1]}"
+            )
+
+    def is_microsoft_authenticator_flow(self, key) -> bool:
+        """Return whether an active canonical flow has been classified."""
+        with self._lock:
+            flow = self._flows.get(key)
+            return bool(flow and flow.get("microsoft_authenticator_detected"))
 
     def _is_duplicate_capture(self, flow: Dict[str, Any], fingerprint: Tuple[Any, ...], now: float) -> bool:
         recent = flow["recent_packets"]
@@ -3804,7 +3948,13 @@ class HandshakeManager:
         if self.log_non_tls_tcp:
             return True
         server_port = int(flow.get("server", ("", 0))[1])
-        return bool(flow.get("tls_detected") or flow.get("tls_candidate") or server_port in self.COMMON_TLS_PORTS)
+        return bool(
+            flow.get("tls_detected")
+            or flow.get("tls_candidate")
+            or flow.get("microsoft_authenticator_candidate")
+            or flow.get("microsoft_authenticator_detected")
+            or server_port in self.COMMON_TLS_PORTS
+        )
 
     def _cleanup_loop(self):
         while not self._stop_event.is_set():
@@ -3893,6 +4043,21 @@ class HandshakeManager:
                 },
                 "app_bytes": dict(flow["app_bytes"]),
                 "tls_detected": bool(flow.get("tls_detected")),
+                "microsoft_authenticator_candidate": bool(
+                    flow.get("microsoft_authenticator_candidate")
+                ),
+                "microsoft_authenticator_detected": bool(
+                    flow.get("microsoft_authenticator_detected")
+                ),
+                "microsoft_authenticator_service": flow.get(
+                    "microsoft_authenticator_service"
+                ),
+                "microsoft_authenticator_sni": flow.get(
+                    "microsoft_authenticator_sni"
+                ),
+                "microsoft_authenticator_detection_source": flow.get(
+                    "microsoft_authenticator_detection_source"
+                ),
                 "midstream": bool(flow.get("midstream")),
             }
         result["tls"] = self._tls_mgr.get_session_summary(key) if flow.get("tls_detected") else None
@@ -3958,6 +4123,25 @@ class HandshakeManager:
                 f"len={message.get('length')}"
             )
             if message_type == "ClientHello":
+                sni = message.get("sni")
+                service = self._classify_microsoft_authenticator_sni(sni)
+                if service:
+                    key = _get_canonical_session_key(
+                        rec.src,
+                        rec.src_port,
+                        rec.dst,
+                        rec.dst_port,
+                    )
+                    with self._lock:
+                        flow = self._flows.get(key)
+                        if flow is not None:
+                            self._mark_microsoft_authenticator_flow(
+                                flow,
+                                service=service,
+                                sni=sni,
+                                source="tls-sni",
+                            )
+
                 alpn = ",".join(message.get("alpn") or []) or "N/A"
                 versions = ",".join(v for v in (message.get("supported_versions") or []) if v) or message.get("version_name") or "N/A"
                 self._log_message(
@@ -8102,6 +8286,7 @@ class NATManager:
 
 
 
+
 class DNSResolutionError(RuntimeError):
     """Base exception for a resolver-pipeline failure."""
 
@@ -8694,7 +8879,18 @@ class DNSManager:
     RAW_FALLBACK_AFTER_SOCKET_FAILURE = True
 
     REPLY_SOURCE_POLICY = "query-destination"  # query-destination | router-address | upstream
-    PASSIVE_CACHE_UNMATCHED_RESPONSES = False
+    # Active transparent ownership: captured UDP/53 traffic is never merely
+    # observed. Queries enter the resolver pipeline and responses are matched,
+    # cached, or explicitly claimed by DNSManager.
+    ACTIVE_CAPTURE_OWNERSHIP = True
+    CLAIM_UNMATCHED_RESPONSES = True
+    CACHE_UNMATCHED_RESPONSES = True
+    SELF_UPSTREAM_CAPTURE_TTL_SEC = 6.0
+    SELF_UPSTREAM_CAPTURE_MAX = 8192
+
+    # Retained for compatibility with older configuration code. Active mode
+    # supersedes the old passive-cache behavior.
+    PASSIVE_CACHE_UNMATCHED_RESPONSES = True
     BROWSER_RELEVANT_QTYPES = {1, 2, 5, 6, 12, 15, 16, 28, 33, 41, 43, 48, 64, 65, 255}
 
     MAX_DNS_MESSAGE_BYTES = 65535
@@ -8782,6 +8978,12 @@ class DNSManager:
         self._recent_terminal_replies: "OrderedDict[Tuple, float]" = OrderedDict()
         self._learned_local_upstreams: "OrderedDict[str, float]" = OrderedDict()
 
+        # Short-lived signatures for UDP/53 requests emitted by DNSManager's
+        # own socket transports. Packet capture will see these packets too;
+        # recognizing them prevents recursive interception without excluding
+        # ordinary Windows resolver queries sourced from the router address.
+        self._self_upstream_queries: "OrderedDict[Tuple, float]" = OrderedDict()
+
         self._tcp_listener_config: Dict[str, Any] = {
             "enabled": bool(self.ENABLE_TCP_LISTENER),
             "hosts": list(self.TCP_LISTEN_HOSTS),
@@ -8838,6 +9040,14 @@ class DNSManager:
             "unmatched_response_ignored": 0,
             "local_upstream_loop_prevented": 0,
             "self_originated_query_passed": 0,
+            "active_queries_claimed": 0,
+            "active_responses_claimed": 0,
+            "captured_response_won": 0,
+            "captured_response_duplicate": 0,
+            "unmatched_response_cached": 0,
+            "unmatched_response_claimed": 0,
+            "self_upstream_query_recaptured": 0,
+            "self_upstream_response_recaptured": 0,
             "dns64_a_lookup": 0,
             "dns64_synthesized": 0,
             "dns64_skipped_dnssec": 0,
@@ -9085,14 +9295,25 @@ class DNSManager:
         self._elog("tcp", f"TCP/53 listener configured: {config}", ["🔌", "🧭", "🛡️"])
 
     def process_packet(self, packet: Packet, inbound_iface: str, context: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Actively own captured UDP DNS traffic.
+
+        A valid UDP/53 query is always submitted to handle_query(). A valid
+        UDP/53 response is always submitted to handle_response(). In active
+        capture mode the method returns True for either direction, including
+        exact recaptures of DNSManager's own upstream packets, so the router
+        never falls back to an "observed host resolver pass-through" decision.
+        """
         if DNS is None or packet is None or not packet.haslayer(DNS):
             return False
         if UDP is None or UDP not in packet:
             return False
+
         try:
             dns = packet[DNS]
             sport = int(packet[UDP].sport)
             dport = int(packet[UDP].dport)
+            qr = int(getattr(dns, "qr", 0))
         except Exception:
             return False
 
@@ -9102,17 +9323,58 @@ class DNSManager:
             except Exception as exc:
                 self._elog("dispatch", f"Context provider failed: {exc}", ["⚠️", "🧩"])
                 context = {}
+
+        context = dict(context or {})
+        context.setdefault("active_dns_ownership", bool(self.ACTIVE_CAPTURE_OWNERSHIP))
+        context.setdefault("inbound_iface", str(inbound_iface or ""))
+        context.setdefault("sport", sport)
+        context.setdefault("dport", dport)
+        context.setdefault("dns_qr", qr)
+
         try:
-            setattr(packet, "_dns_packet_context", context or {})
+            setattr(packet, "_dns_packet_context", context)
+            setattr(packet, "_dns_inbound_iface", str(inbound_iface or ""))
         except Exception:
             pass
 
-        if int(getattr(dns, "qr", 0)) == 0 and dport == 53:
+        if qr == 0 and dport == 53:
             self._stat_inc("packet_dispatch_query")
-            return self.handle_query(packet, inbound_iface)
-        if int(getattr(dns, "qr", 0)) == 1 and (sport == 53 or dport >= 1024):
+            try:
+                handled = bool(self.handle_query(packet, inbound_iface))
+            except Exception as exc:
+                self._elog(
+                    "dispatch",
+                    f"Active query handling failed q={self._safe_qname(packet)}: {exc}",
+                    ["❌", "📨", "🧯"],
+                )
+                try:
+                    self._send_servfail(packet)
+                except Exception:
+                    pass
+                handled = True
+
+            if handled or self.ACTIVE_CAPTURE_OWNERSHIP:
+                self._stat_inc("active_queries_claimed")
+                return True
+            return False
+
+        if qr == 1 and sport == 53:
             self._stat_inc("packet_dispatch_response")
-            return self.handle_response(packet)
+            try:
+                handled = bool(self.handle_response(packet))
+            except Exception as exc:
+                self._elog(
+                    "dispatch",
+                    f"Active response handling failed q={self._safe_qname(packet)}: {exc}",
+                    ["❌", "📥", "🧯"],
+                )
+                handled = True
+
+            if handled or self.ACTIVE_CAPTURE_OWNERSHIP:
+                self._stat_inc("active_responses_claimed")
+                return True
+            return False
+
         return False
 
     def set_blacklist(self, rules: List[Dict[str, Any]]):
@@ -9404,6 +9666,15 @@ class DNSManager:
         return None
 
     def _is_self_originated_or_recaptured_query(self, packet: Packet, sport: int) -> bool:
+        """
+        Suppress only exact DNSManager-generated upstream recaptures.
+
+        Older behavior treated every query sourced from a router address as a
+        self-originated query and returned False, which caused Windows resolver
+        traffic to be merely observed. Router-address queries are now legitimate
+        transparent clients. Only a raw-fallback pending tuple or a short-lived
+        socket-transport signature is considered recursive.
+        """
         try:
             if IP is not None and IP in packet:
                 src = str(packet[IP].src)
@@ -9413,33 +9684,237 @@ class DNSManager:
                 ipver = "6"
             else:
                 return False
-            router_ips = {
-                str(value).split("%", 1)[0]
-                for value in (
-                    self.router_ip_out,
-                    self.router_ipv4_out,
-                    self.router_ipv6_out,
-                    self.router_ipv6_link_local_out,
-                )
-                if value
-            }
-            possible = (ipver, src, int(sport), int(packet[DNS].id))
+
             with self._lock:
-                recaptured = any(
-                    key[0] == ipver and key[1] == src and key[2] == int(sport) and key[3] == int(packet[DNS].id)
+                raw_recapture = any(
+                    len(key) >= 4
+                    and key[0] == ipver
+                    and key[1] == src
+                    and int(key[2]) == int(sport)
+                    and int(key[3]) == int(packet[DNS].id)
                     for key in self._pending_requests.keys()
-                    if len(key) >= 4
                 )
-            if recaptured:
+
+            if raw_recapture:
+                self._stat_inc("local_upstream_loop_prevented")
+                self._stat_inc("self_upstream_query_recaptured")
                 return True
-            if src in router_ips:
-                self._stat_inc("self_originated_query_passed")
+
+            if self._is_recent_self_upstream_query(packet):
+                self._stat_inc("local_upstream_loop_prevented")
+                self._stat_inc("self_upstream_query_recaptured")
                 return True
         except Exception:
             return False
         return False
 
-    # ===================== OS Socket / Shared Resolution Pipeline =====================
+    def _dns_signature_fields(self, dns: Any) -> Tuple[int, str, int, int]:
+        try:
+            txid = int(getattr(dns, "id", 0))
+        except Exception:
+            txid = 0
+        try:
+            qname = bytes(dns.qd.qname).decode("ascii", "ignore").rstrip(".").lower()
+        except Exception:
+            qname = ""
+        try:
+            qtype = int(dns.qd.qtype)
+        except Exception:
+            qtype = 0
+        try:
+            qclass = int(getattr(dns.qd, "qclass", 1))
+        except Exception:
+            qclass = 1
+        return txid, qname, qtype, qclass
+
+    def _self_upstream_signature_from_wire(
+        self,
+        query_wire: bytes,
+        endpoint: UpstreamEndpoint,
+    ) -> Optional[Tuple]:
+        try:
+            dns = DNS(query_wire)
+            txid, qname, qtype, qclass = self._dns_signature_fields(dns)
+            destination = self._endpoint_raw_ip(endpoint)
+            if not destination:
+                return None
+            ipver = "6" if ":" in destination else "4"
+            return (ipver, destination, txid, qname, qtype, qclass)
+        except Exception:
+            return None
+
+    def _remember_self_upstream_query(
+        self,
+        query_wire: bytes,
+        endpoint: UpstreamEndpoint,
+    ) -> None:
+        signature = self._self_upstream_signature_from_wire(query_wire, endpoint)
+        if signature is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_self_upstream_queries_locked(now)
+            self._self_upstream_queries[signature] = now
+            self._self_upstream_queries.move_to_end(signature)
+            while len(self._self_upstream_queries) > int(self.SELF_UPSTREAM_CAPTURE_MAX):
+                self._self_upstream_queries.popitem(last=False)
+
+    def _cleanup_self_upstream_queries_locked(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else float(now)
+        ttl = float(self.SELF_UPSTREAM_CAPTURE_TTL_SEC)
+        for signature, timestamp in list(self._self_upstream_queries.items()):
+            if current - float(timestamp) <= ttl:
+                continue
+            self._self_upstream_queries.pop(signature, None)
+
+    def _captured_self_upstream_signature(self, packet: Packet, *, response: bool) -> Optional[Tuple]:
+        try:
+            if IP is not None and IP in packet:
+                ipver = "4"
+                address = str(packet[IP].src if response else packet[IP].dst)
+            elif IPv6 is not None and IPv6 in packet:
+                ipver = "6"
+                address = str(packet[IPv6].src if response else packet[IPv6].dst).split("%", 1)[0]
+            else:
+                return None
+            txid, qname, qtype, qclass = self._dns_signature_fields(packet[DNS])
+            return (ipver, address, txid, qname, qtype, qclass)
+        except Exception:
+            return None
+
+    def _is_recent_self_upstream_query(self, packet: Packet) -> bool:
+        signature = self._captured_self_upstream_signature(packet, response=False)
+        if signature is None:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_self_upstream_queries_locked(now)
+            timestamp = self._self_upstream_queries.get(signature)
+            return timestamp is not None and now - float(timestamp) <= float(self.SELF_UPSTREAM_CAPTURE_TTL_SEC)
+
+    def _is_recent_self_upstream_response(self, packet: Packet) -> bool:
+        signature = self._captured_self_upstream_signature(packet, response=True)
+        if signature is None:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_self_upstream_queries_locked(now)
+            timestamp = self._self_upstream_queries.get(signature)
+            return timestamp is not None and now - float(timestamp) <= float(self.SELF_UPSTREAM_CAPTURE_TTL_SEC)
+
+    def _find_inflight_qkey_for_captured_response(self, packet: Packet) -> Optional[str]:
+        """
+        Match a captured response to any resolver job already serving the same
+        question. Exact cache-key matching is preferred; a bounded question and
+        endpoint comparison handles response-side EDNS flag differences.
+        """
+        try:
+            exact_qkey = self._dns_cache_key(packet[DNS])
+        except Exception:
+            exact_qkey = None
+
+        response_question = self._dns_question_key_from_packet(packet)
+        try:
+            response_id = int(packet[DNS].id)
+            response_dport = int(packet[UDP].dport)
+            if IP is not None and IP in packet:
+                response_source = str(packet[IP].src)
+            elif IPv6 is not None and IPv6 in packet:
+                response_source = str(packet[IPv6].src).split("%", 1)[0]
+            else:
+                response_source = ""
+        except Exception:
+            response_id = -1
+            response_dport = -1
+            response_source = ""
+
+        best_qkey = None
+        best_score = -1
+        best_created = -1.0
+
+        with self._lock:
+            if exact_qkey and exact_qkey in self._inflight:
+                return exact_qkey
+
+            for qkey, inflight in self._inflight.items():
+                original = inflight.get("original_packet")
+                if original is None or DNS not in original or UDP not in original:
+                    continue
+                if response_question is not None:
+                    original_question = self._dns_question_key_from_packet(original)
+                    if original_question != response_question:
+                        continue
+
+                score = 0
+                try:
+                    if int(original[DNS].id) == response_id:
+                        score += 3
+                    if int(original[UDP].sport) == response_dport:
+                        score += 3
+                    if IP is not None and IP in original and str(original[IP].dst) == response_source:
+                        score += 4
+                    elif IPv6 is not None and IPv6 in original and (
+                        str(original[IPv6].dst).split("%", 1)[0] == response_source
+                    ):
+                        score += 4
+                except Exception:
+                    pass
+
+                created = float(inflight.get("created", 0.0))
+                if score > best_score or (score == best_score and created > best_created):
+                    best_qkey = str(qkey)
+                    best_score = score
+                    best_created = created
+
+        return best_qkey
+
+    def _claim_inflight_captured_response(
+        self,
+        qkey: str,
+        packet: Packet,
+    ) -> Tuple[Optional[Dict[str, Any]], float, bool]:
+        """
+        Atomically let a captured DNS response win over the socket worker.
+
+        Returns (completion_info, rtt_ms, duplicate). Once claimed, the resolver
+        generation is advanced so any slower transport completion becomes stale.
+        """
+        now = time.monotonic()
+        with self._lock:
+            inflight = self._inflight.get(qkey)
+            if inflight is None:
+                return None, 0.0, False
+            if inflight.get("captured_response_claimed"):
+                return None, 0.0, True
+
+            original = inflight.get("original_packet")
+            if original is None:
+                return None, 0.0, False
+
+            inflight["captured_response_claimed"] = True
+            inflight["resolution_mode"] = "captured-udp-response"
+            self._socket_generation += 1
+            inflight["resolution_token"] = int(self._socket_generation)
+            created = float(inflight.get("created", now))
+
+        try:
+            if IP is not None and IP in packet:
+                upstream_ip = str(packet[IP].src)
+            elif IPv6 is not None and IPv6 in packet:
+                upstream_ip = str(packet[IPv6].src).split("%", 1)[0]
+            else:
+                upstream_ip = "captured"
+        except Exception:
+            upstream_ip = "captured"
+
+        info = {
+            "original_packet": original.copy(),
+            "timestamp": created,
+            "upstream_ip": upstream_ip,
+            "qkey": qkey,
+            "captured_response": True,
+        }
+        return info, max(0.0, (now - created) * 1000.0), False
 
     def _ensure_socket_executor(self):
         if self.OS_SOCKET_RESOLUTION_MODE == "disabled" and not self._tcp_listener_config.get("enabled"):
@@ -9675,6 +10150,13 @@ class DNSManager:
             transport = self._transports.get(scheme)
             if transport is None:
                 raise DNSTransportUnavailable(f"no transport registered for scheme {scheme}")
+
+            # Register the exact wire question before the UDP socket sends it.
+            # The packet capture path can then consume that recapture without
+            # recursively treating it as another Windows/client query.
+            if scheme == "udp":
+                self._remember_self_upstream_query(query_wire, endpoint)
+
             try:
                 return transport.exchange(query_wire, endpoint, deadline)
             except DNSTruncated:
@@ -9923,48 +10405,152 @@ class DNSManager:
     # ===================== Raw Response Handling =====================
 
     def handle_response(self, packet: Packet) -> bool:
+        """
+        Actively process every structurally valid UDP DNS response.
+
+        Priority:
+          1. Complete an exact raw-fallback pending request.
+          2. Let a captured response win an existing inflight resolver job.
+          3. Claim DNSManager's own already-consumed socket response recapture.
+          4. Cache and claim an otherwise unmatched response.
+
+        A valid response never returns False merely because it was not found in
+        _pending_requests.
+        """
         if DNS is None or UDP is None or not (
-            packet.haslayer(DNS) and int(packet[DNS].qr) == 1 and packet.haslayer(UDP)
+            packet.haslayer(DNS)
+            and int(packet[DNS].qr) == 1
+            and packet.haslayer(UDP)
+            and int(packet[UDP].sport) == 53
         ):
             return False
+
         self._stat_inc("responses_total")
-        primary, secondary = self._resolve_keys_from_resp(packet)
-        matched_key, info, matched_via = self._find_pending_match(packet, primary, secondary)
-        if matched_key is None or info is None:
-            self._stat_inc("unmatched_response_ignored")
-            if self.PASSIVE_CACHE_UNMATCHED_RESPONSES:
-                try:
-                    self._cache_put_from_response(packet, negative=False)
-                except Exception:
-                    pass
-            return False
-        if self.REQUIRE_QUESTION_MATCH and not self._question_match_info_vs_packet(info, packet):
-            return False
-
-        info = self._consume_pending_entry(matched_key)
-        if info is None:
-            return False
-        if matched_via == "question-fallback":
-            self._stat_inc("fallback_question_match")
-
-        qkey = info.get("qkey")
-        self._cancel_hedge_siblings(qkey, matched_key)
-        upstream_ip = str(info.get("upstream_ip", ""))
-        rtt_ms = max(0.0, (time.monotonic() - float(info.get("timestamp", time.monotonic()))) * 1000.0)
-        self._mark_upstream_success(upstream_ip, rtt_ms)
         self._normalize_checksums(packet)
 
-        self._ensure_socket_executor()
-        with self._lock:
-            executor = self._socket_executor
-        if executor is not None:
-            try:
-                executor.submit(self._process_raw_response_completion, packet.copy(), info, qkey, rtt_ms)
+        primary, secondary = self._resolve_keys_from_resp(packet)
+        matched_key, info, matched_via = self._find_pending_match(packet, primary, secondary)
+
+        if matched_key is not None and info is not None:
+            if self.REQUIRE_QUESTION_MATCH and not self._question_match_info_vs_packet(info, packet):
+                self._elog(
+                    "response",
+                    f"Claimed mismatched raw response id={getattr(packet[DNS], 'id', 0)} "
+                    f"q={self._safe_qname(packet)}",
+                    ["🛡️", "⚠️", "📥"],
+                )
                 return True
-            except Exception:
-                pass
-        self._process_raw_response_completion(packet, info, qkey, rtt_ms)
-        return True
+
+            info = self._consume_pending_entry(matched_key)
+            if info is None:
+                return True
+            if matched_via == "question-fallback":
+                self._stat_inc("fallback_question_match")
+
+            qkey = info.get("qkey")
+            self._cancel_hedge_siblings(qkey, matched_key)
+            upstream_ip = str(info.get("upstream_ip", ""))
+            rtt_ms = max(
+                0.0,
+                (time.monotonic() - float(info.get("timestamp", time.monotonic()))) * 1000.0,
+            )
+            self._mark_upstream_success(upstream_ip, rtt_ms)
+
+            self._ensure_socket_executor()
+            with self._lock:
+                executor = self._socket_executor
+            if executor is not None:
+                try:
+                    executor.submit(
+                        self._process_raw_response_completion,
+                        packet.copy(),
+                        info,
+                        qkey,
+                        rtt_ms,
+                    )
+                    return True
+                except Exception:
+                    pass
+            self._process_raw_response_completion(packet, info, qkey, rtt_ms)
+            return True
+
+        qkey = self._find_inflight_qkey_for_captured_response(packet)
+        if qkey:
+            completion_info, rtt_ms, duplicate = self._claim_inflight_captured_response(qkey, packet)
+            if duplicate:
+                self._stat_inc("captured_response_duplicate")
+                return True
+            if completion_info is not None:
+                self._stat_inc("captured_response_won")
+                self._elog(
+                    "response",
+                    f"Captured response won qkey={qkey} "
+                    f"upstream={completion_info.get('upstream_ip')} rtt={rtt_ms:.2f}ms",
+                    ["🏁", "📥", "✅"],
+                )
+                self._ensure_socket_executor()
+                with self._lock:
+                    executor = self._socket_executor
+                if executor is not None:
+                    try:
+                        executor.submit(
+                            self._process_raw_response_completion,
+                            packet.copy(),
+                            completion_info,
+                            qkey,
+                            rtt_ms,
+                        )
+                        return True
+                    except Exception:
+                        pass
+                self._process_raw_response_completion(packet, completion_info, qkey, rtt_ms)
+                return True
+
+        # The packet may be the pcap copy of a response already received by one
+        # of DNSManager's connected UDP sockets. Claim it without generating a
+        # second reply.
+        if self._is_recent_self_upstream_response(packet):
+            self._stat_inc("self_upstream_response_recaptured")
+            return True
+
+        cached = False
+        if self.CACHE_UNMATCHED_RESPONSES or self.PASSIVE_CACHE_UNMATCHED_RESPONSES:
+            try:
+                self._cache_put_from_response_advanced(
+                    packet,
+                    negative=False,
+                    validation_status=str(
+                        getattr(packet, "_dns_validation_status", "disabled")
+                    ),
+                    source_upstream=self._response_source_address(packet),
+                )
+                cached = True
+                self._stat_inc("unmatched_response_cached")
+            except Exception as exc:
+                self._elog(
+                    "response",
+                    f"Unmatched response cache rejected q={self._safe_qname(packet)}: {exc}",
+                    ["⚠️", "📦", "📥"],
+                )
+
+        self._stat_inc("unmatched_response_claimed")
+        self._elog(
+            "response",
+            f"Actively claimed unmatched response id={getattr(packet[DNS], 'id', 0)} "
+            f"q={self._safe_qname(packet)} cached={cached}",
+            ["📥", "🛡️", "✅"],
+        )
+        return bool(self.CLAIM_UNMATCHED_RESPONSES or self.ACTIVE_CAPTURE_OWNERSHIP)
+
+    def _response_source_address(self, packet: Packet) -> str:
+        try:
+            if IP is not None and IP in packet:
+                return str(packet[IP].src)
+            if IPv6 is not None and IPv6 in packet:
+                return str(packet[IPv6].src).split("%", 1)[0]
+        except Exception:
+            pass
+        return "captured"
 
     def _process_raw_response_completion(
         self,
@@ -12079,6 +12665,7 @@ class DNSManager:
             name_wire = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels) + b"\x00"
             return struct.pack("!HHHHHH", int(txid), 0x0100, 1, 0, 0, 0) + name_wire + struct.pack("!HH", int(qtype), 1)
         return bytes(DNS(id=int(txid), rd=1, qd=DNSQR(qname=str(qname), qtype=int(qtype), qclass=1)))
+
 
 
 

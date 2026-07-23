@@ -2313,6 +2313,24 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
     DNS_DISPOSITION_SPECIAL_NAME_SERVICE = "special-name-service"
     DNS_DISPOSITION_DROP = "drop"
 
+    # Common DNS registry values used only for readable packet metadata/logging.
+    # Unknown values are retained numerically, so newer RR types still survive.
+    DNS_TYPE_NAMES = {
+        1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR",
+        15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 35: "NAPTR",
+        39: "DNAME", 41: "OPT", 43: "DS", 44: "SSHFP", 46: "RRSIG",
+        47: "NSEC", 48: "DNSKEY", 50: "NSEC3", 51: "NSEC3PARAM",
+        52: "TLSA", 64: "SVCB", 65: "HTTPS", 99: "SPF", 108: "EUI48",
+        109: "EUI64", 249: "TKEY", 250: "TSIG", 251: "IXFR",
+        252: "AXFR", 255: "ANY", 256: "URI", 257: "CAA",
+    }
+    DNS_CLASS_NAMES = {1: "IN", 3: "CH", 4: "HS", 254: "NONE", 255: "ANY"}
+    DNS_RCODE_NAMES = {
+        0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+        4: "NOTIMP", 5: "REFUSED", 6: "YXDOMAIN", 7: "YXRRSET",
+        8: "NXRRSET", 9: "NOTAUTH", 10: "NOTZONE", 16: "BADVERS",
+    }
+
     def _dns_normalize_ip(self, value) -> str:
         try:
             return str(value or "").strip().split("%", 1)[0].lower()
@@ -2354,28 +2372,15 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         return result
 
     def _dns_is_fragmented_packet(self, packet) -> bool:
-        """
-        DNS carried in fragmented IP packets must not be parsed as an independent
-        complete DNS message. Let the host stack or normal forwarding path perform
-        reassembly.
-        """
+        """Return True when DNS must wait for IP reassembly."""
         try:
             if packet.haslayer(IP):
                 ip = packet[IP]
-
-                fragment_offset = self._dns_safe_int(
-                    getattr(ip, "frag", 0),
-                    0,
-                )
-
+                fragment_offset = self._dns_safe_int(getattr(ip, "frag", 0), 0)
                 try:
-                    more_fragments = bool(
-                        int(getattr(ip, "flags", 0)) & 0x01
-                    )
+                    more_fragments = bool(int(getattr(ip, "flags", 0)) & 0x01)
                 except Exception:
-                    more_fragments = "MF" in str(
-                        getattr(ip, "flags", "")
-                    )
+                    more_fragments = "MF" in str(getattr(ip, "flags", ""))
 
                 if fragment_offset != 0 or more_fragments:
                     return True
@@ -2391,13 +2396,806 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         return False
 
-    def _dns_extract_packet_metadata(self, packet) -> dict:
-        """
-        Identify DNS using ports and direct wire decoding.
+    def _dns_type_name(self, value: int) -> str:
+        value = self._dns_safe_int(value, 0)
+        return self.DNS_TYPE_NAMES.get(value, f"TYPE{value}")
 
-        Direct DNS wire decoding is authoritative for QR/RCODE because Scapy may
-        leave a valid UDP/53 payload as Raw.
+    def _dns_class_name(self, value: int) -> str:
+        value = self._dns_safe_int(value, 0)
+        return self.DNS_CLASS_NAMES.get(value, f"CLASS{value}")
+
+    def _dns_rcode_name(self, value: int) -> str:
+        value = self._dns_safe_int(value, 0)
+        return self.DNS_RCODE_NAMES.get(value, f"RCODE{value}")
+
+    def _dns_wire_label_text(self, label: bytes) -> str:
+        if not label:
+            return ""
+
+        try:
+            return label.decode("idna")
+        except Exception:
+            try:
+                return label.decode("utf-8", errors="replace")
+            except Exception:
+                return "\\x" + label.hex()
+
+    def _dns_read_wire_name(
+            self,
+            wire: bytes,
+            offset: int,
+            *,
+            max_jumps: int = 32,
+            max_labels: int = 128,
+    ) -> tuple[str, int]:
         """
+        Decode one RFC 1035 domain name, including compression pointers.
+
+        The returned offset always points after the bytes consumed at the original
+        location, not after the pointer target. This is required for RR traversal.
+        """
+        wire_length = len(wire)
+        cursor = int(offset)
+        consumed_offset = None
+        labels: list[str] = []
+        visited: set[int] = set()
+        jumps = 0
+
+        while True:
+            if cursor < 0 or cursor >= wire_length:
+                raise ValueError("DNS name offset is outside the message")
+
+            if cursor in visited:
+                raise ValueError("DNS compression pointer loop")
+            visited.add(cursor)
+
+            length = wire[cursor]
+
+            if length == 0:
+                if consumed_offset is None:
+                    consumed_offset = cursor + 1
+                break
+
+            marker = length & 0xC0
+
+            if marker == 0xC0:
+                if cursor + 1 >= wire_length:
+                    raise ValueError("truncated DNS compression pointer")
+
+                pointer = ((length & 0x3F) << 8) | wire[cursor + 1]
+                if pointer >= wire_length:
+                    raise ValueError("DNS compression pointer is outside message")
+
+                if consumed_offset is None:
+                    consumed_offset = cursor + 2
+
+                cursor = pointer
+                jumps += 1
+                if jumps > max_jumps:
+                    raise ValueError("too many DNS compression pointer jumps")
+                continue
+
+            # 01xxxxxx and 10xxxxxx are reserved extended-label forms. They are
+            # not ordinary RFC 1035 labels and must not be accepted as a hostname.
+            if marker != 0:
+                raise ValueError("unsupported DNS extended label")
+
+            if length > 63:
+                raise ValueError("DNS label exceeds 63 bytes")
+
+            start = cursor + 1
+            end = start + length
+            if end > wire_length:
+                raise ValueError("truncated DNS label")
+
+            labels.append(self._dns_wire_label_text(wire[start:end]))
+            if len(labels) > max_labels:
+                raise ValueError("too many DNS labels")
+
+            cursor = end
+
+        name = ".".join(labels).rstrip(".").lower()
+        if len(name.encode("utf-8", errors="ignore")) > 1024:
+            raise ValueError("decoded DNS name is unreasonably long")
+
+        return name or ".", int(consumed_offset)
+
+    def _dns_format_svc_params(self, data: bytes) -> str:
+        params: list[str] = []
+        cursor = 0
+        key_names = {
+            0: "mandatory", 1: "alpn", 2: "no-default-alpn", 3: "port",
+            4: "ipv4hint", 5: "ech", 6: "ipv6hint", 7: "dohpath",
+            8: "ohttp",
+        }
+
+        while cursor + 4 <= len(data) and len(params) < 16:
+            key, length = struct.unpack("!HH", data[cursor:cursor + 4])
+            cursor += 4
+            if cursor + length > len(data):
+                params.append(f"key{key}=<truncated>")
+                break
+
+            value = data[cursor:cursor + length]
+            cursor += length
+            name = key_names.get(key, f"key{key}")
+
+            try:
+                if key == 1:  # ALPN: one-byte length-prefixed strings
+                    items = []
+                    p = 0
+                    while p < len(value):
+                        item_len = value[p]
+                        p += 1
+                        if p + item_len > len(value):
+                            break
+                        items.append(value[p:p + item_len].decode("ascii", errors="replace"))
+                        p += item_len
+                    rendered = ",".join(items)
+                elif key == 3 and len(value) == 2:
+                    rendered = str(struct.unpack("!H", value)[0])
+                elif key == 4 and len(value) % 4 == 0:
+                    rendered = ",".join(
+                        socket.inet_ntop(socket.AF_INET, value[i:i + 4])
+                        for i in range(0, len(value), 4)
+                    )
+                elif key == 6 and len(value) % 16 == 0:
+                    rendered = ",".join(
+                        socket.inet_ntop(socket.AF_INET6, value[i:i + 16])
+                        for i in range(0, len(value), 16)
+                    )
+                elif key == 7:
+                    rendered = value.decode("utf-8", errors="replace")
+                elif key in (0,) and len(value) % 2 == 0:
+                    rendered = ",".join(
+                        str(struct.unpack("!H", value[i:i + 2])[0])
+                        for i in range(0, len(value), 2)
+                    )
+                elif key in (2, 8) and not value:
+                    rendered = ""
+                else:
+                    rendered = value.hex()[:128]
+            except Exception:
+                rendered = value.hex()[:128]
+
+            params.append(f"{name}={rendered}" if rendered else name)
+
+        if cursor < len(data):
+            params.append(f"trailing={data[cursor:].hex()[:64]}")
+
+        return " ".join(params)
+
+    def _dns_format_rr_rdata(
+            self,
+            wire: bytes,
+            rdata_offset: int,
+            rdlength: int,
+            rr_type: int,
+            rr_class: int,
+            rr_ttl: int,
+    ) -> str:
+        """Render common RR payloads without trusting Scapy's field binding."""
+        end = rdata_offset + rdlength
+        if rdata_offset < 0 or rdlength < 0 or end > len(wire):
+            raise ValueError("truncated DNS RDATA")
+
+        data = wire[rdata_offset:end]
+
+        try:
+            if rr_type == 1 and len(data) == 4:
+                return socket.inet_ntop(socket.AF_INET, data)
+
+            if rr_type == 28 and len(data) == 16:
+                return socket.inet_ntop(socket.AF_INET6, data)
+
+            if rr_type in (2, 5, 12, 39):
+                name, _ = self._dns_read_wire_name(wire, rdata_offset)
+                return name
+
+            if rr_type == 15 and len(data) >= 3:
+                preference = struct.unpack("!H", data[:2])[0]
+                exchange, _ = self._dns_read_wire_name(wire, rdata_offset + 2)
+                return f"{preference} {exchange}"
+
+            if rr_type == 33 and len(data) >= 7:
+                priority, weight, port = struct.unpack("!HHH", data[:6])
+                target, _ = self._dns_read_wire_name(wire, rdata_offset + 6)
+                return f"{priority} {weight} {port} {target}"
+
+            if rr_type in (16, 99):
+                texts: list[str] = []
+                cursor = 0
+                while cursor < len(data) and len(texts) < 32:
+                    text_length = data[cursor]
+                    cursor += 1
+                    if cursor + text_length > len(data):
+                        texts.append("<truncated>")
+                        break
+                    texts.append(
+                        data[cursor:cursor + text_length]
+                        .decode("utf-8", errors="replace")
+                    )
+                    cursor += text_length
+                return " | ".join(texts)
+
+            if rr_type == 6:
+                mname, cursor = self._dns_read_wire_name(wire, rdata_offset)
+                rname, cursor = self._dns_read_wire_name(wire, cursor)
+                if cursor + 20 > end:
+                    raise ValueError("truncated SOA integers")
+                serial, refresh, retry, expire, minimum = struct.unpack(
+                    "!IIIII", wire[cursor:cursor + 20]
+                )
+                return (
+                    f"{mname} {rname} serial={serial} refresh={refresh} "
+                    f"retry={retry} expire={expire} minimum={minimum}"
+                )
+
+            if rr_type == 35 and len(data) >= 5:
+                order, preference = struct.unpack("!HH", data[:4])
+                cursor = 4
+                fields = []
+                for _ in range(3):
+                    if cursor >= len(data):
+                        raise ValueError("truncated NAPTR character-string")
+                    size = data[cursor]
+                    cursor += 1
+                    if cursor + size > len(data):
+                        raise ValueError("truncated NAPTR character-string")
+                    fields.append(data[cursor:cursor + size].decode("utf-8", errors="replace"))
+                    cursor += size
+                replacement, _ = self._dns_read_wire_name(wire, rdata_offset + cursor)
+                return f"{order} {preference} {' '.join(fields)} {replacement}"
+
+            if rr_type == 43 and len(data) >= 4:
+                key_tag, algorithm, digest_type = struct.unpack("!HBB", data[:4])
+                return (
+                    f"keytag={key_tag} alg={algorithm} digest={digest_type} "
+                    f"{data[4:].hex()}"
+                )
+
+            if rr_type == 48 and len(data) >= 4:
+                flags, protocol, algorithm = struct.unpack("!HBB", data[:4])
+                return (
+                    f"flags={flags} protocol={protocol} alg={algorithm} "
+                    f"key={data[4:].hex()[:192]}"
+                )
+
+            if rr_type == 46 and len(data) >= 18:
+                covered, algorithm, labels, original_ttl, expiration, inception, key_tag = struct.unpack(
+                    "!HBBIIIH", data[:18]
+                )
+                signer, signer_end = self._dns_read_wire_name(wire, rdata_offset + 18)
+                signature_start = signer_end
+                signature = wire[signature_start:end].hex()[:192]
+                return (
+                    f"covered={self._dns_type_name(covered)} alg={algorithm} labels={labels} "
+                    f"original_ttl={original_ttl} expiration={expiration} "
+                    f"inception={inception} keytag={key_tag} signer={signer} sig={signature}"
+                )
+
+            if rr_type == 52 and len(data) >= 3:
+                usage, selector, matching = struct.unpack("!BBB", data[:3])
+                return (
+                    f"usage={usage} selector={selector} matching={matching} "
+                    f"data={data[3:].hex()}"
+                )
+
+            if rr_type in (64, 65) and len(data) >= 3:
+                priority = struct.unpack("!H", data[:2])[0]
+                target, target_end = self._dns_read_wire_name(wire, rdata_offset + 2)
+                params = self._dns_format_svc_params(wire[target_end:end])
+                return f"priority={priority} target={target}" + (f" {params}" if params else "")
+
+            if rr_type == 257 and len(data) >= 2:
+                flags = data[0]
+                tag_length = data[1]
+                if 2 + tag_length > len(data):
+                    raise ValueError("truncated CAA tag")
+                tag = data[2:2 + tag_length].decode("ascii", errors="replace")
+                value = data[2 + tag_length:].decode("utf-8", errors="replace")
+                return f"{flags} {tag} {value}"
+
+            if rr_type == 256 and len(data) >= 4:
+                priority, weight = struct.unpack("!HH", data[:4])
+                target = data[4:].decode("utf-8", errors="replace")
+                return f"{priority} {weight} {target}"
+
+            if rr_type == 41:
+                # OPT uses CLASS as advertised UDP payload size and TTL bits for
+                # extended RCODE/version/flags. Decode its option list.
+                options: list[str] = []
+                cursor = 0
+                while cursor + 4 <= len(data) and len(options) < 16:
+                    option_code, option_length = struct.unpack("!HH", data[cursor:cursor + 4])
+                    cursor += 4
+                    if cursor + option_length > len(data):
+                        options.append(f"opt{option_code}=<truncated>")
+                        break
+                    option_data = data[cursor:cursor + option_length]
+                    cursor += option_length
+                    options.append(f"opt{option_code}={option_data.hex()[:96]}")
+
+                ext_rcode = (rr_ttl >> 24) & 0xFF
+                version = (rr_ttl >> 16) & 0xFF
+                do_flag = bool(rr_ttl & 0x8000)
+                rendered = (
+                    f"udp={rr_class} ext_rcode={ext_rcode} version={version} "
+                    f"do={int(do_flag)}"
+                )
+                if options:
+                    rendered += " " + " ".join(options)
+                return rendered
+
+        except Exception as exc:
+            return f"<decode-error:{exc}> raw={data.hex()[:256]}"
+
+        return data.hex()[:512]
+
+    def _dns_parse_wire_message(self, wire: bytes) -> dict:
+        """
+        Parse a DNS datagram directly from captured bytes.
+
+        This parser is intentionally bounded and independent of Scapy. It gives the
+        dispatcher real question/answer names even when Scapy leaves UDP payload as
+        Raw, wraps qd/an in a packet-list field, or partially decodes compression.
+        """
+        if not isinstance(wire, (bytes, bytearray, memoryview)):
+            raise TypeError("DNS wire message must be bytes-like")
+
+        wire = bytes(wire)
+        if len(wire) < 12:
+            raise ValueError("DNS message is shorter than the 12-byte header")
+        if len(wire) > 65535:
+            raise ValueError("DNS UDP message exceeds 65535 bytes")
+
+        (
+            transaction_id,
+            flags,
+            question_count,
+            answer_count,
+            authority_count,
+            additional_count,
+        ) = struct.unpack("!HHHHHH", wire[:12])
+
+        qr = (flags >> 15) & 0x01
+        opcode = (flags >> 11) & 0x0F
+        rcode = flags & 0x0F
+
+        if question_count > 64:
+            raise ValueError("DNS question count is unreasonably large")
+        if any(count > 4096 for count in (answer_count, authority_count, additional_count)):
+            raise ValueError("DNS RR count is unreasonably large")
+        if question_count + answer_count + authority_count + additional_count > 8192:
+            raise ValueError("DNS section counts are unreasonably large")
+
+        cursor = 12
+        questions: list[dict] = []
+
+        for index in range(question_count):
+            name, cursor = self._dns_read_wire_name(wire, cursor)
+            if cursor + 4 > len(wire):
+                raise ValueError(f"truncated DNS question {index}")
+            qtype, qclass = struct.unpack("!HH", wire[cursor:cursor + 4])
+            cursor += 4
+            questions.append({
+                "name": name,
+                "type": qtype,
+                "type_name": self._dns_type_name(qtype),
+                "class": qclass,
+                "class_name": self._dns_class_name(qclass),
+            })
+
+        def parse_rr_section(section_name: str, count: int) -> list[dict]:
+            nonlocal cursor
+            records: list[dict] = []
+
+            for index in range(count):
+                name, cursor = self._dns_read_wire_name(wire, cursor)
+                if cursor + 10 > len(wire):
+                    raise ValueError(f"truncated {section_name} RR header {index}")
+
+                rr_type, rr_class, ttl, rdlength = struct.unpack(
+                    "!HHIH", wire[cursor:cursor + 10]
+                )
+                cursor += 10
+                rdata_offset = cursor
+                rdata_end = cursor + rdlength
+                if rdata_end > len(wire):
+                    raise ValueError(f"truncated {section_name} RR data {index}")
+
+                rdata_text = self._dns_format_rr_rdata(
+                    wire,
+                    rdata_offset,
+                    rdlength,
+                    rr_type,
+                    rr_class,
+                    ttl,
+                )
+
+                records.append({
+                    "name": name,
+                    "type": rr_type,
+                    "type_name": self._dns_type_name(rr_type),
+                    "class": rr_class,
+                    "class_name": self._dns_class_name(rr_class),
+                    "ttl": ttl,
+                    "rdlength": rdlength,
+                    "rdata": bytes(wire[rdata_offset:rdata_end]),
+                    "rdata_text": rdata_text,
+                })
+                cursor = rdata_end
+
+            return records
+
+        answers = parse_rr_section("answer", answer_count)
+        authorities = parse_rr_section("authority", authority_count)
+        additionals = parse_rr_section("additional", additional_count)
+
+        # A query with no question and no update/notify opcode is almost certainly
+        # random bytes that happened to travel on port 53. Empty responses are legal.
+        if qr == 0 and opcode == 0 and question_count == 0:
+            raise ValueError("standard DNS query has no question")
+
+        return {
+            "wire": wire,
+            "wire_length": len(wire),
+            "transaction_id": transaction_id,
+            "flags": flags,
+            "qr": qr,
+            "opcode": opcode,
+            "aa": (flags >> 10) & 0x01,
+            "tc": (flags >> 9) & 0x01,
+            "rd": (flags >> 8) & 0x01,
+            "ra": (flags >> 7) & 0x01,
+            "z": (flags >> 6) & 0x01,
+            "ad": (flags >> 5) & 0x01,
+            "cd": (flags >> 4) & 0x01,
+            "rcode": rcode,
+            "rcode_name": self._dns_rcode_name(rcode),
+            "question_count": question_count,
+            "answer_count": answer_count,
+            "authority_count": authority_count,
+            "additional_count": additional_count,
+            "questions": questions,
+            "answers": answers,
+            "authorities": authorities,
+            "additionals": additionals,
+            "parsed_length": cursor,
+            "trailing_bytes": wire[cursor:],
+        }
+
+    def _dns_udp_payload_bytes(self, packet) -> bytes:
+        """
+        Extract exactly the UDP application payload.
+
+        UDP.len includes the eight-byte UDP header. Trimming prevents Ethernet or
+        capture padding from being mistaken for DNS records. `bytes(udp.payload)`
+        works for both Raw payloads from Wireshark and Scapy-bound DNS payloads.
+        """
+        udp = packet.getlayer(UDP)
+        if udp is None:
+            return b""
+
+        payload_object = udp.payload
+        try:
+            original = getattr(payload_object, "original", None)
+            payload = bytes(original) if original else bytes(payload_object)
+        except Exception:
+            try:
+                payload = bytes(payload_object)
+            except Exception:
+                return b""
+
+        if not payload:
+            return b""
+
+        udp_length = self._dns_safe_int(getattr(udp, "len", 0), 0)
+        if udp_length >= 8:
+            expected_payload_length = udp_length - 8
+            if expected_payload_length <= len(payload):
+                payload = payload[:expected_payload_length]
+
+        return payload
+
+    def _dns_decode_udp_wire(self, packet) -> dict | None:
+        """Decode and validate DNS from the exact UDP payload."""
+        udp = packet.getlayer(UDP)
+        if udp is None:
+            return None
+
+        sport = self._dns_safe_int(getattr(udp, "sport", 0), 0)
+        dport = self._dns_safe_int(getattr(udp, "dport", 0), 0)
+        if sport != 53 and dport != 53:
+            return None
+
+        wire = self._dns_udp_payload_bytes(packet)
+        if len(wire) < 12:
+            return None
+
+        try:
+            result = self._dns_parse_wire_message(wire)
+        except Exception:
+            return None
+
+        # Build a Scapy DNS object for existing DNSManager implementations, but do
+        # not use it as the source of truth for names or RR data.
+        decoded_dns = None
+        try:
+            decoded_dns = DNS(wire)
+            if self._dns_safe_int(getattr(decoded_dns, "id", -1), -1) != result["transaction_id"]:
+                decoded_dns = None
+        except Exception:
+            decoded_dns = None
+
+        result["dns"] = decoded_dns
+        return result
+
+    def _dns_make_decoded_packet(self, packet, wire_result: dict | None):
+        """Create a DNS-bound copy while preserving the original packet for forwarding."""
+        if not wire_result or packet.getlayer(UDP) is None:
+            return packet
+
+        decoded_dns = wire_result.get("dns")
+        wire = bytes(wire_result.get("wire") or b"")
+        if decoded_dns is None and wire:
+            try:
+                decoded_dns = DNS(wire)
+            except Exception:
+                return packet
+
+        if decoded_dns is None:
+            return packet
+
+        try:
+            normalized = packet.copy()
+            udp = normalized.getlayer(UDP)
+            if udp is None:
+                return packet
+
+            udp.remove_payload()
+            try:
+                udp.add_payload(decoded_dns.copy())
+            except Exception:
+                udp.add_payload(DNS(wire))
+
+            # Checksums/lengths belong to the original captured packet. The
+            # normalized copy is for manager inspection, not direct reinjection.
+            return normalized
+        except Exception as exc:
+            self._dns_dispatch_log_limited(
+                key="dns-normalized-packet-failure",
+                message=f"[DNS] ⚠️ Could not create normalized DNS packet: {exc}",
+                interval_sec=10.0,
+            )
+            return packet
+
+    def _dns_scapy_section_items(self, section, expected_count: int = 0) -> list:
+        """Normalize Scapy's single-packet, packet-list, and chained RR layouts."""
+        if section is None:
+            return []
+
+        items: list = []
+
+        if isinstance(section, (list, tuple)):
+            items.extend(section)
+        else:
+            try:
+                # Scapy's _DNSPacketListField behaves list-like in newer releases.
+                if hasattr(section, "__iter__") and not hasattr(section, "qname") and not hasattr(section, "rrname"):
+                    items.extend(list(section))
+                else:
+                    items.append(section)
+            except Exception:
+                items.append(section)
+
+        # Older Scapy versions may chain records through payload.
+        flattened: list = []
+        seen: set[int] = set()
+        limit = max(1, min(int(expected_count or 1), 4096))
+
+        for item in items:
+            current = item
+            while current is not None and len(flattened) < limit:
+                identity = id(current)
+                if identity in seen:
+                    break
+                seen.add(identity)
+                flattened.append(current)
+
+                payload = getattr(current, "payload", None)
+                if payload is None or payload.__class__.__name__ in ("NoPayload", "Raw"):
+                    break
+                if not (hasattr(payload, "qname") or hasattr(payload, "rrname")):
+                    break
+                current = payload
+
+        return flattened
+
+    def _dns_questions_from_scapy(self, dns) -> list[dict]:
+        if dns is None:
+            return []
+
+        expected = self._dns_safe_int(getattr(dns, "qdcount", 0), 0)
+        result: list[dict] = []
+
+        for question in self._dns_scapy_section_items(getattr(dns, "qd", None), expected):
+            try:
+                qname = getattr(question, "qname", b"")
+                if isinstance(qname, bytes):
+                    raw_name = qname.rstrip(b".")
+                    try:
+                        name = raw_name.decode("idna").rstrip(".").lower()
+                    except Exception:
+                        name = raw_name.decode("utf-8", errors="replace").rstrip(".").lower()
+                else:
+                    name = str(qname or "").rstrip(".").lower()
+                if not name:
+                    continue
+
+                qtype = self._dns_safe_int(getattr(question, "qtype", 0), 0)
+                qclass = self._dns_safe_int(getattr(question, "qclass", 0), 0)
+                result.append({
+                    "name": name,
+                    "type": qtype,
+                    "type_name": self._dns_type_name(qtype),
+                    "class": qclass,
+                    "class_name": self._dns_class_name(qclass),
+                })
+            except Exception:
+                continue
+
+        return result
+
+    def _dns_question_summary(self, questions: list[dict] | None) -> str:
+        questions = list(questions or [])
+        if not questions:
+            return "<no-question>"
+
+        rendered = []
+        for question in questions[:4]:
+            rendered.append(
+                f"{question.get('name') or '.'} "
+                f"{question.get('type_name') or self._dns_type_name(question.get('type', 0))}/"
+                f"{question.get('class_name') or self._dns_class_name(question.get('class', 0))}"
+            )
+        if len(questions) > 4:
+            rendered.append(f"+{len(questions) - 4} more")
+        return ", ".join(rendered)
+
+    def _dns_answer_summary(self, answers: list[dict] | None) -> str:
+        answers = list(answers or [])
+        if not answers:
+            return "<no-answer>"
+
+        rendered = []
+        for answer in answers[:4]:
+            rendered.append(
+                f"{answer.get('name') or '.'} "
+                f"{answer.get('type_name') or self._dns_type_name(answer.get('type', 0))}="
+                f"{answer.get('rdata_text', '')} ttl={answer.get('ttl', 0)}"
+            )
+        if len(answers) > 4:
+            rendered.append(f"+{len(answers) - 4} more")
+        return "; ".join(rendered)
+
+    def _dns_safe_question_name(self, dns) -> str:
+        questions = self._dns_questions_from_scapy(dns)
+        if not questions:
+            return "<no-question>"
+        return str(questions[0].get("name") or "<no-question>")
+
+    def _dns_pending_key(
+            self,
+            *,
+            transport: str,
+            src_ip: str,
+            sport: int,
+            dst_ip: str,
+            dport: int,
+            transaction_id: int,
+    ) -> tuple:
+        return (
+            str(transport or "udp").lower(),
+            self._dns_normalize_ip(src_ip),
+            self._dns_safe_int(sport, 0),
+            self._dns_normalize_ip(dst_ip),
+            self._dns_safe_int(dport, 0),
+            self._dns_safe_int(transaction_id, 0),
+        )
+
+    def _dns_correlate_wire_message(
+            self,
+            metadata: dict,
+            *,
+            src_ip: str,
+            dst_ip: str,
+    ) -> None:
+        """Remember queries and recover omitted response questions safely."""
+        wire_result = metadata.get("wire_result")
+        if not wire_result:
+            return
+
+        lock = getattr(self, "_dns_pending_wire_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._dns_pending_wire_lock = lock
+
+        table = getattr(self, "_dns_pending_wire_queries", None)
+        if table is None:
+            table = {}
+            self._dns_pending_wire_queries = table
+
+        now = time.monotonic()
+        ttl = 45.0
+        transaction_id = self._dns_safe_int(wire_result.get("transaction_id"), 0)
+        transport = str(metadata.get("transport") or "udp")
+        sport = self._dns_safe_int(metadata.get("sport"), 0)
+        dport = self._dns_safe_int(metadata.get("dport"), 0)
+        qr = self._dns_safe_int(metadata.get("qr"), 0)
+
+        with lock:
+            if len(table) > 4096:
+                for key, value in list(table.items()):
+                    if now - float(value.get("seen", 0.0)) > ttl:
+                        table.pop(key, None)
+                if len(table) > 4096:
+                    oldest = sorted(table.items(), key=lambda item: float(item[1].get("seen", 0.0)))[:1024]
+                    for key, _ in oldest:
+                        table.pop(key, None)
+
+            if qr == 0:
+                key = self._dns_pending_key(
+                    transport=transport,
+                    src_ip=src_ip,
+                    sport=sport,
+                    dst_ip=dst_ip,
+                    dport=dport,
+                    transaction_id=transaction_id,
+                )
+                table[key] = {
+                    "seen": now,
+                    "questions": list(wire_result.get("questions") or []),
+                    "server_ip": self._dns_normalize_ip(dst_ip),
+                    "transaction_id": transaction_id,
+                    "transport": transport,
+                }
+                return
+
+            response_key = self._dns_pending_key(
+                transport=transport,
+                src_ip=dst_ip,
+                sport=dport,
+                dst_ip=src_ip,
+                dport=sport,
+                transaction_id=transaction_id,
+            )
+            candidate = table.get(response_key)
+
+            if candidate is None:
+                # NAT can change the client-side address/port before the reply is
+                # captured. Use a conservative unique match by server+ID+transport.
+                matches = [
+                    value
+                    for value in table.values()
+                    if (
+                        value.get("transaction_id") == transaction_id
+                        and value.get("transport") == transport
+                        and value.get("server_ip") == self._dns_normalize_ip(src_ip)
+                        and now - float(value.get("seen", 0.0)) <= ttl
+                    )
+                ]
+                if len(matches) == 1:
+                    candidate = matches[0]
+
+            if candidate and not wire_result.get("questions"):
+                recovered = list(candidate.get("questions") or [])
+                wire_result["questions"] = recovered
+                metadata["questions"] = recovered
+                metadata["question_recovered_from_query"] = bool(recovered)
+
+    def _dns_extract_packet_metadata(self, packet) -> dict:
+        """Identify DNS and extract real questions/answers from UDP wire bytes."""
         udp = packet.getlayer(UDP)
         tcp = packet.getlayer(TCP)
 
@@ -2422,19 +3220,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 "fragmented": False,
                 "decoded_from_wire": False,
                 "direction_mismatch": False,
+                "wire_result": None,
+                "questions": [],
+                "answers": [],
+                "authorities": [],
+                "additionals": [],
             }
 
-        sport = self._dns_safe_int(
-            getattr(transport_layer, "sport", 0),
-            0,
-        )
-        dport = self._dns_safe_int(
-            getattr(transport_layer, "dport", 0),
-            0,
-        )
+        sport = self._dns_safe_int(getattr(transport_layer, "sport", 0), 0)
+        dport = self._dns_safe_int(getattr(transport_layer, "dport", 0), 0)
 
         special = None
-
         if sport == 5353 or dport == 5353:
             special = "mdns"
         elif sport == 5355 or dport == 5355:
@@ -2444,50 +3240,34 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         is_standard_dns = sport == 53 or dport == 53
         is_dns_related = bool(is_standard_dns or special)
-
         existing_dns = packet.getlayer(DNS)
         wire_result = None
 
-        # Only ordinary UDP/53 uses RFC 1035 DNS wire decoding here.
-        # mDNS and LLMNR remain owned by their dedicated managers.
-        if (
-                transport == "udp"
-                and is_standard_dns
-                and special is None
-        ):
+        if transport == "udp" and is_standard_dns and special is None:
             wire_result = self._dns_decode_udp_wire(packet)
 
-        decoded_from_wire = wire_result is not None
-
         if wire_result is not None:
-            dns = wire_result["dns"]
-            qr = int(wire_result["qr"])
-            rcode = int(wire_result["rcode"])
-
-            dispatch_packet = self._dns_make_decoded_packet(
-                packet,
-                dns,
-            )
+            dns = wire_result.get("dns") or existing_dns
+            qr = self._dns_safe_int(wire_result.get("qr"), 0)
+            rcode = self._dns_safe_int(wire_result.get("rcode"), 0)
+            dispatch_packet = self._dns_make_decoded_packet(packet, wire_result)
+            questions = list(wire_result.get("questions") or [])
+            answers = list(wire_result.get("answers") or [])
+            authorities = list(wire_result.get("authorities") or [])
+            additionals = list(wire_result.get("additionals") or [])
+            decoded_from_wire = True
         else:
             dns = existing_dns
             dispatch_packet = packet
+            qr = self._dns_safe_int(getattr(dns, "qr", 0), 0) if dns is not None else None
+            rcode = self._dns_safe_int(getattr(dns, "rcode", 0), 0) if dns is not None else None
+            questions = self._dns_questions_from_scapy(dns)
+            answers = []
+            authorities = []
+            additionals = []
+            decoded_from_wire = False
 
-            if dns is not None:
-                qr = self._dns_safe_int(
-                    getattr(dns, "qr", 0),
-                    0,
-                )
-                rcode = self._dns_safe_int(
-                    getattr(dns, "rcode", 0),
-                    0,
-                )
-            else:
-                qr = None
-                rcode = None
-
-        # Port-based direction is only a hint. The DNS QR bit is authoritative.
         port_direction = None
-
         if dport == 53 and sport != 53:
             port_direction = 0
         elif sport == 53 and dport != 53:
@@ -2509,11 +3289,18 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             "dispatch_packet": dispatch_packet,
             "qr": qr,
             "rcode": rcode,
+            "rcode_name": self._dns_rcode_name(rcode or 0),
             "special": special,
             "fragmented": self._dns_is_fragmented_packet(packet),
             "decoded_from_wire": decoded_from_wire,
             "direction_mismatch": direction_mismatch,
             "wire_result": wire_result,
+            "questions": questions,
+            "answers": answers,
+            "authorities": authorities,
+            "additionals": additionals,
+            "question_summary": self._dns_question_summary(questions),
+            "answer_summary": self._dns_answer_summary(answers),
         }
 
     def _dns_dispatch_log_limited(
@@ -2522,32 +3309,145 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             message: str,
             interval_sec: float = 5.0,
     ):
-        """
-        Avoid printing a warning for every host resolver packet.
-        """
+        """Rate-limit duplicate capture-path logs without hiding different DNS messages."""
         now = time.monotonic()
-
         table = getattr(self, "_dns_dispatch_log_times", None)
         if table is None:
             table = {}
             self._dns_dispatch_log_times = table
 
         last = float(table.get(key, 0.0))
-
         if now - last < float(interval_sec):
             return
-
         table[key] = now
 
-        # Keep the lazy table bounded.
-        if len(table) > 256:
+        if len(table) > 2048:
             cutoff = now - max(float(interval_sec) * 4.0, 30.0)
-
             for existing_key, timestamp in list(table.items()):
                 if float(timestamp) < cutoff:
                     table.pop(existing_key, None)
 
         self.router_logger.log_message(message)
+
+    def _dns_deliver_to_manager(
+            self,
+            dns_packet,
+            inbound_iface: str,
+            *,
+            qr,
+            context: dict,
+    ) -> dict:
+        """
+        Deliver one captured DNS packet to DNSManager exactly once.
+
+        ``handled=False`` means DNSManager received the packet but intentionally
+        left it on the host/transit path. It must not be interpreted as a failed
+        delivery. TCP/53 packets are observation-only until a complete framed DNS
+        message has been reassembled by the manager's TCP listener/stream logic.
+        """
+        result = {
+            "available": False,
+            "called": False,
+            "handled": False,
+            "method": None,
+            "error": None,
+        }
+
+        manager = getattr(self, "dns_manager", None)
+        if manager is None:
+            return result
+
+        result["available"] = True
+        manager_context = dict(context or {})
+        manager_context["dns_manager_delivery"] = True
+        manager_context["observation_only"] = bool(
+            manager_context.get("transport") == "tcp"
+        )
+        manager_context["complete_dns_message"] = bool(
+            manager_context.get("transport") == "udp"
+            and manager_context.get("dns_wire")
+        )
+
+        try:
+            process_packet = getattr(manager, "process_packet", None)
+            if callable(process_packet):
+                result["method"] = "process_packet"
+                try:
+                    result["handled"] = bool(
+                        process_packet(
+                            dns_packet,
+                            inbound_iface,
+                            context=manager_context,
+                        )
+                    )
+                except TypeError as exc:
+                    message = str(exc)
+                    context_unsupported = (
+                        "unexpected keyword argument 'context'" in message
+                        or 'unexpected keyword argument "context"' in message
+                    )
+                    if not context_unsupported:
+                        raise
+                    result["handled"] = bool(
+                        process_packet(dns_packet, inbound_iface)
+                    )
+                result["called"] = True
+                return result
+
+            # Compatibility with older DNSManager implementations. Never feed an
+            # arbitrary TCP segment into UDP-only handle_query/handle_response.
+            if manager_context.get("transport") == "udp":
+                if self._dns_safe_int(qr, -1) == 0:
+                    handler = getattr(manager, "handle_query", None)
+                    if callable(handler):
+                        result["method"] = "handle_query"
+                        result["handled"] = bool(
+                            handler(dns_packet, inbound_iface)
+                        )
+                        result["called"] = True
+                        return result
+                elif self._dns_safe_int(qr, -1) == 1:
+                    handler = getattr(manager, "handle_response", None)
+                    if callable(handler):
+                        result["method"] = "handle_response"
+                        result["handled"] = bool(handler(dns_packet))
+                        result["called"] = True
+                        return result
+
+            # Optional passive hook for managers that separate observation from
+            # resolver ownership, especially for TCP stream segments.
+            for method_name in (
+                    "observe_dns_packet",
+                    "observe_packet",
+                    "ingest_dns_packet",
+            ):
+                observer = getattr(manager, method_name, None)
+                if not callable(observer):
+                    continue
+                result["method"] = method_name
+                try:
+                    observer(
+                        dns_packet,
+                        inbound_iface,
+                        context=manager_context,
+                    )
+                except TypeError as exc:
+                    message = str(exc)
+                    context_unsupported = (
+                        "unexpected keyword argument 'context'" in message
+                        or 'unexpected keyword argument "context"' in message
+                    )
+                    if not context_unsupported:
+                        raise
+                    observer(dns_packet, inbound_iface)
+                result["called"] = True
+                return result
+
+            return result
+
+        except Exception as exc:
+            result["error"] = exc
+            return result
 
     def _dispatch_dns_packet(
             self,
@@ -2557,40 +3457,17 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             src_ip=None,
             dst_ip=None,
     ) -> str:
-        """
-        Route one DNS-related packet to the correct owner.
-
-        DNSManager returning False means it did not consume the packet. It does not
-        automatically mean the packet is invalid.
-
-        Results:
-          handled:
-              DNSManager consumed or answered the packet.
-
-          host-passthrough:
-              The packet belongs to a router-owned socket or local TCP DNS listener.
-              The router pipeline must stop without forwarding it as transit traffic.
-
-          transit-passthrough:
-              DNSManager did not consume it. Continue normal router forwarding.
-
-          special-name-service:
-              mDNS, LLMNR or NBNS must go to their dedicated manager.
-
-          not-dns:
-              Continue the ordinary packet pipeline.
-        """
+        """Dispatch one DNS packet using wire-derived QR, questions, and answers."""
         metadata = self._dns_extract_packet_metadata(packet)
         dns_packet = metadata.get("dispatch_packet") or packet
+
         if not metadata["is_dns_related"]:
             return self.DNS_DISPOSITION_NOT_DNS
-
         if metadata["special"] is not None:
             return self.DNS_DISPOSITION_SPECIAL_NAME_SERVICE
 
         src_ip = self._dns_normalize_ip(src_ip)
         dst_ip = self._dns_normalize_ip(dst_ip)
-
         if not src_ip or not dst_ip:
             if packet.haslayer(IP):
                 src_ip = self._dns_normalize_ip(packet[IP].src)
@@ -2600,7 +3477,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 dst_ip = self._dns_normalize_ip(packet[IPv6].dst)
 
         local_ips = self._dns_router_ip_set()
-
         source_is_router = src_ip in local_ips
         destination_is_router = dst_ip in local_ips
         belongs_to_host = source_is_router or destination_is_router
@@ -2612,123 +3488,146 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         qr = metadata["qr"]
         fragmented = metadata["fragmented"]
 
-        # TCP DNS is a byte stream. Individual captured TCP segments must not be
-        # passed to the UDP packet resolver. The DNSManager TCP listener handles
-        # router-destined TCP/53 through the host socket stack.
         if transport == "tcp":
-            if belongs_to_host:
-                self._dns_dispatch_log_limited(
-                    key=f"tcp-host:{src_ip}:{dst_ip}",
-                    message=(
-                        f"[DNS] 🧵 TCP/53 host-stack pass-through on "
-                        f"{inbound_iface}: "
-                        f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                    ),
-                )
-                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
-
-            self._dns_dispatch_log_limited(
-                key=f"tcp-transit:{inbound_iface}",
-                message=(
-                    f"[DNS] 🚚 TCP/53 transit forwarding on "
-                    f"{inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                ),
+            # TCP capture gives us stream segments, not necessarily one complete
+            # length-prefixed DNS message. Deliver the segment to DNSManager for
+            # observation/stream handling, then preserve the host/transit path.
+            tcp_context = {
+                "capture_phase": "pre-nat",
+                "capture_source": inbound_iface,
+                "inbound_iface": inbound_iface,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "source_is_router": source_is_router,
+                "destination_is_router": destination_is_router,
+                "is_transit": not belongs_to_host,
+                "transport": "tcp",
+                "sport": sport,
+                "dport": dport,
+                "dns_qr": qr,
+                "dns_wire": b"",
+                "tcp_stream_segment": True,
+            }
+            delivery = self._dns_deliver_to_manager(
+                dns_packet,
+                inbound_iface,
+                qr=qr,
+                context=tcp_context,
             )
-            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+            disposition = (
+                self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                if belongs_to_host
+                else self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+            )
+            delivery_state = (
+                "handled"
+                if delivery.get("handled")
+                else "observed/pass-through"
+                if delivery.get("called")
+                else "no-compatible-manager-hook"
+            )
+            if delivery.get("error") is not None:
+                delivery_state = f"manager-error={delivery['error']}"
+            self._dns_dispatch_log_limited(
+                key=f"tcp-dns:{disposition}:{src_ip}:{sport}:{dst_ip}:{dport}",
+                message=(
+                    f"[DNS] 🧵 TCP/53 {'host-stack' if belongs_to_host else 'transit'} "
+                    f"pass-through on {inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} | "
+                    f"DNSManager={delivery_state} method={delivery.get('method') or '-'}"
+                ),
+                interval_sec=3.0,
+            )
+            return (
+                self.DNS_DISPOSITION_HANDLED
+                if delivery.get("handled")
+                else disposition
+            )
 
-        # Let IP reassembly happen before DNS parsing.
         if fragmented:
-            if belongs_to_host:
-                self._dns_dispatch_log_limited(
-                    key=f"fragment-host:{src_ip}:{dst_ip}",
-                    message=(
-                        f"[DNS] 🧩 Fragmented DNS host-stack pass-through on "
-                        f"{inbound_iface}: "
-                        f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                    ),
-                )
-                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
-
+            disposition = (
+                self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                if belongs_to_host
+                else self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+            )
             self._dns_dispatch_log_limited(
-                key=f"fragment-transit:{inbound_iface}",
+                key=f"fragmented-dns:{disposition}:{src_ip}:{dst_ip}",
                 message=(
-                    f"[DNS] 🧩 Fragmented DNS transit pass-through on "
-                    f"{inbound_iface}: "
+                    f"[DNS] 🧩 Fragmented DNS {'host-stack' if belongs_to_host else 'transit'} "
+                    f"pass-through on {inbound_iface}: "
                     f"{src_ip}:{sport} -> {dst_ip}:{dport}"
                 ),
             )
-            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+            return disposition
 
-        # UDP/53 was recognized by its ports, but Scapy could not decode a complete
-        # DNS layer. Do not accidentally feed it to a normal DNS handler.
-        if dns is None:
-            payload_length = 0
-
-            if transport == "udp":
-                payload_length = len(
-                    self._dns_udp_payload_bytes(packet)
-                )
-
+        if metadata.get("wire_result") is None and dns is None:
+            payload_length = len(self._dns_udp_payload_bytes(packet)) if transport == "udp" else 0
             self._dns_dispatch_log_limited(
-                key=f"invalid-dns-wire:{transport}:{inbound_iface}",
+                key=f"invalid-dns-wire:{transport}:{inbound_iface}:{src_ip}:{sport}:{dst_ip}:{dport}",
                 message=(
-                    f"[DNS] ⚠️ Port-53 packet has no valid DNS message on "
-                    f"{inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"[DNS] ⚠️ Port-53 packet has no structurally valid DNS message on "
+                    f"{inbound_iface}: {src_ip}:{sport} -> {dst_ip}:{dport} "
                     f"payload_bytes={payload_length}"
                 ),
                 interval_sec=5.0,
             )
+            return (
+                self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                if belongs_to_host
+                else self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
+            )
 
-            if belongs_to_host:
-                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
+        self._dns_correlate_wire_message(metadata, src_ip=src_ip, dst_ip=dst_ip)
+        questions = list(metadata.get("questions") or [])
+        answers = list(metadata.get("answers") or [])
+        question_summary = self._dns_question_summary(questions)
+        answer_summary = self._dns_answer_summary(answers)
+        transaction_id = self._dns_safe_int(
+            (metadata.get("wire_result") or {}).get("transaction_id", getattr(dns, "id", 0)),
+            0,
+        )
 
-            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
         if metadata.get("decoded_from_wire"):
+            direction_word = "RESPONSE" if qr == 1 else "QUERY"
+            detail = (
+                f"answers={answer_summary}"
+                if qr == 1
+                else f"questions={question_summary}"
+            )
             self._dns_dispatch_log_limited(
-                key=f"wire-recovered:{inbound_iface}",
-                message=(
-                    f"[DNS] 🧬 Recovered DNS from raw UDP payload on "
-                    f"{inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
-                    f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
-                    f"qr={qr} "
-                    f"rcode={metadata.get('rcode')} "
-                    f"q={self._dns_safe_question_name(dns)}"
+                key=(
+                    f"wire-dns:{inbound_iface}:{src_ip}:{sport}:{dst_ip}:{dport}:"
+                    f"{transaction_id}:{qr}:{question_summary}:{answer_summary}"
                 ),
-                interval_sec=2.0,
+                message=(
+                    f"[DNS] 🧬 Real UDP DNS {direction_word} from capture on {inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} id={transaction_id} "
+                    f"rcode={metadata.get('rcode')}({metadata.get('rcode_name')}) "
+                    f"{detail}"
+                ),
+                interval_sec=0.75,
             )
 
         if metadata.get("direction_mismatch"):
             port_direction = (
-                "query"
-                if dport == 53 and sport != 53
-                else "response"
-                if sport == 53 and dport != 53
+                "query" if dport == 53 and sport != 53
+                else "response" if sport == 53 and dport != 53
                 else "unknown"
             )
-
             dns_direction = "response" if qr == 1 else "query"
-
             self._dns_dispatch_log_limited(
-                key=(
-                    f"dns-direction-mismatch:"
-                    f"{src_ip}:{sport}:{dst_ip}:{dport}"
-                ),
+                key=f"dns-direction-mismatch:{src_ip}:{sport}:{dst_ip}:{dport}:{transaction_id}",
                 message=(
-                    f"[DNS] 🔄 DNS direction mismatch on {inbound_iface}: "
-                    f"ports imply {port_direction}, "
-                    f"wire QR implies {dns_direction}; "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
-                    f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
-                    f"q={self._dns_safe_question_name(dns)}"
+                    f"[DNS] 🔄 Direction mismatch on {inbound_iface}: ports imply "
+                    f"{port_direction}, wire QR implies {dns_direction}; "
+                    f"id={transaction_id} q={question_summary}"
                 ),
                 interval_sec=5.0,
             )
 
         context = {
             "capture_phase": "pre-nat",
+            "capture_source": inbound_iface,
             "inbound_iface": inbound_iface,
             "src_ip": src_ip,
             "dst_ip": dst_ip,
@@ -2738,343 +3637,125 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             "transport": transport,
             "sport": sport,
             "dport": dport,
+            "dns_wire": bytes((metadata.get("wire_result") or {}).get("wire") or b""),
+            "dns_wire_metadata": metadata.get("wire_result"),
+            "dns_questions": questions,
+            "dns_answers": answers,
+            "dns_authorities": list(metadata.get("authorities") or []),
+            "dns_additionals": list(metadata.get("additionals") or []),
+            "dns_transaction_id": transaction_id,
+            "dns_qr": qr,
+            "dns_rcode": metadata.get("rcode"),
+            "dns_rcode_name": metadata.get("rcode_name"),
+            "decoded_from_udp_wire": bool(metadata.get("decoded_from_wire")),
         }
 
-        manager = getattr(self, "dns_manager", None)
+        delivery = self._dns_deliver_to_manager(
+            dns_packet,
+            inbound_iface,
+            qr=qr,
+            context=context,
+        )
 
-        if manager is None:
-            if belongs_to_host:
-                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
-            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
-
-        handled = False
-
-        try:
-            manager_process_packet = getattr(
-                manager,
-                "process_packet",
-                None,
+        if not delivery.get("available"):
+            self._dns_dispatch_log_limited(
+                key="dns-manager-unavailable",
+                message=(
+                    "[DNS][DISPATCH] ⚠️ Valid DNS packet decoded, but DNSManager "
+                    "is not initialized."
+                ),
+                interval_sec=5.0,
+            )
+            return (
+                self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                if belongs_to_host
+                else self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
             )
 
-            if callable(manager_process_packet):
-                try:
-                    handled = bool(
-                        manager_process_packet(
-                            dns_packet,
-                            inbound_iface,
-                            context=context,
-                        )
-                    )
-                except TypeError as exc:
-                    if "context" not in str(exc):
-                        raise
-
-                    handled = bool(
-                        manager_process_packet(
-                            dns_packet,
-                            inbound_iface,
-                        )
-                    )
-            elif qr == 0:
-                handled = bool(
-                    manager.handle_query(
-                        dns_packet,
-                        inbound_iface,
-                    )
-                )
-            else:
-                handled = bool(
-                    manager.handle_response(dns_packet)
-                )
-
-        except Exception as exc:
+        if delivery.get("error") is not None:
             self.router_logger.log_message(
-                f"[DNS] ❗ DNS manager dispatch failed on "
-                f"{inbound_iface}: {exc}"
+                f"[DNS][DISPATCH] ❗ DNSManager delivery failed on {inbound_iface}: "
+                f"{delivery['error']} | id={transaction_id} "
+                f"q={question_summary} a={answer_summary}"
+            )
+            return (
+                self.DNS_DISPOSITION_HOST_PASSTHROUGH
+                if belongs_to_host
+                else self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
             )
 
-            # Fail open for ordinary DNS connectivity. A manager exception should
-            # not convert every DNS packet into a router-wide outage.
-            if belongs_to_host:
-                direction = (
-                    "response"
-                    if qr == 1
-                    else "query"
-                    if qr == 0
-                    else "message"
-                )
+        delivery_state = (
+            "handled"
+            if delivery.get("handled")
+            else "observed/pass-through"
+            if delivery.get("called")
+            else "no-compatible-manager-hook"
+        )
+        self._dns_dispatch_log_limited(
+            key=(
+                f"dns-manager-delivery:{inbound_iface}:{src_ip}:{sport}:"
+                f"{dst_ip}:{dport}:{transaction_id}:{qr}:{delivery_state}"
+            ),
+            message=(
+                f"[DNS][DISPATCH] 📬 DNSManager received "
+                f"{'RESPONSE' if qr == 1 else 'QUERY'} on {inbound_iface}: "
+                f"{src_ip}:{sport} -> {dst_ip}:{dport} id={transaction_id} "
+                f"method={delivery.get('method') or '-'} decision={delivery_state} "
+                f"q={question_summary} a={answer_summary}"
+            ),
+            interval_sec=0.75,
+        )
 
-                self._dns_dispatch_log_limited(
-                    key=f"host-dns:{direction}:{src_ip}:{dst_ip}",
-                    message=(
-                        f"[DNS] 🖥️ Host DNS {direction} pass-through on "
-                        f"{inbound_iface}: "
-                        f"{src_ip}:{sport} -> {dst_ip}:{dport} "
-                        f"id={self._dns_safe_int(getattr(dns, 'id', 0))} "
-                        f"rcode={metadata.get('rcode')} "
-                        f"q={self._dns_safe_question_name(dns)}"
-                    ),
-                    interval_sec=3.0,
-                )
-
-                return self.DNS_DISPOSITION_HOST_PASSTHROUGH
-
-            return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
-
-        if handled:
+        if delivery.get("handled"):
             return self.DNS_DISPOSITION_HANDLED
 
-        # Unmatched query sourced from the router:
-        # ordinary host resolver query or OS-socket upstream transport.
         if qr == 0 and source_is_router:
             self._dns_dispatch_log_limited(
-                key=f"os-query:{src_ip}:{dst_ip}",
+                key=f"os-query:{src_ip}:{sport}:{dst_ip}:{dport}:{transaction_id}",
                 message=(
-                    f"[DNS] 🖥️ Host resolver query pass-through on "
-                    f"{inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                    f"[DNS] 🖥️ DNSManager observed host resolver query; host-stack pass-through on {inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} id={transaction_id} "
+                    f"q={question_summary}"
                 ),
+                interval_sec=2.0,
             )
             return self.DNS_DISPOSITION_HOST_PASSTHROUGH
 
-        # Unmatched answer destined for a router address:
-        # usually a reply to a Windows resolver socket, UDP transport, probe,
-        # DNSSEC backend, DoH bootstrap lookup, or another local application.
         if qr == 1 and destination_is_router:
             self._dns_dispatch_log_limited(
-                key=f"os-response:{src_ip}:{dst_ip}",
+                key=f"os-response:{src_ip}:{sport}:{dst_ip}:{dport}:{transaction_id}",
                 message=(
-                    f"[DNS] 🖥️ Host resolver response pass-through on "
-                    f"{inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                    f"[DNS] 🖥️ DNSManager observed host resolver response; host-stack pass-through on {inbound_iface}: "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} id={transaction_id} "
+                    f"rcode={metadata.get('rcode_name')} q={question_summary} "
+                    f"a={answer_summary}"
                 ),
+                interval_sec=2.0,
             )
             return self.DNS_DISPOSITION_HOST_PASSTHROUGH
 
-        # A query directed to the router was not claimed by DNSManager. Let a local
-        # socket listener receive it instead of forwarding it back onto the network.
         if qr == 0 and destination_is_router:
             self._dns_dispatch_log_limited(
-                key=f"local-listener-query:{dst_ip}",
+                key=f"local-listener-query:{src_ip}:{sport}:{dst_ip}:{dport}:{transaction_id}",
                 message=(
-                    f"[DNS] 🎧 Unclaimed local DNS query passed to host listener "
-                    f"on {inbound_iface}: "
-                    f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                    f"[DNS] 🎧 Unclaimed local DNS query passed to host listener on "
+                    f"{inbound_iface}: {src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"id={transaction_id} q={question_summary}"
                 ),
+                interval_sec=2.0,
             )
             return self.DNS_DISPOSITION_HOST_PASSTHROUGH
 
-        # Any other unclaimed response/query is transit traffic. It may be:
-        #   - direct client DNS intentionally not intercepted
-        #   - an ordinary NATed response
-        #   - traffic whose raw pending entry expired
-        # Continue the standard forwarding pipeline.
         self._dns_dispatch_log_limited(
-            key=f"transit:{qr}:{inbound_iface}",
+            key=f"transit:{qr}:{src_ip}:{sport}:{dst_ip}:{dport}:{transaction_id}",
             message=(
-                f"[DNS] ↪️ Unclaimed DNS transit packet continuing normally on "
-                f"{inbound_iface}: "
-                f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                f"[DNS] ↪️ Unclaimed DNS {'response' if qr == 1 else 'query'} continuing "
+                f"as transit on {inbound_iface}: {src_ip}:{sport} -> {dst_ip}:{dport} "
+                f"id={transaction_id} q={question_summary} a={answer_summary}"
             ),
+            interval_sec=2.0,
         )
-
         return self.DNS_DISPOSITION_TRANSIT_PASSTHROUGH
-
-    def _dns_udp_payload_bytes(self, packet) -> bytes:
-        """
-        Extract exactly the UDP application payload.
-
-        UDP.len includes the eight-byte UDP header. Trimming to UDP.len avoids
-        accidentally feeding Ethernet padding or capture padding into DNS().
-        """
-        udp = packet.getlayer(UDP)
-        if udp is None:
-            return b""
-
-        try:
-            payload = bytes(udp.payload)
-        except Exception:
-            return b""
-
-        if not payload:
-            return b""
-
-        udp_length = self._dns_safe_int(
-            getattr(udp, "len", 0),
-            0,
-        )
-
-        if udp_length >= 8:
-            expected_payload_length = udp_length - 8
-
-            if expected_payload_length <= len(payload):
-                payload = payload[:expected_payload_length]
-
-        return payload
-
-    def _dns_decode_udp_wire(self, packet) -> dict | None:
-        """
-        Decode DNS directly from a UDP payload even when Scapy did not bind DNS.
-
-        Returns normalized DNS metadata or None when the payload is not a
-        structurally plausible DNS message.
-        """
-        udp = packet.getlayer(UDP)
-        if udp is None:
-            return None
-
-        sport = self._dns_safe_int(
-            getattr(udp, "sport", 0),
-            0,
-        )
-        dport = self._dns_safe_int(
-            getattr(udp, "dport", 0),
-            0,
-        )
-
-        if sport != 53 and dport != 53:
-            return None
-
-        wire = self._dns_udp_payload_bytes(packet)
-
-        # RFC 1035 DNS header is exactly 12 bytes.
-        if len(wire) < 12:
-            return None
-
-        try:
-            (
-                transaction_id,
-                flags,
-                question_count,
-                answer_count,
-                authority_count,
-                additional_count,
-            ) = struct.unpack("!HHHHHH", wire[:12])
-        except struct.error:
-            return None
-
-        # Bound counts before allowing Scapy to traverse the message.
-        # Ordinary DNS generally has one question. A higher small value may still
-        # be decoded here so the DNSManager can reject it using its own policy.
-        if question_count > 16:
-            return None
-
-        if any(
-                count > 4096
-                for count in (
-                        answer_count,
-                        authority_count,
-                        additional_count,
-                )
-        ):
-            return None
-
-        if (
-                question_count
-                + answer_count
-                + authority_count
-                + additional_count
-        ) > 8192:
-            return None
-
-        try:
-            decoded_dns = DNS(wire)
-        except Exception:
-            return None
-
-        try:
-            decoded_id = self._dns_safe_int(
-                getattr(decoded_dns, "id", -1),
-                -1,
-            )
-            decoded_qr = self._dns_safe_int(
-                getattr(decoded_dns, "qr", -1),
-                -1,
-            )
-
-            header_qr = (flags >> 15) & 0x01
-
-            if decoded_id != transaction_id:
-                return None
-
-            if decoded_qr != header_qr:
-                return None
-
-            if question_count > 0 and getattr(decoded_dns, "qd", None) is None:
-                return None
-        except Exception:
-            return None
-
-        return {
-            "dns": decoded_dns,
-            "wire": wire,
-            "transaction_id": transaction_id,
-            "flags": flags,
-            "qr": (flags >> 15) & 0x01,
-            "opcode": (flags >> 11) & 0x0F,
-            "aa": (flags >> 10) & 0x01,
-            "tc": (flags >> 9) & 0x01,
-            "rd": (flags >> 8) & 0x01,
-            "ra": (flags >> 7) & 0x01,
-            "ad": (flags >> 5) & 0x01,
-            "cd": (flags >> 4) & 0x01,
-            "rcode": flags & 0x0F,
-            "question_count": question_count,
-            "answer_count": answer_count,
-            "authority_count": authority_count,
-            "additional_count": additional_count,
-        }
-
-    def _dns_make_decoded_packet(self, packet, decoded_dns):
-        """
-        Create a DNS-normalized copy for DNSManager.
-
-        The original captured packet remains untouched so normal forwarding still
-        uses the exact captured bytes when DNSManager does not consume it.
-        """
-        if decoded_dns is None or packet.getlayer(UDP) is None:
-            return packet
-
-        try:
-            normalized = packet.copy()
-            udp = normalized.getlayer(UDP)
-
-            if udp is None:
-                return packet
-
-            udp.remove_payload()
-            udp.add_payload(DNS(bytes(decoded_dns)))
-
-            return normalized
-        except Exception as exc:
-            self._dns_dispatch_log_limited(
-                key="dns-normalized-packet-failure",
-                message=(
-                    f"[DNS] ⚠️ Could not create normalized DNS packet: {exc}"
-                ),
-                interval_sec=10.0,
-            )
-            return packet
-
-    def _dns_safe_question_name(self, dns) -> str:
-        try:
-            question = getattr(dns, "qd", None)
-
-            if question is None:
-                return "<no-question>"
-
-            qname = getattr(question, "qname", b"")
-
-            if isinstance(qname, bytes):
-                return (
-                    qname.decode("idna", errors="replace")
-                    .rstrip(".")
-                    .lower()
-                )
-
-            return str(qname).rstrip(".").lower()
-        except Exception:
-            return "<unknown>"
     def process_packet(self, packet, inbound_iface: str):
         """
         Main packet processing pipeline with a clear separation for router-destined
@@ -3408,6 +4089,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             # DNS CONTROL-PLANE DISPATCH — BEFORE HANDSHAKE AND NAT
             # ==========================================================
             dns_metadata = self._dns_extract_packet_metadata(packet)
+            dns_display_packet = dns_metadata.get("dispatch_packet")
+            if dns_display_packet is None:
+                dns_display_packet = packet
 
             if dns_metadata["is_dns_related"]:
                 # Dedicated multicast/local name-service protocols remain separate.
@@ -3460,15 +4144,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     )
 
                     if dns_disposition == self.DNS_DISPOSITION_HANDLED:
-                        try:
-                            dns_qr = self._dns_safe_int(
-                                getattr(packet[DNS], "qr", 0)
-                            )
-                        except Exception:
-                            dns_qr = 0
+                        dns_qr = self._dns_safe_int(
+                            dns_metadata.get("qr"),
+                            0,
+                        )
 
                         self.code_output_manager.submit_packet(
-                            packet,
+                            dns_display_packet,
                             inbound_iface=inbound_iface,
                             phase="handled",
                             component=(
@@ -3487,7 +4169,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         # or a DNSManager OS-socket transport. Do not NAT it, duplicate it,
                         # or send it through _forward_general_ip_packet().
                         self.code_output_manager.submit_packet(
-                            packet,
+                            dns_display_packet,
                             inbound_iface=inbound_iface,
                             phase="bypass",
                             component="dns-host-stack",
@@ -3496,7 +4178,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
                     if dns_disposition == self.DNS_DISPOSITION_DROP:
                         self.code_output_manager.submit_packet(
-                            packet,
+                            dns_display_packet,
                             inbound_iface=inbound_iface,
                             phase="dropped",
                             component="dns-invalid",
@@ -3514,7 +4196,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         phase="handled",
                         component="handshake",
                     )
-                    return
             nat_decision = self.nat_manager.handle_packet(
                 packet,
                 inbound_iface,
