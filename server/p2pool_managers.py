@@ -177,6 +177,35 @@ class PythonRouterManager:
         self.dhcp_server_in = None
         self.dhcp_server_out = None
         self._dhcp_control_plane_signature = None
+        self._dhcp_control_plane_signatures = {}
+        self._enable_dhcp_server = True
+        self._serve_dhcp_on_wan = False
+        self._dhcp_server_settings = {}
+        self._wan_dhcp_server_settings = {}
+        self._transport_settings = {}
+        self._manager_settings = {
+            "enable_firewall": True,
+            "enable_packet_analyzer": True,
+            "enable_packet_catcher": True,
+            "enable_handshake": True,
+            "enable_syn_scanner": True,
+            "enable_igmp": True,
+            "enable_mdns": True,
+            "handshake_timeout_half_open": 60,
+            "handshake_timeout_established": 300,
+            "handshake_rate_limit_threshold": 20,
+            "handshake_rate_limit_period": 60,
+            "handshake_ban_duration": 300,
+            "handshake_log_tcp_lifecycle": True,
+            "handshake_log_non_tls_tcp": False,
+            "handshake_log_tls_records": True,
+            "handshake_log_application_data": False,
+            "handshake_log_tls13_key_events": True,
+            "syn_scan_interval": 300,
+            "packet_catcher_tcp_rate": 0.60,
+            "packet_catcher_udp_rate": 0.60,
+            "packet_catcher_default_rate": 0.60,
+        }
         self.firewall_manager = FirewallManager(router_logger)
         self.syn_scanner = None
         self.ethernet_manager = EthernetBridgeManager(router_logger, self.packet_writer)
@@ -1917,10 +1946,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
     def _dhcp_control_plane_iface_sets(self) -> tuple[set[str], set[str]]:
         """
-        Build explicit DHCP service and deny sets.
+        Build the explicit LAN-DHCP service and deny sets.
 
-        DHCP can serve only known LAN-facing interfaces. WAN, loopback, socket,
-        and outbound interfaces are always denied.
+        The LAN server owns only known downstream interfaces. The current WAN,
+        loopback, and socket interfaces remain denied even when a separate WAN
+        DHCP server is enabled.
         """
         allowed: set[str] = set()
         denied: set[str] = set()
@@ -1936,6 +1966,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         add_iface(denied, self.interface_loopback_full_name)
         add_iface(denied, SocketInterface.IFACE_NAME)
 
+        # The primary router IN interface is always a LAN candidate.
+        add_iface(allowed, self.interface_in_full_name)
+        add_iface(allowed, self.interface_in_friendly_name)
+
         try:
             configured_outbound = (
                 self.outbound_load_balancer.get_configured_interfaces()
@@ -1947,22 +1981,14 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         except Exception:
             pass
 
-        # Known LAN-facing capture interfaces.
+        # Wi-Fi Direct adapters created by WifiManager are downstream LAN
+        # interfaces, not uplinks.
         for iface in getattr(
                 self,
                 "wifi_host_managed_ifaces",
                 set(),
         ):
-            add_iface(denied, iface)
-
-        add_iface(
-            denied,
-            getattr(self, "interface_wifi_full_name", None),
-        )
-        add_iface(
-            denied,
-            getattr(self, "interface_wifi_friendly_name", None),
-        )
+            add_iface(allowed, iface)
 
         # Include interfaces currently owned by LanManager.
         try:
@@ -1998,6 +2024,59 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         return allowed, denied
 
+    def _dhcp_wan_control_plane_iface_sets(
+            self,
+    ) -> tuple[set[str], set[str]]:
+        """
+        Build a narrow policy for the optional WAN DHCP server.
+
+        Only the selected active OUT interface is allowed. LAN, loopback, and
+        socket interfaces are denied so enabling WAN DHCP cannot broaden the
+        existing LAN server's ownership.
+        """
+        allowed: set[str] = set()
+        denied: set[str] = set()
+
+        def add_iface(target: set[str], value) -> None:
+            value = str(value or "").strip()
+            if value:
+                target.add(value)
+
+        add_iface(allowed, self.interface_out_full_name)
+        add_iface(allowed, self.interface_out_friendly_name)
+
+        add_iface(denied, self.interface_in_full_name)
+        add_iface(denied, self.interface_in_friendly_name)
+        add_iface(denied, self.interface_loopback_full_name)
+        add_iface(denied, SocketInterface.IFACE_NAME)
+
+        for iface in getattr(
+                self,
+                "wifi_host_managed_ifaces",
+                set(),
+        ):
+            add_iface(denied, iface)
+
+        try:
+            lan_ifaces = getattr(self.lan_manager, "lan_ifaces", None)
+            if isinstance(lan_ifaces, (set, list, tuple)):
+                for iface in lan_ifaces:
+                    add_iface(denied, iface)
+        except Exception:
+            pass
+
+        allowed_normalized = {
+            str(iface).casefold()
+            for iface in allowed
+        }
+        denied = {
+            iface
+            for iface in denied
+            if str(iface).casefold() not in allowed_normalized
+        }
+
+        return allowed, denied
+
     def _configure_dhcp_control_plane(
             self,
             *,
@@ -2007,242 +2086,381 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         Atomically update DHCP interface ownership without restarting the server,
         clearing leases, resetting NAT, or changing Windows interface state.
         """
-        server = getattr(self, "dhcp_server_in", None)
+        server_specs = [
+            (
+                "lan",
+                getattr(self, "dhcp_server_in", None),
+                self._dhcp_control_plane_iface_sets,
+            ),
+            (
+                "wan",
+                getattr(self, "dhcp_server_out", None),
+                self._dhcp_wan_control_plane_iface_sets,
+            ),
+        ]
 
-        if server is None:
-            return {
-                "configured": False,
-                "reason": "no-server",
-            }
+        results = {}
 
-        allowed, denied = self._dhcp_control_plane_iface_sets()
+        for role_name, server, policy_factory in server_specs:
+            if server is None:
+                continue
 
-        interface_roles = {
-            iface: "lan"
-            for iface in allowed
-        }
-
-        interface_roles.update({
-            iface: "wan"
-            for iface in denied
-        })
-
-        signature = (
-            id(server),
-            tuple(sorted(
-                str(iface).casefold()
+            allowed, denied = policy_factory()
+            interface_roles = {
+                iface: f"{role_name}-dhcp-server"
                 for iface in allowed
-            )),
-            tuple(sorted(
-                str(iface).casefold()
+            }
+            interface_roles.update({
+                iface: "deny"
                 for iface in denied
-            )),
-        )
+            })
 
-        previous_signature = getattr(
-            self,
-            "_dhcp_control_plane_signature",
-            None,
-        )
-
-        changed = signature != previous_signature
-
-        configure_policy = getattr(
-            server,
-            "configure_interface_policy",
-            None,
-        )
-
-        if callable(configure_policy):
-            policy_snapshot = configure_policy(
-                allowed_ifaces=allowed,
-                denied_ifaces=denied,
-                observe_only_ifaces=set(),
-                interface_roles=interface_roles,
-                replace=True,
-                reason=reason,
+            signature = (
+                id(server),
+                tuple(sorted(
+                    str(iface).casefold()
+                    for iface in allowed
+                )),
+                tuple(sorted(
+                    str(iface).casefold()
+                    for iface in denied
+                )),
             )
-        else:
-            # Compatibility fallback for an older DHCPServer implementation.
-            server.serve_on_all_ifaces = False
-            server.allowed_ifaces = set(allowed)
-            server.denied_ifaces = set(denied)
+            previous_signature = (
+                self._dhcp_control_plane_signatures.get(role_name)
+            )
+            changed = signature != previous_signature
 
-            policy_snapshot = {
-                "legacy": True,
-                "allowed": sorted(allowed),
-                "denied": sorted(denied),
+            configure_policy = getattr(
+                server,
+                "configure_interface_policy",
+                None,
+            )
+            if callable(configure_policy):
+                policy_snapshot = configure_policy(
+                    allowed_ifaces=allowed,
+                    denied_ifaces=denied,
+                    observe_only_ifaces=set(),
+                    interface_roles=interface_roles,
+                    replace=True,
+                    reason=f"{reason}:{role_name}",
+                )
+            else:
+                server.serve_on_all_ifaces = False
+                server.allowed_ifaces = set(allowed)
+                server.denied_ifaces = set(denied)
+                policy_snapshot = {
+                    "legacy": True,
+                    "allowed": sorted(allowed),
+                    "denied": sorted(denied),
+                }
+
+            self._dhcp_control_plane_signatures[role_name] = signature
+
+            if changed:
+                self.router_logger.log_message(
+                    f"[DHCP][ControlPlane][{role_name.upper()}] "
+                    f"✅ Configured reason={reason} "
+                    f"allowed={sorted(allowed)} "
+                    f"denied={sorted(denied)}"
+                )
+
+            results[role_name] = {
+                "configured": True,
+                "changed": changed,
+                "policy": policy_snapshot,
             }
 
-        self._dhcp_control_plane_signature = signature
-
-        if changed:
-            self.router_logger.log_message(
-                f"[DHCP][ControlPlane] ✅ Configured reason={reason} "
-                f"allowed={sorted(allowed)} "
-                f"denied={sorted(denied)}"
-            )
+        self._dhcp_control_plane_signature = tuple(
+            sorted(self._dhcp_control_plane_signatures.items())
+        )
 
         return {
-            "configured": True,
-            "changed": changed,
-            "policy": policy_snapshot,
+            "configured": bool(results),
+            "reason": reason if results else "no-server",
+            "servers": results,
         }
 
-    def _start_dhcp_servers(self):
-        """
-        Start exactly one DHCP server for LAN-facing interfaces.
+    @staticmethod
+    def _default_dhcp_pool(
+            network: ipaddress.IPv4Network,
+            router_ip: str,
+    ) -> tuple[str, str]:
+        router_address = ipaddress.IPv4Address(router_ip)
+        first_host = int(network.network_address) + 1
+        last_host = int(network.broadcast_address) - 1
+        router_value = int(router_address)
 
-        If LanManager has already created a DHCPServer, adopt it. Do not create
-        another DHCP server and never create a DHCP server for the WAN.
-        """
-        if not self.router_network_in:
-            self.router_logger.log_message(
-                "[DHCP] DHCP server not initialized because the "
-                "router LAN network is unavailable."
-            )
-            return
-
-        existing_server = getattr(self, "dhcp_server_in", None)
-
-        if existing_server is not None:
-            existing_server.sniffer = self.sniffer
-            existing_server.router_ipv6_link_local_out = (
-                self.router_ipv6_link_local_out
+        if last_host < first_host:
+            raise RuntimeError(
+                f"No usable DHCP addresses exist in {network}."
             )
 
-            # Never run a DHCP server on the WAN.
-            self.dhcp_server_out = None
-
-            self._configure_dhcp_control_plane(
-                reason="adopt-lan-manager-server"
+        below = (first_host, router_value - 1)
+        above = (router_value + 1, last_host)
+        candidates = [
+            pair
+            for pair in (below, above)
+            if pair[0] <= pair[1]
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"No DHCP range remains after reserving {router_address}."
             )
 
-            # The upgraded DHCPServer start method is idempotent.
-            existing_server.start()
+        start_value, end_value = max(
+            candidates,
+            key=lambda pair: pair[1] - pair[0],
+        )
+        return (
+            str(ipaddress.IPv4Address(start_value)),
+            str(ipaddress.IPv4Address(end_value)),
+        )
 
-            try:
-                self.arp_manager.set_dhcp_server_reference(
-                    existing_server,
-                    None,
+    def _create_configured_dhcp_server(
+            self,
+            *,
+            role_name: str,
+            iface_name: str,
+            network: ipaddress.IPv4Network,
+            router_ip: str,
+            router_mac: str,
+            settings: dict,
+            policy_factory,
+    ):
+        settings = dict(settings or {})
+        pool_start = settings.get("pool_start")
+        pool_end = settings.get("pool_end")
+
+        if not pool_start or not pool_end:
+            pool_start, pool_end = self._default_dhcp_pool(
+                network,
+                router_ip,
+            )
+
+        pool_start_ip = ipaddress.IPv4Address(pool_start)
+        pool_end_ip = ipaddress.IPv4Address(pool_end)
+        router_address = ipaddress.IPv4Address(router_ip)
+
+        if pool_start_ip > pool_end_ip:
+            raise ValueError(
+                f"{role_name.upper()} DHCP pool start is after pool end."
+            )
+        if settings.get("enforce_same_subnet", True):
+            if pool_start_ip not in network or pool_end_ip not in network:
+                raise ValueError(
+                    f"{role_name.upper()} DHCP pool must be inside "
+                    f"{network}."
                 )
-            except Exception as exc:
-                self.router_logger.log_message(
-                    f"[DHCP] ⚠️ Could not update ARP DHCP reference: {exc}"
-                )
-
-            self.router_logger.log_message(
-                "[DHCP][ControlPlane] ♻️ Adopted the existing LAN DHCP "
-                "server; duplicate creation was skipped."
+        if pool_start_ip <= router_address <= pool_end_ip:
+            raise ValueError(
+                f"{role_name.upper()} DHCP pool includes router address "
+                f"{router_address}."
             )
-            return
 
-        def generate_full_pool(network, router_ip):
-            return [
-                str(ip)
-                for ip in network.hosts()
-                if str(ip) != str(router_ip)
-            ]
-
-        interface_config = self._interfaces_config.get(
-            self.interface_in_full_name,
-            {},
-        )
-
-        router_lan_ip = (
-                interface_config.get("ip_addr")
-                or self.router_ip_in
-        )
-
-        router_lan_mac = (
-                interface_config.get("mac")
-                or self.mac_in
-        )
-
-        dhcp_pool = generate_full_pool(
-            self.router_network_in,
-            router_lan_ip,
-        )
-
-        if not dhcp_pool:
-            self.router_logger.log_message(
-                "[DHCP] ❌ The LAN network has no usable DHCP addresses."
-            )
-            return
-
-        allowed_ifaces, denied_ifaces = (
-            self._dhcp_control_plane_iface_sets()
-        )
-
+        allowed_ifaces, denied_ifaces = policy_factory()
         interface_roles = {
-            iface: "lan"
+            iface: f"{role_name}-dhcp-server"
             for iface in allowed_ifaces
         }
-
         interface_roles.update({
-            iface: "wan"
+            iface: "deny"
             for iface in denied_ifaces
         })
 
-        self.dhcp_server_in = DHCPServer(
+        server = DHCPServer(
             self.router_logger,
             self.packet_writer,
-            self.interface_in_full_name,
-            dhcp_pool[0],
-            dhcp_pool[-1],
+            iface_name,
+            str(pool_start_ip),
+            str(pool_end_ip),
             self._interfaces_config,
-            in_mac=router_lan_mac,
-
-            # Lease and subnet safety.
-            allow_out_of_pool=False,
-            enforce_same_subnet=True,
-
-            # Interface control plane.
+            dhcp_relay_target_ip=settings.get(
+                "dhcp_relay_target_ip"
+            ),
+            dhcp6_prefix=settings.get("dhcp6_prefix"),
+            dhcp6_relay_target_ip=settings.get(
+                "dhcp6_relay_target_ip"
+            ),
+            in_mac=router_mac,
+            allow_out_of_pool=bool(
+                settings.get("allow_out_of_pool", False)
+            ),
+            enforce_same_subnet=bool(
+                settings.get("enforce_same_subnet", True)
+            ),
             serve_on_all_ifaces=False,
+            authoritative=bool(
+                settings.get("authoritative", True)
+            ),
+            rogue_policy=str(
+                settings.get("rogue_policy", "log")
+            ),
+            dns_v6=list(settings.get("dns_v6") or []),
+            search_domains=list(
+                settings.get("search_domains") or []
+            ),
             allowed_ifaces=allowed_ifaces,
             denied_ifaces=denied_ifaces,
             observe_only_ifaces=set(),
             interface_roles=interface_roles,
-            control_plane_name="router-lan-dhcp",
+            control_plane_name=f"router-{role_name}-dhcp",
             preserve_leases_on_policy_update=True,
-
-            # Do not attack or NAK upstream/Windows DHCP servers.
-            authoritative=True,
-            rogue_policy="log",
-
-            # Existing IPv6 configuration.
-            dns_v6=[
-                "fd00::1",
-                "fd00::2",
-            ],
-            search_domains=[
-                "lan.local",
-            ],
+            lease_duration_seconds=int(
+                settings.get("lease_duration_seconds", 600)
+            ),
+            dns_v4=list(settings.get("dns_v4") or []),
+            domain_name=settings.get("domain_name"),
+            max_leases=settings.get("max_leases"),
         )
-
-        self.dhcp_server_in.sniffer = self.sniffer
-        self.dhcp_server_in.router_ipv6_link_local_out = (
+        server.sniffer = self.sniffer
+        server.router_ipv6_link_local_out = (
             self.router_ipv6_link_local_out
         )
+        server.start()
 
-        # The operating system is the DHCP client on Wi-Fi.
-        # This application must not serve DHCP on that interface.
-        self.dhcp_server_out = None
+        self.router_logger.log_message(
+            f"[DHCP][{role_name.upper()}] 🚀 Serving {pool_start_ip}-"
+            f"{pool_end_ip} on {iface_name}."
+        )
+        return server
+
+    def _start_dhcp_servers(self):
+        """
+        Start the configured LAN server and, only when explicitly requested,
+        an isolated WAN server with its own pool and interface policy.
+        """
+        if self._enable_dhcp_server:
+            if not getattr(self, "router_network_in", None):
+                self.router_logger.log_message(
+                    "[DHCP][LAN] ❌ Router LAN network is unavailable."
+                )
+            else:
+                existing_server = getattr(
+                    self,
+                    "dhcp_server_in",
+                    None,
+                )
+                if existing_server is not None:
+                    existing_server.sniffer = self.sniffer
+                    existing_server.router_ipv6_link_local_out = (
+                        self.router_ipv6_link_local_out
+                    )
+                    existing_server.start()
+                    self.router_logger.log_message(
+                        "[DHCP][LAN] ♻️ Adopted the DHCP server "
+                        "created by LanManager."
+                    )
+                else:
+                    interface_config = self._interfaces_config.get(
+                        self.interface_in_full_name,
+                        {},
+                    )
+                    router_lan_ip = (
+                        interface_config.get("ip_addr")
+                        or self.router_ip_in
+                    )
+                    router_lan_mac = (
+                        interface_config.get("mac")
+                        or self.mac_in
+                    )
+                    try:
+                        self.dhcp_server_in = (
+                            self._create_configured_dhcp_server(
+                                role_name="lan",
+                                iface_name=self.interface_in_full_name,
+                                network=self.router_network_in,
+                                router_ip=router_lan_ip,
+                                router_mac=router_lan_mac,
+                                settings=self._dhcp_server_settings,
+                                policy_factory=(
+                                    self._dhcp_control_plane_iface_sets
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        self.dhcp_server_in = None
+                        self.router_logger.log_message(
+                            f"[DHCP][LAN] ❌ Startup failed: {exc}"
+                        )
+        else:
+            if self.dhcp_server_in is not None:
+                try:
+                    self.dhcp_server_in.stop()
+                except Exception:
+                    pass
+            self.dhcp_server_in = None
+            self.router_logger.log_message(
+                "[DHCP][LAN] ⏭️ LAN DHCP server disabled by settings."
+            )
+
+        if self._serve_dhcp_on_wan:
+            if (
+                not getattr(self, "router_network_out", None)
+                or not self.interface_out_full_name
+                or not self.router_ip_out
+            ):
+                self.dhcp_server_out = None
+                self.router_logger.log_message(
+                    "[DHCP][WAN] ❌ WAN DHCP requested, but the active "
+                    "WAN interface/network is unavailable."
+                )
+            else:
+                interface_config = self._interfaces_config.get(
+                    self.interface_out_full_name,
+                    {},
+                )
+                router_wan_ip = (
+                    interface_config.get("ip_addr")
+                    or self.router_ip_out
+                )
+                router_wan_mac = (
+                    interface_config.get("mac")
+                    or self.mac_out
+                )
+                try:
+                    self.dhcp_server_out = (
+                        self._create_configured_dhcp_server(
+                            role_name="wan",
+                            iface_name=self.interface_out_full_name,
+                            network=self.router_network_out,
+                            router_ip=router_wan_ip,
+                            router_mac=router_wan_mac,
+                            settings=self._wan_dhcp_server_settings,
+                            policy_factory=(
+                                self._dhcp_wan_control_plane_iface_sets
+                            ),
+                        )
+                    )
+                    self.router_logger.log_message(
+                        "[DHCP][WAN] ⚠️ WAN DHCP is active on the "
+                        "selected uplink."
+                    )
+                except Exception as exc:
+                    self.dhcp_server_out = None
+                    self.router_logger.log_message(
+                        f"[DHCP][WAN] ❌ Startup failed: {exc}"
+                    )
+        else:
+            if self.dhcp_server_out is not None:
+                try:
+                    self.dhcp_server_out.stop()
+                except Exception:
+                    pass
+            self.dhcp_server_out = None
 
         try:
             self.arp_manager.set_dhcp_server_reference(
                 self.dhcp_server_in,
-                None,
+                self.dhcp_server_out,
             )
         except Exception as exc:
             self.router_logger.log_message(
-                f"[DHCP] ⚠️ Could not update ARP DHCP reference: {exc}"
+                f"[DHCP] ⚠️ Could not update ARP DHCP references: {exc}"
             )
 
-        self.dhcp_server_in.start()
-
         self._configure_dhcp_control_plane(
-            reason="standalone-server-start"
+            reason="server-start"
         )
 
     def _dispatch_dhcp_packet(
@@ -2256,49 +2474,47 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             bypass   - Windows, ICS, or an upstream DHCP server owns it.
             not-dhcp - No DHCP action was taken.
         """
-        server = getattr(self, "dhcp_server_in", None)
+        servers = [
+            getattr(self, "dhcp_server_out", None),
+            getattr(self, "dhcp_server_in", None),
+        ]
+        servers = [server for server in servers if server is not None]
 
-        if server is None:
+        if not servers:
             return "not-dhcp"
 
         self._configure_dhcp_control_plane(
             reason="dhcp-dispatch-refresh"
         )
 
-        server = getattr(self, "dhcp_server_in", None)
-        if server is None:
-            return "not-dhcp"
-
-        decision = server.interface_policy_decision(
-            inbound_iface
-        )
-
-        if decision == "serve":
-            handled = server.handle_packet(
-                packet,
-                inbound_iface,
-                self.rip_manager.find_route,
+        for server in servers:
+            decision = server.interface_policy_decision(
+                inbound_iface
             )
-            return "served" if handled else "not-dhcp"
 
-        if decision == "observe":
-            # Permit server responses to be recorded, but never generate
-            # an OFFER, ACK, NAK, or relay message.
-            server.handle_packet(
-                packet,
-                inbound_iface,
-                self.rip_manager.find_route,
-            )
-            return "bypass"
+            if decision == "serve":
+                handled = server.handle_packet(
+                    packet,
+                    inbound_iface,
+                    self.rip_manager.find_route,
+                )
+                return "served" if handled else "not-dhcp"
 
-        # Both deny and pass mean that this DHCP server does not own the
-        # interface. Do not send replies and do not feed the packet into
-        # normal routing/NAT/firewall handling.
-        server._policy_log_limited(
-            f"bypass:{server._normalize_iface_name(inbound_iface)}",
+            if decision == "observe":
+                server.handle_packet(
+                    packet,
+                    inbound_iface,
+                    self.rip_manager.find_route,
+                )
+                return "bypass"
+
+        # No configured DHCP instance owns this interface.
+        logger_server = servers[0]
+        logger_server._policy_log_limited(
+            f"bypass:{logger_server._normalize_iface_name(inbound_iface)}",
             (
                 f"[DHCP][ControlPlane] 🚪 BYPASS DHCP on "
-                f"{inbound_iface}; owner=Windows/upstream"
+                f"{inbound_iface}; no configured server owns it"
             ),
             cooldown=15.0,
         )
@@ -4078,13 +4294,23 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if packet.haslayer(ICMPv6ND_NA):
                 self.ndp_manager.learn_neighbor_advertisement(packet)
                 return
-            if not self.firewall_manager.process_packet(packet):
+            if (
+                    self._manager_settings.get(
+                        "enable_firewall",
+                        True,
+                    )
+                    and not self.firewall_manager.process_packet(packet)
+            ):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
-            self.packet_analyzer.execute(
-                packet,
-                params=self.default_analysis_extras
-            )
+            if self._manager_settings.get(
+                    "enable_packet_analyzer",
+                    True,
+            ):
+                self.packet_analyzer.execute(
+                    packet,
+                    params=self.default_analysis_extras
+                )
             # ==========================================================
             # DNS CONTROL-PLANE DISPATCH — BEFORE HANDSHAKE AND NAT
             # ==========================================================
@@ -4096,7 +4322,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if dns_metadata["is_dns_related"]:
                 # Dedicated multicast/local name-service protocols remain separate.
                 if dns_metadata["special"] == "mdns":
-                    if self.mdns_manager.handle_packet(packet):
+                    if (
+                            self._manager_settings.get(
+                                "enable_mdns",
+                                True,
+                            )
+                            and self.mdns_manager.handle_packet(packet)
+                    ):
                         self.code_output_manager.submit_packet(
                             packet,
                             inbound_iface=inbound_iface,
@@ -4188,7 +4420,14 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     # transit-passthrough intentionally falls through to handshake,
                     # NAT, transport and ordinary router forwarding.
             transport_layer = self.sniffer._find_transport_layer(packet)
-            if isinstance(transport_layer, TCP):
+            if (
+                    isinstance(transport_layer, TCP)
+                    and self.handshake_manager is not None
+                    and self._manager_settings.get(
+                        "enable_handshake",
+                        True,
+                    )
+            ):
                 if self.handshake_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
                         packet,
@@ -4349,7 +4588,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     )
                 return
 
-            if packet.haslayer(IGMP) or packet.haslayer(IGMPv3):  # Echo Request
+            if (
+                    self._manager_settings.get("enable_igmp", True)
+                    and (
+                        packet.haslayer(IGMP)
+                        or packet.haslayer(IGMPv3)
+                    )
+            ):  # Echo Request
                 self.router_logger.log_message(f"[IGMP] 📶 Processing IGMP on {iface_short} Packet: {packet.summary()}")
                 if self.igmp_manager.handle_packet(packet, inbound_iface):
                     self.code_output_manager.submit_packet(
@@ -4842,16 +5087,23 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 emoticons=["🏢", "🚕", "🗽", "🏞️", "🎢", "🎡", "🦖", "📰", "🖼️", "⛲"]
             )
         )
-        deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
-        sampling_rate = self.packet_catcher_heuristic_rates.get(proto, self.packet_catcher_heuristic_rates['DEFAULT'])
-        if deterministic_value < sampling_rate:
-            self.packet_catcher.process_packet(packet)
-            self.code_output_manager.submit_packet(
-                packet,
-                inbound_iface=inbound_iface,
-                phase="handled",
-                component="packet-catch",
+        if self._manager_settings.get(
+                "enable_packet_catcher",
+                True,
+        ):
+            deterministic_value = abs(hash(str(packet))) / (2 ** 64 - 1)
+            sampling_rate = self.packet_catcher_heuristic_rates.get(
+                proto,
+                self.packet_catcher_heuristic_rates['DEFAULT'],
             )
+            if deterministic_value < sampling_rate:
+                self.packet_catcher.process_packet(packet)
+                self.code_output_manager.submit_packet(
+                    packet,
+                    inbound_iface=inbound_iface,
+                    phase="handled",
+                    component="packet-catch",
+                )
         self.code_output_manager.submit_packet(
             packet,
             inbound_iface=inbound_iface,
@@ -4867,12 +5119,188 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                       use_wifi_host=False,
                       wifi_ssid="PythonRouter",
                       wifi_password=None,
-                      wifi_executable_path=None,):
+                      wifi_executable_path=None,
+                      router_ip_in=None,
+                      netmask_in="255.255.255.0",
+                      enable_dhcp_server=True,
+                      serve_dhcp_on_wan=False,
+                      dhcp_server_settings=None,
+                      wan_dhcp_server_settings=None,
+                      gateway_settings=None,
+                      lan_settings=None,
+                      uplink_settings=None,
+                      python_server_settings=None,
+                      wifi_settings=None,
+                      stratum_connection_mode="auto",
+                      stratum_pool_port=3333,
+                      stratum_wallet="46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
+                      stratum_password="x",
+                      stratum_worker="PythonProxy",
+                      stratum_proxy_host="127.0.0.1",
+                      stratum_proxy_port=3334,
+                      stratum_enable_proxy=True,
+                      stratum_use_tls="auto",
+                      stratum_tls_hostname=None,
+                      stratum_user_agent="pystratum/0.5",
+                      stratum_daemon_url="http://127.0.0.1:18081",
+                      stratum_zmq_address="tcp://127.0.0.1:18083",
+                      manager_settings=None,
+                      transport_settings=None,):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
                 self.router_logger.log_message("[Router] Start requested while already running; ignoring.")
                 return
+
+            self._enable_dhcp_server = bool(enable_dhcp_server)
+            self._serve_dhcp_on_wan = bool(serve_dhcp_on_wan)
+            self._dhcp_server_settings = dict(
+                dhcp_server_settings or {}
+            )
+            self._wan_dhcp_server_settings = dict(
+                wan_dhcp_server_settings or {}
+            )
+            gateway_settings = dict(gateway_settings or {})
+            lan_settings = dict(lan_settings or {})
+            uplink_settings = dict(uplink_settings or {})
+            python_server_settings = dict(
+                python_server_settings or {}
+            )
+            wifi_settings = dict(wifi_settings or {})
+            requested_manager_settings = dict(
+                manager_settings or {}
+            )
+            allowed_manager_settings = set(
+                self._manager_settings
+            )
+            unknown_manager_settings = (
+                set(requested_manager_settings)
+                - allowed_manager_settings
+            )
+            if unknown_manager_settings:
+                raise ValueError(
+                    "Unknown core manager setting(s): "
+                    + ", ".join(sorted(unknown_manager_settings))
+                )
+            self._manager_settings.update(
+                requested_manager_settings
+            )
+
+            bool_manager_settings = {
+                "enable_firewall",
+                "enable_packet_analyzer",
+                "enable_packet_catcher",
+                "enable_handshake",
+                "enable_syn_scanner",
+                "enable_igmp",
+                "enable_mdns",
+                "handshake_log_tcp_lifecycle",
+                "handshake_log_non_tls_tcp",
+                "handshake_log_tls_records",
+                "handshake_log_application_data",
+                "handshake_log_tls13_key_events",
+            }
+            for setting_name in bool_manager_settings:
+                self._manager_settings[setting_name] = bool(
+                    self._manager_settings[setting_name]
+                )
+
+            for setting_name in (
+                    "handshake_timeout_half_open",
+                    "handshake_timeout_established",
+                    "handshake_rate_limit_threshold",
+                    "handshake_rate_limit_period",
+                    "handshake_ban_duration",
+                    "syn_scan_interval",
+            ):
+                parsed_value = int(
+                    self._manager_settings[setting_name]
+                )
+                if parsed_value < 1:
+                    raise ValueError(
+                        f"{setting_name} must be at least 1."
+                    )
+                self._manager_settings[setting_name] = parsed_value
+
+            for setting_name, protocol_name in (
+                    ("packet_catcher_tcp_rate", "TCP"),
+                    ("packet_catcher_udp_rate", "UDP"),
+                    ("packet_catcher_default_rate", "DEFAULT"),
+            ):
+                parsed_rate = float(
+                    self._manager_settings[setting_name]
+                )
+                if not 0.0 <= parsed_rate <= 1.0:
+                    raise ValueError(
+                        f"{setting_name} must be between 0 and 1."
+                    )
+                self._manager_settings[setting_name] = parsed_rate
+                self.packet_catcher_heuristic_rates[
+                    protocol_name
+                ] = parsed_rate
+
+            requested_transport_settings = dict(
+                transport_settings or {}
+            )
+            allowed_transport_settings = {
+                "enabled",
+                "protocol_enabled",
+                "stratum_ports",
+                "monero_ports",
+                "voip_port_start",
+                "voip_port_end",
+                "parallel_analysis",
+                "inspection_log_rps",
+                "inspection_log_burst",
+                "inspection_flow_cooldown_sec",
+                "stratum_log_rps",
+                "stratum_log_burst",
+                "stratum_flow_cooldown_sec",
+                "monero_log_rps",
+                "monero_log_burst",
+                "monero_flow_cooldown_sec",
+                "dns_pending_ttl_sec",
+                "dns_gc_interval_sec",
+                "dns_alert_on_rebind",
+                "dhcp_transaction_ttl_sec",
+                "dhcp_lease_ttl_sec",
+                "https_logging",
+                "https_parse_certificates",
+                "https_parse_quic_crypto",
+            }
+            unknown_transport_settings = (
+                set(requested_transport_settings)
+                - allowed_transport_settings
+            )
+            if unknown_transport_settings:
+                raise ValueError(
+                    "Unknown transport manager setting(s): "
+                    + ", ".join(
+                        sorted(unknown_transport_settings)
+                    )
+                )
+            self._transport_settings = (
+                requested_transport_settings
+            )
+            self.transport_manager.configure(
+                **self._transport_settings
+            )
+            self.transport_manager.start()
+
+            stratum_mode = str(
+                stratum_connection_mode or "auto"
+            ).strip().casefold()
+            if stratum_mode == "auto":
+                stratum_mode = (
+                    "daemon"
+                    if not str(p2pool_server_ip or "").strip()
+                    else "pool"
+                )
+            if stratum_mode not in {"pool", "daemon"}:
+                raise ValueError(
+                    "stratum_connection_mode must be pool, daemon, or auto."
+                )
+
             self.started = True
             if use_wifi_host:
                 try:
@@ -4891,14 +5319,38 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                             "PYTHONROUTER_WIFI_PASSWORD."
                         )
 
-                    self.wifi_manager.configure(
-                        ssid=wifi_ssid,
-                        password=resolved_wifi_password,
-                        executable_path=wifi_executable_path,
-                        start_timeout=35.0,
-                        adapter_timeout=45.0,
-                        enable_windows_forwarding=True,
-                    )
+                    wifi_config = {
+                        "ssid": wifi_ssid,
+                        "password": resolved_wifi_password,
+                        "executable_path": wifi_executable_path,
+                        "start_timeout": 35.0,
+                        "adapter_timeout": 45.0,
+                        "enable_windows_forwarding": True,
+                    }
+                    allowed_wifi_settings = {
+                        "state_file",
+                        "start_timeout",
+                        "adapter_timeout",
+                        "adapter_poll_interval",
+                        "enable_windows_forwarding",
+                        "auto_restart",
+                        "restart_backoff",
+                        "max_restart_backoff",
+                        "status_poll_interval",
+                        "hotspot_router_ip",
+                        "hotspot_prefix_length",
+                        "enforce_fixed_hotspot_address",
+                        "require_address_before_ready",
+                        "address_verify_interval",
+                        "address_policy_timeout",
+                        "restore_dynamic_address_on_stop",
+                    }
+                    wifi_config.update({
+                        key: value
+                        for key, value in wifi_settings.items()
+                        if key in allowed_wifi_settings
+                    })
+                    self.wifi_manager.configure(**wifi_config)
                     self.wifi_manager.start()
                 except Exception as exc:
                     self.router_logger.log_message(
@@ -4906,12 +5358,27 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     )
             try:
                 self._initialize_interface_discovery()
-                if not self._auto_configure_interfaces(use_dhcp_out, use_dhcp_in, router_ip_out=router_ip_out, router_netmask_out=netmask_out):
+                if not self._auto_configure_interfaces(
+                        use_dhcp_out,
+                        use_dhcp_in,
+                        router_ip_in=router_ip_in,
+                        router_netmask_in=netmask_in,
+                        router_ip_out=router_ip_out,
+                        router_netmask_out=netmask_out,
+                ):
                     self.router_logger.log_message("[Router] ❌ Failed to auto-configure interfaces.")
             except Exception as e:
                 self.router_logger.log_message(f"[Router] ❌ Crash in start_routing: {e}")
             if use_static:
-                self._configure_interface_settings(use_dhcp_out, use_dhcp_in, use_hyperv, router_ip_out=router_ip_out, router_netmask_out=netmask_out)
+                self._configure_interface_settings(
+                    use_dhcp_out,
+                    use_dhcp_in,
+                    use_hyperv,
+                    router_ip_in=router_ip_in,
+                    router_netmask_in=netmask_in,
+                    router_ip_out=router_ip_out,
+                    router_netmask_out=netmask_out,
+                )
             self._configure_host_preserving_upstream_mode()
             if use_hostbypass:
                 self.host_connectivity_boundary = HostConnectivityBoundaryManager(
@@ -4947,55 +5414,129 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if use_gateway:
                 self.gateway_manager = GatewayManager(self, DNSManager)
 
-                self.gateway_manager.configure(
-                    packet_writer=self.packet_writer,
-                    nat_manager=self.nat_manager,
-                    dns_manager=getattr(self, "dns_manager", None),
-                    arp_manager=self.arp_manager,
-                    ndp_manager=self.ndp_manager,
-                    icmp_manager=self.icmp_manager,
-                    netroute_manager=self.netroute_manager,
-                    rip_manager=getattr(self, "rip_manager", None),
-                    ethernet_manager=getattr(self, "ethernet_manager", None),
-                    dhcp_manager=getattr(self, "dhcp_manager", None),
-                    sendback_manager=getattr(self, "sendback_manager", None),
-
-                    # Additional custom managers can also participate.
-                    manager_inputs={
-                        # "firewall_manager": self.firewall_manager,
-                        # "tunnel_manager": self.tunnel_manager,
-                    },
-
-                    attach_managers_to_router=True,
-                    manage_dns_lifecycle=True,
-                    stop_injected_managers_on_stop=False,
-                    sync_managers_on_gateway_change=True,
-                    dispatch_gateway_packets_to_managers=True,
-
-                    auto_configure_router_interfaces=False,
-                    use_dhcp_out=use_dhcp_out,
-                    use_dhcp_in=use_dhcp_in,
-                    router_ip_out=router_ip_out,
-                    router_netmask_out=netmask_out,
-                    force_wan_to_dhcp_on_start=False,
-                    ensure_host_dns_from_wan=False,
-                    repair_on_failure=True,
-                    pin_gateway_arp=True,
-                    runtime_set_wan_to_dhcp=bool(use_dhcp_out),
-                    disable_netroute_default_sync=True,
-                    disable_netroute_metric_tuning=True,
-                )
+                gateway_config = {
+                    "packet_writer": self.packet_writer,
+                    "nat_manager": self.nat_manager,
+                    "dns_manager": getattr(
+                        self,
+                        "dns_manager",
+                        None,
+                    ),
+                    "arp_manager": self.arp_manager,
+                    "ndp_manager": self.ndp_manager,
+                    "icmp_manager": self.icmp_manager,
+                    "netroute_manager": self.netroute_manager,
+                    "rip_manager": getattr(
+                        self,
+                        "rip_manager",
+                        None,
+                    ),
+                    "ethernet_manager": getattr(
+                        self,
+                        "ethernet_manager",
+                        None,
+                    ),
+                    "dhcp_manager": getattr(
+                        self,
+                        "dhcp_manager",
+                        None,
+                    ),
+                    "sendback_manager": getattr(
+                        self,
+                        "sendback_manager",
+                        None,
+                    ),
+                    "manager_inputs": {},
+                    "attach_managers_to_router": True,
+                    "manage_dns_lifecycle": True,
+                    "stop_injected_managers_on_stop": False,
+                    "sync_managers_on_gateway_change": True,
+                    "dispatch_gateway_packets_to_managers": True,
+                    "auto_configure_router_interfaces": False,
+                    "use_dhcp_out": use_dhcp_out,
+                    "use_dhcp_in": use_dhcp_in,
+                    "router_ip_out": self.router_ip_out,
+                    "router_netmask_out": self.router_netmask_out,
+                    "force_wan_to_dhcp_on_start": False,
+                    "ensure_host_dns_from_wan": False,
+                    "repair_on_failure": True,
+                    "pin_gateway_arp": True,
+                    "runtime_set_wan_to_dhcp": bool(use_dhcp_out),
+                    "disable_netroute_default_sync": True,
+                    "disable_netroute_metric_tuning": True,
+                }
+                allowed_gateway_settings = {
+                    "repair_on_failure",
+                    "pin_gateway_arp",
+                    "enable_dns64",
+                    "dns64_prefix",
+                    "upstream_dns",
+                    "enable_packet_observer",
+                    "enable_arp_probes",
+                    "enable_icmp_probes",
+                    "enable_first_hop_probe",
+                    "enable_gateway_dns_probe",
+                    "enable_ipv6_router_solicitation",
+                    "consume_own_probe_replies",
+                    "health_interval_sec",
+                    "wan_snapshot_interval_sec",
+                    "route_refresh_interval_sec",
+                    "dns_refresh_interval_sec",
+                    "probe_cycle_interval_sec",
+                    "arp_probe_interval_sec",
+                    "icmp_probe_interval_sec",
+                    "first_hop_probe_interval_sec",
+                    "gateway_dns_probe_interval_sec",
+                    "ipv6_rs_interval_sec",
+                    "probe_budget_window_sec",
+                    "probe_budget_max_packets",
+                    "max_candidates_per_cycle",
+                    "max_pending_probes",
+                    "soft_repair_cooldown_sec",
+                    "hard_repair_cooldown_sec",
+                    "failure_threshold_for_soft_repair",
+                    "failure_threshold_for_hard_repair",
+                    "minimum_degraded_time_for_hard_repair_sec",
+                }
+                gateway_config.update({
+                    key: value
+                    for key, value in gateway_settings.items()
+                    if key in allowed_gateway_settings
+                })
+                self.gateway_manager.configure(**gateway_config)
 
                 self.gateway_manager.start()
             if python_server:
+                python_server_config = {
+                    "router": self,
+                    "router_logger": self.router_logger,
+                    "host": "0.0.0.0",
+                    "port": 8844,
+                    "dashboard_title": "Router Dashboard",
+                    "store_raw_packets": True,
+                    "max_raw_packet_bytes": 0,
+                }
+                allowed_python_server_settings = {
+                    "host",
+                    "port",
+                    "dashboard_title",
+                    "max_packets",
+                    "max_logs",
+                    "max_events",
+                    "packet_window_sec",
+                    "store_raw_packets",
+                    "max_raw_packet_bytes",
+                    "raw_hex_preview_bytes",
+                    "max_logs_per_prefix",
+                    "max_prefix_buckets",
+                }
+                python_server_config.update({
+                    key: value
+                    for key, value in python_server_settings.items()
+                    if key in allowed_python_server_settings
+                })
                 self.python_server_manager = PythonServerManager(
-                    router=self,
-                    router_logger=self.router_logger,
-                    host="0.0.0.0",
-                    port=8844,
-                    dashboard_title="Router Dashboard",
-                    store_raw_packets=True,
-                    max_raw_packet_bytes=0,
+                    **python_server_config
                 )
                 self.router_logger.log_message = self.python_server_manager.wrap_log_call(
                     self.router_logger.log_message,
@@ -5011,26 +5552,107 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     gateway_manager=self.gateway_manager,
                 )
 
-                self.lan_manager.configure(
-                    bridge_name="ManagedLANBridge",
-                    create_bridge=True,
+                lan_config = {
+                    "bridge_name": "ManagedLANBridge",
+                    "create_bridge": True,
+                    "enable_dhcp_server": self._enable_dhcp_server,
+                    "serve_on_all_lan_ifaces": False,
+                    "authoritative": True,
+                    "rogue_policy": "log",
+                    "enforce_same_subnet": True,
+                    "allow_out_of_pool": False,
+                    "start_transport_dhcp_client": False,
+                    "handle_icmp": True,
+                }
+                allowed_lan_settings = {
+                    "bridge_name",
+                    "create_bridge",
+                    "member_ifaces",
+                    "serve_on_all_lan_ifaces",
+                    "health_interval_sec",
+                    "start_transport_dhcp_client",
+                    "handle_icmp",
+                    "learn_ipv6_link_local",
+                    "learn_ipv6_ula",
+                }
+                lan_config.update({
+                    key: value
+                    for key, value in lan_settings.items()
+                    if key in allowed_lan_settings
+                })
 
-                    # DHCP is restricted by the explicit control-plane allow-set.
-                    serve_on_all_lan_ifaces=False,
-
-                    authoritative=True,
-
-                    # Observe competing servers without sending disruptive NAK replies.
-                    rogue_policy="log",
-
-                    enforce_same_subnet=True,
-                    allow_out_of_pool=False,
-
-                    # The LAN is a DHCP-server domain, not a DHCP-client domain.
-                    start_transport_dhcp_client=False,
-
-                    handle_icmp=True,
-                )
+                # Global DHCP settings own the server configuration even when
+                # LanManager is the component that constructs the instance.
+                lan_config.update({
+                    "enable_dhcp_server": self._enable_dhcp_server,
+                    "authoritative": self._dhcp_server_settings.get(
+                        "authoritative",
+                        True,
+                    ),
+                    "rogue_policy": self._dhcp_server_settings.get(
+                        "rogue_policy",
+                        "log",
+                    ),
+                    "enforce_same_subnet": (
+                        self._dhcp_server_settings.get(
+                            "enforce_same_subnet",
+                            True,
+                        )
+                    ),
+                    "allow_out_of_pool": (
+                        self._dhcp_server_settings.get(
+                            "allow_out_of_pool",
+                            False,
+                        )
+                    ),
+                    "dns_v6": self._dhcp_server_settings.get(
+                        "dns_v6",
+                        ["fd00::1", "fd00::2"],
+                    ),
+                    "search_domains": (
+                        self._dhcp_server_settings.get(
+                            "search_domains",
+                            ["lan.internal"],
+                        )
+                    ),
+                    "dhcp_pool_start": (
+                        self._dhcp_server_settings.get("pool_start")
+                    ),
+                    "dhcp_pool_end": (
+                        self._dhcp_server_settings.get("pool_end")
+                    ),
+                    "dhcp_relay_target_ip": (
+                        self._dhcp_server_settings.get(
+                            "dhcp_relay_target_ip"
+                        )
+                    ),
+                    "dhcp6_prefix": self._dhcp_server_settings.get(
+                        "dhcp6_prefix"
+                    ),
+                    "dhcp6_relay_target_ip": (
+                        self._dhcp_server_settings.get(
+                            "dhcp6_relay_target_ip"
+                        )
+                    ),
+                    "lease_duration_seconds": (
+                        self._dhcp_server_settings.get(
+                            "lease_duration_seconds",
+                            600,
+                        )
+                    ),
+                    "dns_v4": self._dhcp_server_settings.get(
+                        "dns_v4",
+                        [],
+                    ),
+                    "domain_name": self._dhcp_server_settings.get(
+                        "domain_name",
+                        "lan.internal",
+                    ),
+                    "max_leases": self._dhcp_server_settings.get(
+                        "max_leases"
+                    ),
+                })
+                self.lan_manager.configure(**lan_config)
 
                 self.lan_manager.start()
 
@@ -5039,19 +5661,40 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 )
             if use_uplink:
                 self.uplink_manager = UplinkManager(self, gateway_manager=self.gateway_manager)
-                self.uplink_manager.configure(
-                    health_interval_sec=15.0,
-                    preferred_iface_names=["Wi-Fi"],
-                    allow_router_failover=True,
-                    preserve_wifi_link=True,
-                    disable_netroute_default_sync=True,
-                    disable_netroute_metric_tuning=True,
-                    remove_public_host_routes=True,
-                )
+                uplink_config = {
+                    "health_interval_sec": 15.0,
+                    "preferred_iface_names": ["Wi-Fi"],
+                    "allow_router_failover": True,
+                    "preserve_wifi_link": True,
+                    "disable_netroute_default_sync": True,
+                    "disable_netroute_metric_tuning": True,
+                    "remove_public_host_routes": True,
+                }
+                allowed_uplink_settings = {
+                    "health_interval_sec",
+                    "preferred_iface_names",
+                    "allow_router_failover",
+                    "preserve_wifi_link",
+                    "disable_netroute_default_sync",
+                    "disable_netroute_metric_tuning",
+                    "remove_public_host_routes",
+                    "gateway_probe_ports",
+                    "public_probes",
+                    "candidate_stale_sec",
+                    "minimum_public_score_to_activate",
+                    "keep_current_if_public",
+                }
+                uplink_config.update({
+                    key: value
+                    for key, value in uplink_settings.items()
+                    if key in allowed_uplink_settings
+                })
+                self.uplink_manager.configure(**uplink_config)
                 self.uplink_manager.start()
             # NEW
             self.stratum_manager = None
             self.stratum_connection_manager = None
+            self.daemon_manager = None
 
             if use_stratum_comm:
                 self.stratum_manager = StratumManager(self.code_output_manager, self.router_logger)
@@ -5086,6 +5729,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.interface_in_full_name
             )
             self.sniffer = SnifferSoftware(self.arp_manager, self.rip_manager, self.lag_manager, self.outbound_load_balancer, self.notification_manager, self._interfaces_config, self.router_logger, self.hyperv_manager, use_hyperv)
+            self.transport_manager.sniffer = self.sniffer
             self._inject_dependencies()
             if use_wifi_host and self.wifi_manager:
                 try:
@@ -5095,9 +5739,34 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         f"[WiFiManager] ⚠️ Router binding refresh failed: {exc}"
                     )
 
-            self.transport_manager.transport_dhcp.enable_client(self.interface_in_friendly_name)
+            dhcp_client_ifaces = []
+            if use_dhcp_out and self.interface_out_full_name:
+                dhcp_client_ifaces.append(
+                    self.interface_out_full_name
+                )
+            if use_dhcp_in and self.interface_in_full_name:
+                dhcp_client_ifaces.append(
+                    self.interface_in_full_name
+                )
 
-            self.parallel_python.inject_into(self.transport_manager.transport_dhcp._active)
+            if (
+                    dhcp_client_ifaces
+                    and self.transport_manager.is_protocol_enabled(
+                        "dhcp4"
+                    )
+            ):
+                self.transport_manager.transport_dhcp.enable_client(
+                    self.sniffer
+                )
+                for dhcp_client_iface in dict.fromkeys(
+                        dhcp_client_ifaces
+                ):
+                    self.transport_manager.transport_dhcp.client_start(
+                        dhcp_client_iface
+                    )
+                self.parallel_python.inject_into(
+                    self.transport_manager.transport_dhcp._active
+                )
 
             self.isakmp_manager = ISAKMPManager(self.router_logger, self.packet_writer, self.notification_manager, self._interfaces_config)
             self.packet_catcher.notification_manager = self.notification_manager
@@ -5114,28 +5783,91 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 interface_in_full_name=self.interface_in_full_name
             )
             self.dns_manager.start()
-            self.handshake_manager = HandshakeManager(self.router_logger, self.arp_manager, self.nat_manager,
-                                                      self.rip_manager, self.packet_writer)
-            self.handshake_manager.sniffer = self.sniffer
-            self.handshake_manager._tls_mgr.policy.ciphers.set_requirements(
-                require_pfs=True,
-                require_aead=True
-            )
+            if self._manager_settings.get(
+                    "enable_handshake",
+                    True,
+            ):
+                self.handshake_manager = HandshakeManager(
+                    self.router_logger,
+                    self.arp_manager,
+                    self.nat_manager,
+                    self.rip_manager,
+                    self.packet_writer,
+                    timeout_half_open=self._manager_settings[
+                        "handshake_timeout_half_open"
+                    ],
+                    timeout_established=self._manager_settings[
+                        "handshake_timeout_established"
+                    ],
+                )
+                self.handshake_manager.sniffer = self.sniffer
+                self.handshake_manager.set_thresholds(
+                    rate_limit_threshold=self._manager_settings[
+                        "handshake_rate_limit_threshold"
+                    ],
+                    rate_limit_period=self._manager_settings[
+                        "handshake_rate_limit_period"
+                    ],
+                    ban_duration=self._manager_settings[
+                        "handshake_ban_duration"
+                    ],
+                )
+                self.handshake_manager.log_tcp_lifecycle = (
+                    self._manager_settings[
+                        "handshake_log_tcp_lifecycle"
+                    ]
+                )
+                self.handshake_manager.log_non_tls_tcp = (
+                    self._manager_settings[
+                        "handshake_log_non_tls_tcp"
+                    ]
+                )
+                self.handshake_manager.log_tls_records = (
+                    self._manager_settings[
+                        "handshake_log_tls_records"
+                    ]
+                )
+                self.handshake_manager.log_tls_application_data = (
+                    self._manager_settings[
+                        "handshake_log_application_data"
+                    ]
+                )
+                self.handshake_manager.log_tls13_key_events = (
+                    self._manager_settings[
+                        "handshake_log_tls13_key_events"
+                    ]
+                )
+                self.handshake_manager._tls_mgr.policy.ciphers.set_requirements(
+                    require_pfs=True,
+                    require_aead=True
+                )
+            else:
+                self.handshake_manager = None
             self.router_logger.log_message("\n--- Python Router Starting Services ---")
             self._stop_sniffing_event.clear()
 
 
-            self.syn_scanner = SYNScanner(
-                sniffer=self.sniffer,
-                router_logger=self.router_logger,
-                packet_writer=self.packet_writer,
-                interfaces_config=self._interfaces_config,
-                notification_manager=self.notification_manager,
-                arp_manager=self.arp_manager,
-                scan_targets=[
-                    ("8.8.8.8", [53, 80]),
-                    ("1.1.1.1", [443]),
-                ],scan_interval=300)
+            if self._manager_settings.get(
+                    "enable_syn_scanner",
+                    True,
+            ):
+                self.syn_scanner = SYNScanner(
+                    sniffer=self.sniffer,
+                    router_logger=self.router_logger,
+                    packet_writer=self.packet_writer,
+                    interfaces_config=self._interfaces_config,
+                    notification_manager=self.notification_manager,
+                    arp_manager=self.arp_manager,
+                    scan_targets=[
+                        ("8.8.8.8", [53, 80]),
+                        ("1.1.1.1", [443]),
+                    ],
+                    scan_interval=self._manager_settings[
+                        "syn_scan_interval"
+                    ],
+                )
+            else:
+                self.syn_scanner = None
             self.dns_manager.configure_runtime(
                 upstream_iface=self.interface_out_full_name,
                 upstream_iface_selector=self._select_dns_upstream_iface,
@@ -5145,13 +5877,18 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 reply_source_policy="query-destination",
             )
 
-            self.syn_scanner.start()
+            if self.syn_scanner is not None:
+                self.syn_scanner.start()
             self.rip_manager.start()
             self.packet_writer.sniffer = self.sniffer
             self.packet_writer.start()
-            self.handshake_manager.start()
-            self.igmp_manager.set_interfaces_config(self._interfaces_config)
-            self.igmp_manager.start()
+            if self.handshake_manager is not None:
+                self.handshake_manager.start()
+            if self._manager_settings.get("enable_igmp", True):
+                self.igmp_manager.set_interfaces_config(
+                    self._interfaces_config
+                )
+                self.igmp_manager.start()
             self._start_dhcp_servers()
             self.ethernet_manager.start()
             self.nat_manager.start()
@@ -5162,20 +5899,54 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if self.interface_out_full_name and self.router_ip_out and self.mac_out:
                 self.arp_manager.send_gratuitous_arp(self.router_ip_out, self.mac_out, self.interface_out_full_name)
             if use_stratum_comm:
-                if p2pool_server_ip == "":
-                    self.stratum_connection_manager.configure(p2pool_server_ip, 3333, "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk", "PythonProxy")
+                configured_pool_host = (
+                    str(p2pool_server_ip or "").strip()
+                    or "127.0.0.1"
+                )
+                self.stratum_connection_manager.configure(
+                    configured_pool_host,
+                    int(stratum_pool_port),
+                    str(stratum_wallet or "").strip(),
+                    str(stratum_worker or "PythonProxy").strip(),
+                    listen_port=int(stratum_proxy_port),
+                    use_tls=stratum_use_tls,
+                    pool_host=(
+                        str(stratum_tls_hostname).strip()
+                        if stratum_tls_hostname
+                        else configured_pool_host
+                    ),
+                    user_agent=(
+                        str(stratum_user_agent).strip()
+                        or "pystratum/0.5"
+                    ),
+                    password=(
+                        "x"
+                        if stratum_password is None
+                        else str(stratum_password)
+                    ),
+                    listen_host=(
+                        str(stratum_proxy_host).strip()
+                        or "127.0.0.1"
+                    ),
+                    enable_proxy=bool(stratum_enable_proxy),
+                )
+
+                if stratum_mode == "daemon":
                     self.daemon_manager = MoneroDaemonManager(
                         self.code_output_manager,
-                        daemon_url="http://127.0.0.1:18081",
-                        zmq_address="tcp://127.0.0.1:18083",
+                        daemon_url=(
+                            str(stratum_daemon_url).strip()
+                            or "http://127.0.0.1:18081"
+                        ),
+                        zmq_address=(
+                            str(stratum_zmq_address).strip()
+                            or "tcp://127.0.0.1:18083"
+                        ),
                         stratum_conn_manager=self.stratum_connection_manager,
                         logger=self.router_logger
                         )
                     self.daemon_manager.start()
                 else:
-                    self.stratum_connection_manager.configure(p2pool_server_ip, 3333,
-                                                          "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk",
-                                                          "PythonProxy")
                     self.stratum_connection_manager.start()
             if use_peer_to_peer:
                 broadcast_ip = "255.255.255.255"
@@ -5298,7 +6069,15 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.hyperv_enabled = False
             self.started = True
         except Exception as e:
-            self.router_logger.log_message(f"[Router] Error shutting down {e}")
+            self.started = False
+            try:
+                if self.transport_manager:
+                    self.transport_manager.stop()
+            except Exception:
+                pass
+            self.router_logger.log_message(
+                f"[Router] ❌ Startup failed: {type(e).__name__}: {e}"
+            )
 
 
     def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os, use_ollama):
@@ -5311,6 +6090,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.wintun_manager.stop()
                 self.hyperv_manager.teardown()
                 self.hyperv_enabled = False
+            try:
+                if self.transport_manager:
+                    self.transport_manager.stop()
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[Transport] ⚠️ Stop error: {exc}"
+                )
             self.parallel_python.release_ram_usage()
             try:
                 if self.scrapewebsite_manager:
@@ -5323,7 +6109,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if use_stratum_comm:
                 if self.daemon_manager:
                     self.daemon_manager.stop()
-                self.stratum_connection_manager.stop()
+                if self.stratum_connection_manager:
+                    self.stratum_connection_manager.stop()
             self.code_output_manager.stop()
             try:
                 if self.ollama_assistant and use_ollama:
@@ -5405,8 +6192,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.router_logger.log_message("[Router] Sniffer threads stopped.")
             stop_cpu_boost()
             self._sniff_threads.clear()
-            self.igmp_manager.stop()
-            self.handshake_manager.stop()
+            if self._manager_settings.get("enable_igmp", True):
+                self.igmp_manager.stop()
+            if self.handshake_manager:
+                self.handshake_manager.stop()
             self.remove_l2_bridge("MyLANBridge")
             self.remove_link_aggregation_group("MyLANAggregation")
             if self.interface_out_full_name:
@@ -5415,7 +6204,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.remove_outbound_load_balancing_interface(self.interface_lac_full_name)
             if self.interface_lac_2_full_name:
                 self.remove_outbound_load_balancing_interface(self.interface_lac_2_full_name)
-            self.syn_scanner.stop()
+            if self.syn_scanner:
+                self.syn_scanner.stop()
             self.cleanup_all_network_changes()
             self.started = False
             self.router_logger.log_message("[Router] All services stopped.")
@@ -6752,6 +7542,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
     def get_firewall_rules(self) -> List[Dict[str, Any]]:
         """Returns the current list of firewall rules."""
         return self.firewall_manager.get_rules()
+
+
 
 class PacketManager:
     """

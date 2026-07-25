@@ -757,8 +757,10 @@ class StratumConnectionManager:
         self.use_tls: str | bool = "auto"
 
         self.wallet_address: Optional[str] = None
+        self.password = "x"
         self.worker_name = "default"
         self.user_agent = "pystratum/0.5"
+        self.enable_proxy = True
 
         self._threads: list[threading.Thread] = []
         self._active_sockets: list[socket.socket] = []
@@ -787,12 +789,19 @@ class StratumConnectionManager:
         use_tls: str | bool = "auto",
         pool_host: Optional[str] = None,
         user_agent: Optional[str] = None,
+        password: Optional[str] = None,
+        listen_host: Optional[str] = None,
+        enable_proxy: bool = True,
     ) -> None:
         self.pool_ip = pool_ip
         self.pool_port = int(pool_port)
         self.wallet_address = wallet
+        self.password = "x" if password is None else str(password)
         self.worker_name = worker
         self.proxy_port = int(listen_port)
+        if listen_host:
+            self.proxy_host = str(listen_host).strip()
+        self.enable_proxy = bool(enable_proxy)
         self.use_tls = use_tls
         self.pool_host = pool_host or pool_ip
         if user_agent:
@@ -800,7 +809,7 @@ class StratumConnectionManager:
 
         self.logger.log_message(
             f"[StratumConn] 🎯 pool={self.pool_ip}:{self.pool_port} tls={self.use_tls} sni={self.pool_host} "
-            f"proxy={self.proxy_host}:{self.proxy_port}"
+            f"proxy={self.proxy_host}:{self.proxy_port} enabled={self.enable_proxy}"
         )
 
     def start(self) -> None:
@@ -812,14 +821,19 @@ class StratumConnectionManager:
 
         self._stop_event.clear()
         t1 = threading.Thread(target=self._direct_connection_loop, daemon=True, name="StratumDirectConnector")
-        t2 = threading.Thread(target=self._listen_for_miners, daemon=True, name="StratumProxyListener")
-        self._threads = [t1, t2]
+        self._threads = [t1]
+        if self.enable_proxy:
+            self._threads.append(
+                threading.Thread(
+                    target=self._listen_for_miners,
+                    daemon=True,
+                    name="StratumProxyListener",
+                )
+            )
         for t in self._threads:
             t.start()
 
     def stop(self) -> None:
-        if not self._threads:
-            return
         self._stop_event.set()
         self.stratum_manager.stop()
 
@@ -909,7 +923,12 @@ class StratumConnectionManager:
             self._pending_by_id[mid] = mth
 
     def _send_authorize_request(self, sock: socket.socket) -> None:
-        params = {"login": self.wallet_address, "pass": "x", "agent": self.user_agent, "rigid": self.worker_name}
+        params = {
+            "login": self.wallet_address,
+            "pass": self.password,
+            "agent": self.user_agent,
+            "rigid": self.worker_name,
+        }
         self._send_json_rpc_request(sock, {"jsonrpc": "2.0", "id": 1, "method": "login", "params": params})
         self._schedule_keepalive()
 
@@ -2174,6 +2193,1139 @@ def _version_name(version: Optional[Tuple[int, int]]) -> Optional[str]:
     return _TLS_VERSION_NAMES.get(tuple(version), f"{version[0]}.{version[1]}")
 
 
+_TLS13_CIPHER_SPECS: Dict[int, Dict[str, Any]] = {
+    0x1301: {
+        "name": "TLS_AES_128_GCM_SHA256",
+        "hash": "sha256",
+        "key_length": 16,
+        "iv_length": 12,
+        "tag_length": 16,
+        "aead": "AESGCM",
+    },
+    0x1302: {
+        "name": "TLS_AES_256_GCM_SHA384",
+        "hash": "sha384",
+        "key_length": 32,
+        "iv_length": 12,
+        "tag_length": 16,
+        "aead": "AESGCM",
+    },
+    0x1303: {
+        "name": "TLS_CHACHA20_POLY1305_SHA256",
+        "hash": "sha256",
+        "key_length": 32,
+        "iv_length": 12,
+        "tag_length": 16,
+        "aead": "CHACHA20",
+    },
+    0x1304: {
+        "name": "TLS_AES_128_CCM_SHA256",
+        "hash": "sha256",
+        "key_length": 16,
+        "iv_length": 12,
+        "tag_length": 16,
+        "aead": "AESCCM",
+    },
+    0x1305: {
+        "name": "TLS_AES_128_CCM_8_SHA256",
+        "hash": "sha256",
+        "key_length": 16,
+        "iv_length": 12,
+        "tag_length": 8,
+        "aead": "AESCCM",
+    },
+}
+
+_TLS13_KEYLOG_LABELS: Dict[str, Tuple[str, str, int]] = {
+    "CLIENT_EARLY_TRAFFIC_SECRET": ("c2s", "early", 0),
+    "CLIENT_HANDSHAKE_TRAFFIC_SECRET": ("c2s", "handshake", 0),
+    "SERVER_HANDSHAKE_TRAFFIC_SECRET": ("s2c", "handshake", 0),
+    "CLIENT_TRAFFIC_SECRET_0": ("c2s", "application", 0),
+    "SERVER_TRAFFIC_SECRET_0": ("s2c", "application", 0),
+}
+
+
+class TLS13KeyUnavailableError(RuntimeError):
+    """Raised when an authorized TLS 1.3 traffic secret is not installed."""
+
+
+class TLS13RecordProtectionError(ValueError):
+    """Raised when TLS 1.3 AEAD authentication or record formatting fails."""
+
+
+def _tls13_secret_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        result = value
+    elif isinstance(value, (bytearray, memoryview)):
+        result = bytes(value)
+    elif isinstance(value, str):
+        text = "".join(value.strip().split())
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        if not text or len(text) % 2:
+            raise ValueError("TLS traffic secret must be non-empty hexadecimal bytes")
+        try:
+            result = bytes.fromhex(text)
+        except ValueError as exc:
+            raise ValueError("TLS traffic secret must be hexadecimal") from exc
+    else:
+        raise TypeError("TLS traffic secret must be bytes or a hexadecimal string")
+
+    if not result:
+        raise ValueError("TLS traffic secret cannot be empty")
+    return result
+
+
+def _tls13_cipher_suite(value: Any) -> int:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        suite = int(text, 16) if text.startswith("0x") else int(text, 10)
+    else:
+        suite = int(value)
+    suite &= 0xFFFF
+    if suite not in _TLS13_CIPHER_SPECS:
+        raise ValueError(f"unsupported TLS 1.3 cipher suite 0x{suite:04x}")
+    return suite
+
+
+def _tls13_hkdf_expand(secret: bytes, info: bytes, length: int, hash_name: str) -> bytes:
+    digest_size = hashlib.new(hash_name).digest_size
+    if length < 0 or length > 255 * digest_size:
+        raise ValueError("invalid HKDF output length")
+
+    output = bytearray()
+    previous = b""
+    counter = 1
+    while len(output) < length:
+        previous = hmac.new(
+            secret,
+            previous + info + bytes((counter,)),
+            hash_name,
+        ).digest()
+        output.extend(previous)
+        counter += 1
+    return bytes(output[:length])
+
+
+def _tls13_hkdf_expand_label(
+        secret: bytes,
+        label: str,
+        context: bytes,
+        length: int,
+        hash_name: str,
+) -> bytes:
+    full_label = b"tls13 " + str(label).encode("ascii")
+    context = bytes(context)
+    if len(full_label) > 255 or len(context) > 255:
+        raise ValueError("TLS 1.3 HKDF label or context is too long")
+    hkdf_label = (
+        struct.pack("!H", int(length))
+        + bytes((len(full_label),))
+        + full_label
+        + bytes((len(context),))
+        + context
+    )
+    return _tls13_hkdf_expand(secret, hkdf_label, int(length), hash_name)
+
+
+class TLS13TrafficKeys:
+    """
+    One direction/epoch of RFC 8446 record protection.
+
+    The object owns one monotonically increasing sequence number. A separate
+    instance is used for reading and writing so observer state cannot silently
+    consume an endpoint's write nonce.
+    """
+
+    MAX_PLAINTEXT = 1 << 14
+    MAX_CIPHERTEXT = (1 << 14) + 256
+
+    def __init__(
+            self,
+            traffic_secret: Any,
+            cipher_suite: int,
+            *,
+            direction: str,
+            epoch: str,
+            generation: int = 0,
+            sequence_number: int = 0,
+    ):
+        self.cipher_suite = _tls13_cipher_suite(cipher_suite)
+        self.spec = dict(_TLS13_CIPHER_SPECS[self.cipher_suite])
+        self.direction = str(direction)
+        self.epoch = str(epoch)
+        self.generation = int(generation)
+        self.traffic_secret = _tls13_secret_bytes(traffic_secret)
+        self.sequence_number = int(sequence_number)
+        self._validate_sequence(self.sequence_number)
+
+        hash_name = str(self.spec["hash"])
+        digest_size = hashlib.new(hash_name).digest_size
+        if len(self.traffic_secret) != digest_size:
+            raise ValueError(
+                f"{self.spec['name']} requires a {digest_size}-byte traffic secret; "
+                f"received {len(self.traffic_secret)} bytes"
+            )
+
+        self.key = _tls13_hkdf_expand_label(
+            self.traffic_secret,
+            "key",
+            b"",
+            int(self.spec["key_length"]),
+            hash_name,
+        )
+        self.iv = _tls13_hkdf_expand_label(
+            self.traffic_secret,
+            "iv",
+            b"",
+            int(self.spec["iv_length"]),
+            hash_name,
+        )
+        self._aead = None
+
+    @staticmethod
+    def _validate_sequence(sequence_number: int) -> None:
+        if not 0 <= int(sequence_number) <= 0xFFFFFFFFFFFFFFFF:
+            raise OverflowError("TLS 1.3 record sequence number is outside uint64")
+
+    def _nonce(self, sequence_number: int) -> bytes:
+        self._validate_sequence(sequence_number)
+        padded_sequence = (
+            b"\x00" * (len(self.iv) - 8)
+            + int(sequence_number).to_bytes(8, "big")
+        )
+        return bytes(left ^ right for left, right in zip(self.iv, padded_sequence))
+
+    def _get_aead(self):
+        if self._aead is not None:
+            return self._aead
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import (
+                AESCCM,
+                AESGCM,
+                ChaCha20Poly1305,
+            )
+        except ImportError as exc:
+            raise TLS13KeyUnavailableError(
+                "TLS 1.3 record protection requires the 'cryptography' package"
+            ) from exc
+
+        algorithm = self.spec["aead"]
+        if algorithm == "AESGCM":
+            self._aead = AESGCM(self.key)
+        elif algorithm == "AESCCM":
+            self._aead = AESCCM(
+                self.key,
+                tag_length=int(self.spec["tag_length"]),
+            )
+        elif algorithm == "CHACHA20":
+            self._aead = ChaCha20Poly1305(self.key)
+        else:
+            raise TLS13KeyUnavailableError(f"unsupported AEAD algorithm {algorithm}")
+        return self._aead
+
+    def protect(
+            self,
+            plaintext: bytes,
+            *,
+            content_type: int,
+            padding_length: int = 0,
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        plaintext = bytes(plaintext)
+        content_type = int(content_type)
+        padding_length = int(padding_length)
+        if content_type not in (20, 21, 22, 23):
+            raise ValueError(f"invalid TLSInnerPlaintext content type {content_type}")
+        if padding_length < 0:
+            raise ValueError("TLS 1.3 padding length cannot be negative")
+        if len(plaintext) > self.MAX_PLAINTEXT:
+            raise ValueError("TLS 1.3 plaintext exceeds 2^14 bytes")
+
+        inner_plaintext = (
+            plaintext
+            + bytes((content_type,))
+            + (b"\x00" * padding_length)
+        )
+        ciphertext_length = len(inner_plaintext) + int(self.spec["tag_length"])
+        if ciphertext_length > self.MAX_CIPHERTEXT:
+            raise ValueError("TLS 1.3 ciphertext exceeds 2^14 + 256 bytes")
+
+        header = bytes((23, 3, 3)) + struct.pack("!H", ciphertext_length)
+        sequence = self.sequence_number
+        nonce = self._nonce(sequence)
+        ciphertext = self._get_aead().encrypt(
+            nonce,
+            inner_plaintext,
+            header,
+        )
+        self.sequence_number += 1
+        return header + ciphertext, {
+            "direction": self.direction,
+            "epoch": self.epoch,
+            "generation": self.generation,
+            "sequence_number": sequence,
+            "content_type": content_type,
+            "padding_length": padding_length,
+            "cipher_suite": self.cipher_suite,
+            "cipher_suite_name": self.spec["name"],
+        }
+
+    def unprotect(
+            self,
+            ciphertext: bytes,
+            *,
+            outer_version: Tuple[int, int] = (3, 3),
+    ) -> Dict[str, Any]:
+        ciphertext = bytes(ciphertext)
+        if tuple(outer_version) != (3, 3):
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 TLSCiphertext legacy_record_version must be 0x0303"
+            )
+        if len(ciphertext) < int(self.spec["tag_length"]) + 1:
+            raise TLS13RecordProtectionError("TLS 1.3 ciphertext is too short")
+        if len(ciphertext) > self.MAX_CIPHERTEXT:
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 ciphertext exceeds 2^14 + 256 bytes"
+            )
+
+        header = (
+            bytes((23, int(outer_version[0]), int(outer_version[1])))
+            + struct.pack("!H", len(ciphertext))
+        )
+        sequence = self.sequence_number
+        nonce = self._nonce(sequence)
+        try:
+            inner_plaintext = self._get_aead().decrypt(
+                nonce,
+                ciphertext,
+                header,
+            )
+        except Exception as exc:
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 record authentication failed"
+            ) from exc
+
+        content_type_index = len(inner_plaintext) - 1
+        while (
+                content_type_index >= 0
+                and inner_plaintext[content_type_index] == 0
+        ):
+            content_type_index -= 1
+        if content_type_index < 0:
+            raise TLS13RecordProtectionError(
+                "TLSInnerPlaintext contains only zero padding"
+            )
+
+        content_type = inner_plaintext[content_type_index]
+        if content_type not in (20, 21, 22, 23):
+            raise TLS13RecordProtectionError(
+                f"invalid TLSInnerPlaintext content type {content_type}"
+            )
+
+        plaintext = inner_plaintext[:content_type_index]
+        padding_length = len(inner_plaintext) - content_type_index - 1
+        if len(plaintext) > self.MAX_PLAINTEXT:
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 plaintext exceeds 2^14 bytes"
+            )
+        self.sequence_number += 1
+        return {
+            "plaintext": plaintext,
+            "content_type": content_type,
+            "padding_length": padding_length,
+            "direction": self.direction,
+            "epoch": self.epoch,
+            "generation": self.generation,
+            "sequence_number": sequence,
+            "cipher_suite": self.cipher_suite,
+            "cipher_suite_name": self.spec["name"],
+        }
+
+    def next_generation(self) -> "TLS13TrafficKeys":
+        hash_name = str(self.spec["hash"])
+        updated_secret = _tls13_hkdf_expand_label(
+            self.traffic_secret,
+            "traffic upd",
+            b"",
+            hashlib.new(hash_name).digest_size,
+            hash_name,
+        )
+        return TLS13TrafficKeys(
+            updated_secret,
+            self.cipher_suite,
+            direction=self.direction,
+            epoch="application",
+            generation=self.generation + 1,
+            sequence_number=0,
+        )
+
+    def set_sequence_number(self, sequence_number: int) -> None:
+        self._validate_sequence(sequence_number)
+        self.sequence_number = int(sequence_number)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "direction": self.direction,
+            "epoch": self.epoch,
+            "generation": self.generation,
+            "sequence_number": self.sequence_number,
+            "cipher_suite": self.cipher_suite,
+            "cipher_suite_name": self.spec["name"],
+        }
+
+
+class TLS13KeyManager:
+    """
+    Authorized TLS 1.3 traffic-secret registry and record protector.
+
+    It intentionally accepts traffic secrets/SSLKEYLOGFILE entries rather than
+    pretending that a certificate private key can decrypt ECDHE traffic.
+    """
+
+    C2S = "c2s"
+    S2C = "s2c"
+    READ = "read"
+    WRITE = "write"
+
+    _APPLICATION_LABEL = re.compile(
+        r"^(CLIENT|SERVER)_TRAFFIC_SECRET_(\d+)$"
+    )
+
+    _KEY_ALIASES = {
+        "client_early_traffic_secret": "CLIENT_EARLY_TRAFFIC_SECRET",
+        "client_handshake_traffic_secret": "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "server_handshake_traffic_secret": "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "client_application_traffic_secret": "CLIENT_TRAFFIC_SECRET_0",
+        "server_application_traffic_secret": "SERVER_TRAFFIC_SECRET_0",
+        "client_traffic_secret": "CLIENT_TRAFFIC_SECRET_0",
+        "server_traffic_secret": "SERVER_TRAFFIC_SECRET_0",
+    }
+
+    def __init__(self, logger=None):
+        self.log = logger
+        self._sessions: Dict[Any, Dict[str, Any]] = {}
+        self._keylog_entries: Dict[str, Dict[str, bytes]] = defaultdict(dict)
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _new_session() -> Dict[str, Any]:
+        return {
+            "client_random": None,
+            "cipher_suite": None,
+            "secrets": {},
+            "contexts": {"read": {}, "write": {}},
+            "active": {
+                "read": {"c2s": None, "s2c": None},
+                "write": {"c2s": None, "s2c": None},
+            },
+            "decrypt_successes": 0,
+            "decrypt_failures": 0,
+            "encryptions": 0,
+            "key_updates": 0,
+        }
+
+    def _log_message(self, message: str) -> None:
+        try:
+            if hasattr(self.log, "log_message"):
+                self.log.log_message(message)
+            elif callable(self.log):
+                self.log(message)
+        except Exception:
+            pass
+
+    def _session(self, canonical_key) -> Dict[str, Any]:
+        session = self._sessions.get(canonical_key)
+        if session is None:
+            session = self._new_session()
+            self._sessions[canonical_key] = session
+        return session
+
+    @classmethod
+    def _label_info(cls, label: str) -> Tuple[str, str, int]:
+        normalized = str(label or "").strip().upper()
+        fixed = _TLS13_KEYLOG_LABELS.get(normalized)
+        if fixed is not None:
+            return fixed
+        match = cls._APPLICATION_LABEL.match(normalized)
+        if match:
+            direction = cls.C2S if match.group(1) == "CLIENT" else cls.S2C
+            return direction, "application", int(match.group(2))
+        raise ValueError(f"unsupported TLS 1.3 key-log label '{label}'")
+
+    @staticmethod
+    def _context_id(
+            direction: str,
+            epoch: str,
+            generation: int,
+    ) -> Tuple[str, str, int]:
+        return str(direction), str(epoch), int(generation)
+
+    def _materialize_secret(
+            self,
+            session: Dict[str, Any],
+            entry: Dict[str, Any],
+    ) -> bool:
+        cipher_suite = session.get("cipher_suite")
+        if cipher_suite is None:
+            return False
+
+        context_id = self._context_id(
+            entry["direction"],
+            entry["epoch"],
+            entry["generation"],
+        )
+        for operation, sequence_field in (
+                (self.READ, "read_sequence"),
+                (self.WRITE, "write_sequence"),
+        ):
+            contexts = session["contexts"][operation]
+            existing = contexts.get(context_id)
+            if existing is None:
+                contexts[context_id] = TLS13TrafficKeys(
+                    entry["secret"],
+                    cipher_suite,
+                    direction=entry["direction"],
+                    epoch=entry["epoch"],
+                    generation=entry["generation"],
+                    sequence_number=entry.get(sequence_field, 0),
+                )
+
+            active = session["active"][operation][entry["direction"]]
+            if active is None:
+                session["active"][operation][entry["direction"]] = context_id
+        return True
+
+    def set_cipher_suite(self, canonical_key, cipher_suite: int) -> Dict[str, Any]:
+        suite = _tls13_cipher_suite(cipher_suite)
+        with self._lock:
+            session = self._session(canonical_key)
+            previous = session.get("cipher_suite")
+            if previous is not None and previous != suite:
+                session["contexts"] = {"read": {}, "write": {}}
+                session["active"] = {
+                    "read": {"c2s": None, "s2c": None},
+                    "write": {"c2s": None, "s2c": None},
+                }
+            session["cipher_suite"] = suite
+            for entry in session["secrets"].values():
+                self._materialize_secret(session, entry)
+            return self.summary(canonical_key)
+
+    def observe_client_random(
+            self,
+            canonical_key,
+            client_random: str,
+    ) -> Dict[str, Any]:
+        normalized = "".join(str(client_random or "").strip().split()).lower()
+        if len(normalized) != 64:
+            raise ValueError("TLS ClientHello random must contain 32 bytes")
+        try:
+            bytes.fromhex(normalized)
+        except ValueError as exc:
+            raise ValueError("TLS ClientHello random must be hexadecimal") from exc
+
+        with self._lock:
+            session = self._session(canonical_key)
+            session["client_random"] = normalized
+            for label, secret in self._keylog_entries.get(normalized, {}).items():
+                self._install_locked(
+                    session,
+                    label,
+                    secret,
+                    read_sequence=0,
+                    write_sequence=0,
+                )
+            return self.summary(canonical_key)
+
+    def _install_locked(
+            self,
+            session: Dict[str, Any],
+            label: str,
+            secret: Any,
+            *,
+            read_sequence: int,
+            write_sequence: int,
+    ) -> Dict[str, Any]:
+        normalized_label = str(label or "").strip().upper()
+        direction, epoch, generation = self._label_info(normalized_label)
+        context_id = self._context_id(direction, epoch, generation)
+        entry = {
+            "label": normalized_label,
+            "direction": direction,
+            "epoch": epoch,
+            "generation": generation,
+            "secret": _tls13_secret_bytes(secret),
+            "read_sequence": int(read_sequence),
+            "write_sequence": int(write_sequence),
+        }
+        session["secrets"][context_id] = entry
+        ready = self._materialize_secret(session, entry)
+        return {
+            "label": normalized_label,
+            "direction": direction,
+            "epoch": epoch,
+            "generation": generation,
+            "ready": ready,
+        }
+
+    def install_traffic_secret(
+            self,
+            canonical_key,
+            label: str,
+            secret: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+            read_sequence: int = 0,
+            write_sequence: int = 0,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            session = self._session(canonical_key)
+            if client_random is not None:
+                normalized_random = "".join(
+                    str(client_random).strip().split()
+                ).lower()
+                if len(normalized_random) != 64:
+                    raise ValueError("TLS ClientHello random must contain 32 bytes")
+                bytes.fromhex(normalized_random)
+                session["client_random"] = normalized_random
+            if cipher_suite is not None:
+                suite = _tls13_cipher_suite(cipher_suite)
+                if (
+                        session.get("cipher_suite") is not None
+                        and session["cipher_suite"] != suite
+                ):
+                    session["contexts"] = {"read": {}, "write": {}}
+                    session["active"] = {
+                        "read": {"c2s": None, "s2c": None},
+                        "write": {"c2s": None, "s2c": None},
+                    }
+                session["cipher_suite"] = suite
+            installed = self._install_locked(
+                session,
+                label,
+                secret,
+                read_sequence=read_sequence,
+                write_sequence=write_sequence,
+            )
+            installed["session"] = self.summary(canonical_key)
+            return installed
+
+    @staticmethod
+    def _read_keylog_source(source: Any) -> str:
+        if isinstance(source, os.PathLike):
+            with open(os.fspath(source), "r", encoding="utf-8") as handle:
+                return handle.read()
+        if isinstance(source, bytes):
+            return source.decode("utf-8")
+        if not isinstance(source, str):
+            raise TypeError("key-log source must be text, bytes, or a file path")
+        if "\n" not in source and "\r" not in source and os.path.isfile(source):
+            with open(source, "r", encoding="utf-8") as handle:
+                return handle.read()
+        return source
+
+    def load_keylog(
+            self,
+            canonical_key,
+            source: Any,
+            *,
+            client_random: Optional[str] = None,
+            cipher_suite: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        text = self._read_keylog_source(source)
+        parsed = 0
+        ignored = 0
+        randoms_seen: set[str] = set()
+
+        with self._lock:
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) != 3:
+                    ignored += 1
+                    continue
+                label, random_hex, secret_hex = parts
+                try:
+                    self._label_info(label)
+                    random_hex = random_hex.lower()
+                    if len(random_hex) != 64:
+                        raise ValueError
+                    bytes.fromhex(random_hex)
+                    secret = _tls13_secret_bytes(secret_hex)
+                except Exception:
+                    ignored += 1
+                    continue
+                self._keylog_entries[random_hex][label.upper()] = secret
+                randoms_seen.add(random_hex)
+                parsed += 1
+
+            session = self._session(canonical_key)
+            selected_random = (
+                "".join(str(client_random).strip().split()).lower()
+                if client_random is not None
+                else session.get("client_random")
+            )
+            if selected_random is None and len(randoms_seen) == 1:
+                selected_random = next(iter(randoms_seen))
+            if selected_random is not None:
+                if len(selected_random) != 64:
+                    raise ValueError("TLS ClientHello random must contain 32 bytes")
+                bytes.fromhex(selected_random)
+                session["client_random"] = selected_random
+            if cipher_suite is not None:
+                suite = _tls13_cipher_suite(cipher_suite)
+                if (
+                        session.get("cipher_suite") is not None
+                        and session["cipher_suite"] != suite
+                ):
+                    session["contexts"] = {"read": {}, "write": {}}
+                    session["active"] = {
+                        "read": {"c2s": None, "s2c": None},
+                        "write": {"c2s": None, "s2c": None},
+                    }
+                session["cipher_suite"] = suite
+
+            installed = 0
+            if selected_random:
+                for label, secret in self._keylog_entries.get(
+                        selected_random,
+                        {},
+                ).items():
+                    self._install_locked(
+                        session,
+                        label,
+                        secret,
+                        read_sequence=0,
+                        write_sequence=0,
+                    )
+                    installed += 1
+
+            return {
+                "parsed": parsed,
+                "ignored": ignored,
+                "installed": installed,
+                "client_random": selected_random,
+                "session": self.summary(canonical_key),
+            }
+
+    def process_server_keys(
+            self,
+            canonical_key,
+            server_keys: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if isinstance(server_keys, (str, bytes, os.PathLike)):
+            text = self._read_keylog_source(server_keys)
+            raw = text.encode("utf-8", "ignore")
+            if b"-----BEGIN" in raw and b"PRIVATE KEY-----" in raw:
+                raise TLS13KeyUnavailableError(
+                    "A TLS certificate private key cannot recover TLS 1.3 ECDHE "
+                    "traffic secrets. Provide SSLKEYLOGFILE entries or explicit "
+                    "CLIENT_/SERVER_*_TRAFFIC_SECRET values."
+                )
+            return self.load_keylog(
+                canonical_key,
+                text,
+                client_random=client_random,
+                cipher_suite=cipher_suite,
+            )
+
+        if not isinstance(server_keys, Mapping):
+            raise TypeError(
+                "server_keys must be a key-log source or a mapping of traffic secrets"
+            )
+        normalized_mapping_keys = {
+            str(name).strip().lower()
+            for name in server_keys
+        }
+        if normalized_mapping_keys.intersection({
+                "private_key",
+                "private_key_pem",
+                "certificate_private_key",
+        }):
+            raise TLS13KeyUnavailableError(
+                "TLS 1.3 uses ephemeral (EC)DHE; the certificate private key is "
+                "not a record-encryption key. Export traffic secrets from the "
+                "authorized client/server instead."
+            )
+
+        effective_suite = server_keys.get("cipher_suite", cipher_suite)
+        effective_random = server_keys.get("client_random", client_random)
+        result: Dict[str, Any] = {"installed": []}
+
+        if server_keys.get("keylog") is not None:
+            result["keylog"] = self.load_keylog(
+                canonical_key,
+                server_keys["keylog"],
+                client_random=effective_random,
+                cipher_suite=effective_suite,
+            )
+
+        for raw_name, value in server_keys.items():
+            if value is None or raw_name in {
+                "keylog", "cipher_suite", "client_random",
+            }:
+                continue
+            normalized_name = str(raw_name).strip()
+            label = self._KEY_ALIASES.get(
+                normalized_name.lower(),
+                normalized_name.upper(),
+            )
+            try:
+                self._label_info(label)
+            except ValueError:
+                continue
+            result["installed"].append(
+                self.install_traffic_secret(
+                    canonical_key,
+                    label,
+                    value,
+                    cipher_suite=effective_suite,
+                    client_random=effective_random,
+                )
+            )
+
+        result["session"] = self.summary(canonical_key)
+        return result
+
+    @staticmethod
+    def _operation_name(operation: str) -> str:
+        operation = str(operation or "").strip().lower()
+        if operation not in ("read", "write"):
+            raise ValueError("TLS key operation must be 'read' or 'write'")
+        return operation
+
+    @staticmethod
+    def _direction_name(direction: str) -> str:
+        direction = str(direction or "").strip().lower()
+        if direction not in ("c2s", "s2c"):
+            raise ValueError("TLS traffic direction must be 'c2s' or 's2c'")
+        return direction
+
+    def _candidate_contexts(
+            self,
+            session: Dict[str, Any],
+            operation: str,
+            direction: str,
+    ) -> List[Tuple[Tuple[str, str, int], TLS13TrafficKeys]]:
+        contexts = session["contexts"][operation]
+        active_id = session["active"][operation][direction]
+        result: List[Tuple[Tuple[str, str, int], TLS13TrafficKeys]] = []
+        if active_id in contexts:
+            result.append((active_id, contexts[active_id]))
+
+        epoch_order = {"early": 0, "handshake": 1, "application": 2}
+        remaining = [
+            (context_id, context)
+            for context_id, context in contexts.items()
+            if context_id != active_id and context_id[0] == direction
+        ]
+        remaining.sort(
+            key=lambda item: (
+                epoch_order.get(item[0][1], 99),
+                item[0][2],
+            )
+        )
+        result.extend(remaining)
+        return result
+
+    def unprotect(
+            self,
+            canonical_key,
+            direction: str,
+            ciphertext: bytes,
+            *,
+            outer_version: Tuple[int, int] = (3, 3),
+    ) -> Dict[str, Any]:
+        direction = self._direction_name(direction)
+        with self._lock:
+            session = self._session(canonical_key)
+            candidates = self._candidate_contexts(
+                session,
+                self.READ,
+                direction,
+            )
+            if not candidates:
+                raise TLS13KeyUnavailableError(
+                    f"no TLS 1.3 read traffic secret is installed for {direction}"
+                )
+
+            for context_id, context in candidates:
+                try:
+                    result = context.unprotect(
+                        ciphertext,
+                        outer_version=outer_version,
+                    )
+                except TLS13RecordProtectionError:
+                    continue
+                session["active"][self.READ][direction] = context_id
+                session["decrypt_successes"] += 1
+                return result
+
+            session["decrypt_failures"] += 1
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 record did not authenticate under the installed "
+                "traffic secrets and current sequence numbers"
+            )
+
+    def _select_write_context(
+            self,
+            session: Dict[str, Any],
+            direction: str,
+            epoch: str,
+            generation: Optional[int],
+    ) -> Tuple[Tuple[str, str, int], TLS13TrafficKeys]:
+        contexts = session["contexts"][self.WRITE]
+        matches = [
+            (context_id, context)
+            for context_id, context in contexts.items()
+            if context_id[0] == direction and context_id[1] == epoch
+            and (generation is None or context_id[2] == int(generation))
+        ]
+        if not matches:
+            raise TLS13KeyUnavailableError(
+                f"no TLS 1.3 {epoch} write secret is installed for {direction}"
+            )
+        matches.sort(key=lambda item: item[0][2], reverse=True)
+        return matches[0]
+
+    def protect(
+            self,
+            canonical_key,
+            direction: str,
+            plaintext: bytes,
+            *,
+            content_type: int = 23,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        direction = self._direction_name(direction)
+        epoch = str(epoch or "application").strip().lower()
+        with self._lock:
+            session = self._session(canonical_key)
+            context_id, context = self._select_write_context(
+                session,
+                direction,
+                epoch,
+                generation,
+            )
+            record, details = context.protect(
+                plaintext,
+                content_type=content_type,
+                padding_length=padding_length,
+            )
+            session["active"][self.WRITE][direction] = context_id
+            session["encryptions"] += 1
+            return record, details
+
+    def encrypt_for_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = 23,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        record, _ = self.protect(
+            canonical_key,
+            self.C2S,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+        return record
+
+    def encrypt_from_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = 23,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        record, _ = self.protect(
+            canonical_key,
+            self.S2C,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+        return record
+
+    def set_sequence_number(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str,
+            epoch: str,
+            sequence_number: int,
+            generation: int = 0,
+    ) -> None:
+        direction = self._direction_name(direction)
+        operation = self._operation_name(operation)
+        context_id = self._context_id(direction, epoch, generation)
+        with self._lock:
+            session = self._session(canonical_key)
+            context = session["contexts"][operation].get(context_id)
+            if context is None:
+                raise TLS13KeyUnavailableError(
+                    f"TLS 1.3 context {context_id} is not installed for {operation}"
+                )
+            context.set_sequence_number(sequence_number)
+            session["active"][operation][direction] = context_id
+
+    def advance_traffic_secret(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str = "read",
+    ) -> Dict[str, Any]:
+        direction = self._direction_name(direction)
+        operation = self._operation_name(operation)
+        with self._lock:
+            session = self._session(canonical_key)
+            active_id = session["active"][operation][direction]
+            active = session["contexts"][operation].get(active_id)
+            if active is None or active.epoch != "application":
+                candidates = [
+                    (context_id, context)
+                    for context_id, context in session["contexts"][operation].items()
+                    if context_id[0] == direction and context_id[1] == "application"
+                ]
+                if not candidates:
+                    raise TLS13KeyUnavailableError(
+                        f"no application traffic secret is installed for {direction}"
+                    )
+                candidates.sort(key=lambda item: item[0][2], reverse=True)
+                active_id, active = candidates[0]
+
+            updated = active.next_generation()
+            updated_id = self._context_id(
+                direction,
+                "application",
+                updated.generation,
+            )
+            existing = session["contexts"][operation].get(updated_id)
+            if (
+                    existing is not None
+                    and not hmac.compare_digest(
+                        existing.traffic_secret,
+                        updated.traffic_secret,
+                    )
+            ):
+                raise TLS13RecordProtectionError(
+                    "derived KeyUpdate secret conflicts with the installed "
+                    "traffic-secret generation"
+                )
+            session["contexts"][operation][updated_id] = updated
+            session["active"][operation][direction] = updated_id
+            session["key_updates"] += 1
+            return updated.summary()
+
+    def process_key_update(
+            self,
+            canonical_key,
+            incoming_direction: str,
+            request_peer_update: bool,
+    ) -> Dict[str, Any]:
+        incoming_direction = self._direction_name(incoming_direction)
+        result: Dict[str, Any] = {
+            "read": self.advance_traffic_secret(
+                canonical_key,
+                incoming_direction,
+                operation=self.READ,
+            )
+        }
+        if request_peer_update:
+            outgoing_direction = (
+                self.C2S
+                if incoming_direction == self.S2C
+                else self.S2C
+            )
+            try:
+                result["write"] = self.advance_traffic_secret(
+                    canonical_key,
+                    outgoing_direction,
+                    operation=self.WRITE,
+                )
+            except TLS13KeyUnavailableError:
+                result["write"] = None
+        return result
+
+    def has_keys(
+            self,
+            canonical_key,
+            direction: Optional[str] = None,
+    ) -> bool:
+        with self._lock:
+            session = self._sessions.get(canonical_key)
+            if not session:
+                return False
+            contexts = session["contexts"][self.READ]
+            if direction is None:
+                return bool(contexts)
+            direction = self._direction_name(direction)
+            return any(context_id[0] == direction for context_id in contexts)
+
+    def summary(self, canonical_key) -> Dict[str, Any]:
+        with self._lock:
+            session = self._sessions.get(canonical_key)
+            if not session:
+                return {
+                    "client_random": None,
+                    "cipher_suite": None,
+                    "cipher_suite_name": None,
+                    "read_contexts": [],
+                    "write_contexts": [],
+                    "decrypt_successes": 0,
+                    "decrypt_failures": 0,
+                    "encryptions": 0,
+                    "key_updates": 0,
+                }
+            suite = session.get("cipher_suite")
+            return {
+                "client_random": session.get("client_random"),
+                "cipher_suite": suite,
+                "cipher_suite_name": (
+                    _TLS13_CIPHER_SPECS[suite]["name"]
+                    if suite in _TLS13_CIPHER_SPECS
+                    else None
+                ),
+                "read_contexts": [
+                    context.summary()
+                    for context in session["contexts"][self.READ].values()
+                ],
+                "write_contexts": [
+                    context.summary()
+                    for context in session["contexts"][self.WRITE].values()
+                ],
+                "decrypt_successes": session["decrypt_successes"],
+                "decrypt_failures": session["decrypt_failures"],
+                "encryptions": session["encryptions"],
+                "key_updates": session["key_updates"],
+            }
+
+    def reset_session(self, canonical_key) -> None:
+        with self._lock:
+            self._sessions.pop(canonical_key, None)
+
+
 class TLSPolicyDecision:
     __slots__ = ("action", "reason", "tags")
 
@@ -2276,6 +3428,18 @@ class TLSPolicyEngine:
             nv = sh.get("version_tuple")
             if self.alert_on_tls11_or_lower and nv and tuple(nv) < (3, 3):
                 return TLSPolicyDecision("alert", f"Negotiated {tuple(nv)} (TLS<=1.1)", ["old-tls"])
+            if (
+                    nv
+                    and tuple(nv) == (3, 4)
+                    and self.ciphers.require_pfs
+                    and not sh.get("hello_retry_request")
+                    and sh.get("selected_group") is None
+            ):
+                return TLSPolicyDecision(
+                    "block",
+                    "TLS 1.3 negotiated without an (EC)DHE key share",
+                    ["tls13", "no-pfs", "no-key-share"],
+                )
 
             ja3s = sh.get("ja3s_md5")
             if ja3s and ja3s.lower() in self.ja3_denylist:
@@ -2288,6 +3452,10 @@ class TLSRecord:
     __slots__ = (
         "content_type", "version", "length", "payload", "ts",
         "src", "dst", "src_port", "dst_port", "direction",
+        "outer_content_type", "outer_version", "wire_length",
+        "encrypted", "decrypted", "tls13_epoch",
+        "tls13_generation", "tls13_sequence_number",
+        "tls13_padding_length", "decryption_error",
     )
 
     def __init__(self, content_type: int, version: Tuple[int, int], length: int, payload: bytes,
@@ -2302,6 +3470,16 @@ class TLSRecord:
         self.src_port = src_port
         self.dst_port = dst_port
         self.direction = direction
+        self.outer_content_type = content_type
+        self.outer_version = version
+        self.wire_length = length
+        self.encrypted = False
+        self.decrypted = False
+        self.tls13_epoch = None
+        self.tls13_generation = None
+        self.tls13_sequence_number = None
+        self.tls13_padding_length = 0
+        self.decryption_error = None
 
 
 class TLSCipherManager:
@@ -2454,6 +3632,8 @@ class TLSRecordManager:
                 "records": 0, "handshakes": 0, "handshake_messages": 0,
                 "alerts": 0, "appdata": 0, "ccs": 0, "legacy": 0,
                 "desync_bytes": 0, "malformed": 0,
+                "tls13_decrypted": 0, "tls13_decrypt_failures": 0,
+                "tls13_encrypted": 0, "tls13_key_updates": 0,
             }
         )
         self._meta: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict] = defaultdict(self._new_meta)
@@ -2471,6 +3651,7 @@ class TLSRecordManager:
         self.policy.ciphers = self.ciphers
         for suite in self.policy.block_weak_ciphers:
             self.ciphers.block_suite(suite)
+        self.tls13_keys = TLS13KeyManager(self.log)
         self._lock = threading.RLock()
 
     @staticmethod
@@ -2489,6 +3670,10 @@ class TLSRecordManager:
             "blocked": False, "quarantined": False, "tags": set(),
             "last_decision": None, "tls_detected": False,
             "handshake_complete": False,
+            "client_random": None, "server_random": None,
+            "tls13_key_state": None,
+            "tls13_decrypted_records": 0,
+            "tls13_decrypt_failures": 0,
         }
 
     def _log_message(self, message: str):
@@ -2669,6 +3854,75 @@ class TLSRecordManager:
             for rec in records:
                 self._process_record(canonical_key, rec)
 
+    def _try_unprotect_tls13_record(
+            self,
+            canonical_key,
+            rec: TLSRecord,
+    ) -> TLSRecord:
+        if rec.content_type != self.APPLICATION_DATA:
+            return rec
+        if not self.tls13_keys.has_keys(canonical_key, rec.direction):
+            return rec
+
+        rec.encrypted = True
+        try:
+            result = self.tls13_keys.unprotect(
+                canonical_key,
+                rec.direction,
+                rec.payload,
+                outer_version=rec.version,
+            )
+        except TLS13KeyUnavailableError:
+            return rec
+        except TLS13RecordProtectionError:
+            rec.decryption_error = "authentication-failed"
+            stats = self._stats[canonical_key]
+            meta = self._meta[canonical_key]
+            stats["tls13_decrypt_failures"] += 1
+            meta["tls13_decrypt_failures"] += 1
+            meta["tls13_key_state"] = self.tls13_keys.summary(canonical_key)
+            self._emit_event(
+                canonical_key,
+                "tls13_decrypt_failed",
+                {
+                    "dir": rec.direction,
+                    "wire_length": rec.wire_length,
+                    "reason": rec.decryption_error,
+                },
+            )
+            return rec
+
+        rec.decrypted = True
+        rec.content_type = int(result["content_type"])
+        rec.payload = bytes(result["plaintext"])
+        rec.length = len(rec.payload)
+        rec.version = (3, 4)
+        rec.tls13_epoch = result["epoch"]
+        rec.tls13_generation = int(result["generation"])
+        rec.tls13_sequence_number = int(result["sequence_number"])
+        rec.tls13_padding_length = int(result["padding_length"])
+
+        stats = self._stats[canonical_key]
+        meta = self._meta[canonical_key]
+        stats["tls13_decrypted"] += 1
+        meta["tls13_decrypted_records"] += 1
+        meta["tls13_key_state"] = self.tls13_keys.summary(canonical_key)
+        self._emit_event(
+            canonical_key,
+            "tls13_decrypted",
+            {
+                "dir": rec.direction,
+                "inner_content_type": rec.content_type,
+                "plaintext_length": rec.length,
+                "wire_length": rec.wire_length,
+                "epoch": rec.tls13_epoch,
+                "generation": rec.tls13_generation,
+                "sequence_number": rec.tls13_sequence_number,
+                "padding_length": rec.tls13_padding_length,
+            },
+        )
+        return rec
+
     def _process_record(self, canonical_key, rec: TLSRecord):
         stats = self._stats[canonical_key]
         meta = self._meta[canonical_key]
@@ -2676,6 +3930,8 @@ class TLSRecordManager:
         meta["tls_detected"] = True
         if rec.version == (3, 0):
             meta["legacy_ssl"] = True
+
+        rec = self._try_unprotect_tls13_record(canonical_key, rec)
 
         try:
             self.on_record(rec)
@@ -2826,9 +4082,25 @@ class TLSRecordManager:
                 info["client_hello"] = parsed
                 meta["client_hello"] = parsed
                 meta["sni"] = parsed.get("sni") or meta.get("sni")
+                meta["client_random"] = (
+                    parsed.get("client_random")
+                    or meta.get("client_random")
+                )
                 if parsed.get("alpn"):
                     meta["alpn"] = list(parsed["alpn"])
                 meta["offered_only_weak"] = parsed.get("only_weak_offered")
+                if parsed.get("client_random"):
+                    try:
+                        meta["tls13_key_state"] = (
+                            self.tls13_keys.observe_client_random(
+                                key,
+                                parsed["client_random"],
+                            )
+                        )
+                    except Exception as exc:
+                        self._log_message(
+                            f"[TLS1.3][Keys] ⚠️ Client random registration failed: {exc}"
+                        )
                 self._emit_event(key, "client_hello", {
                     "dir": direction,
                     "sni": meta.get("sni"),
@@ -2841,6 +4113,10 @@ class TLSRecordManager:
                 entry.update(parsed)
                 info["server_hello"] = parsed
                 meta["server_hello"] = parsed
+                meta["server_random"] = (
+                    parsed.get("server_random")
+                    or meta.get("server_random")
+                )
                 if parsed.get("version_tuple"):
                     meta["negotiated_version_tuple"] = parsed["version_tuple"]
                     meta["negotiated_version"] = parsed.get("version_name") or parsed.get("version")
@@ -2848,6 +4124,21 @@ class TLSRecordManager:
                 meta["negotiated_cipher_name"] = parsed.get("cipher_suite_name")
                 meta["negotiated_cipher_weak"] = parsed.get("cipher_weak")
                 meta["negotiated_cipher_reasons"] = list(parsed.get("cipher_reasons") or [])
+                if (
+                        parsed.get("version_tuple") == (3, 4)
+                        and parsed.get("cipher_suite_int") in _TLS13_CIPHER_SPECS
+                ):
+                    try:
+                        meta["tls13_key_state"] = (
+                            self.tls13_keys.set_cipher_suite(
+                                key,
+                                parsed["cipher_suite_int"],
+                            )
+                        )
+                    except Exception as exc:
+                        self._log_message(
+                            f"[TLS1.3][Keys] ⚠️ Cipher activation failed: {exc}"
+                        )
                 self._emit_event(key, "server_hello", {
                     "dir": direction,
                     "ja3s": parsed.get("ja3s_md5"),
@@ -2856,14 +4147,56 @@ class TLSRecordManager:
                     "hello_retry_request": parsed.get("hello_retry_request", False),
                 })
 
+            elif (
+                    msg_type == 8
+                    and meta.get("negotiated_version_tuple") == (3, 4)
+            ):
+                parsed = self._parse_tls13_extensions_summary(body)
+                entry.update(parsed)
+                selected_alpn = parsed.get("selected_alpn")
+                if selected_alpn:
+                    meta["alpn"] = [selected_alpn]
             elif msg_type == 11:
                 entry.update(self._parse_certificate_summary(body, meta))
+            elif (
+                    msg_type == 13
+                    and meta.get("negotiated_version_tuple") == (3, 4)
+            ):
+                entry.update(
+                    self._parse_tls13_certificate_request_summary(body)
+                )
+            elif (
+                    msg_type == 15
+                    and meta.get("negotiated_version_tuple") == (3, 4)
+            ):
+                entry.update(self._parse_tls13_certificate_verify_summary(body))
             elif msg_type == 20:
                 meta["handshake_complete"] = True
+                entry.update(self._parse_tls13_finished_summary(body, meta))
             elif msg_type == 24 and body:
-                entry["request_update"] = bool(body[0])
+                entry["request_update"] = body[0] == 1
+                entry["valid_request_update"] = body[0] in (0, 1)
+                if (
+                        entry["valid_request_update"]
+                        and self.tls13_keys.has_keys(key, direction)
+                ):
+                    try:
+                        entry["key_update"] = self.tls13_keys.process_key_update(
+                            key,
+                            direction,
+                            entry["request_update"],
+                        )
+                        self._stats[key]["tls13_key_updates"] += 1
+                        meta["tls13_key_state"] = self.tls13_keys.summary(key)
+                    except (
+                            TLS13KeyUnavailableError,
+                            TLS13RecordProtectionError,
+                    ) as exc:
+                        entry["key_update_error"] = str(exc)
             elif msg_type == 4:
                 entry.update(self._parse_new_session_ticket_summary(body, meta))
+            elif msg_type in (5, 26):
+                entry["valid_empty_body"] = len(body) == 0
 
             info["messages"].append(entry)
 
@@ -2873,18 +4206,25 @@ class TLSRecordManager:
     def _parse_client_hello(self, body: bytes) -> Dict:
         out: Dict[str, Any] = {
             "hello": "client", "sni": None,
+            "client_random": None,
             "version": None, "version_name": None, "version_tuple": None,
             "supported_versions": [], "supported_version_tuples": [],
             "highest_supported_version": None, "highest_supported_version_tuple": None,
             "cipher_suites_count": None, "cipher_suites": [], "cipher_suite_names": [],
             "extensions": [], "groups": [], "ec_point_formats": [], "alpn": [],
             "signature_algorithms": [], "key_share_groups": [],
+            "key_shares": [],
+            "psk_key_exchange_modes": [],
+            "offered_psk": False,
+            "psk_identity_count": 0,
+            "early_data": False,
             "ja3": None, "ja3_md5": None, "only_weak_offered": None,
         }
         try:
             if len(body) < 34:
                 return out
             legacy_version = (body[0], body[1])
+            out["client_random"] = body[2:34].hex()
             out["version"] = f"{legacy_version[0]}.{legacy_version[1]}"
             out["version_name"] = _version_name(legacy_version)
             out["version_tuple"] = legacy_version
@@ -2934,6 +4274,11 @@ class TLSRecordManager:
             supported_versions: List[Tuple[int, int]] = []
             signature_algorithms: List[int] = []
             key_share_groups: List[int] = []
+            key_shares: List[Dict[str, Any]] = []
+            psk_key_exchange_modes: List[int] = []
+            offered_psk = False
+            psk_identity_count = 0
+            early_data = False
             sni = None
 
             while idx + 4 <= end:
@@ -2997,6 +4342,31 @@ class TLSRecordManager:
                     for pos in range(1, limit - 1, 2):
                         supported_versions.append((ext_data[pos], ext_data[pos + 1]))
 
+                elif ext_type == 41 and len(ext_data) >= 2:
+                    offered_psk = True
+                    identities_length = self._u16(ext_data, 0)
+                    pos = 2
+                    limit = min(len(ext_data), 2 + identities_length)
+                    while pos + 6 <= limit:
+                        identity_length = self._u16(ext_data, pos)
+                        pos += 2
+                        if pos + identity_length + 4 > limit:
+                            break
+                        pos += identity_length + 4
+                        psk_identity_count += 1
+
+                elif ext_type == 42:
+                    early_data = ext_len == 0
+
+                elif ext_type == 45 and ext_data:
+                    modes_length = ext_data[0]
+                    psk_key_exchange_modes.extend(
+                        int(value)
+                        for value in ext_data[
+                            1:1 + min(modes_length, len(ext_data) - 1)
+                        ]
+                    )
+
                 elif ext_type == 51 and len(ext_data) >= 2:
                     list_len = self._u16(ext_data, 0)
                     pos = 2
@@ -3008,6 +4378,14 @@ class TLSRecordManager:
                         if pos + key_len > limit:
                             break
                         key_share_groups.append(group)
+                        key_exchange = bytes(ext_data[pos:pos + key_len])
+                        key_shares.append({
+                            "group": group,
+                            "key_exchange_length": key_len,
+                            "key_exchange_sha256": hashlib.sha256(
+                                key_exchange
+                            ).hexdigest(),
+                        })
                         pos += key_len
 
             out["extensions"] = ext_types
@@ -3017,6 +4395,11 @@ class TLSRecordManager:
             out["sni"] = sni
             out["signature_algorithms"] = signature_algorithms
             out["key_share_groups"] = key_share_groups
+            out["key_shares"] = key_shares
+            out["psk_key_exchange_modes"] = psk_key_exchange_modes
+            out["offered_psk"] = offered_psk
+            out["psk_identity_count"] = psk_identity_count
+            out["early_data"] = early_data
             out["supported_version_tuples"] = supported_versions
             out["supported_versions"] = [_version_name(v) for v in supported_versions]
             non_grease_versions = [v for v in supported_versions if not _is_grease((v[0] << 8) | v[1])]
@@ -3038,10 +4421,13 @@ class TLSRecordManager:
     def _parse_server_hello(self, body: bytes) -> Dict:
         out: Dict[str, Any] = {
             "hello": "server", "version": None, "version_name": None,
+            "server_random": None,
             "version_tuple": None, "legacy_version_tuple": None,
             "cipher_suite": None, "cipher_suite_int": None, "cipher_suite_name": None,
             "cipher_weak": None, "cipher_reasons": [], "extensions": [],
             "selected_alpn": None, "selected_group": None,
+            "selected_key_share": None,
+            "selected_psk_identity": None,
             "ja3s": None, "ja3s_md5": None, "hello_retry_request": False,
         }
         try:
@@ -3049,6 +4435,7 @@ class TLSRecordManager:
                 return out
             legacy_version = (body[0], body[1])
             random_bytes = body[2:34]
+            out["server_random"] = random_bytes.hex()
             hrr_random = bytes.fromhex(
                 "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"
             )
@@ -3067,6 +4454,8 @@ class TLSRecordManager:
             selected_version = legacy_version
             selected_alpn = None
             selected_group = None
+            selected_key_share = None
+            selected_psk_identity = None
             if idx + 2 <= len(body):
                 ext_total = self._u16(body, idx)
                 idx += 2
@@ -3082,6 +4471,8 @@ class TLSRecordManager:
                     ext_types.append(ext_type)
                     if ext_type == 43 and len(ext_data) == 2:
                         selected_version = (ext_data[0], ext_data[1])
+                    elif ext_type == 41 and len(ext_data) == 2:
+                        selected_psk_identity = self._u16(ext_data, 0)
                     elif ext_type == 16 and len(ext_data) >= 3:
                         list_len = self._u16(ext_data, 0)
                         if list_len >= 1 and len(ext_data) >= 3:
@@ -3090,6 +4481,24 @@ class TLSRecordManager:
                                 selected_alpn = ext_data[3:3 + proto_len].decode("ascii", "replace")
                     elif ext_type == 51 and len(ext_data) >= 2:
                         selected_group = self._u16(ext_data, 0)
+                        if len(ext_data) >= 4:
+                            key_length = self._u16(ext_data, 2)
+                            if 4 + key_length <= len(ext_data):
+                                key_exchange = bytes(
+                                    ext_data[4:4 + key_length]
+                                )
+                                selected_key_share = {
+                                    "group": selected_group,
+                                    "key_exchange_length": key_length,
+                                    "key_exchange_sha256": hashlib.sha256(
+                                        key_exchange
+                                    ).hexdigest(),
+                                }
+                        elif out["hello_retry_request"]:
+                            selected_key_share = {
+                                "group": selected_group,
+                                "hello_retry_request": True,
+                            }
 
             weak, reasons = self.ciphers.is_weak(cipher, negotiated=True)
             out.update({
@@ -3105,6 +4514,8 @@ class TLSRecordManager:
                 "extensions": ext_types,
                 "selected_alpn": selected_alpn,
                 "selected_group": selected_group,
+                "selected_key_share": selected_key_share,
+                "selected_psk_identity": selected_psk_identity,
             })
             ja3s, ja3s_md5 = self._compute_ja3s(
                 (legacy_version[0] << 8) | legacy_version[1], cipher, ext_types
@@ -3115,8 +4526,203 @@ class TLSRecordManager:
             pass
         return out
 
+    def _parse_tls13_extensions_summary(
+            self,
+            body: bytes,
+            *,
+            offset: int = 0,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "extensions": [],
+            "selected_alpn": None,
+            "early_data": False,
+            "record_size_limit": None,
+            "server_name_acknowledged": False,
+            "supported_groups": [],
+            "signature_algorithms": [],
+            "signature_algorithms_cert": [],
+            "malformed_extensions": False,
+        }
+        try:
+            if offset < 0 or offset + 2 > len(body):
+                result["malformed_extensions"] = True
+                return result
+            total_length = self._u16(body, offset)
+            cursor = offset + 2
+            end = cursor + total_length
+            if end > len(body):
+                result["malformed_extensions"] = True
+                end = len(body)
+
+            while cursor + 4 <= end:
+                extension_type = self._u16(body, cursor)
+                extension_length = self._u16(body, cursor + 2)
+                cursor += 4
+                extension_end = cursor + extension_length
+                if extension_end > end:
+                    result["malformed_extensions"] = True
+                    break
+                data = bytes(body[cursor:extension_end])
+                cursor = extension_end
+                result["extensions"].append(extension_type)
+
+                if extension_type == 0:
+                    result["server_name_acknowledged"] = (
+                        extension_length == 0
+                    )
+                elif extension_type == 10 and len(data) >= 2:
+                    vector_length = self._u16(data, 0)
+                    limit = min(len(data), 2 + vector_length)
+                    result["supported_groups"] = [
+                        self._u16(data, index)
+                        for index in range(2, limit - 1, 2)
+                    ]
+                elif extension_type in (13, 50) and len(data) >= 2:
+                    vector_length = self._u16(data, 0)
+                    limit = min(len(data), 2 + vector_length)
+                    values = [
+                        self._u16(data, index)
+                        for index in range(2, limit - 1, 2)
+                    ]
+                    target = (
+                        "signature_algorithms"
+                        if extension_type == 13
+                        else "signature_algorithms_cert"
+                    )
+                    result[target] = values
+                elif extension_type == 16 and len(data) >= 3:
+                    vector_length = self._u16(data, 0)
+                    limit = min(len(data), 2 + vector_length)
+                    cursor2 = 2
+                    protocols: List[str] = []
+                    while cursor2 < limit:
+                        protocol_length = data[cursor2]
+                        cursor2 += 1
+                        if cursor2 + protocol_length > limit:
+                            result["malformed_extensions"] = True
+                            break
+                        protocols.append(
+                            data[cursor2:cursor2 + protocol_length].decode(
+                                "ascii",
+                                "replace",
+                            )
+                        )
+                        cursor2 += protocol_length
+                    if protocols:
+                        result["selected_alpn"] = protocols[0]
+                        result["alpn_protocols"] = protocols
+                elif extension_type == 28 and len(data) == 2:
+                    result["record_size_limit"] = self._u16(data, 0)
+                elif extension_type == 42:
+                    result["early_data"] = True
+                    if len(data) == 4:
+                        result["max_early_data_size"] = int.from_bytes(
+                            data,
+                            "big",
+                        )
+
+            if cursor != end:
+                result["malformed_extensions"] = True
+        except Exception:
+            result["malformed_extensions"] = True
+        return result
+
+    def _parse_tls13_certificate_request_summary(
+            self,
+            body: bytes,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "certificate_request_context_length": None,
+            "certificate_request_context_sha256": None,
+        }
+        try:
+            if not body:
+                return result
+            context_length = body[0]
+            if 1 + context_length > len(body):
+                return result
+            context = bytes(body[1:1 + context_length])
+            result["certificate_request_context_length"] = context_length
+            if context:
+                result["certificate_request_context_sha256"] = (
+                    hashlib.sha256(context).hexdigest()
+                )
+            result.update(
+                self._parse_tls13_extensions_summary(
+                    body,
+                    offset=1 + context_length,
+                )
+            )
+        except Exception:
+            pass
+        return result
+
+    def _parse_tls13_certificate_verify_summary(
+            self,
+            body: bytes,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "signature_scheme": None,
+            "signature_length": None,
+            "signature_sha256": None,
+            "signature_length_valid": False,
+        }
+        try:
+            if len(body) < 4:
+                return result
+            signature_scheme = self._u16(body, 0)
+            signature_length = self._u16(body, 2)
+            signature = bytes(body[4:4 + signature_length])
+            result.update({
+                "signature_scheme": signature_scheme,
+                "signature_length": signature_length,
+                "signature_sha256": hashlib.sha256(signature).hexdigest(),
+                "signature_length_valid": (
+                    len(signature) == signature_length
+                    and 4 + signature_length == len(body)
+                ),
+            })
+        except Exception:
+            pass
+        return result
+
+    def _parse_tls13_finished_summary(
+            self,
+            body: bytes,
+            meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "verify_data_length": len(body),
+            "verify_data_sha256": hashlib.sha256(body).hexdigest(),
+            "verify_data_length_valid": None,
+        }
+        try:
+            cipher_suite = (meta.get("server_hello") or {}).get(
+                "cipher_suite_int"
+            )
+            spec = _TLS13_CIPHER_SPECS.get(int(cipher_suite))
+            if spec is not None:
+                expected = hashlib.new(str(spec["hash"])).digest_size
+                result["expected_verify_data_length"] = expected
+                result["verify_data_length_valid"] = len(body) == expected
+        except Exception:
+            pass
+        return result
+
     def _parse_certificate_summary(self, body: bytes, meta: Dict[str, Any]) -> Dict[str, Any]:
-        result: Dict[str, Any] = {"certificate_count": None, "certificate_bytes": None}
+        result: Dict[str, Any] = {
+            "certificate_count": None,
+            "certificate_bytes": None,
+            "certificate_sha256": [],
+            "leaf_subject": None,
+            "leaf_issuer": None,
+            "leaf_serial_number": None,
+            "leaf_not_before": None,
+            "leaf_not_after": None,
+            "leaf_public_key_type": None,
+            "leaf_public_key_bits": None,
+            "leaf_public_key_curve": None,
+        }
         try:
             tls13 = meta.get("negotiated_version_tuple") == (3, 4)
             idx = 0
@@ -3132,11 +4738,14 @@ class TLSRecordManager:
             end = min(len(body), idx + list_len)
             count = 0
             cert_bytes = 0
+            certificates: List[bytes] = []
             while idx + 3 <= end:
                 cert_len = int.from_bytes(body[idx:idx + 3], "big")
                 idx += 3
                 if idx + cert_len > end:
                     break
+                cert_der = bytes(body[idx:idx + cert_len])
+                certificates.append(cert_der)
                 idx += cert_len
                 count += 1
                 cert_bytes += cert_len
@@ -3144,9 +4753,66 @@ class TLSRecordManager:
                     if idx + 2 > end:
                         break
                     ext_len = self._u16(body, idx)
-                    idx += 2 + ext_len
+                    idx += 2
+                    if idx + ext_len > end:
+                        break
+                    idx += ext_len
             result["certificate_count"] = count
             result["certificate_bytes"] = cert_bytes
+            result["certificate_sha256"] = [
+                hashlib.sha256(cert_der).hexdigest()
+                for cert_der in certificates
+            ]
+
+            if certificates:
+                try:
+                    from cryptography import x509
+
+                    certificate = x509.load_der_x509_certificate(
+                        certificates[0]
+                    )
+                    public_key = certificate.public_key()
+                    result["leaf_subject"] = (
+                        certificate.subject.rfc4514_string()
+                    )
+                    result["leaf_issuer"] = (
+                        certificate.issuer.rfc4514_string()
+                    )
+                    result["leaf_serial_number"] = format(
+                        certificate.serial_number,
+                        "x",
+                    )
+                    not_before = getattr(
+                        certificate,
+                        "not_valid_before_utc",
+                        None,
+                    )
+                    if not_before is None:
+                        not_before = certificate.not_valid_before
+                    not_after = getattr(
+                        certificate,
+                        "not_valid_after_utc",
+                        None,
+                    )
+                    if not_after is None:
+                        not_after = certificate.not_valid_after
+                    result["leaf_not_before"] = not_before.isoformat()
+                    result["leaf_not_after"] = not_after.isoformat()
+                    result["leaf_public_key_type"] = (
+                        public_key.__class__.__name__
+                    )
+                    key_size = getattr(public_key, "key_size", None)
+                    if key_size is not None:
+                        result["leaf_public_key_bits"] = int(key_size)
+                    curve = getattr(public_key, "curve", None)
+                    if curve is not None:
+                        result["leaf_public_key_curve"] = getattr(
+                            curve,
+                            "name",
+                            curve.__class__.__name__,
+                        )
+                except Exception:
+                    pass
         except Exception:
             pass
         return result
@@ -3205,6 +4871,11 @@ class TLSRecordManager:
             "tags": m.get("tags"),
             "tls_detected": m.get("tls_detected"),
             "handshake_complete": m.get("handshake_complete"),
+            "client_random": m.get("client_random"),
+            "server_random": m.get("server_random"),
+            "tls13_keys": self.tls13_keys.summary(canonical_key),
+            "tls13_decrypted_records": m.get("tls13_decrypted_records", 0),
+            "tls13_decrypt_failures": m.get("tls13_decrypt_failures", 0),
             "stats": self.get_stats(canonical_key),
         }
 
@@ -3218,6 +4889,7 @@ class TLSRecordManager:
             self._handshake_buffers.pop(canonical_key, None)
             self._stats.pop(canonical_key, None)
             self._meta.pop(canonical_key, None)
+            self.tls13_keys.reset_session(canonical_key)
 
     def block_session(self, canonical_key, reason="manual block"):
         with self._lock:
@@ -3244,6 +4916,297 @@ class TLSRecordManager:
             m["quarantined"] = False
             m["last_decision"] = None
             self._emit_event(canonical_key, "allow", {"reason": reason})
+
+    def install_tls13_traffic_secret(
+            self,
+            canonical_key,
+            label: str,
+            secret: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+            read_sequence: int = 0,
+            write_sequence: int = 0,
+    ) -> Dict[str, Any]:
+        result = self.tls13_keys.install_traffic_secret(
+            canonical_key,
+            label,
+            secret,
+            cipher_suite=cipher_suite,
+            client_random=client_random,
+            read_sequence=read_sequence,
+            write_sequence=write_sequence,
+        )
+        with self._lock:
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        self._emit_event(
+            canonical_key,
+            "tls13_key_installed",
+            {
+                "label": result["label"],
+                "direction": result["direction"],
+                "epoch": result["epoch"],
+                "generation": result["generation"],
+                "ready": result["ready"],
+            },
+        )
+        return result
+
+    def load_tls13_keylog(
+            self,
+            canonical_key,
+            source: Any,
+            *,
+            client_random: Optional[str] = None,
+            cipher_suite: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        result = self.tls13_keys.load_keylog(
+            canonical_key,
+            source,
+            client_random=client_random,
+            cipher_suite=cipher_suite,
+        )
+        with self._lock:
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        self._emit_event(
+            canonical_key,
+            "tls13_keylog_loaded",
+            {
+                "parsed": result["parsed"],
+                "ignored": result["ignored"],
+                "installed": result["installed"],
+            },
+        )
+        return result
+
+    def process_server_keys(
+            self,
+            canonical_key,
+            server_keys: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result = self.tls13_keys.process_server_keys(
+            canonical_key,
+            server_keys,
+            cipher_suite=cipher_suite,
+            client_random=client_random,
+        )
+        with self._lock:
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        return result
+
+    def protect_tls13_record(
+            self,
+            canonical_key,
+            direction: str,
+            plaintext: bytes,
+            *,
+            content_type: int = APPLICATION_DATA,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        record, details = self.tls13_keys.protect(
+            canonical_key,
+            direction,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+        with self._lock:
+            self._stats[canonical_key]["tls13_encrypted"] += 1
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        self._emit_event(
+            canonical_key,
+            "tls13_encrypted",
+            {
+                "direction": details["direction"],
+                "epoch": details["epoch"],
+                "generation": details["generation"],
+                "sequence_number": details["sequence_number"],
+                "content_type": details["content_type"],
+                "plaintext_length": len(bytes(plaintext)),
+                "record_length": len(record),
+                "padding_length": details["padding_length"],
+            },
+        )
+
+        # RFC 8446: a sender protects KeyUpdate with the old application key,
+        # then immediately advances its sending traffic secret.
+        if int(content_type) == self.HANDSHAKE and epoch == "application":
+            payload = bytes(plaintext)
+            cursor = 0
+            sent_key_update = False
+            while cursor + 4 <= len(payload):
+                message_type = payload[cursor]
+                message_length = int.from_bytes(
+                    payload[cursor + 1:cursor + 4],
+                    "big",
+                )
+                end = cursor + 4 + message_length
+                if end > len(payload):
+                    break
+                if (
+                        message_type == 24
+                        and message_length == 1
+                        and payload[cursor + 4] in (0, 1)
+                ):
+                    sent_key_update = True
+                    break
+                cursor = end
+            if sent_key_update:
+                update = self.tls13_keys.advance_traffic_secret(
+                    canonical_key,
+                    direction,
+                    operation="write",
+                )
+                with self._lock:
+                    self._stats[canonical_key]["tls13_key_updates"] += 1
+                    self._meta[canonical_key]["tls13_key_state"] = (
+                        self.tls13_keys.summary(canonical_key)
+                    )
+                self._emit_event(
+                    canonical_key,
+                    "tls13_key_update_sent",
+                    {
+                        "direction": direction,
+                        "generation": update["generation"],
+                    },
+                )
+        return record
+
+    def encrypt_for_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = APPLICATION_DATA,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        """Build a client-to-server TLS 1.3 record for an owned endpoint."""
+        return self.protect_tls13_record(
+            canonical_key,
+            self.C2S,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+
+    def encrypt_from_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = APPLICATION_DATA,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        """Build a server-to-client TLS 1.3 record for an owned endpoint."""
+        return self.protect_tls13_record(
+            canonical_key,
+            self.S2C,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+
+    def unprotect_tls13_record(
+            self,
+            canonical_key,
+            direction: str,
+            record: bytes,
+    ) -> Dict[str, Any]:
+        """Authenticate/decrypt one complete TLSCiphertext record."""
+        record = bytes(record)
+        if len(record) < 5:
+            raise TLS13RecordProtectionError("TLS record is shorter than its header")
+        if record[0] != self.APPLICATION_DATA:
+            raise TLS13RecordProtectionError(
+                "TLS 1.3 encrypted records use outer content type 23"
+            )
+        record_length = struct.unpack("!H", record[3:5])[0]
+        if record_length != len(record) - 5:
+            raise TLS13RecordProtectionError(
+                "TLS record header length does not match the supplied bytes"
+            )
+        result = self.tls13_keys.unprotect(
+            canonical_key,
+            direction,
+            record[5:],
+            outer_version=(record[1], record[2]),
+        )
+        with self._lock:
+            self._stats[canonical_key]["tls13_decrypted"] += 1
+            self._meta[canonical_key]["tls13_decrypted_records"] += 1
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        return result
+
+    def set_tls13_sequence_number(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str,
+            epoch: str,
+            sequence_number: int,
+            generation: int = 0,
+    ) -> None:
+        self.tls13_keys.set_sequence_number(
+            canonical_key,
+            direction,
+            operation=operation,
+            epoch=epoch,
+            sequence_number=sequence_number,
+            generation=generation,
+        )
+        with self._lock:
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+
+    def advance_tls13_traffic_secret(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str = "write",
+    ) -> Dict[str, Any]:
+        result = self.tls13_keys.advance_traffic_secret(
+            canonical_key,
+            direction,
+            operation=operation,
+        )
+        with self._lock:
+            self._stats[canonical_key]["tls13_key_updates"] += 1
+            self._meta[canonical_key]["tls13_key_state"] = (
+                self.tls13_keys.summary(canonical_key)
+            )
+        return result
+
+    def get_tls13_key_state(self, canonical_key) -> Dict[str, Any]:
+        """Return counters/context metadata without exposing traffic secrets."""
+        return self.tls13_keys.summary(canonical_key)
 
     def set_cipher_requirements(self, **kwargs):
         self.ciphers.set_requirements(**kwargs)
@@ -3342,6 +5305,7 @@ class HandshakeManager:
         self.log_tls_records = True
         self.log_tls_application_data = False
         self.reinject_tls_application_data = False
+        self.log_tls13_key_events = True
 
         # Microsoft Authenticator support is passive. The manager recognizes and
         # records relevant Microsoft/APNs/FCM TLS flows, but never re-sends or
@@ -3349,7 +5313,8 @@ class HandshakeManager:
         self.log_microsoft_authenticator = True
         self._log_message(
             "[Handshake] Manager ready "
-            "(TCP reassembly + passive TLS + Microsoft Authenticator classification)."
+            "(TCP reassembly + TLS 1.3 key-aware record processing + "
+            "Microsoft Authenticator classification)."
         )
 
     def _log_message(self, message: str):
@@ -4102,6 +6067,187 @@ class HandshakeManager:
         if timeout_established is not None:
             self.timeout_established = int(timeout_established)
 
+    def install_tls13_traffic_secret(
+            self,
+            canonical_key,
+            label: str,
+            secret: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+            read_sequence: int = 0,
+            write_sequence: int = 0,
+    ) -> Dict[str, Any]:
+        result = self._tls_mgr.install_tls13_traffic_secret(
+            canonical_key,
+            label,
+            secret,
+            cipher_suite=cipher_suite,
+            client_random=client_random,
+            read_sequence=read_sequence,
+            write_sequence=write_sequence,
+        )
+        if self.log_tls13_key_events:
+            self._log_message(
+                "[TLS1.3][Keys] 🔑 Traffic secret installed "
+                f"label={result['label']} direction={result['direction']} "
+                f"epoch={result['epoch']} generation={result['generation']} "
+                f"ready={result['ready']}"
+            )
+        return result
+
+    def load_tls13_keylog(
+            self,
+            canonical_key,
+            source: Any,
+            *,
+            client_random: Optional[str] = None,
+            cipher_suite: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        result = self._tls_mgr.load_tls13_keylog(
+            canonical_key,
+            source,
+            client_random=client_random,
+            cipher_suite=cipher_suite,
+        )
+        if self.log_tls13_key_events:
+            self._log_message(
+                "[TLS1.3][Keys] 📜 Authorized key log loaded "
+                f"parsed={result['parsed']} installed={result['installed']} "
+                f"ignored={result['ignored']}"
+            )
+        return result
+
+    def process_server_keys(
+            self,
+            canonical_key,
+            server_keys: Any,
+            *,
+            cipher_suite: Optional[int] = None,
+            client_random: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Process exported TLS 1.3 traffic secrets for an owned endpoint.
+
+        Certificate private keys are rejected because TLS 1.3 ECDHE does not
+        derive record keys from the certificate key.
+        """
+        result = self._tls_mgr.process_server_keys(
+            canonical_key,
+            server_keys,
+            cipher_suite=cipher_suite,
+            client_random=client_random,
+        )
+        if self.log_tls13_key_events:
+            installed = len(result.get("installed") or [])
+            keylog_installed = int(
+                (result.get("keylog") or {}).get("installed", 0)
+            )
+            self._log_message(
+                "[TLS1.3][Keys] 🛡️ Server key material processed "
+                f"traffic_secrets={installed + keylog_installed}"
+            )
+        return result
+
+    def encrypt_for_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = TLSRecordManager.APPLICATION_DATA,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        """
+        Produce one authenticated client-to-server TLS 1.3 record.
+
+        This returns TLS bytes only. It deliberately does not forge/reinject a
+        TCP packet; the owning endpoint must send the record through its live
+        socket so TCP sequence and congestion state remain correct.
+        """
+        record = self._tls_mgr.encrypt_for_server(
+            canonical_key,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+        if self.log_tls13_key_events:
+            self._log_message(
+                "[TLS1.3][Encrypt] 🔐 Built client→server record "
+                f"plaintext={len(bytes(plaintext))} record={len(record)}"
+            )
+        return record
+
+    def encrypt_from_server(
+            self,
+            canonical_key,
+            plaintext: bytes,
+            *,
+            content_type: int = TLSRecordManager.APPLICATION_DATA,
+            padding_length: int = 0,
+            epoch: str = "application",
+            generation: Optional[int] = None,
+    ) -> bytes:
+        record = self._tls_mgr.encrypt_from_server(
+            canonical_key,
+            plaintext,
+            content_type=content_type,
+            padding_length=padding_length,
+            epoch=epoch,
+            generation=generation,
+        )
+        if self.log_tls13_key_events:
+            self._log_message(
+                "[TLS1.3][Encrypt] 🔐 Built server→client record "
+                f"plaintext={len(bytes(plaintext))} record={len(record)}"
+            )
+        return record
+
+    def set_tls13_sequence_number(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str,
+            epoch: str,
+            sequence_number: int,
+            generation: int = 0,
+    ) -> None:
+        self._tls_mgr.set_tls13_sequence_number(
+            canonical_key,
+            direction,
+            operation=operation,
+            epoch=epoch,
+            sequence_number=sequence_number,
+            generation=generation,
+        )
+
+    def advance_tls13_traffic_secret(
+            self,
+            canonical_key,
+            direction: str,
+            *,
+            operation: str = "write",
+    ) -> Dict[str, Any]:
+        result = self._tls_mgr.advance_tls13_traffic_secret(
+            canonical_key,
+            direction,
+            operation=operation,
+        )
+        if self.log_tls13_key_events:
+            self._log_message(
+                "[TLS1.3][KeyUpdate] 🔄 Advanced traffic secret "
+                f"direction={direction} operation={operation} "
+                f"generation={result['generation']}"
+            )
+        return result
+
+    def get_tls13_key_state(self, canonical_key) -> Dict[str, Any]:
+        return self._tls_mgr.get_tls13_key_state(canonical_key)
+
     def _on_tls_record(self, rec: "TLSRecord"):
         if not self.log_tls_records:
             return
@@ -4110,9 +6256,19 @@ class HandshakeManager:
         }.get(rec.content_type, f"type-{rec.content_type}")
         if rec.content_type == TLSRecordManager.APPLICATION_DATA and not self.log_tls_application_data:
             return
+        protection = ""
+        if rec.decrypted:
+            protection = (
+                f" decrypted=TLS1.3/{rec.tls13_epoch}"
+                f"#{rec.tls13_generation} seq={rec.tls13_sequence_number}"
+                f" wire={rec.wire_length} pad={rec.tls13_padding_length}"
+            )
+        elif rec.encrypted:
+            protection = " encrypted=TLS1.3 decrypt=failed"
         self._log_message(
             f"[TLS][Record] {type_name} {_version_name(rec.version)} len={rec.length} "
             f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
+            f"{protection}"
         )
 
     def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
@@ -4159,7 +6315,15 @@ class HandshakeManager:
             elif message_type == "Certificate":
                 self._log_message(
                     f"[TLS][Certificate] {prefix} certificates={message.get('certificate_count')} "
-                    f"bytes={message.get('certificate_bytes')}"
+                    f"bytes={message.get('certificate_bytes')} "
+                    f"key={message.get('leaf_public_key_type') or 'N/A'}"
+                    f"/{message.get('leaf_public_key_bits') or message.get('leaf_public_key_curve') or 'N/A'}"
+                )
+            elif message_type == "KeyUpdate":
+                self._log_message(
+                    f"[TLS1.3][KeyUpdate] 🔄 {prefix} "
+                    f"request_peer={bool(message.get('request_update'))} "
+                    f"applied={bool(message.get('key_update'))}"
                 )
             else:
                 self._log_message(f"[TLS][Handshake] {message_type} {prefix}")
@@ -4171,13 +6335,13 @@ class HandshakeManager:
         )
 
     def _on_tls_application_data(self, rec: "TLSRecord"):
-        # Passive packet capture must never fabricate and re-send encrypted TCP
-        # payload.  Doing so duplicates sequence numbers, creates capture loops,
-        # and corrupts live connections.  The original callback signature is
-        # retained so callers can still observe application-data records.
+        # Packet capture remains observation-only. Explicit encrypt_for_server()
+        # returns a TLS record to the endpoint that owns the socket; this callback
+        # never fabricates or re-injects TCP segments.
         if self.log_tls_application_data:
             self._log_message(
-                f"[TLS][ApplicationData] len={rec.length} {rec.direction} "
+                f"[TLS][ApplicationData] len={rec.length} "
+                f"decrypted={rec.decrypted} {rec.direction} "
                 f"{rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
             )
 
@@ -4198,6 +6362,7 @@ class HandshakeManager:
 
     def normalize_mac(self, mac: str) -> str:
         return mac.replace('-', ':').lower()
+
 
 
 @dataclass
@@ -17529,6 +19694,10 @@ class DHCPServer:
         interface_roles=None,
         control_plane_name: str = "dhcp",
         preserve_leases_on_policy_update: bool = True,
+        lease_duration_seconds: int = 600,
+        dns_v4=None,
+        domain_name: str = None,
+        max_leases: int = None,
     ):
         import ipaddress, threading, time
         from typing import Dict, Tuple, Set
@@ -17554,6 +19723,10 @@ class DHCPServer:
         # --- DHCPv4 ---
         self.lease_pool_start = ipaddress.IPv4Address(dhcp_pool_start)
         self.lease_pool_end = ipaddress.IPv4Address(dhcp_pool_end)
+        if self.lease_pool_start > self.lease_pool_end:
+            raise ValueError(
+                "DHCP pool start must not be after DHCP pool end."
+            )
         self._leases: Dict[str, Tuple[ipaddress.IPv4Address, float]] = {}  # mac -> (ip, expiry)
         self.dynamic_ip_pool = list(self._generate_ip_pool(self.lease_pool_start, self.lease_pool_end))
         self.available_ips = set(self.dynamic_ip_pool)
@@ -17590,7 +19763,32 @@ class DHCPServer:
         self.denied_ifaces = set(str(x) for x in (denied_ifaces or []) if x)
         self.observe_only_ifaces = set(str(x) for x in (observe_only_ifaces or []) if x)
 
-        self.LEASE_DURATION_SECONDS = 600
+        self.LEASE_DURATION_SECONDS = max(
+            60,
+            int(lease_duration_seconds),
+        )
+        raw_dns_v4 = (
+            [item.strip() for item in dns_v4.split(",")]
+            if isinstance(dns_v4, str)
+            else list(dns_v4 or [])
+        )
+        self.dns_v4 = []
+        for value in raw_dns_v4:
+            value = str(value).strip()
+            if not value:
+                continue
+            parsed_dns = ipaddress.ip_address(value)
+            if parsed_dns.version != 4:
+                raise ValueError(
+                    f"DHCPv4 DNS server is not IPv4: {value}"
+                )
+            self.dns_v4.append(str(parsed_dns))
+        self.domain_name = str(domain_name or "").strip() or None
+        self.max_leases = (
+            max(1, int(max_leases))
+            if max_leases is not None
+            else None
+        )
         self.dhcp_relay_target_ip = dhcp_relay_target_ip
 
         self.allow_out_of_pool = bool(allow_out_of_pool)
@@ -17628,6 +19826,7 @@ class DHCPServer:
             f"v6Prefix={self.dhcp6_prefix or 'None'} v6Relay={self.dhcp6_relay_target_ip or 'None'} | "
             f"out_of_pool={self.allow_out_of_pool} same_subnet={self.enforce_same_subnet} "
             f"serve_all_ifaces={self.serve_on_all_ifaces} authoritative={self.authoritative} "
+            f"lease={self.LEASE_DURATION_SECONDS}s max_leases={self.max_leases or 'pool'} "
             f"rogue_policy={self.rogue_policy} policy={self.interface_policy_snapshot()}"
         )
 
@@ -17854,6 +20053,22 @@ class DHCPServer:
         ip_addr = ipaddress.IPv4Address(ip)
 
         with self._lease_lock:
+            if (
+                not force
+                and norm_mac not in self._leases
+                and self.max_leases is not None
+                and sum(
+                    1
+                    for _, expiry in self._leases.values()
+                    if expiry > time.time()
+                ) >= self.max_leases
+            ):
+                self.logger.log_message(
+                    f"[DHCP] 🚫 Lease limit {self.max_leases} reached; "
+                    f"cannot pin a new lease for {norm_mac}."
+                )
+                return False
+
             in_cfg = self._iface_cfg_for(self.in_iface)
             net = in_cfg.get("network")
             self._reserve_router_ipv4_once()
@@ -17928,6 +20143,10 @@ class DHCPServer:
                 "lease_pool_start": str(self.lease_pool_start),
                 "lease_pool_end": str(self.lease_pool_end),
                 "dynamic_pool_size": len(self.dynamic_ip_pool),
+                "lease_duration_seconds": self.LEASE_DURATION_SECONDS,
+                "max_leases": self.max_leases,
+                "dns_v4": list(self.dns_v4),
+                "domain_name": self.domain_name,
                 "available_ips": len(self.available_ips),
                 "active_ipv4_leases": {
                     mac: {"ip": str(ip), "ttl": max(0, int(exp - now))}
@@ -18090,6 +20309,20 @@ class DHCPServer:
                     return assigned_ip
                 self._leases.pop(norm_mac, None)
 
+            if (
+                self.max_leases is not None
+                and sum(
+                    1
+                    for _, expiry in self._leases.values()
+                    if expiry > time.time()
+                ) >= self.max_leases
+            ):
+                self.logger.log_message(
+                    f"[DHCP] 🚫 Lease limit {self.max_leases} reached; "
+                    f"no address assigned to {norm_mac}."
+                )
+                return None
+
             if preferred_ip is not None:
                 if not isinstance(preferred_ip, ipaddress.IPv4Address):
                     try:
@@ -18202,9 +20435,15 @@ class DHCPServer:
         if t2 > lease:
             t2 = lease
 
+        opts.append(("router", router_in_ip))
+
+        dns_values = list(self.dns_v4 or [router_in_ip])
+        opts.append(tuple(["name_server", *dns_values]))
+
+        if self.domain_name:
+            opts.append(("domain", self.domain_name))
+
         opts.extend([
-            ("router", router_in_ip),
-            ("name_server", router_in_ip),
             ("lease_time", lease),
             ("renewal_time", t1),
             ("rebinding_time", t2),
@@ -18703,9 +20942,16 @@ class DHCPServer:
                         opts.append(("broadcast_address", str(net.broadcast_address)))
                     except Exception:
                         pass
+                opts.append(("router", router_in_ip))
+                opts.append(
+                    tuple([
+                        "name_server",
+                        *(self.dns_v4 or [router_in_ip]),
+                    ])
+                )
+                if self.domain_name:
+                    opts.append(("domain", self.domain_name))
                 opts.extend([
-                    ("router", router_in_ip),
-                    ("name_server", router_in_ip),
                     ("server_id", router_in_ip),
                     "end",
                 ])
@@ -29193,6 +31439,7 @@ class LanManager(_SmartManagerBase):
             "bridge_name": "ManagedLANBridge",
             "create_bridge": True,
             "member_ifaces": None,
+            "enable_dhcp_server": True,
             "serve_on_all_lan_ifaces": False,
             "authoritative": True,
             "rogue_policy": "nak_on_mismatch",
@@ -29202,7 +31449,13 @@ class LanManager(_SmartManagerBase):
             "search_domains": ["lan.local"],
             "dhcp_pool_start": None,
             "dhcp_pool_end": None,
+            "dhcp_relay_target_ip": None,
             "dhcp6_prefix": None,
+            "dhcp6_relay_target_ip": None,
+            "lease_duration_seconds": 600,
+            "dns_v4": [],
+            "domain_name": "lan.internal",
+            "max_leases": None,
             "health_interval_sec": 20.0,
             "start_transport_dhcp_client": True,
             "handle_icmp": True,
@@ -29235,11 +31488,19 @@ class LanManager(_SmartManagerBase):
         handle_icmp: bool = True,
         learn_ipv6_link_local: bool = True,
         learn_ipv6_ula: bool = True,
+        enable_dhcp_server: bool = True,
+        dhcp_relay_target_ip: Optional[str] = None,
+        dhcp6_relay_target_ip: Optional[str] = None,
+        lease_duration_seconds: int = 600,
+        dns_v4: Optional[list[str]] = None,
+        domain_name: Optional[str] = "lan.internal",
+        max_leases: Optional[int] = None,
     ) -> None:
         self._prefs.update({
             "bridge_name": bridge_name,
             "create_bridge": bool(create_bridge),
             "member_ifaces": list(member_ifaces) if member_ifaces else None,
+            "enable_dhcp_server": bool(enable_dhcp_server),
             "serve_on_all_lan_ifaces": bool(serve_on_all_lan_ifaces),
             "authoritative": bool(authoritative),
             "rogue_policy": rogue_policy,
@@ -29249,7 +31510,20 @@ class LanManager(_SmartManagerBase):
             "search_domains": list(search_domains or ["lan.local"]),
             "dhcp_pool_start": dhcp_pool_start,
             "dhcp_pool_end": dhcp_pool_end,
+            "dhcp_relay_target_ip": dhcp_relay_target_ip,
             "dhcp6_prefix": dhcp6_prefix,
+            "dhcp6_relay_target_ip": dhcp6_relay_target_ip,
+            "lease_duration_seconds": max(
+                60,
+                int(lease_duration_seconds),
+            ),
+            "dns_v4": list(dns_v4 or []),
+            "domain_name": str(domain_name or "").strip() or None,
+            "max_leases": (
+                max(1, int(max_leases))
+                if max_leases is not None
+                else None
+            ),
             "health_interval_sec": max(5.0, float(health_interval_sec)),
             "start_transport_dhcp_client": bool(start_transport_dhcp_client),
             "handle_icmp": bool(handle_icmp),
@@ -29295,7 +31569,6 @@ class LanManager(_SmartManagerBase):
                 pass
 
         self.router.dhcp_server_in = None
-        self.router.dhcp_server_out = None
         self._dhcp_fingerprint = None
         self._gc_flows()
         self._say("lan_stopped", "LAN services stopped", ["🛑", "🌙"], cooldown=0.0)
@@ -29774,6 +32047,17 @@ class LanManager(_SmartManagerBase):
 
     def _ensure_dhcp_server(self, *, force_restart: bool) -> None:
         r = self.router
+        if not self._prefs.get("enable_dhcp_server", True):
+            current = getattr(r, "dhcp_server_in", None)
+            if current is not None:
+                try:
+                    current.stop()
+                except Exception:
+                    pass
+            r.dhcp_server_in = None
+            self._dhcp_fingerprint = None
+            return
+
         in_iface = getattr(r, "interface_in_full_name", None)
         lan_ip = getattr(r, "router_ip_in", None)
         lan_net = getattr(r, "router_network_in", None)
@@ -29792,6 +32076,10 @@ class LanManager(_SmartManagerBase):
             str(self._prefs["authoritative"]),
             str(self._prefs["rogue_policy"]),
             str(self._prefs["enforce_same_subnet"]),
+            str(self._prefs["lease_duration_seconds"]),
+            str(self._prefs["dns_v4"]),
+            str(self._prefs["domain_name"]),
+            str(self._prefs["max_leases"]),
         ])
 
         current = getattr(r, "dhcp_server_in", None)
@@ -29814,7 +32102,13 @@ class LanManager(_SmartManagerBase):
             pool_start,
             pool_end,
             r._interfaces_config,
+            dhcp_relay_target_ip=self._prefs[
+                "dhcp_relay_target_ip"
+            ],
             dhcp6_prefix=self._prefs["dhcp6_prefix"],
+            dhcp6_relay_target_ip=self._prefs[
+                "dhcp6_relay_target_ip"
+            ],
             allow_out_of_pool=self._prefs["allow_out_of_pool"],
             enforce_same_subnet=self._prefs["enforce_same_subnet"],
             serve_on_all_ifaces=self._prefs["serve_on_all_lan_ifaces"],
@@ -29823,18 +32117,26 @@ class LanManager(_SmartManagerBase):
             in_mac=in_mac,
             dns_v6=self._prefs["dns_v6"],
             search_domains=self._prefs["search_domains"],
+            lease_duration_seconds=self._prefs[
+                "lease_duration_seconds"
+            ],
+            dns_v4=self._prefs["dns_v4"],
+            domain_name=self._prefs["domain_name"],
+            max_leases=self._prefs["max_leases"],
         )
         dhcp_server.sniffer = getattr(r, "sniffer", None)
         dhcp_server.router_ipv6_link_local_out = getattr(r, "router_ipv6_link_local_out", None)
         dhcp_server.start()
 
         r.dhcp_server_in = dhcp_server
-        r.dhcp_server_out = None
         self._dhcp_fingerprint = fingerprint
 
         try:
             if getattr(r, "arp_manager", None) is not None:
-                r.arp_manager.set_dhcp_server_reference(dhcp_server, None)
+                r.arp_manager.set_dhcp_server_reference(
+                    dhcp_server,
+                    getattr(r, "dhcp_server_out", None),
+                )
         except Exception:
             pass
 
@@ -29860,7 +32162,24 @@ class LanManager(_SmartManagerBase):
         manual_start = self._prefs.get("dhcp_pool_start")
         manual_end = self._prefs.get("dhcp_pool_end")
         if manual_start and manual_end:
-            return manual_start, manual_end
+            start = ipaddress.IPv4Address(manual_start)
+            end = ipaddress.IPv4Address(manual_end)
+            router_address = ipaddress.IPv4Address(router_ip)
+            if start > end:
+                raise ValueError(
+                    "LAN DHCP pool start must not be after pool end."
+                )
+            if self._prefs.get("enforce_same_subnet", True):
+                if start not in network or end not in network:
+                    raise ValueError(
+                        f"LAN DHCP pool must be inside {network}."
+                    )
+            if start <= router_address <= end:
+                raise ValueError(
+                    f"LAN DHCP pool includes router address "
+                    f"{router_address}."
+                )
+            return str(start), str(end)
 
         router_ip_obj = ipaddress.IPv4Address(router_ip)
         usable = [ip for ip in network.hosts() if ip != router_ip_obj]
@@ -38051,9 +40370,9 @@ class ScrapeWebsiteManager:
             self.router_logger.log_message(msg)
         except Exception:
             print(msg)
-            
-            
-            
+
+
+
 class WifiManager:
     """
     Startup-only fixed-address control plane for PythonRouterWirelessHost.exe.

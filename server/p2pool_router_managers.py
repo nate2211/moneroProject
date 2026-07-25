@@ -29846,13 +29846,106 @@ class TransportManager:
       - serialize main dispatch paths to reduce cross-thread packet-writer races
     """
 
-    def __init__(self, router_logger, packet_signer, code_output_manager, parallel_python, packet_writer):
+    DEFAULT_PROTOCOL_ENABLED = {
+        "scada": True,
+        "http": True,
+        "stratum": True,
+        "https": True,
+        "dns": True,
+        "ssh": True,
+        "ftp": True,
+        "kerberos": True,
+        "rdp": True,
+        "monero": True,
+        "steam": True,
+        "tcp_ephemeral": True,
+        "tcp_high_server": True,
+        "files": True,
+        "snmp": True,
+        "rip": True,
+        "mdns": True,
+        "llmnr": True,
+        "nbns": True,
+        "nbds": True,
+        "dhcp4": True,
+        "ike_esp": True,
+        "dhcp6": True,
+        "wireguard": True,
+        "quic": True,
+        "ntp": True,
+        "tftp": True,
+        "sip": True,
+        "overlay": True,
+        "ssdp": True,
+        "ws_discovery": True,
+        "rtp": True,
+        "udp_ephemeral": True,
+        "ipv6": True,
+        "inspection": True,
+        "scraper": True,
+        "undecoded": True,
+    }
+
+    HANDLER_PROTOCOLS = {
+        "_handle_scada_tcp_packet": "scada",
+        "_handle_scada_udp_packet": "scada",
+        "_handle_http_packet": "http",
+        "_handle_stratum_packet": "stratum",
+        "_handle_https_packet": "https",
+        "_handle_domain_tcp_packet": "dns",
+        "_handle_dns_packet": "dns",
+        "_handle_ssh_packet": "ssh",
+        "_handle_ftp_packet": "ftp",
+        "_handle_kerberos_packet": "kerberos",
+        "_handle_rdp_packet": "rdp",
+        "_handle_monero_packet": "monero",
+        "_handle_tcp_steam_packet": "steam",
+        "_handle_udp_steam_packet": "steam",
+        "_handle_tcp_ephemeral_packet": "tcp_ephemeral",
+        "_handle_high_server_packet": "tcp_high_server",
+        "_handle_files_packet": "files",
+        "_handle_snmp_tcp_packet": "snmp",
+        "_handle_snmp_udp_packet": "snmp",
+        "_handle_rip_packet": "rip",
+        "_handle_mdns_packet": "mdns",
+        "_handle_llmnr_packet": "llmnr",
+        "_handle_nbns_packet": "nbns",
+        "_handle_nbds_packet": "nbds",
+        "_handle_dhcp_packet": "dhcp4",
+        "_handle_esp_packet": "ike_esp",
+        "_handle_dhcp6_packet": "dhcp6",
+        "_handle_wireguard_packet": "wireguard",
+        "_handle_quic_packet": "quic",
+        "_handle_ntp_packet": "ntp",
+        "_handle_tftp_packet": "tftp",
+        "_handle_sip_packet": "sip",
+        "_handle_overlay_packet": "overlay",
+        "_handle_ssdp_packet": "ssdp",
+        "_handle_ws_discovery_packet": "ws_discovery",
+        "_handle_rtp_packet": "rtp",
+        "_handle_udp_ephemeral_packet": "udp_ephemeral",
+    }
+
+    def __init__(
+        self,
+        router_logger,
+        packet_signer,
+        code_output_manager,
+        parallel_python,
+        packet_writer,
+        *,
+        settings: Optional[Dict[str, Any]] = None,
+    ):
         self.logger = router_logger
         self.parallel_python = parallel_python
         self.code_output_manager = code_output_manager
         self.sniffer = None
         self.packet_signer = packet_signer
         self.packet_writer = packet_writer
+        self.enabled = True
+        self.started = True
+        self.protocol_enabled = dict(self.DEFAULT_PROTOCOL_ENABLED)
+        self._settings: Dict[str, Any] = {}
 
         self.logger.log_message("[Transport] Manager initialized (safe Hyper-V mode).")
 
@@ -29926,6 +30019,253 @@ class TransportManager:
         self.transport_rip = TransportRIPManager(self.logger)
         self.transport_domain = TransportDomainManager(self.logger)
         self.transport_snmp = TransportSNMPManager(self.logger)
+
+        if settings:
+            self.configure(**dict(settings))
+        else:
+            self._settings = self.settings_snapshot()
+
+    @staticmethod
+    def _normalize_port_set(value, default_ports) -> set[int]:
+        if value is None:
+            values = list(default_ports)
+        elif isinstance(value, str):
+            values = [
+                item.strip()
+                for item in value.split(",")
+                if item.strip()
+            ]
+        else:
+            values = list(value)
+
+        ports: set[int] = set()
+        for raw_value in values:
+            port = int(raw_value)
+            if not 1 <= port <= 65535:
+                raise ValueError(
+                    f"Transport port must be in 1-65535: {port}"
+                )
+            ports.add(port)
+        if not ports:
+            raise ValueError("At least one transport port is required.")
+        return ports
+
+    def configure(
+        self,
+        *,
+        enabled: bool = True,
+        protocol_enabled: Optional[Dict[str, bool]] = None,
+        stratum_ports=None,
+        monero_ports=None,
+        voip_port_start: int = 10000,
+        voip_port_end: int = 20000,
+        parallel_analysis: bool = True,
+        inspection_log_rps: float = 0.2,
+        inspection_log_burst: int = 50,
+        inspection_flow_cooldown_sec: float = 20.0,
+        stratum_log_rps: float = 1.5,
+        stratum_log_burst: int = 120,
+        stratum_flow_cooldown_sec: float = 1.2,
+        monero_log_rps: float = 2.0,
+        monero_log_burst: int = 140,
+        monero_flow_cooldown_sec: float = 1.2,
+        dns_pending_ttl_sec: int = 30,
+        dns_gc_interval_sec: int = 10,
+        dns_alert_on_rebind: bool = True,
+        dhcp_transaction_ttl_sec: int = 180,
+        dhcp_lease_ttl_sec: int = 86400,
+        https_logging: bool = True,
+        https_parse_certificates: bool = True,
+        https_parse_quic_crypto: bool = True,
+    ) -> None:
+        requested_protocols = dict(self.DEFAULT_PROTOCOL_ENABLED)
+        for key, value in dict(protocol_enabled or {}).items():
+            normalized_key = str(key).strip().casefold()
+            if normalized_key not in requested_protocols:
+                raise ValueError(
+                    f"Unknown transport protocol setting: {key}"
+                )
+            requested_protocols[normalized_key] = bool(value)
+
+        start_port = int(voip_port_start)
+        end_port = int(voip_port_end)
+        if not 1 <= start_port <= end_port <= 65535:
+            raise ValueError(
+                "VoIP port range must satisfy "
+                "1 <= start <= end <= 65535."
+            )
+
+        resolved_stratum_ports = self._normalize_port_set(
+            stratum_ports,
+            TransportStratumManager.DEFAULT_PORTS,
+        )
+        resolved_monero_ports = self._normalize_port_set(
+            monero_ports,
+            TransportMoneroManager.DEFAULT_PORTS,
+        )
+
+        self.enabled = bool(enabled)
+        self.protocol_enabled = requested_protocols
+        self.voip_port_range = range(start_port, end_port + 1)
+        self._analysis_parallel_enabled = (
+            bool(parallel_analysis)
+            and hasattr(self.parallel_python, "run_parallel")
+        )
+
+        # These managers carry their tuning in constructor state. Replacing
+        # them during router startup is safe because no packets have entered
+        # the transport pipeline yet.
+        self.transport_inspect = TransportInspectionManager(
+            self.logger,
+            log_rps=max(0.01, float(inspection_log_rps)),
+            log_burst=max(1, int(inspection_log_burst)),
+            flow_cooldown_s=max(
+                0.0,
+                float(inspection_flow_cooldown_sec),
+            ),
+        )
+        self.transport_stratum = TransportStratumManager(
+            self.logger,
+            ports=resolved_stratum_ports,
+            packet_writer=self.packet_writer,
+            log_rps=max(0.01, float(stratum_log_rps)),
+            log_burst=max(1, int(stratum_log_burst)),
+            flow_cooldown_s=max(
+                0.0,
+                float(stratum_flow_cooldown_sec),
+            ),
+        )
+        self.transport_monero = TransportMoneroManager(
+            self.logger,
+            self.packet_writer,
+            ports=resolved_monero_ports,
+            log_rps=max(0.01, float(monero_log_rps)),
+            log_burst=max(1, int(monero_log_burst)),
+            flow_cooldown_s=max(
+                0.0,
+                float(monero_flow_cooldown_sec),
+            ),
+        )
+        self.transport_dns = TransportDNSManager(
+            self.logger,
+            pending_ttl_sec=max(1, int(dns_pending_ttl_sec)),
+            gc_interval_sec=max(1, int(dns_gc_interval_sec)),
+            alert_on_rebind_attacks=bool(dns_alert_on_rebind),
+        )
+        self.transport_dhcp = TransportDHCPManager(
+            self.logger,
+            txn_ttl_sec=max(1, int(dhcp_transaction_ttl_sec)),
+            lease_ttl_sec=max(60, int(dhcp_lease_ttl_sec)),
+        )
+        self.transport_https = TransportHTTPSManager(
+            self.logger,
+            logging_enabled=bool(https_logging),
+            parse_certificates=bool(https_parse_certificates),
+            parse_quic_crypto=bool(https_parse_quic_crypto),
+        )
+
+        self._settings = self.settings_snapshot()
+        enabled_count = sum(
+            1 for value in self.protocol_enabled.values() if value
+        )
+        self.logger.log_message(
+            "[Transport] ⚙️ Configured "
+            f"enabled={self.enabled} protocols="
+            f"{enabled_count}/{len(self.protocol_enabled)} "
+            f"stratum_ports={sorted(resolved_stratum_ports)} "
+            f"monero_ports={sorted(resolved_monero_ports)}"
+        )
+
+    def settings_snapshot(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "protocol_enabled": dict(self.protocol_enabled),
+            "stratum_ports": sorted(
+                getattr(self.transport_stratum, "ports", set())
+            ),
+            "monero_ports": sorted(
+                getattr(self.transport_monero, "ports", set())
+            ),
+            "voip_port_start": int(self.voip_port_range.start),
+            "voip_port_end": int(self.voip_port_range.stop - 1),
+            "parallel_analysis": bool(
+                self._analysis_parallel_enabled
+            ),
+        }
+
+    def is_protocol_enabled(self, protocol: str) -> bool:
+        key = str(protocol or "").strip().casefold()
+        return (
+            bool(self.enabled)
+            and bool(self.started)
+            and bool(self.protocol_enabled.get(key, False))
+        )
+
+    def _handler_is_enabled(self, handler) -> bool:
+        protocol = self.HANDLER_PROTOCOLS.get(
+            getattr(handler, "__name__", ""),
+        )
+        return (
+            self.is_protocol_enabled(protocol)
+            if protocol is not None
+            else bool(self.enabled and self.started)
+        )
+
+    def start(self) -> None:
+        self.started = True
+        self.logger.log_message("[Transport] ▶️ Manager started.")
+
+    def stop(self) -> None:
+        self.started = False
+        self._initiators.clear()
+        for manager in (
+            self.transport_dhcp,
+            self.transport_dhcp6,
+            self.transport_dns,
+            self.transport_mdns,
+            self.transport_nbns,
+            self.transport_nbds,
+            self.transport_ssdp,
+            self.transport_quic,
+            self.transport_http,
+            self.transport_ssh,
+            self.transport_ftp,
+            self.transport_rdp,
+            self.transport_rtp,
+            self.transport_kerberos,
+            self.transport_ipv6,
+            self.transport_overlay,
+            self.transport_wireguard,
+            self.transport_tcp_ephemeral,
+            self.transport_udp_ephemeral,
+            self.transport_steam,
+            self.transport_tcp_high_Level,
+            self.transport_files,
+            self.transport_https,
+            self.transport_ws_discovery,
+            self.transport_esp,
+            self.transport_inspect,
+            self.transport_scraper,
+            self.transport_llmnr,
+            self.transport_undecoded,
+            self.transport_stratum,
+            self.transport_ike,
+            self.transport_monero,
+            self.transport_scada,
+            self.transport_rip,
+            self.transport_domain,
+            self.transport_snmp,
+        ):
+            stop_method = getattr(manager, "stop", None)
+            if callable(stop_method):
+                try:
+                    stop_method()
+                except Exception as exc:
+                    self.logger.log_message(
+                        "[Transport] ⚠️ Sub-manager stop failed for "
+                        f"{type(manager).__name__}: {exc}"
+                    )
+        self.logger.log_message("[Transport] 🛑 Manager stopped.")
     # ------------------------------------------------------------------
     # Safety helpers
     # ------------------------------------------------------------------
@@ -30167,6 +30507,9 @@ class TransportManager:
           - main TCP/UDP dispatch happens locally
           - only inspect/scrape are optionally parallelized, using bytes not Packet objects
         """
+        if not self.enabled or not self.started:
+            return False
+
         raw_packet = self._freeze_packet_bytes(packet)
         if not raw_packet:
             return False
@@ -30190,26 +30533,28 @@ class TransportManager:
             sport = int(transport_layer.sport)
             dport = int(transport_layer.dport)
 
-            self._queue_analysis_from_raw(
-                self._inspect_from_raw,
-                raw_packet,
-                src_ip,
-                dst_ip,
-                sport,
-                dport,
-                iface_short,
-                queue_name="transport_inspect_tcp_packets",
-            )
-            self._queue_analysis_from_raw(
-                self._scrape_from_raw,
-                raw_packet,
-                src_ip,
-                dst_ip,
-                sport,
-                dport,
-                iface_short,
-                queue_name="transport_scrape_tcp_packets",
-            )
+            if self.is_protocol_enabled("inspection"):
+                self._queue_analysis_from_raw(
+                    self._inspect_from_raw,
+                    raw_packet,
+                    src_ip,
+                    dst_ip,
+                    sport,
+                    dport,
+                    iface_short,
+                    queue_name="transport_inspect_tcp_packets",
+                )
+            if self.is_protocol_enabled("scraper"):
+                self._queue_analysis_from_raw(
+                    self._scrape_from_raw,
+                    raw_packet,
+                    src_ip,
+                    dst_ip,
+                    sport,
+                    dport,
+                    iface_short,
+                    queue_name="transport_scrape_tcp_packets",
+                )
 
             with self._dispatch_lock:
                 return bool(self._handle_tcp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
@@ -30218,34 +30563,42 @@ class TransportManager:
             sport = int(transport_layer.sport)
             dport = int(transport_layer.dport)
 
-            self._queue_analysis_from_raw(
-                self._inspect_from_raw,
-                raw_packet,
-                src_ip,
-                dst_ip,
-                sport,
-                dport,
-                iface_short,
-                queue_name="transport_inspect_udp_packets",
-            )
-            self._queue_analysis_from_raw(
-                self._scrape_from_raw,
-                raw_packet,
-                src_ip,
-                dst_ip,
-                sport,
-                dport,
-                iface_short,
-                queue_name="transport_scrape_udp_packets",
-            )
+            if self.is_protocol_enabled("inspection"):
+                self._queue_analysis_from_raw(
+                    self._inspect_from_raw,
+                    raw_packet,
+                    src_ip,
+                    dst_ip,
+                    sport,
+                    dport,
+                    iface_short,
+                    queue_name="transport_inspect_udp_packets",
+                )
+            if self.is_protocol_enabled("scraper"):
+                self._queue_analysis_from_raw(
+                    self._scrape_from_raw,
+                    raw_packet,
+                    src_ip,
+                    dst_ip,
+                    sport,
+                    dport,
+                    iface_short,
+                    queue_name="transport_scrape_udp_packets",
+                )
 
             with self._dispatch_lock:
                 return bool(self._handle_udp_packet(local_packet, src_ip, dst_ip, sport, dport, iface_short))
 
-        try:
-            self.transport_ipv6.handle(local_packet, inbound_iface)
-        except Exception as e:
-            self.logger.log_message(f"[Transport] IPv6 handler error: {e}")
+        if self.is_protocol_enabled("ipv6"):
+            try:
+                self.transport_ipv6.handle(
+                    local_packet,
+                    inbound_iface,
+                )
+            except Exception as e:
+                self.logger.log_message(
+                    f"[Transport] IPv6 handler error: {e}"
+                )
         return False
 
     # ------------------------------------------------------------------
@@ -30268,19 +30621,25 @@ class TransportManager:
         rules = [
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
-            ([3333, 4444, 5555, 7777, 9999], self._handle_stratum_packet),
+            (
+                sorted(self.transport_stratum.ports),
+                self._handle_stratum_packet,
+            ),
             ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
             ([53], self._handle_domain_tcp_packet),
             ([22], self._handle_ssh_packet),
             ([21], self._handle_ftp_packet),
             ([88], self._handle_kerberos_packet),
             ([3389], self._handle_rdp_packet),
-            ([18080, 28080, 38080, 41257, 18081, 18083, 18089, 28081, 38081, 37888, 37889], self._handle_monero_packet),
+            (
+                sorted(self.transport_monero.ports),
+                self._handle_monero_packet,
+            ),
             ([(27014, 27050)], self._handle_tcp_steam_packet),
             ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),
-            ([(1024, 65535)], self._handle_high_server_packet),
             ([445, 139, 62078], self._handle_files_packet),
             ([161, 162, 10161, 10162], self._handle_snmp_tcp_packet),
+            ([(1024, 65535)], self._handle_high_server_packet),
         ]
 
         handler = None
@@ -30289,10 +30648,14 @@ class TransportManager:
                 if isinstance(p, tuple):
                     lo, hi = p
                     if lo <= sport <= hi or lo <= dport <= hi:
+                        if not self._handler_is_enabled(h):
+                            return False
                         handler = h
                         break
                 else:
                     if p in (sport, dport):
+                        if not self._handler_is_enabled(h):
+                            return False
                         handler = h
                         break
             if handler:
@@ -30354,6 +30717,8 @@ class TransportManager:
         handler = None
         for ports, h in rules:
             if _match(ports, sport, dport):
+                if not self._handler_is_enabled(h):
+                    return False
                 handler = h
                 break
         if self.packet_writer.should_drop_packet(packet, inbound_iface=iface_short, consume=True):
@@ -30390,11 +30755,20 @@ class TransportManager:
                 return True
 
         try:
-            if sport in self.voip_port_range or dport in self.voip_port_range:
+            if (
+                self.is_protocol_enabled("rtp")
+                and (
+                    sport in self.voip_port_range
+                    or dport in self.voip_port_range
+                )
+            ):
                 self._handle_rtp_packet(packet, src_ip, dst_ip, sport, dport, iface_short)
                 return True
         except Exception:
             pass
+
+        if not self.is_protocol_enabled("undecoded"):
+            return False
 
         self.code_output_manager.submit_packet(
             packet, inbound_iface=iface_short, phase="unhandled", component="udp"

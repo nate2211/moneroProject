@@ -416,6 +416,154 @@ class P2PoolGUI(QMainWindow):
         else:
             self.wireshark_logger.log_message("[GUI] Wireshark manager not available.")
 
+    @staticmethod
+    def _csv_setting(value: str) -> list[str]:
+        return [
+            item.strip()
+            for item in str(value or "").split(",")
+            if item.strip()
+        ]
+
+    @staticmethod
+    def _validated_ip_list(
+        values,
+        label: str,
+        *,
+        version: int | None = None,
+    ) -> list[str]:
+        import ipaddress
+
+        validated = []
+        for value in values or []:
+            try:
+                parsed = ipaddress.ip_address(str(value).strip())
+            except Exception as exc:
+                raise ValueError(
+                    f"{label} contains an invalid address: {value}"
+                ) from exc
+            if version is not None and parsed.version != version:
+                raise ValueError(
+                    f"{label} requires IPv{version} addresses: {value}"
+                )
+            validated.append(str(parsed))
+        return validated
+
+    @staticmethod
+    def _int_setting(
+        value,
+        label: str,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+        allow_blank: bool = False,
+    ):
+        raw = str(value or "").strip()
+        if not raw and allow_blank:
+            return None
+        if not raw:
+            raise ValueError(f"{label} is required.")
+        try:
+            parsed = int(raw)
+        except Exception as exc:
+            raise ValueError(f"{label} must be a whole number.") from exc
+        if minimum is not None and parsed < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        if maximum is not None and parsed > maximum:
+            raise ValueError(f"{label} must be at most {maximum}.")
+        return parsed
+
+    @classmethod
+    def _port_list_setting(
+        cls,
+        value,
+        label: str,
+    ) -> list[int]:
+        ports = []
+        for item in cls._csv_setting(value):
+            ports.append(
+                cls._int_setting(
+                    item,
+                    label,
+                    minimum=1,
+                    maximum=65535,
+                )
+            )
+        if not ports:
+            raise ValueError(
+                f"{label} requires at least one port."
+            )
+        return sorted(set(ports))
+
+    @staticmethod
+    def _float_setting(
+        value,
+        label: str,
+        *,
+        minimum: float | None = None,
+    ) -> float:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError(f"{label} is required.")
+        try:
+            parsed = float(raw)
+        except Exception as exc:
+            raise ValueError(f"{label} must be numeric.") from exc
+        if minimum is not None and parsed < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return parsed
+
+    @staticmethod
+    def _validate_ipv4_scope(
+        *,
+        label: str,
+        pool_start: str,
+        pool_end: str,
+        router_ip: str = "",
+        netmask: str = "",
+        enforce_same_subnet: bool = True,
+    ) -> None:
+        import ipaddress
+
+        if not pool_start or not pool_end:
+            raise ValueError(
+                f"{label} pool start and pool end are both required."
+            )
+
+        try:
+            start = ipaddress.IPv4Address(pool_start)
+            end = ipaddress.IPv4Address(pool_end)
+        except Exception as exc:
+            raise ValueError(
+                f"{label} pool contains an invalid IPv4 address."
+            ) from exc
+
+        if start > end:
+            raise ValueError(
+                f"{label} pool start must not be after pool end."
+            )
+
+        if router_ip and netmask and enforce_same_subnet:
+            try:
+                router_address = ipaddress.IPv4Address(router_ip)
+                network = ipaddress.IPv4Network(
+                    f"{router_address}/{netmask}",
+                    strict=False,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"{label} router IP or netmask is invalid."
+                ) from exc
+
+            if start not in network or end not in network:
+                raise ValueError(
+                    f"{label} pool must be inside {network}."
+                )
+            if start <= router_address <= end:
+                raise ValueError(
+                    f"{label} pool must not include router address "
+                    f"{router_address}."
+                )
+
     def start_router(self):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
 
@@ -423,82 +571,823 @@ class P2PoolGUI(QMainWindow):
             self.router_logger.log_message("[GUI] Router manager not available.")
             return
 
-        ipc_emit_host = self.router_tab.ipc_host_input.text().strip()
-        p2pool_server_ip = self.router_tab.p2pool_server_ip_input.text().strip()
+        tab = self.router_tab
 
-        use_stratum_comm = self.router_tab.stratum_comm_checkbox.isChecked()
-        use_blocknet = self.router_tab.blocknet_checkbox.isChecked()
-        use_peer_to_peer = self.router_tab.peer_to_peer_checkbox.isChecked()
+        try:
+            ipc_emit_host = tab.ipc_host_input.text().strip()
+            p2pool_server_ip = tab.p2pool_server_ip_input.text().strip()
 
-        use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
-        use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
-        use_static = self.router_tab.use_static_checkbox.isChecked()
-        use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
-        use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
-        lan_ip = self.router_tab.router_ip_out_input.text().strip()
-        netmask_out = self.router_tab.router_netmask_out_input.text().strip()
-        use_hostbypass = self.router_tab.use_hostbypass_checkbox.isChecked()
-        blocknet_relay = self.router_tab.blocknet_relay_input.text().strip()
-        blocknet_token = self.router_tab.blocknet_token_input.text().strip()
-        use_gateway = self.router_tab.use_gateway_checkbox.isChecked()
-        use_lan = self.router_tab.use_lan_checkbox.isChecked()
-        use_uplink = self.router_tab.use_uplink_checkbox.isChecked()
-        nat_os = self.router_tab.nat_os_checkbox.isChecked()
-        python_server = self.router_tab.python_server_checkbox.isChecked()
-        promisc = self.router_tab.promisc_checkbox.isChecked()
-        use_socket = self.router_tab.use_socket.isChecked()
-        use_ollama = self.router_tab.ollama_checkbox.isChecked()
-        if use_blocknet and not blocknet_relay:
-            self.router_logger.log_message("[RouterTab] ❌ BlockNet enabled but BlockNet Relay is empty.")
-            return
-        use_scrapewebsite = self.router_tab.use_scrapewebsite_checkbox.isChecked()
-        scrapewebsite_endpoint = self.router_tab.scrapewebsite_endpoint_input.text().strip()
-        use_wifi_host = (
-            self.router_tab.use_wifi_host_checkbox.isChecked()
-        )
+            use_stratum_comm = tab.stratum_comm_checkbox.isChecked()
+            use_blocknet = tab.blocknet_checkbox.isChecked()
+            use_peer_to_peer = tab.peer_to_peer_checkbox.isChecked()
 
-        wifi_ssid = (
-            self.router_tab.wifi_ssid_input.text().strip()
-        )
-
-        wifi_password = (
-            self.router_tab.wifi_password_input.text()
-        )
-        if use_wifi_host:
-            if not wifi_ssid:
-                self.router_logger.log_message(
-                    "[RouterTab][WiFi] ❌ Enter a wireless network name."
-                )
-                return
-
-            try:
-                ssid_length = len(wifi_ssid.encode("utf-8"))
-            except Exception:
-                ssid_length = 0
-
-            if not 1 <= ssid_length <= 32:
-                self.router_logger.log_message(
-                    "[RouterTab][WiFi] ❌ The SSID must contain "
-                    "between 1 and 32 UTF-8 bytes."
-                )
-                return
-
-            if not 8 <= len(wifi_password) <= 63:
-                self.router_logger.log_message(
-                    "[RouterTab][WiFi] ❌ The wireless password must "
-                    "contain between 8 and 63 characters."
-                )
-                return
-
-            self.router_logger.log_message(
-                "[RouterTab][WiFi] 📶 Wireless hosting enabled for "
-                f"SSID '{wifi_ssid}'."
+            use_dhcp_out = tab.dhcp_out_checkbox.isChecked()
+            use_dhcp_in = tab.dhcp_in_checkbox.isChecked()
+            use_static = tab.use_static_checkbox.isChecked()
+            use_hyperv = tab.use_hyperv_checkbox.isChecked()
+            use_netroute = tab.use_netroute_checkbox.isChecked()
+            router_ip_out = tab.router_ip_out_input.text().strip()
+            netmask_out = tab.router_netmask_out_input.text().strip()
+            router_ip_in = tab.router_ip_in_input.text().strip()
+            netmask_in = tab.router_netmask_in_input.text().strip()
+            use_hostbypass = tab.use_hostbypass_checkbox.isChecked()
+            blocknet_relay = tab.blocknet_relay_input.text().strip()
+            blocknet_token = tab.blocknet_token_input.text().strip()
+            use_gateway = tab.use_gateway_checkbox.isChecked()
+            use_lan = tab.use_lan_checkbox.isChecked()
+            use_uplink = tab.use_uplink_checkbox.isChecked()
+            nat_os = tab.nat_os_checkbox.isChecked()
+            python_server = tab.python_server_checkbox.isChecked()
+            promisc = tab.promisc_checkbox.isChecked()
+            use_socket = tab.use_socket.isChecked()
+            use_ollama = tab.ollama_checkbox.isChecked()
+            use_scrapewebsite = (
+                tab.use_scrapewebsite_checkbox.isChecked()
             )
+            scrapewebsite_endpoint = (
+                tab.scrapewebsite_endpoint_input.text().strip()
+            )
+
+            if use_blocknet and not blocknet_relay:
+                raise ValueError(
+                    "BlockNet is enabled but BlockNet Relay is empty."
+                )
+
+            import ipaddress
+
+            for value, label in (
+                (router_ip_out, "Router WAN IP"),
+                (router_ip_in, "Router LAN IP"),
+            ):
+                if value:
+                    try:
+                        ipaddress.IPv4Address(value)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"{label} is not a valid IPv4 address."
+                        ) from exc
+
+            for address, mask, label in (
+                (
+                    router_ip_out,
+                    netmask_out,
+                    "Router WAN netmask",
+                ),
+                (
+                    router_ip_in,
+                    netmask_in,
+                    "Router LAN netmask",
+                ),
+            ):
+                if address:
+                    try:
+                        ipaddress.IPv4Network(
+                            f"{address}/{mask}",
+                            strict=False,
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            f"{label} is invalid."
+                        ) from exc
+
+            # ---------------- Stratum ----------------
+            stratum_mode = (
+                "daemon"
+                if tab.stratum_mode_dropdown.currentText()
+                == "Local Monero Daemon"
+                else "pool"
+            )
+            stratum_pool_port = 3333
+            stratum_proxy_port = 3334
+            stratum_wallet = tab.stratum_wallet_input.text().strip()
+            stratum_password = tab.stratum_password_input.text()
+            stratum_worker = (
+                tab.stratum_worker_input.text().strip()
+                or "PythonProxy"
+            )
+            stratum_use_tls = {
+                "Enabled": True,
+                "Disabled": False,
+            }.get(
+                tab.stratum_tls_dropdown.currentText(),
+                "auto",
+            )
+            stratum_tls_hostname = (
+                tab.stratum_sni_input.text().strip() or None
+            )
+            stratum_enable_proxy = (
+                tab.stratum_proxy_checkbox.isChecked()
+            )
+            stratum_proxy_host = (
+                tab.stratum_proxy_host_input.text().strip()
+                or "127.0.0.1"
+            )
+            stratum_user_agent = (
+                tab.stratum_user_agent_input.text().strip()
+                or "pystratum/0.5"
+            )
+            stratum_daemon_url = (
+                tab.stratum_daemon_url_input.text().strip()
+            )
+            stratum_zmq_address = (
+                tab.stratum_zmq_address_input.text().strip()
+            )
+
+            if use_stratum_comm:
+                if not stratum_wallet:
+                    raise ValueError(
+                        "Stratum wallet/login is required."
+                    )
+
+                if stratum_mode == "pool":
+                    if not p2pool_server_ip:
+                        raise ValueError(
+                            "Stratum pool host is required."
+                        )
+                    stratum_pool_port = self._int_setting(
+                        tab.stratum_pool_port_input.text(),
+                        "Stratum pool port",
+                        minimum=1,
+                        maximum=65535,
+                    )
+                    if stratum_enable_proxy:
+                        stratum_proxy_port = self._int_setting(
+                            tab.stratum_proxy_port_input.text(),
+                            "Stratum proxy port",
+                            minimum=1,
+                            maximum=65535,
+                        )
+
+                        local_names = {
+                            "127.0.0.1",
+                            "localhost",
+                            "::1",
+                        }
+                        if (
+                            p2pool_server_ip.casefold()
+                            in local_names
+                            and stratum_proxy_host.casefold()
+                            in local_names.union({"0.0.0.0", "::"})
+                            and stratum_pool_port
+                            == stratum_proxy_port
+                        ):
+                            raise ValueError(
+                                "The local Stratum proxy port must differ "
+                                "from the local upstream pool port."
+                            )
+                elif not stratum_daemon_url or not stratum_zmq_address:
+                    raise ValueError(
+                        "Daemon RPC URL and ZMQ address are required "
+                        "for Local Monero Daemon mode."
+                    )
+
+            # ---------------- DHCP ----------------
+            enable_dhcp_server = tab.dhcp_server_checkbox.isChecked()
+            serve_dhcp_on_wan = (
+                tab.serve_dhcp_on_wan_checkbox.isChecked()
+            )
+
+            dhcp_server_settings = {}
+            if enable_dhcp_server:
+                dhcp_pool_start = (
+                    tab.dhcp_pool_start_input.text().strip()
+                )
+                dhcp_pool_end = tab.dhcp_pool_end_input.text().strip()
+                dhcp_enforce_subnet = (
+                    tab.dhcp_enforce_subnet_checkbox.isChecked()
+                )
+
+                if bool(dhcp_pool_start) != bool(dhcp_pool_end):
+                    raise ValueError(
+                        "LAN DHCP pool start and end must both be "
+                        "filled or both left blank for automatic sizing."
+                    )
+                if dhcp_pool_start and dhcp_pool_end:
+                    self._validate_ipv4_scope(
+                        label="LAN DHCP",
+                        pool_start=dhcp_pool_start,
+                        pool_end=dhcp_pool_end,
+                        router_ip=router_ip_in,
+                        netmask=netmask_in,
+                        enforce_same_subnet=dhcp_enforce_subnet,
+                    )
+
+                dhcp_dns_v4 = self._validated_ip_list(
+                    self._csv_setting(tab.dhcp_dns_input.text()),
+                    "LAN DHCP DNS",
+                    version=4,
+                )
+                dhcp_dns_v6 = self._validated_ip_list(
+                    self._csv_setting(tab.dhcp_dns_v6_input.text()),
+                    "LAN DHCP IPv6 DNS",
+                    version=6,
+                )
+                dhcp_relay_target = (
+                    tab.dhcp_relay_input.text().strip() or None
+                )
+                if dhcp_relay_target:
+                    self._validated_ip_list(
+                        [dhcp_relay_target],
+                        "LAN DHCP relay",
+                        version=4,
+                    )
+                dhcp6_relay_target = (
+                    tab.dhcp6_relay_input.text().strip() or None
+                )
+                if dhcp6_relay_target:
+                    self._validated_ip_list(
+                        [dhcp6_relay_target],
+                        "LAN DHCPv6 relay",
+                        version=6,
+                    )
+                dhcp6_prefix = (
+                    tab.dhcp6_prefix_input.text().strip() or None
+                )
+                if dhcp6_prefix:
+                    try:
+                        parsed_prefix = ipaddress.ip_network(
+                            dhcp6_prefix,
+                            strict=False,
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            "LAN DHCPv6 prefix is invalid."
+                        ) from exc
+                    if parsed_prefix.version != 6:
+                        raise ValueError(
+                            "LAN DHCPv6 prefix must be IPv6."
+                        )
+                    dhcp6_prefix = str(parsed_prefix)
+
+                dhcp_server_settings = {
+                    "pool_start": dhcp_pool_start or None,
+                    "pool_end": dhcp_pool_end or None,
+                    "dns_v4": dhcp_dns_v4,
+                    "domain_name": (
+                        tab.dhcp_domain_input.text().strip()
+                        or "lan.internal"
+                    ),
+                    "lease_duration_seconds": self._int_setting(
+                        tab.dhcp_lease_seconds_input.text(),
+                        "LAN DHCP lease seconds",
+                        minimum=60,
+                    ),
+                    "max_leases": self._int_setting(
+                        tab.dhcp_max_leases_input.text(),
+                        "LAN DHCP max leases",
+                        minimum=1,
+                        allow_blank=True,
+                    ),
+                    "authoritative": (
+                        tab.dhcp_authoritative_checkbox.isChecked()
+                    ),
+                    "allow_out_of_pool": (
+                        tab.dhcp_allow_out_of_pool_checkbox.isChecked()
+                    ),
+                    "enforce_same_subnet": dhcp_enforce_subnet,
+                    "rogue_policy": (
+                        "nak_on_mismatch"
+                        if tab.dhcp_rogue_policy_dropdown.currentText()
+                        == "NAK on Mismatch"
+                        else "log"
+                    ),
+                    "dhcp_relay_target_ip": dhcp_relay_target,
+                    "dhcp6_prefix": dhcp6_prefix,
+                    "dhcp6_relay_target_ip": dhcp6_relay_target,
+                    "dns_v6": dhcp_dns_v6,
+                    "search_domains": self._csv_setting(
+                        tab.dhcp_search_domains_input.text()
+                    ),
+                }
+
+            wan_dhcp_server_settings = {}
+            if serve_dhcp_on_wan:
+                wan_pool_start = (
+                    tab.wan_dhcp_pool_start_input.text().strip()
+                )
+                wan_pool_end = (
+                    tab.wan_dhcp_pool_end_input.text().strip()
+                )
+                wan_enforce_subnet = (
+                    tab.wan_dhcp_enforce_subnet_checkbox.isChecked()
+                )
+                if not router_ip_out:
+                    raise ValueError(
+                        "Router WAN IP is required when WAN DHCP is enabled."
+                    )
+                self._validate_ipv4_scope(
+                    label="WAN DHCP",
+                    pool_start=wan_pool_start,
+                    pool_end=wan_pool_end,
+                    router_ip=router_ip_out,
+                    netmask=netmask_out,
+                    enforce_same_subnet=wan_enforce_subnet,
+                )
+
+                wan_dns_v4 = self._validated_ip_list(
+                    self._csv_setting(
+                        tab.wan_dhcp_dns_input.text()
+                    ),
+                    "WAN DHCP DNS",
+                    version=4,
+                )
+                wan_relay_target = (
+                    tab.wan_dhcp_relay_input.text().strip() or None
+                )
+                if wan_relay_target:
+                    self._validated_ip_list(
+                        [wan_relay_target],
+                        "WAN DHCP relay",
+                        version=4,
+                    )
+
+                wan_dhcp_server_settings = {
+                    "pool_start": wan_pool_start,
+                    "pool_end": wan_pool_end,
+                    "dns_v4": wan_dns_v4,
+                    "domain_name": (
+                        tab.wan_dhcp_domain_input.text().strip()
+                        or "wan.router"
+                    ),
+                    "lease_duration_seconds": self._int_setting(
+                        tab.wan_dhcp_lease_seconds_input.text(),
+                        "WAN DHCP lease seconds",
+                        minimum=60,
+                    ),
+                    "max_leases": self._int_setting(
+                        tab.wan_dhcp_max_leases_input.text(),
+                        "WAN DHCP max leases",
+                        minimum=1,
+                        allow_blank=True,
+                    ),
+                    "authoritative": (
+                        tab.wan_dhcp_authoritative_checkbox.isChecked()
+                    ),
+                    "allow_out_of_pool": (
+                        tab.wan_dhcp_allow_out_of_pool_checkbox.isChecked()
+                    ),
+                    "enforce_same_subnet": wan_enforce_subnet,
+                    "rogue_policy": (
+                        "nak_on_mismatch"
+                        if (
+                            tab.wan_dhcp_rogue_policy_dropdown.currentText()
+                            == "NAK on Mismatch"
+                        )
+                        else "log"
+                    ),
+                    "dhcp_relay_target_ip": wan_relay_target,
+                }
+
+                self.router_logger.log_message(
+                    "[RouterTab][DHCP-WAN] ⚠️ WAN DHCP is enabled. "
+                    f"Serving {wan_pool_start}-{wan_pool_end} only on "
+                    "the selected WAN interface."
+                )
+
+            # ---------------- manager settings ----------------
+            gateway_settings = {}
+            if use_gateway:
+                gateway_upstream_dns = self._validated_ip_list(
+                    self._csv_setting(
+                        tab.gateway_upstream_dns_input.text()
+                    ),
+                    "Gateway upstream DNS",
+                )
+                gateway_dns64_prefix = (
+                    tab.gateway_dns64_prefix_input.text().strip()
+                    or "64:ff9b::/96"
+                )
+                try:
+                    parsed_dns64_prefix = ipaddress.ip_network(
+                        gateway_dns64_prefix,
+                        strict=False,
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "Gateway DNS64 prefix is invalid."
+                    ) from exc
+                if parsed_dns64_prefix.version != 6:
+                    raise ValueError(
+                        "Gateway DNS64 prefix must be IPv6."
+                    )
+                gateway_settings = {
+                    "health_interval_sec": self._float_setting(
+                        tab.gateway_health_interval_input.text(),
+                        "Gateway health interval",
+                        minimum=0.5,
+                    ),
+                    "enable_dns64": (
+                        tab.gateway_dns64_checkbox.isChecked()
+                    ),
+                    "dns64_prefix": str(parsed_dns64_prefix),
+                    "upstream_dns": gateway_upstream_dns,
+                    "repair_on_failure": (
+                        tab.gateway_repair_checkbox.isChecked()
+                    ),
+                    "pin_gateway_arp": (
+                        tab.gateway_pin_arp_checkbox.isChecked()
+                    ),
+                    "probe_budget_max_packets": self._int_setting(
+                        tab.gateway_probe_budget_input.text(),
+                        "Gateway probe budget",
+                        minimum=1,
+                    ),
+                }
+
+            lan_settings = {}
+            if use_lan:
+                lan_settings = {
+                    "bridge_name": (
+                        tab.lan_bridge_name_input.text().strip()
+                        or "ManagedLANBridge"
+                    ),
+                    "create_bridge": (
+                        tab.lan_create_bridge_checkbox.isChecked()
+                    ),
+                    "health_interval_sec": self._float_setting(
+                        tab.lan_health_interval_input.text(),
+                        "LAN health interval",
+                        minimum=5.0,
+                    ),
+                    "handle_icmp": (
+                        tab.lan_handle_icmp_checkbox.isChecked()
+                    ),
+                    "start_transport_dhcp_client": (
+                        tab.lan_transport_dhcp_client_checkbox.isChecked()
+                    ),
+                }
+
+            uplink_settings = {}
+            if use_uplink:
+                uplink_settings = {
+                    "health_interval_sec": self._float_setting(
+                        tab.uplink_health_interval_input.text(),
+                        "Uplink health interval",
+                        minimum=5.0,
+                    ),
+                    "preferred_iface_names": self._csv_setting(
+                        tab.uplink_preferred_ifaces_input.text()
+                    ) or ["Wi-Fi"],
+                    "allow_router_failover": (
+                        tab.uplink_allow_failover_checkbox.isChecked()
+                    ),
+                    "preserve_wifi_link": (
+                        tab.uplink_preserve_wifi_checkbox.isChecked()
+                    ),
+                    "minimum_public_score_to_activate": (
+                        self._float_setting(
+                            tab.uplink_min_score_input.text(),
+                            "Uplink minimum public score",
+                            minimum=0.0,
+                        )
+                    ),
+                }
+
+            python_server_settings = {}
+            if python_server:
+                python_server_settings = {
+                    "host": (
+                        tab.python_server_host_input.text().strip()
+                        or "0.0.0.0"
+                    ),
+                    "port": self._int_setting(
+                        tab.python_server_port_input.text(),
+                        "Python server port",
+                        minimum=1,
+                        maximum=65535,
+                    ),
+                    "dashboard_title": (
+                        tab.python_server_title_input.text().strip()
+                        or "Router Dashboard"
+                    ),
+                    "max_packets": self._int_setting(
+                        tab.python_server_max_packets_input.text(),
+                        "Python server max packets",
+                        minimum=100,
+                    ),
+                    "max_logs": self._int_setting(
+                        tab.python_server_max_logs_input.text(),
+                        "Python server max logs",
+                        minimum=100,
+                    ),
+                    "max_events": self._int_setting(
+                        tab.python_server_max_events_input.text(),
+                        "Python server max events",
+                        minimum=200,
+                    ),
+                    "store_raw_packets": (
+                        tab.python_server_store_raw_checkbox.isChecked()
+                    ),
+                    "max_raw_packet_bytes": self._int_setting(
+                        tab.python_server_max_raw_bytes_input.text(),
+                        "Python server max raw packet bytes",
+                        minimum=0,
+                    ),
+                }
+
+            # ---------------- core packet managers ----------------
+            packet_catcher_tcp_rate = self._float_setting(
+                tab.packet_catcher_tcp_rate_input.text(),
+                "Packet catcher TCP rate",
+                minimum=0.0,
+            )
+            packet_catcher_udp_rate = self._float_setting(
+                tab.packet_catcher_udp_rate_input.text(),
+                "Packet catcher UDP rate",
+                minimum=0.0,
+            )
+            packet_catcher_default_rate = self._float_setting(
+                tab.packet_catcher_default_rate_input.text(),
+                "Packet catcher default rate",
+                minimum=0.0,
+            )
+            for rate_name, rate_value in (
+                ("Packet catcher TCP rate", packet_catcher_tcp_rate),
+                ("Packet catcher UDP rate", packet_catcher_udp_rate),
+                (
+                    "Packet catcher default rate",
+                    packet_catcher_default_rate,
+                ),
+            ):
+                if rate_value > 1.0:
+                    raise ValueError(
+                        f"{rate_name} must not exceed 1.0."
+                    )
+
+            manager_settings = {
+                "enable_firewall": (
+                    tab.core_firewall_checkbox.isChecked()
+                ),
+                "enable_packet_analyzer": (
+                    tab.core_packet_analyzer_checkbox.isChecked()
+                ),
+                "enable_packet_catcher": (
+                    tab.core_packet_catcher_checkbox.isChecked()
+                ),
+                "enable_handshake": (
+                    tab.core_handshake_checkbox.isChecked()
+                ),
+                "enable_syn_scanner": (
+                    tab.core_syn_scanner_checkbox.isChecked()
+                ),
+                "enable_igmp": (
+                    tab.core_igmp_checkbox.isChecked()
+                ),
+                "enable_mdns": (
+                    tab.core_mdns_checkbox.isChecked()
+                ),
+                "handshake_timeout_half_open": self._int_setting(
+                    tab.handshake_half_open_timeout_input.text(),
+                    "Handshake half-open timeout",
+                    minimum=1,
+                ),
+                "handshake_timeout_established": self._int_setting(
+                    tab.handshake_established_timeout_input.text(),
+                    "Handshake established timeout",
+                    minimum=1,
+                ),
+                "handshake_rate_limit_threshold": self._int_setting(
+                    tab.handshake_rate_threshold_input.text(),
+                    "Handshake rate threshold",
+                    minimum=1,
+                ),
+                "handshake_rate_limit_period": self._int_setting(
+                    tab.handshake_rate_period_input.text(),
+                    "Handshake rate period",
+                    minimum=1,
+                ),
+                "handshake_ban_duration": self._int_setting(
+                    tab.handshake_ban_duration_input.text(),
+                    "Handshake ban duration",
+                    minimum=1,
+                ),
+                "handshake_log_tcp_lifecycle": (
+                    tab.handshake_log_tcp_checkbox.isChecked()
+                ),
+                "handshake_log_non_tls_tcp": (
+                    tab.handshake_log_non_tls_checkbox.isChecked()
+                ),
+                "handshake_log_tls_records": (
+                    tab.handshake_log_tls_records_checkbox.isChecked()
+                ),
+                "handshake_log_application_data": (
+                    tab.handshake_log_app_data_checkbox.isChecked()
+                ),
+                "handshake_log_tls13_key_events": (
+                    tab.handshake_log_tls13_keys_checkbox.isChecked()
+                ),
+                "syn_scan_interval": self._int_setting(
+                    tab.syn_scan_interval_input.text(),
+                    "SYN scan interval",
+                    minimum=1,
+                ),
+                "packet_catcher_tcp_rate": (
+                    packet_catcher_tcp_rate
+                ),
+                "packet_catcher_udp_rate": (
+                    packet_catcher_udp_rate
+                ),
+                "packet_catcher_default_rate": (
+                    packet_catcher_default_rate
+                ),
+            }
+
+            # ---------------- transport managers ----------------
+            transport_settings = {
+                "enabled": (
+                    tab.transport_enabled_checkbox.isChecked()
+                ),
+                "protocol_enabled": {
+                    key: checkbox.isChecked()
+                    for key, checkbox
+                    in tab.transport_protocol_checkboxes.items()
+                },
+                "stratum_ports": self._port_list_setting(
+                    tab.transport_stratum_ports_input.text(),
+                    "Transport Stratum ports",
+                ),
+                "monero_ports": self._port_list_setting(
+                    tab.transport_monero_ports_input.text(),
+                    "Transport Monero ports",
+                ),
+                "voip_port_start": self._int_setting(
+                    tab.transport_voip_start_input.text(),
+                    "Transport VoIP start port",
+                    minimum=1,
+                    maximum=65535,
+                ),
+                "voip_port_end": self._int_setting(
+                    tab.transport_voip_end_input.text(),
+                    "Transport VoIP end port",
+                    minimum=1,
+                    maximum=65535,
+                ),
+                "parallel_analysis": (
+                    tab.transport_parallel_analysis_checkbox.isChecked()
+                ),
+                "inspection_log_rps": self._float_setting(
+                    tab.transport_inspection_rps_input.text(),
+                    "Inspection logs per second",
+                    minimum=0.01,
+                ),
+                "inspection_log_burst": self._int_setting(
+                    tab.transport_inspection_burst_input.text(),
+                    "Inspection log burst",
+                    minimum=1,
+                ),
+                "inspection_flow_cooldown_sec": self._float_setting(
+                    tab.transport_inspection_cooldown_input.text(),
+                    "Inspection flow cooldown",
+                    minimum=0.0,
+                ),
+                "stratum_log_rps": self._float_setting(
+                    tab.transport_stratum_rps_input.text(),
+                    "Transport Stratum logs per second",
+                    minimum=0.01,
+                ),
+                "stratum_log_burst": self._int_setting(
+                    tab.transport_stratum_burst_input.text(),
+                    "Transport Stratum log burst",
+                    minimum=1,
+                ),
+                "stratum_flow_cooldown_sec": self._float_setting(
+                    tab.transport_stratum_cooldown_input.text(),
+                    "Transport Stratum cooldown",
+                    minimum=0.0,
+                ),
+                "monero_log_rps": self._float_setting(
+                    tab.transport_monero_rps_input.text(),
+                    "Transport Monero logs per second",
+                    minimum=0.01,
+                ),
+                "monero_log_burst": self._int_setting(
+                    tab.transport_monero_burst_input.text(),
+                    "Transport Monero log burst",
+                    minimum=1,
+                ),
+                "monero_flow_cooldown_sec": self._float_setting(
+                    tab.transport_monero_cooldown_input.text(),
+                    "Transport Monero cooldown",
+                    minimum=0.0,
+                ),
+                "dns_pending_ttl_sec": self._int_setting(
+                    tab.transport_dns_pending_ttl_input.text(),
+                    "Transport DNS pending TTL",
+                    minimum=1,
+                ),
+                "dns_gc_interval_sec": self._int_setting(
+                    tab.transport_dns_gc_interval_input.text(),
+                    "Transport DNS GC interval",
+                    minimum=1,
+                ),
+                "dns_alert_on_rebind": (
+                    tab.transport_dns_rebind_alert_checkbox.isChecked()
+                ),
+                "dhcp_transaction_ttl_sec": self._int_setting(
+                    tab.transport_dhcp_transaction_ttl_input.text(),
+                    "Transport DHCP transaction TTL",
+                    minimum=1,
+                ),
+                "dhcp_lease_ttl_sec": self._int_setting(
+                    tab.transport_dhcp_lease_ttl_input.text(),
+                    "Transport DHCP observed lease TTL",
+                    minimum=60,
+                ),
+                "https_logging": (
+                    tab.transport_https_logging_checkbox.isChecked()
+                ),
+                "https_parse_certificates": (
+                    tab.transport_https_certificates_checkbox.isChecked()
+                ),
+                "https_parse_quic_crypto": (
+                    tab.transport_https_quic_crypto_checkbox.isChecked()
+                ),
+            }
+            if (
+                    transport_settings["voip_port_start"]
+                    > transport_settings["voip_port_end"]
+            ):
+                raise ValueError(
+                    "Transport VoIP start port must not exceed "
+                    "the end port."
+                )
+
+            # ---------------- Wi-Fi host ----------------
+            use_wifi_host = tab.use_wifi_host_checkbox.isChecked()
+            wifi_ssid = tab.wifi_ssid_input.text().strip()
+            wifi_password = tab.wifi_password_input.text()
+            wifi_settings = {}
+
+            if use_wifi_host:
+                if not wifi_ssid:
+                    raise ValueError(
+                        "Enter a wireless network name."
+                    )
+                ssid_length = len(wifi_ssid.encode("utf-8"))
+                if not 1 <= ssid_length <= 32:
+                    raise ValueError(
+                        "The SSID must contain 1-32 UTF-8 bytes."
+                    )
+                if not 8 <= len(wifi_password) <= 63:
+                    raise ValueError(
+                        "The wireless password must contain "
+                        "8-63 characters."
+                    )
+
+                wifi_router_ip = (
+                    tab.wifi_router_ip_input.text().strip()
+                )
+                try:
+                    ipaddress.IPv4Address(wifi_router_ip)
+                except Exception as exc:
+                    raise ValueError(
+                        "Wireless router IP is invalid."
+                    ) from exc
+
+                wifi_settings = {
+                    "hotspot_router_ip": wifi_router_ip,
+                    "hotspot_prefix_length": self._int_setting(
+                        tab.wifi_prefix_length_input.text(),
+                        "Wireless prefix length",
+                        minimum=1,
+                        maximum=30,
+                    ),
+                    "auto_restart": (
+                        tab.wifi_auto_restart_checkbox.isChecked()
+                    ),
+                    "start_timeout": self._float_setting(
+                        tab.wifi_start_timeout_input.text(),
+                        "Wireless start timeout",
+                        minimum=5.0,
+                    ),
+                    "adapter_timeout": self._float_setting(
+                        tab.wifi_adapter_timeout_input.text(),
+                        "Wireless adapter timeout",
+                        minimum=5.0,
+                    ),
+                }
+
+                self.router_logger.log_message(
+                    "[RouterTab][WiFi] 📶 Wireless hosting enabled for "
+                    f"SSID '{wifi_ssid}'."
+                )
+
+        except ValueError as exc:
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ Settings error: {exc}"
+            )
+            return
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ Could not read settings: {exc}"
+            )
+            return
+
         try:
             self.helper.router_manager.start_routing(
                 use_dhcp_out=use_dhcp_out,
                 use_dhcp_in=use_dhcp_in,
-                router_ip_out=lan_ip,
+                router_ip_out=router_ip_out,
                 netmask_out=netmask_out,
                 use_static=use_static,
                 use_hyperv=use_hyperv,
@@ -529,11 +1418,56 @@ class P2PoolGUI(QMainWindow):
                     else None
                 ),
                 wifi_executable_path=None,
+                router_ip_in=router_ip_in or None,
+                netmask_in=netmask_in,
+                enable_dhcp_server=enable_dhcp_server,
+                serve_dhcp_on_wan=serve_dhcp_on_wan,
+                dhcp_server_settings=dhcp_server_settings,
+                wan_dhcp_server_settings=wan_dhcp_server_settings,
+                gateway_settings=gateway_settings,
+                lan_settings=lan_settings,
+                uplink_settings=uplink_settings,
+                python_server_settings=python_server_settings,
+                wifi_settings=wifi_settings,
+                stratum_connection_mode=stratum_mode,
+                stratum_pool_port=stratum_pool_port,
+                stratum_wallet=stratum_wallet,
+                stratum_password=stratum_password,
+                stratum_worker=stratum_worker,
+                stratum_proxy_host=stratum_proxy_host,
+                stratum_proxy_port=stratum_proxy_port,
+                stratum_enable_proxy=stratum_enable_proxy,
+                stratum_use_tls=stratum_use_tls,
+                stratum_tls_hostname=stratum_tls_hostname,
+                stratum_user_agent=stratum_user_agent,
+                stratum_daemon_url=stratum_daemon_url,
+                stratum_zmq_address=stratum_zmq_address,
+                manager_settings=manager_settings,
+                transport_settings=transport_settings,
             )
         except Exception as e:
-            self.router_logger.log_message(f"[RouterTab] ❌ Exception during router start: {e}")
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ Exception during router start: {e}"
+            )
             return
 
+        if not getattr(self.helper.router_manager, "started", False):
+            self.router_logger.log_message(
+                "[RouterTab] ❌ Router startup did not complete. "
+                "Review the Router log for the failing manager."
+            )
+            return
+
+        self._active_router_stop_flags = {
+            "use_stratum_comm": use_stratum_comm,
+            "use_dhcp_out": use_dhcp_out,
+            "use_dhcp_in": use_dhcp_in,
+            "use_static": use_static,
+            "use_hyperv": use_hyperv,
+            "use_netroute": use_netroute,
+            "nat_os": nat_os,
+            "use_ollama": use_ollama,
+        }
         self.router_tab.start_router_button.setEnabled(False)
         self.router_tab.stop_router_button.setEnabled(True)
 
@@ -548,13 +1482,39 @@ class P2PoolGUI(QMainWindow):
         self.router_tab.stop_router_button.setEnabled(False)
 
         try:
-            use_stratum_comm = self.router_tab.stratum_comm_checkbox.isChecked()
-            use_dhcp_out = self.router_tab.dhcp_out_checkbox.isChecked()
-            use_dhcp_in = self.router_tab.dhcp_in_checkbox.isChecked()
-            use_static = self.router_tab.use_static_checkbox.isChecked()
-            use_hyperv = self.router_tab.use_hyperv_checkbox.isChecked()
-            use_netroute = self.router_tab.use_netroute_checkbox.isChecked()
-            nat_os = self.router_tab.nat_os_checkbox.isChecked()
+            active_flags = getattr(
+                self,
+                "_active_router_stop_flags",
+                {},
+            )
+            use_stratum_comm = active_flags.get(
+                "use_stratum_comm",
+                self.router_tab.stratum_comm_checkbox.isChecked(),
+            )
+            use_dhcp_out = active_flags.get(
+                "use_dhcp_out",
+                self.router_tab.dhcp_out_checkbox.isChecked(),
+            )
+            use_dhcp_in = active_flags.get(
+                "use_dhcp_in",
+                self.router_tab.dhcp_in_checkbox.isChecked(),
+            )
+            use_static = active_flags.get(
+                "use_static",
+                self.router_tab.use_static_checkbox.isChecked(),
+            )
+            use_hyperv = active_flags.get(
+                "use_hyperv",
+                self.router_tab.use_hyperv_checkbox.isChecked(),
+            )
+            use_netroute = active_flags.get(
+                "use_netroute",
+                self.router_tab.use_netroute_checkbox.isChecked(),
+            )
+            nat_os = active_flags.get(
+                "nat_os",
+                self.router_tab.nat_os_checkbox.isChecked(),
+            )
             self.router_logger.log_message(
                 f"[GUI] stop_router flags: "
                 f"stratum={use_stratum_comm}, "
@@ -563,7 +1523,10 @@ class P2PoolGUI(QMainWindow):
                 f"static={use_static}, "
                 f"hyperv={use_hyperv}"
             )
-            use_ollama = self.router_tab.ollama_checkbox.isChecked()
+            use_ollama = active_flags.get(
+                "use_ollama",
+                self.router_tab.ollama_checkbox.isChecked(),
+            )
             self.helper.router_manager.stop_routing(
                 use_dhcp_out,
                 use_dhcp_in,
@@ -577,6 +1540,7 @@ class P2PoolGUI(QMainWindow):
 
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
+            self._active_router_stop_flags = {}
 
         except Exception as e:
             self.router_logger.log_message(f"[GUI] Exception during router stop: {e}")
@@ -642,3 +1606,5 @@ class P2PoolGUI(QMainWindow):
 
         self.gui_logger.log_message("[GUI] All GUI-managed threads cleanup attempted.")
         event.accept()
+
+

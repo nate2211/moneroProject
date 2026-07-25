@@ -1728,8 +1728,15 @@ class RouterTab(QWidget):
     def __init__(self, logger, parent=None):
         super().__init__(parent)
         self.router_logger = logger
+
+        self.router_logger.message_signal.connect(
+            self.log_message,
+            Qt.ConnectionType.QueuedConnection
+        )
         self._console_panes = {}
         self._pane_index = {}
+        self._settings_sections = {}
+        self._active_settings_section = None
 
         self.presets = {
             "Full": [
@@ -1765,18 +1772,94 @@ class RouterTab(QWidget):
         self._log_flush_timer.timeout.connect(self._flush_log_queue)
         self._log_flush_timer.start()
 
-        self.router_logger.message_signal.connect(
-            self.log_message,
-            Qt.ConnectionType.QueuedConnection
-        )
 
     def _create_widgets(self):
         self.start_router_button = QPushButton("Start Router")
         self.stop_router_button = QPushButton("Stop Router")
         self.stop_router_button.setEnabled(False)
 
+        self.settings_toggle_button = QPushButton("⚙ Settings ▶")
+        self.settings_toggle_button.setCheckable(True)
+        self.settings_toggle_button.setChecked(False)
+        self.settings_toggle_button.setToolTip(
+            "Show or hide all router settings menus."
+        )
+
         self.stratum_comm_checkbox = QCheckBox("Use Stratum Comm")
         self.stratum_comm_checkbox.setChecked(False)
+
+        self.stratum_mode_dropdown = QComboBox()
+        self.stratum_mode_dropdown.addItems(
+            ["Direct Pool / P2Pool", "Local Monero Daemon"]
+        )
+
+        self.stratum_pool_host_input = QLineEdit()
+        self.stratum_pool_host_input.setText("127.0.0.1")
+        self.stratum_pool_host_input.setPlaceholderText(
+            "Pool address or hostname"
+        )
+
+        # Backward-compatible alias used by existing GUI code.
+        self.p2pool_server_ip_input = self.stratum_pool_host_input
+
+        self.stratum_pool_port_input = QLineEdit()
+        self.stratum_pool_port_input.setText("3333")
+        self.stratum_pool_port_input.setPlaceholderText("Pool port")
+
+        self.stratum_wallet_input = QLineEdit()
+        self.stratum_wallet_input.setText(
+            "46NctiVJGQgRPoFq84xqZkhQTbrkPnp9KGpcewpKQkyoMu3FsQifcWdRT5RdUoH9QsBUxUPowGUw7Ns44RCRByWwPCBkmgk"
+        )
+        self.stratum_wallet_input.setPlaceholderText(
+            "Wallet address or pool login"
+        )
+
+        self.stratum_password_input = QLineEdit()
+        self.stratum_password_input.setText("x")
+        self.stratum_password_input.setEchoMode(QLineEdit.Password)
+        self.stratum_password_input.setPlaceholderText(
+            "Stratum server password"
+        )
+        self.stratum_password_input.setToolTip(
+            "Used only for Stratum login and never written to router logs."
+        )
+
+        self.stratum_worker_input = QLineEdit()
+        self.stratum_worker_input.setText("PythonProxy")
+        self.stratum_worker_input.setPlaceholderText("Worker / rig name")
+
+        self.stratum_tls_dropdown = QComboBox()
+        self.stratum_tls_dropdown.addItems(["Auto", "Enabled", "Disabled"])
+
+        self.stratum_sni_input = QLineEdit()
+        self.stratum_sni_input.setPlaceholderText(
+            "TLS hostname / SNI (optional)"
+        )
+
+        self.stratum_proxy_checkbox = QCheckBox("Enable Local Stratum Proxy")
+        self.stratum_proxy_checkbox.setChecked(True)
+
+        self.stratum_proxy_host_input = QLineEdit()
+        self.stratum_proxy_host_input.setText("127.0.0.1")
+        self.stratum_proxy_host_input.setPlaceholderText("Proxy listen host")
+
+        self.stratum_proxy_port_input = QLineEdit()
+        self.stratum_proxy_port_input.setText("3334")
+        self.stratum_proxy_port_input.setPlaceholderText("Proxy listen port")
+
+        self.stratum_user_agent_input = QLineEdit()
+        self.stratum_user_agent_input.setText("pystratum/0.5")
+        self.stratum_user_agent_input.setPlaceholderText("Stratum user agent")
+
+        self.stratum_daemon_url_input = QLineEdit()
+        self.stratum_daemon_url_input.setText("http://127.0.0.1:18081")
+        self.stratum_daemon_url_input.setPlaceholderText("Monero daemon RPC URL")
+
+        self.stratum_zmq_address_input = QLineEdit()
+        self.stratum_zmq_address_input.setText("tcp://127.0.0.1:18083")
+        self.stratum_zmq_address_input.setPlaceholderText(
+            "Monero daemon ZMQ address"
+        )
 
         self.blocknet_checkbox = QCheckBox("Use BlockNet")
         self.blocknet_checkbox.setChecked(False)
@@ -1789,6 +1872,283 @@ class RouterTab(QWidget):
 
         self.dhcp_in_checkbox = QCheckBox("DHCP IN")
         self.dhcp_in_checkbox.setChecked(False)
+
+        self.dhcp_server_checkbox = QCheckBox("Run LAN DHCP Server")
+        self.dhcp_server_checkbox.setChecked(True)
+
+        self.serve_dhcp_on_wan_checkbox = QCheckBox(
+            "Serve DHCP on WAN"
+        )
+        self.serve_dhcp_on_wan_checkbox.setChecked(False)
+        self.serve_dhcp_on_wan_checkbox.setToolTip(
+            "Advanced: replies to DHCP clients on the selected WAN/uplink. "
+            "Leave disabled on networks you do not own or administer."
+        )
+
+        self.dhcp_pool_start_input = QLineEdit()
+        self.dhcp_pool_start_input.setPlaceholderText(
+            "Auto from router LAN network"
+        )
+        self.dhcp_pool_end_input = QLineEdit()
+        self.dhcp_pool_end_input.setPlaceholderText(
+            "Auto from router LAN network"
+        )
+        self.dhcp_dns_input = QLineEdit()
+        self.dhcp_dns_input.setPlaceholderText(
+            "Blank = router LAN IP; comma-separated"
+        )
+        self.dhcp_domain_input = QLineEdit()
+        self.dhcp_domain_input.setText("lan.internal")
+        self.dhcp_lease_seconds_input = QLineEdit()
+        self.dhcp_lease_seconds_input.setText("600")
+        self.dhcp_max_leases_input = QLineEdit()
+        self.dhcp_max_leases_input.setPlaceholderText(
+            "Blank = pool capacity"
+        )
+        self.dhcp_authoritative_checkbox = QCheckBox("Authoritative")
+        self.dhcp_authoritative_checkbox.setChecked(True)
+        self.dhcp_allow_out_of_pool_checkbox = QCheckBox(
+            "Allow Out-of-Pool Requests"
+        )
+        self.dhcp_allow_out_of_pool_checkbox.setChecked(False)
+        self.dhcp_enforce_subnet_checkbox = QCheckBox(
+            "Enforce Same Subnet"
+        )
+        self.dhcp_enforce_subnet_checkbox.setChecked(True)
+        self.dhcp_rogue_policy_dropdown = QComboBox()
+        self.dhcp_rogue_policy_dropdown.addItems(
+            ["Log Only", "NAK on Mismatch"]
+        )
+        self.dhcp_relay_input = QLineEdit()
+        self.dhcp_relay_input.setPlaceholderText(
+            "DHCPv4 relay target (optional)"
+        )
+        self.dhcp6_prefix_input = QLineEdit()
+        self.dhcp6_prefix_input.setPlaceholderText(
+            "IPv6 prefix (optional)"
+        )
+        self.dhcp6_relay_input = QLineEdit()
+        self.dhcp6_relay_input.setPlaceholderText(
+            "DHCPv6 relay target (optional)"
+        )
+        self.dhcp_dns_v6_input = QLineEdit()
+        self.dhcp_dns_v6_input.setText("fd00::1, fd00::2")
+        self.dhcp_search_domains_input = QLineEdit()
+        self.dhcp_search_domains_input.setText("lan.internal")
+
+        self.wan_dhcp_pool_start_input = QLineEdit()
+        self.wan_dhcp_pool_start_input.setPlaceholderText(
+            "WAN pool start"
+        )
+        self.wan_dhcp_pool_end_input = QLineEdit()
+        self.wan_dhcp_pool_end_input.setPlaceholderText(
+            "WAN pool end"
+        )
+        self.wan_dhcp_dns_input = QLineEdit()
+        self.wan_dhcp_dns_input.setPlaceholderText(
+            "Blank = router WAN IP; comma-separated"
+        )
+        self.wan_dhcp_domain_input = QLineEdit()
+        self.wan_dhcp_domain_input.setText("wan.router")
+        self.wan_dhcp_lease_seconds_input = QLineEdit()
+        self.wan_dhcp_lease_seconds_input.setText("600")
+        self.wan_dhcp_max_leases_input = QLineEdit()
+        self.wan_dhcp_max_leases_input.setPlaceholderText(
+            "Blank = pool capacity"
+        )
+        self.wan_dhcp_authoritative_checkbox = QCheckBox(
+            "WAN Authoritative"
+        )
+        self.wan_dhcp_authoritative_checkbox.setChecked(True)
+        self.wan_dhcp_allow_out_of_pool_checkbox = QCheckBox(
+            "WAN Allow Out-of-Pool"
+        )
+        self.wan_dhcp_allow_out_of_pool_checkbox.setChecked(False)
+        self.wan_dhcp_enforce_subnet_checkbox = QCheckBox(
+            "WAN Enforce Same Subnet"
+        )
+        self.wan_dhcp_enforce_subnet_checkbox.setChecked(True)
+        self.wan_dhcp_rogue_policy_dropdown = QComboBox()
+        self.wan_dhcp_rogue_policy_dropdown.addItems(
+            ["Log Only", "NAK on Mismatch"]
+        )
+        self.wan_dhcp_relay_input = QLineEdit()
+        self.wan_dhcp_relay_input.setPlaceholderText(
+            "WAN DHCP relay target (optional)"
+        )
+
+        self.transport_enabled_checkbox = QCheckBox(
+            "Enable Transport Manager"
+        )
+        self.transport_enabled_checkbox.setChecked(True)
+        self.transport_parallel_analysis_checkbox = QCheckBox(
+            "Parallel Passive Analysis"
+        )
+        self.transport_parallel_analysis_checkbox.setChecked(True)
+        self.transport_protocol_checkboxes = {}
+        transport_protocol_labels = [
+            ("inspection", "Deep Inspection"),
+            ("scraper", "Transport Scraper"),
+            ("https", "HTTPS / TLS"),
+            ("http", "HTTP"),
+            ("stratum", "Stratum"),
+            ("monero", "Monero / P2Pool"),
+            ("dns", "DNS"),
+            ("dhcp4", "DHCPv4"),
+            ("dhcp6", "DHCPv6"),
+            ("mdns", "mDNS"),
+            ("llmnr", "LLMNR"),
+            ("nbns", "NBNS"),
+            ("nbds", "NBDS"),
+            ("ssdp", "SSDP"),
+            ("ws_discovery", "WS-Discovery"),
+            ("quic", "QUIC"),
+            ("ipv6", "IPv6"),
+            ("ike_esp", "IKE / ESP"),
+            ("wireguard", "WireGuard"),
+            ("ssh", "SSH"),
+            ("ftp", "FTP"),
+            ("rdp", "RDP"),
+            ("kerberos", "Kerberos"),
+            ("steam", "Steam"),
+            ("scada", "SCADA"),
+            ("snmp", "SNMP"),
+            ("rip", "RIP"),
+            ("rtp", "RTP / VoIP"),
+            ("sip", "SIP"),
+            ("ntp", "NTP"),
+            ("tftp", "TFTP"),
+            ("overlay", "Overlay Networks"),
+            ("files", "File Services"),
+            ("tcp_ephemeral", "Ephemeral TCP"),
+            ("tcp_high_server", "High Server TCP"),
+            ("udp_ephemeral", "Ephemeral UDP"),
+            ("undecoded", "Undecoded UDP"),
+        ]
+        for protocol_key, protocol_label in transport_protocol_labels:
+            checkbox = QCheckBox(protocol_label)
+            checkbox.setChecked(True)
+            self.transport_protocol_checkboxes[
+                protocol_key
+            ] = checkbox
+
+        self.transport_stratum_ports_input = QLineEdit()
+        self.transport_stratum_ports_input.setText(
+            "3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444"
+        )
+        self.transport_monero_ports_input = QLineEdit()
+        self.transport_monero_ports_input.setText(
+            "18080, 28080, 38080, 41257, 18081, 18083, "
+            "18089, 28081, 38081, 37888, 37889"
+        )
+        self.transport_voip_start_input = QLineEdit()
+        self.transport_voip_start_input.setText("10000")
+        self.transport_voip_end_input = QLineEdit()
+        self.transport_voip_end_input.setText("20000")
+        self.transport_inspection_rps_input = QLineEdit()
+        self.transport_inspection_rps_input.setText("0.2")
+        self.transport_inspection_burst_input = QLineEdit()
+        self.transport_inspection_burst_input.setText("50")
+        self.transport_inspection_cooldown_input = QLineEdit()
+        self.transport_inspection_cooldown_input.setText("20.0")
+        self.transport_stratum_rps_input = QLineEdit()
+        self.transport_stratum_rps_input.setText("1.5")
+        self.transport_stratum_burst_input = QLineEdit()
+        self.transport_stratum_burst_input.setText("120")
+        self.transport_stratum_cooldown_input = QLineEdit()
+        self.transport_stratum_cooldown_input.setText("1.2")
+        self.transport_monero_rps_input = QLineEdit()
+        self.transport_monero_rps_input.setText("2.0")
+        self.transport_monero_burst_input = QLineEdit()
+        self.transport_monero_burst_input.setText("140")
+        self.transport_monero_cooldown_input = QLineEdit()
+        self.transport_monero_cooldown_input.setText("1.2")
+        self.transport_dns_pending_ttl_input = QLineEdit()
+        self.transport_dns_pending_ttl_input.setText("30")
+        self.transport_dns_gc_interval_input = QLineEdit()
+        self.transport_dns_gc_interval_input.setText("10")
+        self.transport_dns_rebind_alert_checkbox = QCheckBox(
+            "Alert on DNS Rebinding"
+        )
+        self.transport_dns_rebind_alert_checkbox.setChecked(True)
+        self.transport_dhcp_transaction_ttl_input = QLineEdit()
+        self.transport_dhcp_transaction_ttl_input.setText("180")
+        self.transport_dhcp_lease_ttl_input = QLineEdit()
+        self.transport_dhcp_lease_ttl_input.setText("86400")
+        self.transport_https_logging_checkbox = QCheckBox(
+            "HTTPS Logging"
+        )
+        self.transport_https_logging_checkbox.setChecked(True)
+        self.transport_https_certificates_checkbox = QCheckBox(
+            "Parse TLS Certificates"
+        )
+        self.transport_https_certificates_checkbox.setChecked(True)
+        self.transport_https_quic_crypto_checkbox = QCheckBox(
+            "Parse QUIC Crypto"
+        )
+        self.transport_https_quic_crypto_checkbox.setChecked(True)
+
+        self.core_firewall_checkbox = QCheckBox("Firewall Manager")
+        self.core_firewall_checkbox.setChecked(True)
+        self.core_packet_analyzer_checkbox = QCheckBox(
+            "Packet Analyzer"
+        )
+        self.core_packet_analyzer_checkbox.setChecked(True)
+        self.core_packet_catcher_checkbox = QCheckBox(
+            "Packet Catcher"
+        )
+        self.core_packet_catcher_checkbox.setChecked(True)
+        self.core_handshake_checkbox = QCheckBox(
+            "TCP / TLS Handshake Manager"
+        )
+        self.core_handshake_checkbox.setChecked(True)
+        self.core_syn_scanner_checkbox = QCheckBox("SYN Scanner")
+        self.core_syn_scanner_checkbox.setChecked(False)
+        self.core_syn_scanner_checkbox.setToolTip(
+            "Active scanner. Disabled by default to keep router startup idle."
+        )
+        self.core_igmp_checkbox = QCheckBox("IGMP Manager")
+        self.core_igmp_checkbox.setChecked(True)
+        self.core_mdns_checkbox = QCheckBox("mDNS Manager")
+        self.core_mdns_checkbox.setChecked(True)
+        self.handshake_half_open_timeout_input = QLineEdit()
+        self.handshake_half_open_timeout_input.setText("60")
+        self.handshake_established_timeout_input = QLineEdit()
+        self.handshake_established_timeout_input.setText("300")
+        self.handshake_rate_threshold_input = QLineEdit()
+        self.handshake_rate_threshold_input.setText("20")
+        self.handshake_rate_period_input = QLineEdit()
+        self.handshake_rate_period_input.setText("60")
+        self.handshake_ban_duration_input = QLineEdit()
+        self.handshake_ban_duration_input.setText("300")
+        self.handshake_log_tcp_checkbox = QCheckBox(
+            "Log TCP Lifecycle"
+        )
+        self.handshake_log_tcp_checkbox.setChecked(True)
+        self.handshake_log_non_tls_checkbox = QCheckBox(
+            "Log Non-TLS TCP"
+        )
+        self.handshake_log_non_tls_checkbox.setChecked(False)
+        self.handshake_log_tls_records_checkbox = QCheckBox(
+            "Log TLS Records"
+        )
+        self.handshake_log_tls_records_checkbox.setChecked(True)
+        self.handshake_log_app_data_checkbox = QCheckBox(
+            "Log TLS Application Data"
+        )
+        self.handshake_log_app_data_checkbox.setChecked(False)
+        self.handshake_log_tls13_keys_checkbox = QCheckBox(
+            "Log TLS 1.3 Key Events"
+        )
+        self.handshake_log_tls13_keys_checkbox.setChecked(True)
+        self.syn_scan_interval_input = QLineEdit()
+        self.syn_scan_interval_input.setText("300")
+        self.packet_catcher_tcp_rate_input = QLineEdit()
+        self.packet_catcher_tcp_rate_input.setText("0.60")
+        self.packet_catcher_udp_rate_input = QLineEdit()
+        self.packet_catcher_udp_rate_input.setText("0.60")
+        self.packet_catcher_default_rate_input = QLineEdit()
+        self.packet_catcher_default_rate_input.setText("0.60")
 
         self.use_static_checkbox = QCheckBox("Use Static (all)")
         self.use_static_checkbox.setChecked(False)
@@ -1806,16 +2166,80 @@ class RouterTab(QWidget):
         self.use_hyperv_checkbox.setChecked(False)
         self.use_gateway_checkbox = QCheckBox("Use Gateway Manager")
         self.use_gateway_checkbox.setChecked(False)
+        self.gateway_health_interval_input = QLineEdit()
+        self.gateway_health_interval_input.setText("2.0")
+        self.gateway_dns64_checkbox = QCheckBox("Enable DNS64")
+        self.gateway_dns64_checkbox.setChecked(True)
+        self.gateway_dns64_prefix_input = QLineEdit()
+        self.gateway_dns64_prefix_input.setText("64:ff9b::/96")
+        self.gateway_upstream_dns_input = QLineEdit()
+        self.gateway_upstream_dns_input.setText(
+            "1.1.1.1, 8.8.8.8, 9.9.9.9"
+        )
+        self.gateway_repair_checkbox = QCheckBox("Repair on Failure")
+        self.gateway_repair_checkbox.setChecked(True)
+        self.gateway_pin_arp_checkbox = QCheckBox("Pin Gateway ARP")
+        self.gateway_pin_arp_checkbox.setChecked(True)
+        self.gateway_probe_budget_input = QLineEdit()
+        self.gateway_probe_budget_input.setText("8")
+
         self.use_lan_checkbox = QCheckBox("Use Lan Manager")
         self.use_lan_checkbox.setChecked(False)
+        self.lan_bridge_name_input = QLineEdit()
+        self.lan_bridge_name_input.setText("ManagedLANBridge")
+        self.lan_create_bridge_checkbox = QCheckBox("Create LAN Bridge")
+        self.lan_create_bridge_checkbox.setChecked(True)
+        self.lan_health_interval_input = QLineEdit()
+        self.lan_health_interval_input.setText("20.0")
+        self.lan_handle_icmp_checkbox = QCheckBox("Handle LAN ICMP")
+        self.lan_handle_icmp_checkbox.setChecked(True)
+        self.lan_transport_dhcp_client_checkbox = QCheckBox(
+            "Start LAN Transport DHCP Client"
+        )
+        self.lan_transport_dhcp_client_checkbox.setChecked(False)
+
         self.use_uplink_checkbox = QCheckBox("Use Uplink Manager")
         self.use_uplink_checkbox.setChecked(False)
+        self.uplink_health_interval_input = QLineEdit()
+        self.uplink_health_interval_input.setText("15.0")
+        self.uplink_preferred_ifaces_input = QLineEdit()
+        self.uplink_preferred_ifaces_input.setText("Wi-Fi")
+        self.uplink_allow_failover_checkbox = QCheckBox(
+            "Allow Router Failover"
+        )
+        self.uplink_allow_failover_checkbox.setChecked(True)
+        self.uplink_preserve_wifi_checkbox = QCheckBox(
+            "Preserve Wi-Fi Link"
+        )
+        self.uplink_preserve_wifi_checkbox.setChecked(True)
+        self.uplink_min_score_input = QLineEdit()
+        self.uplink_min_score_input.setText("45.0")
+
         self.use_socket = QCheckBox("Use Socket Interface")
         self.use_socket.setChecked(False)
         self.nat_os_checkbox = QCheckBox("Use OS Nat")
         self.nat_os_checkbox.setChecked(False)
         self.python_server_checkbox = QCheckBox("Use Python Server")
         self.python_server_checkbox.setChecked(False)
+        self.python_server_host_input = QLineEdit()
+        self.python_server_host_input.setText("0.0.0.0")
+        self.python_server_port_input = QLineEdit()
+        self.python_server_port_input.setText("8844")
+        self.python_server_title_input = QLineEdit()
+        self.python_server_title_input.setText("Router Dashboard")
+        self.python_server_max_packets_input = QLineEdit()
+        self.python_server_max_packets_input.setText("4000")
+        self.python_server_max_logs_input = QLineEdit()
+        self.python_server_max_logs_input.setText("12000")
+        self.python_server_max_events_input = QLineEdit()
+        self.python_server_max_events_input.setText("16000")
+        self.python_server_store_raw_checkbox = QCheckBox(
+            "Store Raw Packets"
+        )
+        self.python_server_store_raw_checkbox.setChecked(True)
+        self.python_server_max_raw_bytes_input = QLineEdit()
+        self.python_server_max_raw_bytes_input.setText("0")
+
         self.promisc_checkbox = QCheckBox("Promiscuous")
         self.promisc_checkbox.setChecked(False)
         self.ollama_checkbox = QCheckBox("Ollama")
@@ -1842,17 +2266,54 @@ class RouterTab(QWidget):
             "The password is passed to the wireless-host process "
             "and is not written to the router log."
         )
+        self.wifi_router_ip_input = QLineEdit()
+        self.wifi_router_ip_input.setText("192.168.160.1")
+        self.wifi_router_ip_input.setPlaceholderText(
+            "Hotspot router IPv4"
+        )
+        self.wifi_prefix_length_input = QLineEdit()
+        self.wifi_prefix_length_input.setText("24")
+        self.wifi_auto_restart_checkbox = QCheckBox(
+            "Auto-Restart Wireless Host"
+        )
+        self.wifi_auto_restart_checkbox.setChecked(True)
+        self.wifi_start_timeout_input = QLineEdit()
+        self.wifi_start_timeout_input.setText("35.0")
+        self.wifi_adapter_timeout_input = QLineEdit()
+        self.wifi_adapter_timeout_input.setText("45.0")
+
+        self.network_preset_dropdown = QComboBox()
+        self.network_preset_dropdown.addItems(
+            [
+                "Detected LAN",
+                "Personal Network",
+                "Personal 172 Network",
+                "Ole Miss 172.24.56 Lab",
+                "Enterprise Network",
+                "Custom",
+            ]
+        )
+        self.apply_network_preset_button = QPushButton("Apply Preset")
+        self.detect_wan_ip_button = QPushButton("Detect WAN IP")
+
         self.router_ip_out_input = QLineEdit()
-        self.router_ip_out_input.setPlaceholderText("Manual LAN IP (optional)")
+        self.router_ip_out_input.setPlaceholderText(
+            "Auto-detected current LAN/uplink IPv4"
+        )
 
         self.router_netmask_out_input = QLineEdit()
         self.router_netmask_out_input.setText("255.255.255.0")
 
+        self.router_ip_in_input = QLineEdit()
+        self.router_ip_in_input.setPlaceholderText(
+            "Blank = auto-select private LAN IP"
+        )
+
+        self.router_netmask_in_input = QLineEdit()
+        self.router_netmask_in_input.setText("255.255.255.0")
+
         self.ipc_host_input = QLineEdit()
         self.ipc_host_input.setText("127.0.0.1")
-
-        self.p2pool_server_ip_input = QLineEdit()
-        self.p2pool_server_ip_input.setPlaceholderText("P2Pool IP:PORT (optional)")
 
         self.blocknet_relay_input = QLineEdit()
         self.blocknet_relay_input.setPlaceholderText("http://HOST:PORT (BlockNet Relay)")
@@ -1873,21 +2334,52 @@ class RouterTab(QWidget):
         self.preset_dropdown.addItems(self.presets.keys())
 
         self._load_presets("Full")
+        self._autofill_router_wan_ip(log_result=False)
         self._sync_enable_states()
 
     def _configure_layout(self):
+        try:
+            from PyQt5.QtWidgets import QScrollArea
+        except ImportError:
+            from PyQt6.QtWidgets import QScrollArea
+
         layout = QVBoxLayout(self)
 
         top_row = QHBoxLayout()
         top_row.addWidget(self.start_router_button)
         top_row.addWidget(self.stop_router_button)
+        top_row.addWidget(self.settings_toggle_button)
         top_row.addStretch(1)
         layout.addLayout(top_row)
 
-        group_row = QHBoxLayout()
+        self.settings_container = QWidget()
+        settings_layout = QVBoxLayout(self.settings_container)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(4)
 
-        routing_box = QGroupBox("Routing")
-        routing_grid = QGridLayout(routing_box)
+        addressing_content = QWidget()
+        addressing_grid = QGridLayout(addressing_content)
+        addressing_grid.setContentsMargins(8, 8, 8, 8)
+        addressing_grid.setHorizontalSpacing(12)
+        addressing_grid.setVerticalSpacing(8)
+        addressing_grid.setColumnStretch(1, 1)
+        addressing_grid.setColumnStretch(3, 1)
+
+        addressing_grid.addWidget(QLabel("Preset:"), 0, 0)
+        addressing_grid.addWidget(self.network_preset_dropdown, 0, 1)
+        addressing_grid.addWidget(self.apply_network_preset_button, 0, 2)
+        addressing_grid.addWidget(self.detect_wan_ip_button, 0, 3)
+        addressing_grid.addWidget(QLabel("Router WAN IP:"), 1, 0)
+        addressing_grid.addWidget(self.router_ip_out_input, 1, 1)
+        addressing_grid.addWidget(QLabel("WAN netmask:"), 1, 2)
+        addressing_grid.addWidget(self.router_netmask_out_input, 1, 3)
+        addressing_grid.addWidget(QLabel("Router LAN IP:"), 2, 0)
+        addressing_grid.addWidget(self.router_ip_in_input, 2, 1)
+        addressing_grid.addWidget(QLabel("LAN netmask:"), 2, 2)
+        addressing_grid.addWidget(self.router_netmask_in_input, 2, 3)
+
+        routing_content = QWidget()
+        routing_grid = QGridLayout(routing_content)
         routing_grid.setContentsMargins(8, 8, 8, 8)
         routing_grid.setHorizontalSpacing(18)
         routing_grid.setVerticalSpacing(10)
@@ -1899,49 +2391,710 @@ class RouterTab(QWidget):
 
         routing_grid.addWidget(self.use_netroute_checkbox, 1, 0)
         routing_grid.addWidget(self.use_hostbypass_checkbox, 1, 1)
-        routing_grid.addWidget(self.use_gateway_checkbox, 1, 2)
-        routing_grid.addWidget(self.use_lan_checkbox, 1, 3)
+        routing_grid.addWidget(self.use_socket, 1, 2)
+        routing_grid.addWidget(self.promisc_checkbox, 1, 3)
+        routing_grid.addWidget(self.ollama_checkbox, 1, 4)
 
-        routing_grid.addWidget(self.use_uplink_checkbox, 2, 0)
-        routing_grid.addWidget(self.use_socket, 2, 1)
-        routing_grid.addWidget(self.python_server_checkbox, 2, 2)
-        routing_grid.addWidget(self.promisc_checkbox, 2, 3)
-        routing_grid.addWidget(self.ollama_checkbox, 2, 4)
-        ip_row = QWidget()
-        ip_layout = QHBoxLayout(ip_row)
-        ip_layout.setContentsMargins(0, 0, 0, 0)
-        ip_layout.setSpacing(10)
-        ip_layout.addWidget(QLabel("Manual LAN IP:"))
-        ip_layout.addWidget(self.router_ip_out_input)
-        ip_layout.addWidget(QLabel("Netmask:"))
-        ip_layout.addWidget(self.router_netmask_out_input)
+        core_managers_content = QWidget()
+        core_managers_grid = QGridLayout(core_managers_content)
+        core_managers_grid.setContentsMargins(8, 8, 8, 8)
+        core_managers_grid.setHorizontalSpacing(12)
+        core_managers_grid.setVerticalSpacing(8)
+        core_managers_grid.setColumnStretch(1, 1)
+        core_managers_grid.setColumnStretch(3, 1)
+        core_managers_grid.addWidget(
+            self.core_firewall_checkbox,
+            0,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.core_packet_analyzer_checkbox,
+            0,
+            1,
+        )
+        core_managers_grid.addWidget(
+            self.core_packet_catcher_checkbox,
+            0,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.core_handshake_checkbox,
+            0,
+            3,
+        )
+        core_managers_grid.addWidget(
+            self.core_syn_scanner_checkbox,
+            1,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.core_igmp_checkbox,
+            1,
+            1,
+        )
+        core_managers_grid.addWidget(
+            self.core_mdns_checkbox,
+            1,
+            2,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Half-open timeout:"),
+            2,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_half_open_timeout_input,
+            2,
+            1,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Established timeout:"),
+            2,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_established_timeout_input,
+            2,
+            3,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Rate threshold:"),
+            3,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_rate_threshold_input,
+            3,
+            1,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Rate period:"),
+            3,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_rate_period_input,
+            3,
+            3,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Ban duration:"),
+            4,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_ban_duration_input,
+            4,
+            1,
+        )
+        core_managers_grid.addWidget(
+            QLabel("SYN scan interval:"),
+            4,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.syn_scan_interval_input,
+            4,
+            3,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_log_tcp_checkbox,
+            5,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_log_non_tls_checkbox,
+            5,
+            1,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_log_tls_records_checkbox,
+            5,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_log_app_data_checkbox,
+            5,
+            3,
+        )
+        core_managers_grid.addWidget(
+            self.handshake_log_tls13_keys_checkbox,
+            6,
+            0,
+            1,
+            2,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Packet catch TCP rate:"),
+            7,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.packet_catcher_tcp_rate_input,
+            7,
+            1,
+        )
+        core_managers_grid.addWidget(
+            QLabel("UDP rate:"),
+            7,
+            2,
+        )
+        core_managers_grid.addWidget(
+            self.packet_catcher_udp_rate_input,
+            7,
+            3,
+        )
+        core_managers_grid.addWidget(
+            QLabel("Default catch rate:"),
+            8,
+            0,
+        )
+        core_managers_grid.addWidget(
+            self.packet_catcher_default_rate_input,
+            8,
+            1,
+        )
 
-        routing_grid.addWidget(ip_row, 3, 0, 1, 4)
+        transport_content = QWidget()
+        transport_layout = QVBoxLayout(transport_content)
+        transport_layout.setContentsMargins(8, 8, 8, 8)
+        transport_layout.setSpacing(8)
 
-        comms_box = QGroupBox("Comms")
-        comms_form = QFormLayout(comms_box)
-        comms_form.addRow(self.peer_to_peer_checkbox, self.stratum_comm_checkbox)
+        transport_tuning_box = QGroupBox(
+            "Transport Pipeline and Tuning"
+        )
+        transport_tuning_grid = QGridLayout(transport_tuning_box)
+        transport_tuning_grid.setColumnStretch(1, 1)
+        transport_tuning_grid.setColumnStretch(3, 1)
+        transport_tuning_grid.addWidget(
+            self.transport_enabled_checkbox,
+            0,
+            0,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_parallel_analysis_checkbox,
+            0,
+            2,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Stratum ports:"),
+            1,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_ports_input,
+            1,
+            1,
+            1,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Monero ports:"),
+            2,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_monero_ports_input,
+            2,
+            1,
+            1,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("VoIP start:"),
+            3,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_voip_start_input,
+            3,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("VoIP end:"),
+            3,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_voip_end_input,
+            3,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Inspection logs/sec:"),
+            4,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_inspection_rps_input,
+            4,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Inspection burst:"),
+            4,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_inspection_burst_input,
+            4,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Inspection cooldown:"),
+            5,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_inspection_cooldown_input,
+            5,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Stratum logs/sec:"),
+            5,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_rps_input,
+            5,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Stratum burst:"),
+            6,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_burst_input,
+            6,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Stratum cooldown:"),
+            6,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_cooldown_input,
+            6,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Monero logs/sec:"),
+            7,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_monero_rps_input,
+            7,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Monero burst:"),
+            7,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_monero_burst_input,
+            7,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Monero cooldown:"),
+            8,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_monero_cooldown_input,
+            8,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("DNS pending TTL:"),
+            8,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_dns_pending_ttl_input,
+            8,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("DNS GC interval:"),
+            9,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_dns_gc_interval_input,
+            9,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_dns_rebind_alert_checkbox,
+            9,
+            2,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("DHCP transaction TTL:"),
+            10,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_dhcp_transaction_ttl_input,
+            10,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Observed lease TTL:"),
+            10,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_dhcp_lease_ttl_input,
+            10,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_https_logging_checkbox,
+            11,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_https_certificates_checkbox,
+            11,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_https_quic_crypto_checkbox,
+            11,
+            2,
+            1,
+            2,
+        )
+
+        transport_protocol_box = QGroupBox(
+            "Protocol Managers"
+        )
+        transport_protocol_grid = QGridLayout(
+            transport_protocol_box
+        )
+        for protocol_index, checkbox in enumerate(
+                self.transport_protocol_checkboxes.values()
+        ):
+            transport_protocol_grid.addWidget(
+                checkbox,
+                protocol_index // 4,
+                protocol_index % 4,
+            )
+
+        transport_layout.addWidget(transport_tuning_box)
+        transport_layout.addWidget(transport_protocol_box)
+
+        comms_content = QWidget()
+        comms_form = QFormLayout(comms_content)
+        comms_form.setContentsMargins(8, 8, 8, 8)
+        comms_form.addRow(self.peer_to_peer_checkbox, self.nat_os_checkbox)
         comms_form.addRow(QLabel("IPC Host:"), self.ipc_host_input)
-        comms_form.addRow(QLabel("P2Pool IP:"), self.p2pool_server_ip_input)
-        comms_form.addRow(self.nat_os_checkbox)
-        blocknet_box = QGroupBox("BlockNet")
-        blocknet_form = QFormLayout(blocknet_box)
+
+        stratum_content = QWidget()
+        stratum_grid = QGridLayout(stratum_content)
+        stratum_grid.setContentsMargins(8, 8, 8, 8)
+        stratum_grid.setHorizontalSpacing(12)
+        stratum_grid.setVerticalSpacing(8)
+        stratum_grid.setColumnStretch(1, 1)
+        stratum_grid.setColumnStretch(3, 1)
+
+        stratum_grid.addWidget(self.stratum_comm_checkbox, 0, 0, 1, 2)
+        stratum_grid.addWidget(QLabel("Connection:"), 0, 2)
+        stratum_grid.addWidget(self.stratum_mode_dropdown, 0, 3)
+
+        stratum_grid.addWidget(QLabel("Pool host:"), 1, 0)
+        stratum_grid.addWidget(self.stratum_pool_host_input, 1, 1)
+        stratum_grid.addWidget(QLabel("Pool port:"), 1, 2)
+        stratum_grid.addWidget(self.stratum_pool_port_input, 1, 3)
+
+        stratum_grid.addWidget(QLabel("Wallet / login:"), 2, 0)
+        stratum_grid.addWidget(self.stratum_wallet_input, 2, 1, 1, 3)
+
+        stratum_grid.addWidget(QLabel("Server password:"), 3, 0)
+        stratum_grid.addWidget(self.stratum_password_input, 3, 1)
+        stratum_grid.addWidget(QLabel("Worker:"), 3, 2)
+        stratum_grid.addWidget(self.stratum_worker_input, 3, 3)
+
+        stratum_grid.addWidget(QLabel("TLS:"), 4, 0)
+        stratum_grid.addWidget(self.stratum_tls_dropdown, 4, 1)
+        stratum_grid.addWidget(QLabel("TLS host / SNI:"), 4, 2)
+        stratum_grid.addWidget(self.stratum_sni_input, 4, 3)
+
+        stratum_grid.addWidget(QLabel("User agent:"), 5, 0)
+        stratum_grid.addWidget(self.stratum_user_agent_input, 5, 1, 1, 3)
+
+        stratum_grid.addWidget(self.stratum_proxy_checkbox, 6, 0)
+        stratum_grid.addWidget(self.stratum_proxy_host_input, 6, 1)
+        stratum_grid.addWidget(QLabel("Proxy port:"), 6, 2)
+        stratum_grid.addWidget(self.stratum_proxy_port_input, 6, 3)
+
+        stratum_grid.addWidget(QLabel("Daemon RPC:"), 7, 0)
+        stratum_grid.addWidget(self.stratum_daemon_url_input, 7, 1, 1, 3)
+        stratum_grid.addWidget(QLabel("Daemon ZMQ:"), 8, 0)
+        stratum_grid.addWidget(self.stratum_zmq_address_input, 8, 1, 1, 3)
+
+        dhcp_content = QWidget()
+        dhcp_layout = QVBoxLayout(dhcp_content)
+        dhcp_layout.setContentsMargins(8, 8, 8, 8)
+        dhcp_layout.setSpacing(8)
+
+        lan_dhcp_box = QGroupBox("LAN DHCP Server")
+        lan_dhcp_grid = QGridLayout(lan_dhcp_box)
+        lan_dhcp_grid.setColumnStretch(1, 1)
+        lan_dhcp_grid.setColumnStretch(3, 1)
+        lan_dhcp_grid.addWidget(self.dhcp_server_checkbox, 0, 0, 1, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_authoritative_checkbox, 0, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_enforce_subnet_checkbox, 0, 3)
+        lan_dhcp_grid.addWidget(QLabel("Pool start:"), 1, 0)
+        lan_dhcp_grid.addWidget(self.dhcp_pool_start_input, 1, 1)
+        lan_dhcp_grid.addWidget(QLabel("Pool end:"), 1, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_pool_end_input, 1, 3)
+        lan_dhcp_grid.addWidget(QLabel("DNS:"), 2, 0)
+        lan_dhcp_grid.addWidget(self.dhcp_dns_input, 2, 1)
+        lan_dhcp_grid.addWidget(QLabel("Domain:"), 2, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_domain_input, 2, 3)
+        lan_dhcp_grid.addWidget(QLabel("Lease seconds:"), 3, 0)
+        lan_dhcp_grid.addWidget(self.dhcp_lease_seconds_input, 3, 1)
+        lan_dhcp_grid.addWidget(QLabel("Max leases:"), 3, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_max_leases_input, 3, 3)
+        lan_dhcp_grid.addWidget(
+            self.dhcp_allow_out_of_pool_checkbox,
+            4,
+            0,
+            1,
+            2,
+        )
+        lan_dhcp_grid.addWidget(QLabel("Rogue policy:"), 4, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_rogue_policy_dropdown, 4, 3)
+        lan_dhcp_grid.addWidget(QLabel("DHCP relay:"), 5, 0)
+        lan_dhcp_grid.addWidget(self.dhcp_relay_input, 5, 1)
+        lan_dhcp_grid.addWidget(QLabel("DHCPv6 prefix:"), 5, 2)
+        lan_dhcp_grid.addWidget(self.dhcp6_prefix_input, 5, 3)
+        lan_dhcp_grid.addWidget(QLabel("DHCPv6 relay:"), 6, 0)
+        lan_dhcp_grid.addWidget(self.dhcp6_relay_input, 6, 1)
+        lan_dhcp_grid.addWidget(QLabel("IPv6 DNS:"), 6, 2)
+        lan_dhcp_grid.addWidget(self.dhcp_dns_v6_input, 6, 3)
+        lan_dhcp_grid.addWidget(QLabel("Search domains:"), 7, 0)
+        lan_dhcp_grid.addWidget(
+            self.dhcp_search_domains_input,
+            7,
+            1,
+            1,
+            3,
+        )
+
+        wan_dhcp_box = QGroupBox("WAN DHCP Server (Advanced)")
+        wan_dhcp_grid = QGridLayout(wan_dhcp_box)
+        wan_dhcp_grid.setColumnStretch(1, 1)
+        wan_dhcp_grid.setColumnStretch(3, 1)
+        wan_dhcp_grid.addWidget(
+            self.serve_dhcp_on_wan_checkbox,
+            0,
+            0,
+            1,
+            2,
+        )
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_authoritative_checkbox,
+            0,
+            2,
+        )
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_enforce_subnet_checkbox,
+            0,
+            3,
+        )
+        wan_dhcp_grid.addWidget(QLabel("WAN pool start:"), 1, 0)
+        wan_dhcp_grid.addWidget(self.wan_dhcp_pool_start_input, 1, 1)
+        wan_dhcp_grid.addWidget(QLabel("WAN pool end:"), 1, 2)
+        wan_dhcp_grid.addWidget(self.wan_dhcp_pool_end_input, 1, 3)
+        wan_dhcp_grid.addWidget(QLabel("WAN DNS:"), 2, 0)
+        wan_dhcp_grid.addWidget(self.wan_dhcp_dns_input, 2, 1)
+        wan_dhcp_grid.addWidget(QLabel("WAN domain:"), 2, 2)
+        wan_dhcp_grid.addWidget(self.wan_dhcp_domain_input, 2, 3)
+        wan_dhcp_grid.addWidget(QLabel("Lease seconds:"), 3, 0)
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_lease_seconds_input,
+            3,
+            1,
+        )
+        wan_dhcp_grid.addWidget(QLabel("Max leases:"), 3, 2)
+        wan_dhcp_grid.addWidget(self.wan_dhcp_max_leases_input, 3, 3)
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_allow_out_of_pool_checkbox,
+            4,
+            0,
+            1,
+            2,
+        )
+        wan_dhcp_grid.addWidget(QLabel("Rogue policy:"), 4, 2)
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_rogue_policy_dropdown,
+            4,
+            3,
+        )
+        wan_dhcp_grid.addWidget(QLabel("WAN DHCP relay:"), 5, 0)
+        wan_dhcp_grid.addWidget(
+            self.wan_dhcp_relay_input,
+            5,
+            1,
+            1,
+            3,
+        )
+
+        dhcp_layout.addWidget(lan_dhcp_box)
+        dhcp_layout.addWidget(wan_dhcp_box)
+
+        gateway_content = QWidget()
+        gateway_grid = QGridLayout(gateway_content)
+        gateway_grid.setContentsMargins(8, 8, 8, 8)
+        gateway_grid.setColumnStretch(1, 1)
+        gateway_grid.setColumnStretch(3, 1)
+        gateway_grid.addWidget(self.use_gateway_checkbox, 0, 0, 1, 2)
+        gateway_grid.addWidget(self.gateway_repair_checkbox, 0, 2)
+        gateway_grid.addWidget(self.gateway_pin_arp_checkbox, 0, 3)
+        gateway_grid.addWidget(QLabel("Health interval:"), 1, 0)
+        gateway_grid.addWidget(self.gateway_health_interval_input, 1, 1)
+        gateway_grid.addWidget(QLabel("Probe budget:"), 1, 2)
+        gateway_grid.addWidget(self.gateway_probe_budget_input, 1, 3)
+        gateway_grid.addWidget(self.gateway_dns64_checkbox, 2, 0)
+        gateway_grid.addWidget(self.gateway_dns64_prefix_input, 2, 1)
+        gateway_grid.addWidget(QLabel("Upstream DNS:"), 2, 2)
+        gateway_grid.addWidget(self.gateway_upstream_dns_input, 2, 3)
+
+        lan_content = QWidget()
+        lan_grid = QGridLayout(lan_content)
+        lan_grid.setContentsMargins(8, 8, 8, 8)
+        lan_grid.setColumnStretch(1, 1)
+        lan_grid.setColumnStretch(3, 1)
+        lan_grid.addWidget(self.use_lan_checkbox, 0, 0, 1, 2)
+        lan_grid.addWidget(self.lan_create_bridge_checkbox, 0, 2)
+        lan_grid.addWidget(self.lan_handle_icmp_checkbox, 0, 3)
+        lan_grid.addWidget(QLabel("Bridge name:"), 1, 0)
+        lan_grid.addWidget(self.lan_bridge_name_input, 1, 1)
+        lan_grid.addWidget(QLabel("Health interval:"), 1, 2)
+        lan_grid.addWidget(self.lan_health_interval_input, 1, 3)
+        lan_grid.addWidget(
+            self.lan_transport_dhcp_client_checkbox,
+            2,
+            0,
+            1,
+            4,
+        )
+
+        uplink_content = QWidget()
+        uplink_grid = QGridLayout(uplink_content)
+        uplink_grid.setContentsMargins(8, 8, 8, 8)
+        uplink_grid.setColumnStretch(1, 1)
+        uplink_grid.setColumnStretch(3, 1)
+        uplink_grid.addWidget(self.use_uplink_checkbox, 0, 0, 1, 2)
+        uplink_grid.addWidget(
+            self.uplink_allow_failover_checkbox,
+            0,
+            2,
+        )
+        uplink_grid.addWidget(
+            self.uplink_preserve_wifi_checkbox,
+            0,
+            3,
+        )
+        uplink_grid.addWidget(QLabel("Health interval:"), 1, 0)
+        uplink_grid.addWidget(self.uplink_health_interval_input, 1, 1)
+        uplink_grid.addWidget(QLabel("Minimum score:"), 1, 2)
+        uplink_grid.addWidget(self.uplink_min_score_input, 1, 3)
+        uplink_grid.addWidget(QLabel("Preferred interfaces:"), 2, 0)
+        uplink_grid.addWidget(
+            self.uplink_preferred_ifaces_input,
+            2,
+            1,
+            1,
+            3,
+        )
+
+        python_server_content = QWidget()
+        python_server_grid = QGridLayout(python_server_content)
+        python_server_grid.setContentsMargins(8, 8, 8, 8)
+        python_server_grid.setColumnStretch(1, 1)
+        python_server_grid.setColumnStretch(3, 1)
+        python_server_grid.addWidget(
+            self.python_server_checkbox,
+            0,
+            0,
+            1,
+            2,
+        )
+        python_server_grid.addWidget(
+            self.python_server_store_raw_checkbox,
+            0,
+            2,
+            1,
+            2,
+        )
+        python_server_grid.addWidget(QLabel("Host:"), 1, 0)
+        python_server_grid.addWidget(self.python_server_host_input, 1, 1)
+        python_server_grid.addWidget(QLabel("Port:"), 1, 2)
+        python_server_grid.addWidget(self.python_server_port_input, 1, 3)
+        python_server_grid.addWidget(QLabel("Dashboard title:"), 2, 0)
+        python_server_grid.addWidget(
+            self.python_server_title_input,
+            2,
+            1,
+            1,
+            3,
+        )
+        python_server_grid.addWidget(QLabel("Max packets:"), 3, 0)
+        python_server_grid.addWidget(
+            self.python_server_max_packets_input,
+            3,
+            1,
+        )
+        python_server_grid.addWidget(QLabel("Max logs:"), 3, 2)
+        python_server_grid.addWidget(
+            self.python_server_max_logs_input,
+            3,
+            3,
+        )
+        python_server_grid.addWidget(QLabel("Max events:"), 4, 0)
+        python_server_grid.addWidget(
+            self.python_server_max_events_input,
+            4,
+            1,
+        )
+        python_server_grid.addWidget(QLabel("Max raw bytes:"), 4, 2)
+        python_server_grid.addWidget(
+            self.python_server_max_raw_bytes_input,
+            4,
+            3,
+        )
+
+        blocknet_content = QWidget()
+        blocknet_form = QFormLayout(blocknet_content)
+        blocknet_form.setContentsMargins(8, 8, 8, 8)
         blocknet_form.addRow(self.blocknet_checkbox)
         blocknet_form.addRow(QLabel("Relay:"), self.blocknet_relay_input)
         blocknet_form.addRow(QLabel("Token:"), self.blocknet_token_input)
-        scrape_box = QGroupBox("ScrapeWebsite")
-        scrape_form = QFormLayout(scrape_box)
+
+        scrape_content = QWidget()
+        scrape_form = QFormLayout(scrape_content)
+        scrape_form.setContentsMargins(8, 8, 8, 8)
         scrape_form.addRow(self.use_scrapewebsite_checkbox)
         scrape_form.addRow(QLabel("Endpoint:"), self.scrapewebsite_endpoint_input)
 
-        group_row.addWidget(scrape_box, 2)
-        group_row.addWidget(routing_box, 2)
-        group_row.addWidget(comms_box, 2)
-        group_row.addWidget(blocknet_box, 2)
-
-        layout.addLayout(group_row)
-        wireless_box = QGroupBox("Wireless Access Point")
-        wireless_form = QFormLayout(wireless_box)
+        wireless_content = QWidget()
+        wireless_form = QFormLayout(wireless_content)
         wireless_form.setContentsMargins(8, 8, 8, 8)
         wireless_form.setHorizontalSpacing(12)
         wireless_form.setVerticalSpacing(8)
@@ -1955,6 +3108,23 @@ class RouterTab(QWidget):
             QLabel("Password:"),
             self.wifi_password_input,
         )
+        wireless_form.addRow(
+            QLabel("Router IP:"),
+            self.wifi_router_ip_input,
+        )
+        wireless_form.addRow(
+            QLabel("Prefix length:"),
+            self.wifi_prefix_length_input,
+        )
+        wireless_form.addRow(self.wifi_auto_restart_checkbox)
+        wireless_form.addRow(
+            QLabel("Start timeout:"),
+            self.wifi_start_timeout_input,
+        )
+        wireless_form.addRow(
+            QLabel("Adapter timeout:"),
+            self.wifi_adapter_timeout_input,
+        )
 
         wireless_exe_label = QLabel(
             "Executable: tools/PythonRouterWirelessHost.exe"
@@ -1965,7 +3135,99 @@ class RouterTab(QWidget):
         )
         wireless_form.addRow(wireless_exe_label)
 
-        layout.addWidget(wireless_box)
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Network Presets & Addresses",
+                addressing_content,
+                expanded=True,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Routing",
+                routing_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Core Packet Managers",
+                core_managers_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Transport Managers",
+                transport_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "DHCP Server",
+                dhcp_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Gateway Manager",
+                gateway_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "LAN Manager",
+                lan_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Uplink Manager",
+                uplink_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Python Server",
+                python_server_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Communications",
+                comms_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Stratum Connection",
+                stratum_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "BlockNet",
+                blocknet_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "ScrapeWebsite",
+                scrape_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Wireless Access Point",
+                wireless_content,
+            )
+        )
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setWidget(self.settings_container)
+        self.settings_scroll.setMaximumHeight(430)
+        self.settings_scroll.setVisible(False)
+        layout.addWidget(self.settings_scroll)
+
         pane_row = QHBoxLayout()
         pane_row.addWidget(QLabel("Pane:"))
         pane_row.addWidget(self.add_pane_input)
@@ -1978,15 +3240,440 @@ class RouterTab(QWidget):
         layout.addLayout(pane_row)
         layout.addWidget(self.console_tabs)
 
+    def _make_settings_section(
+        self,
+        title: str,
+        content: QWidget,
+        expanded: bool = False,
+    ) -> QWidget:
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(0)
+
+        button = QPushButton(f"▶ {title}")
+        button.setCheckable(True)
+        button.setChecked(False)
+        button.setToolTip(f"Show or hide {title} settings.")
+
+        content.setVisible(False)
+        wrapper_layout.addWidget(button)
+        wrapper_layout.addWidget(content)
+
+        self._settings_sections[title] = (button, content)
+        button.toggled.connect(
+            lambda checked, section_title=title:
+            self._set_settings_section_expanded(
+                section_title,
+                checked,
+            )
+        )
+
+        if expanded:
+            button.setChecked(True)
+
+        return wrapper
+
+    def _set_settings_section_expanded(
+        self,
+        title: str,
+        expanded: bool,
+    ):
+        entry = self._settings_sections.get(title)
+        if entry is None:
+            return
+
+        button, content = entry
+
+        if expanded:
+            for other_title, (other_button, other_content) in (
+                self._settings_sections.items()
+            ):
+                if other_title == title:
+                    continue
+
+                if other_button.isChecked():
+                    other_button.blockSignals(True)
+                    other_button.setChecked(False)
+                    other_button.blockSignals(False)
+
+                other_button.setText(f"▶ {other_title}")
+                other_content.setVisible(False)
+
+            self._active_settings_section = title
+        elif self._active_settings_section == title:
+            self._active_settings_section = None
+
+        button.setText(
+            f"{'▼' if expanded else '▶'} {title}"
+        )
+        content.setVisible(expanded)
+
+    def _on_settings_toggled(self, expanded: bool):
+        self.settings_toggle_button.setText(
+            f"⚙ Settings {'▼' if expanded else '▶'}"
+        )
+        self.settings_scroll.setVisible(expanded)
+
+    def _detect_observable_lan_ipv4(self):
+        """
+        Return the IPv4/netmask Windows would currently use for ordinary
+        outbound traffic. No configuration is changed.
+        """
+        import ipaddress
+        import os
+        import re
+        import socket
+        import subprocess
+
+        detected_ip = ""
+        detected_netmask = ""
+
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("8.8.8.8", 80))
+            detected_ip = str(probe.getsockname()[0] or "").strip()
+        except Exception:
+            detected_ip = ""
+        finally:
+            try:
+                if probe is not None:
+                    probe.close()
+            except Exception:
+                pass
+
+        # On Windows, confirm the observable address and subnet mask against
+        # ipconfig. The UDP route probe chooses the active path; ipconfig
+        # supplies the address data the user sees in Windows.
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["ipconfig"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    creationflags=getattr(
+                        subprocess,
+                        "CREATE_NO_WINDOW",
+                        0,
+                    ),
+                )
+                ipconfig_text = result.stdout or ""
+                address_matches = list(
+                    re.finditer(
+                        r"IPv4[^:\r\n]*:\s*"
+                        r"(\d{1,3}(?:\.\d{1,3}){3})"
+                        r"(?:\(Preferred\))?"
+                        r"(?:(?!IPv4)[\s\S])*?"
+                        r"Subnet Mask[^:\r\n]*:\s*"
+                        r"(\d{1,3}(?:\.\d{1,3}){3})",
+                        ipconfig_text,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                ipconfig_addresses = []
+                for match in address_matches:
+                    candidate_ip = match.group(1)
+                    candidate_mask = match.group(2)
+                    try:
+                        parsed_candidate = ipaddress.IPv4Address(
+                            candidate_ip
+                        )
+                        ipaddress.IPv4Network(
+                            f"{candidate_ip}/{candidate_mask}",
+                            strict=False,
+                        )
+                    except Exception:
+                        continue
+                    if (
+                            parsed_candidate.is_loopback
+                            or parsed_candidate.is_link_local
+                    ):
+                        continue
+                    ipconfig_addresses.append(
+                        (candidate_ip, candidate_mask)
+                    )
+
+                if detected_ip:
+                    for candidate_ip, candidate_mask in (
+                            ipconfig_addresses
+                    ):
+                        if candidate_ip == detected_ip:
+                            detected_netmask = candidate_mask
+                            break
+                elif ipconfig_addresses:
+                    detected_ip, detected_netmask = (
+                        ipconfig_addresses[0]
+                    )
+            except Exception:
+                pass
+
+        if detected_ip:
+            try:
+                import psutil
+
+                for addresses in psutil.net_if_addrs().values():
+                    for address in addresses:
+                        if (
+                            address.family == socket.AF_INET
+                            and str(address.address) == detected_ip
+                        ):
+                            detected_netmask = str(
+                                address.netmask or ""
+                            ).strip()
+                            break
+                    if detected_netmask:
+                        break
+            except Exception:
+                pass
+
+        if not detected_ip:
+            try:
+                for candidate in socket.gethostbyname_ex(
+                    socket.gethostname()
+                )[2]:
+                    parsed = ipaddress.ip_address(candidate)
+                    if (
+                        parsed.version == 4
+                        and not parsed.is_loopback
+                        and not parsed.is_link_local
+                    ):
+                        detected_ip = str(parsed)
+                        break
+            except Exception:
+                pass
+
+        if not detected_netmask:
+            detected_netmask = "255.255.255.0"
+
+        return detected_ip, detected_netmask
+
+    def _suggest_pool_for_network(
+        self,
+        router_ip: str,
+        netmask: str,
+    ):
+        import ipaddress
+
+        try:
+            router_address = ipaddress.IPv4Address(
+                str(router_ip).strip()
+            )
+            network = ipaddress.IPv4Network(
+                f"{router_address}/{str(netmask).strip()}",
+                strict=False,
+            )
+        except Exception:
+            return "", ""
+
+        first_host = int(network.network_address) + 1
+        last_host = int(network.broadcast_address) - 1
+        if last_host < first_host:
+            return "", ""
+
+        router_value = int(router_address)
+        above_start = max(first_host, router_value + 1)
+        above_end = min(last_host, above_start + 119)
+
+        if above_end - above_start >= 7:
+            return (
+                str(ipaddress.IPv4Address(above_start)),
+                str(ipaddress.IPv4Address(above_end)),
+            )
+
+        below_end = min(last_host, router_value - 1)
+        below_start = max(first_host, below_end - 119)
+        if below_end >= below_start:
+            return (
+                str(ipaddress.IPv4Address(below_start)),
+                str(ipaddress.IPv4Address(below_end)),
+            )
+
+        return "", ""
+
+    def _autofill_router_wan_ip(self, log_result: bool = True):
+        detected_ip, detected_netmask = (
+            self._detect_observable_lan_ipv4()
+        )
+
+        if detected_ip:
+            self.router_ip_out_input.setText(detected_ip)
+            self.router_netmask_out_input.setText(detected_netmask)
+
+            pool_start, pool_end = self._suggest_pool_for_network(
+                detected_ip,
+                detected_netmask,
+            )
+            if pool_start and pool_end:
+                self.wan_dhcp_pool_start_input.setText(pool_start)
+                self.wan_dhcp_pool_end_input.setText(pool_end)
+
+            if log_result:
+                self.router_logger.log_message(
+                    f"[RouterTab][Preset] 🌐 Detected WAN/LAN address "
+                    f"{detected_ip}/{detected_netmask}."
+                )
+            return True
+
+        if log_result:
+            self.router_logger.log_message(
+                "[RouterTab][Preset] ⚠️ Could not detect an active "
+                "LAN/uplink IPv4 address."
+            )
+        return False
+
+    def _apply_network_preset(self):
+        preset_name = self.network_preset_dropdown.currentText()
+
+        if preset_name == "Custom":
+            self.router_logger.log_message(
+                "[RouterTab][Preset] ✏️ Custom selected; "
+                "manual address and manager settings were preserved."
+            )
+            return
+
+        # Keep WAN aligned with the address Windows currently exposes.
+        self._autofill_router_wan_ip(log_result=False)
+
+        if preset_name == "Detected LAN":
+            wan_ip = self.router_ip_out_input.text().strip()
+            wan_mask = self.router_netmask_out_input.text().strip()
+            pool_start, pool_end = self._suggest_pool_for_network(
+                wan_ip,
+                wan_mask,
+            )
+            if pool_start and pool_end:
+                self.wan_dhcp_pool_start_input.setText(pool_start)
+                self.wan_dhcp_pool_end_input.setText(pool_end)
+            if wan_ip:
+                self.wan_dhcp_dns_input.setText(
+                    f"{wan_ip}, 1.1.1.1, 8.8.8.8"
+                )
+                self.wan_dhcp_domain_input.setText(
+                    "observed.lan"
+                )
+
+        elif preset_name == "Personal Network":
+            self.router_ip_in_input.setText("192.168.160.1")
+            self.router_netmask_in_input.setText("255.255.255.0")
+            self.dhcp_pool_start_input.setText("192.168.160.100")
+            self.dhcp_pool_end_input.setText("192.168.160.220")
+            self.dhcp_dns_input.setText("")
+            self.dhcp_domain_input.setText("home.arpa")
+            self.dhcp_search_domains_input.setText("home.arpa")
+            self.dhcp_lease_seconds_input.setText("86400")
+            self.dhcp_max_leases_input.setText("121")
+            self.wifi_router_ip_input.setText("192.168.160.1")
+            self.wifi_prefix_length_input.setText("24")
+
+        elif preset_name == "Personal 172 Network":
+            self.router_ip_in_input.setText("172.16.10.1")
+            self.router_netmask_in_input.setText("255.255.255.0")
+            self.dhcp_pool_start_input.setText("172.16.10.100")
+            self.dhcp_pool_end_input.setText("172.16.10.220")
+            self.dhcp_dns_input.setText("")
+            self.dhcp_domain_input.setText("home.arpa")
+            self.dhcp_search_domains_input.setText("home.arpa")
+            self.dhcp_lease_seconds_input.setText("86400")
+            self.dhcp_max_leases_input.setText("121")
+            self.wifi_router_ip_input.setText("172.16.10.1")
+            self.wifi_prefix_length_input.setText("24")
+
+        elif preset_name == "Ole Miss 172.24.56 Lab":
+            self.router_ip_in_input.setText("172.24.56.1")
+            self.router_netmask_in_input.setText("255.255.255.0")
+            self.dhcp_pool_start_input.setText("172.24.56.100")
+            self.dhcp_pool_end_input.setText("172.24.56.220")
+            self.dhcp_dns_input.setText(
+                "172.24.56.1, 1.1.1.1, 8.8.8.8"
+            )
+            self.dhcp_domain_input.setText("lab.olemiss")
+            self.dhcp_search_domains_input.setText("lab.olemiss")
+            self.dhcp_lease_seconds_input.setText("28800")
+            self.dhcp_max_leases_input.setText("121")
+            self.wifi_router_ip_input.setText("172.24.56.1")
+            self.wifi_prefix_length_input.setText("24")
+            self.router_logger.log_message(
+                "[RouterTab][Preset] ⚠️ Ole Miss 172.24.56 is "
+                "for an isolated lab/test segment only. WAN DHCP "
+                "was not enabled."
+            )
+
+        elif preset_name == "Enterprise Network":
+            self.router_ip_in_input.setText("172.31.0.1")
+            self.router_netmask_in_input.setText("255.255.0.0")
+            self.dhcp_pool_start_input.setText("172.31.10.10")
+            self.dhcp_pool_end_input.setText("172.31.250.250")
+            self.dhcp_dns_input.setText(
+                "1.1.1.1, 8.8.8.8, 9.9.9.9"
+            )
+            self.dhcp_domain_input.setText("corp.internal")
+            self.dhcp_search_domains_input.setText("corp.internal")
+            self.dhcp_lease_seconds_input.setText("28800")
+            self.dhcp_max_leases_input.setText("4096")
+            self.wifi_router_ip_input.setText("172.31.0.1")
+            self.wifi_prefix_length_input.setText("16")
+
+        self.router_logger.log_message(
+            f"[RouterTab][Preset] 🧩 Applied '{preset_name}' values. "
+            "No manager or WAN DHCP toggle was enabled automatically."
+        )
+
     def _connect_signals(self):
+        self.settings_toggle_button.toggled.connect(
+            self._on_settings_toggled
+        )
+        self.apply_network_preset_button.clicked.connect(
+            self._apply_network_preset
+        )
+        self.detect_wan_ip_button.clicked.connect(
+            lambda: self._autofill_router_wan_ip(True)
+        )
         self.add_pane_button.clicked.connect(self._on_add_pane)
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
         self.use_static_checkbox.stateChanged.connect(self._sync_enable_states)
         self.dhcp_out_checkbox.stateChanged.connect(self._sync_enable_states)
         self.dhcp_in_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.dhcp_server_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.serve_dhcp_on_wan_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.use_gateway_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.use_lan_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.use_uplink_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.python_server_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.transport_enabled_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.core_handshake_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.core_syn_scanner_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.core_packet_catcher_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
         self.blocknet_checkbox.stateChanged.connect(self._sync_enable_states)
         self.stratum_comm_checkbox.stateChanged.connect(self._sync_enable_states)
+        self.stratum_mode_dropdown.currentTextChanged.connect(
+            self._sync_enable_states
+        )
+        self.stratum_proxy_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
         self.use_scrapewebsite_checkbox.stateChanged.connect(self._sync_enable_states)
         self.use_wifi_host_checkbox.stateChanged.connect(
             self._sync_enable_states
@@ -1999,10 +3686,182 @@ class RouterTab(QWidget):
         self.dhcp_in_checkbox.setEnabled(not use_static)
 
         self.router_ip_out_input.setEnabled(not self.dhcp_out_checkbox.isChecked())
-        self.router_netmask_out_input.setEnabled(True)
+        self.router_netmask_out_input.setEnabled(
+            not self.dhcp_out_checkbox.isChecked()
+        )
+        self.router_ip_in_input.setEnabled(
+            not self.dhcp_in_checkbox.isChecked()
+        )
+        self.router_netmask_in_input.setEnabled(
+            not self.dhcp_in_checkbox.isChecked()
+        )
+
+        use_lan_dhcp = self.dhcp_server_checkbox.isChecked()
+        for widget in (
+            self.dhcp_pool_start_input,
+            self.dhcp_pool_end_input,
+            self.dhcp_dns_input,
+            self.dhcp_domain_input,
+            self.dhcp_lease_seconds_input,
+            self.dhcp_max_leases_input,
+            self.dhcp_authoritative_checkbox,
+            self.dhcp_allow_out_of_pool_checkbox,
+            self.dhcp_enforce_subnet_checkbox,
+            self.dhcp_rogue_policy_dropdown,
+            self.dhcp_relay_input,
+            self.dhcp6_prefix_input,
+            self.dhcp6_relay_input,
+            self.dhcp_dns_v6_input,
+            self.dhcp_search_domains_input,
+        ):
+            widget.setEnabled(use_lan_dhcp)
+
+        use_wan_dhcp = self.serve_dhcp_on_wan_checkbox.isChecked()
+        for widget in (
+            self.wan_dhcp_pool_start_input,
+            self.wan_dhcp_pool_end_input,
+            self.wan_dhcp_dns_input,
+            self.wan_dhcp_domain_input,
+            self.wan_dhcp_lease_seconds_input,
+            self.wan_dhcp_max_leases_input,
+            self.wan_dhcp_authoritative_checkbox,
+            self.wan_dhcp_allow_out_of_pool_checkbox,
+            self.wan_dhcp_enforce_subnet_checkbox,
+            self.wan_dhcp_rogue_policy_dropdown,
+            self.wan_dhcp_relay_input,
+        ):
+            widget.setEnabled(use_wan_dhcp)
+
+        for widget in (
+            self.gateway_health_interval_input,
+            self.gateway_dns64_checkbox,
+            self.gateway_dns64_prefix_input,
+            self.gateway_upstream_dns_input,
+            self.gateway_repair_checkbox,
+            self.gateway_pin_arp_checkbox,
+            self.gateway_probe_budget_input,
+        ):
+            widget.setEnabled(self.use_gateway_checkbox.isChecked())
+
+        for widget in (
+            self.lan_bridge_name_input,
+            self.lan_create_bridge_checkbox,
+            self.lan_health_interval_input,
+            self.lan_handle_icmp_checkbox,
+            self.lan_transport_dhcp_client_checkbox,
+        ):
+            widget.setEnabled(self.use_lan_checkbox.isChecked())
+
+        for widget in (
+            self.uplink_health_interval_input,
+            self.uplink_preferred_ifaces_input,
+            self.uplink_allow_failover_checkbox,
+            self.uplink_preserve_wifi_checkbox,
+            self.uplink_min_score_input,
+        ):
+            widget.setEnabled(self.use_uplink_checkbox.isChecked())
+
+        for widget in (
+            self.python_server_host_input,
+            self.python_server_port_input,
+            self.python_server_title_input,
+            self.python_server_max_packets_input,
+            self.python_server_max_logs_input,
+            self.python_server_max_events_input,
+            self.python_server_store_raw_checkbox,
+            self.python_server_max_raw_bytes_input,
+        ):
+            widget.setEnabled(self.python_server_checkbox.isChecked())
+
+        transport_enabled = (
+            self.transport_enabled_checkbox.isChecked()
+        )
+        for widget in (
+            self.transport_parallel_analysis_checkbox,
+            self.transport_stratum_ports_input,
+            self.transport_monero_ports_input,
+            self.transport_voip_start_input,
+            self.transport_voip_end_input,
+            self.transport_inspection_rps_input,
+            self.transport_inspection_burst_input,
+            self.transport_inspection_cooldown_input,
+            self.transport_stratum_rps_input,
+            self.transport_stratum_burst_input,
+            self.transport_stratum_cooldown_input,
+            self.transport_monero_rps_input,
+            self.transport_monero_burst_input,
+            self.transport_monero_cooldown_input,
+            self.transport_dns_pending_ttl_input,
+            self.transport_dns_gc_interval_input,
+            self.transport_dns_rebind_alert_checkbox,
+            self.transport_dhcp_transaction_ttl_input,
+            self.transport_dhcp_lease_ttl_input,
+            self.transport_https_logging_checkbox,
+            self.transport_https_certificates_checkbox,
+            self.transport_https_quic_crypto_checkbox,
+            *self.transport_protocol_checkboxes.values(),
+        ):
+            widget.setEnabled(transport_enabled)
+
+        handshake_enabled = self.core_handshake_checkbox.isChecked()
+        for widget in (
+            self.handshake_half_open_timeout_input,
+            self.handshake_established_timeout_input,
+            self.handshake_rate_threshold_input,
+            self.handshake_rate_period_input,
+            self.handshake_ban_duration_input,
+            self.handshake_log_tcp_checkbox,
+            self.handshake_log_non_tls_checkbox,
+            self.handshake_log_tls_records_checkbox,
+            self.handshake_log_app_data_checkbox,
+            self.handshake_log_tls13_keys_checkbox,
+        ):
+            widget.setEnabled(handshake_enabled)
+
+        self.syn_scan_interval_input.setEnabled(
+            self.core_syn_scanner_checkbox.isChecked()
+        )
+        packet_catcher_enabled = (
+            self.core_packet_catcher_checkbox.isChecked()
+        )
+        for widget in (
+            self.packet_catcher_tcp_rate_input,
+            self.packet_catcher_udp_rate_input,
+            self.packet_catcher_default_rate_input,
+        ):
+            widget.setEnabled(packet_catcher_enabled)
 
         use_stratum = self.stratum_comm_checkbox.isChecked()
-        self.p2pool_server_ip_input.setEnabled(use_stratum)
+        use_daemon = (
+            self.stratum_mode_dropdown.currentText()
+            == "Local Monero Daemon"
+        )
+        use_direct_pool = use_stratum and not use_daemon
+        use_proxy = (
+            use_direct_pool
+            and self.stratum_proxy_checkbox.isChecked()
+        )
+
+        self.stratum_mode_dropdown.setEnabled(use_stratum)
+        self.stratum_wallet_input.setEnabled(use_stratum)
+        self.stratum_password_input.setEnabled(use_stratum)
+        self.stratum_worker_input.setEnabled(use_stratum)
+        self.stratum_user_agent_input.setEnabled(use_stratum)
+
+        self.stratum_pool_host_input.setEnabled(use_direct_pool)
+        self.stratum_pool_port_input.setEnabled(use_direct_pool)
+        self.stratum_tls_dropdown.setEnabled(use_direct_pool)
+        self.stratum_sni_input.setEnabled(use_direct_pool)
+        self.stratum_proxy_checkbox.setEnabled(use_direct_pool)
+        self.stratum_proxy_host_input.setEnabled(use_proxy)
+        self.stratum_proxy_port_input.setEnabled(use_proxy)
+
+        self.stratum_daemon_url_input.setEnabled(
+            use_stratum and use_daemon
+        )
+        self.stratum_zmq_address_input.setEnabled(
+            use_stratum and use_daemon
+        )
 
         use_blocknet = self.blocknet_checkbox.isChecked()
         self.blocknet_relay_input.setEnabled(use_blocknet)
@@ -2012,12 +3871,15 @@ class RouterTab(QWidget):
             self.blocknet_relay_input.setText("")
             self.blocknet_token_input.setText("")
 
-        if not use_stratum:
-            self.p2pool_server_ip_input.setText("")
         use_wifi_host = self.use_wifi_host_checkbox.isChecked()
 
         self.wifi_ssid_input.setEnabled(use_wifi_host)
         self.wifi_password_input.setEnabled(use_wifi_host)
+        self.wifi_router_ip_input.setEnabled(use_wifi_host)
+        self.wifi_prefix_length_input.setEnabled(use_wifi_host)
+        self.wifi_auto_restart_checkbox.setEnabled(use_wifi_host)
+        self.wifi_start_timeout_input.setEnabled(use_wifi_host)
+        self.wifi_adapter_timeout_input.setEnabled(use_wifi_host)
 
     def _on_preset_selected(self, preset_name: str):
         self._load_presets(preset_name)
@@ -2222,6 +4084,8 @@ class RouterTab(QWidget):
             pass
 
         self._log_queue.clear()
+
+
 
 
 
