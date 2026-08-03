@@ -31403,6 +31403,1219 @@ if ($servers) {{
 
         return False
 
+
+@dataclass
+class WanDhcpLease:
+    """Normalized IPv4 WAN lease learned from Windows or a DHCP ACK."""
+
+    iface_full: str
+    iface_friendly: str
+    address: str
+    subnet_mask: str
+    prefix_length: int
+    network: str
+    gateway: Optional[str] = None
+    dns_servers: list[str] = field(default_factory=list)
+    dhcp_server: Optional[str] = None
+    lease_seconds: int = 3600
+    renewal_seconds: int = 1800
+    rebinding_seconds: int = 3150
+    acquired_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+    source: str = "windows"
+    xid: Optional[int] = None
+    state: str = "BOUND"
+
+    def __post_init__(self) -> None:
+        self.address = str(self.address or "").strip()
+        self.subnet_mask = str(self.subnet_mask or "255.255.255.0").strip()
+        self.gateway = str(self.gateway or "").strip() or None
+        self.dhcp_server = str(self.dhcp_server or "").strip() or None
+        self.dns_servers = [
+            str(value).strip()
+            for value in (self.dns_servers or [])
+            if str(value).strip()
+        ]
+        self.lease_seconds = max(60, int(self.lease_seconds or 3600))
+        self.renewal_seconds = max(30, int(self.renewal_seconds or self.lease_seconds // 2))
+        self.rebinding_seconds = max(
+            self.renewal_seconds,
+            int(self.rebinding_seconds or int(self.lease_seconds * 0.875)),
+        )
+        if not self.expires_at:
+            self.expires_at = float(self.acquired_at) + float(self.lease_seconds)
+
+    @property
+    def valid(self) -> bool:
+        try:
+            addr = ipaddress.IPv4Address(self.address)
+            return not (
+                addr.is_unspecified
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_multicast
+            )
+        except Exception:
+            return False
+
+    @property
+    def renewal_at(self) -> float:
+        return float(self.acquired_at) + float(self.renewal_seconds)
+
+    @property
+    def rebinding_at(self) -> float:
+        return float(self.acquired_at) + float(self.rebinding_seconds)
+
+    def to_dict(self) -> dict:
+        return {
+            "iface_full": self.iface_full,
+            "iface_friendly": self.iface_friendly,
+            "address": self.address,
+            "subnet_mask": self.subnet_mask,
+            "prefix_length": self.prefix_length,
+            "network": self.network,
+            "gateway": self.gateway,
+            "dns_servers": list(self.dns_servers),
+            "dhcp_server": self.dhcp_server,
+            "lease_seconds": self.lease_seconds,
+            "renewal_seconds": self.renewal_seconds,
+            "rebinding_seconds": self.rebinding_seconds,
+            "acquired_at": self.acquired_at,
+            "expires_at": self.expires_at,
+            "source": self.source,
+            "xid": self.xid,
+            "state": self.state,
+            "valid": self.valid,
+        }
+
+
+class WanDhcpClient:
+    """
+    WAN DHCP client/control plane for the router host.
+
+    Windows remains the address owner.  This class asks the native DHCP client
+    to perform DISCOVER/REQUEST/renew operations, observes DHCP OFFER/ACK/NAK
+    packets from the router capture path, normalizes the resulting lease, and
+    ensures the host has a usable default route and DHCP-provided DNS.
+
+    It deliberately does not bind UDP/68 or inject a second DHCP transaction;
+    doing that beside the Windows DHCP Client service can create duplicate
+    client identities and reconnect loops.
+    """
+
+    DHCP_DISCOVER = 1
+    DHCP_OFFER = 2
+    DHCP_REQUEST = 3
+    DHCP_DECLINE = 4
+    DHCP_ACK = 5
+    DHCP_NAK = 6
+    DHCP_RELEASE = 7
+    DHCP_INFORM = 8
+
+    _TYPE_NAMES = {
+        DHCP_DISCOVER: "DISCOVER",
+        DHCP_OFFER: "OFFER",
+        DHCP_REQUEST: "REQUEST",
+        DHCP_DECLINE: "DECLINE",
+        DHCP_ACK: "ACK",
+        DHCP_NAK: "NAK",
+        DHCP_RELEASE: "RELEASE",
+        DHCP_INFORM: "INFORM",
+    }
+
+    def __init__(
+        self,
+        router: Any,
+        logger: Any,
+        *,
+        lease_callback: Optional[Callable[[WanDhcpLease], None]] = None,
+    ):
+        self.router = router
+        self.logger = logger
+        self.lease_callback = lease_callback
+        self._lock = threading.RLock()
+        self._operation_lock = threading.Lock()
+        self.offers: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=16))
+        self.leases: Dict[str, WanDhcpLease] = {}
+        self.last_message_by_iface: Dict[str, dict] = {}
+        self.last_nak_at: Dict[str, float] = {}
+        self.last_attempt_at: Dict[str, float] = {}
+        self.last_error_by_iface: Dict[str, str] = {}
+
+    # ---------------------------- logging / subprocess ----------------------------
+
+    def _log(self, message: str) -> None:
+        try:
+            self.logger.log_message(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _ps_quote(value: Any) -> str:
+        return str(value or "").replace("'", "''")
+
+    def _run(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 20.0,
+    ) -> Optional[subprocess.CompletedProcess]:
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+            "check": False,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            return subprocess.run(args, **kwargs)
+        except Exception as exc:
+            return None
+
+    # ---------------------------- packet observation ----------------------------
+
+    @staticmethod
+    def _normalize_message_type(value: Any) -> Optional[int]:
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("ascii", errors="ignore")
+            except Exception:
+                value = None
+        if isinstance(value, int):
+            return value if 1 <= value <= 8 else None
+        text = str(value or "").strip().lower().replace("dhcp", "")
+        names = {
+            "discover": 1,
+            "offer": 2,
+            "request": 3,
+            "decline": 4,
+            "ack": 5,
+            "nak": 6,
+            "release": 7,
+            "inform": 8,
+        }
+        if text.isdigit():
+            num = int(text)
+            return num if 1 <= num <= 8 else None
+        return names.get(text)
+
+    @staticmethod
+    def _first_ipv4(value: Any) -> Optional[str]:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            try:
+                ipaddress.IPv4Address(text)
+                return text
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _ipv4_list(cls, value: Any) -> list[str]:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        out: list[str] = []
+        for item in values:
+            text = str(item or "").strip()
+            try:
+                ipaddress.IPv4Address(text)
+            except Exception:
+                continue
+            if text not in out:
+                out.append(text)
+        return out
+
+    @staticmethod
+    def _int_option(value: Any, default: int) -> int:
+        if isinstance(value, bytes):
+            try:
+                return int.from_bytes(value, "big", signed=False)
+            except Exception:
+                return default
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _friendly_for_iface(self, iface_full: str) -> str:
+        cfg = dict(getattr(self.router, "_interfaces_config", {}).get(iface_full, {}) or {})
+        return str(cfg.get("friendly_name") or iface_full or "").strip()
+
+    def _full_for_friendly(self, friendly: str) -> str:
+        friendly_cf = str(friendly or "").strip().casefold()
+        for iface_full, cfg in dict(getattr(self.router, "_interfaces_config", {}) or {}).items():
+            candidate = str((cfg or {}).get("friendly_name") or iface_full).strip()
+            if candidate.casefold() == friendly_cf:
+                return str(iface_full)
+        return str(friendly or "").strip()
+
+    def _parse_options(self, packet: Packet) -> dict:
+        options: dict = {}
+        try:
+            raw_options = list(packet[DHCP].options or [])
+        except Exception:
+            return options
+
+        for item in raw_options:
+            if not isinstance(item, tuple) or not item:
+                continue
+            key = str(item[0]).strip().lower().replace("-", "_")
+            value = item[1] if len(item) == 2 else list(item[1:])
+            options[key] = value
+        return options
+
+    def observe_packet(self, packet: Any, inbound_iface: str) -> None:
+        try:
+            if isinstance(packet, (bytes, bytearray)):
+                packet = Ether(bytes(packet))
+            if packet is None or not packet.haslayer(DHCP) or not packet.haslayer(BOOTP):
+                return
+        except Exception:
+            return
+
+        opts = self._parse_options(packet)
+        msg_type = self._normalize_message_type(opts.get("message_type"))
+        if msg_type is None:
+            return
+
+        iface_full = str(inbound_iface or "").strip()
+        iface_friendly = self._friendly_for_iface(iface_full)
+        iface_full = self._full_for_friendly(iface_friendly) or iface_full
+        bootp = packet[BOOTP]
+        xid = int(getattr(bootp, "xid", 0) or 0)
+        yiaddr = str(getattr(bootp, "yiaddr", "0.0.0.0") or "0.0.0.0")
+        server_id = self._first_ipv4(opts.get("server_id"))
+        gateway = self._first_ipv4(opts.get("router"))
+        dns_servers = self._ipv4_list(
+            opts.get("name_server")
+            or opts.get("domain_name_server")
+            or opts.get("dns")
+        )
+        subnet_mask = self._first_ipv4(opts.get("subnet_mask")) or "255.255.255.0"
+        lease_seconds = self._int_option(opts.get("lease_time"), 3600)
+        renewal_seconds = self._int_option(opts.get("renewal_time"), max(30, lease_seconds // 2))
+        rebinding_seconds = self._int_option(
+            opts.get("rebinding_time"),
+            max(renewal_seconds, int(lease_seconds * 0.875)),
+        )
+
+        message = {
+            "at": time.time(),
+            "type": msg_type,
+            "type_name": self._TYPE_NAMES.get(msg_type, str(msg_type)),
+            "iface_full": iface_full,
+            "iface_friendly": iface_friendly,
+            "xid": xid,
+            "offered_ip": yiaddr,
+            "server_id": server_id,
+            "gateway": gateway,
+            "dns_servers": dns_servers,
+            "subnet_mask": subnet_mask,
+            "lease_seconds": lease_seconds,
+        }
+        with self._lock:
+            self.last_message_by_iface[iface_full] = message
+
+        if msg_type == self.DHCP_OFFER:
+            with self._lock:
+                self.offers[iface_full].append(message)
+            self._log(
+                "[WanDHCP] 📨 OFFER "
+                f"iface={iface_friendly} address={yiaddr} "
+                f"server={server_id or 'unknown'} gateway={gateway or 'pending'}"
+            )
+            return
+
+        if msg_type == self.DHCP_NAK:
+            with self._lock:
+                self.last_nak_at[iface_full] = time.time()
+                self.leases.pop(iface_full, None)
+            self._log(
+                f"[WanDHCP] ❌ NAK received on {iface_friendly}; lease reacquisition scheduled."
+            )
+            return
+
+        if msg_type != self.DHCP_ACK:
+            return
+
+        if yiaddr in ("", "0.0.0.0"):
+            current = self.read_system_lease(iface_full, iface_friendly)
+            if current is not None:
+                yiaddr = current.address
+                subnet_mask = current.subnet_mask
+                gateway = gateway or current.gateway
+                dns_servers = dns_servers or current.dns_servers
+
+        lease = self._build_lease(
+            iface_full=iface_full,
+            iface_friendly=iface_friendly,
+            address=yiaddr,
+            subnet_mask=subnet_mask,
+            gateway=gateway,
+            dns_servers=dns_servers,
+            dhcp_server=server_id,
+            lease_seconds=lease_seconds,
+            renewal_seconds=renewal_seconds,
+            rebinding_seconds=rebinding_seconds,
+            source="packet-ack",
+            xid=xid,
+        )
+        if lease and lease.valid:
+            self._commit_lease(lease)
+
+    # ---------------------------- lease discovery ----------------------------
+
+    def _build_lease(
+        self,
+        *,
+        iface_full: str,
+        iface_friendly: str,
+        address: str,
+        subnet_mask: str,
+        gateway: Optional[str],
+        dns_servers: list[str],
+        dhcp_server: Optional[str],
+        lease_seconds: int,
+        renewal_seconds: int,
+        rebinding_seconds: int,
+        source: str,
+        xid: Optional[int] = None,
+    ) -> Optional[WanDhcpLease]:
+        try:
+            address_obj = ipaddress.IPv4Address(str(address).strip())
+            mask_text = str(subnet_mask or "255.255.255.0").strip()
+            prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask_text}").prefixlen
+            network = ipaddress.IPv4Network(f"{address_obj}/{prefix}", strict=False)
+        except Exception:
+            return None
+
+        return WanDhcpLease(
+            iface_full=str(iface_full or iface_friendly).strip(),
+            iface_friendly=str(iface_friendly or iface_full).strip(),
+            address=str(address_obj),
+            subnet_mask=str(network.netmask),
+            prefix_length=int(prefix),
+            network=str(network),
+            gateway=self._first_ipv4(gateway),
+            dns_servers=self._ipv4_list(dns_servers),
+            dhcp_server=self._first_ipv4(dhcp_server),
+            lease_seconds=lease_seconds,
+            renewal_seconds=renewal_seconds,
+            rebinding_seconds=rebinding_seconds,
+            source=source,
+            xid=xid,
+        )
+
+    def read_system_lease(
+        self,
+        iface_full: str,
+        iface_friendly: str,
+    ) -> Optional[WanDhcpLease]:
+        """Read the address, gateway, DNS, and DHCP server currently owned by Windows."""
+        friendly = str(iface_friendly or iface_full or "").strip()
+        if not friendly:
+            return None
+
+        if os.name != "nt":
+            return self._read_psutil_lease(iface_full, friendly)
+
+        alias = self._ps_quote(friendly)
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$adapter = Get-NetAdapter -Name '{alias}' -ErrorAction Stop
+$cfg = Get-NetIPConfiguration -InterfaceIndex $adapter.IfIndex -ErrorAction Stop
+$ip = @($cfg.IPv4Address | Where-Object {{ $_.IPAddress -and $_.IPAddress -notlike '169.254.*' }} | Select-Object -First 1)[0]
+$gw = @($cfg.IPv4DefaultGateway | Select-Object -First 1)[0]
+$dns = @((Get-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses)
+$nic = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' | Where-Object {{ $_.InterfaceIndex -eq $adapter.IfIndex }} | Select-Object -First 1)[0]
+[pscustomobject]@{{
+  InterfaceIndex = $adapter.IfIndex
+  Address = if ($ip) {{ $ip.IPAddress }} else {{ $null }}
+  PrefixLength = if ($ip) {{ $ip.PrefixLength }} else {{ $null }}
+  Gateway = if ($gw) {{ $gw.NextHop }} else {{ $null }}
+  DnsServers = $dns
+  DhcpEnabled = if ($nic) {{ [bool]$nic.DHCPEnabled }} else {{ $true }}
+  DhcpServer = if ($nic) {{ $nic.DHCPServer }} else {{ $null }}
+}} | ConvertTo-Json -Compress -Depth 4
+"""
+        proc = self._run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            timeout=8.0,
+        )
+        if not proc or proc.returncode != 0 or not str(proc.stdout or "").strip():
+            return self._read_psutil_lease(iface_full, friendly)
+
+        try:
+            data = json.loads(str(proc.stdout).strip().splitlines()[-1])
+            address = str(data.get("Address") or "").strip()
+            prefix = int(data.get("PrefixLength"))
+            network = ipaddress.IPv4Network(f"{address}/{prefix}", strict=False)
+        except Exception:
+            return self._read_psutil_lease(iface_full, friendly)
+
+        lease = self._build_lease(
+            iface_full=iface_full or self._full_for_friendly(friendly),
+            iface_friendly=friendly,
+            address=address,
+            subnet_mask=str(network.netmask),
+            gateway=data.get("Gateway"),
+            dns_servers=self._ipv4_list(data.get("DnsServers")),
+            dhcp_server=data.get("DhcpServer"),
+            lease_seconds=3600,
+            renewal_seconds=1800,
+            rebinding_seconds=3150,
+            source="windows-native",
+        )
+        return lease if lease and lease.valid else None
+
+    def _read_psutil_lease(
+        self,
+        iface_full: str,
+        iface_friendly: str,
+    ) -> Optional[WanDhcpLease]:
+        address = None
+        netmask = None
+        for addr in psutil.net_if_addrs().get(iface_friendly, []):
+            if addr.family != socket.AF_INET:
+                continue
+            try:
+                parsed = ipaddress.IPv4Address(addr.address)
+            except Exception:
+                continue
+            if parsed.is_link_local or parsed.is_loopback or parsed.is_unspecified:
+                continue
+            address = addr.address
+            netmask = addr.netmask or "255.255.255.0"
+            break
+        if not address:
+            return None
+
+        gateway = None
+        try:
+            helper = getattr(self.router, "_get_default_gateway_for_interface", None)
+            if callable(helper):
+                gateway = helper(iface_friendly)
+        except Exception:
+            gateway = None
+
+        dns_servers: list[str] = []
+        try:
+            helper = getattr(self.router, "_get_windows_dns_servers", None)
+            if callable(helper):
+                dns_servers = self._ipv4_list(helper(iface_friendly))
+        except Exception:
+            pass
+
+        return self._build_lease(
+            iface_full=iface_full or self._full_for_friendly(iface_friendly),
+            iface_friendly=iface_friendly,
+            address=address,
+            subnet_mask=netmask,
+            gateway=gateway,
+            dns_servers=dns_servers,
+            dhcp_server=None,
+            lease_seconds=3600,
+            renewal_seconds=1800,
+            rebinding_seconds=3150,
+            source="psutil",
+        )
+
+    # ---------------------------- native acquisition ----------------------------
+
+    def acquire(
+        self,
+        iface_full: str,
+        iface_friendly: str,
+        *,
+        timeout: float = 35.0,
+        force: bool = False,
+        route_metric: int = 15,
+        ensure_default_route: bool = True,
+        reset_dns_from_dhcp: bool = True,
+    ) -> Optional[WanDhcpLease]:
+        friendly = str(iface_friendly or iface_full or "").strip()
+        full = str(iface_full or self._full_for_friendly(friendly)).strip()
+        if not friendly:
+            return None
+
+        with self._operation_lock:
+            self.last_attempt_at[full] = time.time()
+
+            if not force:
+                existing = self.read_system_lease(full, friendly)
+                if existing and existing.valid and existing.gateway:
+                    self._commit_lease(existing)
+                    self.ensure_host_connectivity(
+                        existing,
+                        route_metric=route_metric,
+                        ensure_default_route=ensure_default_route,
+                        reset_dns_from_dhcp=reset_dns_from_dhcp,
+                    )
+                    return existing
+
+            self._log(
+                f"[WanDHCP] 🔎 Requesting native DHCP lease on {friendly}; waiting for OFFER/ACK."
+            )
+
+            if os.name == "nt":
+                alias = self._ps_quote(friendly)
+                script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$adapter = Get-NetAdapter -Name '{alias}' -ErrorAction SilentlyContinue
+if (-not $adapter) {{ exit 3 }}
+Set-NetIPInterface -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
+Set-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+exit 0
+"""
+                self._run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        script,
+                    ],
+                    timeout=10.0,
+                )
+                if force:
+                    self._run(["ipconfig", "/release", friendly], timeout=20.0)
+                self._run(["ipconfig", "/renew", friendly], timeout=max(20.0, timeout))
+            else:
+                # Best-effort support for non-Windows test hosts.
+                self._run(["dhclient", "-1", "-v", friendly], timeout=max(20.0, timeout))
+
+            deadline = time.monotonic() + max(5.0, float(timeout))
+            last_seen: Optional[WanDhcpLease] = None
+            while time.monotonic() < deadline:
+                lease = self.read_system_lease(full, friendly)
+                if lease and lease.valid:
+                    last_seen = lease
+                    if lease.gateway:
+                        self._commit_lease(lease)
+                        self.ensure_host_connectivity(
+                            lease,
+                            route_metric=route_metric,
+                            ensure_default_route=ensure_default_route,
+                            reset_dns_from_dhcp=reset_dns_from_dhcp,
+                        )
+                        return lease
+                time.sleep(1.0)
+
+            if last_seen and last_seen.valid:
+                self._commit_lease(last_seen)
+                self.ensure_host_connectivity(
+                    last_seen,
+                    route_metric=route_metric,
+                    ensure_default_route=ensure_default_route,
+                    reset_dns_from_dhcp=reset_dns_from_dhcp,
+                )
+                return last_seen
+
+            error = f"No usable DHCP ACK/lease became active on {friendly}."
+            with self._lock:
+                self.last_error_by_iface[full] = error
+            self._log(f"[WanDHCP] ❌ {error}")
+            return None
+
+    def renew(
+        self,
+        iface_full: str,
+        iface_friendly: str,
+        **kwargs: Any,
+    ) -> Optional[WanDhcpLease]:
+        return self.acquire(
+            iface_full,
+            iface_friendly,
+            force=True,
+            **kwargs,
+        )
+
+    def release(self, iface_full: str, iface_friendly: str) -> bool:
+        friendly = str(iface_friendly or iface_full or "").strip()
+        if not friendly:
+            return False
+        proc = self._run(["ipconfig", "/release", friendly], timeout=20.0)
+        ok = bool(proc and proc.returncode == 0)
+        with self._lock:
+            self.leases.pop(str(iface_full or friendly), None)
+        return ok
+
+    def ensure_host_connectivity(
+        self,
+        lease: WanDhcpLease,
+        *,
+        route_metric: int = 15,
+        ensure_default_route: bool = True,
+        reset_dns_from_dhcp: bool = True,
+    ) -> bool:
+        """Ensure the host itself uses the acquired WAN gateway and DNS."""
+        if not lease or not lease.valid:
+            return False
+        if os.name != "nt":
+            return True
+
+        alias = self._ps_quote(lease.iface_friendly)
+        gateway = self._ps_quote(lease.gateway or "")
+        metric = max(1, min(9999, int(route_metric)))
+        reset_dns = "$true" if reset_dns_from_dhcp else "$false"
+        ensure_route = "$true" if ensure_default_route else "$false"
+        script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$adapter = Get-NetAdapter -Name '{alias}' -ErrorAction SilentlyContinue
+if (-not $adapter) {{ exit 3 }}
+Set-NetIPInterface -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -Dhcp Enabled -ErrorAction SilentlyContinue
+Set-NetIPInterface -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric {metric} -ErrorAction SilentlyContinue
+if ({reset_dns}) {{
+    Set-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+}}
+$gateway = '{gateway}'
+if ({ensure_route} -and $gateway) {{
+    $default = @(Get-NetRoute -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+    if (-not $default -or $default.Count -eq 0) {{
+        New-NetRoute -InterfaceIndex $adapter.IfIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -NextHop $gateway -RouteMetric {metric} -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+    }} else {{
+        $default | Set-NetRoute -RouteMetric {metric} -ErrorAction SilentlyContinue | Out-Null
+    }}
+}}
+ipconfig /flushdns | Out-Null
+exit 0
+"""
+        proc = self._run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            timeout=15.0,
+        )
+        ok = bool(proc and proc.returncode == 0)
+        if ok:
+            self._log(
+                "[WanDHCP] ✅ Host path applied: "
+                f"{lease.iface_friendly} {lease.address}/{lease.prefix_length} "
+                f"via {lease.gateway or 'OS route'} DNS={lease.dns_servers or 'DHCP'}"
+            )
+        return ok
+
+    def _commit_lease(self, lease: WanDhcpLease) -> None:
+        with self._lock:
+            previous = self.leases.get(lease.iface_full)
+            packet_offer = None
+            if self.offers.get(lease.iface_full):
+                packet_offer = self.offers[lease.iface_full][-1]
+            if packet_offer:
+                if not lease.dhcp_server:
+                    lease.dhcp_server = packet_offer.get("server_id")
+                if not lease.gateway:
+                    lease.gateway = packet_offer.get("gateway")
+                if not lease.dns_servers:
+                    lease.dns_servers = list(packet_offer.get("dns_servers") or [])
+                lease.lease_seconds = int(packet_offer.get("lease_seconds") or lease.lease_seconds)
+                lease.expires_at = lease.acquired_at + lease.lease_seconds
+            self.leases[lease.iface_full] = lease
+            self.last_error_by_iface.pop(lease.iface_full, None)
+
+        changed = (
+            previous is None
+            or previous.address != lease.address
+            or previous.gateway != lease.gateway
+            or previous.dns_servers != lease.dns_servers
+        )
+        if changed:
+            self._log(
+                "[WanDHCP] ✅ BOUND "
+                f"iface={lease.iface_friendly} address={lease.address}/{lease.prefix_length} "
+                f"gateway={lease.gateway or 'pending'} server={lease.dhcp_server or 'unknown'}"
+            )
+        if callable(self.lease_callback):
+            try:
+                self.lease_callback(lease)
+            except Exception as exc:
+                self._log(f"[WanDHCP] ⚠️ Lease callback failed: {exc}")
+
+    def get_lease(self, iface: Optional[str] = None) -> Optional[WanDhcpLease]:
+        with self._lock:
+            if iface:
+                target = str(iface).strip().casefold()
+                for key, lease in self.leases.items():
+                    if key.casefold() == target or lease.iface_friendly.casefold() == target:
+                        return lease
+                return None
+            if not self.leases:
+                return None
+            return max(self.leases.values(), key=lambda value: value.acquired_at)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "leases": {key: lease.to_dict() for key, lease in self.leases.items()},
+                "offers": {key: list(values) for key, values in self.offers.items()},
+                "last_message_by_iface": dict(self.last_message_by_iface),
+                "last_nak_at": dict(self.last_nak_at),
+                "last_attempt_at": dict(self.last_attempt_at),
+                "last_error_by_iface": dict(self.last_error_by_iface),
+            }
+
+
+class UpstreamManager(UplinkManager):
+    """
+    Full upstream control plane.
+
+    Extends UplinkManager's health scoring/failover with WAN DHCP lease
+    acquisition, DHCP OFFER/ACK observation, host-route/DNS repair, lease
+    renewal, and synchronization of the router's ARP/NAT/DNS/packet writer.
+    """
+
+    def __init__(self, router: Any, gateway_manager: Optional[Any] = None):
+        super().__init__(router, gateway_manager=gateway_manager)
+        self.name = "UpstreamManager"
+        self.wan_dhcp_client = WanDhcpClient(
+            router,
+            getattr(router, "router_logger", None),
+            lease_callback=self._on_wan_lease,
+        )
+        self._dhcp_stop_event = threading.Event()
+        self._dhcp_thread: Optional[threading.Thread] = None
+        self._dhcp_attempt_lock = threading.Lock()
+        self._last_dhcp_attempt: Dict[str, float] = {}
+        self._upstream_prefs = {
+            "enable_wan_dhcp": True,
+            "wan_dhcp_interfaces": [],
+            "wan_dhcp_bootstrap_timeout_sec": 35.0,
+            "wan_dhcp_retry_sec": 30.0,
+            "wan_dhcp_watch_interval_sec": 10.0,
+            "wan_dhcp_force_renew_on_start": False,
+            "wan_dhcp_renew_margin_sec": 120.0,
+            "ensure_host_default_route": True,
+            "reset_dns_from_dhcp": True,
+            "host_route_metric": 15,
+            "auto_acquire_missing_uplinks": False,
+        }
+
+    def configure(
+        self,
+        *,
+        health_interval_sec: float = 15.0,
+        preferred_iface_names: Optional[list[str]] = None,
+        allow_router_failover: bool = True,
+        preserve_wifi_link: bool = True,
+        disable_netroute_default_sync: bool = True,
+        disable_netroute_metric_tuning: bool = True,
+        remove_public_host_routes: bool = True,
+        gateway_probe_ports: Optional[list[int]] = None,
+        public_probes: Optional[list[tuple[str, int]]] = None,
+        candidate_stale_sec: float = 300.0,
+        minimum_public_score_to_activate: float = 45.0,
+        keep_current_if_public: bool = True,
+        enable_wan_dhcp: bool = True,
+        wan_dhcp_interfaces: Optional[list[str]] = None,
+        wan_dhcp_bootstrap_timeout_sec: float = 35.0,
+        wan_dhcp_retry_sec: float = 30.0,
+        wan_dhcp_watch_interval_sec: float = 10.0,
+        wan_dhcp_force_renew_on_start: bool = False,
+        wan_dhcp_renew_margin_sec: float = 120.0,
+        ensure_host_default_route: bool = True,
+        reset_dns_from_dhcp: bool = True,
+        host_route_metric: int = 15,
+        auto_acquire_missing_uplinks: bool = False,
+    ) -> None:
+        super().configure(
+            health_interval_sec=health_interval_sec,
+            preferred_iface_names=preferred_iface_names,
+            allow_router_failover=allow_router_failover,
+            preserve_wifi_link=preserve_wifi_link,
+            disable_netroute_default_sync=disable_netroute_default_sync,
+            disable_netroute_metric_tuning=disable_netroute_metric_tuning,
+            remove_public_host_routes=remove_public_host_routes,
+            gateway_probe_ports=gateway_probe_ports,
+            public_probes=public_probes,
+            candidate_stale_sec=candidate_stale_sec,
+            minimum_public_score_to_activate=minimum_public_score_to_activate,
+            keep_current_if_public=keep_current_if_public,
+        )
+        self._upstream_prefs.update({
+            "enable_wan_dhcp": bool(enable_wan_dhcp),
+            "wan_dhcp_interfaces": [
+                str(value).strip()
+                for value in (wan_dhcp_interfaces or [])
+                if str(value).strip()
+            ],
+            "wan_dhcp_bootstrap_timeout_sec": max(5.0, float(wan_dhcp_bootstrap_timeout_sec)),
+            "wan_dhcp_retry_sec": max(10.0, float(wan_dhcp_retry_sec)),
+            "wan_dhcp_watch_interval_sec": max(5.0, float(wan_dhcp_watch_interval_sec)),
+            "wan_dhcp_force_renew_on_start": bool(wan_dhcp_force_renew_on_start),
+            "wan_dhcp_renew_margin_sec": max(30.0, float(wan_dhcp_renew_margin_sec)),
+            "ensure_host_default_route": bool(ensure_host_default_route),
+            "reset_dns_from_dhcp": bool(reset_dns_from_dhcp),
+            "host_route_metric": max(1, min(9999, int(host_route_metric))),
+            "auto_acquire_missing_uplinks": bool(auto_acquire_missing_uplinks),
+        })
+        self._say(
+            "upstream_configured",
+            "stored upstream and WAN DHCP preferences",
+            ["🌐", "📨", "🧭"],
+            cooldown=0.0,
+        )
+
+    # ---------------------------- lifecycle ----------------------------
+
+    def start(self) -> None:
+        if self._state.started:
+            return
+
+        self._dhcp_stop_event.clear()
+        if self._upstream_prefs["enable_wan_dhcp"]:
+            self._bootstrap_wan_dhcp()
+
+        super().start()
+
+        if self._upstream_prefs["enable_wan_dhcp"]:
+            self._dhcp_thread = threading.Thread(
+                target=self._dhcp_watch_loop,
+                name="UpstreamManagerWanDHCP",
+                daemon=True,
+            )
+            self._dhcp_thread.start()
+
+        self._say(
+            "upstream_started",
+            "upstream manager is active with WAN DHCP support",
+            ["🌍", "📶", "✅"],
+            cooldown=0.0,
+        )
+
+    def stop(self) -> None:
+        self._dhcp_stop_event.set()
+        thread = self._dhcp_thread
+        self._dhcp_thread = None
+        if thread and thread.is_alive():
+            thread.join(timeout=3.0)
+        super().stop()
+
+    # ---------------------------- packet path ----------------------------
+
+    def observe_packet(self, packet: Any, inbound_iface: str) -> None:
+        try:
+            self.wan_dhcp_client.observe_packet(packet, inbound_iface)
+        except Exception as exc:
+            self._say(
+                "upstream_dhcp_observe_error",
+                f"WAN DHCP packet observation failed: {exc}",
+                ["⚠️", "📨"],
+            )
+        super().observe_packet(packet, inbound_iface)
+
+    # ---------------------------- public control API ----------------------------
+
+    def request_wan_lease(
+        self,
+        iface: Optional[str] = None,
+        *,
+        force: bool = False,
+    ) -> Optional[WanDhcpLease]:
+        candidates = self._wan_interface_pairs()
+        if iface:
+            token = str(iface).strip().casefold()
+            candidates = [
+                pair for pair in candidates
+                if token in {pair[0].casefold(), pair[1].casefold()}
+            ]
+        if not candidates:
+            self._say(
+                "upstream_no_dhcp_iface",
+                f"no WAN DHCP interface matched {iface or 'the configured upstreams'}",
+                ["⚠️", "🔌"],
+                cooldown=0.0,
+            )
+            return None
+
+        for iface_full, iface_friendly in candidates:
+            lease = self._acquire_pair(iface_full, iface_friendly, force=force)
+            if lease and lease.valid:
+                return lease
+        return None
+
+    def get_wan_lease(self, iface: Optional[str] = None) -> Optional[dict]:
+        lease = self.wan_dhcp_client.get_lease(iface)
+        return lease.to_dict() if lease else None
+
+    def get_upstream_status(self) -> dict:
+        with self._candidate_lock:
+            candidates = {
+                key: {
+                    "iface_full": value.iface_full,
+                    "iface_friendly": value.iface_friendly,
+                    "ip": value.ip,
+                    "gateway": value.gateway_ip,
+                    "dns_servers": list(value.dns_servers),
+                    "link_up": value.link_up,
+                    "gateway_ok": value.gateway_ok,
+                    "dns_ok": value.dns_ok,
+                    "public_ok": value.public_ok,
+                    "score": value.score,
+                    "health_state": value.health_state,
+                }
+                for key, value in self.candidates.items()
+            }
+        return {
+            "active_uplink_full": self.active_uplink_full,
+            "active_uplink_friendly": self.active_uplink_friendly,
+            "active_public_ready": self.active_public_ready,
+            "candidates": candidates,
+            "wan_dhcp": self.wan_dhcp_client.snapshot(),
+            "preferences": dict(self._upstream_prefs),
+        }
+
+    # ---------------------------- DHCP orchestration ----------------------------
+
+    def _wan_interface_pairs(self) -> list[tuple[str, str]]:
+        router = self.router
+        configs = dict(getattr(router, "_interfaces_config", {}) or {})
+        current_full = str(getattr(router, "interface_out_full_name", None) or "").strip()
+        current_friendly = str(getattr(router, "interface_out_friendly_name", None) or "").strip()
+        preferred = {
+            str(value).strip().casefold()
+            for value in self._prefs.get("preferred_iface_names", [])
+            if str(value).strip()
+        }
+        explicit = {
+            str(value).strip().casefold()
+            for value in self._upstream_prefs.get("wan_dhcp_interfaces", [])
+            if str(value).strip()
+        }
+
+        if current_full and current_full not in configs:
+            configs[current_full] = {
+                "friendly_name": current_friendly or current_full,
+                "is_default_gateway_iface": True,
+                "gateway": getattr(router, "router_gateway_out_ip", None),
+            }
+
+        pairs: list[tuple[str, str]] = []
+        for iface_full, raw_cfg in configs.items():
+            cfg = dict(raw_cfg or {})
+            friendly = str(cfg.get("friendly_name") or iface_full).strip()
+            if not friendly:
+                continue
+            if not self._is_candidate_iface(str(iface_full), cfg):
+                continue
+
+            names = {str(iface_full).strip().casefold(), friendly.casefold()}
+            selected = False
+            if explicit:
+                selected = bool(names & explicit)
+            else:
+                selected = (
+                    str(iface_full) == current_full
+                    or friendly == current_friendly
+                    or friendly.casefold() in preferred
+                    or bool(cfg.get("is_default_gateway_iface"))
+                    or bool(cfg.get("gateway"))
+                )
+                if self._upstream_prefs.get("auto_acquire_missing_uplinks"):
+                    selected = selected or friendly.casefold() in preferred
+            if not selected:
+                continue
+            pair = (str(iface_full), friendly)
+            if pair not in pairs:
+                pairs.append(pair)
+
+        def sort_key(pair: tuple[str, str]) -> tuple[int, int, str]:
+            full, friendly = pair
+            return (
+                0 if full == current_full or friendly == current_friendly else 1,
+                0 if friendly.casefold() in preferred else 1,
+                friendly.casefold(),
+            )
+
+        pairs.sort(key=sort_key)
+        return pairs
+
+    def _bootstrap_wan_dhcp(self) -> None:
+        pairs = self._wan_interface_pairs()
+        if not pairs:
+            self._say(
+                "upstream_bootstrap_no_iface",
+                "WAN DHCP is enabled but no safe upstream interface was selected",
+                ["⚠️", "🔌"],
+                cooldown=0.0,
+            )
+            return
+
+        force = bool(self._upstream_prefs["wan_dhcp_force_renew_on_start"])
+        for iface_full, iface_friendly in pairs:
+            if self._dhcp_stop_event.is_set():
+                return
+            current = self.wan_dhcp_client.read_system_lease(iface_full, iface_friendly)
+            if current and current.valid and current.gateway and not force:
+                self.wan_dhcp_client._commit_lease(current)
+                self.wan_dhcp_client.ensure_host_connectivity(
+                    current,
+                    route_metric=self._upstream_prefs["host_route_metric"],
+                    ensure_default_route=self._upstream_prefs["ensure_host_default_route"],
+                    reset_dns_from_dhcp=self._upstream_prefs["reset_dns_from_dhcp"],
+                )
+                continue
+            self._acquire_pair(iface_full, iface_friendly, force=force)
+
+    def _dhcp_watch_loop(self) -> None:
+        interval = float(self._upstream_prefs["wan_dhcp_watch_interval_sec"])
+        while not self._dhcp_stop_event.wait(interval):
+            try:
+                now = time.time()
+                for iface_full, iface_friendly in self._wan_interface_pairs():
+                    if self._dhcp_stop_event.is_set():
+                        return
+                    lease = self.wan_dhcp_client.read_system_lease(iface_full, iface_friendly)
+                    known = self.wan_dhcp_client.get_lease(iface_full)
+                    nak_at = float(self.wan_dhcp_client.last_nak_at.get(iface_full, 0.0))
+                    last_attempt = float(self._last_dhcp_attempt.get(iface_full, 0.0))
+                    if nak_at > last_attempt:
+                        self._acquire_pair(iface_full, iface_friendly, force=True)
+                        continue
+
+                    if lease and lease.valid and lease.gateway:
+                        if known is None or known.address != lease.address or known.gateway != lease.gateway:
+                            self.wan_dhcp_client._commit_lease(lease)
+                            self.wan_dhcp_client.ensure_host_connectivity(
+                                lease,
+                                route_metric=self._upstream_prefs["host_route_metric"],
+                                ensure_default_route=self._upstream_prefs["ensure_host_default_route"],
+                                reset_dns_from_dhcp=self._upstream_prefs["reset_dns_from_dhcp"],
+                            )
+                            continue
+
+                        renew_margin = float(self._upstream_prefs["wan_dhcp_renew_margin_sec"])
+                        if known and now >= (known.renewal_at - renew_margin):
+                            self._acquire_pair(iface_full, iface_friendly, force=True)
+                        continue
+
+                    last_attempt = float(self._last_dhcp_attempt.get(iface_full, 0.0))
+                    if (now - last_attempt) >= float(self._upstream_prefs["wan_dhcp_retry_sec"]):
+                        self._acquire_pair(iface_full, iface_friendly, force=False)
+            except Exception as exc:
+                self._say(
+                    "upstream_dhcp_watch_error",
+                    f"WAN DHCP watch loop hit {type(exc).__name__}: {exc}",
+                    ["⚠️", "🔄", "📨"],
+                )
+
+    def _acquire_pair(
+        self,
+        iface_full: str,
+        iface_friendly: str,
+        *,
+        force: bool,
+    ) -> Optional[WanDhcpLease]:
+        if not self._dhcp_attempt_lock.acquire(blocking=False):
+            return None
+        try:
+            self._last_dhcp_attempt[iface_full] = time.time()
+            return self.wan_dhcp_client.acquire(
+                iface_full,
+                iface_friendly,
+                timeout=self._upstream_prefs["wan_dhcp_bootstrap_timeout_sec"],
+                force=force,
+                route_metric=self._upstream_prefs["host_route_metric"],
+                ensure_default_route=self._upstream_prefs["ensure_host_default_route"],
+                reset_dns_from_dhcp=self._upstream_prefs["reset_dns_from_dhcp"],
+            )
+        finally:
+            self._dhcp_attempt_lock.release()
+
+    def _on_wan_lease(self, lease: WanDhcpLease) -> None:
+        if not lease or not lease.valid:
+            return
+        router = self.router
+        try:
+            network_obj = ipaddress.IPv4Network(lease.network, strict=False)
+        except Exception:
+            return
+
+        cfg = router._interfaces_config.setdefault(lease.iface_full, {})
+        cfg.update({
+            "friendly_name": lease.iface_friendly,
+            "ip_addr": lease.address,
+            "network": network_obj,
+            "gateway": lease.gateway,
+            "dns_servers": list(lease.dns_servers),
+            "dhcp_server": lease.dhcp_server,
+            "dhcp_client": True,
+            "dhcp_owner": "windows_native",
+            "dhcp_lease": lease.to_dict(),
+            "is_default_gateway_iface": True,
+        })
+
+        old_out = getattr(router, "interface_out_full_name", None)
+        if old_out and old_out != lease.iface_full and old_out in router._interfaces_config:
+            try:
+                router._interfaces_config[old_out]["is_default_gateway_iface"] = False
+            except Exception:
+                pass
+
+        router.interface_out_full_name = lease.iface_full
+        router.interface_out_friendly_name = lease.iface_friendly
+        router.router_ip_out = lease.address
+        router.router_netmask_out = lease.subnet_mask
+        router.router_network_out = network_obj
+        router.router_gateway_out_ip = lease.gateway
+
+        with self._candidate_lock:
+            cand = self.candidates.get(lease.iface_full)
+            if cand is None:
+                cand = UplinkCandidate(
+                    iface_full=lease.iface_full,
+                    iface_friendly=lease.iface_friendly,
+                )
+                self.candidates[lease.iface_full] = cand
+            cand.iface_friendly = lease.iface_friendly
+            cand.ip = lease.address
+            cand.netmask = lease.subnet_mask
+            cand.network = network_obj
+            cand.gateway_ip = lease.gateway
+            cand.dns_servers = list(lease.dns_servers)
+            cand.link_up = True
+            cand.last_seen = time.time()
+            cand.metadata["dhcp_lease"] = lease.to_dict()
+            cand.metadata["last_discovered_from"] = lease.source
+
+        try:
+            marker = getattr(router, "_mark_default_gateway_iface", None)
+            if callable(marker):
+                marker(lease.iface_full, lease.gateway)
+        except Exception:
+            pass
+
+        self._apply_candidate_to_managers(cand)
+        try:
+            if hasattr(router, "_configure_host_preserving_upstream_mode"):
+                router._configure_host_preserving_upstream_mode()
+        except Exception:
+            pass
+
+        # Allow the normal health scorer to retain/fail over this lease.
+        self._last_applied_iface = None
+        self._activate_candidate(cand)
+
+        self._say(
+            "upstream_dhcp_bound",
+            f"WAN DHCP bound {lease.iface_friendly} to {lease.address}/{lease.prefix_length} via {lease.gateway or 'OS route'}",
+            ["✅", "📨", "🌐"],
+            cooldown=0.0,
+        )
+
 class LanManager(_SmartManagerBase):
     """
     Safe LAN host/subnet control plane with strict learning patch.

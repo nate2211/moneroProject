@@ -55,7 +55,7 @@ from p2pool_sniffer import SnifferSoftware, ICMPv6
 from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManager, RIPManager, IGMPManager, \
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
-    P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, \
+    P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, UpstreamManager, \
     HyperVRouterManager, PythonServerManager,ScrapeWebsiteManager, WifiManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
@@ -243,6 +243,7 @@ class PythonRouterManager:
         self.gateway_manager = None
         self.lan_manager = None
         self.uplink_manager = None
+        self.upstream_manager = None
         self.hypervrouter_manager = None
         self.python_server_manager = None
         self.socket_interface = None
@@ -1307,46 +1308,85 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         if use_dhcp_out:
             self.router_logger.log_message(
-                f"[Router] 🌍 Setting OUT interface '{self.interface_out_friendly_name}' to DHCP to get internet access.")
-            if not self._execute_netsh(["set", "address", f'name={self.interface_out_friendly_name}', "source=dhcp"]):
+                f"[Router][WanDHCP] 🌍 Enabling native DHCP on OUT interface '{self.interface_out_friendly_name}'.")
+
+            self._execute_netsh([
+                "set", "address",
+                f'name={self.interface_out_friendly_name}',
+                "source=dhcp",
+            ])
+            self._execute_netsh([
+                "set", "dnsservers",
+                f'name={self.interface_out_friendly_name}',
+                "source=dhcp",
+            ])
+
+            renew_kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 35,
+                "check": False,
+            }
+            if os.name == "nt":
+                renew_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                subprocess.run(
+                    ["ipconfig", "/renew", self.interface_out_friendly_name],
+                    **renew_kwargs,
+                )
+            except Exception as exc:
                 self.router_logger.log_message(
-                    f"[Router] ⚠️ Failed to set OUT interface to DHCP. It might already be configured. Proceeding to retrieve current IP...")
+                    f"[Router][WanDHCP] ⚠️ Native renew command returned early: {exc}"
+                )
 
-            time.sleep(5)  # Give OS time to acquire DHCP lease
-
-            # Retrieve the newly assigned IP address and netmask using psutil
-            for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
-                if addr.family == socket.AF_INET:
+            # A DHCP OFFER/ACK can take longer than five seconds on Wi-Fi.
+            # Poll until Windows has installed both a non-APIPA address and
+            # the upstream default gateway used by the host itself.
+            deadline = time.monotonic() + 35.0
+            while time.monotonic() < deadline:
+                current_out_ip = None
+                current_out_netmask = None
+                for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
+                    if addr.family != socket.AF_INET:
+                        continue
+                    try:
+                        parsed = ipaddress.IPv4Address(addr.address)
+                    except Exception:
+                        continue
+                    if parsed.is_link_local or parsed.is_loopback or parsed.is_unspecified:
+                        continue
                     current_out_ip = addr.address
-                    current_out_netmask = addr.netmask
+                    current_out_netmask = addr.netmask or "255.255.255.0"
                     break
 
-            if current_out_ip and current_out_netmask:
-                current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
+                current_out_gateway = self._get_default_gateway_for_interface(
+                    self.interface_out_friendly_name
+                )
+                if current_out_ip and current_out_netmask and current_out_gateway:
+                    break
+                time.sleep(1.0)
+
+            if current_out_ip and current_out_netmask and current_out_gateway:
                 self.router_logger.log_message(
-                    f"[Router] ✅ OUT interface successfully obtained IP via DHCP: {current_out_ip}/{current_out_netmask}, Gateway: {current_out_gateway}")
+                    "[Router][WanDHCP] ✅ Lease active: "
+                    f"{current_out_ip}/{current_out_netmask} via {current_out_gateway}."
+                )
+            elif router_ip_out:
+                current_out_ip = router_ip_out
+                current_out_netmask = router_netmask_out
+                current_out_gateway = self._get_default_gateway_for_interface(
+                    self.interface_out_friendly_name
+                )
+                self.router_logger.log_message(
+                    "[Router][WanDHCP] ⚠️ No complete DHCP lease was installed; "
+                    f"using the explicitly supplied static WAN address {current_out_ip}/{current_out_netmask}."
+                )
             else:
                 self.router_logger.log_message(
-                    f"[Router] ❌ FAILED to get IP via DHCP for OUT interface. Falling back to a private IP or user-provided static IP.")
-                # Fallback if DHCP fails: try user-provided static IP for OUT, or find unused private subnet
-                if router_ip_out:  # Check if user provided a static IP for OUT
-                    current_out_ip = router_ip_out
-                    current_out_netmask = router_netmask_out
-                    current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
-                    self.router_logger.log_message(
-                        f"[Router] Using user-provided static IP for OUT interface: {current_out_ip}/{current_out_netmask}")
-                else:  # No user-provided static IP for OUT, find unused private subnet
-                    unused_out_ip = self._find_unused_private_subnet(system_active_networks)
-                    if unused_out_ip:
-                        current_out_ip = unused_out_ip
-                        current_out_netmask = "255.255.255.0"
-                        current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
-                        self.router_logger.log_message(
-                            f"[Router] Dynamically assigned fallback private IP for OUT interface '{self.interface_out_friendly_name}': {current_out_ip}/{current_out_netmask}")
-                    else:
-                        self.router_logger.log_message(
-                            "[Router] CRITICAL ERROR: Failed to assign any IP to OUT interface. Routing may not work.")
-                        return False
+                    "[Router][WanDHCP] ❌ No DHCP ACK/default gateway became active. "
+                    "Refusing to invent a private WAN address because that would disconnect the host."
+                )
+                return False
         else:  # use_dhcp_out is False, so configure statically
             if router_ip_out:  # User explicitly provided static IP for OUT
                 current_out_ip = router_ip_out
@@ -4200,8 +4240,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                         f"[Router] ⚠️ Packet parse failure on {iface_short}: {e}"
                     )
                     return
-            if self.uplink_manager:
-                self.uplink_manager.observe_packet(packet, inbound_iface)
+            upstream_observer = self.upstream_manager or self.uplink_manager
+            if upstream_observer:
+                upstream_observer.observe_packet(packet, inbound_iface)
             if self.gateway_manager:
                 self.gateway_manager.observe_packet(packet, inbound_iface)
             if self.lan_manager:
@@ -5659,16 +5700,34 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self._configure_dhcp_control_plane(
                     reason="lan-manager-start"
                 )
-            if use_uplink:
-                self.uplink_manager = UplinkManager(self, gateway_manager=self.gateway_manager)
+            if use_uplink or use_dhcp_out:
+                self.upstream_manager = UpstreamManager(
+                    self,
+                    gateway_manager=self.gateway_manager,
+                )
+                # Compatibility: existing managers and dependency injection still
+                # refer to uplink_manager. Both names point at one enhanced object.
+                self.uplink_manager = self.upstream_manager
+
                 uplink_config = {
                     "health_interval_sec": 15.0,
-                    "preferred_iface_names": ["Wi-Fi"],
-                    "allow_router_failover": True,
+                    "preferred_iface_names": [self.interface_out_friendly_name or "Wi-Fi"],
+                    "allow_router_failover": bool(use_uplink),
                     "preserve_wifi_link": True,
                     "disable_netroute_default_sync": True,
                     "disable_netroute_metric_tuning": True,
                     "remove_public_host_routes": True,
+                    "enable_wan_dhcp": bool(use_dhcp_out),
+                    "wan_dhcp_interfaces": [self.interface_out_friendly_name] if self.interface_out_friendly_name else [],
+                    "wan_dhcp_bootstrap_timeout_sec": 35.0,
+                    "wan_dhcp_retry_sec": 30.0,
+                    "wan_dhcp_watch_interval_sec": 10.0,
+                    "wan_dhcp_force_renew_on_start": False,
+                    "wan_dhcp_renew_margin_sec": 120.0,
+                    "ensure_host_default_route": True,
+                    "reset_dns_from_dhcp": True,
+                    "host_route_metric": 15,
+                    "auto_acquire_missing_uplinks": bool(use_uplink),
                 }
                 allowed_uplink_settings = {
                     "health_interval_sec",
@@ -5683,14 +5742,31 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     "candidate_stale_sec",
                     "minimum_public_score_to_activate",
                     "keep_current_if_public",
+                    "enable_wan_dhcp",
+                    "wan_dhcp_interfaces",
+                    "wan_dhcp_bootstrap_timeout_sec",
+                    "wan_dhcp_retry_sec",
+                    "wan_dhcp_watch_interval_sec",
+                    "wan_dhcp_force_renew_on_start",
+                    "wan_dhcp_renew_margin_sec",
+                    "ensure_host_default_route",
+                    "reset_dns_from_dhcp",
+                    "host_route_metric",
+                    "auto_acquire_missing_uplinks",
                 }
                 uplink_config.update({
                     key: value
                     for key, value in uplink_settings.items()
                     if key in allowed_uplink_settings
                 })
-                self.uplink_manager.configure(**uplink_config)
-                self.uplink_manager.start()
+                self.upstream_manager.configure(**uplink_config)
+                self.upstream_manager.start()
+
+                if self.lan_manager is not None:
+                    try:
+                        self.lan_manager.uplink_manager = self.upstream_manager
+                    except Exception:
+                        pass
             # NEW
             self.stratum_manager = None
             self.stratum_connection_manager = None
@@ -6179,9 +6255,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if self.gateway_manager:
                 self.gateway_manager.stop()
                 self.gateway_manager = None
-            if self.uplink_manager:
-                self.uplink_manager.stop()
-                self.uplink_manager = None
+            upstream_manager = self.upstream_manager or self.uplink_manager
+            if upstream_manager:
+                upstream_manager.stop()
+            self.upstream_manager = None
+            self.uplink_manager = None
             self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
             self.router_logger.log_message("[Router] Worker threads stopped.")
             self.router_logger.log_message("[Router] Worker threads stopped.")
