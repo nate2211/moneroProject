@@ -8663,6 +8663,7 @@ class NATManager:
         88: ("Kerberos", "🎟️"),
         520: ("RIP", "🗺️"),
         3333: ("P2Pool", "❤️"),
+        5000: ("Mining Server", "❤️"),
         38887: ("Blocknet", "❤️"),
         38888: ("Blocknet", "❤️"),
         25565: ("Minecraft", "🧱"),
