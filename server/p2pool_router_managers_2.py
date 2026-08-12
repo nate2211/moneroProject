@@ -5256,11 +5256,85 @@ class HandshakeManager:
         ),
     )
 
+    # Passive cryptocurrency endpoint classification. Like Authenticator
+    # support above, these are metadata hints only: no TLS decryption, redirect,
+    # blocking, transaction creation, credential handling, or packet rewriting.
+    CRYPTO_SERVICE_SNI_RULES = (
+        (
+            "xmr",
+            "moneroocean",
+            ("moneroocean.stream",),
+        ),
+        (
+            "xmr",
+            "supportxmr",
+            ("supportxmr.com",),
+        ),
+        (
+            "xmr",
+            "getmonero",
+            ("getmonero.org",),
+        ),
+        (
+            "xmr",
+            "nanopool-xmr",
+            ("xmr.nanopool.org",),
+        ),
+        (
+            "exchange",
+            "coinbase",
+            ("coinbase.com", "coinbasecdn.net"),
+        ),
+        (
+            "exchange",
+            "kraken",
+            ("kraken.com", "kraken.tech"),
+        ),
+        (
+            "exchange",
+            "binance",
+            ("binance.com", "binance.us"),
+        ),
+        (
+            "exchange",
+            "gemini",
+            ("gemini.com",),
+        ),
+        (
+            "exchange",
+            "crypto.com",
+            ("crypto.com",),
+        ),
+        (
+            "exchange",
+            "bitstamp",
+            ("bitstamp.net",),
+        ),
+        (
+            "exchange",
+            "okx",
+            ("okx.com",),
+        ),
+        (
+            "exchange",
+            "bybit",
+            ("bybit.com",),
+        ),
+    )
+
+    # Port-only matches remain candidates, because XMR pools commonly expose
+    # several plaintext or TLS Stratum ports. A detected label requires SNI.
+    XMR_TCP_PORT_HINTS = {
+        3333, 4444, 5555, 6666, 7777, 8888, 9999,
+        10001, 10128, 10132, 14444, 24444,
+    }
+
     SYN_SENT = "SYN_SENT"
     SYN_ACK = "SYN_ACK_RECEIVED"
     EST = "ESTABLISHED"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
+
 
     def __init__(self, router_logger, arp_manager, nat_manager, rip_manager, packet_writer,
                  tls_record_manager=None,
@@ -5291,7 +5365,11 @@ class HandshakeManager:
         self._conn_rate: Dict[str, List[float]] = defaultdict(list)
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="HandshakeCleanup")
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            daemon=True,
+            name="HandshakeCleanup",
+        )
         self._cleanup_thread.start()
         self.sniffer = None
         self.on_flow_new = None
@@ -5307,14 +5385,16 @@ class HandshakeManager:
         self.reinject_tls_application_data = False
         self.log_tls13_key_events = True
 
-        # Microsoft Authenticator support is passive. The manager recognizes and
-        # records relevant Microsoft/APNs/FCM TLS flows, but never re-sends or
-        # consumes the original encrypted packet.
+        # Service classification is entirely passive. It records endpoint metadata
+        # that is already visible in ports and ClientHello SNI. It never decrypts
+        # protected application data or changes the observed connection.
         self.log_microsoft_authenticator = True
+        self.log_crypto_services = True
+
         self._log_message(
             "[Handshake] Manager ready "
-            "(TCP reassembly + TLS 1.3 key-aware record processing + "
-            "Microsoft Authenticator classification)."
+            "(IPv4/IPv6 TCP reassembly + TLS 1.3 key-aware record processing + "
+            "Microsoft Authenticator + XMR/exchange endpoint classification)."
         )
 
     def _log_message(self, message: str):
@@ -5369,6 +5449,7 @@ class HandshakeManager:
         flow["_packet_dst"] = (logical_dst_ip, logical_dport)
         self._refine_roles(flow, src_ip, sport, logical_dst_ip, logical_dport, flags)
         self._refresh_microsoft_authenticator_port_hint(flow)
+        self._refresh_crypto_service_port_hint(flow)
 
         direction = "c2s" if self._is_c2s(flow, src_ip, sport) else "s2c"
         packet_payload = bytes(tcp.payload) if tcp.payload else b""
@@ -5415,18 +5496,45 @@ class HandshakeManager:
             pass
         return dst_ip, dport
 
+
     def _get_or_init_flow(self, key, sip, sport, dip, dport, iface, now):
         with self._lock:
             flow = self._flows.get(key)
             if flow:
                 return flow
+
+            sip_text = str(sip)
+            dip_text = str(dip)
+            address_family = (
+                "IPv6"
+                if ":" in sip_text or ":" in dip_text
+                else "IPv4"
+            )
+            ipv6_scope = None
+            if address_family == "IPv6":
+                try:
+                    parsed = [
+                        ipaddress.ip_address(sip_text.split("%", 1)[0]),
+                        ipaddress.ip_address(dip_text.split("%", 1)[0]),
+                    ]
+                    if any(addr.is_link_local for addr in parsed):
+                        ipv6_scope = "link-local"
+                    elif any(addr.is_global for addr in parsed):
+                        ipv6_scope = "global"
+                    else:
+                        ipv6_scope = "other"
+                except Exception:
+                    ipv6_scope = "unknown"
+
             flow = {
                 "state": None,
                 "first_seen": now,
                 "last_seen": now,
-                "client": (str(sip), int(sport)),
-                "server": (str(dip), int(dport)),
+                "client": (sip_text, int(sport)),
+                "server": (dip_text, int(dport)),
                 "iface": iface,
+                "address_family": address_family,
+                "ipv6_scope": ipv6_scope,
                 "syn_ts": None,
                 "synack_ts": None,
                 "rtt_smoothed": None,
@@ -5434,12 +5542,30 @@ class HandshakeManager:
                 "tcp_opts": {"c2s": {}, "s2c": {}},
                 "dup_acks": {"c2s": 0, "s2c": 0},
                 "seq_track": {
-                    "c2s": {"last_seq": None, "last_ack": None, "expected": None, "seen": set()},
-                    "s2c": {"last_seq": None, "last_ack": None, "expected": None, "seen": set()},
+                    "c2s": {
+                        "last_seq": None,
+                        "last_ack": None,
+                        "expected": None,
+                        "seen": set(),
+                    },
+                    "s2c": {
+                        "last_seq": None,
+                        "last_ack": None,
+                        "expected": None,
+                        "seen": set(),
+                    },
                 },
                 "tls_stream": {
-                    "c2s": {"next_seq": None, "pending": {}, "pending_bytes": 0},
-                    "s2c": {"next_seq": None, "pending": {}, "pending_bytes": 0},
+                    "c2s": {
+                        "next_seq": None,
+                        "pending": {},
+                        "pending_bytes": 0,
+                    },
+                    "s2c": {
+                        "next_seq": None,
+                        "pending": {},
+                        "pending_bytes": 0,
+                    },
                 },
                 "app_bytes": {"c2s": 0, "s2c": 0},
                 "fin_seen": set(),
@@ -5447,16 +5573,30 @@ class HandshakeManager:
                 "recent_packets": {},
                 "tls_detected": False,
                 "tls_candidate": False,
+                # Existing Authenticator classification.
                 "microsoft_authenticator_candidate": False,
                 "microsoft_authenticator_detected": False,
                 "microsoft_authenticator_service": None,
                 "microsoft_authenticator_sni": None,
                 "microsoft_authenticator_detection_source": None,
                 "microsoft_authenticator_logged": False,
+                # New generic crypto endpoint classification.
+                "crypto_service_candidate": False,
+                "crypto_service_detected": False,
+                "crypto_service_category": None,
+                "crypto_service_name": None,
+                "crypto_service_sni": None,
+                "crypto_service_detection_source": None,
+                "crypto_service_logged": False,
+                "xmr_candidate": False,
+                "xmr_detected": False,
+                "exchange_candidate": False,
+                "exchange_detected": False,
                 "established_notified": False,
                 "midstream": False,
             }
             self._flows[key] = flow
+
         if callable(self.on_flow_new):
             try:
                 self.on_flow_new(key, flow)
@@ -6271,62 +6411,104 @@ class HandshakeManager:
             f"{protection}"
         )
 
+
     def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
         for message in info.get("messages", []):
             message_type = message.get("type")
             prefix = (
-                f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port} "
+                f"{rec.direction} {self._format_endpoint(rec.src, rec.src_port)} -> "
+                f"{self._format_endpoint(rec.dst, rec.dst_port)} "
                 f"len={message.get('length')}"
             )
+
             if message_type == "ClientHello":
                 sni = message.get("sni")
-                service = self._classify_microsoft_authenticator_sni(sni)
-                if service:
-                    key = _get_canonical_session_key(
-                        rec.src,
-                        rec.src_port,
-                        rec.dst,
-                        rec.dst_port,
-                    )
+                key = _get_canonical_session_key(
+                    rec.src,
+                    rec.src_port,
+                    rec.dst,
+                    rec.dst_port,
+                )
+
+                # Existing Microsoft Authenticator classification.
+                auth_service = self._classify_microsoft_authenticator_sni(sni)
+
+                # New XMR / exchange endpoint classification uses the same passive
+                # ClientHello SNI model. The TLS payload itself remains encrypted.
+                crypto_match = self._classify_crypto_service_sni(sni)
+
+                if auth_service or crypto_match:
                     with self._lock:
                         flow = self._flows.get(key)
                         if flow is not None:
-                            self._mark_microsoft_authenticator_flow(
-                                flow,
-                                service=service,
-                                sni=sni,
-                                source="tls-sni",
-                            )
+                            if auth_service:
+                                self._mark_microsoft_authenticator_flow(
+                                    flow,
+                                    service=auth_service,
+                                    sni=sni,
+                                    source="tls-sni",
+                                )
+                            if crypto_match:
+                                category, service_name = crypto_match
+                                self._mark_crypto_service_flow(
+                                    flow,
+                                    category=category,
+                                    service=service_name,
+                                    sni=sni,
+                                    source="tls-sni",
+                                )
 
                 alpn = ",".join(message.get("alpn") or []) or "N/A"
-                versions = ",".join(v for v in (message.get("supported_versions") or []) if v) or message.get("version_name") or "N/A"
+                versions = (
+                    ",".join(
+                        v
+                        for v in (message.get("supported_versions") or [])
+                        if v
+                    )
+                    or message.get("version_name")
+                    or "N/A"
+                )
                 self._log_message(
-                    f"[TLS][ClientHello] {prefix} SNI={message.get('sni') or 'N/A'} "
-                    f"versions={versions} ALPN={alpn} ciphers={message.get('cipher_suites_count') or 0} "
+                    f"[TLS][ClientHello] {prefix} "
+                    f"SNI={message.get('sni') or 'N/A'} "
+                    f"versions={versions} ALPN={alpn} "
+                    f"ciphers={message.get('cipher_suites_count') or 0} "
                     f"JA3={message.get('ja3_md5') or 'N/A'}"
                 )
+
             elif message_type == "ServerHello":
-                label = "HelloRetryRequest" if message.get("hello_retry_request") else "ServerHello"
+                label = (
+                    "HelloRetryRequest"
+                    if message.get("hello_retry_request")
+                    else "ServerHello"
+                )
                 self._log_message(
-                    f"[TLS][{label}] {prefix} version={message.get('version_name') or message.get('version') or 'N/A'} "
+                    f"[TLS][{label}] {prefix} "
+                    f"version={message.get('version_name') or message.get('version') or 'N/A'} "
                     f"cipher={message.get('cipher_suite_name') or message.get('cipher_suite') or 'N/A'} "
                     f"JA3S={message.get('ja3s_md5') or 'N/A'}"
                 )
+
             elif message_type == "Certificate":
                 self._log_message(
-                    f"[TLS][Certificate] {prefix} certificates={message.get('certificate_count')} "
+                    f"[TLS][Certificate] {prefix} "
+                    f"certificates={message.get('certificate_count')} "
                     f"bytes={message.get('certificate_bytes')} "
                     f"key={message.get('leaf_public_key_type') or 'N/A'}"
                     f"/{message.get('leaf_public_key_bits') or message.get('leaf_public_key_curve') or 'N/A'}"
                 )
+
             elif message_type == "KeyUpdate":
                 self._log_message(
                     f"[TLS1.3][KeyUpdate] 🔄 {prefix} "
                     f"request_peer={bool(message.get('request_update'))} "
                     f"applied={bool(message.get('key_update'))}"
                 )
+
             else:
-                self._log_message(f"[TLS][Handshake] {message_type} {prefix}")
+                self._log_message(
+                    f"[TLS][Handshake] {message_type} {prefix}"
+                )
 
     def _on_tls_alert(self, rec: "TLSRecord", alert: Dict):
         self._log_message(
@@ -6362,6 +6544,158 @@ class HandshakeManager:
 
     def normalize_mac(self, mac: str) -> str:
         return mac.replace('-', ':').lower()
+
+
+    @staticmethod
+    def _normalize_sni_host(sni: Optional[str]) -> str:
+        return str(sni or "").strip().lower().rstrip(".")
+
+    @staticmethod
+    def _sni_matches_suffix(host: str, suffix: str) -> bool:
+        host = str(host or "").strip().lower().rstrip(".")
+        suffix = str(suffix or "").strip().lower().lstrip(".").rstrip(".")
+        if not host or not suffix:
+            return False
+        return host == suffix or host.endswith("." + suffix)
+
+    def _classify_crypto_service_sni(
+        self,
+        sni: Optional[str],
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Return ``(category, service_name)`` for a recognized XMR/exchange SNI.
+
+        This method intentionally does not infer service identity from arbitrary
+        encrypted payload bytes. SNI may be absent when ECH is used; in that case
+        the flow remains unclassified unless a conservative port hint exists.
+        """
+        host = self._normalize_sni_host(sni)
+        if not host:
+            return None
+
+        for category, service_name, suffixes in self.CRYPTO_SERVICE_SNI_RULES:
+            for suffix in suffixes:
+                if self._sni_matches_suffix(host, suffix):
+                    return str(category), str(service_name)
+        return None
+
+    def _refresh_crypto_service_port_hint(
+        self,
+        flow: Dict[str, Any],
+    ) -> None:
+        """
+        Mark likely XMR transport by server port without claiming endpoint identity.
+
+        Pool operators can bind Stratum to arbitrary ports, so a port hint is only
+        a candidate. ``xmr_detected`` becomes true only when stronger visible
+        metadata such as SNI matches a configured XMR service rule.
+        """
+        try:
+            server_port = int(flow.get("server", ("", 0))[1])
+        except Exception:
+            server_port = 0
+
+        if server_port not in self.XMR_TCP_PORT_HINTS:
+            return
+
+        flow["crypto_service_candidate"] = True
+        flow["xmr_candidate"] = True
+
+        if not flow.get("crypto_service_detection_source"):
+            flow["crypto_service_detection_source"] = (
+                f"tcp-port-{server_port}-candidate"
+            )
+
+    def _mark_crypto_service_flow(
+        self,
+        flow: Dict[str, Any],
+        *,
+        category: str,
+        service: str,
+        sni: Optional[str],
+        source: str,
+    ) -> None:
+        """Store a passive XMR/exchange endpoint match on an existing flow."""
+        category = str(category or "").strip().lower()
+        service = str(service or "").strip().lower()
+        host = self._normalize_sni_host(sni)
+
+        if category not in {"xmr", "exchange"} or not service:
+            return
+
+        flow["crypto_service_candidate"] = True
+        flow["crypto_service_detected"] = True
+        flow["crypto_service_category"] = category
+        flow["crypto_service_name"] = service
+        flow["crypto_service_sni"] = host or None
+        flow["crypto_service_detection_source"] = str(source or "unknown")
+
+        if category == "xmr":
+            flow["xmr_candidate"] = True
+            flow["xmr_detected"] = True
+        elif category == "exchange":
+            flow["exchange_candidate"] = True
+            flow["exchange_detected"] = True
+
+        if not self.log_crypto_services:
+            return
+        if flow.get("crypto_service_logged"):
+            return
+
+        flow["crypto_service_logged"] = True
+        client = flow.get("client", ("?", 0))
+        server = flow.get("server", ("?", 0))
+        family = flow.get("address_family") or "IP"
+        scope = flow.get("ipv6_scope")
+        scope_text = f"/{scope}" if scope and family == "IPv6" else ""
+
+        self._log_message(
+            f"[Handshake][CryptoService] {family}{scope_text} "
+            f"category={category} service={service} "
+            f"{self._format_endpoint(client[0], client[1])} -> "
+            f"{self._format_endpoint(server[0], server[1])} "
+            f"SNI={host or 'N/A'} "
+            f"source={flow.get('crypto_service_detection_source')}"
+        )
+
+    def is_crypto_service_flow(self, key) -> bool:
+        """Return whether an active canonical flow has a confirmed crypto endpoint."""
+        with self._lock:
+            flow = self._flows.get(key)
+            return bool(flow and flow.get("crypto_service_detected"))
+
+    def get_crypto_service_metadata(self, key) -> Optional[Dict[str, Any]]:
+        """Return a copy of passive crypto endpoint metadata for a live flow."""
+        with self._lock:
+            flow = self._flows.get(key)
+            if not flow:
+                return None
+            return {
+                "candidate": bool(flow.get("crypto_service_candidate")),
+                "detected": bool(flow.get("crypto_service_detected")),
+                "category": flow.get("crypto_service_category"),
+                "service": flow.get("crypto_service_name"),
+                "sni": flow.get("crypto_service_sni"),
+                "source": flow.get("crypto_service_detection_source"),
+                "xmr_candidate": bool(flow.get("xmr_candidate")),
+                "xmr_detected": bool(flow.get("xmr_detected")),
+                "exchange_candidate": bool(flow.get("exchange_candidate")),
+                "exchange_detected": bool(flow.get("exchange_detected")),
+                "address_family": flow.get("address_family"),
+                "ipv6_scope": flow.get("ipv6_scope"),
+            }
+
+    @staticmethod
+    def _format_endpoint(host: str, port: int) -> str:
+        """Bracket IPv6 endpoints so logs remain unambiguous."""
+        host = str(host or "?")
+        try:
+            port = int(port)
+        except Exception:
+            port = 0
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{host}:{port}"
 
 
 

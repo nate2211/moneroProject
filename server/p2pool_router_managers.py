@@ -3724,6 +3724,14 @@ class TransportHTTPManager:
     MSCV_MAXLEN         = 64
     REDACT_QUERY_VALUES = True
 
+    # IPv4/IPv6 stream reassembly limits. These are deliberately bounded so a
+    # capture gap cannot grow an unbounded pending queue.
+    COMMON_HTTP_PORTS = {80, 8000, 8008, 8080, 8081, 8880, 3128}
+    TCP_PENDING_MAX_SEGMENTS = 2048
+    TCP_PENDING_MAX_BYTES = 2 * 1024 * 1024
+    HTTP_STREAM_MAX = 1024 * 1024
+    MAX_HEADERS_PER_PACKET = 256
+
     METHODS = {
         b"GET", b"POST", b"HEAD", b"PUT", b"DELETE", b"OPTIONS",
         b"PATCH", b"CONNECT", b"TRACE"
@@ -3739,16 +3747,37 @@ class TransportHTTPManager:
         self.detect_non80_http = bool(detect_non80_http)
         self.peek_cap = max(128, int(header_peek_bytes))
 
-        # flow cache: canonical 4-tuple -> state
-        # state: {
-        #   "last": ts, "last_log": ts, "noinspect": bool,
-        #   "client": (ip, port) or None, "server": (ip, port) or None,
-        #   "summary": dict | None
-        # }
+        # canonical flow -> reassembly/orientation/parser state
         self._flows: Dict[Tuple[str, str, str, str], Dict[str, object]] = {}
         self._last_gc = time.time()
+        self._metrics = {
+            "seen": 0,
+            "ipv4_seen": 0,
+            "ipv6_seen": 0,
+            "flows": 0,
+            "requests": 0,
+            "responses": 0,
+            "h2c_preface": 0,
+            "reassembly_bytes": 0,
+            "reassembly_delivered": 0,
+            "reassembly_prepend": 0,
+            "reassembly_ooo": 0,
+            "reassembly_retx": 0,
+            "reassembly_overlap_trim": 0,
+            "reassembly_pending_trim": 0,
+            "partial_headers_waited": 0,
+            "body_bytes_skipped": 0,
+            "chunked_bodies": 0,
+            "signature_port_matches": 0,
+            "exchange_hosts": 0,
+            "xmr_hosts": 0,
+            "errors": 0,
+        }
 
-        self.logger.log_message("[Transport][🌐 HTTP] Manager ready.")
+        self.logger.log_message(
+            "[Transport][🌐 HTTP] Manager ready "
+            "(IPv4/IPv6 TCP reassembly + segmented-header support)."
+        )
 
     # -------------------- Public entry --------------------
     def handle(self, pkt, src_ip: str, dst_ip: str, sport: int, dport: int,
@@ -3757,13 +3786,13 @@ class TransportHTTPManager:
             if TCP is None or not pkt or not pkt.haslayer(TCP):
                 return False
 
-            on_80 = (int(sport) == 80) or (int(dport) == 80)
-            if not on_80 and not self.detect_non80_http:
-                if not self._cheap_http_signature(pkt):
-                    return False
+            sport = int(sport)
+            dport = int(dport)
+            if not self.matches_packet(pkt, src_ip, dst_ip, sport, dport):
+                return False
 
             tcp = pkt[TCP]
-            tcp_flags = int(getattr(tcp, "flags", 0))
+            tcp_flags = int(getattr(tcp, "flags", 0) or 0)
             syn = bool(tcp_flags & 0x02)
             ack = bool(tcp_flags & 0x10)
             psh = bool(tcp_flags & 0x08)
@@ -3774,132 +3803,87 @@ class TransportHTTPManager:
             now = time.time()
             st = self._flows.get(fkey)
             if st is None:
-                st = {
-                    "last": now,
-                    "last_log": 0.0,
-                    "noinspect": False,
-                    "client": None,
-                    "server": None,
-                    "summary": None,
-                }
+                st = self._new_http_flow_state(fkey, src_ip, sport, dst_ip, dport, now)
                 self._flows[fkey] = st
-            else:
-                st["last"] = now
+                self._metrics["flows"] = len(self._flows)
+                if sport not in self.COMMON_HTTP_PORTS and dport not in self.COMMON_HTTP_PORTS:
+                    self._metrics["signature_port_matches"] += 1
 
+            st["last"] = now
+            st["ip_version"] = 6 if self._is_ipv6_pair(src_ip, dst_ip) else 4
+            if not st.get("_family_counted"):
+                st["_family_counted"] = True
+                if st["ip_version"] == 6:
+                    self._metrics["ipv6_seen"] += 1
+                else:
+                    self._metrics["ipv4_seen"] += 1
+
+            direction = self._http_direction(fkey, src_ip, sport)
             raw = self._get_raw(pkt)
+            flags_text = self._join_flags(
+                "syn-data" if (syn and raw) else None,
+                "syn" if (syn and not raw) else None,
+                "ack" if ack else None,
+                "psh" if psh else None,
+                "fin" if fin else None,
+                "rst" if rst else None,
+                "ipv6" if st["ip_version"] == 6 else "ipv4",
+            )
 
-            # Fast path after first successful classification
-            if st.get("noinspect", False):
-                if self._should_log(st, now):
-                    cached = st.get("summary")
-                    if cached:
-                        self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, cached)
+            if raw:
+                contiguous, prepend = self._reassemble_http_payload(
+                    st=st,
+                    direction=direction,
+                    tcp=tcp,
+                    payload=raw,
+                )
+                if contiguous:
+                    dstate = st["streams"][direction]
+                    app = dstate["app"]
+                    if prepend:
+                        app[:0] = contiguous
                     else:
-                        self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, info=None, tag="fast")
-                self._maybe_gc(now)
-                return True
+                        app.extend(contiguous)
 
-            if not raw:
+                    if len(app) > self.HTTP_STREAM_MAX:
+                        trim = len(app) - self.HTTP_STREAM_MAX
+                        del app[:trim]
+                        self._metrics["reassembly_pending_trim"] += trim
+
+                    parsed = self._drain_http_stream(
+                        st=st,
+                        direction=direction,
+                        src_ip=src_ip,
+                        sport=sport,
+                        dst_ip=dst_ip,
+                        dport=dport,
+                        inbound_iface=inbound_iface,
+                        tcp_flags=flags_text,
+                        now=now,
+                    )
+                    dstate["can_prepend"] = bool(app) and parsed == 0
+
+                    if parsed == 0 and app:
+                        self._metrics["partial_headers_waited"] += 1
+            else:
+                # Keep observing header-only TCP packets without declaring the flow
+                # uninspectable; the first HTTP bytes may arrive in a later segment.
                 if self._should_log(st, now):
-                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, info=None, tag="hdr-only")
-                self._maybe_gc(now)
-                return True
+                    self._log_line(
+                        src_ip, sport, dst_ip, dport, inbound_iface,
+                        info={"type": "unknown", "flags": flags_text, "detail": "tcp-control"},
+                    )
 
-            cap = min(len(raw), self.peek_cap, self.MAX_HEADER_BYTES)
-            buf = self._trim_leading_junk(raw[:cap])
-
-            # HTTP/2 cleartext preface (h2c)
-            if buf.startswith(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"):
-                info = {
-                    "type": "h2c",
-                    "detail": "preface",
-                    "flags": self._join_flags(
-                        "syn-data" if syn else None,
-                        "psh" if psh else None,
-                        "fin" if fin else None,
-                        "rst" if rst else None,
-                    ),
-                }
-                self._learn_orientation(st, src_ip, sport, dst_ip, dport, role="client")
-                st["summary"] = info
-                if self._should_log(st, now):
-                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, info)
-                st["noinspect"] = True
-                self._maybe_gc(now)
-                return True
-
-            # Try request first
-            is_req, req_info = self._parse_request(buf)
-            if is_req:
-                self._learn_orientation(st, src_ip, sport, dst_ip, dport, role="client", headers=req_info.get("_h"))
-
-                req_info["flags"] = self._join_flags(
-                    req_info.get("flags"),
-                    "syn-data" if (syn and raw) else None,
-                    "syn" if (syn and not raw) else None,
-                    "ack" if ack else None,
-                    "psh" if psh else None,
-                    "fin" if fin else None,
-                    "rst" if rst else None,
-                    "partial-hdr" if req_info.get("_partial") else None,
-                    "folded-hdr" if req_info.get("_folded") else None,
-                )
-                if req_info.get("method") == "CONNECT":
-                    req_info["flags"] = self._join_flags(req_info.get("flags"), "CONNECT")
-
-                summary = self._summarize_req(req_info)
-                st["summary"] = summary
-
-                if self._should_log(st, now):
-                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, summary)
-                st["noinspect"] = True
-                self._maybe_gc(now)
-                return True
-
-            # Then response
-            is_resp, resp_info = self._parse_response(buf)
-            if is_resp:
-                self._learn_orientation(st, src_ip, sport, dst_ip, dport, role="server", headers=resp_info.get("_h"))
-
-                resp_info["flags"] = self._join_flags(
-                    resp_info.get("flags"),
-                    "syn-data" if (syn and raw) else None,
-                    "ack" if ack else None,
-                    "psh" if psh else None,
-                    "fin" if fin else None,
-                    "rst" if rst else None,
-                    "partial-hdr" if resp_info.get("_partial") else None,
-                    "folded-hdr" if resp_info.get("_folded") else None,
-                )
-                summary = self._summarize_resp(resp_info)
-                st["summary"] = summary
-
-                if self._should_log(st, now):
-                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, summary)
-                st["noinspect"] = True
-                self._maybe_gc(now)
-                return True
-
-            # Unknown/partial payload—log once and mark done
-            if self._should_log(st, now):
-                self._log_line(
-                    src_ip, sport, dst_ip, dport, inbound_iface,
-                    info={
-                        "type": "unknown",
-                        "flags": self._join_flags(
-                            "syn-data" if (syn and raw) else None,
-                            "ack" if ack else None,
-                            "psh" if psh else None,
-                            "fin" if fin else None,
-                            "rst" if rst else None,
-                        ),
-                    },
-                )
-            st["noinspect"] = True
+            self._metrics["seen"] += 1
             self._maybe_gc(now)
             return True
 
-        except Exception:
+        except Exception as exc:
+            self._metrics["errors"] += 1
+            try:
+                self.logger.log_message(f"[Transport][🌐 HTTP] ⚠️ handle failed: {exc}")
+            except Exception:
+                pass
             return False
 
     # -------------------- Parsing (budgeted) --------------------
@@ -4100,7 +4084,8 @@ class TransportHTTPManager:
         dst_fmt = self._fmt_host_port(dst, dport)
         src_fmt = self._fmt_host_port(src, sport)
         nic = (iface or "").split("_")[-1] if iface else ""
-        base = f"[Transport][🧵 TCP][🌐 HTTP] {'80' if on_80 else 'non-80'} {src_fmt} -> {dst_fmt} on {nic}"
+        ipver = "IPv6" if (":" in str(src) or ":" in str(dst)) else "IPv4"
+        base = f"[Transport][🧵 TCP][🌐 HTTP][{ipver}] {'80' if on_80 else 'non-80'} {src_fmt} -> {dst_fmt} on {nic}"
 
         if tag == "hdr-only":
             self.logger.log_message(f"{base} | hdr-only")
@@ -4335,15 +4320,48 @@ class TransportHTTPManager:
             return "…"
 
     def _host_family(self, host: str) -> Optional[str]:
-        h = (host or "").lower()
+        h = (host or "").strip().lower().rstrip(".")
         if not h:
             return None
-        if h.endswith(".delivery.mp.microsoft.com") or ".delivery.mp.microsoft.com" in h:
+
+        # Strip an HTTP Host port while preserving bracketed IPv6 literals.
+        if h.startswith("["):
+            end = h.find("]")
+            if end >= 0:
+                host_only = h[1:end]
+            else:
+                host_only = h
+        else:
+            host_only = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+        if host_only.endswith(".delivery.mp.microsoft.com") or ".delivery.mp.microsoft.com" in host_only:
             return "msdo"
-        if "windowsupdate.com" in h or "update.microsoft.com" in h:
+        if "windowsupdate.com" in host_only or "update.microsoft.com" in host_only:
             return "update"
-        if "azureedge.net" in h or "microsoft.com" in h:
+        if "azureedge.net" in host_only or "microsoft.com" in host_only:
             return "microsoft"
+
+        crypto_rules = (
+            ("exchange:coinbase", ("coinbase.com", "coinbasecdn.net")),
+            ("exchange:kraken", ("kraken.com", "kraken.tech")),
+            ("exchange:binance", ("binance.com", "binance.us")),
+            ("exchange:gemini", ("gemini.com",)),
+            ("exchange:crypto.com", ("crypto.com",)),
+            ("exchange:bitstamp", ("bitstamp.net",)),
+            ("exchange:okx", ("okx.com",)),
+            ("exchange:bybit", ("bybit.com",)),
+            ("xmr:moneroocean", ("moneroocean.stream",)),
+            ("xmr:supportxmr", ("supportxmr.com",)),
+            ("xmr:getmonero", ("getmonero.org",)),
+        )
+        for label, suffixes in crypto_rules:
+            for suffix in suffixes:
+                if host_only == suffix or host_only.endswith("." + suffix):
+                    if label.startswith("exchange:"):
+                        self._metrics["exchange_hosts"] += 1
+                    elif label.startswith("xmr:"):
+                        self._metrics["xmr_hosts"] += 1
+                    return label
         return None
 
     def _ua_family(self, ua: str) -> Optional[str]:
@@ -4399,6 +4417,441 @@ class TransportHTTPManager:
                 out.append(p)
 
         return ",".join(out) if out else None
+
+    def snapshot_metrics(self) -> dict:
+        snap = dict(self._metrics)
+        snap["flows"] = len(self._flows)
+        return snap
+
+    def matches_packet(
+        self,
+        pkt,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+    ) -> bool:
+        sport = int(sport)
+        dport = int(dport)
+        fkey = self._flow_key(src_ip, sport, dst_ip, dport)
+
+        if fkey in self._flows:
+            return True
+        if sport in self.COMMON_HTTP_PORTS or dport in self.COMMON_HTTP_PORTS:
+            return True
+        if not self.detect_non80_http and not self._cheap_http_signature(pkt):
+            return False
+        return self._cheap_http_signature(pkt)
+
+    def _new_http_flow_state(
+        self,
+        fkey,
+        src_ip: str,
+        sport: int,
+        dst_ip: str,
+        dport: int,
+        now: float,
+    ) -> Dict[str, Any]:
+        def _direction_state():
+            return {
+                "start_seq": None,
+                "next_seq": None,
+                "pending": {},
+                "pending_bytes": 0,
+                "can_prepend": True,
+                "app": bytearray(),
+                "body_remaining": 0,
+                "body_until_close": False,
+                "chunked": None,
+                "protocol_switched": False,
+            }
+
+        return {
+            "flow_key": fkey,
+            "last": now,
+            "last_log": 0.0,
+            "noinspect": False,
+            "client": None,
+            "server": None,
+            "summary": None,
+            "ip_version": 6 if self._is_ipv6_pair(src_ip, dst_ip) else 4,
+            "_family_counted": False,
+            "streams": {
+                "a2b": _direction_state(),
+                "b2a": _direction_state(),
+            },
+        }
+
+    @staticmethod
+    def _is_ipv6_pair(src_ip: str, dst_ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(str(src_ip).split("%", 1)[0]).version == 6 or \
+                   ipaddress.ip_address(str(dst_ip).split("%", 1)[0]).version == 6
+        except Exception:
+            return ":" in str(src_ip) or ":" in str(dst_ip)
+
+    @staticmethod
+    def _http_direction(fkey, src_ip: str, sport: int) -> str:
+        ep = (str(src_ip), str(int(sport)))
+        return "a2b" if ep == (fkey[0], fkey[1]) else "b2a"
+
+    @staticmethod
+    def _seq_before_http(a: int, b: int) -> bool:
+        return ((int(a) - int(b)) & 0xFFFFFFFF) > 0x7FFFFFFF
+
+    def _reassemble_http_payload(
+        self,
+        *,
+        st: Dict[str, Any],
+        direction: str,
+        tcp,
+        payload: bytes,
+    ) -> Tuple[bytes, bool]:
+        if not payload:
+            return b"", False
+
+        dstate = st["streams"][direction]
+        seq = int(getattr(tcp, "seq", 0) or 0) & 0xFFFFFFFF
+        flags = int(getattr(tcp, "flags", 0) or 0)
+        if flags & 0x02:
+            seq = (seq + 1) & 0xFFFFFFFF
+
+        self._metrics["reassembly_bytes"] += len(payload)
+        start_seq = dstate.get("start_seq")
+        next_seq = dstate.get("next_seq")
+
+        if start_seq is None or next_seq is None:
+            dstate["start_seq"] = seq
+            dstate["next_seq"] = (seq + len(payload)) & 0xFFFFFFFF
+            self._metrics["reassembly_delivered"] += len(payload)
+            return bytes(payload), False
+
+        if self._seq_before_http(seq, int(start_seq)):
+            distance = (int(start_seq) - seq) & 0xFFFFFFFF
+            if dstate.get("can_prepend") and 0 < distance <= len(payload):
+                prefix = bytes(payload[:distance])
+                dstate["start_seq"] = seq
+                self._metrics["reassembly_prepend"] += 1
+                self._metrics["reassembly_delivered"] += len(prefix)
+                return prefix, True
+
+            self._metrics["reassembly_retx"] += 1
+            return b"", False
+
+        if self._seq_before_http(seq, int(next_seq)):
+            overlap = (int(next_seq) - seq) & 0xFFFFFFFF
+            if overlap >= len(payload):
+                self._metrics["reassembly_retx"] += 1
+                return b"", False
+            payload = payload[overlap:]
+            seq = int(next_seq)
+            self._metrics["reassembly_overlap_trim"] += overlap
+
+        if seq == int(next_seq):
+            chunks = [bytes(payload)]
+            dstate["next_seq"] = (int(next_seq) + len(payload)) & 0xFFFFFFFF
+
+            while True:
+                edge = int(dstate["next_seq"])
+                pending = dstate["pending"]
+                frag = pending.pop(edge, None)
+                if frag is not None:
+                    dstate["pending_bytes"] -= len(frag)
+                    chunks.append(frag)
+                    dstate["next_seq"] = (edge + len(frag)) & 0xFFFFFFFF
+                    continue
+
+                overlap_key = None
+                overlap_tail = None
+                for candidate, candidate_data in list(pending.items()):
+                    if self._seq_before_http(candidate, edge):
+                        overlap = (edge - candidate) & 0xFFFFFFFF
+                        if overlap < len(candidate_data):
+                            overlap_key = candidate
+                            overlap_tail = candidate_data[overlap:]
+                            break
+                if overlap_key is None:
+                    break
+
+                old = pending.pop(overlap_key)
+                dstate["pending_bytes"] -= len(old)
+                if overlap_tail:
+                    chunks.append(bytes(overlap_tail))
+                    dstate["next_seq"] = (edge + len(overlap_tail)) & 0xFFFFFFFF
+
+            out = b"".join(chunks)
+            self._metrics["reassembly_delivered"] += len(out)
+            return out, False
+
+        pending = dstate["pending"]
+        old = pending.get(seq)
+        if old is None or len(payload) > len(old):
+            if old is not None:
+                dstate["pending_bytes"] -= len(old)
+            pending[seq] = bytes(payload)
+            dstate["pending_bytes"] += len(payload)
+        self._metrics["reassembly_ooo"] += 1
+
+        while (
+            len(pending) > self.TCP_PENDING_MAX_SEGMENTS
+            or dstate["pending_bytes"] > self.TCP_PENDING_MAX_BYTES
+        ):
+            if not pending:
+                break
+            edge = int(dstate.get("next_seq") or 0)
+            victim = max(pending, key=lambda key: ((int(key) - edge) & 0xFFFFFFFF))
+            frag = pending.pop(victim)
+            dstate["pending_bytes"] -= len(frag)
+            self._metrics["reassembly_pending_trim"] += len(frag)
+
+        return b"", False
+
+    def _drain_http_stream(
+        self,
+        *,
+        st: Dict[str, Any],
+        direction: str,
+        src_ip: str,
+        sport: int,
+        dst_ip: str,
+        dport: int,
+        inbound_iface: Optional[str],
+        tcp_flags: Optional[str],
+        now: float,
+    ) -> int:
+        dstate = st["streams"][direction]
+        app: bytearray = dstate["app"]
+        parsed = 0
+
+        while app and parsed < self.MAX_HEADERS_PER_PACKET:
+            if dstate.get("protocol_switched") or dstate.get("body_until_close"):
+                break
+
+            if not self._consume_http_body_state(dstate):
+                break
+            if not app:
+                break
+
+            # Remove harmless separators between HTTP messages.
+            while app[:1] in (b"\r", b"\n", b"\x00"):
+                del app[:1]
+            if not app:
+                break
+
+            if app.startswith(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"):
+                info = {
+                    "type": "h2c",
+                    "detail": "preface",
+                    "flags": self._join_flags(tcp_flags, "h2c"),
+                }
+                self._learn_orientation(st, src_ip, sport, dst_ip, dport, role="client")
+                st["summary"] = info
+                self._metrics["h2c_preface"] += 1
+                if self._should_log(st, now):
+                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, info)
+                del app[:24]
+                dstate["protocol_switched"] = True
+                parsed += 1
+                break
+
+            start = self._find_http_message_start(bytes(app))
+            if start is None:
+                # Keep a bounded incomplete prefix; it may begin in a later segment.
+                if len(app) > self.peek_cap * 8:
+                    del app[:-self.peek_cap * 4]
+                break
+            if start > 0:
+                del app[:start]
+
+            header_end, terminator_len = self._find_http_header_end(bytes(app))
+            if header_end is None:
+                break
+
+            frame_end = header_end + terminator_len
+            frame = bytes(app[:frame_end])
+
+            is_req, req_info = self._parse_request(frame)
+            if is_req:
+                self._learn_orientation(
+                    st, src_ip, sport, dst_ip, dport,
+                    role="client", headers=req_info.get("_h")
+                )
+                req_info["flags"] = self._join_flags(
+                    req_info.get("flags"), tcp_flags,
+                    "folded-hdr" if req_info.get("_folded") else None,
+                )
+                summary = self._summarize_req(req_info)
+                st["summary"] = summary
+                self._metrics["requests"] += 1
+                if self._should_log(st, now):
+                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, summary)
+                del app[:frame_end]
+                self._prepare_http_body_state(dstate, req_info.get("_h") or {}, response=False)
+                parsed += 1
+                continue
+
+            is_resp, resp_info = self._parse_response(frame)
+            if is_resp:
+                self._learn_orientation(
+                    st, src_ip, sport, dst_ip, dport,
+                    role="server", headers=resp_info.get("_h")
+                )
+                resp_info["flags"] = self._join_flags(
+                    resp_info.get("flags"), tcp_flags,
+                    "folded-hdr" if resp_info.get("_folded") else None,
+                )
+                summary = self._summarize_resp(resp_info)
+                st["summary"] = summary
+                self._metrics["responses"] += 1
+                if self._should_log(st, now):
+                    self._log_line(src_ip, sport, dst_ip, dport, inbound_iface, summary)
+                del app[:frame_end]
+                code = str(resp_info.get("code") or "")
+                bodyless = code.startswith("1") or code in {"204", "304"}
+                self._prepare_http_body_state(
+                    dstate,
+                    resp_info.get("_h") or {},
+                    response=True,
+                    bodyless=bodyless,
+                )
+                parsed += 1
+                continue
+
+            # A complete header boundary that is not HTTP may be capture junk. Search
+            # for the next plausible request/status line rather than disabling the flow.
+            if len(app) > frame_end:
+                del app[:1]
+                continue
+            break
+
+        return parsed
+
+    def _find_http_message_start(self, data: bytes) -> Optional[int]:
+        if not data:
+            return None
+        if data.startswith(b"HTTP/1.") or data.startswith(b"PRI * HTTP/2.0"):
+            return 0
+        first = data.split(b" ", 1)[0]
+        if first in self.METHODS:
+            return 0
+
+        cap = min(len(data), max(self.peek_cap * 4, 8192))
+        for token in (
+            b"\r\nHTTP/1.", b"\nHTTP/1.",
+            b"\r\nGET ", b"\nGET ",
+            b"\r\nPOST ", b"\nPOST ",
+            b"\r\nHEAD ", b"\nHEAD ",
+            b"\r\nPUT ", b"\nPUT ",
+            b"\r\nDELETE ", b"\nDELETE ",
+            b"\r\nOPTIONS ", b"\nOPTIONS ",
+            b"\r\nPATCH ", b"\nPATCH ",
+            b"\r\nCONNECT ", b"\nCONNECT ",
+        ):
+            idx = data[:cap].find(token)
+            if idx >= 0:
+                return idx + (2 if token.startswith(b"\r\n") else 1)
+        return None
+
+    @staticmethod
+    def _find_http_header_end(data: bytes) -> Tuple[Optional[int], int]:
+        i = data.find(b"\r\n\r\n")
+        if i >= 0:
+            return i, 4
+        i = data.find(b"\n\n")
+        if i >= 0:
+            return i, 2
+        return None, 0
+
+    def _prepare_http_body_state(
+        self,
+        dstate: Dict[str, Any],
+        headers: Dict[bytes, bytes],
+        *,
+        response: bool,
+        bodyless: bool = False,
+    ) -> None:
+        if bodyless:
+            dstate["body_remaining"] = 0
+            dstate["chunked"] = None
+            return
+
+        transfer = (headers.get(b"transfer-encoding") or b"").lower()
+        if b"chunked" in transfer:
+            dstate["chunked"] = {"remaining": None, "trailers": False}
+            dstate["body_remaining"] = 0
+            self._metrics["chunked_bodies"] += 1
+            return
+
+        clen = headers.get(b"content-length")
+        if clen is not None:
+            try:
+                dstate["body_remaining"] = max(0, int(clen.strip() or b"0"))
+            except Exception:
+                dstate["body_remaining"] = 0
+            return
+
+        # A response without explicit framing is delimited by connection close. Do
+        # not scan encrypted/binary/body bytes for fake HTTP headers.
+        if response:
+            dstate["body_until_close"] = True
+
+    def _consume_http_body_state(self, dstate: Dict[str, Any]) -> bool:
+        app: bytearray = dstate["app"]
+
+        remaining = int(dstate.get("body_remaining", 0) or 0)
+        if remaining > 0:
+            take = min(remaining, len(app))
+            if take:
+                del app[:take]
+                dstate["body_remaining"] = remaining - take
+                self._metrics["body_bytes_skipped"] += take
+            if dstate["body_remaining"] > 0:
+                return False
+
+        chunked = dstate.get("chunked")
+        if not chunked:
+            return True
+
+        while True:
+            if chunked.get("trailers"):
+                marker = bytes(app).find(b"\r\n\r\n")
+                if marker >= 0:
+                    del app[:marker + 4]
+                    dstate["chunked"] = None
+                    return True
+                if app.startswith(b"\r\n"):
+                    del app[:2]
+                    dstate["chunked"] = None
+                    return True
+                return False
+
+            current = chunked.get("remaining")
+            if current is None:
+                eol = bytes(app).find(b"\r\n")
+                if eol < 0:
+                    return False
+                size_line = bytes(app[:eol]).split(b";", 1)[0].strip()
+                try:
+                    size = int(size_line or b"0", 16)
+                except Exception:
+                    # Invalid chunk framing: stop parsing this body conservatively.
+                    dstate["body_until_close"] = True
+                    dstate["chunked"] = None
+                    return False
+                del app[:eol + 2]
+                if size == 0:
+                    chunked["trailers"] = True
+                    continue
+                chunked["remaining"] = size
+                current = size
+
+            if len(app) < int(current) + 2:
+                return False
+            del app[:int(current)]
+            self._metrics["body_bytes_skipped"] += int(current)
+            if app[:2] == b"\r\n":
+                del app[:2]
+            chunked["remaining"] = None
 class TransportSCADAManager:
     """
     Observes common ICS/SCADA protocols with cheap signature peeks.
@@ -8482,6 +8935,32 @@ class TransportHTTPSManager:
         "mobileappcommunicator.auth.microsoft.com",
     )
 
+    # Passive cryptocurrency service classification. These rules never
+    # decrypt TLS; they only label endpoints that are visible in ClientHello SNI.
+    XMR_SERVICE_SUFFIX_RULES = (
+        ("moneroocean", ("moneroocean.stream",)),
+        ("supportxmr", ("supportxmr.com",)),
+        ("getmonero", ("getmonero.org",)),
+        ("nanopool-xmr", ("xmr.nanopool.org",)),
+        ("p2pool-xmr", ("p2pool.io",)),
+    )
+
+    EXCHANGE_SERVICE_SUFFIX_RULES = (
+        ("coinbase", ("coinbase.com", "coinbasecdn.net")),
+        ("kraken", ("kraken.com", "kraken.tech")),
+        ("binance", ("binance.com", "binance.us")),
+        ("gemini", ("gemini.com",)),
+        ("crypto.com", ("crypto.com",)),
+        ("bitstamp", ("bitstamp.net",)),
+        ("okx", ("okx.com",)),
+        ("bybit", ("bybit.com",)),
+    )
+
+    XMR_TLS_PORT_HINTS = {
+        3333, 4444, 5555, 6666, 7777, 8888, 9999,
+        10001, 10128, 10132, 14444, 24444,
+    }
+
     _TLS_CIPHERS = {
         0x1301: "TLS_AES_128_GCM_SHA256",
         0x1302: "TLS_AES_256_GCM_SHA384",
@@ -8546,6 +9025,7 @@ class TransportHTTPSManager:
     _PROTO_HINT_SYN_DATA = "SYN_DATA_443"
     _PROTO_HINT_OPAQUE = "OPAQUE_443"
 
+
     def __init__(
         self,
         logger,
@@ -8587,8 +9067,9 @@ class TransportHTTPSManager:
         self._tls_flows: "OrderedDict[tuple, dict]" = OrderedDict()
         self._peek_tcp_meta_cached = None
 
-        # Keep all existing metric keys so callers do not break, then add richer
-        # browser/Auth/QUIC correctness counters.
+        # Keep legacy metric keys for callers, and add address-family/service
+        # counters. A flow is counted once for IPv4/IPv6 even when packets are
+        # retransmitted or captured on multiple interfaces.
         metric_names = (
             "https_seen", "tls_non443_seen", "client_hello_seen",
             "server_hello_seen", "errors", "sni_parsed", "sni_cache_hits",
@@ -8626,6 +9107,12 @@ class TransportHTTPSManager:
             "microsoft_authenticator_candidates",
             "microsoft_authenticator_sni_matches", "apns_candidates",
             "fcm_candidates",
+            "xmr_service_candidates", "xmr_sni_matches",
+            "exchange_service_candidates", "exchange_sni_matches",
+            # IPv6/IPv4 observability additions.
+            "ipv4_flows", "ipv6_flows", "ipv6_global_flows",
+            "ipv6_link_local_flows", "ipv6_other_scope_flows",
+            "ipv6_tcp_packets", "ipv6_udp_packets",
             # Reassembly/correctness additions.
             "tcp_gap_waits", "tcp_pending_segments", "tcp_overlap_trimmed",
             "tls_handshake_messages_reassembled", "tls_desync_bytes",
@@ -8637,7 +9124,8 @@ class TransportHTTPSManager:
 
         self._safe_log(
             "[Transport][🔒 HTTPS] Advanced Manager ready "
-            "(browser-ready TLS/HTTP2/HTTP3/Auth metadata; packet bytes unchanged)"
+            "(IPv4/IPv6 TLS/HTTP2/HTTP3 + Auth/XMR/exchange metadata; "
+            "packet bytes unchanged)"
         )
 
     # ------------------------------------------------------------------
@@ -8698,6 +9186,7 @@ class TransportHTTPSManager:
 
         fkey = self._flow_key(src_ip, sport, dst_ip, dport)
         st = self._get_or_create_flow(fkey, now)
+        self._apply_ip_family_metadata(st, src_ip, dst_ip, "udp")
         self._touch_flow(fkey, st, now)
         self._update_flow_roles(st, src_ip, sport, dst_ip, dport, None)
         st["transport"] = "udp"
@@ -8808,6 +9297,7 @@ class TransportHTTPSManager:
             return False
 
         st = self._get_or_create_flow(fkey, now)
+        self._apply_ip_family_metadata(st, src_ip, dst_ip, "tcp")
         self._touch_flow(fkey, st, now)
         self._update_flow_roles(st, src_ip, sport, dst_ip, dport, tmeta)
         direction = self._packet_direction(src_ip, sport, dst_ip, dport, fkey)
@@ -8908,6 +9398,7 @@ class TransportHTTPSManager:
     # Flow lifecycle and downstream metadata
     # ------------------------------------------------------------------
 
+
     def _get_or_create_flow(self, fkey, now: float) -> dict:
         st = self._tls_flows.get(fkey)
         if st is not None:
@@ -8934,6 +9425,10 @@ class TransportHTTPSManager:
             "notes": [],
             "confidence": 0.0,
             "parse_reason": None,
+            # Address-family metadata is filled on first observed packet.
+            "ip_version": None,
+            "ipv6_scope": None,
+            "_ip_family_counted": False,
             "tcp_state": self._TCP_STATE_INIT,
             "tls_state": self._TLS_STATE_INIT,
             "tls_ver_neg": None,
@@ -8969,6 +9464,14 @@ class TransportHTTPSManager:
             "service_hint": None,
             "microsoft_authenticator_candidate": False,
             "microsoft_authenticator_detected": False,
+            # Passive crypto-service classification.
+            "crypto_service_category": None,
+            "crypto_service_name": None,
+            "crypto_service_sni": None,
+            "xmr_service_candidate": False,
+            "xmr_service_detected": False,
+            "exchange_service_candidate": False,
+            "exchange_service_detected": False,
             "quic_seen": False,
             "quic_type": None,
             "quic_version": None,
@@ -9030,6 +9533,7 @@ class TransportHTTPSManager:
         except Exception:
             pass
 
+
     def _attach_packet_metadata(self, packet) -> None:
         """Attach non-wire metadata for downstream managers; never alter bytes."""
         try:
@@ -9048,6 +9552,8 @@ class TransportHTTPSManager:
                 "transport": st.get("transport"),
                 "protocol_hint": st.get("proto_hint"),
                 "confidence": st.get("confidence"),
+                "ip_version": st.get("ip_version"),
+                "ipv6_scope": st.get("ipv6_scope"),
                 "tcp_state": st.get("tcp_state"),
                 "tls_state": st.get("tls_state"),
                 "tls_version": st.get("tls_ver_neg"),
@@ -9061,6 +9567,13 @@ class TransportHTTPSManager:
                 "service_hint": st.get("service_hint"),
                 "microsoft_authenticator_candidate": bool(st.get("microsoft_authenticator_candidate")),
                 "microsoft_authenticator_detected": bool(st.get("microsoft_authenticator_detected")),
+                "crypto_service_category": st.get("crypto_service_category"),
+                "crypto_service_name": st.get("crypto_service_name"),
+                "crypto_service_sni": st.get("crypto_service_sni"),
+                "xmr_service_candidate": bool(st.get("xmr_service_candidate")),
+                "xmr_service_detected": bool(st.get("xmr_service_detected")),
+                "exchange_service_candidate": bool(st.get("exchange_service_candidate")),
+                "exchange_service_detected": bool(st.get("exchange_service_detected")),
                 "quic_type": st.get("quic_type"),
                 "quic_version": st.get("quic_version"),
                 "notes": list(st.get("notes") or []),
@@ -9480,7 +9993,15 @@ class TransportHTTPSManager:
             score += 2
         st["organic_browser_score"] = max(int(st.get("organic_browser_score", 0)), min(100, score))
 
+
     def _classify_service(self, st: dict, sport: Optional[int], dport: Optional[int]) -> None:
+        """
+        Classify only metadata that is visible without decrypting application data.
+
+        Microsoft Authenticator, XMR pool, and exchange labels come from a known
+        service port or ClientHello SNI. A generic TCP/443 connection is not enough
+        to assert that it belongs to any specific service.
+        """
         ports = {int(p) for p in (sport, dport) if p is not None}
         sni = str(st.get("sni") or "").strip().lower().rstrip(".")
 
@@ -9493,17 +10014,68 @@ class TransportHTTPSManager:
             st["browser_ready"] = True
             self._metrics["fcm_candidates"] += 1
 
-        if 443 in ports or sni:
+        # Preserve Authenticator support, but avoid treating every HTTPS flow as
+        # Authenticator traffic. Dedicated push ports are candidates; Microsoft
+        # endpoint SNI is a positive passive match.
+        auth_port_candidate = bool(
+            ports & (self.APNS_PORTS | self.FCM_PORTS)
+        )
+        if auth_port_candidate and not st.get("microsoft_authenticator_candidate"):
             st["microsoft_authenticator_candidate"] = True
             self._metrics["microsoft_authenticator_candidates"] += 1
 
         if sni and self._host_matches_suffixes(sni, self.MICROSOFT_AUTH_SUFFIXES):
+            if not st.get("microsoft_authenticator_candidate"):
+                self._metrics["microsoft_authenticator_candidates"] += 1
+            if not st.get("microsoft_authenticator_detected"):
+                self._metrics["microsoft_authenticator_sni_matches"] += 1
             st["service_hint"] = "microsoft-authenticator-or-entra-auth"
             st["microsoft_authenticator_detected"] = True
             st["microsoft_authenticator_candidate"] = True
             st["browser_ready"] = True
-            self._metrics["microsoft_authenticator_sni_matches"] += 1
             self._note_flow(st, "microsoft_authentication_endpoint")
+
+        # XMR endpoints. Port-only information is a candidate because many pools
+        # use configurable ports; SNI is the stronger endpoint identity.
+        if ports & self.XMR_TLS_PORT_HINTS and not st.get("xmr_service_candidate"):
+            st["xmr_service_candidate"] = True
+            self._metrics["xmr_service_candidates"] += 1
+            self._note_flow(st, "xmr_tls_port_candidate")
+
+        if sni:
+            for service_name, suffixes in self.XMR_SERVICE_SUFFIX_RULES:
+                if not self._host_matches_suffixes(sni, suffixes):
+                    continue
+                if not st.get("xmr_service_candidate"):
+                    self._metrics["xmr_service_candidates"] += 1
+                if not st.get("xmr_service_detected"):
+                    self._metrics["xmr_sni_matches"] += 1
+                st["xmr_service_candidate"] = True
+                st["xmr_service_detected"] = True
+                st["crypto_service_category"] = "xmr"
+                st["crypto_service_name"] = service_name
+                st["crypto_service_sni"] = sni
+                st["service_hint"] = f"xmr:{service_name}"
+                self._note_flow(st, f"xmr_endpoint:{service_name}")
+                break
+
+        if sni:
+            for service_name, suffixes in self.EXCHANGE_SERVICE_SUFFIX_RULES:
+                if not self._host_matches_suffixes(sni, suffixes):
+                    continue
+                if not st.get("exchange_service_candidate"):
+                    self._metrics["exchange_service_candidates"] += 1
+                if not st.get("exchange_service_detected"):
+                    self._metrics["exchange_sni_matches"] += 1
+                st["exchange_service_candidate"] = True
+                st["exchange_service_detected"] = True
+                st["crypto_service_category"] = "exchange"
+                st["crypto_service_name"] = service_name
+                st["crypto_service_sni"] = sni
+                st["service_hint"] = f"exchange:{service_name}"
+                st["browser_ready"] = True
+                self._note_flow(st, f"exchange_endpoint:{service_name}")
+                break
 
     @staticmethod
     def _host_matches_suffixes(host: str, suffixes) -> bool:
@@ -10593,6 +11165,53 @@ class TransportHTTPSManager:
             or st.get("cipher") is not None or st.get("tls_ver_neg")
             or st.get("clienthello_fp")
         )
+
+
+    def _apply_ip_family_metadata(self, st: dict, src_ip: str, dst_ip: str, transport: str) -> None:
+        """Count and retain IPv4/IPv6 flow metadata without touching packet bytes."""
+        try:
+            normalized = []
+            for value in (src_ip, dst_ip):
+                value = str(value or "").split("%", 1)[0]
+                normalized.append(ipaddress.ip_address(value))
+        except Exception:
+            return
+
+        is_v6 = any(addr.version == 6 for addr in normalized)
+        st["ip_version"] = 6 if is_v6 else 4
+
+        if is_v6:
+            if any(addr.version == 6 and addr.is_link_local for addr in normalized):
+                scope = "link-local"
+            elif any(addr.version == 6 and addr.is_global for addr in normalized):
+                scope = "global"
+            else:
+                scope = "other"
+            st["ipv6_scope"] = scope
+
+            if transport == "tcp":
+                self._metrics["ipv6_tcp_packets"] += 1
+            elif transport == "udp":
+                self._metrics["ipv6_udp_packets"] += 1
+        else:
+            st["ipv6_scope"] = None
+
+        if st.get("_ip_family_counted"):
+            return
+        st["_ip_family_counted"] = True
+
+        if is_v6:
+            self._metrics["ipv6_flows"] += 1
+            if st["ipv6_scope"] == "global":
+                self._metrics["ipv6_global_flows"] += 1
+            elif st["ipv6_scope"] == "link-local":
+                self._metrics["ipv6_link_local_flows"] += 1
+            else:
+                self._metrics["ipv6_other_scope_flows"] += 1
+            self._note_flow(st, f"ipv6:{st['ipv6_scope']}")
+        else:
+            self._metrics["ipv4_flows"] += 1
+            self._note_flow(st, "ipv4")
 class TransportStratumManager:
     """
     Advanced Stratum observer/logger for LAN and pool traffic.
@@ -10619,10 +11238,16 @@ class TransportStratumManager:
     FLOW_SOFT_MAX = 50_000
     GC_PERIOD_SEC = 60.0
 
-    MAX_BUF_PER_DIR = 256 * 1024
-    MAX_LINE_BYTES = 32 * 1024
-    MAX_MESSAGES_PER_PKT = 8
-    ASCII_PREVIEW_MAX = 160
+    # Larger bounded buffers plus lossless drain rounds keep bursty pool work
+    # from being discarded when a single TCP segment contains many JSON-RPC
+    # messages. Complete frames are processed; only incomplete tails remain.
+    MAX_BUF_PER_DIR = 1024 * 1024
+    MAX_LINE_BYTES = 256 * 1024
+    MAX_MESSAGES_PER_PKT = 8192  # compatibility name; now a per-drain safety ceiling
+    MAX_DRAIN_ROUNDS = 32
+    MAX_PENDING_TCP_SEGMENTS = 4096
+    MAX_PENDING_TCP_BYTES = 4 * 1024 * 1024
+    ASCII_PREVIEW_MAX = 240
 
     MAX_PENDING_IDS = 256
     PARTIAL_JSON_COOLDOWN_S = 6.0
@@ -10632,7 +11257,14 @@ class TransportStratumManager:
     MALFORMED_FLOW_BLOCK_TTL_S = 20.0
     EXACT_PACKET_BLOCK_TTL_S = 10.0
 
-    DEFAULT_PORTS = {3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444}
+    # Includes common Stratum ports plus ports frequently used by Monero
+    # pools/proxies. Signature-based discovery below still recognizes Stratum on
+    # any other TCP port without permanently treating client ephemeral ports as
+    # mining service ports.
+    DEFAULT_PORTS = {
+        3333, 4444, 5555, 6666, 7777, 8888, 9999,
+        10001, 10128, 10132, 14444, 24444,
+    }
 
     class _TokenBucket:
         __slots__ = ("capacity", "refill", "tokens", "last")
@@ -10676,8 +11308,13 @@ class TransportStratumManager:
         self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         self._last_gc = time.time()
 
-        self.active_tx_enabled = True
-        self.respond_only_if_dst_owned = False
+        # This manager is an observer by default. Synthetic ACK/RST generation
+        # and PacketWriter enforcement remain available for explicit experiments,
+        # but are disabled so captured pool retransmissions/jobs cannot be
+        # suppressed or altered by the inspection path.
+        self.active_tx_enabled = False
+        self.active_enforcement_enabled = False
+        self.respond_only_if_dst_owned = True
         self._last_tx_slots = {}
         self.TX_COOLDOWN_S = 1.0
 
@@ -10728,6 +11365,24 @@ class TransportStratumManager:
             "tx_failed": 0,
             "tx_skipped_no_writer": 0,
             "tx_skipped_not_owned": 0,
+
+            # Lossless stream/reassembly metrics.
+            "tcp_reassembly_bytes": 0,
+            "tcp_reassembly_delivered": 0,
+            "tcp_reassembly_prepend": 0,
+            "tcp_out_of_order_buffered": 0,
+            "tcp_pending_drained": 0,
+            "tcp_overlap_trimmed": 0,
+            "tcp_retransmission_ignored": 0,
+            "tcp_pending_trimmed": 0,
+            "framing_rounds": 0,
+            "framing_limit_yields": 0,
+            "framing_incomplete_tail": 0,
+            "json_arrays": 0,
+            "valid_work_packets": 0,
+            "xmr_work_packets": 0,
+            "btc_work_packets": 0,
+            "signature_port_matches": 0,
         }
 
         # TX cache / semantic dedupe
@@ -10760,7 +11415,7 @@ class TransportStratumManager:
             sport = int(sport)
             dport = int(dport)
 
-            if not self._is_service_port(sport, dport):
+            if not self.matches_packet(packet, src_ip, dst_ip, sport, dport):
                 return False
 
             now = time.time()
@@ -10774,6 +11429,8 @@ class TransportStratumManager:
                 st = self._new_flow_state(src_ip, sport, dst_ip, dport, iface, now)
                 self._flows[fkey] = st
                 self._metrics["flows"] = len(self._flows)
+                if not self._is_service_port(sport, dport):
+                    self._metrics["signature_port_matches"] += 1
 
             st["last"] = now
             st["iface"] = iface
@@ -10809,143 +11466,37 @@ class TransportStratumManager:
             if payload:
                 self._track_duplicate_payload(st, payload, now)
 
-                buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
-                st[buf_key] = self._append_buf(st.get(buf_key, b""), payload)
-
-                frames, remain = self._drain_messages(st[buf_key])
-                st[buf_key] = remain
-
-                processed = 0
-                for item in frames:
-                    if processed >= self.MAX_MESSAGES_PER_PKT:
-                        break
-
-                    kind = item.get("kind")
-                    raw = item.get("raw", b"")
-                    if not raw:
-                        continue
-
-                    if kind == "json":
-                        event = self._parse_json_rpc(
-                            item.get("obj") or {},
-                            raw,
-                            st=st,
-                            direction=direction,
-                        )
+                contiguous, prepend = self._reassemble_stratum_payload(
+                    st=st,
+                    direction=direction,
+                    packet=packet,
+                    payload=payload,
+                )
+                if contiguous:
+                    buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
+                    if prepend:
+                        combined = bytes(contiguous) + bytes(st.get(buf_key, b"") or b"")
+                        st[buf_key] = combined[-self.MAX_BUF_PER_DIR:]
                     else:
-                        event = self._parse_line(raw, st=st, direction=direction)
+                        st[buf_key] = self._append_buf(st.get(buf_key, b""), contiguous)
 
-                    if event is None:
-                        if self._should_log(st, importance="low", slot="unknown"):
-                            preview = self._safe_ascii(raw, self.ASCII_PREVIEW_MAX) or "-"
-                            self._emit(
-                                f"{self._tag_prefix(st)}[🧾 UNKNOWN] "
-                                f"{src_ip}:{sport} -> {dst_ip}:{dport} "
-                                f"dir={direction} iface={iface} preview={preview}"
-                            )
-                        self._metrics["unknown"] += 1
-                        processed += 1
-                        continue
-
-                    self._update_state_from_event(st, event, now=now, direction=direction)
-                    self._bump_metrics(event)
-
-                    self._maybe_packetwriter_actions(
+                    self._consume_stratum_buffer(
                         packet=packet,
                         st=st,
-                        event=event,
+                        buf_key=buf_key,
                         flags=flags,
                         inbound_iface=inbound_iface,
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         sport=sport,
                         dport=dport,
-                        now=now,
-                    )
-
-                    self._maybe_packetwriter_tx(
-                        packet=packet,
-                        st=st,
-                        event=event,
-                        flags=flags,
-                        inbound_iface=inbound_iface,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        sport=sport,
-                        dport=dport,
-                        now=now,
-                    )
-
-                    if event.get("_classification_changed") and self._should_log(st, importance="med", slot="classify"):
-                        self._emit_classification(st, event)
-
-                    if self._should_log(st, importance=event.get("importance", "med"), slot=event.get("log_slot", "event")):
-                        self._log_event(
-                            st=st,
-                            event=event,
-                            src_ip=src_ip,
-                            sport=sport,
-                            dst_ip=dst_ip,
-                            dport=dport,
-                            iface=iface,
-                            direction=direction,
-                            now=now,
-                        )
-
-                    processed += 1
-
-                if not frames:
-                    partial_event = self._maybe_partial_event(
-                        buf=st[buf_key],
-                        st=st,
+                        iface=iface,
                         direction=direction,
                         now=now,
                     )
-                    if partial_event is not None:
-                        self._update_state_from_event(st, partial_event, now=now, direction=direction)
-                        self._bump_metrics(partial_event)
 
-                        self._maybe_packetwriter_actions(
-                            packet=packet,
-                            st=st,
-                            event=partial_event,
-                            flags=flags,
-                            inbound_iface=inbound_iface,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            sport=sport,
-                            dport=dport,
-                            now=now,
-                        )
-
-                        self._maybe_packetwriter_tx(
-                            packet=packet,
-                            st=st,
-                            event=partial_event,
-                            flags=flags,
-                            inbound_iface=inbound_iface,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            sport=sport,
-                            dport=dport,
-                            now=now,
-                        )
-
-                        if partial_event.get("_classification_changed") and self._should_log(st, importance="med", slot="classify"):
-                            self._emit_classification(st, partial_event)
-
-                        if self._should_log(st, importance=partial_event.get("importance", "low"), slot="partial"):
-                            self._log_event(
-                                st=st,
-                                event=partial_event,
-                                src_ip=src_ip,
-                                sport=sport,
-                                dst_ip=dst_ip,
-                                dport=dport,
-                                iface=iface,
-                                direction=direction,
-                                now=now,
-                            )
+                    stream = st["tcp_reassembly"][direction]
+                    stream["can_prepend"] = bool(st.get(buf_key))
             else:
                 control_event = self._make_control_event(flags)
                 if control_event is not None:
@@ -10964,7 +11515,6 @@ class TransportStratumManager:
                     )
 
             self._maybe_gc(now)
-
             self._metrics["seen"] += 1
             return True
 
@@ -11161,6 +11711,10 @@ class TransportStratumManager:
         _ = now
 
         if not self.packet_writer:
+            return
+        if not getattr(self, "active_enforcement_enabled", False):
+            # Passive capture must never suppress a legitimate TCP retransmission,
+            # repeated pool job, or server error response.
             return
 
         kind = str(event.get("kind") or "")
@@ -11536,8 +12090,20 @@ class TransportStratumManager:
             client = (dst_ip, int(dport))
             server = (src_ip, int(sport))
         else:
+            # Signature-discovered non-standard Stratum normally begins with a
+            # client request. Role refinement can still correct this on later packets.
             client = (src_ip, int(sport))
             server = (dst_ip, int(dport))
+
+        def _stream_state():
+            return {
+                "start_seq": None,
+                "next_seq": None,
+                "pending": {},
+                "pending_bytes": 0,
+                "can_prepend": True,
+                "delivered_bytes": 0,
+            }
 
         return {
             "first": now,
@@ -11548,6 +12114,10 @@ class TransportStratumManager:
             "server": server,
             "buf_c2s": b"",
             "buf_s2c": b"",
+            "tcp_reassembly": {
+                "c2s": _stream_state(),
+                "s2c": _stream_state(),
+            },
             "last_worker": None,
             "last_job_id": None,
             "last_height": None,
@@ -12498,103 +13068,98 @@ class TransportStratumManager:
 
     def _drain_messages(self, buf: bytes) -> Tuple[List[Dict[str, Any]], bytes]:
         """
-        Drain JSON frames from arbitrary TCP byte streams.
+        Drain complete Stratum JSON/text frames without discarding an unprocessed
+        suffix. This parser is deliberately stream-oriented:
 
-        Fix over the original:
-        - supports newline-delimited JSON
-        - supports multiple JSON objects in one packet
-        - supports JSON objects without trailing newline
-        - keeps partial tail buffered for the next segment
+        * multiple JSON objects in one TCP segment are returned independently;
+        * objects/arrays split across segments remain buffered;
+        * braces inside quoted JSON strings do not terminate a frame;
+        * newline-delimited text is emitted only after its newline arrives;
+        * hitting the per-drain ceiling returns the untouched suffix so the caller
+          can immediately continue draining instead of losing work.
         """
         items: List[Dict[str, Any]] = []
         if not buf:
             return items, b""
 
-        data = bytes(buf).replace(b"\x00", b"")
-        if not data:
-            return items, b""
+        data = bytes(buf)
+        n = len(data)
+        cursor = 0
 
-        # Fast path for line-oriented streams
-        for line in data.splitlines():
-            s = line.strip()
-            if not s:
+        while cursor < n and len(items) < self.MAX_MESSAGES_PER_PKT:
+            # Skip inter-frame whitespace/NUL padding. NUL is tolerated between
+            # messages but is never removed from the middle of a JSON token.
+            while cursor < n and data[cursor] in b" \t\r\n\x00":
+                cursor += 1
+            if cursor >= n:
+                return items, b""
+
+            first = data[cursor]
+
+            if first in (ord("{"), ord("[")):
+                end = self._scan_json_value_end(data, cursor)
+                if end is None:
+                    self._metrics["framing_incomplete_tail"] += 1
+                    return items, data[cursor:]
+
+                raw = data[cursor:end].strip()
+                parsed = self._try_json_any(raw)
+                if isinstance(parsed, dict):
+                    items.append({"kind": "json", "raw": raw, "obj": parsed})
+                elif isinstance(parsed, list):
+                    self._metrics["json_arrays"] += 1
+                    for obj in parsed:
+                        if isinstance(obj, dict):
+                            encoded = json.dumps(
+                                obj, separators=(",", ":"), ensure_ascii=False
+                            ).encode("utf-8", "replace")
+                            # Keep every object from one already-complete JSON
+                            # array. Truncating a decoded batch here would advance
+                            # past the array and silently lose valid work.
+                            items.append({"kind": "json", "raw": encoded, "obj": obj})
+                else:
+                    # A balanced but invalid JSON value is retained as text only if
+                    # it is bounded; this avoids silently throwing away evidence.
+                    if raw and len(raw) <= self.MAX_LINE_BYTES:
+                        items.append({"kind": "text", "raw": raw})
+                cursor = end
                 continue
-            obj = self._try_json(s)
-            if isinstance(obj, dict):
-                items.append({"kind": "json", "raw": s, "obj": obj})
-            elif len(s) <= self.MAX_LINE_BYTES:
-                items.append({"kind": "text", "raw": s})
 
-        # Brace-balanced JSON scan so split/combined frames still work.
-        balanced: List[Tuple[int, int, Dict[str, Any], bytes]] = []
-        start = -1
-        depth = 0
-        in_str = False
-        esc = False
-        last_complete_end = -1
+            # Non-JSON Stratum implementations are line oriented. Do not emit the
+            # final unterminated line because it may be the first half of a valid
+            # message in the next TCP segment.
+            nl = data.find(b"\n", cursor)
+            if nl < 0:
+                tail = data[cursor:]
+                if len(tail) > self.MAX_BUF_PER_DIR:
+                    tail = tail[-self.MAX_BUF_PER_DIR:]
+                self._metrics["framing_incomplete_tail"] += int(bool(tail))
+                return items, tail
 
-        for i, b in enumerate(data):
-            ch = chr(b)
+            raw = data[cursor:nl].rstrip(b"\r").strip()
+            if raw:
+                parsed = self._try_json_any(raw)
+                if isinstance(parsed, dict):
+                    items.append({"kind": "json", "raw": raw, "obj": parsed})
+                elif isinstance(parsed, list):
+                    self._metrics["json_arrays"] += 1
+                    for obj in parsed:
+                        if isinstance(obj, dict):
+                            encoded = json.dumps(
+                                obj, separators=(",", ":"), ensure_ascii=False
+                            ).encode("utf-8", "replace")
+                            items.append({"kind": "json", "raw": encoded, "obj": obj})
+                            if len(items) >= self.MAX_MESSAGES_PER_PKT:
+                                break
+                elif len(raw) <= self.MAX_LINE_BYTES:
+                    items.append({"kind": "text", "raw": raw})
+            cursor = nl + 1
 
-            if start < 0:
-                if ch == "{":
-                    start = i
-                    depth = 1
-                    in_str = False
-                    esc = False
-                continue
-
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-
-            if ch == '"':
-                in_str = True
-                continue
-            if ch == "{":
-                depth += 1
-                continue
-            if ch == "}":
-                depth -= 1
-                if depth == 0:
-                    raw = data[start:i + 1].strip()
-                    obj = self._try_json(raw)
-                    if isinstance(obj, dict):
-                        balanced.append((start, i + 1, obj, raw))
-                        last_complete_end = i + 1
-                    start = -1
-
-        seen = set()
-        for item in items:
-            raw = item.get("raw", b"")
-            if raw and raw not in seen:
-                seen.add(raw)
-
-        for _, _, obj, raw in balanced:
-            if raw and raw not in seen:
-                seen.add(raw)
-                items.append({"kind": "json", "raw": raw, "obj": obj})
-
-        if start >= 0:
-            remain = data[start:]
-        elif last_complete_end >= 0:
-            remain = data[last_complete_end:]
-            if not remain.strip():
-                remain = b""
-        else:
-            remain = b""
-
+        remain = data[cursor:]
+        if len(items) >= self.MAX_MESSAGES_PER_PKT and remain:
+            self._metrics["framing_limit_yields"] += 1
         if len(remain) > self.MAX_BUF_PER_DIR:
             remain = remain[-self.MAX_BUF_PER_DIR:]
-
-        if len(items) > self.MAX_MESSAGES_PER_PKT:
-            items = items[: self.MAX_MESSAGES_PER_PKT]
-
         return items, remain
 
     def _split_lines(self, buf: bytes) -> Tuple[List[bytes], bytes]:
@@ -12918,6 +13483,471 @@ class TransportStratumManager:
             self._flows.pop(oldest, None)
 
         self._metrics["flows"] = len(self._flows)
+
+    def matches_packet(
+        self,
+        packet,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+    ) -> bool:
+        """Return True for configured ports, an already learned flow, or a strict Stratum signature."""
+        sport = int(sport)
+        dport = int(dport)
+        if self._is_service_port(sport, dport):
+            return True
+
+        try:
+            fkey = self._flow_key(src_ip, sport, dst_ip, dport)
+            if fkey in self._flows:
+                return True
+        except Exception:
+            pass
+
+        payload = self._payload_sample(packet, cap=8192)
+        return self._looks_like_stratum_payload(payload)
+
+    def _looks_like_stratum_payload(self, payload: bytes) -> bool:
+        if not payload:
+            return False
+
+        sample = bytes(payload[:8192]).lstrip(b" \t\r\n\x00")
+        if not sample:
+            return False
+
+        low = sample.lower()
+        strong = (
+            b'"method":"mining.subscribe"',
+            b'"method": "mining.subscribe"',
+            b'"method":"mining.authorize"',
+            b'"method": "mining.authorize"',
+            b'"method":"mining.notify"',
+            b'"method": "mining.notify"',
+            b'"method":"mining.submit"',
+            b'"method": "mining.submit"',
+            b'"method":"login"',
+            b'"method": "login"',
+            b'"method":"keepalived"',
+            b'"method": "keepalived"',
+        )
+        if any(token in low for token in strong):
+            return True
+
+        # Monero job and submit messages vary between pools. Requiring multiple
+        # mining-specific keys keeps generic JSON-RPC APIs from being misclassified.
+        xmr_score = sum(
+            int(token in low)
+            for token in (
+                b'"job_id"', b'"blob"', b'"target"', b'"seed_hash"',
+                b'"algo"', b'"nonce"', b'"result"',
+            )
+        )
+        if (b'"method":"job"' in low or b'"method": "job"' in low) and xmr_score >= 1:
+            return True
+        if (b'"method":"submit"' in low or b'"method": "submit"' in low) and xmr_score >= 2:
+            return True
+        if xmr_score >= 4:
+            return True
+
+        return False
+
+    @staticmethod
+    def _seq_before32(a: int, b: int) -> bool:
+        return ((int(a) - int(b)) & 0xFFFFFFFF) > 0x7FFFFFFF
+
+    def _reassemble_stratum_payload(
+        self,
+        *,
+        st: Dict[str, Any],
+        direction: str,
+        packet,
+        payload: bytes,
+    ) -> Tuple[bytes, bool]:
+        """
+        Return newly contiguous application bytes and whether they belong before
+        the current incomplete application buffer.
+
+        The prepend path is important for captures that begin on the second half of
+        a JSON object and later receive the earlier segment out of order.
+        """
+        if not payload:
+            return b"", False
+
+        stream = st.setdefault("tcp_reassembly", {}).setdefault(direction, {
+            "start_seq": None,
+            "next_seq": None,
+            "pending": {},
+            "pending_bytes": 0,
+            "can_prepend": True,
+            "delivered_bytes": 0,
+        })
+
+        try:
+            tcp = packet[TCP]
+            seq = int(getattr(tcp, "seq", 0) or 0) & 0xFFFFFFFF
+            flags = int(getattr(tcp, "flags", 0) or 0)
+            if flags & 0x02:  # SYN consumes one sequence number before payload
+                seq = (seq + 1) & 0xFFFFFFFF
+        except Exception:
+            self._metrics["tcp_reassembly_bytes"] += len(payload)
+            self._metrics["tcp_reassembly_delivered"] += len(payload)
+            return bytes(payload), False
+
+        self._metrics["tcp_reassembly_bytes"] += len(payload)
+
+        start_seq = stream.get("start_seq")
+        next_seq = stream.get("next_seq")
+        if next_seq is None or start_seq is None:
+            stream["start_seq"] = seq
+            stream["next_seq"] = (seq + len(payload)) & 0xFFFFFFFF
+            stream["delivered_bytes"] += len(payload)
+            self._metrics["tcp_reassembly_delivered"] += len(payload)
+            return bytes(payload), False
+
+        # Earlier contiguous data can be prepended while the application parser is
+        # still waiting on an incomplete frame.
+        if self._seq_before32(seq, int(start_seq)):
+            distance = (int(start_seq) - seq) & 0xFFFFFFFF
+            if stream.get("can_prepend") and 0 < distance <= len(payload):
+                prefix = bytes(payload[:distance])
+                stream["start_seq"] = seq
+                stream["delivered_bytes"] += len(prefix)
+                self._metrics["tcp_reassembly_prepend"] += 1
+                self._metrics["tcp_reassembly_delivered"] += len(prefix)
+                self._drain_early_stratum_pending(stream)
+                return prefix, True
+
+            # A fully old segment is a retransmission. If it does not bridge to the
+            # retained application prefix, keep it only when a missing earlier range
+            # may still arrive.
+            end_seq = (seq + len(payload)) & 0xFFFFFFFF
+            if self._seq_before32(end_seq, int(start_seq)):
+                self._remember_stratum_pending(stream, seq, payload)
+                self._metrics["tcp_out_of_order_buffered"] += 1
+                return b"", False
+            self._metrics["tcp_retransmission_ignored"] += 1
+            return b"", False
+
+        # Trim overlap with bytes already delivered at the forward edge.
+        if self._seq_before32(seq, int(next_seq)):
+            overlap = (int(next_seq) - seq) & 0xFFFFFFFF
+            if overlap >= len(payload):
+                self._metrics["tcp_retransmission_ignored"] += 1
+                return b"", False
+            payload = payload[overlap:]
+            seq = int(next_seq)
+            self._metrics["tcp_overlap_trimmed"] += overlap
+
+        if seq == int(next_seq):
+            chunks = [bytes(payload)]
+            stream["next_seq"] = (int(next_seq) + len(payload)) & 0xFFFFFFFF
+            stream["delivered_bytes"] += len(payload)
+
+            while True:
+                current = int(stream["next_seq"])
+                pending = stream["pending"]
+                frag = pending.pop(current, None)
+                if frag is not None:
+                    stream["pending_bytes"] -= len(frag)
+                    chunks.append(frag)
+                    stream["next_seq"] = (current + len(frag)) & 0xFFFFFFFF
+                    stream["delivered_bytes"] += len(frag)
+                    self._metrics["tcp_pending_drained"] += 1
+                    continue
+
+                overlap_key = None
+                overlap_tail = None
+                for candidate, candidate_data in list(pending.items()):
+                    if self._seq_before32(candidate, current):
+                        overlap = (current - candidate) & 0xFFFFFFFF
+                        if overlap < len(candidate_data):
+                            overlap_key = candidate
+                            overlap_tail = candidate_data[overlap:]
+                            break
+                if overlap_key is None:
+                    break
+
+                old = pending.pop(overlap_key)
+                stream["pending_bytes"] -= len(old)
+                if overlap_tail:
+                    chunks.append(bytes(overlap_tail))
+                    stream["next_seq"] = (current + len(overlap_tail)) & 0xFFFFFFFF
+                    stream["delivered_bytes"] += len(overlap_tail)
+                    self._metrics["tcp_pending_drained"] += 1
+
+            out = b"".join(chunks)
+            self._metrics["tcp_reassembly_delivered"] += len(out)
+            return out, False
+
+        self._remember_stratum_pending(stream, seq, payload)
+        self._metrics["tcp_out_of_order_buffered"] += 1
+        return b"", False
+
+    def _remember_stratum_pending(self, stream: Dict[str, Any], seq: int, payload: bytes) -> None:
+        pending = stream.setdefault("pending", {})
+        old = pending.get(int(seq))
+        if old is None or len(payload) > len(old):
+            if old is not None:
+                stream["pending_bytes"] = max(0, int(stream.get("pending_bytes", 0)) - len(old))
+            pending[int(seq)] = bytes(payload)
+            stream["pending_bytes"] = int(stream.get("pending_bytes", 0)) + len(payload)
+
+        while (
+            len(pending) > self.MAX_PENDING_TCP_SEGMENTS
+            or int(stream.get("pending_bytes", 0)) > self.MAX_PENDING_TCP_BYTES
+        ):
+            # Drop the farthest future fragment first. This preserves the bytes most
+            # likely to close the current gap.
+            if not pending:
+                break
+            next_seq = int(stream.get("next_seq") or 0)
+            victim = max(
+                pending,
+                key=lambda key: ((int(key) - next_seq) & 0xFFFFFFFF),
+            )
+            frag = pending.pop(victim)
+            stream["pending_bytes"] = max(0, int(stream.get("pending_bytes", 0)) - len(frag))
+            self._metrics["tcp_pending_trimmed"] += 1
+
+    def _drain_early_stratum_pending(self, stream: Dict[str, Any]) -> None:
+        # Reserved for future capture-start backfill. Keeping the hook explicit
+        # makes the state format stable while current parsing uses the immediate
+        # contiguous prepend returned to the caller.
+        return
+
+    def _consume_stratum_buffer(
+        self,
+        *,
+        packet,
+        st: Dict[str, Any],
+        buf_key: str,
+        flags: Dict[str, Any],
+        inbound_iface: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        iface: str,
+        direction: str,
+        now: float,
+    ) -> None:
+        parsed_any = False
+
+        for _round in range(self.MAX_DRAIN_ROUNDS):
+            current = bytes(st.get(buf_key, b"") or b"")
+            if not current:
+                break
+
+            frames, remain = self._drain_messages(current)
+            st[buf_key] = remain
+            self._metrics["framing_rounds"] += 1
+
+            if not frames:
+                break
+
+            parsed_any = True
+            for item in frames:
+                raw = item.get("raw", b"")
+                if not raw:
+                    continue
+
+                if item.get("kind") == "json":
+                    event = self._parse_json_rpc(
+                        item.get("obj") or {},
+                        raw,
+                        st=st,
+                        direction=direction,
+                    )
+                else:
+                    event = self._parse_line(raw, st=st, direction=direction)
+
+                self._handle_stratum_event(
+                    packet=packet,
+                    st=st,
+                    event=event,
+                    raw=raw,
+                    flags=flags,
+                    inbound_iface=inbound_iface,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    sport=sport,
+                    dport=dport,
+                    iface=iface,
+                    direction=direction,
+                    now=now,
+                )
+
+            if not remain:
+                break
+            if remain == current:
+                break
+
+        if parsed_any:
+            return
+
+        partial_event = self._maybe_partial_event(
+            buf=bytes(st.get(buf_key, b"") or b""),
+            st=st,
+            direction=direction,
+            now=now,
+        )
+        if partial_event is not None:
+            self._handle_stratum_event(
+                packet=packet,
+                st=st,
+                event=partial_event,
+                raw=bytes(st.get(buf_key, b"") or b""),
+                flags=flags,
+                inbound_iface=inbound_iface,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                sport=sport,
+                dport=dport,
+                iface=iface,
+                direction=direction,
+                now=now,
+            )
+
+    def _handle_stratum_event(
+        self,
+        *,
+        packet,
+        st: Dict[str, Any],
+        event: Optional[Dict[str, Any]],
+        raw: bytes,
+        flags: Dict[str, Any],
+        inbound_iface: str,
+        src_ip: str,
+        dst_ip: str,
+        sport: int,
+        dport: int,
+        iface: str,
+        direction: str,
+        now: float,
+    ) -> None:
+        if event is None:
+            if self._should_log(st, importance="low", slot="unknown"):
+                preview = self._safe_ascii(raw, self.ASCII_PREVIEW_MAX) or "-"
+                self._emit(
+                    f"{self._tag_prefix(st)}[🧾 UNKNOWN] "
+                    f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                    f"dir={direction} iface={iface} preview={preview}"
+                )
+            self._metrics["unknown"] += 1
+            return
+
+        self._update_state_from_event(st, event, now=now, direction=direction)
+        self._bump_metrics(event)
+        self._bump_work_metrics(event)
+
+        self._maybe_packetwriter_actions(
+            packet=packet,
+            st=st,
+            event=event,
+            flags=flags,
+            inbound_iface=inbound_iface,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            sport=sport,
+            dport=dport,
+            now=now,
+        )
+        self._maybe_packetwriter_tx(
+            packet=packet,
+            st=st,
+            event=event,
+            flags=flags,
+            inbound_iface=inbound_iface,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            sport=sport,
+            dport=dport,
+            now=now,
+        )
+
+        if event.get("_classification_changed") and self._should_log(
+            st, importance="med", slot="classify"
+        ):
+            self._emit_classification(st, event)
+
+        if self._should_log(
+            st,
+            importance=event.get("importance", "med"),
+            slot=event.get("log_slot", "event"),
+        ):
+            self._log_event(
+                st=st,
+                event=event,
+                src_ip=src_ip,
+                sport=sport,
+                dst_ip=dst_ip,
+                dport=dport,
+                iface=iface,
+                direction=direction,
+                now=now,
+            )
+
+    def _bump_work_metrics(self, event: Dict[str, Any]) -> None:
+        kind = str(event.get("kind") or "")
+        if kind not in {"job", "notify", "set_difficulty", "set_extranonce"}:
+            return
+        self._metrics["valid_work_packets"] += 1
+        family = event.get("family")
+        if family == "monero_stratum":
+            self._metrics["xmr_work_packets"] += 1
+        elif family == "btc_stratum":
+            self._metrics["btc_work_packets"] += 1
+
+    @staticmethod
+    def _scan_json_value_end(data: bytes, start: int) -> Optional[int]:
+        if start < 0 or start >= len(data) or data[start] not in (ord("{"), ord("[")):
+            return None
+
+        stack = [data[start]]
+        in_string = False
+        escape = False
+        i = start + 1
+
+        while i < len(data):
+            b = data[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif b == ord("\\"):
+                    escape = True
+                elif b == ord('"'):
+                    in_string = False
+                i += 1
+                continue
+
+            if b == ord('"'):
+                in_string = True
+            elif b in (ord("{"), ord("[")):
+                stack.append(b)
+            elif b in (ord("}"), ord("]")):
+                if not stack:
+                    return None
+                opener = stack[-1]
+                if (opener == ord("{") and b != ord("}")) or (
+                    opener == ord("[") and b != ord("]")
+                ):
+                    return None
+                stack.pop()
+                if not stack:
+                    return i + 1
+            i += 1
+
+        return None
+
+    def _try_json_any(self, data: bytes):
+        try:
+            return json.loads(data.decode("utf-8", errors="strict"))
+        except Exception:
+            try:
+                return json.loads(data.decode("utf-8", errors="replace"))
+            except Exception:
+                return None
 class TransportMoneroManager:
     """
     Monero transport observer/logger.
@@ -13027,8 +14057,13 @@ class TransportMoneroManager:
         self._flows: Dict[Tuple[str, int, str, int], Dict[str, Any]] = {}
         self._last_gc = time.time()
 
-        self.active_tx_enabled = True
-        self.respond_only_if_dst_owned = False
+        # This manager is an observer by default. Synthetic ACK/RST generation
+        # and PacketWriter enforcement remain available for explicit experiments,
+        # but are disabled so captured pool retransmissions/jobs cannot be
+        # suppressed or altered by the inspection path.
+        self.active_tx_enabled = False
+        self.active_enforcement_enabled = False
+        self.respond_only_if_dst_owned = True
         self._last_tx_slots = {}
         self.TX_COOLDOWN_S = 1.0
 
@@ -30610,13 +31645,57 @@ class TransportManager:
         t2 = (b_ip, b_port)
         return (t1, t2) if t1 <= t2 else (t2, t1)
 
+
     def _handle_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
+        """
+        Dispatch TCP packets with content-aware precedence for HTTP and Stratum.
+
+        This preserves the existing port table but prevents valid Stratum work from
+        falling through to the generic high-port handler merely because a pool uses
+        a non-default port. HTTP signatures get the same treatment for alternate
+        cleartext ports. HTTPS remains passive and forwarding continues normally.
+        """
         tcp = packet[TCP]
         flags = tcp.sprintf("%TCP.flags%")
 
         if "S" in flags and "A" not in flags:
             key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
             self._initiators[key] = (src_ip, int(sport))
+
+        handler = None
+
+        # Signature-aware dispatch must happen before generic high-port handling.
+        # Existing flows also match so later packets without an application payload
+        # stay attached to the same protocol observer.
+        try:
+            if (
+                self._handler_is_enabled(self._handle_stratum_packet)
+                and self.transport_stratum.matches_packet(
+                    packet, src_ip, dst_ip, sport, dport
+                )
+            ):
+                handler = self._handle_stratum_packet
+        except Exception:
+            handler = None
+
+        if handler is None:
+            try:
+                if (
+                    self._handler_is_enabled(self._handle_http_packet)
+                    and self.transport_http.matches_packet(
+                        packet, src_ip, dst_ip, sport, dport
+                    )
+                ):
+                    handler = self._handle_http_packet
+            except Exception:
+                handler = None
+
+        https_ports = sorted(
+            set(getattr(self.transport_https, "BROWSER_TLS_PORTS", {443}))
+            | set(getattr(self.transport_https, "APNS_PORTS", set()))
+            | set(getattr(self.transport_https, "FCM_PORTS", set()))
+            | {2083, 2087, 2096}
+        )
 
         rules = [
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
@@ -30625,7 +31704,7 @@ class TransportManager:
                 sorted(self.transport_stratum.ports),
                 self._handle_stratum_packet,
             ),
-            ([443, 8443, 9443, 2087, 2096, 2083], self._handle_https_packet),
+            (https_ports, self._handle_https_packet),
             ([53], self._handle_domain_tcp_packet),
             ([22], self._handle_ssh_packet),
             ([21], self._handle_ftp_packet),
@@ -30642,36 +31721,44 @@ class TransportManager:
             ([(1024, 65535)], self._handle_high_server_packet),
         ]
 
-        handler = None
-        for ports, h in rules:
-            for p in ports:
-                if isinstance(p, tuple):
-                    lo, hi = p
-                    if lo <= sport <= hi or lo <= dport <= hi:
-                        if not self._handler_is_enabled(h):
-                            return False
-                        handler = h
-                        break
-                else:
-                    if p in (sport, dport):
-                        if not self._handler_is_enabled(h):
-                            return False
-                        handler = h
-                        break
-            if handler:
-                break
-        if self.packet_writer.should_drop_packet(packet, inbound_iface=iface_short, consume=True):
-            return False
-        if handler:
-            if handler == self._handle_tcp_ephemeral_packet:
-                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
-                return False
-            else:
-                handler(packet, src_ip, dst_ip, sport, dport, iface_short)
-                self.packet_writer._send_raw_packet(packet, iface_short, allow_dst_ours=True, no_consume=True)
-            return True
+        if handler is None:
+            for ports, candidate in rules:
+                for p in ports:
+                    if isinstance(p, tuple):
+                        lo, hi = p
+                        matched = lo <= sport <= hi or lo <= dport <= hi
+                    else:
+                        matched = p in (sport, dport)
 
-        return False
+                    if not matched:
+                        continue
+                    if not self._handler_is_enabled(candidate):
+                        return False
+                    handler = candidate
+                    break
+                if handler:
+                    break
+
+        if self.packet_writer.should_drop_packet(
+            packet, inbound_iface=iface_short, consume=True
+        ):
+            return False
+
+        if not handler:
+            return False
+
+        if handler == self._handle_tcp_ephemeral_packet:
+            handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+            return False
+
+        handler(packet, src_ip, dst_ip, sport, dport, iface_short)
+        self.packet_writer._send_raw_packet(
+            packet,
+            iface_short,
+            allow_dst_ours=True,
+            no_consume=True,
+        )
+        return True
 
     def _handle_udp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
         if sport == 500 or dport == 500:
