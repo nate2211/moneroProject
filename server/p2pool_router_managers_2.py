@@ -8329,7 +8329,6 @@ class NATManager:
         88: ("Kerberos", "🎟️"),
         520: ("RIP", "🗺️"),
         3333: ("P2Pool", "❤️"),
-        5000: ("Mining Server", "❤️"),
         38887: ("Blocknet", "❤️"),
         38888: ("Blocknet", "❤️"),
         25565: ("Minecraft", "🧱"),
@@ -8397,7 +8396,7 @@ class NATManager:
     _FRAG_CACHE_TTL = 20.0
 
     ROUTER_SELF_SERVICE_TCP_PORTS: set[int] = {
-        8844,
+        8844, 5000,
         3333, 4444, 5555, 7777,
         37888, 37889,
         18080, 18081, 18083,
