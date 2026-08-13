@@ -6779,7 +6779,13 @@ class IGMPManager:
 
         self._db: Dict[Tuple[str, str], MembershipEntry] = {}
         self._lock = threading.Lock()
+
+        # Interface configuration is updated by router discovery/reconfiguration threads
+        # while the IGMP service thread periodically walks it. Never retain the caller's
+        # mutable dictionary directly and never iterate the live mapping.
         self._ifcfg: Dict[str, Dict[str, Any]] = {}
+        self._ifcfg_lock = threading.RLock()
+        self._ifcfg_generation = 0
 
         # Querier tracking per interface: { ifname: {"last_seen": ts, "addr": str} }
         self._querier: Dict[str, Dict[str, Any]] = {}
@@ -6801,6 +6807,9 @@ class IGMPManager:
             "tx_general_query": 0,
             "tx_group_query": 0,
             "drops_malformed": 0,
+            "ifcfg_updates": 0,
+            "ifcfg_snapshots": 0,
+            "background_errors": 0,
         }
 
         self.log.log_message("[IGMP] Manager initialized (v1/v2/v3 support, IGMPv3mq enabled, TX/RX-aware).")
@@ -6808,9 +6817,69 @@ class IGMPManager:
     # ------------------------------------------------------------------ Public
 
     def set_interfaces_config(self, interfaces_config: Dict[str, Dict[str, Any]]):
-        """Sets or updates the router's interface configuration."""
-        self._ifcfg = interfaces_config or {}
-        self.log.log_message(f"[IGMP] Interfaces config set ({len(self._ifcfg)} ifaces).")
+        """Atomically replace the IGMP interface configuration.
+
+        The router's discovery code may continue mutating its own dictionary after this
+        call returns, so IGMP stores a detached copy of both the outer dictionary and
+        each per-interface mapping. The background thread reads only snapshots.
+        """
+        normalized: Dict[str, Dict[str, Any]] = {}
+        source = interfaces_config or {}
+
+        try:
+            source_items = list(source.items())
+        except RuntimeError:
+            # A caller may itself be changing the dictionary. Retry from a shallow copy;
+            # if it is still unstable, keep the last valid configuration rather than
+            # crashing the caller or the IGMP service thread.
+            try:
+                source_items = list(dict(source).items())
+            except Exception as exc:
+                self.log.log_message(f"[IGMP] ⚠️ Interface config update skipped: {exc}")
+                return
+        except Exception as exc:
+            self.log.log_message(f"[IGMP] ⚠️ Invalid interface config ignored: {exc}")
+            return
+
+        for ifname, cfg in source_items:
+            name = str(ifname or "").strip()
+            if not name:
+                continue
+            if isinstance(cfg, Mapping):
+                try:
+                    normalized[name] = dict(cfg)
+                except Exception:
+                    normalized[name] = {}
+            else:
+                normalized[name] = {}
+
+        with self._ifcfg_lock:
+            self._ifcfg = normalized
+            self._ifcfg_generation += 1
+            generation = self._ifcfg_generation
+            count = len(self._ifcfg)
+
+        self._counters["ifcfg_updates"] = int(self._counters.get("ifcfg_updates", 0)) + 1
+        self.log.log_message(
+            f"[IGMP] Interfaces config set ({count} ifaces, generation={generation})."
+        )
+
+    def _snapshot_interfaces_config(self) -> Tuple[int, Tuple[Tuple[str, Dict[str, Any]], ...]]:
+        """Return a stable detached snapshot safe for lock-free packet transmission."""
+        with self._ifcfg_lock:
+            generation = self._ifcfg_generation
+            items = tuple(
+                (ifname, dict(cfg) if isinstance(cfg, Mapping) else {})
+                for ifname, cfg in self._ifcfg.items()
+            )
+        self._counters["ifcfg_snapshots"] = int(self._counters.get("ifcfg_snapshots", 0)) + 1
+        return generation, items
+
+    def _get_interface_config(self, ifname: str) -> Dict[str, Any]:
+        """Return a copy of one interface configuration without exposing shared state."""
+        with self._ifcfg_lock:
+            cfg = self._ifcfg.get(ifname)
+            return dict(cfg) if isinstance(cfg, Mapping) else {}
 
     def start(self):
         """Starts the background thread for sending queries and managing state."""
@@ -6925,17 +6994,33 @@ class IGMPManager:
     # ----------------------------------------------------------- Background ops
 
     def _background_loop(self):
-        """The main loop for the background thread."""
+        """The main loop for the background thread.
+
+        Interface discovery and membership processing are asynchronous. A recoverable
+        exception must be logged and counted, not allowed to terminate IGMP_Manager.
+        """
         next_query_time = time.time()
         self.log.log_message("[IGMP] Background loop running.")
         while not self._stop_event.is_set():
             now = time.time()
-            if now >= next_query_time:
-                self._send_general_queries(now)
-                next_query_time = now + self.QUERY_INTERVAL
+            try:
+                if now >= next_query_time:
+                    # Advance before transmission so an exception cannot create a tight
+                    # retry loop that floods logs or general-query packets.
+                    next_query_time = now + self.QUERY_INTERVAL
+                    self._send_general_queries(now)
 
-            self._service_last_member_queries(now)
-            self._purge_stale_memberships(now)
+                self._service_last_member_queries(now)
+                self._purge_stale_memberships(now)
+            except Exception as exc:
+                self._counters["background_errors"] = int(
+                    self._counters.get("background_errors", 0)
+                ) + 1
+                self.log.log_message(
+                    f"[IGMP] ❗ Background iteration recovered from "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
             self._stop_event.wait(0.5)  # Service loop runs twice a second
         self.log.log_message("[IGMP] Background loop exiting.")
 
@@ -6957,7 +7042,11 @@ class IGMPManager:
     # --------------------------------------------------------- Query emission
 
     def _send_general_queries(self, now: float):
-        for ifname, cfg in self._ifcfg.items():
+        generation, interface_items = self._snapshot_interfaces_config()
+        if not interface_items:
+            return
+
+        for ifname, cfg in interface_items:
             ip_src = cfg.get("ip_addr")
             mac_src = cfg.get("mac")
             if not ip_src or self._is_loopback(ifname):
@@ -6988,7 +7077,7 @@ class IGMPManager:
 
     def _send_group_specific_query(self, entry: MembershipEntry):
         ifname = entry.ifname
-        cfg = self._ifcfg.get(ifname, {})
+        cfg = self._get_interface_config(ifname)
         ip_src = cfg.get("ip_addr")
         mac_src = cfg.get("mac")
         if not ip_src:
@@ -7623,6 +7712,75 @@ class RIPManager:
         order = {"static": 3, "direct": 2, "rip": 1}
         return order.get(a_type, 0) > order.get(b_type, 0)
 
+    @staticmethod
+    def _coerce_route_network(value: Any) -> Optional[ipaddress._BaseNetwork]:
+        """Return an ip_network object for legacy/string route-table keys."""
+        if isinstance(value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            return value
+        try:
+            return ipaddress.ip_network(str(value).strip(), strict=False)
+        except (TypeError, ValueError):
+            return None
+
+    def _route_entry_is_better(self, candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+        """Choose a deterministic winner while repairing duplicate route keys."""
+        try:
+            candidate_cost = int(candidate.get("cost", 16))
+        except Exception:
+            candidate_cost = 16
+        try:
+            current_cost = int(current.get("cost", 16))
+        except Exception:
+            current_cost = 16
+        if candidate_cost != current_cost:
+            return candidate_cost < current_cost
+        return self._prefer_route(candidate, current)
+
+    def _routing_table_snapshot(self) -> List[Tuple[ipaddress._BaseNetwork, Dict[str, Any]]]:
+        """
+        Build a type-safe snapshot and repair string keys without mutating the
+        dictionary during iteration.  Older integrations sometimes inject keys such
+        as ``"192.168.1.0/24"`` directly; membership checks require network objects.
+        """
+        repaired: Dict[ipaddress._BaseNetwork, Dict[str, Any]] = {}
+        invalid_keys: List[Any] = []
+        converted = 0
+
+        with self._rt_lock:
+            raw_items = list(self._routing_table.items())
+            for raw_net, raw_details in raw_items:
+                net = self._coerce_route_network(raw_net)
+                if net is None:
+                    invalid_keys.append(raw_net)
+                    continue
+
+                details = dict(raw_details) if isinstance(raw_details, dict) else {}
+                existing = repaired.get(net)
+                if existing is None or self._route_entry_is_better(details, existing):
+                    repaired[net] = details
+                if raw_net is not net and not isinstance(raw_net, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                    converted += 1
+
+            # Self-heal the live table only after the source iteration is complete.
+            # Preserve valid entries while discarding unparseable keys that would
+            # otherwise crash every route lookup and routing-table UI snapshot.
+            if converted or invalid_keys or len(repaired) != len(self._routing_table):
+                self._routing_table.clear()
+                self._routing_table.update(repaired)
+
+        if converted:
+            self.router_logger.log_message(
+                f"[RIP] 🧰 Normalized {converted} legacy string route key(s)."
+            )
+        if invalid_keys:
+            preview = ", ".join(repr(x) for x in invalid_keys[:3])
+            suffix = "" if len(invalid_keys) <= 3 else f" …(+{len(invalid_keys) - 3})"
+            self.router_logger.log_message(
+                f"[RIP] ⚠️ Removed {len(invalid_keys)} invalid route key(s): {preview}{suffix}"
+            )
+
+        return list(repaired.items())
+
     def _is_held_down(self, net) -> bool:
         return time.time() < float(self._route_hold_down.get(net, 0.0))
 
@@ -7903,52 +8061,71 @@ class RIPManager:
             return False
 
     def get_routing_table_view(self) -> List[Dict[str, Any]]:
-        with self._rt_lock:
-            view = []
-            for net, details in self._routing_table.items():
-                entry = details.copy()
-                entry["network"] = str(net)
-                entry["subnet_mask"] = str(net.netmask)
-                entry["interface_friendly"] = self._safe_iface_name(entry["interface"])
-                entry["protected"] = net in self._protected_nets
-                entry["hold_down_until"] = self._route_hold_down.get(net, 0)
-                view.append(entry)
-            return view
+        view = []
+        for net, details in self._routing_table_snapshot():
+            entry = details.copy()
+            entry["network"] = str(net)
+            entry["subnet_mask"] = str(net.netmask)
+            entry["interface_friendly"] = self._safe_iface_name(entry.get("interface", ""))
+            entry["protected"] = net in self._protected_nets
+            entry["hold_down_until"] = self._route_hold_down.get(net, 0)
+            view.append(entry)
+        return view
 
     def find_route(self, dest_ip_str: str) -> Dict[str, Any] | None:
         try:
-            dest_ip_obj = ipaddress.ip_address(dest_ip_str)
-            best_match = None
-            best_prefix = -1
-
-            with self._rt_lock:
-                for net, rt_details in self._routing_table.items():
-                    if self._is_held_down(net):
-                        continue
-
-                    if dest_ip_obj.is_loopback and rt_details["type"] == "direct" and \
-                            rt_details["interface"] == self.interface_loopback_full_name:
-                        return rt_details
-
-                    if dest_ip_obj in net:
-                        current_match_is_better = False
-                        if best_match is None:
-                            current_match_is_better = True
-                        elif net.prefixlen > best_prefix:
-                            current_match_is_better = True
-                        elif net.prefixlen == best_prefix:
-                            if rt_details["cost"] < best_match["cost"]:
-                                current_match_is_better = True
-                            elif rt_details["cost"] == best_match["cost"]:
-                                if self._prefer_route(rt_details, best_match):
-                                    current_match_is_better = True
-
-                        if current_match_is_better and rt_details["cost"] < 16:
-                            best_prefix = net.prefixlen
-                            best_match = rt_details
-            return best_match
-        except ValueError:
+            dest_ip_obj = ipaddress.ip_address(str(dest_ip_str).strip())
+        except (TypeError, ValueError):
             return None
+
+        # RIP/static longest-prefix matching is for unicast routing.  Multicast is
+        # handled by IGMP/MLD and the router's multicast forwarding branch.
+        if dest_ip_obj.is_multicast:
+            return None
+
+        best_match = None
+        best_prefix = -1
+
+        for net, rt_details in self._routing_table_snapshot():
+            if net.version != dest_ip_obj.version:
+                continue
+            if self._is_held_down(net):
+                continue
+
+            if dest_ip_obj.is_loopback and rt_details.get("type") == "direct" and \
+                    rt_details.get("interface") == self.interface_loopback_full_name:
+                return rt_details
+
+            if dest_ip_obj not in net:
+                continue
+
+            try:
+                route_cost = int(rt_details.get("cost", 16))
+            except Exception:
+                route_cost = 16
+            if route_cost >= 16:
+                continue
+
+            current_match_is_better = False
+            if best_match is None:
+                current_match_is_better = True
+            elif net.prefixlen > best_prefix:
+                current_match_is_better = True
+            elif net.prefixlen == best_prefix:
+                try:
+                    best_cost = int(best_match.get("cost", 16))
+                except Exception:
+                    best_cost = 16
+                if route_cost < best_cost:
+                    current_match_is_better = True
+                elif route_cost == best_cost and self._prefer_route(rt_details, best_match):
+                    current_match_is_better = True
+
+            if current_match_is_better:
+                best_prefix = net.prefixlen
+                best_match = rt_details
+
+        return best_match
 
     def get_forwarding_route(self, dest_ip: str) -> Optional[Dict[str, Any]]:
         route = self.find_route(dest_ip)

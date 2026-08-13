@@ -1,10 +1,13 @@
 import contextlib
+import hashlib
 import ctypes
 import ipaddress
 import os
 import socket
 import struct
+import subprocess
 import time
+import threading
 from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
 import sys
 from typing import Optional, List, Union
@@ -222,6 +225,18 @@ class SnifferSoftware:
         self.notification_manager = notification_manager
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
+
+        # Persistent IPv4 resolution state for logical/virtual interfaces.
+        # Some router-side names (WinDivertBridge, WireShark, Nate's Tunnel)
+        # are not normal Windows NICs and therefore do not appear in Scapy's
+        # interface inventory.  Keep one authoritative CIDR cache so sr1/send
+        # can reuse the same answer instead of repeatedly failing resolution.
+        self._ipv4_cidr_cache = {}
+        self._ipv4_cidr_cache_source = {}
+        self._ipv4_resolution_lock = threading.RLock()
+        self._ipconfig_ipv4_inventory = None
+        self._ipconfig_ipv4_loaded = False
+        self._synthetic_ipv4_assignments = {}
 
         self.supported_ethertypes = {
             0x888E,  # EAPOL (802.1X)
@@ -1537,7 +1552,241 @@ class SnifferSoftware:
                 return None
         return iface
 
+    @staticmethod
+    def _ipv4_cache_key(iface_name: str) -> str:
+        return str(iface_name or "").strip().casefold()
+
+    def _remember_ipv4_cidr(self, iface_name: str, cidr: str, *, source: str) -> str | None:
+        """Validate, cache, and expose an interface CIDR through _interfaces_config."""
+        try:
+            iface = str(iface_name or "").strip()
+            parsed = ipaddress.IPv4Interface(str(cidr))
+            canonical = f"{parsed.ip}/{parsed.network.prefixlen}"
+        except Exception:
+            return None
+
+        key = self._ipv4_cache_key(iface)
+        with self._ipv4_resolution_lock:
+            self._ipv4_cidr_cache[key] = canonical
+            self._ipv4_cidr_cache_source[key] = str(source or "unknown")
+
+            configs = getattr(self, "_interfaces_config", None)
+            if isinstance(configs, dict) and iface:
+                cfg = configs.setdefault(iface, {})
+                if isinstance(cfg, dict):
+                    cfg.setdefault("friendly_name", iface)
+                    cfg["ip_addr"] = str(parsed.ip)
+                    cfg["netmask"] = str(parsed.network.netmask)
+                    cfg["cidr"] = canonical
+                    cfg["network"] = str(parsed.network)
+                    cfg["ipv4_resolution_source"] = str(source or "unknown")
+                    if str(source).startswith("synthetic"):
+                        cfg["synthetic_ipv4"] = True
+
+        return canonical
+
+    def _load_ipconfig_ipv4_inventory_once(self) -> dict:
+        """
+        Parse `ipconfig /all` exactly once and retain a friendly-name -> CIDR map.
+
+        This intentionally supplements rather than replaces Scapy/psutil because
+        Windows can expose an address in ipconfig before Npcap refreshes its view.
+        """
+        with self._ipv4_resolution_lock:
+            if self._ipconfig_ipv4_loaded:
+                return dict(self._ipconfig_ipv4_inventory or {})
+            self._ipconfig_ipv4_loaded = True
+
+        inventory = {}
+        if os.name != "nt":
+            with self._ipv4_resolution_lock:
+                self._ipconfig_ipv4_inventory = inventory
+            return inventory
+
+        try:
+            cp = subprocess.run(
+                ["ipconfig", "/all"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            text = cp.stdout or ""
+        except Exception as exc:
+            self.logger.log_message(f"[Sniffer] ipconfig IPv4 inventory unavailable: {exc}")
+            text = ""
+
+        current = ""
+        pending_ip = None
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Adapter headings normally look like: "Ethernet adapter Ethernet:".
+            if not raw_line[:1].isspace() and stripped.endswith(":"):
+                heading = stripped[:-1].strip()
+                lower = heading.casefold()
+                if " adapter " in lower:
+                    current = heading.split(" adapter ", 1)[1].strip()
+                else:
+                    current = heading
+                pending_ip = None
+                continue
+
+            if not current or ":" not in stripped:
+                continue
+            label, value = stripped.split(":", 1)
+            label = label.casefold()
+            value = value.strip().replace("(Preferred)", "").replace("(Tentative)", "").strip()
+            if "ipv4 address" in label or "autoconfiguration ipv4 address" in label:
+                candidate = value.split("%", 1)[0].strip()
+                try:
+                    pending_ip = str(ipaddress.IPv4Address(candidate))
+                except Exception:
+                    pending_ip = None
+            elif "subnet mask" in label and pending_ip:
+                try:
+                    net = ipaddress.IPv4Network((pending_ip, value), strict=False)
+                    cidr = f"{pending_ip}/{net.prefixlen}"
+                    inventory[self._ipv4_cache_key(current)] = cidr
+                except Exception:
+                    pass
+                pending_ip = None
+
+        with self._ipv4_resolution_lock:
+            self._ipconfig_ipv4_inventory = dict(inventory)
+        if inventory:
+            self.logger.log_message(
+                f"[Sniffer] Cached one-time ipconfig IPv4 inventory for {len(inventory)} interface(s)."
+            )
+        return inventory
+
+    def _ipv4_cidr_from_ipconfig_once(self, iface_name: str) -> str | None:
+        inventory = self._load_ipconfig_ipv4_inventory_once()
+        wanted = self._ipv4_cache_key(iface_name)
+        if wanted in inventory:
+            return inventory[wanted]
+
+        # Match aliases from router interface metadata against ipconfig headings.
+        try:
+            cfgs = getattr(self, "_interfaces_config", {}) or {}
+            cfg = cfgs.get(iface_name, {}) or {}
+            aliases = {
+                wanted,
+                self._ipv4_cache_key(cfg.get("friendly_name")),
+                self._ipv4_cache_key(cfg.get("name")),
+                self._ipv4_cache_key(cfg.get("win_name")),
+            }
+            aliases.discard("")
+            for alias in aliases:
+                if alias in inventory:
+                    return inventory[alias]
+        except Exception:
+            pass
+
+        # Conservative partial match for exact adapter names with decorations.
+        for name_key, cidr in inventory.items():
+            if wanted and (wanted in name_key or name_key in wanted):
+                return cidr
+        return None
+
+    @staticmethod
+    def _looks_like_virtual_ipv4_iface(iface_name: str) -> bool:
+        name = str(iface_name or "").casefold()
+        hints = (
+            "windivert", "wintun", "nate's tunnel", "nates tunnel",
+            "wireshark", "wire shark", "vethernet", "virtual ethernet",
+            "hyper-v", "hyperv", "tunnel", "bridge",
+        )
+        return any(h in name for h in hints)
+
+    def _synthesize_ipv4_cidr_for_iface(self, iface_name: str) -> str | None:
+        """
+        Give logical bridge/tunnel names a stable router-side IPv4 identity.
+
+        Preference is to inherit the configured downstream RFC1918 LAN address;
+        only when no downstream address exists do we allocate a deterministic
+        metadata-only RFC1918 /24.  The value is persisted in _interfaces_config
+        and the runtime cache so every later caller receives the same CIDR.
+        """
+        if not self._looks_like_virtual_ipv4_iface(iface_name):
+            return None
+
+        cfgs = getattr(self, "_interfaces_config", {}) or {}
+        candidates = []
+        for full_name, cfg in cfgs.items():
+            if not isinstance(cfg, dict):
+                continue
+            if self._ipv4_cache_key(full_name) == self._ipv4_cache_key(iface_name):
+                continue
+            ip_s = str(cfg.get("ip_addr") or "").strip()
+            mask_s = str(cfg.get("netmask") or "").strip()
+            cidr_s = str(cfg.get("cidr") or "").strip()
+            try:
+                if cidr_s:
+                    iv = ipaddress.IPv4Interface(cidr_s)
+                elif ip_s and mask_s:
+                    net = ipaddress.IPv4Network((ip_s, mask_s), strict=False)
+                    iv = ipaddress.IPv4Interface(f"{ip_s}/{net.prefixlen}")
+                else:
+                    continue
+                if iv.ip.is_private and not iv.ip.is_link_local and not iv.ip.is_loopback:
+                    friendly = str(cfg.get("friendly_name") or full_name).casefold()
+                    score = 0
+                    if "ethernet" in friendly or "lan" in friendly:
+                        score += 3
+                    if not cfg.get("synthetic_ipv4"):
+                        score += 2
+                    candidates.append((score, f"{iv.ip}/{iv.network.prefixlen}"))
+            except Exception:
+                continue
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+
+        # Deterministic fallback in 192.168.240.0/20. It is metadata for logical
+        # interfaces, not an instruction to reconfigure a Windows NIC.
+        digest = hashlib.sha256(str(iface_name).encode("utf-8", "ignore")).digest()
+        third = 240 + (digest[0] % 15)
+        return f"192.168.{third}.1/24"
+
     def _ipv4_cidr_for_iface(self, iface_name: str) -> str | None:
+        if not iface_name:
+            return None
+        try:
+            normalized = self._normalize_pcap_name(iface_name)
+        except Exception:
+            normalized = str(iface_name)
+
+        key = self._ipv4_cache_key(normalized)
+        with self._ipv4_resolution_lock:
+            cached = self._ipv4_cidr_cache.get(key)
+        if cached:
+            return cached
+
+        cidr = self._discover_ipv4_cidr_for_iface_uncached(normalized)
+        source = "scapy/psutil/config"
+        if not cidr:
+            cidr = self._ipv4_cidr_from_ipconfig_once(normalized)
+            source = "ipconfig-once"
+        if not cidr:
+            cidr = self._synthesize_ipv4_cidr_for_iface(normalized)
+            source = "synthetic-virtual"
+
+        if cidr:
+            remembered = self._remember_ipv4_cidr(normalized, cidr, source=source)
+            if source == "synthetic-virtual" and remembered:
+                self.logger.log_message(
+                    f"[Sniffer] 🧩 Saved synthesized IPv4 CIDR {remembered} for logical iface '{normalized}'."
+                )
+            return remembered
+        return None
+
+    def _discover_ipv4_cidr_for_iface_uncached(self, iface_name: str) -> str | None:
         """
         Return 'A.B.C.D/pfx' for the interface.
         Supports Windows Npcap names ('\\Device\\NPF_{GUID}') and friendly names.
@@ -1816,6 +2065,10 @@ class SnifferSoftware:
             "error_device_removed",
             "status_device_removed",
             "filename, directory name, or volume label syntax is incorrect",
+            "could not derive ipv4 cidr",
+            "no usable ipv4 cidr",
+            "interface has no mac address",
+            "could not get hardware address",
         )
         if any(n in s for n in needles):
             return True

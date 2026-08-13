@@ -182,6 +182,11 @@ class PythonRouterManager:
         self._serve_dhcp_on_wan = False
         self._dhcp_server_settings = {}
         self._wan_dhcp_server_settings = {}
+        # Optional per-interface DHCP scopes. Interfaces listed in
+        # dhcp_server_settings["additional_ifaces"] share the LAN scope, while
+        # dhcp_interface_profiles can own independent RFC1918 scopes.
+        self._dhcp_interface_profiles = []
+        self.dhcp_interface_servers = {}
         self._transport_settings = {}
         self._manager_settings = {
             "enable_firewall": True,
@@ -1984,6 +1989,96 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         self.router_logger.log_message(f"[Router] Sniffing started on {iface_name.split('_')[-1]}.")
 
+    @staticmethod
+    def _looks_like_virtual_downstream_iface(value: str) -> bool:
+        name = str(value or "").casefold()
+        hints = (
+            "windivertbridge", "windivert bridge", "nate's tunnel", "nates tunnel",
+            "wintun", "wireshark", "wire shark", "vethernet", "virtual ethernet",
+            "hyper-v", "hyperv", "lan bridge", "virtual switch",
+        )
+        return any(h in name for h in hints)
+
+    def _ensure_virtual_interface_ipv4_metadata(
+            self,
+            iface_name: str,
+            *,
+            router_ip: str,
+            network: ipaddress.IPv4Network,
+            router_mac: Optional[str] = None,
+            source: str = "dhcp-interface-assignment",
+    ) -> dict:
+        """Persist a stable logical-interface IPv4 record for SnifferSoftware and DHCP."""
+        iface = str(iface_name or "").strip()
+        if not iface:
+            return {}
+        cfg = self._interfaces_config.setdefault(iface, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+            self._interfaces_config[iface] = cfg
+        cfg.setdefault("friendly_name", iface)
+        cfg["ip_addr"] = str(router_ip)
+        cfg["netmask"] = str(network.netmask)
+        cfg["cidr"] = f"{router_ip}/{network.prefixlen}"
+        cfg["network"] = str(network)
+        cfg["synthetic_ipv4"] = True
+        cfg["ipv4_resolution_source"] = str(source)
+        if router_mac:
+            cfg.setdefault("mac", str(router_mac))
+        return cfg
+
+    def _normalized_dhcp_interface_profiles(self, profiles) -> list[dict]:
+        """Validate independent per-interface DHCP scope descriptions."""
+        out = []
+        for index, raw_profile in enumerate(profiles or []):
+            if not isinstance(raw_profile, dict):
+                self.router_logger.log_message(
+                    f"[DHCP][InterfaceScope] ⚠️ Ignoring profile #{index + 1}: expected an object."
+                )
+                continue
+            profile = dict(raw_profile)
+            iface = str(profile.get("iface") or profile.get("interface") or "").strip()
+            cidr = str(profile.get("cidr") or profile.get("router_cidr") or "").strip()
+            if not iface:
+                self.router_logger.log_message(
+                    f"[DHCP][InterfaceScope] ⚠️ Ignoring profile #{index + 1}: missing iface."
+                )
+                continue
+            if not cidr:
+                shared = self._dhcp_server_settings.setdefault("additional_ifaces", [])
+                if iface not in shared:
+                    shared.append(iface)
+                continue
+            try:
+                iv = ipaddress.IPv4Interface(cidr)
+            except Exception as exc:
+                raise ValueError(f"Invalid DHCP interface CIDR for {iface}: {cidr}") from exc
+            if not iv.ip.is_private:
+                raise ValueError(
+                    f"Independent DHCP interface scope for {iface} must use RFC1918/private IPv4; got {iv.ip}."
+                )
+            profile["iface"] = iface
+            profile["cidr"] = f"{iv.ip}/{iv.network.prefixlen}"
+            out.append(profile)
+        return out
+
+    def _dhcp_profile_policy_factory(self, owned_ifaces: set[str]):
+        def _policy():
+            allowed = set(str(x).strip() for x in owned_ifaces if str(x).strip())
+            denied = {
+                str(x).strip()
+                for x in (
+                    self.interface_out_full_name,
+                    self.interface_out_friendly_name,
+                    self.interface_loopback_full_name,
+                    SocketInterface.IFACE_NAME,
+                )
+                if str(x or "").strip()
+            }
+            denied -= allowed
+            return allowed, denied
+        return _policy
+
     def _dhcp_control_plane_iface_sets(self) -> tuple[set[str], set[str]]:
         """
         Build the explicit LAN-DHCP service and deny sets.
@@ -2049,6 +2144,33 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     add_iface(allowed, iface)
         except Exception:
             pass
+
+        # Explicitly assigned aliases share the LAN DHCP scope.
+        for iface in self._dhcp_server_settings.get("additional_ifaces", []) or []:
+            add_iface(allowed, iface)
+            try:
+                if getattr(self, "router_network_in", None) and self.router_ip_in:
+                    self._ensure_virtual_interface_ipv4_metadata(
+                        iface, router_ip=self.router_ip_in, network=self.router_network_in,
+                        router_mac=self.mac_in, source="shared-lan-dhcp",
+                    )
+            except Exception:
+                pass
+
+        # Existing virtual downstream adapters also join the LAN scope unless an
+        # independent profile explicitly owns them.
+        dedicated = {
+            str(p.get("iface") or "").casefold()
+            for p in getattr(self, "_dhcp_interface_profiles", []) or []
+        }
+        for full_name, cfg in list((self._interfaces_config or {}).items()):
+            friendly = str((cfg or {}).get("friendly_name") or full_name)
+            if (
+                self._looks_like_virtual_downstream_iface(full_name)
+                or self._looks_like_virtual_downstream_iface(friendly)
+            ) and str(full_name).casefold() not in dedicated and str(friendly).casefold() not in dedicated:
+                add_iface(allowed, full_name)
+                add_iface(allowed, friendly)
 
         # A deny rule always overrides an allow rule.
         denied_normalized = {
@@ -2365,6 +2487,50 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
         return server
 
+    def _start_dhcp_interface_profile_servers(self) -> None:
+        """Start isolated DHCP scopes bound to explicitly named logical/virtual interfaces."""
+        old_servers = dict(getattr(self, "dhcp_interface_servers", {}) or {})
+        self.dhcp_interface_servers = {}
+        for server in old_servers.values():
+            try:
+                server.stop()
+            except Exception:
+                pass
+
+        for profile in getattr(self, "_dhcp_interface_profiles", []) or []:
+            iface = str(profile.get("iface") or "").strip()
+            if not iface:
+                continue
+            iv = ipaddress.IPv4Interface(str(profile["cidr"]))
+            network = iv.network
+            router_ip = str(iv.ip)
+            profile_settings = dict(self._dhcp_server_settings)
+            profile_settings.update({
+                key: value for key, value in profile.items()
+                if key not in {"iface", "interface", "cidr", "router_cidr", "aliases"}
+            })
+            aliases = {iface}
+            aliases.update(str(x).strip() for x in (profile.get("aliases") or []) if str(x).strip())
+            for alias in aliases:
+                self._ensure_virtual_interface_ipv4_metadata(
+                    alias, router_ip=router_ip, network=network, router_mac=self.mac_in,
+                    source=f"dedicated-dhcp:{iface}",
+                )
+            try:
+                server = self._create_configured_dhcp_server(
+                    role_name=f"iface:{iface}", iface_name=iface, network=network,
+                    router_ip=router_ip, router_mac=self.mac_in, settings=profile_settings,
+                    policy_factory=self._dhcp_profile_policy_factory(aliases),
+                )
+                self.dhcp_interface_servers[iface] = server
+                self.router_logger.log_message(
+                    f"[DHCP][InterfaceScope] ✅ {iface} owns {network} router={router_ip} aliases={sorted(aliases)}"
+                )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[DHCP][InterfaceScope] ❌ Could not start {iface}: {exc}"
+                )
+
     def _start_dhcp_servers(self):
         """
         Start the configured LAN server and, only when explicitly requested,
@@ -2489,6 +2655,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     pass
             self.dhcp_server_out = None
 
+        # Dedicated logical/virtual scopes are separate from LAN/WAN ownership.
+        self._start_dhcp_interface_profile_servers()
+
         try:
             self.arp_manager.set_dhcp_server_reference(
                 self.dhcp_server_in,
@@ -2514,7 +2683,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             bypass   - Windows, ICS, or an upstream DHCP server owns it.
             not-dhcp - No DHCP action was taken.
         """
-        servers = [
+        servers = list((getattr(self, "dhcp_interface_servers", {}) or {}).values()) + [
             getattr(self, "dhcp_server_out", None),
             getattr(self, "dhcp_server_in", None),
         ]
@@ -4702,12 +4871,61 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             return
         egress_l2_ok = self._iface_supports_l2(inbound_iface)
         dst_ip = ip_layer.dst
-        route = self.rip_manager.get_forwarding_route(dst_ip)
+
+        # Parse the destination once.  Multicast must be handled before any unicast/RIP
+        # lookup: RIP tables can contain only unicast prefixes, and link-local service
+        # discovery packets captured on Npcap loopback must not be re-routed.
+        try:
+            dst_ip_obj = ipaddress.ip_address(str(dst_ip))
+        except ValueError:
+            self.router_logger.log_message(f"[Router] ❌ Invalid destination IP {dst_ip!r}. Dropping.")
+            return
+
         # --- Multicast Handling (IPv4 and IPv6) ---
-        if ipaddress.ip_address(dst_ip).is_multicast:
+        if dst_ip_obj.is_multicast:
+            inbound_name = str(inbound_iface or "").lower()
+            is_loopback_capture = (
+                "loopback" in inbound_name
+                or inbound_name.endswith("npf_loopback")
+                or inbound_name in {"lo", "loopback"}
+            )
+            hop_limit = 0
+            try:
+                hop_limit = int(
+                    getattr(ip_layer, "ttl", 0)
+                    if isinstance(ip_layer, IP)
+                    else getattr(ip_layer, "hlim", 0)
+                )
+            except Exception:
+                hop_limit = 0
+
+            # Windows/Npcap exposes local SSDP, mDNS and LLMNR on the loopback
+            # capture interface as well as on their real adapter.  Forwarding that
+            # duplicate creates loops and violates TTL/Hop-Limit 1 scope.
+            local_discovery_groups = {
+                "224.0.0.1", "224.0.0.2", "224.0.0.9",
+                "224.0.0.22", "224.0.0.251", "224.0.0.252",
+                "239.255.255.250", "ff02::1", "ff02::2",
+                "ff02::fb", "ff02::1:2", "ff02::c",
+            }
+            if is_loopback_capture and (hop_limit <= 1 or str(dst_ip_obj).lower() in local_discovery_groups):
+                try:
+                    self.function_call_tracker.track(
+                        identifier="DroppedLoopbackScopedMulticast",
+                        threshold=25,
+                        final_message=(
+                            f"[Router] 🧭 Suppressed loopback-scoped multicast to {dst_ip_obj} "
+                            f"(hop-limit={hop_limit}). Count: {{}}."
+                        ),
+                        count_message=None,
+                    )
+                except Exception:
+                    pass
+                return
+
             # Compute L2 multicast destination (only needed when we actually send L2)
             mcast_dst_mac = None
-            ip_bytes = ipaddress.ip_address(dst_ip).packed
+            ip_bytes = dst_ip_obj.packed
 
             is_v4 = isinstance(ip_layer, IP)
             if is_v4:
@@ -4772,6 +4990,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     f"[Router] ❌ L3 multicast inject failed on {egress_iface} using inbound {inbound_iface}: {e}"
                 )
             return
+
+        # Unicast only: perform RIP/static/default-route lookup after multicast has
+        # been completely handled.  This prevents SSDP/mDNS multicast from entering
+        # longest-prefix matching and protects the forwarding path from malformed
+        # route-table keys.
+        route = self.rip_manager.get_forwarding_route(str(dst_ip_obj))
+
         src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
         sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(
@@ -5167,6 +5392,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                       serve_dhcp_on_wan=False,
                       dhcp_server_settings=None,
                       wan_dhcp_server_settings=None,
+                      dhcp_interface_profiles=None,
                       gateway_settings=None,
                       lan_settings=None,
                       uplink_settings=None,
@@ -5200,6 +5426,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             )
             self._wan_dhcp_server_settings = dict(
                 wan_dhcp_server_settings or {}
+            )
+            self._dhcp_interface_profiles = self._normalized_dhcp_interface_profiles(
+                dhcp_interface_profiles or []
             )
             gateway_settings = dict(gateway_settings or {})
             lan_settings = dict(lan_settings or {})
@@ -6109,7 +6338,18 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
                 self.hypervrouter_manager.configure(
                     segment_id="main-lan",
-                    bind_ip=self.router_ip_out or "0.0.0.0",
+                    bind_ip=self.router_ip_out or self.router_ip_in or "127.0.0.1",
+                )
+                self.hypervrouter_manager.configure_ip_passthrough(
+                    public_ip=(self.public_ip_observed or self.router_ip_out),
+                    gateway_ip=self.router_gateway_out_ip,
+                    private_networks=[
+                        str(self.router_network_in)
+                        if getattr(self, "router_network_in", None)
+                        else "192.168.0.0/16"
+                    ],
+                    allow_dhcp_control=True,
+                    allow_tcp_ack_bridge=True,
                 )
 
                 self.hypervrouter_manager.register_hyperv_backend(
@@ -6213,6 +6453,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             for dhcp_server in (
                     self.dhcp_server_in,
                     self.dhcp_server_out,
+                    *list((getattr(self, "dhcp_interface_servers", {}) or {}).values()),
             ):
                 if dhcp_server is None:
                     continue
@@ -6230,6 +6471,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     self.router_logger.log_message(
                         f"[DHCP] ⚠️ Error stopping DHCP server: {exc}"
                     )
+            self.dhcp_interface_servers = {}
             self.rip_manager.stop()
             self.ethernet_manager.stop()
             self.packet_writer.stop()

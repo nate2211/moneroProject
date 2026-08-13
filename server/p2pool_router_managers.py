@@ -11257,6 +11257,21 @@ class TransportStratumManager:
     MALFORMED_FLOW_BLOCK_TTL_S = 20.0
     EXACT_PACKET_BLOCK_TTL_S = 10.0
 
+    # Runtime-discovered Stratum service ports are deliberately temporary. A
+    # strict JSON-RPC signature can promote a non-standard pool/proxy port, but
+    # the learned entry expires unless the flow continues to produce mining
+    # traffic. This avoids permanently classifying unrelated ephemeral ports.
+    DYNAMIC_PORT_TTL_SEC = 30 * 60
+    DYNAMIC_PORT_MIN_TTL_SEC = 30
+    DYNAMIC_PORT_MAX_TTL_SEC = 24 * 60 * 60
+
+    # Operational health thresholds. They only affect diagnostics/logging; the
+    # observer never blocks a pool connection merely because a job is late.
+    HEALTH_SWEEP_SEC = 5.0
+    STALE_JOB_SEC = 120.0
+    DUPLICATE_JOB_WINDOW_SEC = 15.0
+    FLOW_HEALTH_LOG_COOLDOWN_SEC = 30.0
+
     # Includes common Stratum ports plus ports frequently used by Monero
     # pools/proxies. Signature-based discovery below still recognizes Stratum on
     # any other TCP port without permanently treating client ephemeral ports as
@@ -11307,6 +11322,13 @@ class TransportStratumManager:
 
         self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         self._last_gc = time.time()
+
+        # Non-standard service ports learned from strict plaintext Stratum
+        # signatures. Values are metadata dictionaries rather than a bare set so
+        # operators can inspect why a port was learned and when it will expire.
+        self._dynamic_ports: Dict[int, Dict[str, Any]] = {}
+        self._dynamic_ports_lock = threading.RLock()
+        self._last_health_sweep = 0.0
 
         # This manager is an observer by default. Synthetic ACK/RST generation
         # and PacketWriter enforcement remain available for explicit experiments,
@@ -11383,6 +11405,16 @@ class TransportStratumManager:
             "xmr_work_packets": 0,
             "btc_work_packets": 0,
             "signature_port_matches": 0,
+
+            # Runtime port learning / operational flow-health diagnostics.
+            "dynamic_ports_learned": 0,
+            "dynamic_ports_refreshed": 0,
+            "dynamic_ports_expired": 0,
+            "duplicate_jobs": 0,
+            "stale_job_alerts": 0,
+            "accepted_without_recent_submit": 0,
+            "orphan_result_events": 0,
+            "health_sweeps": 0,
         }
 
         # TX cache / semantic dedupe
@@ -11426,11 +11458,22 @@ class TransportStratumManager:
             fkey = self._flow_key(src_ip, sport, dst_ip, dport)
             st = self._flows.get(fkey)
             if st is None:
+                was_known_service = self._is_service_port(sport, dport)
                 st = self._new_flow_state(src_ip, sport, dst_ip, dport, iface, now)
                 self._flows[fkey] = st
                 self._metrics["flows"] = len(self._flows)
-                if not self._is_service_port(sport, dport):
+                if not was_known_service:
                     self._metrics["signature_port_matches"] += 1
+                    learned_port = self._learn_dynamic_service_port(
+                        sport=sport,
+                        dport=dport,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        now=now,
+                        source="strict-payload-signature",
+                    )
+                    if learned_port is not None:
+                        st["dynamic_service_port"] = int(learned_port)
 
             st["last"] = now
             st["iface"] = iface
@@ -11514,6 +11557,7 @@ class TransportStratumManager:
                         now=now,
                     )
 
+            self._sweep_flow_health(now)
             self._maybe_gc(now)
             self._metrics["seen"] += 1
             return True
@@ -11572,6 +11616,9 @@ class TransportStratumManager:
         snap["btc_stratum_flows"] = btc_flows
         snap["unknown_stratum_flows"] = unknown_flows
         snap["pending_ids"] = pending_total
+        snap["dynamic_service_ports"] = self.service_port_snapshot(include_configured=False)
+        snap["configured_service_ports"] = sorted(int(p) for p in self.ports)
+        snap["flow_health"] = self.snapshot_flow_health(limit=32)
 
         if self._metrics["submit_rtt_count"] > 0:
             snap["submit_rtt_ms_avg"] = round(
@@ -12122,6 +12169,13 @@ class TransportStratumManager:
             "last_job_id": None,
             "last_height": None,
             "last_diff": None,
+            "last_job_ts": None,
+            "last_submit_ts": None,
+            "last_result_ts": None,
+            "last_health_log_ts": 0.0,
+            "stale_job_reported": False,
+            "dynamic_service_port": None,
+            "recent_job_ids": OrderedDict(),
             "accepted": 0,
             "rejected": 0,
             "recent_payloads": OrderedDict(),
@@ -13028,7 +13082,20 @@ class TransportStratumManager:
     # Low-level helpers
     # ------------------------------------------------------------------
     def _is_service_port(self, sport: int, dport: int) -> bool:
-        return int(sport) in self.ports or int(dport) in self.ports
+        sport = int(sport)
+        dport = int(dport)
+        if sport in self.ports or dport in self.ports:
+            return True
+
+        now = time.time()
+        with self._dynamic_ports_lock:
+            for port in (sport, dport):
+                meta = self._dynamic_ports.get(port)
+                if not meta:
+                    continue
+                if float(meta.get("expires", 0.0) or 0.0) > now:
+                    return True
+        return False
 
     def _flow_key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple[str, str, str, str]:
         if int(dport) in self.ports and int(sport) not in self.ports:
@@ -13483,6 +13550,7 @@ class TransportStratumManager:
             self._flows.pop(oldest, None)
 
         self._metrics["flows"] = len(self._flows)
+        self._prune_dynamic_service_ports(now)
 
     def matches_packet(
         self,
@@ -13840,6 +13908,7 @@ class TransportStratumManager:
         self._update_state_from_event(st, event, now=now, direction=direction)
         self._bump_metrics(event)
         self._bump_work_metrics(event)
+        self._record_operational_event(st, event, now=now, direction=direction)
 
         self._maybe_packetwriter_actions(
             packet=packet,
@@ -13898,6 +13967,322 @@ class TransportStratumManager:
             self._metrics["xmr_work_packets"] += 1
         elif family == "btc_stratum":
             self._metrics["btc_work_packets"] += 1
+
+    # ------------------------------------------------------------------
+    # Runtime service-port learning and health diagnostics
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _choose_dynamic_service_port(sport: int, dport: int) -> Optional[int]:
+        """Choose the most likely server-side port from a signature-matched flow."""
+        try:
+            sport = int(sport)
+            dport = int(dport)
+        except Exception:
+            return None
+
+        if not (1 <= sport <= 65535 and 1 <= dport <= 65535):
+            return None
+
+        # Prefer the non-ephemeral side when only one side is ephemeral. For a
+        # high-port pool/proxy, the first observed request's destination is still
+        # the best conservative guess and will expire automatically if incorrect.
+        if sport > 49151 >= dport:
+            return dport
+        if dport > 49151 >= sport:
+            return sport
+        return dport
+
+    def register_service_port(
+        self,
+        port: int,
+        *,
+        source: str = "manual",
+        ttl_sec: Optional[float] = None,
+        persistent: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Register a Stratum service port at runtime.
+
+        ``persistent=True`` moves the port into the configured set. Otherwise it
+        is a learned port with a bounded TTL and can be inspected through
+        :meth:`service_port_snapshot`.
+        """
+        port = int(port)
+        if not 1 <= port <= 65535:
+            raise ValueError("Stratum service port must be between 1 and 65535")
+
+        if persistent:
+            self.ports.add(port)
+            with self._dynamic_ports_lock:
+                self._dynamic_ports.pop(port, None)
+            return {
+                "port": port,
+                "persistent": True,
+                "source": str(source or "manual"),
+                "expires": None,
+            }
+
+        ttl = float(self.DYNAMIC_PORT_TTL_SEC if ttl_sec is None else ttl_sec)
+        ttl = max(float(self.DYNAMIC_PORT_MIN_TTL_SEC), min(float(self.DYNAMIC_PORT_MAX_TTL_SEC), ttl))
+        now = time.time()
+        with self._dynamic_ports_lock:
+            previous = self._dynamic_ports.get(port)
+            meta = dict(previous or {})
+            meta.update({
+                "port": port,
+                "source": str(source or "manual"),
+                "last_seen": now,
+                "expires": now + ttl,
+                "ttl_sec": ttl,
+                "hits": int(meta.get("hits", 0) or 0) + 1,
+            })
+            meta.setdefault("first_seen", now)
+            self._dynamic_ports[port] = meta
+
+        if previous is None:
+            self._metrics["dynamic_ports_learned"] += 1
+        else:
+            self._metrics["dynamic_ports_refreshed"] += 1
+        return dict(meta)
+
+    def unregister_service_port(self, port: int, *, include_configured: bool = False) -> bool:
+        port = int(port)
+        removed = False
+        with self._dynamic_ports_lock:
+            removed = self._dynamic_ports.pop(port, None) is not None
+        if include_configured and port in self.ports:
+            self.ports.discard(port)
+            removed = True
+        return removed
+
+    def service_port_snapshot(self, *, include_configured: bool = True) -> Dict[str, Any]:
+        now = time.time()
+        self._prune_dynamic_service_ports(now)
+        with self._dynamic_ports_lock:
+            learned = {
+                str(port): {
+                    **dict(meta),
+                    "expires_in_sec": max(0.0, float(meta.get("expires", now)) - now),
+                }
+                for port, meta in sorted(self._dynamic_ports.items())
+            }
+        result: Dict[str, Any] = {"learned": learned}
+        if include_configured:
+            result["configured"] = sorted(int(p) for p in self.ports)
+        return result
+
+    def _learn_dynamic_service_port(
+        self,
+        *,
+        sport: int,
+        dport: int,
+        src_ip: str,
+        dst_ip: str,
+        now: float,
+        source: str,
+    ) -> Optional[int]:
+        port = self._choose_dynamic_service_port(sport, dport)
+        if port is None or port in self.ports:
+            return port
+
+        meta = self.register_service_port(
+            port,
+            source=source,
+            ttl_sec=self.DYNAMIC_PORT_TTL_SEC,
+            persistent=False,
+        )
+        with self._dynamic_ports_lock:
+            current = self._dynamic_ports.get(port)
+            if current is not None:
+                current["last_seen"] = float(now)
+                current["expires"] = float(now) + float(current.get("ttl_sec", self.DYNAMIC_PORT_TTL_SEC))
+                current["last_src"] = str(src_ip)
+                current["last_dst"] = str(dst_ip)
+
+        self._emit(
+            f"[Transport][🧵 TCP][⛏️ Stratum][PORT-LEARN] "
+            f"port={port} source={meta.get('source')} ttl={int(meta.get('ttl_sec', 0))}s "
+            f"flow={src_ip}:{sport}->{dst_ip}:{dport}"
+        )
+        return port
+
+    def _refresh_dynamic_port_for_flow(self, st: Dict[str, Any], now: float) -> None:
+        port = st.get("dynamic_service_port")
+        if port is None:
+            return
+        try:
+            port = int(port)
+        except Exception:
+            return
+        with self._dynamic_ports_lock:
+            meta = self._dynamic_ports.get(port)
+            if not meta:
+                return
+            ttl = float(meta.get("ttl_sec", self.DYNAMIC_PORT_TTL_SEC))
+            meta["last_seen"] = float(now)
+            meta["expires"] = float(now) + ttl
+            meta["hits"] = int(meta.get("hits", 0) or 0) + 1
+
+    def _prune_dynamic_service_ports(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else float(now)
+        expired = []
+        with self._dynamic_ports_lock:
+            for port, meta in list(self._dynamic_ports.items()):
+                if float(meta.get("expires", 0.0) or 0.0) <= now:
+                    expired.append(port)
+                    self._dynamic_ports.pop(port, None)
+        if expired:
+            self._metrics["dynamic_ports_expired"] += len(expired)
+
+    def _record_operational_event(
+        self,
+        st: Dict[str, Any],
+        event: Dict[str, Any],
+        *,
+        now: float,
+        direction: str,
+    ) -> None:
+        _ = direction
+        kind = str(event.get("kind") or "")
+        rt = st.get("runtime", {})
+
+        if event.get("family") in {"monero_stratum", "btc_stratum"}:
+            self._refresh_dynamic_port_for_flow(st, now)
+
+        if kind in {"job", "notify"}:
+            job_id = self._safe_text(event.get("job_id")) or "<unknown>"
+            recent: OrderedDict = st.setdefault("recent_job_ids", OrderedDict())
+            previous = recent.get(job_id)
+            recent[job_id] = float(now)
+            recent.move_to_end(job_id)
+            while len(recent) > 128:
+                recent.popitem(last=False)
+
+            if previous is not None and (float(now) - float(previous)) <= self.DUPLICATE_JOB_WINDOW_SEC:
+                self._metrics["duplicate_jobs"] += 1
+                rt.setdefault("anomalies", deque(maxlen=24)).append(
+                    f"duplicate-job:{job_id}:{round(float(now) - float(previous), 3)}s"
+                )
+
+            st["last_job_id"] = None if job_id == "<unknown>" else job_id
+            st["last_job_ts"] = float(now)
+            st["stale_job_reported"] = False
+            return
+
+        if kind == "submit":
+            st["last_submit_ts"] = float(now)
+            return
+
+        if kind in {"result_bool", "result_status", "error", "result_obj", "json"}:
+            st["last_result_ts"] = float(now)
+            ident = event.get("id")
+            if (
+                ident is not None
+                and not event.get("request_kind")
+                and kind in {"result_bool", "result_status", "error"}
+            ):
+                self._metrics["orphan_result_events"] += 1
+
+            if event.get("accepted"):
+                last_submit = st.get("last_submit_ts")
+                if last_submit is None or (float(now) - float(last_submit)) > 120.0:
+                    self._metrics["accepted_without_recent_submit"] += 1
+
+    def _sweep_flow_health(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else float(now)
+        if (now - float(self._last_health_sweep)) < self.HEALTH_SWEEP_SEC:
+            return
+        self._last_health_sweep = now
+        self._metrics["health_sweeps"] += 1
+        self._prune_dynamic_service_ports(now)
+
+        for st in list(self._flows.values()):
+            rt = st.get("runtime", {})
+            if not rt.get("established"):
+                continue
+            if rt.get("proto_family") not in {"monero_stratum", "btc_stratum"}:
+                continue
+
+            last_job = st.get("last_job_ts")
+            base = float(last_job if last_job is not None else st.get("first", now))
+            idle = max(0.0, now - base)
+            if idle < self.STALE_JOB_SEC:
+                continue
+            if st.get("stale_job_reported"):
+                continue
+
+            last_log = float(st.get("last_health_log_ts", 0.0) or 0.0)
+            if (now - last_log) < self.FLOW_HEALTH_LOG_COOLDOWN_SEC:
+                continue
+
+            st["stale_job_reported"] = True
+            st["last_health_log_ts"] = now
+            self._metrics["stale_job_alerts"] += 1
+            rt.setdefault("anomalies", deque(maxlen=24)).append(f"stale-job:{round(idle, 1)}s")
+            client = st.get("client") or ("?", 0)
+            server = st.get("server") or ("?", 0)
+            self._emit(
+                f"{self._tag_prefix(st)}[⚠️ HEALTH] no fresh work for {idle:.1f}s "
+                f"client={client[0]}:{client[1]} server={server[0]}:{server[1]} "
+                f"last_job={st.get('last_job_id') or 'N/A'}"
+            )
+
+    def snapshot_flow_health(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        now = time.time()
+        rows: List[Dict[str, Any]] = []
+        for st in self._flows.values():
+            rt = st.get("runtime", {})
+            last_job_ts = st.get("last_job_ts")
+            last_activity = float(rt.get("last_activity_ts", st.get("last", now)) or now)
+            jobs = int(rt.get("jobs_seen", 0) or 0)
+            submits = int(rt.get("submits_seen", 0) or 0)
+            accepts = int(rt.get("accepts_seen", 0) or 0)
+            rejects = int(rt.get("rejects_seen", 0) or 0)
+            total_results = accepts + rejects
+            acceptance = (accepts / total_results) if total_results else None
+
+            health = "ok"
+            if rt.get("rst_seen"):
+                health = "reset"
+            elif rt.get("proto_family") in {"monero_stratum", "btc_stratum"}:
+                base = float(last_job_ts if last_job_ts is not None else st.get("first", now))
+                if (now - base) >= self.STALE_JOB_SEC:
+                    health = "stale-work"
+                elif rejects > accepts and total_results >= 3:
+                    health = "high-reject"
+                elif not rt.get("established"):
+                    health = "opening"
+            elif rt.get("established"):
+                health = "unclassified"
+
+            rows.append({
+                "client": st.get("client"),
+                "server": st.get("server"),
+                "iface": st.get("iface"),
+                "family": rt.get("proto_family"),
+                "confidence": round(float(rt.get("proto_confidence", 0.0) or 0.0), 3),
+                "state": rt.get("state"),
+                "health": health,
+                "last_activity_sec": round(max(0.0, now - last_activity), 3),
+                "last_job_sec": None if last_job_ts is None else round(max(0.0, now - float(last_job_ts)), 3),
+                "last_job_id": st.get("last_job_id"),
+                "dynamic_service_port": st.get("dynamic_service_port"),
+                "jobs": jobs,
+                "submits": submits,
+                "accepts": accepts,
+                "rejects": rejects,
+                "acceptance_ratio": None if acceptance is None else round(acceptance, 4),
+                "pending_ids": len(rt.get("pending_ids", {})),
+                "anomalies": list(rt.get("anomalies", []))[-8:],
+            })
+
+        rows.sort(
+            key=lambda row: (
+                row.get("health") == "ok",
+                row.get("last_activity_sec", 0.0),
+            )
+        )
+        return rows[: max(1, int(limit))]
 
     @staticmethod
     def _scan_json_value_end(data: bytes, start: int) -> Optional[int]:

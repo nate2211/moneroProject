@@ -1936,6 +1936,32 @@ class RouterTab(QWidget):
         self.dhcp_search_domains_input = QLineEdit()
         self.dhcp_search_domains_input.setText("lan.internal")
 
+        self.dhcp_additional_ifaces_input = QLineEdit()
+        self.dhcp_additional_ifaces_input.setText(
+            "WinDivertBridge, Nate's Tunnel, WireShark"
+        )
+        self.dhcp_additional_ifaces_input.setPlaceholderText(
+            "Comma-separated aliases that share the LAN DHCP scope"
+        )
+        self.dhcp_additional_ifaces_input.setToolTip(
+            "Assign the LAN DHCP server to logical/virtual interfaces such as "
+            "WinDivertBridge, Nate's Tunnel, WireShark, or vEthernet. These "
+            "aliases inherit the LAN router IP/netmask and are persisted for "
+            "the sniffer's IPv4 resolver."
+        )
+
+        self.dhcp_interface_profiles_input = QPlainTextEdit()
+        self.dhcp_interface_profiles_input.setMaximumHeight(110)
+        self.dhcp_interface_profiles_input.setPlaceholderText(
+            '[{"iface":"vEthernet (Router)","cidr":"192.168.162.1/24",'
+            '"pool_start":"192.168.162.100","pool_end":"192.168.162.220"}]'
+        )
+        self.dhcp_interface_profiles_input.setToolTip(
+            "Optional JSON list of independent private DHCP scopes. Each object "
+            "needs iface and cidr; pool_start/pool_end, dns_v4, aliases, lease "
+            "settings, and other LAN DHCP options are optional."
+        )
+
         self.wan_dhcp_pool_start_input = QLineEdit()
         self.wan_dhcp_pool_start_input.setPlaceholderText(
             "WAN pool start"
@@ -2896,6 +2922,21 @@ class RouterTab(QWidget):
             3,
         )
 
+        interface_dhcp_box = QGroupBox("DHCP Interface Assignment")
+        interface_dhcp_grid = QGridLayout(interface_dhcp_box)
+        interface_dhcp_grid.setColumnStretch(1, 1)
+        interface_dhcp_grid.addWidget(QLabel("Share LAN scope on:"), 0, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_additional_ifaces_input, 0, 1)
+        interface_dhcp_grid.addWidget(QLabel("Independent scopes (JSON):"), 1, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_interface_profiles_input, 1, 1)
+        interface_help = QLabel(
+            "Shared aliases reuse the LAN pool. Independent scopes create one DHCP "
+            "server per virtual interface. WAN remains denied unless WAN DHCP is "
+            "explicitly enabled."
+        )
+        interface_help.setWordWrap(True)
+        interface_dhcp_grid.addWidget(interface_help, 2, 0, 1, 2)
+
         wan_dhcp_box = QGroupBox("WAN DHCP Server (Advanced)")
         wan_dhcp_grid = QGridLayout(wan_dhcp_box)
         wan_dhcp_grid.setColumnStretch(1, 1)
@@ -2956,6 +2997,7 @@ class RouterTab(QWidget):
         )
 
         dhcp_layout.addWidget(lan_dhcp_box)
+        dhcp_layout.addWidget(interface_dhcp_box)
         dhcp_layout.addWidget(wan_dhcp_box)
 
         gateway_content = QWidget()
@@ -3713,6 +3755,8 @@ class RouterTab(QWidget):
             self.dhcp6_relay_input,
             self.dhcp_dns_v6_input,
             self.dhcp_search_domains_input,
+            self.dhcp_additional_ifaces_input,
+            self.dhcp_interface_profiles_input,
         ):
             widget.setEnabled(use_lan_dhcp)
 

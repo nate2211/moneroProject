@@ -3,6 +3,7 @@ import os
 import queue
 import threading
 import asyncio
+import json
 
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
@@ -748,6 +749,7 @@ class P2PoolGUI(QMainWindow):
             )
 
             dhcp_server_settings = {}
+            dhcp_interface_profiles = []
             if enable_dhcp_server:
                 dhcp_pool_start = (
                     tab.dhcp_pool_start_input.text().strip()
@@ -858,7 +860,48 @@ class P2PoolGUI(QMainWindow):
                     "search_domains": self._csv_setting(
                         tab.dhcp_search_domains_input.text()
                     ),
+                    "additional_ifaces": self._csv_setting(
+                        tab.dhcp_additional_ifaces_input.text()
+                    ),
                 }
+
+                profile_text = tab.dhcp_interface_profiles_input.toPlainText().strip()
+                if profile_text:
+                    try:
+                        parsed_profiles = json.loads(profile_text)
+                    except Exception as exc:
+                        raise ValueError(
+                            "DHCP independent interface scopes must be valid JSON."
+                        ) from exc
+                    if isinstance(parsed_profiles, dict):
+                        parsed_profiles = [parsed_profiles]
+                    if not isinstance(parsed_profiles, list):
+                        raise ValueError(
+                            "DHCP independent interface scopes must be a JSON list or object."
+                        )
+                    for index, raw_profile in enumerate(parsed_profiles):
+                        if not isinstance(raw_profile, dict):
+                            raise ValueError(
+                                f"DHCP interface profile #{index + 1} must be a JSON object."
+                            )
+                        profile = dict(raw_profile)
+                        iface_name = str(
+                            profile.get("iface") or profile.get("interface") or ""
+                        ).strip()
+                        if not iface_name:
+                            raise ValueError(
+                                f"DHCP interface profile #{index + 1} is missing iface."
+                            )
+                        profile["iface"] = iface_name
+                        if isinstance(profile.get("dns_v4"), str):
+                            profile["dns_v4"] = self._validated_ip_list(
+                                self._csv_setting(profile["dns_v4"]),
+                                f"DHCP interface profile {iface_name} DNS",
+                                version=4,
+                            )
+                        if isinstance(profile.get("aliases"), str):
+                            profile["aliases"] = self._csv_setting(profile["aliases"])
+                        dhcp_interface_profiles.append(profile)
 
             wan_dhcp_server_settings = {}
             if serve_dhcp_on_wan:
@@ -1424,6 +1467,7 @@ class P2PoolGUI(QMainWindow):
                 serve_dhcp_on_wan=serve_dhcp_on_wan,
                 dhcp_server_settings=dhcp_server_settings,
                 wan_dhcp_server_settings=wan_dhcp_server_settings,
+                dhcp_interface_profiles=dhcp_interface_profiles,
                 gateway_settings=gateway_settings,
                 lan_settings=lan_settings,
                 uplink_settings=uplink_settings,
