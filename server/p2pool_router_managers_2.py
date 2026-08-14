@@ -34187,6 +34187,7 @@ class LanManager(_SmartManagerBase):
 
 
 
+
 @dataclass
 class _QueuedLocalFrame:
     raw: bytes
@@ -34272,6 +34273,15 @@ class _Peer:
     path_failures: Dict[str, int] = field(default_factory=dict)
     last_success_ip: str = ""
     last_success_port: int = 0
+
+    # Hybrid LAN + IP-passthrough metadata. A peer may legitimately expose
+    # both a private address and a public passthrough address at the same time.
+    address_roles: Dict[str, str] = field(default_factory=dict)
+    private_ips: Set[str] = field(default_factory=set)
+    public_ips: Set[str] = field(default_factory=set)
+    passthrough_enabled: bool = False
+    preferred_private_ip: str = ""
+    path_mode: str = "lan"
 
 
 @dataclass
@@ -34380,6 +34390,18 @@ class HyperVRouterManager:
         self.host_name: str = socket.gethostname()
         self.bind_ip: str = "0.0.0.0"
 
+        # ``bind_ip`` remains the backward-compatible primary address. The
+        # manager now also keeps every usable local IPv4 path so a public
+        # passthrough host can communicate with ordinary 192.168/10/172 LAN
+        # computers without sacrificing its public data path.
+        self._primary_bind_ip: str = "0.0.0.0"
+        self._explicit_transport_ips: Set[str] = set()
+        self._local_transport_roles: Dict[str, str] = {}
+        self._auto_detect_local_ips = True
+        self._prefer_private_lan_paths = True
+        self._hybrid_allow_passthrough_public = True
+        self._hybrid_mode = False
+
         # IP-passthrough state is metadata for Hyper-V peer transport.  It does
         # not replace the Windows adapter/DHCP manager that owns netsh changes.
         self._ip_passthrough_config: Dict[str, Any] = {
@@ -34394,6 +34416,12 @@ class HyperVRouterManager:
             "lan_interface": "",
             "same_address_mode": False,
             "advertise_public_ip": False,
+            "private_lan_ips": [],
+            "local_transport_ips": [],
+            "address_roles": {},
+            "hybrid_mode": False,
+            "prefer_private_lan": True,
+            "allow_same_segment_public": True,
             "public_ok": False,
             "gateway_ok": True,
             "restart_required": False,
@@ -34407,6 +34435,13 @@ class HyperVRouterManager:
         self._discovery_sock: Optional[socket.socket] = None
         self._discovery_tx_sock: Optional[socket.socket] = None
         self._data_sock: Optional[socket.socket] = None
+
+        # One receive/send socket per local IPv4 address. The singular fields
+        # above remain aliases for older startup/status code.
+        self._discovery_tx_socks: Dict[str, socket.socket] = {}
+        self._data_socks: Dict[str, socket.socket] = {}
+        self._bound_data_ports_by_ip: Dict[str, int] = {}
+        self._socket_source_ips: Dict[int, str] = {}
         self._bound_discovery_port: int = self.discovery_port
         self._bound_data_port: int = self.data_port
 
@@ -34548,6 +34583,10 @@ class HyperVRouterManager:
             "tls_dropped": 0,
             "large_stream_dropped": 0,
             "consumer_rate_dropped": 0,
+            "hybrid_private_send": 0,
+            "hybrid_public_send": 0,
+            "hybrid_path_failover": 0,
+            "hybrid_discovery_tx": 0,
         }
 
     def _apply_pressure_mode(self) -> None:
@@ -34620,14 +34659,18 @@ class HyperVRouterManager:
             segment_id: str,
             bind_ip: str = "0.0.0.0",
             node_id: Optional[str] = None,
+            additional_bind_ips: Optional[Any] = None,
+            lan_bind_ips: Optional[Any] = None,
+            auto_detect_local_ips: bool = True,
     ) -> None:
         """
-        Configure the peer-transport identity.
+        Configure the peer-transport identity and every usable local IPv4 path.
 
-        ``bind_ip`` must be an IPv4 address assigned to this Windows host.  A
-        public passthrough address may be used when it is actually present on a
-        local adapter; otherwise pass the host-side/private address and record
-        the public address through :meth:`configure_ip_passthrough`.
+        ``bind_ip`` is still the primary/backward-compatible address. For a
+        passthrough computer, pass its public address as ``bind_ip`` and pass
+        one or more private addresses through ``lan_bind_ips``. When
+        ``auto_detect_local_ips`` is true, assigned private addresses are also
+        discovered automatically.
         """
         segment = str(segment_id or "default").strip() or "default"
         requested_bind = str(bind_ip or "").strip()
@@ -34639,59 +34682,79 @@ class HyperVRouterManager:
                 "0.0.0.0, loopback, multicast, and broadcast addresses are not allowed"
             )
 
+        explicit: List[str] = []
+        for value in self._coerce_ip_list(additional_bind_ips) + self._coerce_ip_list(lan_bind_ips):
+            ip = self._sanitize_peer_ip(value)
+            if ip and ip not in explicit:
+                explicit.append(ip)
+
+        candidates: List[str] = [requested_bind]
+        candidates.extend(explicit)
+        if bool(auto_detect_local_ips):
+            candidates.extend(self._discover_local_ipv4_addresses())
+
+        local_ips = self._dedupe_usable_ips(candidates)
+        if requested_bind not in local_ips:
+            local_ips.insert(0, requested_bind)
+
+        roles = self._build_local_address_roles(
+            local_ips,
+            public_ip="",
+            private_lan_ips=self._coerce_ip_list(lan_bind_ips),
+            primary_ip=requested_bind,
+        )
+
         with self._lock:
-            if self._started and requested_bind != self.bind_ip:
+            old_ips = set(self._local_transport_roles)
+            new_ips = set(local_ips)
+            if self._started and (requested_bind != self.bind_ip or old_ips != new_ips):
                 raise RuntimeError(
-                    "HyperVRouterManager.configure() cannot change bind_ip while started; "
+                    "HyperVRouterManager.configure() cannot change transport addresses while started; "
                     "stop the manager, configure it, then start it again"
                 )
 
             self.segment_id = segment
             self.bind_ip = requested_bind
+            self._primary_bind_ip = requested_bind
             self.node_id = requested_node
+            self._auto_detect_local_ips = bool(auto_detect_local_ips)
+            self._explicit_transport_ips = set(explicit)
+            self._local_transport_roles = roles
+            self._hybrid_mode = self._has_hybrid_local_paths()
 
             cfg = dict(self._ip_passthrough_config)
-            if cfg.get("enabled"):
-                cfg["bind_ip"] = requested_bind
-                cfg["restart_required"] = False
-                self._ip_passthrough_config = cfg
+            cfg["bind_ip"] = requested_bind
+            cfg["local_transport_ips"] = list(self._ordered_local_transport_ips())
+            cfg["address_roles"] = dict(self._local_transport_roles)
+            cfg["hybrid_mode"] = bool(self._hybrid_mode)
+            cfg["restart_required"] = False
+            self._ip_passthrough_config = cfg
 
         self._log_evt(
             "config",
-            f"configured segment='{self.segment_id}' node='{self.node_id}' bind='{self.bind_ip}'",
-            ["🧠", "📝"],
+            f"configured segment='{self.segment_id}' node='{self.node_id}' primary='{self.bind_ip}' "
+            f"paths={self._ordered_local_transport_ips()} hybrid={int(self._hybrid_mode)}",
+            ["🧠", "📝", "🌐"],
         )
 
     def configure_ip_passthrough(self, *args, **kwargs) -> Dict[str, Any]:
         """
-        Record and validate IP-passthrough information used by Hyper-V routing.
+        Record IP-passthrough state without excluding normal private-LAN peers.
 
-        This method intentionally accepts both the current keyword form and
-        older positional/alias forms so startup code does not fail during an
-        upgrade.
-
-        Preferred form::
+        Supported hybrid example::
 
             manager.configure_ip_passthrough(
                 public_ip="203.0.113.10",
-                lan_ip="203.0.113.10",
-                gateway_ip="203.0.113.10",
-                subnet_mask="255.255.255.255",
                 bind_ip="203.0.113.10",
-                wan_interface="Wi-Fi",
-                lan_interface="vEthernet (Default Switch)",
+                private_lan_ips=["192.168.1.20"],
+                gateway_ip="192.168.1.254",
+                wan_interface="Ethernet",
+                lan_interface="Ethernet",
                 enabled=True,
             )
 
-        Positional compatibility order is:
-            public_ip, lan_ip, gateway_ip, subnet_mask,
-            wan_interface, lan_interface
-
-        The AT&T/static passthrough case where public_ip, lan_ip, and
-        gateway_ip are identical is valid and is represented by
-        ``same_address_mode=True``.  This method does not run netsh or assign
-        addresses; adapter configuration remains owned by the router's Windows
-        interface/DHCP manager.
+        Older positional and alias forms remain accepted. This method records
+        transport metadata only; it does not run netsh or change DHCP/NAT.
         """
         options: Dict[str, Any] = dict(kwargs)
         positional_names = (
@@ -34720,21 +34783,22 @@ class HyperVRouterManager:
                         return value
             return default
 
-        enabled = bool(_pick("enabled", "ip_passthrough", "passthrough_enabled", default=True))
-        strict = bool(_pick("strict", "validate_strictly", default=False))
+        enabled = self._coerce_bool(_pick("enabled", "ip_passthrough", "passthrough_enabled", default=True), True)
+        strict = self._coerce_bool(_pick("strict", "validate_strictly", default=False), False)
+        auto_detect = self._coerce_bool(_pick("auto_detect_local_ips", "discover_local_ips", default=True), True)
 
-        public_ip = str(_pick(
+        public_ip = self._sanitize_peer_ip(_pick(
             "public_ip", "wan_ip", "external_ip", "static_ip", "passthrough_ip"
-        ) or "").strip()
-        lan_ip = str(_pick(
+        ))
+        lan_ip = self._sanitize_peer_ip(_pick(
             "lan_ip", "host_ip", "local_ip", "inside_ip", "router_ip", "client_ip"
-        ) or "").strip()
-        gateway_ip = str(_pick(
+        ))
+        gateway_ip = self._sanitize_peer_ip(_pick(
             "gateway_ip", "gateway", "default_gateway", "wan_gateway", "public_gateway"
-        ) or "").strip()
-        requested_bind_ip = str(_pick(
+        ))
+        requested_bind_ip = self._sanitize_peer_ip(_pick(
             "bind_ip", "transport_bind_ip", "listen_ip", "source_ip"
-        ) or "").strip()
+        ))
         subnet_mask = str(_pick("subnet_mask", "netmask", "mask") or "").strip()
         wan_interface = str(_pick(
             "wan_interface", "out_interface", "out_iface", "upstream_interface", "upstream_iface"
@@ -34742,9 +34806,27 @@ class HyperVRouterManager:
         lan_interface = str(_pick(
             "lan_interface", "in_interface", "in_iface", "downstream_interface", "downstream_iface"
         ) or "").strip()
-        advertise_public_ip = bool(_pick(
-            "advertise_public_ip", "public_reachable", default=False
-        ))
+
+        private_values: List[str] = []
+        for key in (
+                "private_lan_ips", "private_lan_ip", "lan_bind_ips", "secondary_lan_ips",
+                "local_private_ips", "additional_bind_ips", "transport_ips",
+        ):
+            private_values.extend(self._coerce_ip_list(options.get(key)))
+        if lan_ip and self._is_private_ipv4(lan_ip):
+            private_values.append(lan_ip)
+        private_lan_ips = [ip for ip in self._dedupe_usable_ips(private_values) if self._is_private_ipv4(ip)]
+
+        advertise_public_ip = self._coerce_bool(
+            _pick("advertise_public_ip", "public_reachable", default=bool(enabled and public_ip)),
+            bool(enabled and public_ip),
+        )
+        prefer_private_lan = self._coerce_bool(
+            _pick("prefer_private_lan", "prefer_private_paths", default=True), True
+        )
+        allow_same_segment_public = self._coerce_bool(
+            _pick("allow_same_segment_public", "allow_passthrough_public", default=True), True
+        )
 
         prefix_raw = _pick("prefix_length", "prefix", "cidr_prefix", default=None)
         prefix_length: Optional[int] = None
@@ -34764,73 +34846,80 @@ class HyperVRouterManager:
                 prefix_length = mask_prefix
             elif prefix_length != mask_prefix:
                 raise ValueError(
-                    f"subnet_mask {subnet_mask!r} is /{mask_prefix}, "
-                    f"but prefix_length={prefix_length}"
+                    f"subnet_mask {subnet_mask!r} is /{mask_prefix}, but prefix_length={prefix_length}"
                 )
         elif prefix_length is not None:
             subnet_mask = self._ipv4_prefix_mask(prefix_length)
 
-        invalid_fields: List[str] = []
-        for field_name, value in (
-                ("public_ip", public_ip),
-                ("lan_ip", lan_ip),
-                ("gateway_ip", gateway_ip),
-                ("bind_ip", requested_bind_ip),
-        ):
-            if value and not self._is_usable_unicast_ipv4(value):
-                invalid_fields.append(f"{field_name}={value!r}")
-        if invalid_fields:
-            raise ValueError("invalid IP-passthrough IPv4 value(s): " + ", ".join(invalid_fields))
-
-        configured_ips = [ip for ip in (public_ip, lan_ip, gateway_ip) if ip]
-        same_address_mode = len(configured_ips) >= 2 and len(set(configured_ips)) == 1
-
-        current_bind = str(self.bind_ip or "").strip()
-        bind_candidates = (
-            requested_bind_ip,
-            lan_ip,
-            public_ip,
-            current_bind,
-        )
-        selected_bind_ip = next(
-            (candidate for candidate in bind_candidates if self._is_valid_bind_ip(candidate)),
-            "",
-        )
-
+        current_bind = self._sanitize_peer_ip(self.bind_ip)
+        selected_bind_ip = next((ip for ip in (
+            requested_bind_ip, public_ip, lan_ip, current_bind
+        ) if self._is_valid_bind_ip(ip)), "")
         if enabled and strict and not selected_bind_ip:
             raise ValueError(
                 "IP passthrough is enabled but no usable local bind address was supplied; "
-                "provide bind_ip, lan_ip, public_ip, or call configure() first"
+                "provide bind_ip, public_ip, lan_ip, or call configure() first"
             )
+
+        local_candidates: List[str] = []
+        local_candidates.extend([selected_bind_ip, current_bind, public_ip, lan_ip])
+        local_candidates.extend(private_lan_ips)
+        local_candidates.extend(self._explicit_transport_ips)
+        if auto_detect:
+            local_candidates.extend(self._discover_local_ipv4_addresses())
+        local_ips = self._dedupe_usable_ips(local_candidates)
+        if selected_bind_ip and selected_bind_ip not in local_ips:
+            local_ips.insert(0, selected_bind_ip)
+
+        roles = self._build_local_address_roles(
+            local_ips,
+            public_ip=public_ip,
+            private_lan_ips=private_lan_ips,
+            primary_ip=selected_bind_ip or current_bind,
+        )
+        actual_private_ips = [ip for ip in local_ips if self._is_private_ipv4(ip)]
+        hybrid_mode = bool(enabled and public_ip and actual_private_ips)
+        configured_ips = [ip for ip in (public_ip, lan_ip, gateway_ip) if ip]
+        same_address_mode = len(configured_ips) >= 2 and len(set(configured_ips)) == 1
 
         requested_public_ok = _pick("public_ok", "has_public_ip", default=None)
         requested_gateway_ok = _pick("gateway_ok", "can_gateway", "gateway_ready", default=None)
-
         public_ok = (
-            bool(requested_public_ok)
+            self._coerce_bool(requested_public_ok, False)
             if requested_public_ok is not None
-            else bool(enabled and public_ip and self._is_usable_unicast_ipv4(public_ip))
+            else bool(enabled and public_ip)
         )
         gateway_ok = (
-            bool(requested_gateway_ok)
+            self._coerce_bool(requested_gateway_ok, False)
             if requested_gateway_ok is not None
             else bool(enabled and (gateway_ip or selected_bind_ip))
         )
 
         with self._lock:
-            old_bind = str(self.bind_ip or "").strip()
+            old_bind = self._sanitize_peer_ip(self.bind_ip)
+            old_ips = set(self._local_transport_roles)
+            new_ips = set(local_ips)
             restart_required = bool(
-                self._started and selected_bind_ip and selected_bind_ip != old_bind
+                self._started and (
+                    (selected_bind_ip and selected_bind_ip != old_bind)
+                    or new_ips != old_ips
+                )
             )
 
-            # Before start, make the selected host address the transport bind.
-            # While running, leave sockets untouched and report restart_required
-            # instead of racing the receive/send threads.
             if selected_bind_ip and not self._started:
                 self.bind_ip = selected_bind_ip
+                self._primary_bind_ip = selected_bind_ip
+
+            if not self._started:
+                self._local_transport_roles = roles
+                self._explicit_transport_ips.update(private_lan_ips)
+
+            self._prefer_private_lan_paths = bool(prefer_private_lan)
+            self._hybrid_allow_passthrough_public = bool(allow_same_segment_public)
+            self._hybrid_mode = bool(hybrid_mode)
 
             self._ip_passthrough_config = {
-                "enabled": enabled,
+                "enabled": bool(enabled),
                 "public_ip": public_ip,
                 "lan_ip": lan_ip,
                 "gateway_ip": gateway_ip,
@@ -34841,40 +34930,47 @@ class HyperVRouterManager:
                 "lan_interface": lan_interface,
                 "same_address_mode": same_address_mode,
                 "advertise_public_ip": advertise_public_ip,
+                "private_lan_ips": list(actual_private_ips),
+                "local_transport_ips": list(local_ips),
+                "address_roles": dict(roles),
+                "hybrid_mode": hybrid_mode,
+                "prefer_private_lan": bool(prefer_private_lan),
+                "allow_same_segment_public": bool(allow_same_segment_public),
                 "public_ok": public_ok if enabled else False,
-                # Preserve the manager's historical gateway advertisement when
-                # passthrough is disabled.
                 "gateway_ok": gateway_ok if enabled else True,
                 "restart_required": restart_required,
             }
             result = dict(self._ip_passthrough_config)
 
-        mode = "same-address" if same_address_mode else "routed"
+        mode = "hybrid" if hybrid_mode else ("same-address" if same_address_mode else "passthrough")
         self._log_evt(
             "ip-passthrough",
-            (
-                f"configured enabled={int(enabled)} mode={mode} "
-                f"public={public_ip or '-'} lan={lan_ip or '-'} "
-                f"gateway={gateway_ip or '-'} bind={result.get('bind_ip') or '-'} "
-                f"mask={subnet_mask or '-'} restart_required={int(restart_required)}"
-            ),
-            ["🌐", "🛣️", "📝"],
+            f"configured enabled={int(enabled)} mode={mode} public={public_ip or '-'} "
+            f"private={actual_private_ips or '-'} primary={result.get('bind_ip') or '-'} "
+            f"paths={local_ips} restart_required={int(restart_required)}",
+            ["🌐", "🛣️", "🏠", "📝"],
         )
 
         if restart_required:
             self._log_evt(
                 "ip-passthrough",
-                "bind address changed while HyperVRouterManager was running; "
-                "stop and restart the manager to rebind its UDP sockets",
+                "transport address set changed while running; stop and restart HyperVRouterManager "
+                "so public and private UDP sockets can be rebound together",
                 ["⚠️", "🔄", "🧯"],
             )
-
         return result
 
     def get_ip_passthrough_status(self) -> Dict[str, Any]:
-        """Return a copy of the current passthrough configuration."""
+        """Return passthrough configuration plus the currently bound paths."""
         with self._lock:
-            return dict(self._ip_passthrough_config)
+            result = dict(self._ip_passthrough_config)
+            result["local_transport_ips"] = list(self._ordered_local_transport_ips())
+            result["address_roles"] = dict(self._local_transport_roles)
+            result["hybrid_mode"] = bool(self._hybrid_mode)
+        with self._sock_lock:
+            result["bound_data_paths"] = dict(self._bound_data_ports_by_ip)
+            result["bound_discovery_paths"] = sorted(self._discovery_tx_socks)
+        return result
 
     def _passthrough_wire_flags(self) -> Tuple[bool, bool]:
         with self._lock:
@@ -34889,18 +34985,16 @@ class HyperVRouterManager:
             cfg = dict(self._ip_passthrough_config)
 
         candidates: List[str] = [str(advertised_ip or "").strip()]
-        candidates.append(str(cfg.get("lan_ip") or "").strip())
-        candidates.append(str(cfg.get("bind_ip") or "").strip())
+        candidates.extend(self._ordered_local_transport_ips())
+        candidates.extend(self._coerce_ip_list(cfg.get("private_lan_ips")))
+        candidates.extend([
+            str(cfg.get("lan_ip") or "").strip(),
+            str(cfg.get("bind_ip") or "").strip(),
+        ])
         if bool(cfg.get("advertise_public_ip", False)) or bool(cfg.get("same_address_mode", False)):
             candidates.append(str(cfg.get("public_ip") or "").strip())
 
-        hints: List[str] = []
-        for candidate in candidates:
-            if not self._is_usable_unicast_ipv4(candidate):
-                continue
-            if candidate not in hints:
-                hints.append(candidate)
-        return hints
+        return self._dedupe_usable_ips(candidates)[:12]
 
     def _ipv4_mask_prefix(self, mask: Any) -> Optional[int]:
         parts = self._ipv4_parts(mask)
@@ -35570,19 +35664,15 @@ class HyperVRouterManager:
         for peer in peers:
             if peer.segment_id != self.segment_id:
                 continue
-            if (now - peer.last_seen) > self.peer_timeout_sec:
+            if (now - peer.last_seen) > self.peer_timeout_sec or not peer.online:
                 continue
-            if not peer.online:
+            if not self._candidate_peer_targets(peer):
                 continue
 
             peer_sender_ids = sorted(peer.sender_ids) or ["default"]
             peer_sender_kinds = dict(peer.sender_kinds or {})
             if "default" not in peer_sender_kinds:
                 peer_sender_kinds["default"] = "hyperv"
-
-            if not self._transport_ip_allowed(peer.listen_ip, discovery=False) and not self._transport_ip_allowed(
-                    peer.last_data_from_ip, discovery=False):
-                continue
 
             for sender_id in peer_sender_ids:
                 sender_kind = peer_sender_kinds.get(sender_id, "hyperv")
@@ -35659,66 +35749,114 @@ class HyperVRouterManager:
         with self._sock_lock:
             self._close_sockets_locked()
 
-            self._discovery_tx_sock = self._open_discovery_sender_socket()
+            self._discovery_tx_socks = self._open_discovery_sender_sockets()
+            self._discovery_tx_sock = self._preferred_socket_alias(self._discovery_tx_socks)
             self._discovery_sock = self._open_discovery_socket()
             self._bound_discovery_port = self.discovery_port
             self._data_sock, self._bound_data_port = self._open_data_socket_with_fallback()
 
-    def _open_discovery_sender_socket(self) -> Optional[socket.socket]:
-        try:
-            ds = self._make_udp_socket()
-            try:
-                ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-            except Exception:
-                pass
-            try:
-                ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-            except Exception:
-                pass
+            if self._data_sock is None:
+                raise RuntimeError("no HyperVRouterManager data socket could be bound")
 
-            bind_ip = str(self.bind_ip or "").strip()
-            if bind_ip and bind_ip != "0.0.0.0":
+            self._log_evt(
+                "socket",
+                f"hybrid sockets ready data={dict(self._bound_data_ports_by_ip)} "
+                f"discovery_tx={sorted(self._discovery_tx_socks)}",
+                ["🌐", "🏠", "✅"],
+            )
+
+    def _open_discovery_sender_sockets(self) -> Dict[str, socket.socket]:
+        out: Dict[str, socket.socket] = {}
+        for bind_ip in self._ordered_local_transport_ips():
+            ds: Optional[socket.socket] = None
+            try:
+                ds = self._make_udp_socket()
+                try:
+                    ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+                except Exception:
+                    pass
+                try:
+                    ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                except Exception:
+                    pass
                 try:
                     ds.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind_ip))
                 except Exception:
                     pass
-                try:
-                    ds.bind((bind_ip, 0))
-                except Exception:
-                    pass
-            else:
-                try:
-                    ds.bind(("", 0))
-                except Exception:
-                    pass
+                ds.bind((bind_ip, 0))
+                ds.settimeout(0.25)
+                out[bind_ip] = ds
+                self._socket_source_ips[id(ds)] = bind_ip
+            except Exception as e:
+                if ds is not None:
+                    self._safe_socket_close(ds)
+                self._log_sparse(
+                    f"discovery-tx-bind:{bind_ip}",
+                    "socket",
+                    f"discovery TX path unavailable on {bind_ip}: {type(e).__name__}: {e}",
+                    ["⚠️", "📡", "🧯"],
+                    every=5.0,
+                )
 
+        if not out:
+            # A route-selected wildcard sender is a last-resort compatibility
+            # path. Stable frame/ACK traffic still uses the bound data sockets.
+            ds = self._make_udp_socket()
+            ds.bind(("", 0))
             ds.settimeout(0.25)
-            return ds
-        except Exception as e:
-            self._log_evt(
-                "socket",
-                f"discovery sender socket open failed: {type(e).__name__}: {e}",
-                ["⚠️", "📡", "🧯"],
-            )
-            return None
+            out["0.0.0.0"] = ds
+            self._socket_source_ips[id(ds)] = "0.0.0.0"
+        return out
 
-    def _join_multicast_group(self, sock_obj: socket.socket) -> None:
-        iface_ip = str(self.bind_ip or "").strip()
-        if iface_ip and iface_ip != "0.0.0.0":
-            mreq = struct.pack("=4s4s", socket.inet_aton(self.discovery_group), socket.inet_aton(iface_ip))
-        else:
-            mreq = struct.pack("=4s4s", socket.inet_aton(self.discovery_group), socket.inet_aton("0.0.0.0"))
+    def _open_discovery_sender_socket(self) -> Optional[socket.socket]:
+        """Backward-compatible wrapper returning the preferred TX socket."""
+        sockets = self._open_discovery_sender_sockets()
+        self._discovery_tx_socks = sockets
+        return self._preferred_socket_alias(sockets)
+
+    def _join_multicast_group(self, sock_obj: socket.socket, iface_ip: str = "") -> None:
+        selected = str(iface_ip or "").strip()
+        mreq = struct.pack(
+            "=4s4s",
+            socket.inet_aton(self.discovery_group),
+            socket.inet_aton(selected if self._is_valid_bind_ip(selected) else "0.0.0.0"),
+        )
         sock_obj.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     def _open_discovery_socket(self) -> Optional[socket.socket]:
+        ds: Optional[socket.socket] = None
         try:
             ds = self._make_udp_socket()
             ds.bind(("", self.discovery_port))
-            self._join_multicast_group(ds)
+
+            joined: List[str] = []
+            for iface_ip in self._ordered_local_transport_ips():
+                try:
+                    self._join_multicast_group(ds, iface_ip)
+                    joined.append(iface_ip)
+                except Exception as e:
+                    self._log_sparse(
+                        f"multicast-join:{iface_ip}",
+                        "socket",
+                        f"multicast join failed on {iface_ip}: {type(e).__name__}: {e}",
+                        ["⚠️", "📡"],
+                        every=10.0,
+                    )
+            if not joined:
+                self._join_multicast_group(ds, "0.0.0.0")
+                joined.append("0.0.0.0")
+
             ds.settimeout(0.25)
-            self._log_evt("socket", f"discovery socket bound on 0.0.0.0:{self.discovery_port}", ["📡", "✅"])
+            self._socket_source_ips[id(ds)] = "0.0.0.0"
+            self._log_evt(
+                "socket",
+                f"discovery socket bound on 0.0.0.0:{self.discovery_port}; memberships={joined}",
+                ["📡", "✅"],
+            )
             return ds
         except OSError as e:
+            if ds is not None:
+                self._safe_socket_close(ds)
             if self._is_addr_in_use_error(e):
                 self._log_evt(
                     "socket",
@@ -35737,6 +35875,8 @@ class HyperVRouterManager:
                 raise
             return None
         except Exception as e:
+            if ds is not None:
+                self._safe_socket_close(ds)
             self._log_evt(
                 "socket",
                 f"discovery socket open failed: {type(e).__name__}: {e}",
@@ -35747,39 +35887,75 @@ class HyperVRouterManager:
             return None
 
     def _open_data_socket_with_fallback(self) -> Tuple[Optional[socket.socket], int]:
-        bind_ip = str(self.bind_ip or "").strip()
-        if not self._is_valid_bind_ip(bind_ip):
-            raise RuntimeError("data socket requires validated concrete bind_ip; wildcard/fallback is disabled")
+        self._data_socks = {}
+        self._bound_data_ports_by_ip = {}
 
-        sock_obj = None
-        try:
-            sock_obj = self._make_udp_socket()
-            sock_obj.bind((bind_ip, self.data_port))
-            sock_obj.settimeout(0.25)
-            actual_port = int(sock_obj.getsockname()[1])
-            self._log_evt("socket", f"data socket bound on {bind_ip}:{actual_port}", ["📦", "✅"])
-            return sock_obj, actual_port
-        except Exception as e:
-            if sock_obj is not None:
-                self._safe_socket_close(sock_obj)
-            self._log_evt(
-                "socket",
-                f"data socket bind failed on {bind_ip}:{self.data_port}: {type(e).__name__}: {e}",
-                ["⚠️", "📦", "🧯"],
-            )
-            raise
+        ordered_ips = self._ordered_local_transport_ips()
+        if not ordered_ips:
+            raise RuntimeError("data sockets require at least one validated concrete local IPv4 address")
+
+        errors: List[str] = []
+        for bind_ip in ordered_ips:
+            sock_obj: Optional[socket.socket] = None
+            try:
+                sock_obj = self._make_udp_socket()
+                sock_obj.bind((bind_ip, self.data_port))
+                sock_obj.settimeout(0.25)
+                actual_port = int(sock_obj.getsockname()[1])
+                self._data_socks[bind_ip] = sock_obj
+                self._bound_data_ports_by_ip[bind_ip] = actual_port
+                self._socket_source_ips[id(sock_obj)] = bind_ip
+                self._log_evt(
+                    "socket",
+                    f"data path bound role={self._local_transport_roles.get(bind_ip, 'local')} "
+                    f"address={bind_ip}:{actual_port}",
+                    ["📦", "✅"],
+                )
+            except Exception as e:
+                if sock_obj is not None:
+                    self._safe_socket_close(sock_obj)
+                errors.append(f"{bind_ip}:{self.data_port}={type(e).__name__}:{e}")
+                self._log_sparse(
+                    f"data-bind:{bind_ip}",
+                    "socket",
+                    f"data path bind failed on {bind_ip}:{self.data_port}: {type(e).__name__}: {e}",
+                    ["⚠️", "📦", "🧯"],
+                    every=5.0,
+                )
+
+        if not self._data_socks:
+            raise RuntimeError("all data socket binds failed: " + "; ".join(errors))
+
+        preferred = self._preferred_socket_alias(self._data_socks)
+        preferred_ip = self._socket_source_ips.get(id(preferred), "") if preferred is not None else ""
+        preferred_port = int(self._bound_data_ports_by_ip.get(preferred_ip, self.data_port))
+        return preferred, preferred_port
 
     def _close_sockets(self) -> None:
         with self._sock_lock:
             self._close_sockets_locked()
 
     def _close_sockets_locked(self) -> None:
-        for attr in ("_discovery_sock", "_discovery_tx_sock", "_data_sock"):
-            s = getattr(self, attr, None)
-            if s is not None:
-                self._safe_socket_close(s)
-                setattr(self, attr, None)
+        unique: List[socket.socket] = []
+        for s in [
+            self._discovery_sock,
+            self._discovery_tx_sock,
+            self._data_sock,
+            *self._discovery_tx_socks.values(),
+            *self._data_socks.values(),
+        ]:
+            if s is not None and s not in unique:
+                unique.append(s)
+        for s in unique:
+            self._safe_socket_close(s)
 
+        self._discovery_sock = None
+        self._discovery_tx_sock = None
+        self._data_sock = None
+        self._discovery_tx_socks = {}
+        self._data_socks = {}
+        self._bound_data_ports_by_ip = {}
+        self._socket_source_ips = {}
         self._bound_discovery_port = self.discovery_port
         self._bound_data_port = self.data_port
 
@@ -35823,14 +35999,22 @@ class HyperVRouterManager:
     def _recv_loop(self) -> None:
         while not self._stop_event.is_set():
             with self._sock_lock:
-                # The discovery TX socket is intentionally included.  In IP-passthrough
-                # mode the main data socket can be bound to a public address while
-                # private peers are reached through this route-selected socket.  ACKs
-                # then return to its ephemeral/local source port and must be consumed.
-                socks = []
-                for candidate in (self._discovery_sock, self._data_sock, self._discovery_tx_sock):
-                    if candidate is not None and candidate not in socks:
-                        socks.append(candidate)
+                socket_kinds: Dict[int, str] = {}
+                socks: List[socket.socket] = []
+
+                def _add(sock_obj: Optional[socket.socket], kind: str) -> None:
+                    if sock_obj is None or sock_obj in socks:
+                        return
+                    socks.append(sock_obj)
+                    socket_kinds[id(sock_obj)] = kind
+
+                _add(self._discovery_sock, "discovery")
+                for sock_obj in self._data_socks.values():
+                    _add(sock_obj, "data")
+                for sock_obj in self._discovery_tx_socks.values():
+                    # hello replies can return to the discovery socket's
+                    # ephemeral source port, so these sockets are polled too.
+                    _add(sock_obj, "data")
 
             if not socks:
                 self._stop_event.wait(0.25)
@@ -35843,9 +36027,7 @@ class HyperVRouterManager:
                 continue
 
             for sock_obj in ready:
-                # Packets received on the route-selected TX socket are data-path
-                # responses, even though that socket is also used to transmit hello.
-                which = "discovery" if sock_obj is self._discovery_sock else "data"
+                which = socket_kinds.get(id(sock_obj), "data")
                 try:
                     data, addr = sock_obj.recvfrom(int(self._wire_message_max_bytes))
                 except socket.timeout:
@@ -36078,101 +36260,86 @@ class HyperVRouterManager:
 
     def _send_hello(self, startup: bool = False) -> None:
         with self._sock_lock:
-            tx_sock = self._discovery_tx_sock or self._discovery_sock
-            advertised_data_port = self._bound_data_port or self.data_port
+            tx_paths = list(self._discovery_tx_socks.items())
+            if not tx_paths and self._discovery_tx_sock is not None:
+                tx_paths = [(self._socket_source_ips.get(id(self._discovery_tx_sock), self._advertise_ip()), self._discovery_tx_sock)]
             advertised_discovery_port = self._bound_discovery_port or self.discovery_port
 
-        if tx_sock is None:
+        if not tx_paths:
             return
-
-        with self._lock:
-            sender_ids = sorted(self._senders.keys())
-            sender_kinds = {sid: self._senders[sid].kind for sid in self._senders}
-            allow_protocols = sorted(
-                set().union(*(s.allow_protocols for s in self._senders.values())) if self._senders else set()
-            )
 
         hello_id = uuid.uuid4().hex
         self._last_hello_id = hello_id
         self._last_hello_ts = time.time()
-        challenge_expiry = self._last_hello_ts + float(self._wire_max_clock_skew_sec)
-        self._hello_challenges[hello_id] = challenge_expiry
+        self._hello_challenges[hello_id] = self._last_hello_ts + float(self._wire_max_clock_skew_sec)
         if len(self._hello_challenges) > 64:
             now_ts = time.time()
             for old_id, expiry in sorted(self._hello_challenges.items(), key=lambda kv: kv[1]):
                 if expiry <= now_ts or len(self._hello_challenges) > 64:
                     self._hello_challenges.pop(old_id, None)
 
-        adv_ip = self._advertise_ip()
-        public_ok, gateway_ok = self._passthrough_wire_flags()
-        address_hints = self._passthrough_address_hints(adv_ip)
-        msg = {
-            "magic": self.MAGIC,
-            "type": "hello",
-            "hello_id": hello_id,
-            "expects_reply": True,
-            "startup": bool(startup),
-            "node_id": self.node_id,
-            "segment_id": self.segment_id,
-            "host_name": self.host_name,
-            "listen_ip": adv_ip,
-            "reply_to_ip": adv_ip,
-            "data_port": advertised_data_port,
-            "reply_data_port": advertised_data_port,
-            "discovery_port": advertised_discovery_port,
-            "reply_discovery_port": advertised_discovery_port,
-            "sender_ids": sender_ids,
-            "sender_kinds": sender_kinds,
-            "allow_protocols": allow_protocols,
-            "public_ok": public_ok,
-            "gateway_ok": gateway_ok,
-            "address_hints": address_hints,
-            "ts": time.time(),
-        }
-
-        raw = self._encode_wire_message(msg)
-
         targets: List[Tuple[str, int, str]] = []
         if self._transport_ip_allowed(self.discovery_group, discovery=True):
             targets.append((self.discovery_group, self.discovery_port, "multicast"))
-
+        for broadcast_ip in self._discovery_broadcast_targets():
+            targets.append((broadcast_ip, self.discovery_port, "broadcast"))
         for ip, port in self._known_peer_direct_targets():
-            if self._transport_ip_allowed(ip, discovery=True):
-                targets.append((ip, port, "direct"))
+            targets.append((ip, port, "direct"))
 
-        deduped: List[Tuple[str, int, str]] = []
-        seen_targets: Set[Tuple[str, int]] = set()
+        deduped_targets: List[Tuple[str, int, str]] = []
+        seen: Set[Tuple[str, int, str]] = set()
         for ip, port, label in targets:
-            item = (str(ip or ""), int(port or 0))
-            if not item[0] or item[1] <= 0 or item in seen_targets:
+            key = (str(ip or ""), int(port or 0), str(label))
+            if not key[0] or key[1] <= 0 or key in seen:
                 continue
-            seen_targets.add(item)
-            deduped.append((item[0], item[1], label))
+            seen.add(key)
+            deduped_targets.append(key)
 
-        sent_any = False
-        for ip, port, label in deduped:
-            try:
-                tx_sock.sendto(raw, (ip, port))
-                sent_any = True
-                if label == "multicast":
-                    self._stats["peer_discovery_multicast"] += 1
-                elif label == "broadcast":
-                    self._stats["peer_discovery_broadcast"] += 1
-            except Exception as e:
-                self._log_sparse(
-                    f"hello-send-fail:{label}:{ip}:{port}",
-                    "peer",
-                    f"hello send failed target={ip}:{port} mode={label}: {type(e).__name__}: {e}",
-                    ["⚠️", "📡", "🧯"],
-                    every=5.0,
+        sent_paths: Set[str] = set()
+        for target_ip, target_port, label in deduped_targets:
+            if label in {"multicast", "broadcast"}:
+                candidates = tx_paths
+            else:
+                selected_sock, selected_source = self._select_transport_socket(
+                    target_ip, "hello", discovery=True
                 )
+                candidates = [(selected_source, selected_sock)] if selected_sock is not None else []
 
-        if sent_any:
+            for source_ip, tx_sock in candidates:
+                if tx_sock is None:
+                    continue
+                source_ip = self._normalize_local_source_ip(source_ip, tx_sock)
+                raw = self._encode_wire_message(self._build_hello_message(
+                    hello_id=hello_id,
+                    startup=startup,
+                    advertised_ip=source_ip,
+                    advertised_discovery_port=advertised_discovery_port,
+                ))
+                try:
+                    tx_sock.sendto(raw, (target_ip, target_port))
+                    sent_paths.add(source_ip)
+                    self._stats["hybrid_discovery_tx"] = int(self._stats.get("hybrid_discovery_tx", 0)) + 1
+                    if label == "multicast":
+                        self._stats["peer_discovery_multicast"] += 1
+                    elif label == "broadcast":
+                        self._stats["peer_discovery_broadcast"] += 1
+                except Exception as e:
+                    self._log_sparse(
+                        f"hello-send-fail:{label}:{source_ip}:{target_ip}:{target_port}",
+                        "peer",
+                        f"hello send failed source={source_ip} target={target_ip}:{target_port} "
+                        f"mode={label}: {type(e).__name__}: {e}",
+                        ["⚠️", "📡", "🧯"],
+                        every=5.0,
+                    )
+
+        if sent_paths:
             self._log_sparse(
-                f"hello-sent:{self.bind_ip}:{self.node_id}",
+                f"hello-sent:{self.node_id}",
                 "peer",
-                f"hello sent node={self.node_id} seg={self.segment_id} adv={adv_ip}:{advertised_data_port} hello_id={hello_id[:12]} startup={int(bool(startup))}",
-                ["📡", "📤"],
+                f"hello sent node={self.node_id} seg={self.segment_id} paths={sorted(sent_paths)} "
+                f"hello_id={hello_id[:12]} startup={int(bool(startup))}",
+                ["📡", "📤", "🌐"],
                 every=10.0,
             )
 
@@ -36410,7 +36577,6 @@ class HyperVRouterManager:
             msg.get("listen_ip") or msg.get("reply_to_ip") or msg.get("advertised_ip")
         )
         observed_ip = self._sanitize_peer_ip(from_ip)
-
         advertised_data_port = self._safe_port(
             msg.get("reply_data_port") or msg.get("data_port"), self.data_port
         )
@@ -36419,13 +36585,26 @@ class HyperVRouterManager:
         )
 
         raw_hints = msg.get("address_hints") or []
-        if not isinstance(raw_hints, (list, tuple, set)):
-            raw_hints = []
-        address_hints = []
-        for value in list(raw_hints)[:8]:
-            ip = self._sanitize_peer_ip(value)
-            if ip and ip not in address_hints:
-                address_hints.append(ip)
+        address_hints = self._dedupe_usable_ips(raw_hints if isinstance(raw_hints, (list, tuple, set)) else [])[:12]
+
+        raw_roles = msg.get("address_roles") or {}
+        advertised_roles: Dict[str, str] = {}
+        if isinstance(raw_roles, dict):
+            for raw_ip, raw_role in list(raw_roles.items())[:16]:
+                ip = self._sanitize_peer_ip(raw_ip)
+                role = self._bounded_text(raw_role, 48).lower()
+                if ip and role:
+                    advertised_roles[ip] = role
+
+        private_ips = {
+            ip for ip in self._dedupe_usable_ips(msg.get("private_ips") or []) if self._is_private_ipv4(ip)
+        }
+        public_ips = {
+            ip for ip in self._dedupe_usable_ips(msg.get("public_ips") or []) if not self._is_private_ipv4(ip)
+        }
+        preferred_private_ip = self._sanitize_peer_ip(msg.get("preferred_private_ip"))
+        if preferred_private_ip and not self._is_private_ipv4(preferred_private_ip):
+            preferred_private_ip = ""
 
         changed = False
         is_new = False
@@ -36455,6 +36634,12 @@ class HyperVRouterManager:
                 tuple(sorted(peer.sender_kinds.items())),
                 tuple(sorted(peer.candidate_ips)),
                 tuple(sorted(peer.confirmed_ips)),
+                tuple(sorted(peer.address_roles.items())),
+                tuple(sorted(peer.private_ips)),
+                tuple(sorted(peer.public_ips)),
+                peer.passthrough_enabled,
+                peer.preferred_private_ip,
+                peer.path_mode,
             )
 
             peer.host_name = self._bounded_text(msg.get("host_name") or peer.host_name or node_id, 255) or node_id
@@ -36468,20 +36653,20 @@ class HyperVRouterManager:
 
             peer.data_port = advertised_data_port
             peer.discovery_port = advertised_discovery_port
+            peer.passthrough_enabled = bool(msg.get("passthrough_enabled", msg.get("public_ok", False)))
+            peer.path_mode = self._bounded_text(msg.get("path_mode") or ("hybrid" if peer.passthrough_enabled else "lan"), 32) or "lan"
+            peer.address_roles.update(advertised_roles)
+            peer.private_ips.update(private_ips)
+            peer.public_ips.update(public_ips)
+            if preferred_private_ip:
+                peer.preferred_private_ip = preferred_private_ip
 
-            self._record_peer_path_locked(
-                peer,
-                advertised_ip,
-                advertised_data_port,
-                confirmed=False,
-                data_path=True,
-            )
+            self._record_peer_path_locked(peer, advertised_ip, advertised_data_port, confirmed=False, data_path=True)
             self._record_peer_path_locked(
                 peer,
                 observed_ip,
                 advertised_data_port,
-                confirmed=(which == "data" or str(msg.get("type") or "").lower() in {"hello_ack", "helloack",
-                                                                                     "hello-response"}),
+                confirmed=(which == "data" or str(msg.get("type") or "").lower() in {"hello_ack", "helloack", "hello-response"}),
                 data_path=(which == "data"),
             )
             for hint in address_hints:
@@ -36490,8 +36675,6 @@ class HyperVRouterManager:
             if which == "data" and observed_ip:
                 peer.last_data_from_ip = observed_ip
                 peer.last_data_from_port = int(from_port or advertised_data_port)
-
-            peer.listen_ip = self._best_peer_ip_locked(peer)
 
             sender_ids = msg.get("sender_ids")
             if isinstance(sender_ids, (list, tuple, set)):
@@ -36512,7 +36695,7 @@ class HyperVRouterManager:
                     if self._bounded_text(x, 32) in self.DEFAULT_PROTOCOLS
                 }
 
-            peer.public_ok = bool(msg.get("public_ok", False))
+            peer.public_ok = bool(msg.get("public_ok", False) or peer.public_ips)
             peer.gateway_ok = bool(msg.get("gateway_ok", False))
             peer.last_seen = now
             peer.online = True
@@ -36521,6 +36704,7 @@ class HyperVRouterManager:
             hello_id = self._bounded_text(msg.get("hello_id"), 128)
             if hello_id:
                 peer.last_hello_id = hello_id
+            peer.listen_ip = self._best_peer_ip_locked(peer)
 
             new_tuple = (
                 peer.listen_ip,
@@ -36531,33 +36715,34 @@ class HyperVRouterManager:
                 tuple(sorted(peer.sender_kinds.items())),
                 tuple(sorted(peer.candidate_ips)),
                 tuple(sorted(peer.confirmed_ips)),
+                tuple(sorted(peer.address_roles.items())),
+                tuple(sorted(peer.private_ips)),
+                tuple(sorted(peer.public_ips)),
+                peer.passthrough_enabled,
+                peer.preferred_private_ip,
+                peer.path_mode,
             )
             changed = new_tuple != old_tuple
 
         if is_new:
             self._log_evt(
                 "peer",
-                f"peer discovered node={node_id} host={peer.host_name} best={peer.listen_ip or '-'}:{peer.data_port} candidates={sorted(peer.candidate_ips)} senders={sorted(peer.sender_ids)}",
+                f"peer discovered node={node_id} host={peer.host_name} mode={peer.path_mode} "
+                f"best={peer.listen_ip or '-'}:{peer.data_port} private={sorted(peer.private_ips)} "
+                f"public={sorted(peer.public_ips)}",
                 ["🤝", "🌐", "✅"],
             )
         elif changed:
             self._log_evt(
                 "peer",
-                f"peer updated node={node_id} host={peer.host_name} best={peer.listen_ip or '-'}:{peer.data_port} candidates={sorted(peer.candidate_ips)} confirmed={sorted(peer.confirmed_ips)}",
+                f"peer updated node={node_id} mode={peer.path_mode} best={peer.listen_ip or '-'}:{peer.data_port} "
+                f"private={sorted(peer.private_ips)} public={sorted(peer.public_ips)} "
+                f"confirmed={sorted(peer.confirmed_ips)}",
                 ["🔄", "🌐", "📝"],
             )
 
     def _send_hello_reply(self, hello_msg: dict, from_ip: str, from_port: int = 0) -> None:
-        with self._lock:
-            sender_ids = sorted(self._senders.keys())
-            sender_kinds = {sid: self._senders[sid].kind for sid in self._senders}
-            allow_protocols = sorted(
-                set().union(*(s.allow_protocols for s in self._senders.values())) if self._senders else set()
-            )
-
         adv_ip = self._advertise_ip()
-        public_ok, gateway_ok = self._passthrough_wire_flags()
-        address_hints = self._passthrough_address_hints(adv_ip)
         msg = {
             "magic": self.MAGIC,
             "type": "hello_ack",
@@ -36571,16 +36756,12 @@ class HyperVRouterManager:
             "reply_data_port": self._bound_data_port or self.data_port,
             "discovery_port": self._bound_discovery_port or self.discovery_port,
             "reply_discovery_port": self._bound_discovery_port or self.discovery_port,
-            "sender_ids": sender_ids,
-            "sender_kinds": sender_kinds,
-            "allow_protocols": allow_protocols,
-            "public_ok": public_ok,
-            "gateway_ok": gateway_ok,
-            "address_hints": address_hints,
             "ts": time.time(),
         }
+        msg.update(self._wire_identity_fields(adv_ip))
         raw = self._encode_wire_message(msg)
 
+        peer_node_id = self._bounded_text(hello_msg.get("node_id") or hello_msg.get("src_node_id"), 128)
         peer_data_port = self._safe_port(
             hello_msg.get("reply_data_port") or hello_msg.get("data_port"), self.data_port
         )
@@ -36591,15 +36772,18 @@ class HyperVRouterManager:
             int(self.discovery_port), int(self._bound_discovery_port)
         } else peer_data_port
 
-        candidates = []
+        with self._lock:
+            peer = self._peers.get(peer_node_id)
+
+        candidates: List[Tuple[str, int]] = []
         observed = self._sanitize_peer_ip(from_ip)
         advertised = self._sanitize_peer_ip(
             hello_msg.get("reply_to_ip") or hello_msg.get("listen_ip") or hello_msg.get("advertised_ip")
         )
         for ip in (observed, advertised):
-            if not ip or not self._transport_ip_allowed(ip, discovery=(reply_port == peer_discovery_port)):
+            if not ip or not self._peer_transport_ip_allowed(peer, ip, discovery=(reply_port == peer_discovery_port)):
                 continue
-            if ip != observed and not self._advertised_fallback_plausible(observed, ip):
+            if ip != observed and not self._advertised_fallback_plausible(observed, ip, peer=peer):
                 continue
             item = (ip, reply_port)
             if item not in candidates:
@@ -36612,7 +36796,7 @@ class HyperVRouterManager:
                     ip=ip,
                     port=port,
                     mtype="hello_reply",
-                    peer_node_id=self._bounded_text(hello_msg.get("node_id"), 128),
+                    peer_node_id=peer_node_id,
             ):
                 sent += 1
 
@@ -36621,7 +36805,7 @@ class HyperVRouterManager:
             self._log_sparse(
                 f"hello-reply:{from_ip}",
                 "peer",
-                f"hello reply queued node={self._bounded_text(hello_msg.get('node_id'), 128) or '?'} targets={candidates[:2]}",
+                f"hello reply queued node={peer_node_id or '?'} targets={candidates[:2]}",
                 ["📡", "↩️", "✅"],
                 every=3.0,
             )
@@ -36864,10 +37048,7 @@ class HyperVRouterManager:
         advertised_ip = self._advertise_ip()
         preferred_ack_port = int(self._bound_data_port or self.data_port or 0)
         source_sender_id = self._derive_source_sender_id(inbound_iface)
-
-        origin_node_id = str(self.node_id or "")
         origin_frame_id = str(frame_id or uuid.uuid4().hex)
-        content_hash = str(payload_sha256 or "")
 
         msg = {
             "magic": self.MAGIC,
@@ -36883,20 +37064,20 @@ class HyperVRouterManager:
             "dst_sender_id": dst_sender_id or "",
             "payload_b64": payload_b64,
             "payload_len": payload_len,
-            "payload_sha256": content_hash,
+            "payload_sha256": str(payload_sha256 or ""),
             "payload_codec": payload_codec,
             "reply_ip": advertised_ip,
             "reply_port": preferred_ack_port,
             "reply_discovery_port": int(self._bound_discovery_port or self.discovery_port or 0),
-
-            # simple cross-machine dedupe fields
-            "origin_node_id": origin_node_id,
+            "origin_node_id": str(self.node_id or ""),
             "origin_frame_id": origin_frame_id,
-            "content_hash": content_hash,
+            "content_hash": str(payload_sha256 or ""),
         }
+        msg.update(self._wire_identity_fields(advertised_ip))
         return [self._encode_wire_message(msg)]
 
     def _make_frame_ack_messages(self, *, frame_id: str, status: str, detail: str = "") -> List[bytes]:
+        advertised_ip = self._advertise_ip()
         msg = {
             "magic": self.MAGIC,
             "type": "ack",
@@ -36908,9 +37089,10 @@ class HyperVRouterManager:
             "frame_id": frame_id,
             "status": status,
             "detail": detail,
-            "reply_ip": self._advertise_ip(),
+            "reply_ip": advertised_ip,
             "reply_port": int(self._bound_data_port or self.data_port or 0),
         }
+        msg.update(self._wire_identity_fields(advertised_ip))
         return [self._encode_wire_message(msg)]
 
     def _enqueue_remote(
@@ -37033,15 +37215,6 @@ class HyperVRouterManager:
             from_port: int,
             src_node_id: str,
     ) -> List[Tuple[str, int]]:
-        """
-        Build ACK destinations for a received frame.
-
-        The observed source IP is authoritative, but an observed UDP source port
-        is not necessarily the peer's data port. Discovery and route-selected
-        sockets commonly use ephemeral ports. Prefer the peer-advertised data
-        port (normally 47772) on the observed private IP, then learned private
-        paths, and only then a validated message hint.
-        """
         out: List[Tuple[str, int]] = []
         observed_ip = self._sanitize_peer_ip(from_ip)
         observed_source_port = self._safe_port(from_port, 0)
@@ -37054,26 +37227,16 @@ class HyperVRouterManager:
             )
 
         hinted_port = self._safe_port(
-            msg.get("reply_port")
-            or msg.get("ack_port")
-            or msg.get("reply_data_port")
-            or msg.get("src_data_port"),
+            msg.get("reply_port") or msg.get("ack_port") or msg.get("reply_data_port") or msg.get("src_data_port"),
             peer_data_port,
         )
 
-        # First choice: observed private/LAN address with the stable data port.
-        if observed_ip and self._transport_ip_allowed(observed_ip, discovery=False):
+        if observed_ip and self._peer_transport_ip_allowed(peer, observed_ip, discovery=False):
             stable_port = hinted_port or peer_data_port or self.data_port
             if stable_port:
                 out.append((observed_ip, int(stable_port)))
-
-            # Keep the observed source port only as a fallback. It is useful when
-            # the peer deliberately transmitted from a route-selected ephemeral
-            # socket and is actively polling that socket for the ACK.
             if observed_source_port and observed_source_port != stable_port:
-                item = (observed_ip, observed_source_port)
-                if item not in out:
-                    out.append(item)
+                out.append((observed_ip, observed_source_port))
 
         for item in self._candidate_reply_targets(
                 dst_node_id=src_node_id,
@@ -37083,12 +37246,10 @@ class HyperVRouterManager:
             if item not in out:
                 out.append(item)
 
-        hinted_ip = self._sanitize_peer_ip(
-            msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip")
-        )
+        hinted_ip = self._sanitize_peer_ip(msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip"))
         if hinted_ip and hinted_port and self._peer_knows_ip(src_node_id, hinted_ip):
             item = (hinted_ip, hinted_port)
-            if self._transport_ip_allowed(hinted_ip, discovery=False) and item not in out:
+            if self._peer_transport_ip_allowed(peer, hinted_ip, discovery=False) and item not in out:
                 out.append(item)
 
         return out[: max(2, int(self._ack_target_limit or 1))]
@@ -37100,7 +37261,7 @@ class HyperVRouterManager:
             dst_ip: str,
             dst_port: int,
     ) -> List[Tuple[str, int]]:
-        """Prefer learned private paths over public passthrough advertisements."""
+        """Prefer a same-LAN private path, then the peer's public passthrough path."""
         out: List[Tuple[str, int]] = []
         supplied_ip = self._sanitize_peer_ip(dst_ip)
         supplied_port = self._safe_port(dst_port, 0)
@@ -37113,20 +37274,16 @@ class HyperVRouterManager:
                 self._bound_data_port or self.data_port,
             )
 
-        # A supplied private observed IP is strong evidence, but pair it with the
-        # stable peer data port rather than a discovery/ephemeral source port.
-        if supplied_ip and self._transport_ip_allowed(supplied_ip, discovery=False):
+        if supplied_ip and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False):
             preferred_port = peer_data_port or supplied_port or self.data_port
-            if self._is_private_ipv4(supplied_ip) and preferred_port:
+            if preferred_port:
                 out.append((supplied_ip, int(preferred_port)))
 
-        # Learned private candidates come before public advertised addresses.
         for item in peer_targets:
-            ip, port = item
-            if self._is_private_ipv4(ip) and item not in out:
-                out.append((ip, port))
+            if self._is_private_ipv4(item[0]) and item not in out:
+                out.append(item)
 
-        if supplied_ip and supplied_port and self._transport_ip_allowed(supplied_ip, discovery=False):
+        if supplied_ip and supplied_port and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False):
             item = (supplied_ip, supplied_port)
             if item not in out:
                 out.append(item)
@@ -37134,14 +37291,18 @@ class HyperVRouterManager:
         for item in peer_targets:
             if item not in out:
                 out.append(item)
-
         return out[: max(2, int(self._ack_target_limit or 1))]
 
     def _candidate_peer_targets(self, peer: _Peer) -> List[Tuple[str, int]]:
+        if peer is None:
+            return []
         now = time.time()
         candidates: List[Tuple[int, str, int]] = []
         ips: Set[str] = set(peer.candidate_ips.keys())
+        ips.update(peer.private_ips)
+        ips.update(peer.public_ips)
         for ip in (
+                peer.preferred_private_ip,
                 peer.last_success_ip,
                 peer.last_data_from_ip,
                 peer.listen_ip,
@@ -37153,7 +37314,7 @@ class HyperVRouterManager:
 
         for ip in ips:
             ip = self._sanitize_peer_ip(ip)
-            if not ip or not self._transport_ip_allowed(ip, discovery=False):
+            if not ip or not self._peer_transport_ip_allowed(peer, ip, discovery=False):
                 continue
             seen_ts = float(peer.candidate_ips.get(ip, 0.0) or 0.0)
             if seen_ts and (now - seen_ts) > float(self._peer_path_ttl_sec):
@@ -37169,25 +37330,27 @@ class HyperVRouterManager:
             if not (1 <= port <= 65535):
                 continue
 
-            score = 0
+            score = self._local_path_affinity_score(ip)
             if ip in peer.confirmed_ips:
                 score += 1000
             if ip == peer.last_success_ip:
                 score += 900
             if ip == peer.last_data_from_ip:
                 score += 800
+            if ip == peer.preferred_private_ip:
+                score += 700
             if ip == peer.last_hello_from_ip:
                 score += 500
             if ip == peer.listen_ip:
                 score += 450
             if ip == peer.advertised_ip:
                 score += 300
-            if self._same_ipv4_subnet(ip, self.bind_ip):
-                score += 250
-            elif self._same_private_scope(ip, self.bind_ip):
-                score += 100
+            if self._is_private_ipv4(ip):
+                score += 900 if self._prefer_private_lan_paths else 100
+            elif peer.public_ok and peer.passthrough_enabled:
+                score += 50
             score += min(100, int(peer.path_successes.get(ip, 0) or 0) * 10)
-            score -= min(300, int(peer.path_failures.get(ip, 0) or 0) * 40)
+            score -= min(400, int(peer.path_failures.get(ip, 0) or 0) * 40)
             if seen_ts:
                 score += max(0, int(60 - (now - seen_ts)))
             candidates.append((score, ip, port))
@@ -37248,66 +37411,76 @@ class HyperVRouterManager:
             return False
 
     def _send_network_item_inline(self, item: Dict[str, Any]) -> bool:
-        ip = str(item.get("ip") or "")
-        port = int(item.get("port") or 0)
+        ip = self._sanitize_peer_ip(item.get("ip"))
+        port = self._safe_port(item.get("port"), 0)
         mtype = str(item.get("mtype") or "")
+        peer_node_id = str(item.get("peer_node_id") or "")
+        is_discovery = bool(
+            mtype in {"hello", "hello_reply"}
+            or port == self.discovery_port
+            or port == self._bound_discovery_port
+        )
 
         if not ip or port <= 0:
             return False
 
-        if not self._transport_ip_allowed(
-                ip,
-                discovery=(mtype in {"hello",
-                                     "hello_reply"} or port == self.discovery_port or port == self._bound_discovery_port)
-        ):
+        with self._lock:
+            peer = self._peers.get(peer_node_id) if peer_node_id else None
+        if not self._peer_transport_ip_allowed(peer, ip, discovery=is_discovery):
             return False
 
         with self._sock_lock:
-            sock_obj = self._data_sock
-            if mtype in {"hello", "hello_reply"}:
-                sock_obj = self._discovery_tx_sock or self._discovery_sock or self._data_sock
-            elif self._is_private_ipv4(ip) and not self._is_private_ipv4(self.bind_ip):
-                # IP passthrough: never force LAN traffic to originate from the
-                # public-bound socket. Let Windows select the 192.168.x.x path.
-                sock_obj = self._discovery_tx_sock or self._discovery_sock or self._data_sock
-            elif sock_obj is None:
-                sock_obj = self._discovery_tx_sock or self._discovery_sock
+            sock_obj, source_ip = self._select_transport_socket(ip, mtype, discovery=is_discovery)
+            source_port = 0
+            if sock_obj is not None:
+                try:
+                    source_port = int(sock_obj.getsockname()[1])
+                except Exception:
+                    source_port = int(self._bound_data_ports_by_ip.get(source_ip, self.data_port))
 
         if sock_obj is None:
             return False
 
+        raw_to_send = self._retarget_wire_source_metadata(
+            bytes(item.get("raw") or b""), source_ip=source_ip, source_port=source_port
+        )
+        if not raw_to_send:
+            return False
+
         try:
-            sock_obj.sendto(item["raw"], (ip, port))
+            sock_obj.sendto(raw_to_send, (ip, port))
             self._stats["peer_send_inline"] += 1
             self._stats["peer_send_ok"] += 1
+            if self._is_private_ipv4(ip):
+                self._stats["hybrid_private_send"] = int(self._stats.get("hybrid_private_send", 0)) + 1
+            else:
+                self._stats["hybrid_public_send"] = int(self._stats.get("hybrid_public_send", 0)) + 1
 
-            peer_node_id = str(item.get("peer_node_id") or "")
             if mtype == "frame":
-                self._note_peer_frame_tx(peer_node_id, len(item["raw"]))
+                self._note_peer_frame_tx(peer_node_id, len(raw_to_send))
                 with self._pending_lock:
                     pending = self._pending_frames.get(str(item.get("frame_id") or ""))
                     if pending is not None:
                         now_ts = time.time()
                         pending["last_send_ts"] = now_ts
+                        pending["last_source_ip"] = source_ip
+                        pending["last_target_ip"] = ip
                         pending["send_success_count"] = int(pending.get("send_success_count", 0)) + 1
                         if float(pending.get("first_send_ok_ts", 0.0) or 0.0) <= 0.0:
                             pending["first_send_ok_ts"] = now_ts
-
             return True
         except Exception as e:
             self._stats["peer_send_fail"] += 1
+            if peer_node_id:
+                self._note_peer_path_failure(peer_node_id, ip)
             self._log_sparse(
-                f"network-send-fail:{ip}:{port}",
+                f"network-send-fail:{source_ip}:{ip}:{port}",
                 "network",
-                f"peer send failed to {ip}:{port}: {type(e).__name__}: {e}",
+                f"peer send failed source={source_ip or '-'} target={ip}:{port}: {type(e).__name__}: {e}",
                 ["⚠️", "🌐", "🧯"],
                 every=3.0,
             )
             return False
-
-    # ---------------------------------------------------------
-    # stats / pruning
-    # ---------------------------------------------------------
 
     def _prune_peers(self) -> None:
         now = time.time()
@@ -37968,48 +38141,321 @@ class HyperVRouterManager:
         except Exception:
             pass
 
-    def _advertise_ip(self) -> str:
-        bind_ip = str(self.bind_ip or "").strip()
-        if bind_ip and bind_ip != "0.0.0.0":
-            return bind_ip
+    def _coerce_bool(self, value: Any, default: bool = False) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "enabled", "enable"}:
+            return True
+        if text in {"0", "false", "no", "off", "disabled", "disable", "none", "null"}:
+            return False
+        return bool(default)
 
+    def _coerce_ip_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_values = value.replace(",", " ").replace(";", " ").split() if value.strip() else []
+        elif isinstance(value, dict):
+            raw_values = list(value.keys())
+        elif isinstance(value, (list, tuple, set)):
+            raw_values = list(value)
+        else:
+            raw_values = [value]
+        out: List[str] = []
+        for raw in raw_values:
+            ip = self._sanitize_peer_ip(raw)
+            if ip and ip not in out:
+                out.append(ip)
+        return out
+
+    def _dedupe_usable_ips(self, values: Any) -> List[str]:
+        out: List[str] = []
+        if values is None:
+            return out
+        if isinstance(values, str):
+            iterable = self._coerce_ip_list(values)
+        else:
+            try:
+                iterable = list(values)
+            except Exception:
+                iterable = [values]
+        for value in iterable:
+            ip = self._sanitize_peer_ip(value)
+            if ip and ip not in out:
+                out.append(ip)
+        return out
+
+    def _discover_local_ipv4_addresses(self) -> List[str]:
         candidates: List[str] = []
         try:
             _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
-            for ip in addrs:
-                if ip and ip not in candidates:
-                    candidates.append(ip)
+            candidates.extend(addrs)
         except Exception:
             pass
-
         try:
             for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
-                ip = str(info[4][0] or "")
-                if ip and ip not in candidates:
-                    candidates.append(ip)
+                candidates.append(str(info[4][0] or ""))
         except Exception:
             pass
+        try:
+            import psutil  # type: ignore
+            for iface_addrs in psutil.net_if_addrs().values():
+                for addr in iface_addrs:
+                    if getattr(addr, "family", None) == socket.AF_INET:
+                        candidates.append(str(getattr(addr, "address", "") or ""))
+        except Exception:
+            pass
+        return self._dedupe_usable_ips(candidates)
 
-        for ip in candidates:
+    def _build_local_address_roles(
+            self,
+            local_ips: Any,
+            *,
+            public_ip: str = "",
+            private_lan_ips: Optional[Any] = None,
+            primary_ip: str = "",
+    ) -> Dict[str, str]:
+        public_ip = self._sanitize_peer_ip(public_ip)
+        primary_ip = self._sanitize_peer_ip(primary_ip)
+        explicit_private = set(self._coerce_ip_list(private_lan_ips))
+        roles: Dict[str, str] = {}
+        for ip in self._dedupe_usable_ips(local_ips):
+            if public_ip and ip == public_ip:
+                role = "passthrough-public"
+            elif self._is_private_ipv4(ip):
+                role = "lan-private" if ip in explicit_private else "private-local"
+            else:
+                role = "public-local"
+            if ip == primary_ip:
+                role = f"primary-{role}"
+            roles[ip] = role
+        return roles
+
+    def _ordered_local_transport_ips(self) -> List[str]:
+        with self._lock:
+            ips = list(self._local_transport_roles.keys())
+            primary = self._sanitize_peer_ip(self.bind_ip or self._primary_bind_ip)
+        if primary and primary not in ips:
+            ips.append(primary)
+
+        def _rank(ip: str) -> Tuple[int, str]:
+            if ip == primary:
+                return (0, ip)
+            if self._is_private_ipv4(ip):
+                return (1, ip)
+            return (2, ip)
+
+        return sorted(self._dedupe_usable_ips(ips), key=_rank)
+
+    def _has_hybrid_local_paths(self) -> bool:
+        ips = self._ordered_local_transport_ips()
+        has_private = any(self._is_private_ipv4(ip) for ip in ips)
+        has_public = any(not self._is_private_ipv4(ip) for ip in ips)
+        return bool(has_private and has_public)
+
+    def _preferred_socket_alias(self, sockets: Dict[str, socket.socket]) -> Optional[socket.socket]:
+        if not sockets:
+            return None
+        primary = self._sanitize_peer_ip(self.bind_ip or self._primary_bind_ip)
+        if primary in sockets:
+            return sockets[primary]
+        for ip in self._ordered_local_transport_ips():
+            if ip in sockets:
+                return sockets[ip]
+        return next(iter(sockets.values()))
+
+    def _normalize_local_source_ip(self, source_ip: str, sock_obj: Optional[socket.socket] = None) -> str:
+        ip = self._sanitize_peer_ip(source_ip)
+        if ip:
+            return ip
+        if sock_obj is not None:
+            try:
+                ip = self._sanitize_peer_ip(sock_obj.getsockname()[0])
+                if ip:
+                    return ip
+            except Exception:
+                pass
+        return self._advertise_ip()
+
+    def _local_path_affinity_score(self, destination_ip: str) -> int:
+        dst = self._sanitize_peer_ip(destination_ip)
+        if not dst:
+            return -100000
+        score = 0
+        local_ips = self._ordered_local_transport_ips()
+        if self._is_private_ipv4(dst):
+            score += 250 if self._prefer_private_lan_paths else 50
+        for local_ip in local_ips:
+            if self._same_ipv4_subnet(dst, local_ip):
+                score = max(score, 1200)
+            elif self._is_private_ipv4(dst) and self._is_private_ipv4(local_ip):
+                score = max(score, 500)
+            elif (not self._is_private_ipv4(dst)) and (not self._is_private_ipv4(local_ip)):
+                score = max(score, 300)
+            elif self._same_private_scope(dst, local_ip):
+                score = max(score, 350)
+        return score
+
+    def _select_transport_socket(
+            self,
+            destination_ip: str,
+            mtype: str,
+            *,
+            discovery: bool = False,
+    ) -> Tuple[Optional[socket.socket], str]:
+        destination_ip = self._sanitize_peer_ip(destination_ip)
+        socket_map = self._discovery_tx_socks if discovery else self._data_socks
+        if not socket_map:
+            fallback = self._discovery_tx_sock or self._discovery_sock or self._data_sock
+            if fallback is None:
+                return None, ""
+            fallback_source = self._socket_source_ips.get(id(fallback), "")
+            return fallback, self._normalize_local_source_ip(fallback_source, fallback)
+
+        primary = self._sanitize_peer_ip(self.bind_ip or self._primary_bind_ip)
+
+        def _score(item: Tuple[str, socket.socket]) -> Tuple[int, str]:
+            source_ip, _ = item
+            score = 0
+            if source_ip == primary:
+                score += 100
+            if destination_ip and self._same_ipv4_subnet(source_ip, destination_ip):
+                score += 1500
+            if destination_ip and self._is_private_ipv4(destination_ip) and self._is_private_ipv4(source_ip):
+                score += 800
+            if destination_ip and not self._is_private_ipv4(destination_ip) and not self._is_private_ipv4(source_ip):
+                score += 700
+            if destination_ip and self._same_private_scope(source_ip, destination_ip):
+                score += 250
+            role = self._local_transport_roles.get(source_ip, "")
+            if destination_ip and self._is_private_ipv4(destination_ip) and "private" in role:
+                score += 200
+            if destination_ip and not self._is_private_ipv4(destination_ip) and "public" in role:
+                score += 200
+            return (score, source_ip)
+
+        source_ip, sock_obj = max(socket_map.items(), key=_score)
+        return sock_obj, source_ip
+
+    def _wire_identity_fields(self, advertised_ip: str = "") -> Dict[str, Any]:
+        advertised_ip = self._sanitize_peer_ip(advertised_ip) or self._advertise_ip()
+        with self._lock:
+            sender_ids = sorted(self._senders.keys())
+            sender_kinds = {sid: self._senders[sid].kind for sid in self._senders}
+            allow_protocols = sorted(
+                set().union(*(sender.allow_protocols for sender in self._senders.values()))
+                if self._senders else set()
+            )
+            cfg = dict(self._ip_passthrough_config)
+            roles = dict(self._local_transport_roles)
+
+        local_ips = self._passthrough_address_hints(advertised_ip)
+        private_ips = [ip for ip in local_ips if self._is_private_ipv4(ip)]
+        public_ips = [ip for ip in local_ips if not self._is_private_ipv4(ip)]
+        preferred_private_ip = ""
+        for ip in private_ips:
+            if self._same_ipv4_subnet(ip, advertised_ip):
+                preferred_private_ip = ip
+                break
+        if not preferred_private_ip and private_ips:
+            preferred_private_ip = private_ips[0]
+        public_ok, gateway_ok = self._passthrough_wire_flags()
+        hybrid_mode = bool(private_ips and public_ips)
+        return {
+            "sender_ids": sender_ids,
+            "sender_kinds": sender_kinds,
+            "allow_protocols": allow_protocols,
+            "public_ok": bool(public_ok),
+            "gateway_ok": bool(gateway_ok),
+            "passthrough_enabled": bool(cfg.get("enabled", False)),
+            "path_mode": "hybrid" if hybrid_mode else ("passthrough" if public_ips else "lan"),
+            "address_hints": local_ips,
+            "address_roles": roles,
+            "private_ips": private_ips,
+            "public_ips": public_ips,
+            "preferred_private_ip": preferred_private_ip,
+        }
+
+    def _build_hello_message(
+            self,
+            *,
+            hello_id: str,
+            startup: bool,
+            advertised_ip: str,
+            advertised_discovery_port: int,
+    ) -> Dict[str, Any]:
+        advertised_ip = self._sanitize_peer_ip(advertised_ip) or self._advertise_ip()
+        advertised_data_port = int(
+            self._bound_data_ports_by_ip.get(advertised_ip, self._bound_data_port or self.data_port)
+        )
+        msg: Dict[str, Any] = {
+            "magic": self.MAGIC,
+            "type": "hello",
+            "hello_id": hello_id,
+            "expects_reply": True,
+            "startup": bool(startup),
+            "node_id": self.node_id,
+            "segment_id": self.segment_id,
+            "host_name": self.host_name,
+            "listen_ip": advertised_ip,
+            "reply_to_ip": advertised_ip,
+            "data_port": advertised_data_port,
+            "reply_data_port": advertised_data_port,
+            "discovery_port": int(advertised_discovery_port),
+            "reply_discovery_port": int(advertised_discovery_port),
+            "ts": time.time(),
+        }
+        msg.update(self._wire_identity_fields(advertised_ip))
+        return msg
+
+    def _retarget_wire_source_metadata(self, raw: bytes, *, source_ip: str, source_port: int) -> bytes:
+        source_ip = self._sanitize_peer_ip(source_ip)
+        if not raw or not source_ip:
+            return bytes(raw or b"")
+        try:
+            msg = json.loads(bytes(raw).decode("utf-8"))
+        except Exception:
+            return bytes(raw)
+        if not isinstance(msg, dict) or str(msg.get("magic") or "") not in self.ACCEPT_MAGICS:
+            return bytes(raw)
+
+        mtype = str(msg.get("type") or "").strip().lower()
+        identity = self._wire_identity_fields(source_ip)
+        msg.update(identity)
+        msg["source_path_ip"] = source_ip
+        msg["reply_ip"] = source_ip
+        if 1 <= int(source_port or 0) <= 65535:
+            msg["reply_port"] = int(source_port)
+        if mtype in {"hello", "hello_ack", "hello-response", "helloack"}:
+            msg["listen_ip"] = source_ip
+            msg["reply_to_ip"] = source_ip
+            stable_data_port = int(self._bound_data_ports_by_ip.get(source_ip, self.data_port))
+            msg["data_port"] = stable_data_port
+            msg["reply_data_port"] = stable_data_port
+        return self._encode_wire_message(msg)
+
+    def _advertise_ip(self) -> str:
+        local_ips = self._ordered_local_transport_ips()
+        if self._prefer_private_lan_paths:
+            for ip in local_ips:
+                if self._is_private_ipv4(ip):
+                    return ip
+        primary = self._sanitize_peer_ip(self.bind_ip or self._primary_bind_ip)
+        if primary:
+            return primary
+        if local_ips:
+            return local_ips[0]
+
+        discovered = self._discover_local_ipv4_addresses()
+        for ip in discovered:
             if self._is_private_ipv4(ip):
                 return ip
-        for ip in candidates:
-            if ip and not ip.startswith("127."):
-                return ip
-
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                probe.connect(("8.8.8.8", 53))
-                ip = str(probe.getsockname()[0])
-                if ip and (self._is_private_ipv4(ip) or self._allow_public_discovery or self._allow_public_peer_data):
-                    return ip
-            finally:
-                probe.close()
-        except Exception:
-            pass
-
-        return "127.0.0.1"
+        return discovered[0] if discovered else "127.0.0.1"
 
     def _stable_flow_key(self, packet, inbound_iface: str, protocol_tag: str, raw: bytes) -> str:
         try:
@@ -38615,26 +39061,19 @@ class HyperVRouterManager:
 
     def _discovery_broadcast_targets(self) -> List[str]:
         targets: List[str] = []
-        adv = self._advertise_ip()
-
         if self._send_global_broadcast:
             targets.append("255.255.255.255")
-
         if self._send_subnet_broadcast:
-            try:
-                if adv and adv not in {"0.0.0.0", "127.0.0.1"} and self._is_private_ipv4(adv):
-                    parts = adv.split(".")
-                    if len(parts) == 4:
-                        targets.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-            except Exception:
-                pass
-
+            for ip in self._ordered_local_transport_ips():
+                if not self._is_private_ipv4(ip):
+                    continue
+                parts = self._ipv4_parts(ip)
+                if parts:
+                    targets.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
         out: List[str] = []
-        seen: Set[str] = set()
-        for x in targets:
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
+        for target in targets:
+            if target not in out:
+                out.append(target)
         return out
 
     def _known_peer_direct_targets(self) -> List[Tuple[str, int]]:
@@ -38649,17 +39088,12 @@ class HyperVRouterManager:
         for peer in peers:
             if (now - peer.last_seen) > max(self.peer_timeout_sec, self._direct_hello_every_sec * 2.0):
                 continue
-            ips = [peer.last_success_ip, peer.last_data_from_ip, peer.last_hello_from_ip, peer.listen_ip,
-                   peer.advertised_ip]
-            ips.extend(peer.candidate_ips.keys())
-            for ip in ips:
-                ip = self._sanitize_peer_ip(ip)
-                if not ip or not self._transport_ip_allowed(ip, discovery=True):
+            for ip, _ in self._candidate_peer_targets(peer):
+                if not self._peer_transport_ip_allowed(peer, ip, discovery=True):
                     continue
                 item = (ip, int(peer.discovery_port or self.discovery_port))
                 if item not in out:
                     out.append(item)
-
         return out[: max(1, int(self._peer_target_limit or 1))]
 
     def _peer_last_seen(self, node_id: str) -> float:
@@ -38670,18 +39104,14 @@ class HyperVRouterManager:
             return float(peer.last_seen or 0.0)
 
     def _choose_peer_ip(self, advertised_ip: str, hello_ip: str, data_ip: str, current_ip: str = "") -> str:
-        candidates = []
+        candidates: List[str] = []
         for value in (data_ip, hello_ip, advertised_ip, current_ip):
             ip = self._sanitize_peer_ip(value)
-            if ip and ip not in candidates and self._transport_ip_allowed(ip, discovery=False):
+            if ip and ip not in candidates:
                 candidates.append(ip)
-        for ip in candidates:
-            if self._same_ipv4_subnet(ip, self.bind_ip):
-                return ip
-        for ip in candidates:
-            if self._same_private_scope(ip, self.bind_ip):
-                return ip
-        return candidates[0] if candidates else ""
+        if not candidates:
+            return ""
+        return max(candidates, key=self._local_path_affinity_score)
 
     def _same_ipv4_subnet(self, ip_a: str, ip_b: str) -> bool:
         a = self._ipv4_parts(ip_a)
@@ -38713,10 +39143,43 @@ class HyperVRouterManager:
         if self._is_private_ipv4(ip_s):
             return True
         parts = self._ipv4_parts(ip_s)
-        bind_parts = self._ipv4_parts(self.bind_ip)
-        if parts and bind_parts and parts[:2] == [169, 254] and bind_parts[:2] == [169, 254]:
-            return True
+        if parts and parts[:2] == [169, 254]:
+            return any(
+                (self._ipv4_parts(local_ip) or [])[:2] == [169, 254]
+                for local_ip in self._ordered_local_transport_ips()
+            )
         return bool(self._allow_public_discovery if discovery else self._allow_public_peer_data)
+
+    def _peer_transport_ip_allowed(
+            self,
+            peer: Optional[_Peer],
+            ip: str,
+            *,
+            discovery: bool,
+    ) -> bool:
+        ip_s = str(ip or "").strip()
+        if self._transport_ip_allowed(ip_s, discovery=discovery):
+            return True
+        if peer is None or not self._is_usable_unicast_ipv4(ip_s):
+            return False
+        if peer.segment_id != self.segment_id:
+            return False
+        if self._is_private_ipv4(ip_s):
+            return True
+        known = ip_s in {
+            peer.listen_ip,
+            peer.advertised_ip,
+            peer.last_hello_from_ip,
+            peer.last_data_from_ip,
+            peer.last_success_ip,
+            *peer.candidate_ips.keys(),
+            *peer.public_ips,
+        }
+        return bool(
+            known
+            and self._hybrid_allow_passthrough_public
+            and (peer.public_ok or peer.passthrough_enabled or ip_s in peer.public_ips)
+        )
 
     def configure_wire_security(
             self,
@@ -38726,6 +39189,7 @@ class HyperVRouterManager:
             allow_public_peer_data: Optional[bool] = None,
             allow_public_discovery: Optional[bool] = None,
             allow_cross_subnet_private_hints: Optional[bool] = None,
+            allow_same_segment_passthrough_public: Optional[bool] = None,
     ) -> None:
         secret = str(shared_secret or "").encode("utf-8")
         if require_auth and not secret:
@@ -38738,9 +39202,14 @@ class HyperVRouterManager:
             self._allow_public_discovery = bool(allow_public_discovery)
         if allow_cross_subnet_private_hints is not None:
             self._allow_cross_subnet_private_peer_hints = bool(allow_cross_subnet_private_hints)
+        if allow_same_segment_passthrough_public is not None:
+            self._hybrid_allow_passthrough_public = bool(allow_same_segment_passthrough_public)
         self._log_evt(
             "security",
-            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} public_data={int(self._allow_public_peer_data)} public_discovery={int(self._allow_public_discovery)} cross_subnet_private_hints={int(self._allow_cross_subnet_private_peer_hints)}",
+            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} "
+            f"public_data={int(self._allow_public_peer_data)} public_discovery={int(self._allow_public_discovery)} "
+            f"same_segment_passthrough_public={int(self._hybrid_allow_passthrough_public)} "
+            f"cross_subnet_private_hints={int(self._allow_cross_subnet_private_peer_hints)}",
             ["🛡️", "🔐", "🌐"],
         )
 
@@ -38804,11 +39273,18 @@ class HyperVRouterManager:
             return True
         return False
 
-    def _advertised_fallback_plausible(self, observed_ip: str, advertised_ip: str) -> bool:
-        if not advertised_ip or not self._transport_ip_allowed(advertised_ip, discovery=True):
+    def _advertised_fallback_plausible(
+            self,
+            observed_ip: str,
+            advertised_ip: str,
+            peer: Optional[_Peer] = None,
+    ) -> bool:
+        if not advertised_ip or not self._peer_transport_ip_allowed(peer, advertised_ip, discovery=True):
             return False
         if advertised_ip == observed_ip or self._same_ipv4_subnet(advertised_ip, observed_ip):
             return True
+        if peer is not None and peer.public_ok and advertised_ip in peer.public_ips:
+            return bool(self._hybrid_allow_passthrough_public)
         return bool(
             self._allow_cross_subnet_private_peer_hints
             and self._is_private_ipv4(advertised_ip)
@@ -38832,14 +39308,27 @@ class HyperVRouterManager:
             peer.candidate_data_ports[ip] = int(port)
         if confirmed:
             peer.confirmed_ips.add(ip)
-        if len(peer.candidate_ips) > 8:
-            keep = sorted(peer.candidate_ips.items(), key=lambda kv: kv[1], reverse=True)[:8]
-            keep_ips = {ip for ip, _ in keep}
+
+        if self._is_private_ipv4(ip):
+            peer.private_ips.add(ip)
+            peer.address_roles.setdefault(ip, "lan-private")
+            if not peer.preferred_private_ip or confirmed:
+                peer.preferred_private_ip = ip
+        else:
+            peer.public_ips.add(ip)
+            peer.address_roles.setdefault(ip, "passthrough-public" if peer.public_ok or peer.passthrough_enabled else "public")
+
+        if len(peer.candidate_ips) > 12:
+            keep = sorted(peer.candidate_ips.items(), key=lambda kv: kv[1], reverse=True)[:12]
+            keep_ips = {candidate_ip for candidate_ip, _ in keep}
             peer.candidate_ips = dict(keep)
-            peer.candidate_data_ports = {ip: p for ip, p in peer.candidate_data_ports.items() if ip in keep_ips}
+            peer.candidate_data_ports = {candidate_ip: p for candidate_ip, p in peer.candidate_data_ports.items() if candidate_ip in keep_ips}
             peer.confirmed_ips.intersection_update(keep_ips)
-            peer.path_successes = {ip: n for ip, n in peer.path_successes.items() if ip in keep_ips}
-            peer.path_failures = {ip: n for ip, n in peer.path_failures.items() if ip in keep_ips}
+            peer.private_ips.intersection_update(keep_ips)
+            peer.public_ips.intersection_update(keep_ips)
+            peer.address_roles = {candidate_ip: role for candidate_ip, role in peer.address_roles.items() if candidate_ip in keep_ips}
+            peer.path_successes = {candidate_ip: n for candidate_ip, n in peer.path_successes.items() if candidate_ip in keep_ips}
+            peer.path_failures = {candidate_ip: n for candidate_ip, n in peer.path_failures.items() if candidate_ip in keep_ips}
 
     def _best_peer_ip_locked(self, peer: _Peer) -> str:
         targets = self._candidate_peer_targets(peer)
@@ -38860,6 +39349,8 @@ class HyperVRouterManager:
                 peer.last_data_from_ip,
                 peer.last_success_ip,
                 *peer.candidate_ips.keys(),
+                *peer.private_ips,
+                *peer.public_ips,
             }
 
     def _wire_source_matches_peer(
@@ -38871,12 +39362,17 @@ class HyperVRouterManager:
             msg: Dict[str, Any],
     ) -> bool:
         ip = self._sanitize_peer_ip(from_ip)
-        if not ip or not self._transport_ip_allowed(ip, discovery=False):
+        if not ip:
             return False
         with self._lock:
             peer = self._peers.get(str(node_id))
             if peer is None:
-                return not self._wire_require_known_peer_for_data
+                return bool(
+                    not self._wire_require_known_peer_for_data
+                    and self._transport_ip_allowed(ip, discovery=False)
+                )
+            if not self._peer_transport_ip_allowed(peer, ip, discovery=False):
+                return False
             known_ips = {
                 peer.listen_ip,
                 peer.advertised_ip,
@@ -38884,6 +39380,8 @@ class HyperVRouterManager:
                 peer.last_data_from_ip,
                 peer.last_success_ip,
                 *peer.candidate_ips.keys(),
+                *peer.private_ips,
+                *peer.public_ips,
             }
             if ip in known_ips:
                 return True
@@ -38895,7 +39393,9 @@ class HyperVRouterManager:
                         return True
             if self._allow_peer_ip_migration and self._is_private_ipv4(ip):
                 for known in known_ips:
-                    if known and (self._same_ipv4_subnet(ip, known) or self._same_private_scope(ip, known)):
+                    if known and self._is_private_ipv4(known) and (
+                        self._same_ipv4_subnet(ip, known) or self._same_private_scope(ip, known)
+                    ):
                         return True
         return False
 
@@ -38964,6 +39464,7 @@ class HyperVRouterManager:
                 peer.candidate_ips.pop(ip, None)
                 peer.candidate_data_ports.pop(ip, None)
             peer.listen_ip = self._best_peer_ip_locked(peer)
+
 
 
 
