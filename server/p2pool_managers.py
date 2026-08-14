@@ -1999,6 +1999,190 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         )
         return any(h in name for h in hints)
 
+
+    @staticmethod
+    def _coerce_network_object(
+            value,
+            *,
+            ip_hint=None,
+            netmask_hint=None,
+            version: Optional[int] = None,
+    ):
+        """
+        Convert mixed interface-network metadata into an ipaddress network.
+
+        Accepted inputs include IPv4Network/IPv6Network, interface objects,
+        CIDR strings, address/netmask pairs, and dictionaries produced by
+        external adapter managers. A version mismatch never wins over a valid
+        hinted candidate.
+        """
+        network_types = (ipaddress.IPv4Network, ipaddress.IPv6Network)
+        interface_types = (ipaddress.IPv4Interface, ipaddress.IPv6Interface)
+
+        def acceptable(network) -> bool:
+            return (
+                isinstance(network, network_types)
+                and (version not in (4, 6) or network.version == version)
+            )
+
+        if isinstance(value, network_types):
+            if acceptable(value):
+                return value
+        elif isinstance(value, interface_types):
+            if acceptable(value.network):
+                return value.network
+
+        raw_candidates = []
+        if isinstance(value, dict):
+            for key in ("network", "cidr", "subnet", "prefix"):
+                candidate = value.get(key)
+                if candidate is not None:
+                    raw_candidates.append(candidate)
+        elif value is not None:
+            raw_candidates.append(value)
+
+        ip_text = str(ip_hint or "").strip().split("%", 1)[0]
+        mask_text = str(netmask_hint or "").strip()
+
+        # Prefer a complete address/mask pair because a bare dotted netmask can
+        # otherwise be misread as a /32 host network.
+        if ip_text and mask_text:
+            raw_candidates.insert(0, f"{ip_text}/{mask_text}")
+
+        if ip_text and value is not None:
+            value_text = str(value).strip()
+            if value_text and "/" not in value_text:
+                raw_candidates.insert(0, f"{ip_text}/{value_text}")
+
+        if ip_text and "/" in ip_text:
+            raw_candidates.append(ip_text)
+
+        seen = set()
+        for candidate in raw_candidates:
+            text = str(candidate or "").strip()
+            if not text or text.casefold() in {"none", "null"} or text in seen:
+                continue
+            seen.add(text)
+            try:
+                network = ipaddress.ip_network(text, strict=False)
+            except (TypeError, ValueError):
+                continue
+            if acceptable(network):
+                return network
+
+        return None
+
+    def _get_interface_network(
+            self,
+            iface_name: Optional[str],
+            config: Optional[dict] = None,
+            *,
+            version: Optional[int] = None,
+            persist: bool = True,
+    ):
+        """
+        Return a normalized network object for an interface.
+
+        When possible this also repairs the shared interface configuration so
+        every downstream manager receives a real IPv4Network/IPv6Network object
+        instead of a serialized string.
+        """
+        iface = str(iface_name or "").strip()
+        cfg = config if isinstance(config, dict) else None
+        if cfg is None and iface:
+            candidate = self._interfaces_config.get(iface)
+            cfg = candidate if isinstance(candidate, dict) else None
+        if cfg is None:
+            return None
+
+        network = self._coerce_network_object(
+            cfg.get("network"),
+            ip_hint=cfg.get("ip_addr"),
+            netmask_hint=cfg.get("netmask"),
+            version=version,
+        )
+        if network is None:
+            return None
+
+        if persist:
+            cfg["network"] = network
+            cfg["network_text"] = str(network)
+            cfg["netmask"] = str(network.netmask)
+            if isinstance(network, ipaddress.IPv4Network):
+                cfg["broadcast"] = str(network.broadcast_address)
+            ip_text = str(cfg.get("ip_addr") or "").strip()
+            if ip_text:
+                try:
+                    ip_obj = ipaddress.ip_address(ip_text.split("%", 1)[0])
+                    if ip_obj.version == network.version:
+                        cfg["cidr"] = f"{ip_obj}/{network.prefixlen}"
+                except ValueError:
+                    pass
+        return network
+
+    def _normalize_all_interface_networks(self) -> None:
+        """Repair all currently registered interface network metadata in place."""
+        for iface_name, cfg in list(self._interfaces_config.items()):
+            if isinstance(cfg, dict):
+                self._get_interface_network(iface_name, cfg, persist=True)
+
+    @staticmethod
+    def _is_loopback_iface_name(iface_name: Optional[str]) -> bool:
+        name = str(iface_name or "").strip().casefold()
+        return (
+            name in {"lo", "loopback"}
+            or "loopback" in name
+            or name.endswith("npf_loopback")
+        )
+
+    def _ipv4_broadcast_owner_ifaces(self, address) -> list[str]:
+        """Return configured interfaces whose directed broadcast equals address."""
+        try:
+            dst = address if isinstance(address, ipaddress.IPv4Address) else ipaddress.IPv4Address(str(address))
+        except (TypeError, ValueError):
+            return []
+
+        matches = []
+        for iface_name, cfg in list(self._interfaces_config.items()):
+            if not isinstance(cfg, dict):
+                continue
+            network = self._get_interface_network(iface_name, cfg, version=4)
+            if isinstance(network, ipaddress.IPv4Network) and dst == network.broadcast_address:
+                matches.append(str(iface_name))
+                continue
+            configured_broadcast = str(cfg.get("broadcast") or "").strip()
+            if configured_broadcast and configured_broadcast == str(dst):
+                matches.append(str(iface_name))
+        return matches
+
+    def _is_ipv4_broadcast(self, address, network=None, config: Optional[dict] = None) -> bool:
+        """Safely recognize limited or directed IPv4 broadcast destinations."""
+        try:
+            dst = address if isinstance(address, ipaddress.IPv4Address) else ipaddress.IPv4Address(str(address))
+        except (TypeError, ValueError):
+            return False
+
+        if dst == ipaddress.IPv4Address("255.255.255.255"):
+            return True
+
+        normalized = self._coerce_network_object(network, version=4)
+        if isinstance(normalized, ipaddress.IPv4Network) and dst == normalized.broadcast_address:
+            return True
+
+        configured_broadcast = str((config or {}).get("broadcast") or "").strip()
+        return bool(configured_broadcast and configured_broadcast == str(dst))
+
+    def _track_local_broadcast_drop(self, identifier: str, message: str) -> None:
+        try:
+            self.function_call_tracker.track(
+                identifier=identifier,
+                threshold=25,
+                final_message=message + " Count: {}.",
+                count_message=None,
+            )
+        except Exception:
+            pass
+
     def _ensure_virtual_interface_ipv4_metadata(
             self,
             iface_name: str,
@@ -2020,7 +2204,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         cfg["ip_addr"] = str(router_ip)
         cfg["netmask"] = str(network.netmask)
         cfg["cidr"] = f"{router_ip}/{network.prefixlen}"
-        cfg["network"] = str(network)
+        cfg["network"] = network
+        cfg["network_text"] = str(network)
         cfg["synthetic_ipv4"] = True
         cfg["ipv4_resolution_source"] = str(source)
         if router_mac:
@@ -4869,26 +5054,66 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         if not ip_layer:
             self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
             return
-        egress_l2_ok = self._iface_supports_l2(inbound_iface)
         dst_ip = ip_layer.dst
+        src_ip = ip_layer.src
 
-        # Parse the destination once.  Multicast must be handled before any unicast/RIP
-        # lookup: RIP tables can contain only unicast prefixes, and link-local service
-        # discovery packets captured on Npcap loopback must not be re-routed.
+        # Parse addresses once. Interface metadata can be supplied by JSON,
+        # virtual adapters, DHCP profiles, or old cached state, so no forwarding
+        # branch is allowed to depend on an unvalidated string network.
         try:
-            dst_ip_obj = ipaddress.ip_address(str(dst_ip))
+            dst_ip_obj = ipaddress.ip_address(str(dst_ip).split("%", 1)[0])
+            src_ip_obj = ipaddress.ip_address(str(src_ip).split("%", 1)[0])
         except ValueError:
-            self.router_logger.log_message(f"[Router] ❌ Invalid destination IP {dst_ip!r}. Dropping.")
+            self.router_logger.log_message(
+                f"[Router] ❌ Invalid IP address src={src_ip!r} dst={dst_ip!r}. Dropping."
+            )
             return
+
+        inbound_is_loopback = self._is_loopback_iface_name(inbound_iface)
+
+        # Windows exposes locally generated NetBIOS/APIPA broadcasts on the
+        # Npcap loopback adapter. They are duplicate host-control traffic and
+        # must not be routed to the WAN or re-injected onto another adapter.
+        if isinstance(dst_ip_obj, ipaddress.IPv4Address):
+            broadcast_owners = self._ipv4_broadcast_owner_ifaces(dst_ip_obj)
+            is_limited_broadcast = dst_ip_obj == ipaddress.IPv4Address("255.255.255.255")
+            is_link_local_control = src_ip_obj.is_link_local or dst_ip_obj.is_link_local
+            is_netbios = bool(
+                packet.haslayer(UDP)
+                and (
+                    int(getattr(packet[UDP], "sport", 0) or 0) in {137, 138}
+                    or int(getattr(packet[UDP], "dport", 0) or 0) in {137, 138}
+                )
+            )
+            is_directed_broadcast = bool(broadcast_owners)
+
+            if is_netbios and (is_limited_broadcast or is_directed_broadcast or is_link_local_control):
+                self._track_local_broadcast_drop(
+                    "DroppedLocalNBNSBroadcast",
+                    (
+                        f"[Router] 🧭 Suppressed local NBNS broadcast "
+                        f"{src_ip_obj} → {dst_ip_obj} on {inbound_iface}."
+                    ),
+                )
+                return
+
+            if inbound_is_loopback and (
+                    is_limited_broadcast
+                    or is_directed_broadcast
+                    or is_link_local_control
+            ):
+                self._track_local_broadcast_drop(
+                    "DroppedLoopbackLocalBroadcast",
+                    (
+                        f"[Router] 🧭 Suppressed loopback-captured local broadcast "
+                        f"{src_ip_obj} → {dst_ip_obj} on {inbound_iface}."
+                    ),
+                )
+                return
 
         # --- Multicast Handling (IPv4 and IPv6) ---
         if dst_ip_obj.is_multicast:
-            inbound_name = str(inbound_iface or "").lower()
-            is_loopback_capture = (
-                "loopback" in inbound_name
-                or inbound_name.endswith("npf_loopback")
-                or inbound_name in {"lo", "loopback"}
-            )
+            is_loopback_capture = inbound_is_loopback
             hop_limit = 0
             try:
                 hop_limit = int(
@@ -4938,6 +5163,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             # Choose egress (keep your own policy; here we mirror inbound)
             egress_iface = inbound_iface
             # L2 is only OK when the driver is NOT windivert/rawip/winfw AND we have a MAC
+            egress_l2_ok = self._iface_supports_l2(egress_iface)
             src_mac = self.get_interface_mac(egress_iface) if egress_l2_ok else None
             use_l2 = bool(egress_l2_ok and src_mac)
 
@@ -4997,7 +5223,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         # route-table keys.
         route = self.rip_manager.get_forwarding_route(str(dst_ip_obj))
 
-        src_ip = ip_layer.src
         proto = "TCP" if packet.haslayer(TCP) else "UDP" if packet.haslayer(UDP) else "IP"
         sport = packet[TCP].sport if packet.haslayer(TCP) else packet[UDP].sport if packet.haslayer(
             UDP) else 0
@@ -5053,9 +5278,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         else:
             is_ipv6 = (ip_layer.version == 6)
 
-            # IMPORTANT: egress_l2_ok must be computed from *selected_iface*, not inbound_iface.
-            # If you don't already have it above, you can uncomment this line:
-            # egress_l2_ok = self._iface_supports_l2(selected_iface)
+            # L2 capability belongs to the actual selected egress adapter,
+            # not to the capture adapter.
+            egress_l2_ok = self._iface_supports_l2(selected_iface)
 
             if egress_l2_ok:
                 if is_ipv6:
@@ -5151,11 +5376,15 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             selected_iface = route["interface"]
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)
-        inbound_network = inbound_config.get("network") if inbound_config else None
-        is_intra_lan = (
-                inbound_network and
-                ipaddress.ip_address(dst_ip) in inbound_network and
-                dst_ip != inbound_config.get("ip_addr")
+        inbound_network = self._get_interface_network(
+            inbound_iface,
+            inbound_config if isinstance(inbound_config, dict) else None,
+            version=dst_ip_obj.version,
+        )
+        is_intra_lan = bool(
+                inbound_network is not None
+                and dst_ip_obj in inbound_network
+                and str(dst_ip_obj) != str((inbound_config or {}).get("ip_addr") or "")
         )
         loop_candidate = inbound_iface in {initial_outbound_iface, selected_iface}
         if loop_candidate:
@@ -5219,19 +5448,42 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             return
 
         is_loopback = (
-                ipaddress.ip_address(dst_ip).is_loopback or
-                "loopback" in initial_outbound_iface.lower() or
-                initial_outbound_iface.lower() == "lo"
+                dst_ip_obj.is_loopback
+                or self._is_loopback_iface_name(initial_outbound_iface)
         )
-        outbound_network = outbound_config["network"]
+        outbound_network = self._get_interface_network(
+            initial_outbound_iface,
+            outbound_config,
+            version=dst_ip_obj.version,
+        )
+        outbound_mac = (
+            str(outbound_config.get("mac") or "").strip()
+            or self.get_interface_mac(initial_outbound_iface)
+        )
         target_mac = None
+
+        # Link-local addresses are never routed between interfaces. A packet
+        # captured on loopback is a duplicate; a packet seen on a real adapter
+        # may only stay on that same link.
+        if (
+                (src_ip_obj.is_link_local or dst_ip_obj.is_link_local)
+                and initial_outbound_iface != inbound_iface
+        ):
+            self._track_local_broadcast_drop(
+                "DroppedCrossInterfaceLinkLocal",
+                (
+                    f"[Router] 🧭 Suppressed cross-interface link-local forwarding "
+                    f"{src_ip_obj} → {dst_ip_obj}: {inbound_iface} -> {initial_outbound_iface}."
+                ),
+            )
+            return
 
         # --- [8] MAC Resolution ---
         if is_loopback:
             target_mac = "00:00:00:00:00:00"
             if packet.haslayer(Ether):
                 # This is a standard packet, just update the MAC addresses
-                packet[Ether].src = outbound_config["mac"]
+                packet[Ether].src = outbound_mac or "00:00:00:00:00:00"
                 packet[Ether].dst = target_mac
             else:
                 # HARDENING: The packet is missing an Ether layer. We will build one.
@@ -5243,14 +5495,21 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     )
                 )
                 # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
-                packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
+                packet = Ether(
+                    src=outbound_mac or "00:00:00:00:00:00",
+                    dst=target_mac,
+                ) / packet
 
             self.router_logger.log_message(
                 f"[Router] 🌀 Loopback forwarding for {dst_ip}. No ARP needed."
             )
             self.packet_writer._send_raw_packet(packet, interface=inbound_iface)
             return
-        elif ipaddress.ip_address(dst_ip) == outbound_network.broadcast_address:
+        elif self._is_ipv4_broadcast(
+                dst_ip_obj,
+                network=outbound_network,
+                config=outbound_config,
+        ):
             target_mac = "ff:ff:ff:ff:ff:ff"
             self.router_logger.log_message(
                 RouterRandomMessages(
@@ -5321,7 +5580,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 packet = packet.payload  # Strip Ethernet layer for loopback processing
         elif packet.haslayer(Ether):
             # Standard case: The packet has a frame, so we just update the MACs.
-            packet[Ether].src = outbound_config["mac"]
+            packet[Ether].src = outbound_mac or self.get_interface_mac(initial_outbound_iface)
             packet[Ether].dst = target_mac
         else:
             # HARDENING: Packet is missing the Ether layer. We will build one
@@ -5334,7 +5593,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 )
             )
             # The original 'packet' is the IP payload. We wrap it in a new Ether frame.
-            packet = Ether(src=outbound_config["mac"], dst=target_mac) / packet
+            packet = Ether(
+                src=outbound_mac or self.get_interface_mac(initial_outbound_iface),
+                dst=target_mac,
+            ) / packet
 
         # --- [11] Fix Checksums ---
         # --- 7. Fix Checksums (IP-Version Aware) ---
@@ -5649,6 +5911,10 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     router_ip_out=router_ip_out,
                     router_netmask_out=netmask_out,
                 )
+
+            # Normalize every interface record before any forwarding, DNS,
+            # DHCP, NAT, or packet-writer manager consumes the shared map.
+            self._normalize_all_interface_networks()
             self._configure_host_preserving_upstream_mode()
             if use_hostbypass:
                 self.host_connectivity_boundary = HostConnectivityBoundaryManager(
@@ -7020,7 +7286,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 )
                 continue
             ip_address_config = config.get('ip_addr')
-            network_config = config.get('network')
+            network_config = self._get_interface_network(
+                iface_full_name,
+                config,
+                persist=True,
+            )
 
             is_out_iface = (iface_full_name == self.interface_out_full_name)
             is_in_iface = (iface_full_name == self.interface_in_full_name)
@@ -7062,7 +7332,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             if is_out_iface:
                 ip_to_assign = router_ip_out if router_ip_out else ip_address_config
-                netmask_to_assign = router_netmask_out if router_netmask_out else str(network_config.netmask)
+                netmask_to_assign = (
+                    router_netmask_out
+                    if router_netmask_out
+                    else str(network_config.netmask)
+                    if network_config is not None
+                    else str(config.get("netmask") or "255.255.255.0")
+                )
                 gateway_to_assign = self.router_gateway_out_ip  # Use the discovered/configured gateway for OUT
 
                 # FIX:
@@ -7079,7 +7355,13 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             elif is_in_iface:
                 ip_to_assign = router_ip_in if router_ip_in else ip_address_config
-                netmask_to_assign = router_netmask_in if router_netmask_in else str(network_config.netmask)
+                netmask_to_assign = (
+                    router_netmask_in
+                    if router_netmask_in
+                    else str(network_config.netmask)
+                    if network_config is not None
+                    else str(config.get("netmask") or "255.255.255.0")
+                )
                 # IN interface typically doesn't have a gateway configured on itself, it *is* the gateway
                 gateway_to_assign = ""
                 dns_server_to_assign = ip_to_assign  # Router itself is DNS for IN clients
@@ -7862,6 +8144,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
     def get_firewall_rules(self) -> List[Dict[str, Any]]:
         """Returns the current list of firewall rules."""
         return self.firewall_manager.get_rules()
+
+
 
 
 

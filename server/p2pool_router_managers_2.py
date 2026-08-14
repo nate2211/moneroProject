@@ -7571,7 +7571,10 @@ class RIPManager:
 
         # _routing_table: { ipaddress.IPv4Network : { "next_hop": str, "cost": int, "interface": str, "advertised_by": str, "last_update": float, "type": "direct" | "rip" | "static" } }
         self._routing_table = {}
-        self._rt_lock = threading.Lock()
+        # RLock allows snapshot helpers to be reused safely by lookup, purge,
+        # advertisement, and UI paths without self-deadlocking.
+        self._rt_lock = threading.RLock()
+        self._interfaces_lock = threading.RLock()
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -7595,7 +7598,17 @@ class RIPManager:
         self._last_trigger_ts = 0.0
 
         self._send_timeout_soft = 1.5
-        self._max_routes_per_advert = 64
+
+        # Maximum routes considered during one advertisement cycle.  This is
+        # intentionally separate from the per-packet RIPv2 limit.
+        self._max_routes_per_advert = 512
+
+        # RFC-compatible RIPv2 batching.  A normal response carries at most
+        # 25 route entries.  Authentication or a large custom auth payload can
+        # reduce the usable batch size further; packet-size fitting below will
+        # split dynamically when needed.
+        self._rip_entries_per_packet = 25
+        self._max_advert_packets_per_iface = 64
         self._max_ifaces_per_cycle = 64
         self._enable_advertisements = True
         self._enable_learning = True
@@ -7608,6 +7621,9 @@ class RIPManager:
         self._loop_sleep_granularity = 0.25
         self._reentrant_send_guard = threading.Lock()
         self._last_advert_digest = None
+        self._last_advert_digest_by_iface = {}
+        self._last_advert_send_ts_by_iface = {}
+        self._snapshot_retry_limit = 4
         self._wan_like_ifaces = set()
         self._disable_rip_ifaces = set()
         self._allow_wan_rip_advertisements = False
@@ -7736,37 +7752,63 @@ class RIPManager:
             return candidate_cost < current_cost
         return self._prefer_route(candidate, current)
 
+
     def _routing_table_snapshot(self) -> List[Tuple[ipaddress._BaseNetwork, Dict[str, Any]]]:
         """
-        Build a type-safe snapshot and repair string keys without mutating the
-        dictionary during iteration.  Older integrations sometimes inject keys such
-        as ``"192.168.1.0/24"`` directly; membership checks require network objects.
+        Return a detached, type-safe route-table snapshot.
+
+        No caller receives a live ``dict_items`` view.  Legacy string keys are
+        normalized only after a complete source snapshot has been captured, so
+        route learning cannot produce ``dictionary changed size during
+        iteration`` in the advertisement thread.
         """
         repaired: Dict[ipaddress._BaseNetwork, Dict[str, Any]] = {}
         invalid_keys: List[Any] = []
         converted = 0
+        raw_items = None
 
-        with self._rt_lock:
-            raw_items = list(self._routing_table.items())
-            for raw_net, raw_details in raw_items:
-                net = self._coerce_route_network(raw_net)
-                if net is None:
-                    invalid_keys.append(raw_net)
-                    continue
+        for attempt in range(max(1, int(self._snapshot_retry_limit))):
+            try:
+                with self._rt_lock:
+                    raw_items = tuple(self._routing_table.items())
+                break
+            except RuntimeError as exc:
+                if "changed size" not in str(exc).lower():
+                    raise
+                if attempt + 1 >= max(1, int(self._snapshot_retry_limit)):
+                    self.router_logger.log_message(
+                        "[RIP] ⚠️ Route snapshot remained busy; advertisement deferred to the next cycle."
+                    )
+                    return []
+                time.sleep(0)
 
-                details = dict(raw_details) if isinstance(raw_details, dict) else {}
-                existing = repaired.get(net)
-                if existing is None or self._route_entry_is_better(details, existing):
-                    repaired[net] = details
-                if raw_net is not net and not isinstance(raw_net, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
-                    converted += 1
+        for raw_net, raw_details in raw_items or ():
+            net = self._coerce_route_network(raw_net)
+            if net is None:
+                invalid_keys.append(raw_net)
+                continue
 
-            # Self-heal the live table only after the source iteration is complete.
-            # Preserve valid entries while discarding unparseable keys that would
-            # otherwise crash every route lookup and routing-table UI snapshot.
-            if converted or invalid_keys or len(repaired) != len(self._routing_table):
-                self._routing_table.clear()
-                self._routing_table.update(repaired)
+            details = dict(raw_details) if isinstance(raw_details, dict) else {}
+            existing = repaired.get(net)
+            if existing is None or self._route_entry_is_better(details, existing):
+                repaired[net] = details
+
+            if not isinstance(raw_net, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                converted += 1
+
+        if converted or invalid_keys:
+            # Repair only entries that still match the captured generation.
+            # Replacing the complete table here would discard routes learned
+            # after the snapshot was taken.
+            with self._rt_lock:
+                for raw_net, _raw_details in raw_items or ():
+                    if raw_net in self._routing_table and not isinstance(
+                            raw_net, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                        self._routing_table.pop(raw_net, None)
+                for net, details in repaired.items():
+                    current = self._routing_table.get(net)
+                    if current is None or self._route_entry_is_better(details, current):
+                        self._routing_table[net] = dict(details)
 
         if converted:
             self.router_logger.log_message(
@@ -7776,13 +7818,44 @@ class RIPManager:
             preview = ", ".join(repr(x) for x in invalid_keys[:3])
             suffix = "" if len(invalid_keys) <= 3 else f" …(+{len(invalid_keys) - 3})"
             self.router_logger.log_message(
-                f"[RIP] ⚠️ Removed {len(invalid_keys)} invalid route key(s): {preview}{suffix}"
+                f"[RIP] ⚠️ Ignored {len(invalid_keys)} invalid route key(s): {preview}{suffix}"
             )
 
-        return list(repaired.items())
+        return [(net, dict(details)) for net, details in repaired.items()]
+
+    def _interfaces_snapshot(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return detached interface records without exposing a live items view."""
+        for attempt in range(max(1, int(self._snapshot_retry_limit))):
+            try:
+                with self._interfaces_lock:
+                    raw_items = tuple(self._interfaces_config.items())
+                return [
+                    (str(ifname), dict(cfg) if isinstance(cfg, dict) else {})
+                    for ifname, cfg in raw_items
+                ]
+            except RuntimeError as exc:
+                if "changed size" not in str(exc).lower():
+                    raise
+                if attempt + 1 >= max(1, int(self._snapshot_retry_limit)):
+                    self.router_logger.log_message(
+                        "[RIP] ⚠️ Interface configuration changed repeatedly; advertisement deferred."
+                    )
+                    return []
+                time.sleep(0)
+        return []
+
+    def _interface_is_configured(self, ifname: str) -> bool:
+        with self._interfaces_lock:
+            return ifname in self._interfaces_config
+
+    def _hold_down_snapshot(self) -> Dict[ipaddress._BaseNetwork, float]:
+        with self._rt_lock:
+            return dict(self._route_hold_down)
+
 
     def _is_held_down(self, net) -> bool:
-        return time.time() < float(self._route_hold_down.get(net, 0.0))
+        with self._rt_lock:
+            return time.time() < float(self._route_hold_down.get(net, 0.0))
 
     def _request_triggered_update(self):
         try:
@@ -7908,13 +7981,40 @@ class RIPManager:
         self.authentication_key = key
         self.router_logger.log_message("[RIP] Authentication key set.")
 
+
     def initialize_routes(self, interfaces_config: dict, default_gateway_ip: str, default_gateway_iface: str,
                           router_gateway_out_ip: str, interface_out_full_name: str, interface_in_full_name: str):
-        self._interfaces_config = interfaces_config or {}
+        # Never retain the caller's mutable dictionary.  Router discovery can
+        # rebuild its dictionary while the RIP worker is advertising.
+        stable_interfaces = {}
+        source_items = ()
+        for attempt in range(max(1, int(self._snapshot_retry_limit))):
+            try:
+                source_items = tuple((interfaces_config or {}).items())
+                break
+            except RuntimeError as exc:
+                if "changed size" not in str(exc).lower():
+                    raise
+                if attempt + 1 >= max(1, int(self._snapshot_retry_limit)):
+                    self.router_logger.log_message(
+                        "[RIP] ⚠️ Interface inventory was changing during initialization; using the last stable subset."
+                    )
+                    source_items = ()
+                    break
+                time.sleep(0)
+
+        for ifname, cfg in source_items:
+            stable_interfaces[str(ifname)] = dict(cfg) if isinstance(cfg, dict) else {}
+
+        with self._interfaces_lock:
+            self._interfaces_config = stable_interfaces
 
         self._wan_like_ifaces = set()
         if interface_out_full_name:
             self._wan_like_ifaces.add(interface_out_full_name)
+
+        interface_snapshot = self._interfaces_snapshot()
+        now = time.time()
 
         with self._rt_lock:
             self._routing_table.clear()
@@ -7923,16 +8023,16 @@ class RIPManager:
             self._protected_nets.clear()
             self._host_service_protect_nets.clear()
 
-            for ifname, cfg in self._interfaces_config.items():
-                net = cfg.get("network")
-                if not net:
+            for ifname, cfg in interface_snapshot:
+                net = self._coerce_route_network(cfg.get("network"))
+                if net is None:
                     continue
                 self._routing_table[net] = {
-                    "next_hop": "0.0.0.0",
+                    "next_hop": "0.0.0.0" if net.version == 4 else "::",
                     "cost": 1,
                     "interface": ifname,
                     "advertised_by": "self",
-                    "last_update": time.time(),
+                    "last_update": now,
                     "type": "direct"
                 }
                 self._protected_nets.add(net)
@@ -7944,11 +8044,14 @@ class RIPManager:
                     "cost": 1,
                     "interface": default_gateway_iface,
                     "advertised_by": "self",
-                    "last_update": time.time(),
+                    "last_update": now,
                     "type": "direct"
                 }
                 self._protected_nets.add(default_net)
 
+            self._route_change_seq += 1
+
+        # Keep the existing static-route policy and compatibility routes.
         self.add_static_route(network_str="0.0.0.0/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="0.0.0.0/0", next_hop=router_gateway_out_ip,
@@ -7993,7 +8096,9 @@ class RIPManager:
         self.add_static_route("45.90.30.0/32", router_gateway_out_ip, interface_out_full_name, 1)
         self.add_static_route(network_str="::1/128", next_hop="::1", interface=interface_in_full_name, cost=2)
 
-        self.router_logger.log_message(f"[RIP] Routing table initialized with {len(self._routing_table)} entries.")
+        self.router_logger.log_message(
+            f"[RIP] Routing table initialized with {len(self._routing_table_snapshot())} entries."
+        )
 
     def add_static_route(self, network_str: str, next_hop: str, interface: str, cost: int = 1):
         try:
@@ -8002,7 +8107,7 @@ class RIPManager:
                 self.router_logger.log_message(f"[RIP] ⚠️ Static route cost {cost} is out of valid range (1-15). Setting to 1.")
                 cost = 1
 
-            if interface not in self._interfaces_config:
+            if not self._interface_is_configured(interface):
                 self.router_logger.log_message(f"[RIP] ❌ Cannot add static route: Interface '{interface}' is not configured.")
                 return False
 
@@ -8415,62 +8520,82 @@ class RIPManager:
         supernet_addr = first_net_addr & int(ipaddress.IPv4Network(f"0.0.0.0/{new_prefixlen}").netmask)
         return ipaddress.IPv4Network((supernet_addr, new_prefixlen), strict=False)
 
+
     def _summarize_routes(self, routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Collapse only routes that have identical forwarding semantics.
+
+        The previous implementation appended every non-summarized route twice:
+        once while processing its prefix group and again in the final pass.  That
+        could double the advertisement dictionary and overflow a RIP packet.
+        """
         if not routes:
             return []
 
-        summarized_networks = set()
-        final_advertisements = []
-        prefix_groups = defaultdict(list)
-
-        for route_details in routes:
-            net = route_details["network"]
+        grouped = defaultdict(list)
+        for route in list(routes):
+            if not isinstance(route, dict):
+                continue
+            net = self._coerce_route_network(route.get("network"))
             if not isinstance(net, ipaddress.IPv4Network):
                 continue
-            parent_net_str = f"{str(net.network_address).rsplit('.', 2)[0]}.0.0/16"
-            parent_net = ipaddress.ip_network(parent_net_str, strict=False)
-            prefix_groups[parent_net].append(route_details)
 
-        for parent_net, child_routes in prefix_groups.items():
-            child_routes.sort(key=lambda r: r["network"].network_address)
-            current_summary_group_nets = []
+            try:
+                cost = max(1, min(16, int(route.get("cost", 16))))
+            except Exception:
+                cost = 16
 
-            for route_details in child_routes:
-                current_net = route_details["network"]
-                if current_net in summarized_networks:
+            key = (
+                str(route.get("next_hop") or "0.0.0.0"),
+                cost,
+                str(route.get("interface") or ""),
+                str(route.get("type") or ""),
+                str(route.get("advertised_by") or ""),
+            )
+            grouped[key].append((net, dict(route)))
+
+        result = []
+        emitted = set()
+
+        for key, members in list(grouped.items()):
+            unique_nets = sorted(
+                {net for net, _route in members},
+                key=lambda n: (int(n.network_address), n.prefixlen),
+            )
+            if not unique_nets:
+                continue
+
+            try:
+                collapsed = list(ipaddress.collapse_addresses(unique_nets))
+            except Exception:
+                collapsed = unique_nets
+
+            template = dict(members[0][1])
+            for net in collapsed:
+                identity = (net, key)
+                if identity in emitted:
                     continue
+                emitted.add(identity)
 
-                if not current_summary_group_nets:
-                    current_summary_group_nets.append(current_net)
-                    continue
+                entry = dict(template)
+                entry["network"] = net
+                entry["subnet_mask"] = str(net.netmask)
+                entry["next_hop"] = key[0]
+                entry["cost"] = key[1]
+                entry["interface"] = key[2]
+                entry["type"] = key[3]
+                entry["advertised_by"] = key[4]
+                result.append(entry)
 
-                temp_nets = current_summary_group_nets + [current_net]
-                common_supernet = self._find_common_supernet(temp_nets)
-
-                if common_supernet.prefixlen < min(n.prefixlen for n in temp_nets):
-                    current_summary_group_nets.append(current_net)
-                else:
-                    if len(current_summary_group_nets) > 1:
-                        group_details = [r for r in child_routes if r["network"] in current_summary_group_nets]
-                        self._process_and_add_summary(final_advertisements, summarized_networks, group_details)
-                    else:
-                        final_advertisements.append(
-                            next(r for r in child_routes if r["network"] == current_summary_group_nets[0])
-                        )
-                    current_summary_group_nets = [current_net]
-
-            if len(current_summary_group_nets) > 1:
-                group_details = [r for r in child_routes if r["network"] in current_summary_group_nets]
-                self._process_and_add_summary(final_advertisements, summarized_networks, group_details)
-            elif len(current_summary_group_nets) == 1 and current_summary_group_nets[0] not in summarized_networks:
-                route_details = next(r for r in child_routes if r["network"] == current_summary_group_nets[0])
-                final_advertisements.append(route_details)
-
-        for route in routes:
-            if route["network"] not in summarized_networks:
-                final_advertisements.append(route)
-
-        return final_advertisements
+        result.sort(
+            key=lambda entry: (
+                int(entry["network"].network_address),
+                int(entry["network"].prefixlen),
+                str(entry.get("interface") or ""),
+                int(entry.get("cost", 16)),
+            )
+        )
+        return result
 
     def _process_and_add_summary(self, final_advertisements: list, summarized_networks: set, group_details: list):
         group_nets = [r["network"] for r in group_details]
@@ -8507,7 +8632,7 @@ class RIPManager:
                 self._bg_last_loop_ts = self._bg_heartbeat_ts
 
                 try:
-                    self._send_advertisements()
+                    self._send_advertisements(triggered=False)
                 except Exception as e:
                     self.router_logger.log_message(f"[RIP] ❌ _send_advertisements exception: {type(e).__name__}: {e}")
 
@@ -8524,7 +8649,7 @@ class RIPManager:
                         if (now - self._last_trigger_ts) >= self._min_trigger_interval:
                             self._last_trigger_ts = now
                             try:
-                                self._send_advertisements()
+                                self._send_advertisements(triggered=True)
                             except Exception as e:
                                 self.router_logger.log_message(
                                     f"[RIP] ❌ triggered advertisement exception: {type(e).__name__}: {e}"
@@ -8544,124 +8669,256 @@ class RIPManager:
             self._bg_stopped_event.set()
             self.router_logger.log_message("[RIP] Advertisement thread has exited.")
 
-    def _send_advertisements(self):
-        if not self._enable_advertisements:
-            return
-        if not self.sniffer:
+
+    def _send_advertisements(self, *, triggered: bool = False):
+        """
+        Advertise a stable route snapshot in bounded RIPv2 packets.
+
+        This method never iterates a live routing/interface dictionary and never
+        places the whole route table into one Scapy packet.  Concurrent route
+        learning is picked up on the next cycle without aborting this one.
+        """
+        if not self._enable_advertisements or not self.sniffer:
             return
 
         if not self._reentrant_send_guard.acquire(blocking=False):
             return
 
         try:
-            with self._rt_lock:
-                table_snapshot_for_summarization = []
-                for net_obj, details in self._routing_table.items():
-                    if self._is_held_down(net_obj):
-                        continue
-                    temp_entry = details.copy()
-                    temp_entry["network"] = net_obj
-                    table_snapshot_for_summarization.append(temp_entry)
+            hold_down = self._hold_down_snapshot()
+            table_snapshot_for_summarization = []
+
+            for net_obj, details in self._routing_table_snapshot():
+                if time.time() < float(hold_down.get(net_obj, 0.0)):
+                    continue
+                temp_entry = dict(details)
+                temp_entry["network"] = net_obj
+                table_snapshot_for_summarization.append(temp_entry)
 
             summarized_table_entries = self._summarize_routes(table_snapshot_for_summarization)
             summarized_table_entries = [
-                x for x in summarized_table_entries
-                if self._should_advertise_route(x)
-            ][:self._max_routes_per_advert]
+                dict(entry) for entry in summarized_table_entries
+                if self._should_advertise_route(entry)
+            ]
+
+            # Stable deterministic ordering makes packet batches and digests
+            # repeatable even while the live table continues changing.
+            summarized_table_entries.sort(
+                key=lambda entry: (
+                    int(entry["network"].network_address),
+                    int(entry["network"].prefixlen),
+                    str(entry.get("interface") or ""),
+                    int(entry.get("cost", 16)),
+                )
+            )
+            summarized_table_entries = summarized_table_entries[:max(1, int(self._max_routes_per_advert))]
 
             if not summarized_table_entries:
                 return
 
-            cur_digest = self._digest_routes(summarized_table_entries)
-            if cur_digest == self._last_advert_digest:
+            interface_snapshot = self._interfaces_snapshot()
+            if not interface_snapshot:
                 return
 
             iface_count = 0
             sent_any = False
+            global_digest = self._digest_routes(summarized_table_entries)
 
-            for ifname, cfg in self._interfaces_config.items():
-                if iface_count >= self._max_ifaces_per_cycle:
+            for ifname, cfg in interface_snapshot:
+                if iface_count >= max(1, int(self._max_ifaces_per_cycle)):
                     break
-
                 if not self._can_send_rip_on_iface(ifname, cfg):
                     continue
 
-                entries = []
+                route_specs = []
                 for entry_details in summarized_table_entries:
-                    net = entry_details["network"]
-
-                    # RIP v2 is IPv4-only
+                    net = entry_details.get("network")
                     if not isinstance(net, ipaddress.IPv4Network):
                         continue
 
-                    metric_to_advertise = int(entry_details["cost"])
+                    try:
+                        metric = max(1, min(16, int(entry_details.get("cost", 16))))
+                    except Exception:
+                        metric = 16
 
-                    if self._split_horizon and entry_details["type"] == "rip" and entry_details["interface"] == ifname:
+                    learned_on_this_iface = (
+                        self._split_horizon
+                        and entry_details.get("type") == "rip"
+                        and entry_details.get("interface") == ifname
+                    )
+                    if learned_on_this_iface:
                         if self._poison_reverse:
-                            metric_to_advertise = 16
+                            metric = 16
                         else:
                             continue
+                    elif metric >= 16:
+                        continue
 
-                    if metric_to_advertise >= 16:
+                    route_specs.append({
+                        "network": net,
+                        "next_hop": entry_details.get("next_hop", "0.0.0.0"),
+                        "cost": metric,
+                        "interface": entry_details.get("interface", ""),
+                        "type": entry_details.get("type", ""),
+                    })
+
+                if not route_specs:
+                    continue
+
+                iface_digest = self._digest_routes(route_specs)
+                now = time.time()
+                if triggered:
+                    previous_digest = self._last_advert_digest_by_iface.get(ifname)
+                    previous_ts = float(self._last_advert_send_ts_by_iface.get(ifname, 0.0))
+                    if previous_digest == iface_digest and (now - previous_ts) < self._min_trigger_interval:
+                        continue
+
+                rip_entries = []
+                for spec in route_specs:
+                    net = spec["network"]
+                    try:
+                        rip_entries.append(RIPEntry(
+                            addr=str(net.network_address),
+                            mask=str(net.netmask),
+                            metric=int(spec["cost"]),
+                        ))
+                    except Exception as exc:
+                        self.router_logger.log_message(
+                            f"[RIP] ⚠️ Entry build skipped for {net} on "
+                            f"{self._safe_iface_name(ifname)}: {type(exc).__name__}: {exc}"
+                        )
+
+                if not rip_entries:
+                    continue
+
+                nominal_size = max(1, min(25, int(self._rip_entries_per_packet)))
+                initial_batches = [
+                    rip_entries[pos:pos + nominal_size]
+                    for pos in range(0, len(rip_entries), nominal_size)
+                ]
+
+                # Dynamically split any batch whose UDP/RIP payload exceeds the
+                # traditional 512-byte RIP message ceiling.
+                fitted_packets = []
+                pending_batches = list(initial_batches)
+                while pending_batches:
+                    batch = pending_batches.pop(0)
+                    pkt = self._build_rip_packet_for_iface(ifname, cfg, batch)
+                    if pkt is None:
                         continue
 
                     try:
-                        entries.append(RIPEntry(
-                            addr=str(net.network_address),
-                            mask=str(net.netmask),
-                            metric=metric_to_advertise
-                        ))
-                    except Exception as e:
+                        payload_len = len(bytes(pkt[UDP].payload)) if UDP in pkt else len(bytes(pkt))
+                    except Exception:
+                        payload_len = 513
+
+                    if payload_len > 512 and len(batch) > 1:
+                        middle = max(1, len(batch) // 2)
+                        pending_batches.insert(0, batch[middle:])
+                        pending_batches.insert(0, batch[:middle])
+                        continue
+
+                    if payload_len > 512:
                         self.router_logger.log_message(
-                            f"[RIP] ⚠️ Entry build skipped for {net} on {self._safe_iface_name(ifname)}: {type(e).__name__}: {e}"
+                            f"[RIP] ⚠️ Single-entry advertisement is {payload_len} bytes on "
+                            f"{self._safe_iface_name(ifname)}; authentication payload may be too large."
                         )
+                        continue
 
-                if not entries:
+                    fitted_packets.append((pkt, len(batch), payload_len))
+                    if len(fitted_packets) >= max(1, int(self._max_advert_packets_per_iface)):
+                        self.router_logger.log_message(
+                            f"[RIP] ⚠️ Packet cap reached on {self._safe_iface_name(ifname)}; "
+                            "remaining routes will be sent next cycle."
+                        )
+                        break
+
+                if not fitted_packets:
                     continue
 
-                pkt = self._build_rip_packet_for_iface(ifname, cfg, entries)
-                if pkt is None:
-                    continue
+                iface_success = True
+                total_entries_sent = 0
+                for packet_index, (pkt, entry_count, payload_len) in enumerate(fitted_packets, start=1):
+                    try:
+                        self.router_logger.log_message(
+                            f"[RIP] 📺 Sending advertisement on {self._safe_iface_name(ifname)} "
+                            f"packet={packet_index}/{len(fitted_packets)} entries={entry_count} "
+                            f"rip_bytes={payload_len}"
+                        )
+                        self.sniffer.sendp(pkt, iface=ifname, verbose=0)
+                        total_entries_sent += entry_count
+                        sent_any = True
+                    except Exception as exc:
+                        iface_success = False
+                        self.router_logger.log_message(
+                            f"[RIP] ❌ Advertisement send failed on {self._safe_iface_name(ifname)} "
+                            f"packet={packet_index}: {type(exc).__name__}: {exc}"
+                        )
+                        break
 
-                try:
+                if iface_success and total_entries_sent:
+                    self._last_advert_digest_by_iface[ifname] = iface_digest
+                    self._last_advert_send_ts_by_iface[ifname] = time.time()
                     self.router_logger.log_message(
-                        f"[RIP] 📺 Sending advertisement on {self._safe_iface_name(ifname)} ({len(entries)} entries)"
-                    )
-                    self.sniffer.sendp(pkt, iface=ifname, verbose=0)
-                    sent_any = True
-                except Exception as e:
-                    self.router_logger.log_message(
-                        f"[RIP] ❌ Advertisement send failed on {self._safe_iface_name(ifname)}: {type(e).__name__}: {e}"
+                        f"[RIP] ✅ Advertised {total_entries_sent} route entries on "
+                        f"{self._safe_iface_name(ifname)} across {len(fitted_packets)} packet(s)."
                     )
 
                 iface_count += 1
 
             if sent_any:
-                self._last_advert_digest = cur_digest
+                self._last_advert_digest = global_digest
 
+        except RuntimeError as exc:
+            if "dictionary changed size" in str(exc).lower():
+                self.router_logger.log_message(
+                    "[RIP] ⚠️ Advertisement snapshot changed unexpectedly; deferred without stopping RIP."
+                )
+                return
+            raise
         finally:
             try:
                 self._reentrant_send_guard.release()
             except Exception:
                 pass
 
+
     def _purge_routes(self):
-        with self._rt_lock:
-            now = time.time()
-            timed_out_routes = []
-            for net, details in self._routing_table.items():
-                if details["type"] == "rip" and (now - details["last_update"]) > self.ROUTE_TIMEOUT:
+        now = time.time()
+        snapshot = self._routing_table_snapshot()
+        timed_out_routes = []
+
+        for net, details in snapshot:
+            try:
+                if details.get("type") == "rip" and (
+                        now - float(details.get("last_update", 0.0))) > self.ROUTE_TIMEOUT:
                     timed_out_routes.append(net)
+            except Exception:
+                continue
 
+        removed = []
+        with self._rt_lock:
             for net in timed_out_routes:
-                self._route_hold_down[net] = now + self._hold_down_seconds
-                del self._routing_table[net]
-                self._route_change_seq += 1
-                self.router_logger.log_message(f"[RIP] 🗑️ Timed out and removed RIP route: {net}")
+                current = self._routing_table.get(net)
+                if not current or current.get("type") != "rip":
+                    continue
+                if (now - float(current.get("last_update", 0.0))) <= self.ROUTE_TIMEOUT:
+                    continue
 
-            for net, expiry in list(self._route_hold_down.items()):
-                if now >= expiry:
-                    self._route_hold_down.pop(net, None)
+                self._route_hold_down[net] = now + self._hold_down_seconds
+                self._routing_table.pop(net, None)
+                self._route_change_seq += 1
+                removed.append(net)
+
+            expired_hold_downs = [
+                net for net, expiry in tuple(self._route_hold_down.items())
+                if now >= float(expiry)
+            ]
+            for net in expired_hold_downs:
+                self._route_hold_down.pop(net, None)
+
+        for net in removed:
+            self.router_logger.log_message(f"[RIP] 🗑️ Timed out and removed RIP route: {net}")
 
     def start(self):
         with self._start_lock:
@@ -8732,6 +8989,7 @@ class RIPManager:
                 out = tail
         return out
 
+
     def find_alternate_route(
             self,
             dest_ip_str: str,
@@ -8757,49 +9015,51 @@ class RIPManager:
         default_v4 = ipaddress.ip_network("0.0.0.0/0")
         default_v6 = ipaddress.ip_network("::/0")
         default_candidate = None
+        hold_down = self._hold_down_snapshot()
 
-        with self._rt_lock:
-            for net, rt in self._routing_table.items():
-                iface = self._canon_iface_name(rt.get("interface", ""))
+        for net, rt in self._routing_table_snapshot():
+            iface = self._canon_iface_name(rt.get("interface", ""))
 
-                if iface == excluded:
+            if iface == excluded:
+                continue
+            if time.time() < float(hold_down.get(net, 0.0)):
+                continue
+
+            if allow_default_as_alt and (net == default_v4 or net == default_v6):
+                if int(rt.get("cost", 16)) <= max_cost:
+                    default_candidate = dict(rt)
+
+            try:
+                if dest_ip not in net:
                     continue
-                if self._is_held_down(net):
-                    continue
+            except Exception:
+                continue
 
-                if allow_default_as_alt and (net == default_v4 or net == default_v6):
-                    if rt.get("cost", 16) <= max_cost:
-                        default_candidate = rt
-
-                try:
-                    if dest_ip not in net:
-                        continue
-                except Exception:
-                    continue
-
+            try:
                 cost = int(rt.get("cost", 16))
-                if cost > max_cost:
-                    continue
+            except Exception:
+                cost = 16
+            if cost > max_cost:
+                continue
 
-                if dest_ip.is_loopback and rt.get("type") == "direct" and iface == self._canon_iface_name(
-                        self.interface_loopback_full_name):
-                    return rt
+            if dest_ip.is_loopback and rt.get("type") == "direct" and iface == self._canon_iface_name(
+                    self.interface_loopback_full_name):
+                return dict(rt)
 
-                better = False
-                if best_match is None:
+            better = False
+            if best_match is None:
+                better = True
+            elif net.prefixlen > best_prefix:
+                better = True
+            elif net.prefixlen == best_prefix:
+                if cost < int(best_match.get("cost", 16)):
                     better = True
-                elif net.prefixlen > best_prefix:
+                elif cost == int(best_match.get("cost", 16)) and self._prefer_route(rt, best_match):
                     better = True
-                elif net.prefixlen == best_prefix:
-                    if cost < best_match.get("cost", 16):
-                        better = True
-                    elif cost == best_match.get("cost", 16):
-                        if self._prefer_route(rt, best_match):
-                            better = True
 
-                if better:
-                    best_prefix = net.prefixlen
-                    best_match = rt
+            if better:
+                best_prefix = net.prefixlen
+                best_match = dict(rt)
 
         if best_match is None and allow_default_as_alt and default_candidate is not None:
             return default_candidate
@@ -33925,6 +34185,8 @@ class LanManager(_SmartManagerBase):
                     self.hosts_by_mac.pop(host.mac.lower(), None)
 
 
+
+
 @dataclass
 class _QueuedLocalFrame:
     raw: bytes
@@ -34117,6 +34379,25 @@ class HyperVRouterManager:
         self.node_id: str = ""
         self.host_name: str = socket.gethostname()
         self.bind_ip: str = "0.0.0.0"
+
+        # IP-passthrough state is metadata for Hyper-V peer transport.  It does
+        # not replace the Windows adapter/DHCP manager that owns netsh changes.
+        self._ip_passthrough_config: Dict[str, Any] = {
+            "enabled": False,
+            "public_ip": "",
+            "lan_ip": "",
+            "gateway_ip": "",
+            "subnet_mask": "",
+            "prefix_length": None,
+            "bind_ip": "",
+            "wan_interface": "",
+            "lan_interface": "",
+            "same_address_mode": False,
+            "advertise_public_ip": False,
+            "public_ok": False,
+            "gateway_ok": True,
+            "restart_required": False,
+        }
 
         self._lock = threading.RLock()
         self._sock_lock = threading.RLock()
@@ -34340,20 +34621,308 @@ class HyperVRouterManager:
             bind_ip: str = "0.0.0.0",
             node_id: Optional[str] = None,
     ) -> None:
-        self.segment_id = str(segment_id or "default").strip() or "default"
-        self.bind_ip = str(bind_ip or "").strip()
-        self.node_id = str(node_id or f"{self.host_name}-{uuid.getnode():012x}")
+        """
+        Configure the peer-transport identity.
 
-        if not self._is_valid_bind_ip(self.bind_ip):
+        ``bind_ip`` must be an IPv4 address assigned to this Windows host.  A
+        public passthrough address may be used when it is actually present on a
+        local adapter; otherwise pass the host-side/private address and record
+        the public address through :meth:`configure_ip_passthrough`.
+        """
+        segment = str(segment_id or "default").strip() or "default"
+        requested_bind = str(bind_ip or "").strip()
+        requested_node = str(node_id or f"{self.host_name}-{uuid.getnode():012x}").strip()
+
+        if not self._is_valid_bind_ip(requested_bind):
             raise ValueError(
-                "HyperVRouterManager requires a concrete IPv4 bind_ip; wildcard/degraded bind is disabled"
+                "HyperVRouterManager requires a concrete, usable IPv4 bind_ip; "
+                "0.0.0.0, loopback, multicast, and broadcast addresses are not allowed"
             )
+
+        with self._lock:
+            if self._started and requested_bind != self.bind_ip:
+                raise RuntimeError(
+                    "HyperVRouterManager.configure() cannot change bind_ip while started; "
+                    "stop the manager, configure it, then start it again"
+                )
+
+            self.segment_id = segment
+            self.bind_ip = requested_bind
+            self.node_id = requested_node
+
+            cfg = dict(self._ip_passthrough_config)
+            if cfg.get("enabled"):
+                cfg["bind_ip"] = requested_bind
+                cfg["restart_required"] = False
+                self._ip_passthrough_config = cfg
 
         self._log_evt(
             "config",
             f"configured segment='{self.segment_id}' node='{self.node_id}' bind='{self.bind_ip}'",
             ["🧠", "📝"],
         )
+
+    def configure_ip_passthrough(self, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Record and validate IP-passthrough information used by Hyper-V routing.
+
+        This method intentionally accepts both the current keyword form and
+        older positional/alias forms so startup code does not fail during an
+        upgrade.
+
+        Preferred form::
+
+            manager.configure_ip_passthrough(
+                public_ip="203.0.113.10",
+                lan_ip="203.0.113.10",
+                gateway_ip="203.0.113.10",
+                subnet_mask="255.255.255.255",
+                bind_ip="203.0.113.10",
+                wan_interface="Wi-Fi",
+                lan_interface="vEthernet (Default Switch)",
+                enabled=True,
+            )
+
+        Positional compatibility order is:
+            public_ip, lan_ip, gateway_ip, subnet_mask,
+            wan_interface, lan_interface
+
+        The AT&T/static passthrough case where public_ip, lan_ip, and
+        gateway_ip are identical is valid and is represented by
+        ``same_address_mode=True``.  This method does not run netsh or assign
+        addresses; adapter configuration remains owned by the router's Windows
+        interface/DHCP manager.
+        """
+        options: Dict[str, Any] = dict(kwargs)
+        positional_names = (
+            "public_ip",
+            "lan_ip",
+            "gateway_ip",
+            "subnet_mask",
+            "wan_interface",
+            "lan_interface",
+        )
+        if len(args) > len(positional_names):
+            raise TypeError(
+                "configure_ip_passthrough() accepts at most 6 positional arguments: "
+                "public_ip, lan_ip, gateway_ip, subnet_mask, wan_interface, lan_interface"
+            )
+        for name, value in zip(positional_names, args):
+            options.setdefault(name, value)
+
+        def _pick(*names: str, default: Any = "") -> Any:
+            for name in names:
+                if name in options and options[name] is not None:
+                    value = options[name]
+                    if isinstance(value, str):
+                        value = value.strip()
+                    if value != "":
+                        return value
+            return default
+
+        enabled = bool(_pick("enabled", "ip_passthrough", "passthrough_enabled", default=True))
+        strict = bool(_pick("strict", "validate_strictly", default=False))
+
+        public_ip = str(_pick(
+            "public_ip", "wan_ip", "external_ip", "static_ip", "passthrough_ip"
+        ) or "").strip()
+        lan_ip = str(_pick(
+            "lan_ip", "host_ip", "local_ip", "inside_ip", "router_ip", "client_ip"
+        ) or "").strip()
+        gateway_ip = str(_pick(
+            "gateway_ip", "gateway", "default_gateway", "wan_gateway", "public_gateway"
+        ) or "").strip()
+        requested_bind_ip = str(_pick(
+            "bind_ip", "transport_bind_ip", "listen_ip", "source_ip"
+        ) or "").strip()
+        subnet_mask = str(_pick("subnet_mask", "netmask", "mask") or "").strip()
+        wan_interface = str(_pick(
+            "wan_interface", "out_interface", "out_iface", "upstream_interface", "upstream_iface"
+        ) or "").strip()
+        lan_interface = str(_pick(
+            "lan_interface", "in_interface", "in_iface", "downstream_interface", "downstream_iface"
+        ) or "").strip()
+        advertise_public_ip = bool(_pick(
+            "advertise_public_ip", "public_reachable", default=False
+        ))
+
+        prefix_raw = _pick("prefix_length", "prefix", "cidr_prefix", default=None)
+        prefix_length: Optional[int] = None
+        if prefix_raw not in (None, ""):
+            try:
+                prefix_length = int(prefix_raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"invalid IPv4 prefix length: {prefix_raw!r}")
+            if not 0 <= prefix_length <= 32:
+                raise ValueError(f"IPv4 prefix length must be from 0 through 32, got {prefix_length}")
+
+        if subnet_mask:
+            mask_prefix = self._ipv4_mask_prefix(subnet_mask)
+            if mask_prefix is None:
+                raise ValueError(f"invalid contiguous IPv4 subnet mask: {subnet_mask!r}")
+            if prefix_length is None:
+                prefix_length = mask_prefix
+            elif prefix_length != mask_prefix:
+                raise ValueError(
+                    f"subnet_mask {subnet_mask!r} is /{mask_prefix}, "
+                    f"but prefix_length={prefix_length}"
+                )
+        elif prefix_length is not None:
+            subnet_mask = self._ipv4_prefix_mask(prefix_length)
+
+        invalid_fields: List[str] = []
+        for field_name, value in (
+                ("public_ip", public_ip),
+                ("lan_ip", lan_ip),
+                ("gateway_ip", gateway_ip),
+                ("bind_ip", requested_bind_ip),
+        ):
+            if value and not self._is_usable_unicast_ipv4(value):
+                invalid_fields.append(f"{field_name}={value!r}")
+        if invalid_fields:
+            raise ValueError("invalid IP-passthrough IPv4 value(s): " + ", ".join(invalid_fields))
+
+        configured_ips = [ip for ip in (public_ip, lan_ip, gateway_ip) if ip]
+        same_address_mode = len(configured_ips) >= 2 and len(set(configured_ips)) == 1
+
+        current_bind = str(self.bind_ip or "").strip()
+        bind_candidates = (
+            requested_bind_ip,
+            lan_ip,
+            public_ip,
+            current_bind,
+        )
+        selected_bind_ip = next(
+            (candidate for candidate in bind_candidates if self._is_valid_bind_ip(candidate)),
+            "",
+        )
+
+        if enabled and strict and not selected_bind_ip:
+            raise ValueError(
+                "IP passthrough is enabled but no usable local bind address was supplied; "
+                "provide bind_ip, lan_ip, public_ip, or call configure() first"
+            )
+
+        requested_public_ok = _pick("public_ok", "has_public_ip", default=None)
+        requested_gateway_ok = _pick("gateway_ok", "can_gateway", "gateway_ready", default=None)
+
+        public_ok = (
+            bool(requested_public_ok)
+            if requested_public_ok is not None
+            else bool(enabled and public_ip and self._is_usable_unicast_ipv4(public_ip))
+        )
+        gateway_ok = (
+            bool(requested_gateway_ok)
+            if requested_gateway_ok is not None
+            else bool(enabled and (gateway_ip or selected_bind_ip))
+        )
+
+        with self._lock:
+            old_bind = str(self.bind_ip or "").strip()
+            restart_required = bool(
+                self._started and selected_bind_ip and selected_bind_ip != old_bind
+            )
+
+            # Before start, make the selected host address the transport bind.
+            # While running, leave sockets untouched and report restart_required
+            # instead of racing the receive/send threads.
+            if selected_bind_ip and not self._started:
+                self.bind_ip = selected_bind_ip
+
+            self._ip_passthrough_config = {
+                "enabled": enabled,
+                "public_ip": public_ip,
+                "lan_ip": lan_ip,
+                "gateway_ip": gateway_ip,
+                "subnet_mask": subnet_mask,
+                "prefix_length": prefix_length,
+                "bind_ip": selected_bind_ip or old_bind,
+                "wan_interface": wan_interface,
+                "lan_interface": lan_interface,
+                "same_address_mode": same_address_mode,
+                "advertise_public_ip": advertise_public_ip,
+                "public_ok": public_ok if enabled else False,
+                # Preserve the manager's historical gateway advertisement when
+                # passthrough is disabled.
+                "gateway_ok": gateway_ok if enabled else True,
+                "restart_required": restart_required,
+            }
+            result = dict(self._ip_passthrough_config)
+
+        mode = "same-address" if same_address_mode else "routed"
+        self._log_evt(
+            "ip-passthrough",
+            (
+                f"configured enabled={int(enabled)} mode={mode} "
+                f"public={public_ip or '-'} lan={lan_ip or '-'} "
+                f"gateway={gateway_ip or '-'} bind={result.get('bind_ip') or '-'} "
+                f"mask={subnet_mask or '-'} restart_required={int(restart_required)}"
+            ),
+            ["🌐", "🛣️", "📝"],
+        )
+
+        if restart_required:
+            self._log_evt(
+                "ip-passthrough",
+                "bind address changed while HyperVRouterManager was running; "
+                "stop and restart the manager to rebind its UDP sockets",
+                ["⚠️", "🔄", "🧯"],
+            )
+
+        return result
+
+    def get_ip_passthrough_status(self) -> Dict[str, Any]:
+        """Return a copy of the current passthrough configuration."""
+        with self._lock:
+            return dict(self._ip_passthrough_config)
+
+    def _passthrough_wire_flags(self) -> Tuple[bool, bool]:
+        with self._lock:
+            cfg = dict(self._ip_passthrough_config)
+        return (
+            bool(cfg.get("public_ok", False)),
+            bool(cfg.get("gateway_ok", True)),
+        )
+
+    def _passthrough_address_hints(self, advertised_ip: str = "") -> List[str]:
+        with self._lock:
+            cfg = dict(self._ip_passthrough_config)
+
+        candidates: List[str] = [str(advertised_ip or "").strip()]
+        candidates.append(str(cfg.get("lan_ip") or "").strip())
+        candidates.append(str(cfg.get("bind_ip") or "").strip())
+        if bool(cfg.get("advertise_public_ip", False)) or bool(cfg.get("same_address_mode", False)):
+            candidates.append(str(cfg.get("public_ip") or "").strip())
+
+        hints: List[str] = []
+        for candidate in candidates:
+            if not self._is_usable_unicast_ipv4(candidate):
+                continue
+            if candidate not in hints:
+                hints.append(candidate)
+        return hints
+
+    def _ipv4_mask_prefix(self, mask: Any) -> Optional[int]:
+        parts = self._ipv4_parts(mask)
+        if parts is None:
+            return None
+        value = (
+            (parts[0] << 24)
+            | (parts[1] << 16)
+            | (parts[2] << 8)
+            | parts[3]
+        )
+        bits = f"{value:032b}"
+        if "01" in bits:
+            return None
+        return bits.count("1")
+
+    def _ipv4_prefix_mask(self, prefix_length: int) -> str:
+        prefix = int(prefix_length)
+        if not 0 <= prefix <= 32:
+            raise ValueError(f"IPv4 prefix length must be from 0 through 32, got {prefix}")
+        value = ((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF) if prefix else 0
+        return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8, 0))
 
     def register_hyperv_backend(
             self,
@@ -35254,7 +35823,14 @@ class HyperVRouterManager:
     def _recv_loop(self) -> None:
         while not self._stop_event.is_set():
             with self._sock_lock:
-                socks = [s for s in (self._discovery_sock, self._data_sock) if s is not None]
+                # The discovery TX socket is intentionally included.  In IP-passthrough
+                # mode the main data socket can be bound to a public address while
+                # private peers are reached through this route-selected socket.  ACKs
+                # then return to its ephemeral/local source port and must be consumed.
+                socks = []
+                for candidate in (self._discovery_sock, self._data_sock, self._discovery_tx_sock):
+                    if candidate is not None and candidate not in socks:
+                        socks.append(candidate)
 
             if not socks:
                 self._stop_event.wait(0.25)
@@ -35267,6 +35843,8 @@ class HyperVRouterManager:
                 continue
 
             for sock_obj in ready:
+                # Packets received on the route-selected TX socket are data-path
+                # responses, even though that socket is also used to transmit hello.
                 which = "discovery" if sock_obj is self._discovery_sock else "data"
                 try:
                     data, addr = sock_obj.recvfrom(int(self._wire_message_max_bytes))
@@ -35526,6 +36104,8 @@ class HyperVRouterManager:
                     self._hello_challenges.pop(old_id, None)
 
         adv_ip = self._advertise_ip()
+        public_ok, gateway_ok = self._passthrough_wire_flags()
+        address_hints = self._passthrough_address_hints(adv_ip)
         msg = {
             "magic": self.MAGIC,
             "type": "hello",
@@ -35544,9 +36124,9 @@ class HyperVRouterManager:
             "sender_ids": sender_ids,
             "sender_kinds": sender_kinds,
             "allow_protocols": allow_protocols,
-            "public_ok": False,
-            "gateway_ok": True,
-            "address_hints": [adv_ip] if adv_ip else [],
+            "public_ok": public_ok,
+            "gateway_ok": gateway_ok,
+            "address_hints": address_hints,
             "ts": time.time(),
         }
 
@@ -35976,6 +36556,8 @@ class HyperVRouterManager:
             )
 
         adv_ip = self._advertise_ip()
+        public_ok, gateway_ok = self._passthrough_wire_flags()
+        address_hints = self._passthrough_address_hints(adv_ip)
         msg = {
             "magic": self.MAGIC,
             "type": "hello_ack",
@@ -35992,9 +36574,9 @@ class HyperVRouterManager:
             "sender_ids": sender_ids,
             "sender_kinds": sender_kinds,
             "allow_protocols": allow_protocols,
-            "public_ok": False,
-            "gateway_ok": True,
-            "address_hints": [adv_ip] if adv_ip else [],
+            "public_ok": public_ok,
+            "gateway_ok": gateway_ok,
+            "address_hints": address_hints,
             "ts": time.time(),
         }
         raw = self._encode_wire_message(msg)
@@ -36444,52 +37026,116 @@ class HyperVRouterManager:
             status=status,
         )
 
-    def _candidate_ack_targets_from_message(self, msg: dict, from_ip: str, from_port: int, src_node_id: str) -> List[
-        Tuple[str, int]]:
+    def _candidate_ack_targets_from_message(
+            self,
+            msg: dict,
+            from_ip: str,
+            from_port: int,
+            src_node_id: str,
+    ) -> List[Tuple[str, int]]:
+        """
+        Build ACK destinations for a received frame.
+
+        The observed source IP is authoritative, but an observed UDP source port
+        is not necessarily the peer's data port. Discovery and route-selected
+        sockets commonly use ephemeral ports. Prefer the peer-advertised data
+        port (normally 47772) on the observed private IP, then learned private
+        paths, and only then a validated message hint.
+        """
         out: List[Tuple[str, int]] = []
         observed_ip = self._sanitize_peer_ip(from_ip)
-        observed_port = self._safe_port(from_port, 0)
+        observed_source_port = self._safe_port(from_port, 0)
 
-        if observed_ip and observed_port and self._transport_ip_allowed(observed_ip, discovery=False):
-            out.append((observed_ip, observed_port))
+        with self._lock:
+            peer = self._peers.get(str(src_node_id)) if src_node_id else None
+            peer_data_port = self._safe_port(
+                getattr(peer, "data_port", 0) if peer is not None else 0,
+                self._bound_data_port or self.data_port,
+            )
+
+        hinted_port = self._safe_port(
+            msg.get("reply_port")
+            or msg.get("ack_port")
+            or msg.get("reply_data_port")
+            or msg.get("src_data_port"),
+            peer_data_port,
+        )
+
+        # First choice: observed private/LAN address with the stable data port.
+        if observed_ip and self._transport_ip_allowed(observed_ip, discovery=False):
+            stable_port = hinted_port or peer_data_port or self.data_port
+            if stable_port:
+                out.append((observed_ip, int(stable_port)))
+
+            # Keep the observed source port only as a fallback. It is useful when
+            # the peer deliberately transmitted from a route-selected ephemeral
+            # socket and is actively polling that socket for the ACK.
+            if observed_source_port and observed_source_port != stable_port:
+                item = (observed_ip, observed_source_port)
+                if item not in out:
+                    out.append(item)
 
         for item in self._candidate_reply_targets(
                 dst_node_id=src_node_id,
                 dst_ip=observed_ip,
-                dst_port=observed_port,
+                dst_port=peer_data_port,
         ):
             if item not in out:
                 out.append(item)
 
-        # Message-supplied reply fields are accepted only when they match an
-        # already learned address for this peer.
-        hinted_ip = self._sanitize_peer_ip(msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip"))
-        hinted_port = self._safe_port(
-            msg.get("reply_port") or msg.get("ack_port") or msg.get("reply_data_port") or msg.get("src_data_port"),
-            0,
+        hinted_ip = self._sanitize_peer_ip(
+            msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip")
         )
         if hinted_ip and hinted_port and self._peer_knows_ip(src_node_id, hinted_ip):
             item = (hinted_ip, hinted_port)
             if self._transport_ip_allowed(hinted_ip, discovery=False) and item not in out:
                 out.append(item)
 
-        return out[: max(1, int(self._ack_target_limit or 1))]
+        return out[: max(2, int(self._ack_target_limit or 1))]
 
-    def _candidate_reply_targets(self, *, dst_node_id: str, dst_ip: str, dst_port: int) -> List[Tuple[str, int]]:
+    def _candidate_reply_targets(
+            self,
+            *,
+            dst_node_id: str,
+            dst_ip: str,
+            dst_port: int,
+    ) -> List[Tuple[str, int]]:
+        """Prefer learned private paths over public passthrough advertisements."""
         out: List[Tuple[str, int]] = []
-        ip = self._sanitize_peer_ip(dst_ip)
-        port = self._safe_port(dst_port, 0)
-        if ip and port and self._transport_ip_allowed(ip, discovery=False):
-            out.append((ip, port))
+        supplied_ip = self._sanitize_peer_ip(dst_ip)
+        supplied_port = self._safe_port(dst_port, 0)
 
         with self._lock:
             peer = self._peers.get(str(dst_node_id)) if dst_node_id else None
-            if peer is not None:
-                for item in self._candidate_peer_targets(peer):
-                    if item not in out:
-                        out.append(item)
+            peer_targets = self._candidate_peer_targets(peer) if peer is not None else []
+            peer_data_port = self._safe_port(
+                getattr(peer, "data_port", 0) if peer is not None else 0,
+                self._bound_data_port or self.data_port,
+            )
 
-        return out[: max(1, int(self._ack_target_limit or 1))]
+        # A supplied private observed IP is strong evidence, but pair it with the
+        # stable peer data port rather than a discovery/ephemeral source port.
+        if supplied_ip and self._transport_ip_allowed(supplied_ip, discovery=False):
+            preferred_port = peer_data_port or supplied_port or self.data_port
+            if self._is_private_ipv4(supplied_ip) and preferred_port:
+                out.append((supplied_ip, int(preferred_port)))
+
+        # Learned private candidates come before public advertised addresses.
+        for item in peer_targets:
+            ip, port = item
+            if self._is_private_ipv4(ip) and item not in out:
+                out.append((ip, port))
+
+        if supplied_ip and supplied_port and self._transport_ip_allowed(supplied_ip, discovery=False):
+            item = (supplied_ip, supplied_port)
+            if item not in out:
+                out.append(item)
+
+        for item in peer_targets:
+            if item not in out:
+                out.append(item)
+
+        return out[: max(2, int(self._ack_target_limit or 1))]
 
     def _candidate_peer_targets(self, peer: _Peer) -> List[Tuple[str, int]]:
         now = time.time()
@@ -36619,6 +37265,10 @@ class HyperVRouterManager:
         with self._sock_lock:
             sock_obj = self._data_sock
             if mtype in {"hello", "hello_reply"}:
+                sock_obj = self._discovery_tx_sock or self._discovery_sock or self._data_sock
+            elif self._is_private_ipv4(ip) and not self._is_private_ipv4(self.bind_ip):
+                # IP passthrough: never force LAN traffic to originate from the
+                # public-bound socket. Let Windows select the 192.168.x.x path.
                 sock_obj = self._discovery_tx_sock or self._discovery_sock or self._data_sock
             elif sock_obj is None:
                 sock_obj = self._discovery_tx_sock or self._discovery_sock
@@ -38314,6 +38964,8 @@ class HyperVRouterManager:
                 peer.candidate_ips.pop(ip, None)
                 peer.candidate_data_ports.pop(ip, None)
             peer.listen_ip = self._best_peer_ip_locked(peer)
+
+
 
 
 @dataclass
