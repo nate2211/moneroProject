@@ -12,6 +12,12 @@ from ctypes import c_char, c_int, c_long, POINTER, CFUNCTYPE, Structure, c_uint
 import sys
 from typing import Optional, List, Union
 import importlib
+import json
+import math
+import re
+import collections
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple, Deque, Iterable
 import psutil
 from scapy.arch import get_if_hwaddr, get_windows_if_list
 from scapy.config import conf
@@ -86,6 +92,102 @@ class pcap_pkthdr(Structure):
         ("caplen", c_uint),
         ("len", c_uint),
     ]
+
+
+class pcap_stat(Structure):
+    """Portable prefix of libpcap/Npcap's packet statistics structure."""
+    _fields_ = [
+        ("ps_recv", c_uint),
+        ("ps_drop", c_uint),
+        ("ps_ifdrop", c_uint),
+    ]
+
+
+# pcap timestamp precision values used by pcap_set_tstamp_precision.
+PCAP_TSTAMP_PRECISION_MICRO = 0
+PCAP_TSTAMP_PRECISION_NANO = 1
+
+# pcap_activate status values. Positive values are warnings and still produce
+# a usable handle; negative values are hard errors.
+PCAP_WARNING = 1
+PCAP_WARNING_PROMISC_NOTSUP = 2
+PCAP_WARNING_TSTAMP_TYPE_NOTSUP = 3
+PCAP_ERROR = -1
+PCAP_ERROR_BREAK = -2
+PCAP_ERROR_NOT_ACTIVATED = -3
+PCAP_ERROR_ACTIVATED = -4
+PCAP_ERROR_NO_SUCH_DEVICE = -5
+PCAP_ERROR_RFMON_NOTSUP = -6
+PCAP_ERROR_NOT_RFMON = -7
+PCAP_ERROR_PERM_DENIED = -8
+PCAP_ERROR_IFACE_NOT_UP = -9
+PCAP_ERROR_CANTSET_TSTAMP_TYPE = -10
+PCAP_ERROR_PROMISC_PERM_DENIED = -11
+PCAP_ERROR_TSTAMP_PRECISION_NOTSUP = -12
+
+
+@dataclass
+class _PendingTcpSegment:
+    """One bounded out-of-order TCP segment retained for later gap closure."""
+    sequence: int
+    payload: bytes
+    timestamp_ns: int
+    flags: int = 0
+
+
+@dataclass
+class _TcpDirectionState:
+    """Loss-aware state for one direction of a normalized TCP flow."""
+    initial_sequence: Optional[int] = None
+    next_sequence: Optional[int] = None
+    contiguous_total: int = 0
+    observed_payload_total: int = 0
+    retransmission_segments: int = 0
+    retransmission_bytes: int = 0
+    overlap_segments: int = 0
+    overlap_bytes: int = 0
+    duplicate_segments: int = 0
+    out_of_order_segments: int = 0
+    sequence_gap_events: int = 0
+    largest_gap: int = 0
+    pending_bytes: int = 0
+    syn_seen: bool = False
+    fin_seen: bool = False
+    rst_seen: bool = False
+    last_ack: Optional[int] = None
+    last_window: Optional[int] = None
+    last_seen_ns: int = 0
+    stream_tail: bytearray = field(default_factory=bytearray)
+    pending: Dict[int, _PendingTcpSegment] = field(default_factory=dict)
+    recent_segments: collections.OrderedDict = field(default_factory=collections.OrderedDict)
+
+
+@dataclass
+class _TcpFlowState:
+    """Bidirectional flow container with independent sequence spaces."""
+    flow_id: str
+    endpoint_a: Tuple[str, int]
+    endpoint_b: Tuple[str, int]
+    created_ns: int
+    last_seen_ns: int
+    directions: Dict[int, _TcpDirectionState] = field(
+        default_factory=lambda: {0: _TcpDirectionState(), 1: _TcpDirectionState()}
+    )
+    packet_count: int = 0
+    payload_bytes: int = 0
+    closed: bool = False
+
+
+@dataclass
+class _FragmentState:
+    """Bounded metadata for observing IPv4/IPv6 fragmented datagrams."""
+    key: Tuple[Any, ...]
+    created_ns: int
+    last_seen_ns: int
+    fragments: int = 0
+    bytes_observed: int = 0
+    final_offset: Optional[int] = None
+    offsets: set = field(default_factory=set)
 
 # --- DLT constants we care about ---
 # --- DLT constants we care about (tcpdump.org/linktypes) ---
@@ -226,6 +328,145 @@ class SnifferSoftware:
         self.logger = logger if logger else self._default_logger()
         self.libpcap = None
 
+        # ------------------------------------------------------------------
+        # High-fidelity capture configuration and bounded analysis state.
+        # These defaults deliberately favor loss resistance without asking
+        # Npcap for unbounded buffers that could destabilize a busy router.
+        # ------------------------------------------------------------------
+        self.capture_snapshot_length = 262144
+        self.capture_kernel_buffer_bytes = 64 * 1024 * 1024
+        self.capture_read_timeout_ms = 100
+        self.capture_immediate_mode = False
+        self.capture_request_nanosecond_timestamps = True
+        self.capture_stats_interval_sec = 1.0
+        self.capture_raw_retention_limit = self.capture_snapshot_length
+        self.capture_stream_tail_bytes = 512 * 1024
+        self.capture_stream_pending_bytes = 2 * 1024 * 1024
+        self.capture_max_tcp_flows = 8192
+        self.capture_tcp_flow_idle_sec = 300.0
+        self.capture_max_fragment_sets = 2048
+        self.capture_fragment_idle_sec = 60.0
+        self.capture_keep_unknown_ethertypes = True
+        self.capture_analyze_protocols = True
+        self.capture_preserve_original_frame = True
+
+        # Allow router settings to override capture tuning without changing
+        # any constructor or public method signature.
+        capture_cfg = {}
+        try:
+            if isinstance(self._interfaces_config, dict):
+                capture_cfg = dict(
+                    self._interfaces_config.get("__capture__", {})
+                    or self._interfaces_config.get("capture", {})
+                    or {}
+                )
+        except Exception:
+            capture_cfg = {}
+
+        def _cfg_int(name, current, low, high):
+            try:
+                value = int(capture_cfg.get(name, current))
+            except Exception:
+                value = current
+            return max(low, min(high, value))
+
+        def _cfg_float(name, current, low, high):
+            try:
+                value = float(capture_cfg.get(name, current))
+            except Exception:
+                value = current
+            return max(low, min(high, value))
+
+        self.capture_snapshot_length = _cfg_int(
+            "snapshot_length", self.capture_snapshot_length, 65535, 4 * 1024 * 1024
+        )
+        self.capture_kernel_buffer_bytes = _cfg_int(
+            "kernel_buffer_bytes", self.capture_kernel_buffer_bytes,
+            4 * 1024 * 1024, 256 * 1024 * 1024
+        )
+        self.capture_read_timeout_ms = _cfg_int(
+            "read_timeout_ms", self.capture_read_timeout_ms, 1, 5000
+        )
+        self.capture_stream_tail_bytes = _cfg_int(
+            "stream_tail_bytes", self.capture_stream_tail_bytes, 16 * 1024, 4 * 1024 * 1024
+        )
+        self.capture_stream_pending_bytes = _cfg_int(
+            "stream_pending_bytes", self.capture_stream_pending_bytes,
+            64 * 1024, 16 * 1024 * 1024
+        )
+        self.capture_max_tcp_flows = _cfg_int(
+            "max_tcp_flows", self.capture_max_tcp_flows, 256, 65536
+        )
+        self.capture_tcp_flow_idle_sec = _cfg_float(
+            "tcp_flow_idle_sec", self.capture_tcp_flow_idle_sec, 10.0, 3600.0
+        )
+        self.capture_max_fragment_sets = _cfg_int(
+            "max_fragment_sets", self.capture_max_fragment_sets, 64, 16384
+        )
+        self.capture_fragment_idle_sec = _cfg_float(
+            "fragment_idle_sec", self.capture_fragment_idle_sec, 5.0, 600.0
+        )
+        for key, attr in (
+            ("immediate_mode", "capture_immediate_mode"),
+            ("nanosecond_timestamps", "capture_request_nanosecond_timestamps"),
+            ("keep_unknown_ethertypes", "capture_keep_unknown_ethertypes"),
+            ("analyze_protocols", "capture_analyze_protocols"),
+            ("preserve_original_frame", "capture_preserve_original_frame"),
+        ):
+            if key in capture_cfg:
+                value = capture_cfg.get(key)
+                if isinstance(value, str):
+                    value = value.strip().casefold() in {"1", "true", "yes", "on", "enabled"}
+                setattr(self, attr, bool(value))
+
+        self._capture_state_lock = threading.RLock()
+        self._capture_sequence = 0
+        self._capture_handle_precision = {}
+        self._capture_handle_iface = {}
+        self._active_capture_handles = {}
+        # Per-device timestamp capability cache.  Npcap commonly exposes the
+        # precision API while individual adapters still support microseconds
+        # only.  Cache that result so each reopen does not repeat a rejected
+        # nanosecond request or emit misleading warnings.
+        self._capture_timestamp_precision_support = {}
+        self._capture_stats = {}
+        self._capture_stats_last_sample = {}
+        self._capture_total_frames = 0
+        self._capture_total_bytes = 0
+        self._capture_total_wire_bytes = 0
+        self._capture_total_truncated = 0
+        self._capture_decode_failures = 0
+        self._capture_protocol_counts = collections.Counter()
+        self._capture_priority_counts = collections.Counter()
+        self._capture_unknown_ethertypes = collections.Counter()
+
+        self._flow_state_lock = threading.RLock()
+        self._tcp_flows = collections.OrderedDict()
+        self._fragment_sets = collections.OrderedDict()
+        self._last_flow_cleanup_ns = 0
+
+        # Ports are hints only. Recognition still checks payload structure so
+        # non-standard Stratum/TLS/QUIC ports are not missed.
+        self._high_value_tcp_ports = {
+            22, 25, 53, 80, 88, 110, 135, 139, 143, 389, 443, 445,
+            465, 587, 636, 853, 993, 995, 1433, 1521, 2375, 2376,
+            3306, 3389, 4444, 5000, 5432, 5671, 5672, 6379, 8080,
+            8443, 8883, 9000, 9092, 10001, 10128, 18080, 18081,
+            18089, 3333, 4444, 5555, 7777,
+        }
+        self._high_value_udp_ports = {
+            53, 67, 68, 88, 123, 161, 162, 389, 443, 500, 514,
+            520, 546, 547, 1900, 4500, 4789, 5353, 6081, 8472,
+            9090,
+        }
+        self._stratum_method_names = {
+            "mining.subscribe", "mining.authorize", "mining.configure",
+            "mining.extranonce.subscribe", "mining.notify",
+            "mining.set_difficulty", "mining.set_target", "mining.submit",
+            "mining.get_transactions", "login", "job", "submit",
+            "keepalived", "getjob", "get_jobs",
+        }
+
         # Persistent IPv4 resolution state for logical/virtual interfaces.
         # Some router-side names (WinDivertBridge, WireShark, Nate's Tunnel)
         # are not normal Windows NICs and therefore do not appear in Scapy's
@@ -285,7 +526,17 @@ class SnifferSoftware:
             0x8864,  # PPPoE Session (you unwrap PPP->IP later)
             0x8863,  # PPPoE Discovery (to avoid false "unsupported" spam)
             0x8847,  # MPLS unicast
-            0x8848,}
+            0x8848,  # MPLS multicast
+            0x9100,  # provider/stacked VLAN used by some switches
+            0x9200,  # stacked VLAN variant
+            0x88B5,  # IEEE local experimental EtherType
+            0x88B6,  # IEEE local experimental EtherType
+            0x88B7,  # IEEE OUI Extended EtherType
+            0x88E5,  # MACsec
+            0x88E1,  # HomePlug AV
+            0x88E3,  # Media Redundancy Protocol
+            0x8915,  # RoCE
+        }
         self.unsupported_ethertypes = {}
         self.local_ips = self._get_local_ips()
         self.banned_packets = []
@@ -301,7 +552,7 @@ class SnifferSoftware:
                 self.logger.log_message(f"[Scapy] contrib load failed: {mod}: {e}")
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
-        self.logged_packets = []
+        self.logged_packets = collections.deque(maxlen=8192)
         self.hyperv_manager = hyperv_manager
         self.banned_ips = ["89.222.103.1"]
 
@@ -402,16 +653,34 @@ class SnifferSoftware:
         if for_send and self._iface_on_send_cooldown(candidate):
             return None, "interface is temporarily suppressed after a recent send failure"
 
+        # Capture handles use pcap_create/pcap_activate when available so Npcap
+        # receives the larger snapshot, kernel buffer, timestamp precision, and
+        # timeout before activation. Packet-injection handles keep the simpler
+        # open_live path to avoid allocating a large receive buffer per send.
+        advanced_error = ""
+        if not for_send:
+            handle, advanced_error = self._open_pcap_handle_advanced(
+                candidate=candidate,
+                promisc=promisc,
+                timeout=timeout,
+                bpf_filter=bpf_filter,
+            )
+            if handle:
+                return handle, ""
+
         errbuf = ctypes.create_string_buffer(256)
         handle = self.libpcap.pcap_open_live(
             candidate.encode("utf-8"),
-            65535,
+            int(self.capture_snapshot_length),
             1 if promisc else 0,
             max(1, int(timeout)),
             errbuf,
         )
         if not handle:
-            return None, errbuf.value.decode(errors="ignore")
+            fallback_error = errbuf.value.decode(errors="ignore")
+            if advanced_error:
+                fallback_error = f"{fallback_error}; advanced_open={advanced_error}".strip("; ")
+            return None, fallback_error
 
         if bpf_filter:
             bpf = bpf_program()
@@ -431,6 +700,14 @@ class SnifferSoftware:
 
             with contextlib.suppress(Exception):
                 self.libpcap.pcap_freecode(ctypes.byref(bpf))
+
+        if not for_send:
+            self._register_capture_handle(
+                handle,
+                candidate,
+                precision=PCAP_TSTAMP_PRECISION_MICRO,
+                open_mode="pcap_open_live",
+            )
 
         return handle, ""
 
@@ -642,6 +919,2109 @@ class SnifferSoftware:
             self.libpcap.pcap_setdirection.argtypes = [pcap_t_p, c_int]
         except Exception:
             pass  # Not present on very old builds
+
+
+        # Optional advanced activation path. Every symbol is probed separately
+        # because WinPcap and older Npcap releases expose different subsets.
+        def _optional(name, restype, argtypes):
+            try:
+                fn = getattr(self.libpcap, name)
+                fn.restype = restype
+                fn.argtypes = argtypes
+                return True
+            except Exception:
+                return False
+
+        self._pcap_has_create = _optional(
+            "pcap_create", pcap_t_p, [ctypes.c_char_p, ctypes.c_char_p]
+        )
+        self._pcap_has_activate = _optional(
+            "pcap_activate", c_int, [pcap_t_p]
+        )
+        self._pcap_has_set_snaplen = _optional(
+            "pcap_set_snaplen", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_set_promisc = _optional(
+            "pcap_set_promisc", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_set_timeout = _optional(
+            "pcap_set_timeout", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_set_buffer_size = _optional(
+            "pcap_set_buffer_size", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_set_immediate_mode = _optional(
+            "pcap_set_immediate_mode", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_set_tstamp_precision = _optional(
+            "pcap_set_tstamp_precision", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_get_tstamp_precision = _optional(
+            "pcap_get_tstamp_precision", c_int, [pcap_t_p]
+        )
+        self._pcap_has_statustostr = _optional(
+            "pcap_statustostr", ctypes.c_char_p, [c_int]
+        )
+        self._pcap_has_stats = _optional(
+            "pcap_stats", c_int, [pcap_t_p, ctypes.POINTER(pcap_stat)]
+        )
+        self._pcap_has_setmintocopy = _optional(
+            "pcap_setmintocopy", c_int, [pcap_t_p, c_int]
+        )
+        self._pcap_has_breakloop = _optional(
+            "pcap_breakloop", None, [pcap_t_p]
+        )
+
+
+    # -------------------------------------------------------------------------
+    # High-fidelity capture activation, statistics, and metadata helpers
+    # -------------------------------------------------------------------------
+    def _pcap_status_text(self, status: int) -> str:
+        """Return a stable human-readable libpcap activation status."""
+        if getattr(self, "_pcap_has_statustostr", False):
+            try:
+                value = self.libpcap.pcap_statustostr(int(status))
+                if value:
+                    return value.decode("utf-8", "replace")
+            except Exception:
+                pass
+        fallback = {
+            0: "success",
+            PCAP_WARNING: "generic warning",
+            PCAP_WARNING_PROMISC_NOTSUP: "promiscuous mode not supported",
+            PCAP_WARNING_TSTAMP_TYPE_NOTSUP: "timestamp type not supported",
+            PCAP_ERROR: "generic libpcap error",
+            PCAP_ERROR_BREAK: "capture loop terminated",
+            PCAP_ERROR_NOT_ACTIVATED: "capture handle not activated",
+            PCAP_ERROR_ACTIVATED: "capture handle already activated",
+            PCAP_ERROR_NO_SUCH_DEVICE: "no such capture device",
+            PCAP_ERROR_RFMON_NOTSUP: "monitor mode not supported",
+            PCAP_ERROR_NOT_RFMON: "device is not in monitor mode",
+            PCAP_ERROR_PERM_DENIED: "permission denied",
+            PCAP_ERROR_IFACE_NOT_UP: "interface is not up",
+            PCAP_ERROR_CANTSET_TSTAMP_TYPE: "cannot set timestamp type",
+            PCAP_ERROR_PROMISC_PERM_DENIED: "promiscuous permission denied",
+            PCAP_ERROR_TSTAMP_PRECISION_NOTSUP: "timestamp precision unsupported",
+        }
+        return fallback.get(int(status), f"pcap status {status}")
+
+    def _pcap_handle_key(self, handle) -> int:
+        """Normalize ctypes/int pcap handles to a dictionary key."""
+        if handle is None:
+            return 0
+        try:
+            if isinstance(handle, int):
+                return int(handle)
+            value = ctypes.cast(handle, ctypes.c_void_p).value
+            return int(value or 0)
+        except Exception:
+            try:
+                return int(handle)
+            except Exception:
+                return 0
+
+    def _register_capture_handle(
+            self,
+            handle,
+            iface: str,
+            *,
+            precision: int = PCAP_TSTAMP_PRECISION_MICRO,
+            open_mode: str = "unknown",
+    ) -> None:
+        key = self._pcap_handle_key(handle)
+        if not key:
+            return
+        normalized = self._normalize_pcap_name(iface)
+        with self._capture_state_lock:
+            self._capture_handle_precision[key] = int(precision)
+            self._capture_handle_iface[key] = normalized
+            self._active_capture_handles[normalized.casefold()] = handle
+            row = self._capture_stats.setdefault(normalized.casefold(), {})
+            row.update({
+                "interface": normalized,
+                "open_mode": str(open_mode),
+                "timestamp_precision": (
+                    "nanosecond"
+                    if int(precision) == PCAP_TSTAMP_PRECISION_NANO
+                    else "microsecond"
+                ),
+                "snapshot_length": int(self.capture_snapshot_length),
+                "kernel_buffer_bytes_requested": int(self.capture_kernel_buffer_bytes),
+                "opened_at_ns": time.time_ns(),
+            })
+
+    def _unregister_capture_handle(self, handle, iface: str = "") -> None:
+        key = self._pcap_handle_key(handle)
+        normalized = self._normalize_pcap_name(iface)
+        with self._capture_state_lock:
+            known_iface = self._capture_handle_iface.pop(key, "")
+            self._capture_handle_precision.pop(key, None)
+            name = normalized or known_iface
+            if name:
+                current = self._active_capture_handles.get(name.casefold())
+                if current is handle or self._pcap_handle_key(current) == key:
+                    self._active_capture_handles.pop(name.casefold(), None)
+
+    def _install_bpf_on_handle(self, handle, bpf_filter: str | None) -> tuple[bool, str]:
+        """Compile/install one BPF expression without leaking native code."""
+        if not bpf_filter:
+            return True, ""
+        bpf = bpf_program()
+        expression = str(bpf_filter).encode("utf-8", "replace")
+        if self.libpcap.pcap_compile(
+                handle, ctypes.byref(bpf), expression, 1, 0
+        ) == -1:
+            err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors="ignore")
+            with contextlib.suppress(Exception):
+                self.libpcap.pcap_freecode(ctypes.byref(bpf))
+            return False, f"filter compile failed: {err}"
+        try:
+            if self.libpcap.pcap_setfilter(handle, ctypes.byref(bpf)) == -1:
+                err = (self.libpcap.pcap_geterr(handle) or b"").decode(errors="ignore")
+                return False, f"filter set failed: {err}"
+            return True, ""
+        finally:
+            with contextlib.suppress(Exception):
+                self.libpcap.pcap_freecode(ctypes.byref(bpf))
+
+    def _negotiate_capture_timestamp_precision(self, handle, candidate: str) -> tuple[int, list[str]]:
+        """Select the best timestamp precision the capture device really supports.
+
+        ``pcap_set_tstamp_precision`` is a pre-activation API.  Npcap may export
+        it even when a particular adapter cannot provide nanosecond capture
+        timestamps.  ``PCAP_ERROR_TSTAMP_PRECISION_NOTSUP`` is therefore a
+        normal capability result, not an activation warning or a fatal error.
+
+        The returned precision describes the units in ``pcap_pkthdr.ts.tv_usec``:
+        microseconds for ``PCAP_TSTAMP_PRECISION_MICRO`` and nanoseconds for
+        ``PCAP_TSTAMP_PRECISION_NANO``.
+        """
+        warnings: list[str] = []
+        precision = PCAP_TSTAMP_PRECISION_MICRO
+        device_key = self._normalize_pcap_name(candidate).casefold()
+
+        if not self.capture_request_nanosecond_timestamps:
+            return precision, warnings
+        if not getattr(self, "_pcap_has_set_tstamp_precision", False):
+            with self._capture_state_lock:
+                self._capture_timestamp_precision_support[device_key] = False
+            return precision, warnings
+
+        with self._capture_state_lock:
+            cached_support = self._capture_timestamp_precision_support.get(device_key)
+
+        # A previous handle already proved this adapter is microsecond-only.
+        # Microsecond precision is libpcap's default, so no rejected call needs
+        # to be repeated for every reopen.
+        if cached_support is False:
+            return precision, warnings
+
+        try:
+            rc = int(self.libpcap.pcap_set_tstamp_precision(
+                handle, PCAP_TSTAMP_PRECISION_NANO
+            ))
+        except Exception as exc:
+            with self._capture_state_lock:
+                self._capture_timestamp_precision_support[device_key] = False
+            # An exception is unusual and worth retaining, but capture can still
+            # proceed with the default microsecond precision.
+            warnings.append(f"timestamp precision probe exception: {exc}")
+            return precision, warnings
+
+        if rc == 0:
+            with self._capture_state_lock:
+                self._capture_timestamp_precision_support[device_key] = True
+            return PCAP_TSTAMP_PRECISION_NANO, warnings
+
+        if rc == PCAP_ERROR_TSTAMP_PRECISION_NOTSUP:
+            with self._capture_state_lock:
+                self._capture_timestamp_precision_support[device_key] = False
+            # This is an expected capability response on many Npcap adapters.
+            # Do not report it as a warning and do not pretend the header has
+            # nanosecond resolution.  The default remains microseconds.
+            return precision, warnings
+
+        # An unexpected status still should not prevent packet capture.  Make a
+        # best-effort explicit microsecond request and report only genuinely
+        # abnormal failures.
+        with self._capture_state_lock:
+            self._capture_timestamp_precision_support[device_key] = False
+        try:
+            fallback_rc = int(self.libpcap.pcap_set_tstamp_precision(
+                handle, PCAP_TSTAMP_PRECISION_MICRO
+            ))
+        except Exception as exc:
+            warnings.append(
+                "timestamp precision fallback failed after "
+                f"{self._pcap_status_text(rc)}: {exc}"
+            )
+            return precision, warnings
+
+        if fallback_rc != 0:
+            warnings.append(
+                "timestamp precision fallback failed: "
+                f"nano={self._pcap_status_text(rc)}, "
+                f"micro={self._pcap_status_text(fallback_rc)}"
+            )
+        return precision, warnings
+
+    def _capture_precision_for_iface(self, iface: str) -> int:
+        """Return the registered packet-header precision for one live handle."""
+        normalized = self._normalize_pcap_name(iface)
+        with self._capture_state_lock:
+            handle = self._active_capture_handles.get(normalized.casefold())
+            return int(self._capture_handle_precision.get(
+                self._pcap_handle_key(handle),
+                PCAP_TSTAMP_PRECISION_MICRO,
+            ))
+
+    def _capture_precision_name_for_iface(self, iface: str) -> str:
+        return (
+            "nanosecond"
+            if self._capture_precision_for_iface(iface) == PCAP_TSTAMP_PRECISION_NANO
+            else "microsecond"
+        )
+
+    def _open_pcap_handle_advanced(
+            self,
+            *,
+            candidate: str,
+            promisc: bool,
+            timeout: int,
+            bpf_filter: str | None,
+    ):
+        """Create and activate one loss-resistant capture handle.
+
+        All standard capture settings are applied before activation.  Timestamp
+        precision is negotiated rather than assumed.  Npcap's ``mintocopy``
+        control is applied only after activation because its Windows extension
+        rejects inactive handles.
+        """
+        if not (
+            getattr(self, "_pcap_has_create", False)
+            and getattr(self, "_pcap_has_activate", False)
+        ):
+            return None, "pcap_create/pcap_activate unavailable"
+
+        errbuf = ctypes.create_string_buffer(256)
+        handle = self.libpcap.pcap_create(
+            candidate.encode("utf-8", "replace"),
+            errbuf,
+        )
+        if not handle:
+            return None, errbuf.value.decode("utf-8", "replace")
+
+        warnings: list[str] = []
+
+        def _set_pre_activation(name: str, enabled: bool, *args) -> None:
+            if not enabled:
+                return
+            try:
+                rc = int(getattr(self.libpcap, name)(handle, *args))
+            except Exception as exc:
+                warnings.append(f"{name} exception: {exc}")
+                return
+            if rc != 0:
+                warnings.append(f"{name}: {self._pcap_status_text(rc)}")
+
+        _set_pre_activation(
+            "pcap_set_snaplen",
+            getattr(self, "_pcap_has_set_snaplen", False),
+            int(self.capture_snapshot_length),
+        )
+        _set_pre_activation(
+            "pcap_set_promisc",
+            getattr(self, "_pcap_has_set_promisc", False),
+            1 if promisc else 0,
+        )
+        _set_pre_activation(
+            "pcap_set_timeout",
+            getattr(self, "_pcap_has_set_timeout", False),
+            max(1, int(timeout or self.capture_read_timeout_ms)),
+        )
+        _set_pre_activation(
+            "pcap_set_buffer_size",
+            getattr(self, "_pcap_has_set_buffer_size", False),
+            int(self.capture_kernel_buffer_bytes),
+        )
+        _set_pre_activation(
+            "pcap_set_immediate_mode",
+            getattr(self, "_pcap_has_set_immediate_mode", False),
+            1 if self.capture_immediate_mode else 0,
+        )
+
+        requested_precision, precision_warnings = (
+            self._negotiate_capture_timestamp_precision(handle, candidate)
+        )
+        warnings.extend(precision_warnings)
+
+        try:
+            status = int(self.libpcap.pcap_activate(handle))
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                self.libpcap.pcap_close(handle)
+            return None, f"pcap_activate exception: {exc}"
+
+        if status < 0:
+            native_error = ""
+            with contextlib.suppress(Exception):
+                native_error = (
+                    self.libpcap.pcap_geterr(handle) or b""
+                ).decode("utf-8", "replace")
+            with contextlib.suppress(Exception):
+                self.libpcap.pcap_close(handle)
+            detail = self._pcap_status_text(status)
+            if native_error:
+                detail = f"{detail}: {native_error}"
+            return None, detail
+
+        if status > 0:
+            warnings.append(self._pcap_status_text(status))
+
+        # Npcap's pcap_setmintocopy extension requires an activated pcap_t.
+        # Calling it before pcap_activate generated the exact warning seen in
+        # the router log: "The pcap_t has not been activated".
+        if getattr(self, "_pcap_has_setmintocopy", False):
+            minimum_copy = 1 if self.capture_immediate_mode else 16 * 1024
+            try:
+                mincopy_rc = int(self.libpcap.pcap_setmintocopy(
+                    handle, minimum_copy
+                ))
+            except Exception as exc:
+                warnings.append(f"pcap_setmintocopy exception: {exc}")
+            else:
+                if mincopy_rc != 0:
+                    warnings.append(
+                        "pcap_setmintocopy: "
+                        + self._pcap_status_text(mincopy_rc)
+                    )
+
+        actual_precision = requested_precision
+        if getattr(self, "_pcap_has_get_tstamp_precision", False):
+            try:
+                reported_precision = int(
+                    self.libpcap.pcap_get_tstamp_precision(handle)
+                )
+                if reported_precision in (
+                    PCAP_TSTAMP_PRECISION_MICRO,
+                    PCAP_TSTAMP_PRECISION_NANO,
+                ):
+                    actual_precision = reported_precision
+            except Exception:
+                pass
+
+        ok, filter_error = self._install_bpf_on_handle(handle, bpf_filter)
+        if not ok:
+            with contextlib.suppress(Exception):
+                self.libpcap.pcap_close(handle)
+            return None, filter_error
+
+        self._register_capture_handle(
+            handle,
+            candidate,
+            precision=actual_precision,
+            open_mode="pcap_create",
+        )
+        if warnings:
+            self._log_send_once(
+                f"pcap-open-warning:{candidate.casefold()}",
+                f"[Sniffer] Npcap activated {candidate} with warning(s): "
+                + "; ".join(warnings),
+                every=30.0,
+            )
+        return handle, ""
+
+    def _next_capture_sequence(self) -> int:
+        with self._capture_state_lock:
+            self._capture_sequence += 1
+            return self._capture_sequence
+
+    def _timestamp_ns_from_header(self, pkthdr_ptr, iface: str = "") -> int:
+        try:
+            hdr = pkthdr_ptr.contents
+            seconds = int(getattr(hdr.ts, "tv_sec", 0) or 0)
+            fraction = int(getattr(hdr.ts, "tv_usec", 0) or 0)
+        except Exception:
+            return time.time_ns()
+
+        precision = PCAP_TSTAMP_PRECISION_MICRO
+        normalized = self._normalize_pcap_name(iface)
+        with self._capture_state_lock:
+            handle = self._active_capture_handles.get(normalized.casefold())
+            precision = self._capture_handle_precision.get(
+                self._pcap_handle_key(handle),
+                PCAP_TSTAMP_PRECISION_MICRO,
+            )
+        if precision == PCAP_TSTAMP_PRECISION_NANO:
+            return seconds * 1_000_000_000 + max(0, fraction)
+        return seconds * 1_000_000_000 + max(0, fraction) * 1_000
+
+    def _sample_capture_stats(
+            self,
+            iface: str,
+            *,
+            handle=None,
+            force: bool = False,
+    ) -> dict:
+        """Sample Npcap receive/drop counters at a bounded interval."""
+        normalized = self._normalize_pcap_name(iface)
+        key = normalized.casefold()
+        now = time.monotonic()
+        with self._capture_state_lock:
+            previous = float(self._capture_stats_last_sample.get(key, 0.0) or 0.0)
+            if not force and now - previous < self.capture_stats_interval_sec:
+                return dict(self._capture_stats.get(key, {}))
+            self._capture_stats_last_sample[key] = now
+            if handle is None:
+                handle = self._active_capture_handles.get(key)
+
+        if not handle or not getattr(self, "_pcap_has_stats", False):
+            with self._capture_state_lock:
+                return dict(self._capture_stats.get(key, {}))
+
+        native = pcap_stat()
+        try:
+            rc = int(self.libpcap.pcap_stats(handle, ctypes.byref(native)))
+        except Exception as exc:
+            with self._capture_state_lock:
+                row = self._capture_stats.setdefault(key, {"interface": normalized})
+                row["stats_error"] = str(exc)
+                return dict(row)
+
+        with self._capture_state_lock:
+            row = self._capture_stats.setdefault(key, {"interface": normalized})
+            if rc == 0:
+                old_recv = int(row.get("ps_recv", 0) or 0)
+                old_drop = int(row.get("ps_drop", 0) or 0)
+                old_ifdrop = int(row.get("ps_ifdrop", 0) or 0)
+                recv = int(native.ps_recv)
+                drop = int(native.ps_drop)
+                ifdrop = int(native.ps_ifdrop)
+                row.update({
+                    "ps_recv": recv,
+                    "ps_drop": drop,
+                    "ps_ifdrop": ifdrop,
+                    "delta_recv": max(0, recv - old_recv),
+                    "delta_drop": max(0, drop - old_drop),
+                    "delta_ifdrop": max(0, ifdrop - old_ifdrop),
+                    "sampled_at_ns": time.time_ns(),
+                    "stats_error": "",
+                })
+            else:
+                row["stats_error"] = (
+                    self.libpcap.pcap_geterr(handle) or b""
+                ).decode("utf-8", "replace")
+            return dict(row)
+
+    def get_capture_stats(self, iface: str = None) -> dict:
+        """Return a thread-safe snapshot of capture and drop counters."""
+        if iface:
+            return self._sample_capture_stats(iface, force=True)
+        with self._capture_state_lock:
+            handles = list(self._active_capture_handles.items())
+        for key, handle in handles:
+            with self._capture_state_lock:
+                name = str(self._capture_stats.get(key, {}).get("interface") or key)
+            self._sample_capture_stats(name, handle=handle, force=True)
+        with self._capture_state_lock:
+            return {
+                "interfaces": {
+                    key: dict(value)
+                    for key, value in self._capture_stats.items()
+                },
+                "totals": {
+                    "frames": int(self._capture_total_frames),
+                    "captured_bytes": int(self._capture_total_bytes),
+                    "wire_bytes": int(self._capture_total_wire_bytes),
+                    "truncated_frames": int(self._capture_total_truncated),
+                    "decode_failures": int(self._capture_decode_failures),
+                },
+                "protocol_counts": dict(self._capture_protocol_counts),
+                "priority_counts": dict(self._capture_priority_counts),
+                "unknown_ethertypes": {
+                    f"0x{k:04x}": int(v)
+                    for k, v in self._capture_unknown_ethertypes.items()
+                },
+                "active_tcp_flows": len(self._tcp_flows),
+                "active_fragment_sets": len(self._fragment_sets),
+            }
+
+    def _safe_set_packet_attr(self, packet, name: str, value) -> None:
+        try:
+            setattr(packet, name, value)
+        except Exception:
+            pass
+
+    def _payload_bytes(self, packet: Packet) -> bytes:
+        """Return the deepest readily available application payload."""
+        if packet is None:
+            return b""
+        try:
+            raw_layer = packet.getlayer(Raw)
+            if raw_layer is not None:
+                return bytes(getattr(raw_layer, "load", b"") or b"")
+        except Exception:
+            pass
+        transport = self._find_transport_layer(packet)
+        if transport is not None:
+            try:
+                payload = getattr(transport, "payload", None)
+                if isinstance(payload, Raw):
+                    return bytes(payload.load or b"")
+            except Exception:
+                pass
+        return b""
+
+    def _packet_endpoint_tuple(self, packet: Packet):
+        """Return family/protocol/source/destination/ports for a decoded packet."""
+        ip_layer = None
+        family = 0
+        try:
+            ip_layer = packet.getlayer(IP)
+            if ip_layer is not None:
+                family = 4
+            else:
+                ip_layer = packet.getlayer(IPv6)
+                if ip_layer is not None:
+                    family = 6
+        except Exception:
+            ip_layer = None
+
+        if ip_layer is None:
+            return None
+
+        src = self._strip_ipv6_zone(str(getattr(ip_layer, "src", "") or ""))
+        dst = self._strip_ipv6_zone(str(getattr(ip_layer, "dst", "") or ""))
+        protocol = "ip"
+        sport = 0
+        dport = 0
+        try:
+            tcp = packet.getlayer(TCP)
+            udp = packet.getlayer(UDP)
+            if tcp is not None:
+                protocol = "tcp"
+                sport = int(getattr(tcp, "sport", 0) or 0)
+                dport = int(getattr(tcp, "dport", 0) or 0)
+            elif udp is not None:
+                protocol = "udp"
+                sport = int(getattr(udp, "sport", 0) or 0)
+                dport = int(getattr(udp, "dport", 0) or 0)
+            elif family == 4 and packet.getlayer(ICMP) is not None:
+                protocol = "icmp"
+            else:
+                for layer in self._iter_layers(packet):
+                    if layer.__class__.__name__.startswith("ICMPv6"):
+                        protocol = "icmp6"
+                        break
+        except Exception:
+            pass
+
+        return family, protocol, src, sport, dst, dport
+
+    def _normalized_flow_identity(self, packet: Packet):
+        endpoints = self._packet_endpoint_tuple(packet)
+        if endpoints is None:
+            return None
+        family, protocol, src, sport, dst, dport = endpoints
+        left = (src, int(sport))
+        right = (dst, int(dport))
+        if left <= right:
+            endpoint_a, endpoint_b = left, right
+            direction = 0
+        else:
+            endpoint_a, endpoint_b = right, left
+            direction = 1
+        canonical = (
+            f"ip{family}/{protocol}/"
+            f"{endpoint_a[0]}:{endpoint_a[1]}<->{endpoint_b[0]}:{endpoint_b[1]}"
+        )
+        digest = hashlib.blake2s(
+            canonical.encode("utf-8", "replace"),
+            digest_size=16,
+        ).hexdigest()
+        return {
+            "id": digest,
+            "canonical": canonical,
+            "family": family,
+            "protocol": protocol,
+            "endpoint_a": endpoint_a,
+            "endpoint_b": endpoint_b,
+            "direction": direction,
+            "src": src,
+            "dst": dst,
+            "sport": sport,
+            "dport": dport,
+        }
+
+    def _attach_flow_identity(self, packet: Packet) -> dict | None:
+        flow = self._normalized_flow_identity(packet)
+        if flow is None:
+            return None
+        for name, value in (
+            ("_flow_id", flow["id"]),
+            ("_flow_canonical", flow["canonical"]),
+            ("_flow_direction", flow["direction"]),
+            ("_flow_family", flow["family"]),
+            ("_flow_protocol", flow["protocol"]),
+            ("_flow_source", flow["src"]),
+            ("_flow_destination", flow["dst"]),
+            ("_flow_source_port", flow["sport"]),
+            ("_flow_destination_port", flow["dport"]),
+        ):
+            self._safe_set_packet_attr(packet, name, value)
+        return flow
+
+    def _tcp_flags_int(self, tcp: TCP) -> int:
+        try:
+            return int(tcp.flags)
+        except Exception:
+            value = 0
+            text = str(getattr(tcp, "flags", "") or "")
+            for char, bit in {
+                "F": 0x01, "S": 0x02, "R": 0x04, "P": 0x08,
+                "A": 0x10, "U": 0x20, "E": 0x40, "C": 0x80,
+            }.items():
+                if char in text:
+                    value |= bit
+            return value
+
+    def _tcp_options_metadata(self, tcp: TCP) -> dict:
+        metadata = {
+            "mss": None,
+            "window_scale": None,
+            "sack_permitted": False,
+            "sack_blocks": [],
+            "timestamps": None,
+            "unknown": [],
+        }
+        try:
+            options = list(getattr(tcp, "options", []) or [])
+        except Exception:
+            options = []
+        for item in options:
+            try:
+                name, value = item
+            except Exception:
+                continue
+            key = str(name or "").casefold()
+            if key == "mss":
+                with contextlib.suppress(Exception):
+                    metadata["mss"] = int(value)
+            elif key in {"wscale", "window scale"}:
+                with contextlib.suppress(Exception):
+                    metadata["window_scale"] = int(value)
+            elif key in {"sackok", "sack permitted"}:
+                metadata["sack_permitted"] = True
+            elif key == "sack":
+                try:
+                    values = list(value) if isinstance(value, (list, tuple)) else [value]
+                    metadata["sack_blocks"] = [int(v) for v in values]
+                except Exception:
+                    metadata["sack_blocks"] = []
+            elif key in {"timestamp", "timestamps"}:
+                try:
+                    metadata["timestamps"] = tuple(int(v) for v in value)
+                except Exception:
+                    metadata["timestamps"] = value
+            elif key not in {"nop", "eol"}:
+                metadata["unknown"].append((str(name), value))
+        return metadata
+
+    def _get_tcp_flow_state(self, flow: dict, timestamp_ns: int) -> _TcpFlowState:
+        flow_id = flow["id"]
+        with self._flow_state_lock:
+            state = self._tcp_flows.get(flow_id)
+            if state is None:
+                state = _TcpFlowState(
+                    flow_id=flow_id,
+                    endpoint_a=tuple(flow["endpoint_a"]),
+                    endpoint_b=tuple(flow["endpoint_b"]),
+                    created_ns=int(timestamp_ns),
+                    last_seen_ns=int(timestamp_ns),
+                )
+                self._tcp_flows[flow_id] = state
+            else:
+                self._tcp_flows.move_to_end(flow_id)
+                state.last_seen_ns = int(timestamp_ns)
+            return state
+
+    def _append_stream_tail(self, direction: _TcpDirectionState, payload: bytes) -> None:
+        if not payload:
+            return
+        direction.stream_tail.extend(payload)
+        limit = int(self.capture_stream_tail_bytes)
+        if len(direction.stream_tail) > limit:
+            del direction.stream_tail[:-limit]
+
+    def _remember_recent_tcp_segment(
+            self,
+            direction: _TcpDirectionState,
+            *,
+            sequence: int,
+            payload: bytes,
+    ) -> bool:
+        """Return True when the exact segment was already observed."""
+        fingerprint = hashlib.blake2s(
+            struct.pack("!I", sequence & 0xFFFFFFFF) + payload,
+            digest_size=12,
+        ).digest()
+        duplicate = fingerprint in direction.recent_segments
+        direction.recent_segments[fingerprint] = len(payload)
+        direction.recent_segments.move_to_end(fingerprint)
+        while len(direction.recent_segments) > 4096:
+            direction.recent_segments.popitem(last=False)
+        return duplicate
+
+    def _trim_pending_tcp_segments(self, direction: _TcpDirectionState) -> None:
+        limit = int(self.capture_stream_pending_bytes)
+        if direction.pending_bytes <= limit:
+            return
+        # Drop the farthest-ahead segments first; data nearest next_sequence is
+        # most likely to become useful soon.
+        ordered = sorted(direction.pending, reverse=True)
+        for sequence in ordered:
+            segment = direction.pending.pop(sequence, None)
+            if segment is None:
+                continue
+            direction.pending_bytes = max(
+                0, direction.pending_bytes - len(segment.payload)
+            )
+            if direction.pending_bytes <= limit:
+                break
+
+    def _flush_pending_tcp_segments(self, direction: _TcpDirectionState) -> int:
+        flushed = 0
+        while direction.next_sequence is not None:
+            next_seq = int(direction.next_sequence)
+            exact = direction.pending.pop(next_seq, None)
+            if exact is not None:
+                direction.pending_bytes = max(
+                    0, direction.pending_bytes - len(exact.payload)
+                )
+                self._append_stream_tail(direction, exact.payload)
+                direction.contiguous_total += len(exact.payload)
+                direction.next_sequence = (
+                    next_seq + len(exact.payload)
+                ) & 0xFFFFFFFF
+                flushed += len(exact.payload)
+                continue
+
+            # A pending segment may begin before next_sequence and overlap it.
+            overlap_key = None
+            for sequence, segment in direction.pending.items():
+                end = sequence + len(segment.payload)
+                if sequence < next_seq < end:
+                    overlap_key = sequence
+                    break
+            if overlap_key is None:
+                break
+            segment = direction.pending.pop(overlap_key)
+            direction.pending_bytes = max(
+                0, direction.pending_bytes - len(segment.payload)
+            )
+            skip = next_seq - overlap_key
+            unseen = segment.payload[skip:]
+            direction.overlap_segments += 1
+            direction.overlap_bytes += max(0, skip)
+            if unseen:
+                self._append_stream_tail(direction, unseen)
+                direction.contiguous_total += len(unseen)
+                direction.next_sequence = (
+                    next_seq + len(unseen)
+                ) & 0xFFFFFFFF
+                flushed += len(unseen)
+        return flushed
+
+    def _update_tcp_reassembly(
+            self,
+            packet: Packet,
+            flow: dict,
+            timestamp_ns: int,
+    ) -> dict | None:
+        tcp = packet.getlayer(TCP)
+        if tcp is None:
+            return None
+
+        state = self._get_tcp_flow_state(flow, timestamp_ns)
+        direction_id = int(flow["direction"])
+        direction = state.directions[direction_id]
+        flags = self._tcp_flags_int(tcp)
+        sequence = int(getattr(tcp, "seq", 0) or 0) & 0xFFFFFFFF
+        acknowledgement = int(getattr(tcp, "ack", 0) or 0) & 0xFFFFFFFF
+        payload = self._payload_bytes(packet)
+        syn_consumed = 1 if flags & 0x02 else 0
+        data_sequence = (sequence + syn_consumed) & 0xFFFFFFFF
+
+        with self._flow_state_lock:
+            state.packet_count += 1
+            state.payload_bytes += len(payload)
+            state.last_seen_ns = int(timestamp_ns)
+            direction.last_seen_ns = int(timestamp_ns)
+            direction.observed_payload_total += len(payload)
+            direction.syn_seen = direction.syn_seen or bool(flags & 0x02)
+            direction.fin_seen = direction.fin_seen or bool(flags & 0x01)
+            direction.rst_seen = direction.rst_seen or bool(flags & 0x04)
+            direction.last_ack = acknowledgement
+            direction.last_window = int(getattr(tcp, "window", 0) or 0)
+            if flags & (0x01 | 0x04):
+                state.closed = True
+
+            duplicate_exact = self._remember_recent_tcp_segment(
+                direction, sequence=data_sequence, payload=payload
+            ) if payload else False
+
+            if direction.initial_sequence is None:
+                direction.initial_sequence = data_sequence
+            if direction.next_sequence is None:
+                direction.next_sequence = data_sequence
+
+            classification = "ack-only"
+            accepted_bytes = 0
+            flushed_bytes = 0
+            gap = 0
+            overlap = 0
+
+            if payload:
+                next_sequence = int(direction.next_sequence)
+                if duplicate_exact:
+                    direction.duplicate_segments += 1
+
+                if data_sequence == next_sequence:
+                    classification = "contiguous"
+                    self._append_stream_tail(direction, payload)
+                    accepted_bytes = len(payload)
+                    direction.contiguous_total += len(payload)
+                    direction.next_sequence = (
+                        next_sequence + len(payload)
+                    ) & 0xFFFFFFFF
+                    flushed_bytes = self._flush_pending_tcp_segments(direction)
+
+                elif data_sequence < next_sequence:
+                    overlap = next_sequence - data_sequence
+                    direction.retransmission_segments += 1
+                    direction.retransmission_bytes += min(overlap, len(payload))
+                    if overlap >= len(payload):
+                        classification = "retransmission"
+                    else:
+                        classification = "overlap-new-tail"
+                        direction.overlap_segments += 1
+                        direction.overlap_bytes += overlap
+                        unseen = payload[overlap:]
+                        self._append_stream_tail(direction, unseen)
+                        accepted_bytes = len(unseen)
+                        direction.contiguous_total += len(unseen)
+                        direction.next_sequence = (
+                            next_sequence + len(unseen)
+                        ) & 0xFFFFFFFF
+                        flushed_bytes = self._flush_pending_tcp_segments(direction)
+
+                else:
+                    classification = "out-of-order"
+                    gap = data_sequence - next_sequence
+                    direction.out_of_order_segments += 1
+                    direction.sequence_gap_events += 1
+                    direction.largest_gap = max(direction.largest_gap, gap)
+                    existing = direction.pending.get(data_sequence)
+                    if existing is None or len(payload) > len(existing.payload):
+                        if existing is not None:
+                            direction.pending_bytes = max(
+                                0,
+                                direction.pending_bytes - len(existing.payload),
+                            )
+                        direction.pending[data_sequence] = _PendingTcpSegment(
+                            sequence=data_sequence,
+                            payload=bytes(payload),
+                            timestamp_ns=int(timestamp_ns),
+                            flags=flags,
+                        )
+                        direction.pending_bytes += len(payload)
+                        self._trim_pending_tcp_segments(direction)
+
+            snapshot = {
+                "flow_id": state.flow_id,
+                "direction": direction_id,
+                "classification": classification,
+                "sequence": sequence,
+                "data_sequence": data_sequence,
+                "acknowledgement": acknowledgement,
+                "flags": flags,
+                "payload_bytes": len(payload),
+                "accepted_contiguous_bytes": accepted_bytes,
+                "flushed_pending_bytes": flushed_bytes,
+                "gap_bytes": gap,
+                "overlap_bytes": overlap,
+                "next_sequence": direction.next_sequence,
+                "initial_sequence": direction.initial_sequence,
+                "contiguous_total": direction.contiguous_total,
+                "observed_payload_total": direction.observed_payload_total,
+                "retransmission_segments": direction.retransmission_segments,
+                "retransmission_bytes": direction.retransmission_bytes,
+                "overlap_segments": direction.overlap_segments,
+                "overlap_total_bytes": direction.overlap_bytes,
+                "duplicate_segments": direction.duplicate_segments,
+                "out_of_order_segments": direction.out_of_order_segments,
+                "sequence_gap_events": direction.sequence_gap_events,
+                "largest_gap": direction.largest_gap,
+                "pending_segments": len(direction.pending),
+                "pending_bytes": direction.pending_bytes,
+                "syn_seen": direction.syn_seen,
+                "fin_seen": direction.fin_seen,
+                "rst_seen": direction.rst_seen,
+                "flow_closed": state.closed,
+                "tcp_options": self._tcp_options_metadata(tcp),
+            }
+            stream_tail = bytes(direction.stream_tail)
+
+        self._safe_set_packet_attr(packet, "_tcp_stream", snapshot)
+        self._safe_set_packet_attr(packet, "_tcp_stream_tail", stream_tail)
+        self._safe_set_packet_attr(packet, "_tcp_stream_tail_length", len(stream_tail))
+        return snapshot
+
+    def _track_ip_fragments(self, packet: Packet, timestamp_ns: int) -> dict | None:
+        key = None
+        offset = 0
+        more_fragments = False
+        payload_len = 0
+        family = 0
+
+        ip4 = packet.getlayer(IP)
+        if ip4 is not None:
+            try:
+                offset = int(getattr(ip4, "frag", 0) or 0) * 8
+                flags = int(getattr(ip4, "flags", 0) or 0)
+                more_fragments = bool(flags & 0x01)
+                if not offset and not more_fragments:
+                    return None
+                family = 4
+                key = (
+                    4,
+                    str(ip4.src),
+                    str(ip4.dst),
+                    int(getattr(ip4, "id", 0) or 0),
+                    int(getattr(ip4, "proto", 0) or 0),
+                )
+                payload_len = max(
+                    0,
+                    int(getattr(ip4, "len", len(bytes(ip4))) or len(bytes(ip4)))
+                    - int(getattr(ip4, "ihl", 5) or 5) * 4,
+                )
+            except Exception:
+                return None
+        else:
+            frag6 = packet.getlayer(IPv6ExtHdrFragment)
+            ip6 = packet.getlayer(IPv6)
+            if frag6 is None or ip6 is None:
+                return None
+            try:
+                offset = int(getattr(frag6, "offset", 0) or 0) * 8
+                more_fragments = bool(int(getattr(frag6, "m", 0) or 0))
+                family = 6
+                key = (
+                    6,
+                    str(ip6.src),
+                    str(ip6.dst),
+                    int(getattr(frag6, "id", 0) or 0),
+                    int(getattr(frag6, "nh", 0) or 0),
+                )
+                payload_len = len(bytes(getattr(frag6, "payload", b"")))
+            except Exception:
+                return None
+
+        with self._flow_state_lock:
+            state = self._fragment_sets.get(key)
+            if state is None:
+                state = _FragmentState(
+                    key=key,
+                    created_ns=int(timestamp_ns),
+                    last_seen_ns=int(timestamp_ns),
+                )
+                self._fragment_sets[key] = state
+            else:
+                self._fragment_sets.move_to_end(key)
+            state.last_seen_ns = int(timestamp_ns)
+            state.fragments += 1
+            state.bytes_observed += payload_len
+            state.offsets.add(offset)
+            if not more_fragments:
+                state.final_offset = offset + payload_len
+            metadata = {
+                "family": family,
+                "key": tuple(key),
+                "offset": offset,
+                "more_fragments": more_fragments,
+                "payload_bytes": payload_len,
+                "fragments_seen": state.fragments,
+                "bytes_observed": state.bytes_observed,
+                "offsets_seen": sorted(state.offsets)[:256],
+                "expected_end": state.final_offset,
+                "appears_complete": (
+                    state.final_offset is not None
+                    and 0 in state.offsets
+                ),
+            }
+        self._safe_set_packet_attr(packet, "_fragment_metadata", metadata)
+        return metadata
+
+    def _cleanup_capture_state(self, timestamp_ns: int) -> None:
+        if timestamp_ns - self._last_flow_cleanup_ns < 5_000_000_000:
+            return
+        self._last_flow_cleanup_ns = int(timestamp_ns)
+        tcp_cutoff = timestamp_ns - int(self.capture_tcp_flow_idle_sec * 1e9)
+        frag_cutoff = timestamp_ns - int(self.capture_fragment_idle_sec * 1e9)
+
+        with self._flow_state_lock:
+            stale_tcp = [
+                key for key, state in self._tcp_flows.items()
+                if state.last_seen_ns < tcp_cutoff
+            ]
+            for key in stale_tcp:
+                self._tcp_flows.pop(key, None)
+            while len(self._tcp_flows) > self.capture_max_tcp_flows:
+                self._tcp_flows.popitem(last=False)
+
+            stale_fragments = [
+                key for key, state in self._fragment_sets.items()
+                if state.last_seen_ns < frag_cutoff
+            ]
+            for key in stale_fragments:
+                self._fragment_sets.pop(key, None)
+            while len(self._fragment_sets) > self.capture_max_fragment_sets:
+                self._fragment_sets.popitem(last=False)
+
+
+
+    # -------------------------------------------------------------------------
+    # Application-protocol recognition for high-value packet/stream metadata
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _u16(data: bytes, offset: int) -> tuple[int, int]:
+        if offset + 2 > len(data):
+            raise ValueError("short u16")
+        return struct.unpack_from("!H", data, offset)[0], offset + 2
+
+    @staticmethod
+    def _u24(data: bytes, offset: int) -> tuple[int, int]:
+        if offset + 3 > len(data):
+            raise ValueError("short u24")
+        value = (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
+        return value, offset + 3
+
+    @staticmethod
+    def _is_grease_value(value: int) -> bool:
+        return (value & 0x0F0F) == 0x0A0A and ((value >> 8) & 0xFF) == (value & 0xFF)
+
+    def _parse_tls_extensions(self, data: bytes) -> dict:
+        offset = 0
+        extension_ids = []
+        server_names = []
+        alpns = []
+        supported_versions = []
+        supported_groups = []
+        ec_point_formats = []
+        signature_algorithms = []
+        key_share_groups = []
+        raw_lengths = {}
+
+        while offset + 4 <= len(data):
+            ext_type = struct.unpack_from("!H", data, offset)[0]
+            ext_len = struct.unpack_from("!H", data, offset + 2)[0]
+            offset += 4
+            if offset + ext_len > len(data):
+                break
+            body = data[offset:offset + ext_len]
+            offset += ext_len
+            extension_ids.append(ext_type)
+            raw_lengths[ext_type] = ext_len
+
+            try:
+                if ext_type == 0 and len(body) >= 2:
+                    list_len = struct.unpack_from("!H", body, 0)[0]
+                    pos = 2
+                    limit = min(len(body), 2 + list_len)
+                    while pos + 3 <= limit:
+                        name_type = body[pos]
+                        name_len = struct.unpack_from("!H", body, pos + 1)[0]
+                        pos += 3
+                        if pos + name_len > limit:
+                            break
+                        name = body[pos:pos + name_len].decode("idna", "replace")
+                        pos += name_len
+                        if name_type == 0 and name:
+                            server_names.append(name)
+
+                elif ext_type == 16 and len(body) >= 2:
+                    list_len = struct.unpack_from("!H", body, 0)[0]
+                    pos = 2
+                    limit = min(len(body), 2 + list_len)
+                    while pos < limit:
+                        item_len = body[pos]
+                        pos += 1
+                        if pos + item_len > limit:
+                            break
+                        value = body[pos:pos + item_len].decode("ascii", "replace")
+                        pos += item_len
+                        if value:
+                            alpns.append(value)
+
+                elif ext_type == 43:
+                    if len(body) == 2:
+                        supported_versions.append(struct.unpack_from("!H", body, 0)[0])
+                    elif body:
+                        list_len = body[0]
+                        pos = 1
+                        limit = min(len(body), 1 + list_len)
+                        while pos + 2 <= limit:
+                            supported_versions.append(
+                                struct.unpack_from("!H", body, pos)[0]
+                            )
+                            pos += 2
+
+                elif ext_type == 10 and len(body) >= 2:
+                    list_len = struct.unpack_from("!H", body, 0)[0]
+                    pos = 2
+                    limit = min(len(body), 2 + list_len)
+                    while pos + 2 <= limit:
+                        supported_groups.append(struct.unpack_from("!H", body, pos)[0])
+                        pos += 2
+
+                elif ext_type == 11 and body:
+                    list_len = body[0]
+                    ec_point_formats.extend(int(v) for v in body[1:1 + list_len])
+
+                elif ext_type == 13 and len(body) >= 2:
+                    list_len = struct.unpack_from("!H", body, 0)[0]
+                    pos = 2
+                    limit = min(len(body), 2 + list_len)
+                    while pos + 2 <= limit:
+                        signature_algorithms.append(
+                            struct.unpack_from("!H", body, pos)[0]
+                        )
+                        pos += 2
+
+                elif ext_type == 51:
+                    # ClientHello has a two-byte vector length; ServerHello has
+                    # one selected group followed by a key length.
+                    pos = 0
+                    if len(body) >= 2:
+                        possible_vector = struct.unpack_from("!H", body, 0)[0]
+                        if possible_vector + 2 == len(body):
+                            pos = 2
+                            limit = len(body)
+                            while pos + 4 <= limit:
+                                group = struct.unpack_from("!H", body, pos)[0]
+                                key_len = struct.unpack_from("!H", body, pos + 2)[0]
+                                pos += 4
+                                if pos + key_len > limit:
+                                    break
+                                key_share_groups.append(group)
+                                pos += key_len
+                        else:
+                            key_share_groups.append(
+                                struct.unpack_from("!H", body, 0)[0]
+                            )
+            except Exception:
+                continue
+
+        return {
+            "extension_ids": extension_ids,
+            "server_names": server_names,
+            "alpn": alpns,
+            "supported_versions": supported_versions,
+            "supported_groups": supported_groups,
+            "ec_point_formats": ec_point_formats,
+            "signature_algorithms": signature_algorithms,
+            "key_share_groups": key_share_groups,
+            "extension_lengths": raw_lengths,
+        }
+
+    def _parse_tls_client_hello(self, body: bytes) -> dict | None:
+        try:
+            if len(body) < 34:
+                return None
+            offset = 0
+            legacy_version, offset = self._u16(body, offset)
+            random_bytes = body[offset:offset + 32]
+            offset += 32
+            session_len = body[offset]
+            offset += 1
+            if offset + session_len > len(body):
+                return None
+            session_id = body[offset:offset + session_len]
+            offset += session_len
+
+            cipher_len, offset = self._u16(body, offset)
+            if cipher_len % 2 or offset + cipher_len > len(body):
+                return None
+            ciphers = [
+                struct.unpack_from("!H", body, pos)[0]
+                for pos in range(offset, offset + cipher_len, 2)
+            ]
+            offset += cipher_len
+
+            if offset >= len(body):
+                return None
+            compression_len = body[offset]
+            offset += 1
+            if offset + compression_len > len(body):
+                return None
+            compression_methods = list(body[offset:offset + compression_len])
+            offset += compression_len
+
+            extensions = {
+                "extension_ids": [],
+                "server_names": [],
+                "alpn": [],
+                "supported_versions": [],
+                "supported_groups": [],
+                "ec_point_formats": [],
+                "signature_algorithms": [],
+                "key_share_groups": [],
+                "extension_lengths": {},
+            }
+            if offset + 2 <= len(body):
+                extension_len, offset = self._u16(body, offset)
+                extension_data = body[offset:min(len(body), offset + extension_len)]
+                extensions = self._parse_tls_extensions(extension_data)
+
+            clean_ciphers = [v for v in ciphers if not self._is_grease_value(v)]
+            clean_extensions = [
+                v for v in extensions["extension_ids"]
+                if not self._is_grease_value(v)
+            ]
+            clean_groups = [
+                v for v in extensions["supported_groups"]
+                if not self._is_grease_value(v)
+            ]
+            ja3_string = ",".join((
+                str(legacy_version),
+                "-".join(str(v) for v in clean_ciphers),
+                "-".join(str(v) for v in clean_extensions),
+                "-".join(str(v) for v in clean_groups),
+                "-".join(str(v) for v in extensions["ec_point_formats"]),
+            ))
+
+            return {
+                "handshake": "client_hello",
+                "legacy_version": legacy_version,
+                "random_sha256": hashlib.sha256(random_bytes).hexdigest(),
+                "session_id_length": len(session_id),
+                "cipher_suites": ciphers,
+                "compression_methods": compression_methods,
+                "sni": extensions["server_names"],
+                "alpn": extensions["alpn"],
+                "supported_versions": extensions["supported_versions"],
+                "supported_groups": extensions["supported_groups"],
+                "signature_algorithms": extensions["signature_algorithms"],
+                "key_share_groups": extensions["key_share_groups"],
+                "extension_ids": extensions["extension_ids"],
+                "ja3_string": ja3_string,
+                "ja3": hashlib.md5(
+                    ja3_string.encode("ascii", "ignore")
+                ).hexdigest(),
+            }
+        except Exception:
+            return None
+
+    def _parse_tls_server_hello(self, body: bytes) -> dict | None:
+        try:
+            if len(body) < 38:
+                return None
+            offset = 0
+            legacy_version, offset = self._u16(body, offset)
+            random_bytes = body[offset:offset + 32]
+            offset += 32
+            session_len = body[offset]
+            offset += 1
+            if offset + session_len + 3 > len(body):
+                return None
+            session_id = body[offset:offset + session_len]
+            offset += session_len
+            cipher_suite, offset = self._u16(body, offset)
+            compression_method = body[offset]
+            offset += 1
+
+            extensions = {
+                "extension_ids": [],
+                "server_names": [],
+                "alpn": [],
+                "supported_versions": [],
+                "supported_groups": [],
+                "ec_point_formats": [],
+                "signature_algorithms": [],
+                "key_share_groups": [],
+                "extension_lengths": {},
+            }
+            if offset + 2 <= len(body):
+                extension_len, offset = self._u16(body, offset)
+                extension_data = body[offset:min(len(body), offset + extension_len)]
+                extensions = self._parse_tls_extensions(extension_data)
+
+            clean_extensions = [
+                v for v in extensions["extension_ids"]
+                if not self._is_grease_value(v)
+            ]
+            ja3s_string = ",".join((
+                str(legacy_version),
+                str(cipher_suite),
+                "-".join(str(v) for v in clean_extensions),
+            ))
+            selected_version = (
+                extensions["supported_versions"][0]
+                if extensions["supported_versions"]
+                else legacy_version
+            )
+            return {
+                "handshake": "server_hello",
+                "legacy_version": legacy_version,
+                "selected_version": selected_version,
+                "random_sha256": hashlib.sha256(random_bytes).hexdigest(),
+                "session_id_length": len(session_id),
+                "cipher_suite": cipher_suite,
+                "compression_method": compression_method,
+                "alpn": extensions["alpn"],
+                "extension_ids": extensions["extension_ids"],
+                "key_share_groups": extensions["key_share_groups"],
+                "ja3s_string": ja3s_string,
+                "ja3s": hashlib.md5(
+                    ja3s_string.encode("ascii", "ignore")
+                ).hexdigest(),
+            }
+        except Exception:
+            return None
+
+    def _parse_tls_records(self, data: bytes, max_records: int = 32) -> dict | None:
+        if len(data) < 5:
+            return None
+        offset = 0
+        records = []
+        handshakes = []
+        recognized = False
+
+        while offset + 5 <= len(data) and len(records) < max_records:
+            content_type = data[offset]
+            version = struct.unpack_from("!H", data, offset + 1)[0]
+            length = struct.unpack_from("!H", data, offset + 3)[0]
+            if content_type not in {20, 21, 22, 23, 24}:
+                break
+            if version < 0x0300 or version > 0x0304:
+                break
+            recognized = True
+            complete = offset + 5 + length <= len(data)
+            record_payload = data[offset + 5:min(len(data), offset + 5 + length)]
+            records.append({
+                "content_type": content_type,
+                "legacy_version": version,
+                "length": length,
+                "complete": complete,
+            })
+            if content_type == 22:
+                hpos = 0
+                while hpos + 4 <= len(record_payload) and len(handshakes) < 64:
+                    handshake_type = record_payload[hpos]
+                    handshake_len = (
+                        (record_payload[hpos + 1] << 16)
+                        | (record_payload[hpos + 2] << 8)
+                        | record_payload[hpos + 3]
+                    )
+                    hpos += 4
+                    available = min(
+                        len(record_payload) - hpos,
+                        handshake_len,
+                    )
+                    body = record_payload[hpos:hpos + available]
+                    item = {
+                        "type": handshake_type,
+                        "length": handshake_len,
+                        "complete": available == handshake_len,
+                    }
+                    if handshake_type == 1:
+                        parsed = self._parse_tls_client_hello(body)
+                        if parsed:
+                            item.update(parsed)
+                    elif handshake_type == 2:
+                        parsed = self._parse_tls_server_hello(body)
+                        if parsed:
+                            item.update(parsed)
+                    elif handshake_type == 11:
+                        item["handshake"] = "certificate"
+                    elif handshake_type == 8:
+                        item["handshake"] = "encrypted_extensions"
+                    elif handshake_type == 4:
+                        item["handshake"] = "new_session_ticket"
+                    elif handshake_type == 20:
+                        item["handshake"] = "finished"
+                    handshakes.append(item)
+                    hpos += available
+                    if available < handshake_len:
+                        break
+            offset += 5 + length
+            if not complete:
+                break
+
+        if not recognized:
+            return None
+        client_hellos = [
+            item for item in handshakes
+            if item.get("handshake") == "client_hello"
+        ]
+        server_hellos = [
+            item for item in handshakes
+            if item.get("handshake") == "server_hello"
+        ]
+        return {
+            "protocol": "tls",
+            "records": records,
+            "handshakes": handshakes,
+            "client_hello": client_hellos[-1] if client_hellos else None,
+            "server_hello": server_hellos[-1] if server_hellos else None,
+            "bytes_consumed": min(offset, len(data)),
+            "stream_bytes_available": len(data),
+        }
+
+    def _quic_varint(self, data: bytes, offset: int) -> tuple[int, int]:
+        if offset >= len(data):
+            raise ValueError("short QUIC varint")
+        first = data[offset]
+        width = 1 << (first >> 6)
+        if offset + width > len(data):
+            raise ValueError("short QUIC varint body")
+        value = first & 0x3F
+        for byte in data[offset + 1:offset + width]:
+            value = (value << 8) | byte
+        return value, offset + width
+
+    def _parse_quic_header(self, data: bytes) -> dict | None:
+        if len(data) < 5:
+            return None
+        first = data[0]
+        if not (first & 0x40):
+            return None
+
+        # Long header: version and both connection IDs are visible without
+        # decrypting Initial/Handshake payloads.
+        if first & 0x80:
+            try:
+                version = struct.unpack_from("!I", data, 1)[0]
+                offset = 5
+                dcid_len = data[offset]
+                offset += 1
+                if dcid_len > 20 or offset + dcid_len > len(data):
+                    return None
+                dcid = data[offset:offset + dcid_len]
+                offset += dcid_len
+                if offset >= len(data):
+                    return None
+                scid_len = data[offset]
+                offset += 1
+                if scid_len > 20 or offset + scid_len > len(data):
+                    return None
+                scid = data[offset:offset + scid_len]
+                offset += scid_len
+
+                packet_type_code = (first >> 4) & 0x03
+                packet_type = {
+                    0: "initial",
+                    1: "0-rtt",
+                    2: "handshake",
+                    3: "retry",
+                }.get(packet_type_code, "unknown")
+                if version == 0:
+                    packet_type = "version-negotiation"
+
+                metadata = {
+                    "protocol": "quic",
+                    "header_form": "long",
+                    "fixed_bit": bool(first & 0x40),
+                    "version": version,
+                    "version_hex": f"0x{version:08x}",
+                    "packet_type": packet_type,
+                    "dcid": dcid.hex(),
+                    "dcid_length": len(dcid),
+                    "scid": scid.hex(),
+                    "scid_length": len(scid),
+                    "header_bytes_observed": offset,
+                }
+
+                if version != 0 and packet_type == "initial":
+                    token_len, pos = self._quic_varint(data, offset)
+                    if pos + token_len <= len(data):
+                        metadata["token_length"] = token_len
+                        metadata["token_sha256"] = (
+                            hashlib.sha256(
+                                data[pos:pos + token_len]
+                            ).hexdigest()
+                            if token_len
+                            else None
+                        )
+                        pos += token_len
+                        packet_len, pos = self._quic_varint(data, pos)
+                        metadata["declared_payload_length"] = packet_len
+                        metadata["packet_number_length"] = (first & 0x03) + 1
+                        metadata["protected_payload_offset"] = pos
+                elif version == 0:
+                    versions = []
+                    pos = offset
+                    while pos + 4 <= len(data):
+                        versions.append(struct.unpack_from("!I", data, pos)[0])
+                        pos += 4
+                    metadata["offered_versions"] = versions
+                return metadata
+            except Exception:
+                return None
+
+        # Short headers do not expose the destination connection-ID length.
+        return {
+            "protocol": "quic",
+            "header_form": "short",
+            "fixed_bit": True,
+            "spin_bit": bool(first & 0x20),
+            "key_phase": bool(first & 0x04),
+            "packet_number_length": (first & 0x03) + 1,
+        }
+
+    def _json_objects_from_bytes(self, data: bytes, max_objects: int = 32) -> list:
+        if not data:
+            return []
+        text = data.decode("utf-8", "replace")
+        objects = []
+        decoder = json.JSONDecoder()
+
+        for line in text.replace("\x00", "\n").splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            # Strip common HTTP chunk-size lines and JSON-RPC framing noise.
+            if re.fullmatch(r"[0-9a-fA-F]{1,8}", candidate):
+                continue
+            starts = [
+                index for index, char in enumerate(candidate)
+                if char in "[{"
+            ]
+            for start in starts[:4]:
+                try:
+                    value, _end = decoder.raw_decode(candidate[start:])
+                except Exception:
+                    continue
+                if isinstance(value, (dict, list)):
+                    objects.append(value)
+                    break
+            if len(objects) >= max_objects:
+                break
+        return objects
+
+    def _redact_json_value(self, key: str, value):
+        key_cf = str(key or "").casefold()
+        if any(token in key_cf for token in (
+            "password", "passwd", "pass", "token", "secret",
+            "authorization", "cookie", "private_key",
+        )):
+            raw = str(value).encode("utf-8", "replace")
+            return {
+                "redacted": True,
+                "length": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        if isinstance(value, dict):
+            return {
+                str(k): self._redact_json_value(str(k), v)
+                for k, v in list(value.items())[:64]
+            }
+        if isinstance(value, list):
+            return [
+                self._redact_json_value(key, item)
+                for item in value[:64]
+            ]
+        if isinstance(value, str) and len(value) > 512:
+            return value[:512] + "…"
+        return value
+
+    def _parse_json_rpc_and_stratum(self, data: bytes) -> dict | None:
+        objects = self._json_objects_from_bytes(data)
+        if not objects:
+            return None
+        messages = []
+        stratum = False
+        methods = []
+        for value in objects:
+            if isinstance(value, dict):
+                method = str(value.get("method") or "").strip()
+                command = str(value.get("command") or "").strip()
+                kind = method or command
+                if kind:
+                    methods.append(kind)
+                lower_kind = kind.casefold()
+                if (
+                    lower_kind in self._stratum_method_names
+                    or lower_kind.startswith("mining.")
+                    or {"login", "pass", "agent"}.intersection(
+                        str(k).casefold() for k in value.keys()
+                    )
+                ):
+                    stratum = True
+                messages.append(
+                    self._redact_json_value("", value)
+                )
+            else:
+                messages.append(value[:64] if isinstance(value, list) else value)
+
+        protocol = "stratum-json-rpc" if stratum else "json-rpc"
+        return {
+            "protocol": protocol,
+            "message_count": len(messages),
+            "methods": methods,
+            "messages": messages,
+        }
+
+    def _parse_http_headers(self, data: bytes) -> dict | None:
+        if not data:
+            return None
+        head_end = data.find(b"\r\n\r\n")
+        separator = 4
+        if head_end < 0:
+            head_end = data.find(b"\n\n")
+            separator = 2
+        if head_end < 0:
+            head_end = min(len(data), 16384)
+            separator = 0
+        head = data[:head_end]
+        try:
+            text = head.decode("iso-8859-1", "replace")
+        except Exception:
+            return None
+        lines = text.splitlines()
+        if not lines:
+            return None
+        first = lines[0].strip()
+        request_match = re.match(
+            r"^([A-Z]{3,12})\s+(\S+)\s+HTTP/(\d\.\d)$",
+            first,
+        )
+        response_match = re.match(
+            r"^HTTP/(\d\.\d)\s+(\d{3})(?:\s+(.*))?$",
+            first,
+        )
+        if not request_match and not response_match:
+            return None
+
+        headers = {}
+        current_name = None
+        for line in lines[1:]:
+            if line[:1] in {" ", "\t"} and current_name:
+                headers[current_name] += " " + line.strip()
+                continue
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            current_name = name.strip().casefold()
+            clean_value = value.strip()
+            if current_name in {
+                "authorization", "proxy-authorization", "cookie", "set-cookie",
+            }:
+                raw = clean_value.encode("utf-8", "replace")
+                clean_value = (
+                    f"<redacted len={len(raw)} "
+                    f"sha256={hashlib.sha256(raw).hexdigest()}>"
+                )
+            headers[current_name] = clean_value[:4096]
+
+        result = {
+            "protocol": "http",
+            "headers": headers,
+            "header_complete": separator > 0,
+            "body_bytes_available": (
+                max(0, len(data) - head_end - separator)
+                if separator
+                else 0
+            ),
+        }
+        if request_match:
+            result.update({
+                "message_type": "request",
+                "method": request_match.group(1),
+                "target": request_match.group(2)[:4096],
+                "version": request_match.group(3),
+                "host": headers.get("host"),
+                "user_agent": headers.get("user-agent"),
+            })
+        else:
+            result.update({
+                "message_type": "response",
+                "version": response_match.group(1),
+                "status": int(response_match.group(2)),
+                "reason": (response_match.group(3) or "")[:512],
+                "server": headers.get("server"),
+                "content_type": headers.get("content-type"),
+            })
+        return result
+
+    def _parse_dns_metadata(self, packet: Packet) -> dict | None:
+        dns = packet.getlayer(DNS)
+        if dns is None:
+            return None
+
+        def _name(value) -> str:
+            if isinstance(value, bytes):
+                return value.rstrip(b".").decode("idna", "replace")
+            return str(value or "").rstrip(".")
+
+        questions = []
+        answers = []
+        try:
+            qd = dns.qd
+            for index in range(min(int(getattr(dns, "qdcount", 0) or 0), 64)):
+                item = qd[index] if hasattr(qd, "__getitem__") else qd
+                if item is None:
+                    break
+                questions.append({
+                    "name": _name(getattr(item, "qname", "")),
+                    "type": int(getattr(item, "qtype", 0) or 0),
+                    "class": int(getattr(item, "qclass", 0) or 0),
+                })
+                qd = getattr(item, "payload", None)
+        except Exception:
+            pass
+        try:
+            rr = dns.an
+            for index in range(min(int(getattr(dns, "ancount", 0) or 0), 128)):
+                item = rr[index] if hasattr(rr, "__getitem__") else rr
+                if item is None:
+                    break
+                rdata = getattr(item, "rdata", None)
+                if isinstance(rdata, bytes):
+                    rdata = rdata.decode("utf-8", "replace")
+                answers.append({
+                    "name": _name(getattr(item, "rrname", "")),
+                    "type": int(getattr(item, "type", 0) or 0),
+                    "class": int(getattr(item, "rclass", 0) or 0),
+                    "ttl": int(getattr(item, "ttl", 0) or 0),
+                    "rdata": str(rdata)[:2048],
+                })
+                rr = getattr(item, "payload", None)
+        except Exception:
+            pass
+        return {
+            "protocol": "dns",
+            "id": int(getattr(dns, "id", 0) or 0),
+            "response": bool(int(getattr(dns, "qr", 0) or 0)),
+            "opcode": int(getattr(dns, "opcode", 0) or 0),
+            "rcode": int(getattr(dns, "rcode", 0) or 0),
+            "truncated": bool(int(getattr(dns, "tc", 0) or 0)),
+            "questions": questions,
+            "answers": answers,
+        }
+
+    def _parse_dhcp_metadata(self, packet: Packet) -> dict | None:
+        dhcp = packet.getlayer(DHCP)
+        bootp = packet.getlayer(BOOTP)
+        if dhcp is None and bootp is None:
+            if packet.getlayer(DHCP6) is not None:
+                return {
+                    "protocol": "dhcpv6",
+                    "message_class": packet.getlayer(DHCP6).__class__.__name__,
+                }
+            return None
+        options = {}
+        if dhcp is not None:
+            for option in list(getattr(dhcp, "options", []) or []):
+                if isinstance(option, tuple) and option:
+                    key = str(option[0])
+                    value = option[1] if len(option) == 2 else option[1:]
+                    if isinstance(value, bytes):
+                        value = value.hex()
+                    options[key] = value
+        result = {
+            "protocol": "dhcpv4",
+            "options": options,
+        }
+        if bootp is not None:
+            result.update({
+                "operation": int(getattr(bootp, "op", 0) or 0),
+                "xid": int(getattr(bootp, "xid", 0) or 0),
+                "client_ip": str(getattr(bootp, "ciaddr", "") or ""),
+                "your_ip": str(getattr(bootp, "yiaddr", "") or ""),
+                "server_ip": str(getattr(bootp, "siaddr", "") or ""),
+                "gateway_ip": str(getattr(bootp, "giaddr", "") or ""),
+                "client_mac": str(getattr(bootp, "chaddr", b"") or b"")[:64],
+            })
+        return result
+
+    def _parse_ssh_banner(self, data: bytes) -> dict | None:
+        if not data.startswith(b"SSH-"):
+            return None
+        line = data.splitlines()[0][:512].decode("ascii", "replace")
+        parts = line.split("-", 2)
+        return {
+            "protocol": "ssh",
+            "banner": line,
+            "protocol_version": parts[1] if len(parts) > 1 else "",
+            "software": parts[2] if len(parts) > 2 else "",
+        }
+
+    def _parse_protocol_metadata(
+            self,
+            packet: Packet,
+            *,
+            payload: bytes,
+            stream_tail: bytes,
+    ) -> dict:
+        metadata = {}
+        candidates = []
+        if stream_tail:
+            candidates.append(("stream", stream_tail))
+        if payload and payload != stream_tail:
+            candidates.append(("packet", payload))
+
+        dns = self._parse_dns_metadata(packet)
+        if dns:
+            metadata["dns"] = dns
+        dhcp = self._parse_dhcp_metadata(packet)
+        if dhcp:
+            metadata["dhcp"] = dhcp
+
+        udp = packet.getlayer(UDP)
+        tcp = packet.getlayer(TCP)
+        for source_name, data in candidates:
+            if not data:
+                continue
+            if "tls" not in metadata:
+                tls = self._parse_tls_records(data)
+                if tls:
+                    tls["source"] = source_name
+                    metadata["tls"] = tls
+            if "stratum" not in metadata and "json_rpc" not in metadata:
+                parsed_json = self._parse_json_rpc_and_stratum(data)
+                if parsed_json:
+                    parsed_json["source"] = source_name
+                    if parsed_json["protocol"] == "stratum-json-rpc":
+                        metadata["stratum"] = parsed_json
+                    else:
+                        metadata["json_rpc"] = parsed_json
+            if "http" not in metadata:
+                http = self._parse_http_headers(data)
+                if http:
+                    http["source"] = source_name
+                    metadata["http"] = http
+            if "ssh" not in metadata:
+                ssh = self._parse_ssh_banner(data)
+                if ssh:
+                    ssh["source"] = source_name
+                    metadata["ssh"] = ssh
+
+        if udp is not None and payload:
+            sport = int(getattr(udp, "sport", 0) or 0)
+            dport = int(getattr(udp, "dport", 0) or 0)
+            if sport == 443 or dport == 443 or payload[0] & 0x40:
+                quic = self._parse_quic_header(payload)
+                if quic:
+                    metadata["quic"] = quic
+
+        if tcp is not None:
+            metadata["tcp"] = {
+                "flags": self._tcp_flags_int(tcp),
+                "sequence": int(getattr(tcp, "seq", 0) or 0),
+                "acknowledgement": int(getattr(tcp, "ack", 0) or 0),
+                "window": int(getattr(tcp, "window", 0) or 0),
+                "options": self._tcp_options_metadata(tcp),
+            }
+        return metadata
+
+    def _shannon_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        counts = collections.Counter(data)
+        length = float(len(data))
+        entropy = 0.0
+        for count in counts.values():
+            probability = count / length
+            entropy -= probability * math.log2(probability)
+        return round(entropy, 5)
+
+    def _capture_priority(
+            self,
+            packet: Packet,
+            metadata: dict,
+            *,
+            payload: bytes,
+            capture_complete: bool,
+    ) -> tuple[int, str, list]:
+        score = 0
+        reasons = []
+        flow = self._packet_endpoint_tuple(packet)
+        if capture_complete:
+            score += 5
+            reasons.append("complete-frame")
+        if payload:
+            score += min(20, 4 + len(payload) // 256)
+            reasons.append("application-payload")
+        if flow:
+            _family, protocol, _src, sport, _dst, dport = flow
+            if protocol == "tcp" and (
+                sport in self._high_value_tcp_ports
+                or dport in self._high_value_tcp_ports
+            ):
+                score += 15
+                reasons.append("high-value-tcp-port")
+            if protocol == "udp" and (
+                sport in self._high_value_udp_ports
+                or dport in self._high_value_udp_ports
+            ):
+                score += 12
+                reasons.append("high-value-udp-port")
+
+        weights = {
+            "stratum": 45,
+            "tls": 35,
+            "quic": 30,
+            "dns": 20,
+            "dhcp": 20,
+            "http": 20,
+            "ssh": 20,
+            "json_rpc": 18,
+            "tcp": 4,
+        }
+        for name, weight in weights.items():
+            if name in metadata:
+                score += weight
+                reasons.append(name)
+
+        tcp = packet.getlayer(TCP)
+        if tcp is not None:
+            flags = self._tcp_flags_int(tcp)
+            if flags & 0x02:
+                score += 8
+                reasons.append("tcp-syn")
+            if flags & 0x04:
+                score += 8
+                reasons.append("tcp-rst")
+            if flags & 0x01:
+                score += 4
+                reasons.append("tcp-fin")
+
+        if score >= 70:
+            priority = "critical"
+        elif score >= 45:
+            priority = "high"
+        elif score >= 20:
+            priority = "elevated"
+        else:
+            priority = "normal"
+        return score, priority, list(dict.fromkeys(reasons))
+
+    def _enrich_captured_packet(
+            self,
+            packet: Packet,
+            *,
+            raw_packet: bytes,
+            meta: dict,
+            iface: str,
+            dlt: int,
+            pkthdr_ptr=None,
+    ) -> Packet:
+        host_arrival_ns = time.time_ns()
+        timestamp_ns = self._timestamp_ns_from_header(pkthdr_ptr, iface) if pkthdr_ptr else host_arrival_ns
+        sequence = self._next_capture_sequence()
+        raw_bytes = bytes(raw_packet or b"")
+        retained_raw = raw_bytes[:int(self.capture_raw_retention_limit)]
+
+        self._safe_set_packet_attr(packet, "_capture_sequence", sequence)
+        self._safe_set_packet_attr(packet, "_capture_timestamp_ns", timestamp_ns)
+        self._safe_set_packet_attr(packet, "_capture_timestamp", timestamp_ns / 1e9)
+        self._safe_set_packet_attr(packet, "_capture_host_arrival_ns", host_arrival_ns)
+        self._safe_set_packet_attr(packet, "_capture_timestamp_precision", self._capture_precision_name_for_iface(iface))
+        self._safe_set_packet_attr(packet, "_capture_iface", iface)
+        self._safe_set_packet_attr(packet, "_capture_dlt", dlt)
+        self._safe_set_packet_attr(packet, "_capture_dlt_name", self._dlt_name(dlt))
+        self._safe_set_packet_attr(packet, "_capture_raw_length", len(raw_bytes))
+        if self.capture_preserve_original_frame:
+            self._safe_set_packet_attr(packet, "_capture_raw", retained_raw)
+            self._safe_set_packet_attr(
+                packet,
+                "_capture_raw_retained_complete",
+                len(retained_raw) == len(raw_bytes),
+            )
+        self._safe_set_packet_attr(
+            packet,
+            "_capture_sha256",
+            hashlib.sha256(raw_bytes).hexdigest(),
+        )
+        self._safe_set_packet_attr(
+            packet,
+            "_capture_blake2b",
+            hashlib.blake2b(raw_bytes, digest_size=32).hexdigest(),
+        )
+        self._safe_set_packet_attr(
+            packet,
+            "_capture_entropy",
+            self._shannon_entropy(raw_bytes[:65536]),
+        )
+
+        flow = self._attach_flow_identity(packet)
+        stream_metadata = None
+        if flow and flow["protocol"] == "tcp":
+            stream_metadata = self._update_tcp_reassembly(
+                packet, flow, timestamp_ns
+            )
+        fragment_metadata = self._track_ip_fragments(packet, timestamp_ns)
+        payload = self._payload_bytes(packet)
+        stream_tail = bytes(
+            getattr(packet, "_tcp_stream_tail", b"") or b""
+        )
+
+        protocol_metadata = {}
+        if self.capture_analyze_protocols:
+            protocol_metadata = self._parse_protocol_metadata(
+                packet,
+                payload=payload,
+                stream_tail=stream_tail,
+            )
+        self._safe_set_packet_attr(
+            packet, "_protocol_metadata", protocol_metadata
+        )
+        self._safe_set_packet_attr(
+            packet,
+            "_recognized_protocols",
+            sorted(protocol_metadata),
+        )
+
+        score, priority, reasons = self._capture_priority(
+            packet,
+            protocol_metadata,
+            payload=payload,
+            capture_complete=bool(meta.get("capture_complete", False)),
+        )
+        self._safe_set_packet_attr(packet, "_capture_priority_score", score)
+        self._safe_set_packet_attr(packet, "_capture_priority", priority)
+        self._safe_set_packet_attr(packet, "_capture_priority_reasons", reasons)
+        self._safe_set_packet_attr(packet, "_capture_high_value", priority in {"high", "critical"})
+        self._safe_set_packet_attr(packet, "_capture_payload_length", len(payload))
+        self._safe_set_packet_attr(packet, "_capture_payload_sha256", hashlib.sha256(payload).hexdigest() if payload else None)
+        self._safe_set_packet_attr(packet, "_tcp_stream_metadata", stream_metadata)
+        self._safe_set_packet_attr(packet, "_fragment_metadata", fragment_metadata)
+
+        stats = self._sample_capture_stats(iface)
+        self._safe_set_packet_attr(packet, "_capture_stats", stats)
+
+        with self._capture_state_lock:
+            self._capture_total_frames += 1
+            self._capture_total_bytes += int(meta.get("captured_len", len(raw_bytes)) or 0)
+            self._capture_total_wire_bytes += int(meta.get("wire_len", len(raw_bytes)) or 0)
+            if not meta.get("capture_complete", False):
+                self._capture_total_truncated += 1
+            for protocol in protocol_metadata:
+                self._capture_protocol_counts[protocol] += 1
+            self._capture_priority_counts[priority] += 1
+            try:
+                ether = packet.getlayer(Ether)
+                if ether is not None:
+                    ether_type = int(getattr(ether, "type", 0) or 0)
+                    if ether_type not in self.supported_ethertypes:
+                        self._capture_unknown_ethertypes[ether_type] += 1
+            except Exception:
+                pass
+
+        self._cleanup_capture_state(timestamp_ns)
+        return packet
+
 
     # --- NEW: generic tunnel/L2 unwrap helpers --------------------------------
     def _unwrap_vlan(self, p):
@@ -3112,6 +5492,7 @@ class SnifferSoftware:
         """Close a stale capture handle and reopen the same adapter by canonical name."""
         with contextlib.suppress(Exception):
             if handle:
+                self._unregister_capture_handle(handle, active_iface)
                 self.libpcap.pcap_close(handle)
         time.sleep(0.15)
 
@@ -3150,16 +5531,13 @@ class SnifferSoftware:
         return None, failed_iface, None, False, last_err
 
     def _capture_meta_from_pkthdr(self, pkthdr_ptr):
-        """
-        Build capture metadata from libpcap's packet header.
-        - captured_len: bytes actually captured into memory
-        - wire_len: original on-the-wire packet length
-        - capture_complete: True if we captured the whole packet
-        """
+        """Build complete packet-header metadata without trusting malformed lengths."""
         try:
             hdr = pkthdr_ptr.contents
-            captured_len = int(getattr(hdr, "caplen", 0) or 0)
-            wire_len = int(getattr(hdr, "len", captured_len) or captured_len)
+            captured_len = max(0, int(getattr(hdr, "caplen", 0) or 0))
+            wire_len = max(0, int(getattr(hdr, "len", captured_len) or captured_len))
+            seconds = int(getattr(hdr.ts, "tv_sec", 0) or 0)
+            fraction = int(getattr(hdr.ts, "tv_usec", 0) or 0)
         except Exception:
             return {
                 "captured_len": 0,
@@ -3167,44 +5545,69 @@ class SnifferSoftware:
                 "capture_complete": False,
                 "capture_quality": "invalid_header",
                 "truncated_bytes": 0,
+                "timestamp_seconds": 0,
+                "timestamp_fraction": 0,
+                "snapshot_length": int(self.capture_snapshot_length),
             }
 
-        capture_complete = (captured_len >= wire_len and wire_len > 0)
-        truncated_bytes = max(0, wire_len - captured_len)
+        # A corrupt header must never cause ctypes.string_at to read beyond the
+        # configured snapshot. Keep the true header value for diagnostics.
+        reported_captured_len = captured_len
+        captured_len = min(captured_len, int(self.capture_snapshot_length))
+        wire_len = max(wire_len, reported_captured_len)
+        capture_complete = wire_len > 0 and reported_captured_len >= wire_len
+        truncated_bytes = max(0, wire_len - reported_captured_len)
+
+        if reported_captured_len > self.capture_snapshot_length:
+            quality = "header_exceeds_snapshot"
+        elif capture_complete:
+            quality = "full"
+        elif reported_captured_len > 0:
+            quality = "truncated"
+        else:
+            quality = "empty"
 
         return {
             "captured_len": captured_len,
+            "reported_captured_len": reported_captured_len,
             "wire_len": wire_len,
             "capture_complete": capture_complete,
-            "capture_quality": "full" if capture_complete else "truncated",
+            "capture_quality": quality,
             "truncated_bytes": truncated_bytes,
+            "timestamp_seconds": seconds,
+            "timestamp_fraction": fraction,
+            "snapshot_length": int(self.capture_snapshot_length),
         }
 
     def _attach_capture_meta(self, packet, meta: dict, *, iface: str = None, dlt: int = None):
-        """
-        Attach capture metadata directly to the decoded Scapy packet.
-        """
+        """Attach compatibility fields plus the richer capture envelope."""
         try:
             setattr(packet, "_captured_len", int(meta.get("captured_len", 0) or 0))
             setattr(packet, "_wire_len", int(meta.get("wire_len", 0) or 0))
             setattr(packet, "_capture_complete", bool(meta.get("capture_complete", False)))
             setattr(packet, "_capture_quality", str(meta.get("capture_quality", "unknown")))
             setattr(packet, "_truncated_bytes", int(meta.get("truncated_bytes", 0) or 0))
+            setattr(packet, "_capture_reported_len", int(meta.get("reported_captured_len", meta.get("captured_len", 0)) or 0))
+            setattr(packet, "_capture_snapshot_length", int(meta.get("snapshot_length", self.capture_snapshot_length) or self.capture_snapshot_length))
+            setattr(packet, "_capture_timestamp_seconds", int(meta.get("timestamp_seconds", 0) or 0))
+            setattr(packet, "_capture_timestamp_fraction", int(meta.get("timestamp_fraction", 0) or 0))
             if iface is not None:
                 setattr(packet, "_capture_iface", iface)
             if dlt is not None:
                 setattr(packet, "_capture_dlt", dlt)
+                setattr(packet, "_capture_dlt_name", self._dlt_name(dlt))
         except Exception:
             pass
         return packet
 
     def _decode_captured_packet(self, pkthdr_ptr, packet_data_ptr, dlt: int, *, iface: str = None,
                                 warn_on_truncation: bool = True):
-        """
-        Safe helper for libpcap receive sites.
-        """
+        """Copy, decode, retain, hash, classify, and enrich one libpcap packet."""
         if not pkthdr_ptr or not pkthdr_ptr.contents:
             self.logger.log_message("[Sniffer] ERROR: Null packet header pointer.")
+            return None, None
+        if not packet_data_ptr:
+            self.logger.log_message("[Sniffer] ERROR: Null packet data pointer.")
             return None, None
 
         meta = self._capture_meta_from_pkthdr(pkthdr_ptr)
@@ -3214,14 +5617,42 @@ class SnifferSoftware:
             self.logger.log_message("[Sniffer] WARNING: Zero-length packet.")
             return None, meta
 
-        raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
-        packet = self._decode_by_dlt(raw_packet, dlt)
+        try:
+            raw_packet = ctypes.string_at(packet_data_ptr, packet_len)
+        except Exception as exc:
+            with self._capture_state_lock:
+                self._capture_decode_failures += 1
+            self.logger.log_message(f"[Sniffer] ERROR: Could not copy captured frame: {exc}")
+            return None, meta
+
+        try:
+            packet = self._decode_by_dlt(raw_packet, dlt)
+        except Exception as exc:
+            packet = Raw(raw_packet)
+            with self._capture_state_lock:
+                self._capture_decode_failures += 1
+            self._safe_set_packet_attr(packet, "_capture_decode_error", str(exc))
+
         self._attach_capture_meta(packet, meta, iface=iface, dlt=dlt)
+        try:
+            self._enrich_captured_packet(
+                packet,
+                raw_packet=raw_packet,
+                meta=meta,
+                iface=iface or "",
+                dlt=dlt,
+                pkthdr_ptr=pkthdr_ptr,
+            )
+        except Exception as exc:
+            # Enrichment is never allowed to remove the original decoded packet.
+            self._safe_set_packet_attr(packet, "_capture_enrichment_error", str(exc))
+            with self._capture_state_lock:
+                self._capture_decode_failures += 1
 
         if warn_on_truncation and not meta["capture_complete"]:
             self.logger.log_message(
                 f"[Sniffer] ⚠️ Truncated capture on {iface or '?'}: "
-                f"captured={meta['captured_len']} wire={meta['wire_len']} "
+                f"captured={meta['reported_captured_len']} wire={meta['wire_len']} "
                 f"lost={meta['truncated_bytes']} dlt={dlt} ({self._dlt_name(dlt)})"
             )
 
@@ -3267,7 +5698,9 @@ class SnifferSoftware:
             return
         dlt = self.libpcap.pcap_datalink(handle)
         self.logger.log_message(
-            f"[Sniffer] capture iface={active_iface} datalink={dlt} ({self._dlt_name(dlt)})"
+            f"[Sniffer] capture iface={active_iface} datalink={dlt} ({self._dlt_name(dlt)}) "
+            f"timestamp={self._capture_precision_name_for_iface(active_iface)} "
+            f"host_clock=nanosecond"
         )
         try:
             while True:
@@ -3386,17 +5819,25 @@ class SnifferSoftware:
                                     }, cooldown_seconds=10, cooldown_key="arp_unknown_op")
                             continue
 
-                        # EtherType checks ONLY when Ether is present
-                        eth_type = packet[Ether].type
-                        if eth_type not in self.supported_ethertypes or eth_type in self.unsupported_ethertypes:
+                        # EtherType policy is now explicit-deny rather than
+                        # implicit-deny. Unknown frames are valuable capture
+                        # evidence and remain available as decoded/Raw payloads.
+                        eth_type = int(packet[Ether].type)
+                        if eth_type in self.unsupported_ethertypes:
                             if self.notification_manager:
                                 self.notification_manager.send_notification({
-                                    "event": "Unsupported EtherType",
-                                    "message": f"Dropped packet with unsupported EtherType {hex(eth_type)} from "
+                                    "event": "Blocked EtherType",
+                                    "message": f"Dropped explicitly blocked EtherType {hex(eth_type)} from "
                                                f"{packet[Ether].src} → {packet[Ether].dst}.",
                                     "iface": iface, "timestamp": time.time(), "emojis": ["❌", "📦", "⚠️"]
-                                }, cooldown_seconds=10, cooldown_key="ethertype_blocked")
+                                }, cooldown_seconds=10, cooldown_key=f"ethertype_blocked_{eth_type:04x}")
                             continue
+
+                        if eth_type not in self.supported_ethertypes:
+                            self._safe_set_packet_attr(packet, "_unknown_ethertype", eth_type)
+                            self._safe_set_packet_attr(packet, "_unknown_ethertype_hex", f"0x{eth_type:04x}")
+                            if not self.capture_keep_unknown_ethertypes:
+                                continue
 
                         if eth_type == 0x86DD and not packet.haslayer(IPv6):
                             if self.notification_manager:
@@ -3468,6 +5909,7 @@ class SnifferSoftware:
                     continue
         finally:
             if handle:
+                self._unregister_capture_handle(handle, active_iface)
                 self.libpcap.pcap_close(handle)
 
     def sendp(self, packet: Packet, iface: str, verbose: int = 0) -> bool:
