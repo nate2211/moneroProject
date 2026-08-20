@@ -34274,12 +34274,20 @@ class _Peer:
     last_success_ip: str = ""
     last_success_port: int = 0
 
+    # Addresses actually observed as the source of a valid HVRM datagram.
+    # These are stronger than addresses merely advertised in a HELLO.
+    observed_ips: Set[str] = field(default_factory=set)
+    observed_data_ports: Dict[str, int] = field(default_factory=dict)
+    last_observed_ip: str = ""
+    last_observed_port: int = 0
+
     # Hybrid LAN + IP-passthrough metadata. A peer may legitimately expose
     # both a private address and a public passthrough address at the same time.
     address_roles: Dict[str, str] = field(default_factory=dict)
     private_ips: Set[str] = field(default_factory=set)
     public_ips: Set[str] = field(default_factory=set)
     passthrough_enabled: bool = False
+    same_address_mode: bool = False
     preferred_private_ip: str = ""
     path_mode: str = "lan"
 
@@ -34402,6 +34410,17 @@ class HyperVRouterManager:
         self._hybrid_allow_passthrough_public = True
         self._hybrid_mode = False
 
+        # Address safety and route selection.  AT&T IP Passthrough can assign
+        # the real WAN address directly to the Windows LAN adapter.  In that
+        # mode private 192.168.x peers are still reached through that adapter,
+        # so arbitrary Hyper-V/WSL/APIPA addresses must never outrank it.
+        self._allow_link_local_transport = False
+        self._auto_detect_virtual_transport_ips = False
+        self._prefer_observed_peer_paths = True
+        self._suppress_local_address_as_peer_hint = True
+        self._route_source_cache: Dict[str, Tuple[str, float]] = {}
+        self._route_source_cache_ttl_sec = 5.0
+
         # IP-passthrough state is metadata for Hyper-V peer transport.  It does
         # not replace the Windows adapter/DHCP manager that owns netsh changes.
         self._ip_passthrough_config: Dict[str, Any] = {
@@ -34492,7 +34511,7 @@ class HyperVRouterManager:
         self._manage_wintun_lifecycle = False
         self._manage_windivert_lifecycle = False
 
-        self._allow_data_port_fallback = False
+        self._allow_data_port_fallback = True
         self._allow_discovery_degraded_mode = False
         self._socket_close_wait_sec = 0.05
 
@@ -34521,6 +34540,16 @@ class HyperVRouterManager:
         self._implicit_ack_grace_sec = max(0.35, min(1.25, self.heartbeat_sec))
         self._assume_delivery_on_peer_contact = False
         self._assume_delivery_on_online_peer = False
+
+        # ACK return-path hardening for AT&T IP Passthrough. A LAN peer can
+        # receive a frame sent from the passthrough public address while being
+        # unable to unicast the ACK back to that public address (no NAT
+        # hairpin/local-public route). Keep normal same-socket ACKs, but also
+        # publish a tiny node-targeted ACK over the discovery multicast path
+        # that is already proven to work between the peers.
+        self._ack_discovery_fallback_enabled = True
+        self._ack_discovery_redundant = True
+        self._ack_discovery_target_limit = 4
 
         # quieter / LAN-scoped behavior
         self._allow_public_peer_data = False
@@ -34587,6 +34616,14 @@ class HyperVRouterManager:
             "hybrid_public_send": 0,
             "hybrid_path_failover": 0,
             "hybrid_discovery_tx": 0,
+            "ack_direct_sent": 0,
+            "ack_direct_failed": 0,
+            "ack_fallback_queued": 0,
+            "ack_discovery_sent": 0,
+            "ack_discovery_received": 0,
+            "ack_discovery_rejected": 0,
+            "ack_received": 0,
+            "ack_unmatched": 0,
         }
 
     def _apply_pressure_mode(self) -> None:
@@ -34880,7 +34917,16 @@ class HyperVRouterManager:
         actual_private_ips = [ip for ip in local_ips if self._is_private_ipv4(ip)]
         hybrid_mode = bool(enabled and public_ip and actual_private_ips)
         configured_ips = [ip for ip in (public_ip, lan_ip, gateway_ip) if ip]
-        same_address_mode = len(configured_ips) >= 2 and len(set(configured_ips)) == 1
+        same_address_mode = bool(
+            enabled
+            and public_ip
+            and selected_bind_ip == public_ip
+            and (not lan_ip or lan_ip == public_ip)
+            and (not gateway_ip or gateway_ip == public_ip)
+            and not actual_private_ips
+        ) or (len(configured_ips) >= 2 and len(set(configured_ips)) == 1)
+        if same_address_mode and selected_bind_ip:
+            roles[selected_bind_ip] = "primary-passthrough-lan-wan"
 
         requested_public_ok = _pick("public_ok", "has_public_ip", default=None)
         requested_gateway_ok = _pick("gateway_ok", "can_gateway", "gateway_ready", default=None)
@@ -35887,6 +35933,15 @@ class HyperVRouterManager:
             return None
 
     def _open_data_socket_with_fallback(self) -> Tuple[Optional[socket.socket], int]:
+        """
+        Bind the stable HVRM data port on every validated concrete transport
+        address.  If Windows refuses every address-specific bind, fall back to
+        one wildcard socket on the *same* port so the Windows routing table can
+        choose the correct source address.
+
+        The fallback never changes the advertised/forwarded port.  This is
+        important for AT&T IP Passthrough and port-forwarded UDP 47772.
+        """
         self._data_socks = {}
         self._bound_data_ports_by_ip = {}
 
@@ -35923,6 +35978,26 @@ class HyperVRouterManager:
                     every=5.0,
                 )
 
+        if not self._data_socks and self._allow_data_port_fallback:
+            wildcard: Optional[socket.socket] = None
+            try:
+                wildcard = self._make_udp_socket()
+                wildcard.bind(("", self.data_port))
+                wildcard.settimeout(0.25)
+                actual_port = int(wildcard.getsockname()[1])
+                self._data_socks["0.0.0.0"] = wildcard
+                self._bound_data_ports_by_ip["0.0.0.0"] = actual_port
+                self._socket_source_ips[id(wildcard)] = "0.0.0.0"
+                self._log_evt(
+                    "socket",
+                    f"data path using route-selected wildcard 0.0.0.0:{actual_port}",
+                    ["🧭", "📦", "✅"],
+                )
+            except Exception as e:
+                if wildcard is not None:
+                    self._safe_socket_close(wildcard)
+                errors.append(f"0.0.0.0:{self.data_port}={type(e).__name__}:{e}")
+
         if not self._data_socks:
             raise RuntimeError("all data socket binds failed: " + "; ".join(errors))
 
@@ -35958,6 +36033,7 @@ class HyperVRouterManager:
         self._socket_source_ips = {}
         self._bound_discovery_port = self.discovery_port
         self._bound_data_port = self.data_port
+        self._route_source_cache.clear()
 
         if self._socket_close_wait_sec > 0:
             time.sleep(self._socket_close_wait_sec)
@@ -36038,7 +36114,9 @@ class HyperVRouterManager:
                     continue
 
                 try:
-                    self._handle_wire_message(data, addr[0], addr[1], which)
+                    self._handle_wire_message(
+                        data, addr[0], addr[1], which, recv_sock=sock_obj
+                    )
                 except Exception as e:
                     self._log_sparse(
                         "wire-msg-fail",
@@ -36241,6 +36319,10 @@ class HyperVRouterManager:
                         f"send_q_full={int(self._stats.get('peer_send_queue_full', 0))} "
                         f"ingress_q_full={int(self._stats.get('remote_ingress_queue_full', 0))} "
                         f"ingress_busy={int(self._stats.get('remote_ingress_busy', 0))} "
+                        f"ack_rx={int(self._stats.get('ack_received', 0))} "
+                        f"ack_direct_tx={int(self._stats.get('ack_direct_sent', 0))} "
+                        f"ack_mc_tx={int(self._stats.get('ack_discovery_sent', 0))} "
+                        f"ack_mc_rx={int(self._stats.get('ack_discovery_received', 0))} "
                         f"dropped_general={int(self._stats.get('general_traffic_dropped', 0))} "
                         f"dropped_noise={int(self._stats.get('noise_dropped', 0))}"
                     ),
@@ -36353,7 +36435,14 @@ class HyperVRouterManager:
                 break
             self._send_network_item_inline(item)
 
-    def _handle_wire_message(self, raw: bytes, from_ip: str, from_port: int, which: str) -> None:
+    def _handle_wire_message(
+            self,
+            raw: bytes,
+            from_ip: str,
+            from_port: int,
+            which: str,
+            recv_sock: Optional[socket.socket] = None,
+    ) -> None:
         raw_bytes = bytes(raw or b"")
         if not raw_bytes or len(raw_bytes) > int(self._wire_message_max_bytes):
             return
@@ -36459,12 +36548,34 @@ class HyperVRouterManager:
             )
             return
 
-        # Discovery may arrive on either bound socket for compatibility. Data
-        # messages must identify a known peer and come from a plausible learned
-        # path, unless they are a verifiable ACK for an outstanding frame.
+        # Frames remain data-socket only. ACKs may additionally arrive over
+        # discovery multicast, but only when explicitly targeted to this node
+        # and tied to an outstanding random frame_id for the same peer.
         if mtype in {"frame", "ack"}:
-            if which != "data" and self._data_sock is not None:
+            discovery_ack = bool(mtype == "ack" and which == "discovery")
+            if mtype == "frame" and which != "data" and self._data_sock is not None:
                 return
+            if mtype == "ack" and which != "data" and not discovery_ack:
+                return
+            if discovery_ack:
+                ack_dst = self._bounded_text(
+                    msg.get("dst_node_id") or msg.get("target_node_id") or msg.get("dst_peer_id"), 128
+                )
+                ack_frame_id = self._bounded_text(
+                    msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128
+                )
+                with self._pending_lock:
+                    pending = self._pending_frames.get(ack_frame_id)
+                    discovery_ack_valid = bool(
+                        ack_dst == self.node_id
+                        and pending is not None
+                        and str(pending.get("peer_node_id") or "") == node_like
+                    )
+                if not discovery_ack_valid:
+                    self._stats["ack_discovery_rejected"] = int(
+                        self._stats.get("ack_discovery_rejected", 0)
+                    ) + 1
+                    return
             if not self._wire_source_matches_peer(node_like, from_ip, from_port, mtype, msg):
                 self._log_sparse(
                     f"wire-source-reject:{node_like}:{from_ip}",
@@ -36502,11 +36613,13 @@ class HyperVRouterManager:
             return
 
         if mtype == "frame":
-            self._handle_remote_frame(msg, from_ip, from_port)
+            self._handle_remote_frame(
+                msg, from_ip, from_port, recv_sock=recv_sock
+            )
             return
 
         if mtype == "ack":
-            self._handle_frame_ack(msg, from_ip, from_port)
+            self._handle_frame_ack(msg, from_ip, from_port, which=which)
             return
 
     def _mark_discovery_success(
@@ -36519,6 +36632,12 @@ class HyperVRouterManager:
             hello_id: str = "",
             was_reply: bool = False,
     ) -> None:
+        """
+        Promote the actual source IP of every valid HELLO/HELLO_ACK to a
+        confirmed peer path.  The UDP source port of discovery is often
+        ephemeral, so the peer's advertised stable data port is stored for
+        frames while the observed source port remains discovery metadata.
+        """
         if not node_id or node_id == self.node_id:
             return
 
@@ -36537,18 +36656,19 @@ class HyperVRouterManager:
                 peer.last_hello_id = self._bounded_text(hello_id, 128)
             if ip:
                 peer.last_hello_from_ip = ip
+                peer.last_observed_ip = ip
             if 1 <= int(from_port or 0) <= 65535:
                 peer.last_hello_from_port = int(from_port)
+
+            stable_data_port = self._safe_port(peer.data_port, self.data_port)
             self._record_peer_path_locked(
                 peer,
                 ip,
-                peer.data_port,
-                confirmed=bool(was_reply or which == "data"),
-                data_path=(which == "data"),
+                stable_data_port,
+                confirmed=True,
+                data_path=True,
+                observed=True,
             )
-            if which == "data" and ip:
-                peer.last_data_from_ip = ip
-                peer.last_data_from_port = int(from_port)
             peer.listen_ip = self._best_peer_ip_locked(peer)
             peer.last_ack_ts = now
 
@@ -36562,7 +36682,9 @@ class HyperVRouterManager:
         self._log_sparse(
             f"discovery-success:{node_id}",
             "peer",
-            f"discovery success node={node_id} source={from_ip}:{from_port} via={which} hello_id={(hello_id or '-')[:12]} reply={int(bool(was_reply))}",
+            f"discovery success node={node_id} source={from_ip}:{from_port} via={which} "
+            f"confirmed_data={ip or '-'}:{stable_data_port or 0} "
+            f"hello_id={(hello_id or '-')[:12]} reply={int(bool(was_reply))}",
             ["✅", "📡", "🤝"],
             every=3.0,
         )
@@ -36585,7 +36707,9 @@ class HyperVRouterManager:
         )
 
         raw_hints = msg.get("address_hints") or []
-        address_hints = self._dedupe_usable_ips(raw_hints if isinstance(raw_hints, (list, tuple, set)) else [])[:12]
+        address_hints = self._dedupe_usable_ips(
+            raw_hints if isinstance(raw_hints, (list, tuple, set)) else []
+        )[:12]
 
         raw_roles = msg.get("address_roles") or {}
         advertised_roles: Dict[str, str] = {}
@@ -36593,17 +36717,25 @@ class HyperVRouterManager:
             for raw_ip, raw_role in list(raw_roles.items())[:16]:
                 ip = self._sanitize_peer_ip(raw_ip)
                 role = self._bounded_text(raw_role, 48).lower()
-                if ip and role:
+                if ip and role and not self._is_unobserved_local_alias(ip, observed_ip):
                     advertised_roles[ip] = role
 
         private_ips = {
-            ip for ip in self._dedupe_usable_ips(msg.get("private_ips") or []) if self._is_private_ipv4(ip)
+            ip for ip in self._dedupe_usable_ips(msg.get("private_ips") or [])
+            if self._is_private_ipv4(ip) and not self._is_unobserved_local_alias(ip, observed_ip)
         }
         public_ips = {
-            ip for ip in self._dedupe_usable_ips(msg.get("public_ips") or []) if not self._is_private_ipv4(ip)
+            ip for ip in self._dedupe_usable_ips(msg.get("public_ips") or [])
+            if not self._is_private_ipv4(ip) and not self._is_unobserved_local_alias(ip, observed_ip)
         }
         preferred_private_ip = self._sanitize_peer_ip(msg.get("preferred_private_ip"))
-        if preferred_private_ip and not self._is_private_ipv4(preferred_private_ip):
+        if (
+                preferred_private_ip
+                and (
+                    not self._is_private_ipv4(preferred_private_ip)
+                    or self._is_unobserved_local_alias(preferred_private_ip, observed_ip)
+                )
+        ):
             preferred_private_ip = ""
 
         changed = False
@@ -36618,7 +36750,7 @@ class HyperVRouterManager:
                     listen_ip=initial_ip,
                     data_port=advertised_data_port,
                     segment_id=self.segment_id,
-                    advertised_ip=advertised_ip,
+                    advertised_ip=("" if self._is_unobserved_local_alias(advertised_ip, observed_ip) else advertised_ip),
                     last_hello_from_ip=observed_ip,
                     last_hello_from_port=int(from_port or 0),
                 )
@@ -36634,47 +36766,66 @@ class HyperVRouterManager:
                 tuple(sorted(peer.sender_kinds.items())),
                 tuple(sorted(peer.candidate_ips)),
                 tuple(sorted(peer.confirmed_ips)),
+                tuple(sorted(getattr(peer, "observed_ips", set()))),
                 tuple(sorted(peer.address_roles.items())),
                 tuple(sorted(peer.private_ips)),
                 tuple(sorted(peer.public_ips)),
                 peer.passthrough_enabled,
+                getattr(peer, "same_address_mode", False),
                 peer.preferred_private_ip,
                 peer.path_mode,
             )
 
             peer.host_name = self._bounded_text(msg.get("host_name") or peer.host_name or node_id, 255) or node_id
             peer.segment_id = self.segment_id
-            if advertised_ip:
+            if advertised_ip and not self._is_unobserved_local_alias(advertised_ip, observed_ip):
                 peer.advertised_ip = advertised_ip
             if observed_ip:
                 peer.last_hello_from_ip = observed_ip
+                peer.last_observed_ip = observed_ip
             if 1 <= int(from_port or 0) <= 65535:
                 peer.last_hello_from_port = int(from_port)
 
             peer.data_port = advertised_data_port
             peer.discovery_port = advertised_discovery_port
             peer.passthrough_enabled = bool(msg.get("passthrough_enabled", msg.get("public_ok", False)))
-            peer.path_mode = self._bounded_text(msg.get("path_mode") or ("hybrid" if peer.passthrough_enabled else "lan"), 32) or "lan"
+            peer.same_address_mode = bool(msg.get("same_address_mode", False))
+            peer.path_mode = self._bounded_text(
+                msg.get("path_mode")
+                or ("same-address" if peer.same_address_mode else ("hybrid" if peer.passthrough_enabled else "lan")),
+                32,
+            ) or "lan"
             peer.address_roles.update(advertised_roles)
             peer.private_ips.update(private_ips)
             peer.public_ips.update(public_ips)
             if preferred_private_ip:
                 peer.preferred_private_ip = preferred_private_ip
 
-            self._record_peer_path_locked(peer, advertised_ip, advertised_data_port, confirmed=False, data_path=True)
+            self._record_peer_path_locked(
+                peer,
+                advertised_ip,
+                advertised_data_port,
+                confirmed=False,
+                data_path=True,
+                observed=False,
+            )
             self._record_peer_path_locked(
                 peer,
                 observed_ip,
                 advertised_data_port,
-                confirmed=(which == "data" or str(msg.get("type") or "").lower() in {"hello_ack", "helloack", "hello-response"}),
-                data_path=(which == "data"),
+                confirmed=True,
+                data_path=True,
+                observed=True,
             )
             for hint in address_hints:
-                self._record_peer_path_locked(peer, hint, advertised_data_port, confirmed=False, data_path=True)
-
-            if which == "data" and observed_ip:
-                peer.last_data_from_ip = observed_ip
-                peer.last_data_from_port = int(from_port or advertised_data_port)
+                self._record_peer_path_locked(
+                    peer,
+                    hint,
+                    advertised_data_port,
+                    confirmed=False,
+                    data_path=True,
+                    observed=False,
+                )
 
             sender_ids = msg.get("sender_ids")
             if isinstance(sender_ids, (list, tuple, set)):
@@ -36695,7 +36846,7 @@ class HyperVRouterManager:
                     if self._bounded_text(x, 32) in self.DEFAULT_PROTOCOLS
                 }
 
-            peer.public_ok = bool(msg.get("public_ok", False) or peer.public_ips)
+            peer.public_ok = bool(msg.get("public_ok", False) and peer.public_ips)
             peer.gateway_ok = bool(msg.get("gateway_ok", False))
             peer.last_seen = now
             peer.online = True
@@ -36715,10 +36866,12 @@ class HyperVRouterManager:
                 tuple(sorted(peer.sender_kinds.items())),
                 tuple(sorted(peer.candidate_ips)),
                 tuple(sorted(peer.confirmed_ips)),
+                tuple(sorted(getattr(peer, "observed_ips", set()))),
                 tuple(sorted(peer.address_roles.items())),
                 tuple(sorted(peer.private_ips)),
                 tuple(sorted(peer.public_ips)),
                 peer.passthrough_enabled,
+                getattr(peer, "same_address_mode", False),
                 peer.preferred_private_ip,
                 peer.path_mode,
             )
@@ -36728,16 +36881,16 @@ class HyperVRouterManager:
             self._log_evt(
                 "peer",
                 f"peer discovered node={node_id} host={peer.host_name} mode={peer.path_mode} "
-                f"best={peer.listen_ip or '-'}:{peer.data_port} private={sorted(peer.private_ips)} "
-                f"public={sorted(peer.public_ips)}",
+                f"best={peer.listen_ip or '-'}:{peer.data_port} observed={sorted(peer.observed_ips)} "
+                f"private={sorted(peer.private_ips)} public={sorted(peer.public_ips)}",
                 ["🤝", "🌐", "✅"],
             )
         elif changed:
             self._log_evt(
                 "peer",
                 f"peer updated node={node_id} mode={peer.path_mode} best={peer.listen_ip or '-'}:{peer.data_port} "
-                f"private={sorted(peer.private_ips)} public={sorted(peer.public_ips)} "
-                f"confirmed={sorted(peer.confirmed_ips)}",
+                f"observed={sorted(peer.observed_ips)} private={sorted(peer.private_ips)} "
+                f"public={sorted(peer.public_ips)} confirmed={sorted(peer.confirmed_ips)}",
                 ["🔄", "🌐", "📝"],
             )
 
@@ -36768,24 +36921,43 @@ class HyperVRouterManager:
         peer_discovery_port = self._safe_port(
             hello_msg.get("reply_discovery_port") or hello_msg.get("discovery_port"), self.discovery_port
         )
-        reply_port = peer_discovery_port if int(from_port or 0) in {
-            int(self.discovery_port), int(self._bound_discovery_port)
-        } else peer_data_port
+        observed = self._sanitize_peer_ip(from_ip)
+        observed_port = self._safe_port(from_port, 0)
 
         with self._lock:
             peer = self._peers.get(peer_node_id)
 
         candidates: List[Tuple[str, int]] = []
-        observed = self._sanitize_peer_ip(from_ip)
+
+        # First answer the exact socket tuple that sent the HELLO.  Discovery
+        # transmit sockets are intentionally polled, so this works even when
+        # the sender used an ephemeral source port.
+        if (
+                observed
+                and observed_port
+                and self._peer_transport_ip_allowed(peer, observed, discovery=True)
+        ):
+            candidates.append((observed, observed_port))
+
+        # Then add the peer's stable control/data destination as a fallback.
+        stable_port = peer_discovery_port if observed_port in {
+            int(self.discovery_port), int(self._bound_discovery_port)
+        } else peer_data_port
+        if observed and stable_port:
+            item = (observed, stable_port)
+            if item not in candidates and self._peer_transport_ip_allowed(peer, observed, discovery=True):
+                candidates.append(item)
+
         advertised = self._sanitize_peer_ip(
             hello_msg.get("reply_to_ip") or hello_msg.get("listen_ip") or hello_msg.get("advertised_ip")
         )
-        for ip in (observed, advertised):
-            if not ip or not self._peer_transport_ip_allowed(peer, ip, discovery=(reply_port == peer_discovery_port)):
-                continue
-            if ip != observed and not self._advertised_fallback_plausible(observed, ip, peer=peer):
-                continue
-            item = (ip, reply_port)
+        if (
+                advertised
+                and stable_port
+                and not self._is_unobserved_local_alias(advertised, observed)
+                and self._advertised_fallback_plausible(observed, advertised, peer=peer)
+        ):
+            item = (advertised, stable_port)
             if item not in candidates:
                 candidates.append(item)
 
@@ -36810,7 +36982,13 @@ class HyperVRouterManager:
                 every=3.0,
             )
 
-    def _handle_remote_frame(self, msg: dict, from_ip: str, from_port: int) -> None:
+    def _handle_remote_frame(
+            self,
+            msg: dict,
+            from_ip: str,
+            from_port: int,
+            recv_sock: Optional[socket.socket] = None,
+    ) -> None:
         frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id"), 128)
         trace_id = self._bounded_text(msg.get("trace_id") or msg.get("trace"), 128)
         src_node_id = self._bounded_text(msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id"), 128)
@@ -36839,6 +37017,7 @@ class HyperVRouterManager:
                     frame_id=frame_id,
                     status="busy",
                     detail=f"breaker_open=1 src_node={src_node_id} proto={protocol_tag}",
+                    preferred_socket=recv_sock,
                 )
             return
 
@@ -36854,6 +37033,7 @@ class HyperVRouterManager:
                     frame_id=frame_id or "-",
                     status="bad_frame",
                     detail="invalid, oversized, or corrupt payload",
+                    preferred_socket=recv_sock,
                 )
             return
 
@@ -36875,6 +37055,7 @@ class HyperVRouterManager:
                     frame_id=frame_id or origin_frame_id,
                     status="observed",
                     detail="duplicate self-origin frame dropped",
+                    preferred_socket=recv_sock,
                 )
             return
 
@@ -36893,6 +37074,7 @@ class HyperVRouterManager:
                     frame_id=frame_id or origin_frame_id,
                     status="observed",
                     detail="duplicate origin frame dropped",
+                    preferred_socket=recv_sock,
                 )
             return
 
@@ -36910,6 +37092,7 @@ class HyperVRouterManager:
                     frame_id=frame_id or origin_frame_id,
                     status="observed",
                     detail="duplicate content hash dropped",
+                    preferred_socket=recv_sock,
                 )
             return
 
@@ -36940,8 +37123,28 @@ class HyperVRouterManager:
                     frame_id=frame_id,
                     status="decode_failed",
                     detail="could not decode packet bytes",
+                    preferred_socket=recv_sock,
                 )
             return
+
+        # Transport ACK semantics: once the HVRM envelope, payload hash, and
+        # packet bytes have all validated, acknowledge immediately from the
+        # exact UDP socket that received the frame.  Do not wait for the router
+        # worker; router processing can be slower than the wire ACK timeout.
+        transport_ack_sent = False
+        if ack_ip and ack_port and frame_id:
+            transport_ack_sent = self._send_frame_ack(
+                dst_ip=ack_ip,
+                dst_port=ack_port,
+                dst_node_id=src_node_id,
+                frame_id=frame_id,
+                status="received",
+                detail=(
+                    f"transport_received=1 src_node={src_node_id} "
+                    f"proto={protocol_tag} payload_len={len(raw)}"
+                ),
+                preferred_socket=recv_sock,
+            )
 
         setattr(pkt, "_hyperv_remote_frame", True)
         setattr(pkt, "_hyperv_remote_node_id", src_node_id)
@@ -36964,6 +37167,7 @@ class HyperVRouterManager:
             duplicate_hint=duplicate_hint,
             reply_ip=ack_ip,
             reply_port=ack_port,
+            success_notified=bool(transport_ack_sent),
         )
         if queued:
             self._stats["remote_ingress_queued"] = int(self._stats.get("remote_ingress_queued", 0)) + 1
@@ -36979,9 +37183,17 @@ class HyperVRouterManager:
                 frame_id=frame_id,
                 status="queue_full",
                 detail=f"queue_full=1 src_node={src_node_id} proto={protocol_tag} payload_len={len(raw)}",
+                preferred_socket=recv_sock,
             )
 
-    def _handle_frame_ack(self, msg: dict, from_ip: str, from_port: int) -> None:
+    def _handle_frame_ack(
+            self,
+            msg: dict,
+            from_ip: str,
+            from_port: int,
+            *,
+            which: str = "data",
+    ) -> None:
         frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128)
         src_node_id = self._bounded_text(
             msg.get("src_node_id") or msg.get("node_id") or msg.get("peer_id") or msg.get("sender_node_id"),
@@ -36993,6 +37205,7 @@ class HyperVRouterManager:
         with self._pending_lock:
             pending = self._pending_frames.get(frame_id)
             if pending is None or str(pending.get("peer_node_id") or "") != src_node_id:
+                self._stats["ack_unmatched"] = int(self._stats.get("ack_unmatched", 0)) + 1
                 return
 
         raw_type = str(msg.get("type") or "").strip().lower()
@@ -37016,8 +37229,21 @@ class HyperVRouterManager:
                 status = "processed"
 
         self._note_peer_ack(src_node_id)
-        self._note_peer_data_path(src_node_id, from_ip, from_port)
-        terminal_success = {"processed", "observed", "ok", "success", "accepted"}
+        ack_transport = self._bounded_text(msg.get("ack_transport"), 32).lower()
+        arrived_via_discovery = bool(which == "discovery" or ack_transport == "discovery-multicast")
+        if arrived_via_discovery:
+            # The multicast source port belongs to the discovery TX socket and
+            # must never replace the peer's stable data port 47772.
+            self._stats["ack_discovery_received"] = int(
+                self._stats.get("ack_discovery_received", 0)
+            ) + 1
+        else:
+            self._note_peer_data_path(src_node_id, from_ip, from_port)
+        self._stats["ack_received"] = int(self._stats.get("ack_received", 0)) + 1
+        terminal_success = {
+            "received", "receipt", "queued", "processed", "observed",
+            "ok", "success", "accepted",
+        }
         terminal_failure = {"busy", "queue_full", "decode_failed", "bad_frame", "failed", "error"}
 
         with self._pending_lock:
@@ -37032,6 +37258,15 @@ class HyperVRouterManager:
             pending["acked_from_port"] = int(from_port or 0)
             if status in terminal_success or status in terminal_failure:
                 self._pending_frames.pop(frame_id, None)
+
+        self._log_sparse(
+            f"ack-rx:{src_node_id}:{status}:{which}",
+            "ack",
+            f"ack received frame={frame_id} peer={src_node_id} status={status} "
+            f"via={which} source={from_ip}:{from_port}",
+            ["✅", "📥", "🤝"],
+            every=1.0,
+        )
 
     def _make_frame_messages(
             self,
@@ -37076,7 +37311,15 @@ class HyperVRouterManager:
         msg.update(self._wire_identity_fields(advertised_ip))
         return [self._encode_wire_message(msg)]
 
-    def _make_frame_ack_messages(self, *, frame_id: str, status: str, detail: str = "") -> List[bytes]:
+    def _make_frame_ack_messages(
+            self,
+            *,
+            frame_id: str,
+            status: str,
+            detail: str = "",
+            dst_node_id: str = "",
+            ack_transport: str = "data",
+    ) -> List[bytes]:
         advertised_ip = self._advertise_ip()
         msg = {
             "magic": self.MAGIC,
@@ -37086,8 +37329,10 @@ class HyperVRouterManager:
             "node_id": self.node_id,
             "src_node_id": self.node_id,
             "src_host_name": self.host_name,
+            "dst_node_id": self._bounded_text(dst_node_id, 128),
             "frame_id": frame_id,
             "status": status,
+            "ack_transport": self._bounded_text(ack_transport, 32) or "data",
             "detail": detail,
             "reply_ip": advertised_ip,
             "reply_port": int(self._bound_data_port or self.data_port or 0),
@@ -37153,6 +37398,7 @@ class HyperVRouterManager:
                 "peer_port": target_port,
                 "peer_targets": list(peer_targets),
                 "target_index": 0,
+                "attempted_targets": [(target_ip, target_port)],
                 "dst_sender_id": dst_sender_id,
                 "protocol_tag": protocol_tag,
                 "created_ts": time.time(),
@@ -37191,22 +37437,200 @@ class HyperVRouterManager:
             frame_id: str,
             status: str,
             detail: str = "",
+            preferred_socket: Optional[socket.socket] = None,
     ) -> bool:
-        raws = self._make_frame_ack_messages(frame_id=frame_id, status=status, detail=detail)
-        targets = self._candidate_reply_targets(dst_node_id=dst_node_id, dst_ip=dst_ip, dst_port=int(dst_port or 0))
-        if not raws or not targets:
+        """
+        Send a transport ACK back to the exact recvfrom() tuple.
+
+        The preferred socket is normally the socket that received the frame.
+        Reusing it preserves the source IP and source port expected by the
+        sender, survives NAT/IP-passthrough translation, and avoids waiting on
+        the normal network queue.  Stable learned peer paths remain fallbacks.
+        """
+        ip = self._sanitize_peer_ip(dst_ip)
+        port = self._safe_port(dst_port, 0)
+        if not ip or not port or not frame_id:
             return False
 
-        ip, port = targets[0]
-        return self._queue_network_message(
-            raw=raws[0],
-            ip=ip,
-            port=port,
-            mtype="ack",
-            peer_node_id=dst_node_id,
+        raws = self._make_frame_ack_messages(
             frame_id=frame_id,
             status=status,
+            detail=detail,
+            dst_node_id=dst_node_id,
+            ack_transport="data",
         )
+        if not raws:
+            return False
+
+        raw_ack = raws[0]
+
+        direct_sent = False
+
+        # First choice: reply synchronously from the exact receiving socket.
+        # The incoming frame has already passed envelope/auth/source checks.
+        if preferred_socket is not None:
+            try:
+                with self._sock_lock:
+                    source_ip = self._socket_source_ips.get(id(preferred_socket), "")
+                    try:
+                        local_name = preferred_socket.getsockname()
+                        local_ip = self._sanitize_peer_ip(local_name[0])
+                        local_port = int(local_name[1])
+                    except Exception:
+                        local_ip = ""
+                        local_port = int(self._bound_data_port or self.data_port)
+
+                    if not source_ip or source_ip == "0.0.0.0":
+                        source_ip = local_ip or self._route_selected_source_ip(ip) or self._advertise_ip()
+                    source_port = local_port or int(self._bound_data_port or self.data_port)
+                    direct_raw = self._retarget_wire_source_metadata(
+                        raw_ack, source_ip=source_ip, source_port=source_port
+                    )
+                    preferred_socket.sendto(direct_raw, (ip, port))
+
+                direct_sent = True
+                self._stats["ack_direct_sent"] = int(self._stats.get("ack_direct_sent", 0)) + 1
+                self._log_sparse(
+                    f"ack-direct:{dst_node_id}:{status}",
+                    "ack",
+                    f"ack sent frame={frame_id} peer={dst_node_id or '?'} "
+                    f"target={ip}:{port} source={source_ip or '-'}:{source_port} status={status}",
+                    ["✅", "↩️", "📡"],
+                    every=2.0,
+                )
+            except Exception as e:
+                self._stats["ack_direct_failed"] = int(self._stats.get("ack_direct_failed", 0)) + 1
+                self._log_sparse(
+                    f"ack-direct-fail:{dst_node_id}:{ip}:{port}",
+                    "ack",
+                    f"direct ack failed frame={frame_id} peer={dst_node_id or '?'} "
+                    f"target={ip}:{port}: {type(e).__name__}: {e}",
+                    ["⚠️", "↩️", "🧯"],
+                    every=2.0,
+                )
+
+        # UDP sendto() success only means the datagram entered the local stack.
+        # It does not prove that a private LAN peer can route back to an AT&T
+        # passthrough public IP. Publish a second, node-targeted ACK over the
+        # discovery multicast path. The sender accepts it only when node_id and
+        # random outstanding frame_id both match.
+        discovery_sent = False
+        if self._ack_discovery_fallback_enabled and (
+                self._ack_discovery_redundant or not direct_sent
+        ):
+            discovery_sent = self._send_frame_ack_over_discovery(
+                dst_node_id=dst_node_id,
+                frame_id=frame_id,
+                status=status,
+                detail=detail,
+            )
+
+        if direct_sent or discovery_sent:
+            return True
+
+        # Final compatibility fallback: exact source tuple first, then the
+        # learned stable data path through the ordinary network queue.
+        targets: List[Tuple[str, int]] = [(ip, port)]
+        for target in self._candidate_reply_targets(
+                dst_node_id=dst_node_id, dst_ip=ip, dst_port=port
+        ):
+            if target not in targets:
+                targets.append(target)
+
+        queued = False
+        for target_ip, target_port in targets[: max(2, int(self._ack_target_limit or 1))]:
+            if self._queue_network_message(
+                    raw=raw_ack,
+                    ip=target_ip,
+                    port=target_port,
+                    mtype="ack",
+                    peer_node_id=dst_node_id,
+                    frame_id=frame_id,
+                    status=status,
+            ):
+                queued = True
+                self._stats["ack_fallback_queued"] = int(self._stats.get("ack_fallback_queued", 0)) + 1
+                break
+        return queued
+
+    def _send_frame_ack_over_discovery(
+            self,
+            *,
+            dst_node_id: str,
+            frame_id: str,
+            status: str,
+            detail: str = "",
+    ) -> bool:
+        """Send a node-targeted ACK over the working discovery multicast LAN."""
+        dst_node_id = self._bounded_text(dst_node_id, 128)
+        frame_id = self._bounded_text(frame_id, 128)
+        if not dst_node_id or not frame_id:
+            return False
+
+        raws = self._make_frame_ack_messages(
+            frame_id=frame_id,
+            status=status,
+            detail=detail,
+            dst_node_id=dst_node_id,
+            ack_transport="discovery-multicast",
+        )
+        if not raws:
+            return False
+        raw_ack = raws[0]
+
+        with self._sock_lock:
+            tx_paths = list(self._discovery_tx_socks.items())
+            if not tx_paths and self._discovery_tx_sock is not None:
+                tx_paths = [(
+                    self._socket_source_ips.get(id(self._discovery_tx_sock), "0.0.0.0"),
+                    self._discovery_tx_sock,
+                )]
+
+        sent = 0
+        used_socket_ids: Set[int] = set()
+        for source_hint, sock_obj in tx_paths:
+            if sock_obj is None or id(sock_obj) in used_socket_ids:
+                continue
+            used_socket_ids.add(id(sock_obj))
+            if sent >= max(1, int(self._ack_discovery_target_limit or 1)):
+                break
+            try:
+                try:
+                    local_name = sock_obj.getsockname()
+                    local_ip = self._sanitize_peer_ip(local_name[0])
+                    local_port = int(local_name[1])
+                except Exception:
+                    local_ip = ""
+                    local_port = 0
+                source_ip = self._sanitize_peer_ip(source_hint) or local_ip or self._advertise_ip()
+                wire = self._retarget_wire_source_metadata(
+                    raw_ack,
+                    source_ip=source_ip,
+                    source_port=local_port or int(self.discovery_port),
+                )
+                sock_obj.sendto(wire, (self.discovery_group, int(self.discovery_port)))
+                sent += 1
+            except Exception as e:
+                self._log_sparse(
+                    f"ack-discovery-send-fail:{dst_node_id}:{source_hint}",
+                    "ack",
+                    f"discovery ACK send failed frame={frame_id} peer={dst_node_id} "
+                    f"source={source_hint or '-'}: {type(e).__name__}: {e}",
+                    ["⚠️", "📡", "🧯"],
+                    every=3.0,
+                )
+
+        if sent:
+            self._stats["ack_discovery_sent"] = int(self._stats.get("ack_discovery_sent", 0)) + sent
+            self._log_sparse(
+                f"ack-discovery:{dst_node_id}:{status}",
+                "ack",
+                f"discovery ACK sent frame={frame_id} peer={dst_node_id} "
+                f"group={self.discovery_group}:{self.discovery_port} paths={sent} status={status}",
+                ["✅", "📡", "↩️"],
+                every=2.0,
+            )
+        return sent > 0
 
     def _candidate_ack_targets_from_message(
             self,
@@ -37215,6 +37639,7 @@ class HyperVRouterManager:
             from_port: int,
             src_node_id: str,
     ) -> List[Tuple[str, int]]:
+        """Return ACK targets with the exact recvfrom() tuple first."""
         out: List[Tuple[str, int]] = []
         observed_ip = self._sanitize_peer_ip(from_ip)
         observed_source_port = self._safe_port(from_port, 0)
@@ -37231,25 +37656,38 @@ class HyperVRouterManager:
             peer_data_port,
         )
 
-        if observed_ip and self._peer_transport_ip_allowed(peer, observed_ip, discovery=False):
-            stable_port = hinted_port or peer_data_port or self.data_port
-            if stable_port:
-                out.append((observed_ip, int(stable_port)))
-            if observed_source_port and observed_source_port != stable_port:
+        # _handle_wire_message() has already validated this frame source.
+        # Therefore the exact recvfrom() tuple is authoritative for its ACK,
+        # even when it is a public IP seen through IP Passthrough/NAT.
+        if observed_ip:
+            if observed_source_port:
                 out.append((observed_ip, observed_source_port))
+            if hinted_port:
+                item = (observed_ip, hinted_port)
+                if item not in out:
+                    out.append(item)
+            if peer_data_port:
+                item = (observed_ip, peer_data_port)
+                if item not in out:
+                    out.append(item)
+
+        hinted_ip = self._sanitize_peer_ip(msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip"))
+        if (
+                hinted_ip
+                and hinted_port
+                and not self._is_unobserved_local_alias(hinted_ip, observed_ip)
+                and self._peer_knows_ip(src_node_id, hinted_ip)
+        ):
+            item = (hinted_ip, hinted_port)
+            if self._peer_transport_ip_allowed(peer, hinted_ip, discovery=False) and item not in out:
+                out.append(item)
 
         for item in self._candidate_reply_targets(
                 dst_node_id=src_node_id,
                 dst_ip=observed_ip,
-                dst_port=peer_data_port,
+                dst_port=observed_source_port or peer_data_port,
         ):
             if item not in out:
-                out.append(item)
-
-        hinted_ip = self._sanitize_peer_ip(msg.get("reply_ip") or msg.get("reply_to_ip") or msg.get("ack_ip"))
-        if hinted_ip and hinted_port and self._peer_knows_ip(src_node_id, hinted_ip):
-            item = (hinted_ip, hinted_port)
-            if self._peer_transport_ip_allowed(peer, hinted_ip, discovery=False) and item not in out:
                 out.append(item)
 
         return out[: max(2, int(self._ack_target_limit or 1))]
@@ -37261,7 +37699,11 @@ class HyperVRouterManager:
             dst_ip: str,
             dst_port: int,
     ) -> List[Tuple[str, int]]:
-        """Prefer a same-LAN private path, then the peer's public passthrough path."""
+        """
+        Prefer the exact source tuple supplied by recvfrom().  This is required
+        for NAT-translated and same-address IP-passthrough traffic.  Learned
+        stable peer paths are only fallbacks.
+        """
         out: List[Tuple[str, int]] = []
         supplied_ip = self._sanitize_peer_ip(dst_ip)
         supplied_port = self._safe_port(dst_port, 0)
@@ -37274,37 +37716,42 @@ class HyperVRouterManager:
                 self._bound_data_port or self.data_port,
             )
 
-        if supplied_ip and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False):
-            preferred_port = peer_data_port or supplied_port or self.data_port
-            if preferred_port:
-                out.append((supplied_ip, int(preferred_port)))
+        if (
+                supplied_ip
+                and supplied_port
+                and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False)
+        ):
+            out.append((supplied_ip, supplied_port))
 
-        for item in peer_targets:
-            if self._is_private_ipv4(item[0]) and item not in out:
-                out.append(item)
-
-        if supplied_ip and supplied_port and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False):
-            item = (supplied_ip, supplied_port)
+        if supplied_ip and peer_data_port and self._peer_transport_ip_allowed(peer, supplied_ip, discovery=False):
+            item = (supplied_ip, peer_data_port)
             if item not in out:
                 out.append(item)
 
         for item in peer_targets:
             if item not in out:
                 out.append(item)
+
         return out[: max(2, int(self._ack_target_limit or 1))]
 
     def _candidate_peer_targets(self, peer: _Peer) -> List[Tuple[str, int]]:
         if peer is None:
             return []
+
         now = time.time()
+        observed_ips = set(getattr(peer, "observed_ips", set()) or set())
+        observed_ports = dict(getattr(peer, "observed_data_ports", {}) or {})
         candidates: List[Tuple[int, str, int]] = []
+
         ips: Set[str] = set(peer.candidate_ips.keys())
         ips.update(peer.private_ips)
         ips.update(peer.public_ips)
+        ips.update(observed_ips)
         for ip in (
                 peer.preferred_private_ip,
                 peer.last_success_ip,
                 peer.last_data_from_ip,
+                getattr(peer, "last_observed_ip", ""),
                 peer.listen_ip,
                 peer.last_hello_from_ip,
                 peer.advertised_ip,
@@ -37312,19 +37759,34 @@ class HyperVRouterManager:
             if ip:
                 ips.add(str(ip))
 
-        for ip in ips:
-            ip = self._sanitize_peer_ip(ip)
+        has_observed = any(
+            self._sanitize_peer_ip(ip)
+            and self._peer_transport_ip_allowed(peer, ip, discovery=False)
+            for ip in observed_ips
+        )
+
+        for raw_ip in ips:
+            ip = self._sanitize_peer_ip(raw_ip)
             if not ip or not self._peer_transport_ip_allowed(peer, ip, discovery=False):
                 continue
+
+            # A peer cannot be reached by sending to one of this machine's own
+            # addresses.  This specifically rejects a shared AT&T WAN address
+            # advertised by every LAN computer.
+            if self._is_unobserved_local_alias(ip, "" ) and ip not in observed_ips:
+                continue
+
             seen_ts = float(peer.candidate_ips.get(ip, 0.0) or 0.0)
             if seen_ts and (now - seen_ts) > float(self._peer_path_ttl_sec):
                 continue
 
-            port = int(peer.data_port or self.data_port)
+            port = self._safe_port(peer.data_port, self.data_port)
             if ip == peer.last_data_from_ip and int(peer.last_data_from_port or 0) > 0:
                 port = int(peer.last_data_from_port)
             elif ip == peer.last_success_ip and int(peer.last_success_port or 0) > 0:
                 port = int(peer.last_success_port)
+            elif int(observed_ports.get(ip, 0) or 0) > 0:
+                port = int(observed_ports[ip])
             elif int(peer.candidate_data_ports.get(ip, 0) or 0) > 0:
                 port = int(peer.candidate_data_ports[ip])
             if not (1 <= port <= 65535):
@@ -37332,27 +37794,43 @@ class HyperVRouterManager:
 
             score = self._local_path_affinity_score(ip)
             if ip in peer.confirmed_ips:
-                score += 1000
+                score += 2400
+            if ip in observed_ips:
+                score += 2200
             if ip == peer.last_success_ip:
-                score += 900
+                score += 1900
             if ip == peer.last_data_from_ip:
-                score += 800
-            if ip == peer.preferred_private_ip:
-                score += 700
+                score += 1800
+            if ip == getattr(peer, "last_observed_ip", ""):
+                score += 1650
             if ip == peer.last_hello_from_ip:
-                score += 500
-            if ip == peer.listen_ip:
+                score += 1500
+            if ip == peer.preferred_private_ip:
                 score += 450
-            if ip == peer.advertised_ip:
+            if ip == peer.listen_ip:
                 score += 300
+            if ip == peer.advertised_ip:
+                score += 75
             if self._is_private_ipv4(ip):
-                score += 900 if self._prefer_private_lan_paths else 100
-            elif peer.public_ok and peer.passthrough_enabled:
-                score += 50
-            score += min(100, int(peer.path_successes.get(ip, 0) or 0) * 10)
-            score -= min(400, int(peer.path_failures.get(ip, 0) or 0) * 40)
+                score += 300 if self._prefer_private_lan_paths else 75
+            elif peer.public_ok or peer.passthrough_enabled or getattr(peer, "same_address_mode", False):
+                score += 125
+
+            if (
+                    has_observed
+                    and ip not in observed_ips
+                    and ip not in peer.confirmed_ips
+                    and ip != peer.last_success_ip
+            ):
+                # Once a valid packet has actually been observed from a peer,
+                # do not rotate ACK retries into merely advertised Hyper-V,
+                # WSL, APIPA, or shared-WAN hints.
+                continue
+
+            score += min(250, int(peer.path_successes.get(ip, 0) or 0) * 25)
+            score -= min(1200, int(peer.path_failures.get(ip, 0) or 0) * 150)
             if seen_ts:
-                score += max(0, int(60 - (now - seen_ts)))
+                score += max(0, int(90 - (now - seen_ts)))
             candidates.append((score, ip, port))
 
         candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
@@ -37415,6 +37893,7 @@ class HyperVRouterManager:
         port = self._safe_port(item.get("port"), 0)
         mtype = str(item.get("mtype") or "")
         peer_node_id = str(item.get("peer_node_id") or "")
+        frame_id = str(item.get("frame_id") or "")
         is_discovery = bool(
             mtype in {"hello", "hello_reply"}
             or port == self.discovery_port
@@ -37438,6 +37917,21 @@ class HyperVRouterManager:
                 except Exception:
                     source_port = int(self._bound_data_ports_by_ip.get(source_ip, self.data_port))
 
+        attempt_ts = time.time()
+        if mtype == "frame" and frame_id:
+            with self._pending_lock:
+                pending = self._pending_frames.get(frame_id)
+                if pending is not None:
+                    pending["last_send_ts"] = attempt_ts
+                    pending["last_source_ip"] = source_ip
+                    pending["last_target_ip"] = ip
+                    pending["last_target_port"] = port
+                    attempted = list(pending.get("attempted_targets") or [])
+                    target_key = (ip, port)
+                    if target_key not in attempted:
+                        attempted.append(target_key)
+                    pending["attempted_targets"] = attempted[-8:]
+
         if sock_obj is None:
             return False
 
@@ -37459,13 +37953,15 @@ class HyperVRouterManager:
             if mtype == "frame":
                 self._note_peer_frame_tx(peer_node_id, len(raw_to_send))
                 with self._pending_lock:
-                    pending = self._pending_frames.get(str(item.get("frame_id") or ""))
+                    pending = self._pending_frames.get(frame_id)
                     if pending is not None:
                         now_ts = time.time()
                         pending["last_send_ts"] = now_ts
                         pending["last_source_ip"] = source_ip
                         pending["last_target_ip"] = ip
+                        pending["last_target_port"] = port
                         pending["send_success_count"] = int(pending.get("send_success_count", 0)) + 1
+                        pending["last_send_error"] = ""
                         if float(pending.get("first_send_ok_ts", 0.0) or 0.0) <= 0.0:
                             pending["first_send_ok_ts"] = now_ts
             return True
@@ -37473,6 +37969,12 @@ class HyperVRouterManager:
             self._stats["peer_send_fail"] += 1
             if peer_node_id:
                 self._note_peer_path_failure(peer_node_id, ip)
+            if mtype == "frame" and frame_id:
+                with self._pending_lock:
+                    pending = self._pending_frames.get(frame_id)
+                    if pending is not None:
+                        pending["last_send_ts"] = time.time()
+                        pending["last_send_error"] = f"{type(e).__name__}: {e}"
             self._log_sparse(
                 f"network-send-fail:{source_ip}:{ip}:{port}",
                 "network",
@@ -37498,17 +38000,24 @@ class HyperVRouterManager:
 
     def _retry_pending_frames(self) -> None:
         now = time.time()
+
+        # Refresh peer targets before taking pending_lock so lock order remains
+        # self._lock -> pending_lock nowhere in this method.
+        fresh_targets: Dict[str, List[Tuple[str, int]]] = {}
+        with self._lock:
+            for node_id, peer in self._peers.items():
+                fresh_targets[node_id] = list(self._candidate_peer_targets(peer))
+
         retry_items: List[Dict[str, Any]] = []
         expired: List[Dict[str, Any]] = []
         failed_paths: List[Tuple[str, str]] = []
 
         with self._pending_lock:
             for frame_id, info in list(self._pending_frames.items()):
-                last_send_ts = float(info.get("last_send_ts", 0.0))
-                retry_count = int(info.get("retry_count", 0))
+                last_send_ts = float(info.get("last_send_ts", 0.0) or 0.0)
+                retry_count = int(info.get("retry_count", 0) or 0)
                 if last_send_ts <= 0.0:
                     continue
-
                 if (now - last_send_ts) < self._frame_ack_timeout_sec:
                     continue
                 if retry_count >= self._frame_retry_limit:
@@ -37516,24 +38025,40 @@ class HyperVRouterManager:
                     self._pending_frames.pop(frame_id, None)
                     continue
 
-                targets = list(info.get("peer_targets") or [])
-                if not targets:
-                    targets = [(str(info.get("peer_ip") or ""), int(info.get("peer_port") or 0))]
-                failed_paths.append((
-                    str(info.get("peer_node_id") or ""),
+                node_id = str(info.get("peer_node_id") or "")
+                current = (
                     str(info.get("peer_ip") or ""),
-                ))
+                    int(info.get("peer_port") or 0),
+                )
+                if current[0]:
+                    failed_paths.append((node_id, current[0]))
 
-                next_index = (int(info.get("target_index", 0)) + 1) % max(1, len(targets))
-                target_ip, target_port = targets[next_index]
-                info["target_index"] = next_index
+                targets = list(fresh_targets.get(node_id) or info.get("peer_targets") or [])
+                targets = [
+                    (str(ip), int(port)) for ip, port in targets
+                    if self._sanitize_peer_ip(ip) and 1 <= int(port or 0) <= 65535
+                ]
+                if not targets and current[0] and current[1] > 0:
+                    targets = [current]
+                if not targets:
+                    expired.append(dict(info))
+                    self._pending_frames.pop(frame_id, None)
+                    continue
+
+                attempted = [tuple(x) for x in list(info.get("attempted_targets") or []) if len(tuple(x)) == 2]
+                next_target = next((target for target in targets if target not in attempted), None)
+                if next_target is None:
+                    next_target = targets[0]
+
+                target_ip, target_port = next_target
+                info["peer_targets"] = list(targets)
+                info["target_index"] = targets.index(next_target) if next_target in targets else 0
                 info["peer_ip"] = str(target_ip)
                 info["peer_port"] = int(target_port)
                 info["retry_count"] = retry_count + 1
                 info["last_send_ts"] = now
                 retry_items.append(dict(info))
 
-        # Preserve lock order: peer lock is never acquired while pending_lock is held.
         for node_id, ip in failed_paths:
             self._note_peer_path_failure(node_id, ip)
 
@@ -37553,7 +38078,9 @@ class HyperVRouterManager:
             self._log_sparse(
                 f"ack-retry:{info.get('peer_node_id') or '?'}",
                 "ack",
-                f"retry frame={info.get('frame_id')} peer={info.get('peer_node_id') or '?'} target={info.get('peer_ip')}:{info.get('peer_port')} retry={info.get('retry_count')} queued={int(bool(queued))}",
+                f"retry frame={info.get('frame_id')} peer={info.get('peer_node_id') or '?'} "
+                f"target={info.get('peer_ip')}:{info.get('peer_port')} "
+                f"retry={info.get('retry_count')} queued={int(bool(queued))}",
                 ["🔁", "📡", "🧭"],
                 every=1.5,
             )
@@ -37562,7 +38089,10 @@ class HyperVRouterManager:
             self._log_sparse(
                 f"ack-expire:{info.get('peer_node_id') or '?'}",
                 "ack",
-                f"delivery tracking expired frame={info.get('frame_id')} peer={info.get('peer_node_id') or '?'} targets={info.get('peer_targets') or []}",
+                f"frame ack timeout after send frame_id={info.get('frame_id')} "
+                f"trace={info.get('trace_id') or '-'} peer={info.get('peer_node_id') or '?'} "
+                f"ip={info.get('peer_ip')}:{info.get('peer_port')} "
+                f"last_ack={info.get('last_ack_status') or '-'}",
                 ["⌛", "📡", "⚠️"],
                 every=1.5,
             )
@@ -37581,6 +38111,7 @@ class HyperVRouterManager:
             duplicate_hint: bool,
             reply_ip: str = "",
             reply_port: int = 0,
+            success_notified: bool = False,
     ) -> bool:
         if self._is_remote_ingress_breaker_open():
             self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
@@ -37600,6 +38131,7 @@ class HyperVRouterManager:
                 duplicate_hint=bool(duplicate_hint),
                 reply_ip=str(reply_ip or ""),
                 reply_port=int(reply_port or 0),
+                success_notified=bool(success_notified),
             )
             self._router_ingress_q.put_nowait(item)
             return True
@@ -37670,7 +38202,7 @@ class HyperVRouterManager:
 
             if fed:
                 self._stats["remote_ingress_ok"] += 1
-                if item.reply_ip and item.frame_id:
+                if item.reply_ip and item.frame_id and not item.success_notified:
                     self._send_frame_ack(
                         dst_ip=item.reply_ip,
                         dst_port=item.reply_port,
@@ -37839,14 +38371,19 @@ class HyperVRouterManager:
             peer.last_data_from_port = port
             peer.last_success_ip = ip
             peer.last_success_port = port
+            peer.last_observed_ip = ip
+            peer.last_observed_port = port
             peer.path_successes[ip] = int(peer.path_successes.get(ip, 0) or 0) + 1
             peer.path_failures[ip] = 0
-            self._record_peer_path_locked(peer, ip, port, confirmed=True, data_path=True)
+            self._record_peer_path_locked(
+                peer,
+                ip,
+                port,
+                confirmed=True,
+                data_path=True,
+                observed=True,
+            )
             peer.listen_ip = self._best_peer_ip_locked(peer)
-
-    # ---------------------------------------------------------
-    # decode / encode / router feed
-    # ---------------------------------------------------------
 
     def _classify_protocol(self, packet) -> Optional[str]:
         try:
@@ -38191,26 +38728,54 @@ class HyperVRouterManager:
         return out
 
     def _discover_local_ipv4_addresses(self) -> List[str]:
-        candidates: List[str] = []
-        try:
-            _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
-            candidates.extend(addrs)
-        except Exception:
-            pass
-        try:
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
-                candidates.append(str(info[4][0] or ""))
-        except Exception:
-            pass
+        """
+        Auto-discover only usable addresses on active, non-virtual interfaces.
+        Hyper-V/WSL/TAP/APIPA addresses remain available when explicitly passed
+        to configure(), but are not advertised automatically as peer paths.
+        """
+        preferred: List[str] = []
+        fallback: List[str] = []
+
         try:
             import psutil  # type: ignore
-            for iface_addrs in psutil.net_if_addrs().values():
+            stats = psutil.net_if_stats()
+            for iface_name, iface_addrs in psutil.net_if_addrs().items():
+                iface_stat = stats.get(iface_name)
+                if iface_stat is not None and not bool(getattr(iface_stat, "isup", False)):
+                    continue
+                virtual = self._is_probably_virtual_interface_name(iface_name)
                 for addr in iface_addrs:
-                    if getattr(addr, "family", None) == socket.AF_INET:
-                        candidates.append(str(getattr(addr, "address", "") or ""))
+                    if getattr(addr, "family", None) != socket.AF_INET:
+                        continue
+                    ip = self._sanitize_peer_ip(getattr(addr, "address", ""))
+                    if not ip:
+                        continue
+                    if virtual:
+                        fallback.append(ip)
+                    else:
+                        preferred.append(ip)
         except Exception:
             pass
-        return self._dedupe_usable_ips(candidates)
+
+        # Hostname resolution is a fallback only; on Windows it commonly
+        # returns a Hyper-V Default Switch address before the real adapter.
+        if not preferred:
+            try:
+                _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+                fallback.extend(addrs)
+            except Exception:
+                pass
+            try:
+                for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
+                    fallback.append(str(info[4][0] or ""))
+            except Exception:
+                pass
+
+        if preferred:
+            return self._dedupe_usable_ips(preferred)
+        if self._auto_detect_virtual_transport_ips:
+            return self._dedupe_usable_ips(fallback)
+        return []
 
     def _build_local_address_roles(
             self,
@@ -38301,6 +38866,35 @@ class HyperVRouterManager:
                 score = max(score, 350)
         return score
 
+    def _route_selected_source_ip(self, destination_ip: str) -> str:
+        """Ask the OS routing table which local IPv4 source it would use."""
+        destination_ip = self._sanitize_peer_ip(destination_ip)
+        if not destination_ip:
+            return ""
+        now = time.monotonic()
+        cached = self._route_source_cache.get(destination_ip)
+        if cached and (now - float(cached[1])) <= float(self._route_source_cache_ttl_sec):
+            return self._sanitize_peer_ip(cached[0])
+
+        source_ip = ""
+        probe: Optional[socket.socket] = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            probe.connect((destination_ip, 9))
+            source_ip = self._sanitize_peer_ip(probe.getsockname()[0])
+        except Exception:
+            source_ip = ""
+        finally:
+            if probe is not None:
+                self._safe_socket_close(probe)
+
+        self._route_source_cache[destination_ip] = (source_ip, now)
+        if len(self._route_source_cache) > 256:
+            oldest = sorted(self._route_source_cache.items(), key=lambda kv: kv[1][1])[:64]
+            for key, _ in oldest:
+                self._route_source_cache.pop(key, None)
+        return source_ip
+
     def _select_transport_socket(
             self,
             destination_ip: str,
@@ -38310,33 +38904,59 @@ class HyperVRouterManager:
     ) -> Tuple[Optional[socket.socket], str]:
         destination_ip = self._sanitize_peer_ip(destination_ip)
         socket_map = self._discovery_tx_socks if discovery else self._data_socks
+        route_source = self._route_selected_source_ip(destination_ip) if destination_ip else ""
+
         if not socket_map:
             fallback = self._discovery_tx_sock or self._discovery_sock or self._data_sock
             if fallback is None:
                 return None, ""
-            fallback_source = self._socket_source_ips.get(id(fallback), "")
+            fallback_source = route_source or self._socket_source_ips.get(id(fallback), "")
             return fallback, self._normalize_local_source_ip(fallback_source, fallback)
+
+        # A wildcard data socket intentionally delegates interface/source
+        # choice to Windows.  Retarget wire metadata to the route-selected
+        # source rather than advertising 0.0.0.0.
+        if "0.0.0.0" in socket_map:
+            source_ip = route_source or self._advertise_ip()
+            return socket_map["0.0.0.0"], source_ip
+
+        if route_source in socket_map:
+            return socket_map[route_source], route_source
 
         primary = self._sanitize_peer_ip(self.bind_ip or self._primary_bind_ip)
 
         def _score(item: Tuple[str, socket.socket]) -> Tuple[int, str]:
             source_ip, _ = item
             score = 0
-            if source_ip == primary:
-                score += 100
+            role = str(self._local_transport_roles.get(source_ip, "") or "")
+
+            if route_source and source_ip == route_source:
+                score += 10000
             if destination_ip and self._same_ipv4_subnet(source_ip, destination_ip):
-                score += 1500
-            if destination_ip and self._is_private_ipv4(destination_ip) and self._is_private_ipv4(source_ip):
-                score += 800
-            if destination_ip and not self._is_private_ipv4(destination_ip) and not self._is_private_ipv4(source_ip):
-                score += 700
-            if destination_ip and self._same_private_scope(source_ip, destination_ip):
-                score += 250
-            role = self._local_transport_roles.get(source_ip, "")
-            if destination_ip and self._is_private_ipv4(destination_ip) and "private" in role:
-                score += 200
-            if destination_ip and not self._is_private_ipv4(destination_ip) and "public" in role:
-                score += 200
+                score += 7000
+            if source_ip == primary:
+                score += 3000
+            if "passthrough-lan-wan" in role:
+                score += 2600
+            elif "passthrough-public" in role:
+                score += 2200
+            elif "lan-private" in role:
+                score += 1800
+            elif "private-local" in role:
+                score += 300
+
+            # Do not select an unrelated private virtual adapter simply because
+            # the destination is private.  Same-subnet and OS-route evidence
+            # above are required for a strong private-source preference.
+            if destination_ip and self._is_private_ipv4(destination_ip):
+                if self._same_ipv4_subnet(source_ip, destination_ip):
+                    score += 2500
+                elif source_ip == primary:
+                    score += 1200
+            elif destination_ip and not self._is_private_ipv4(destination_ip):
+                if not self._is_private_ipv4(source_ip):
+                    score += 1200
+
             return (score, source_ip)
 
         source_ip, sock_obj = max(socket_map.items(), key=_score)
@@ -38364,8 +38984,19 @@ class HyperVRouterManager:
                 break
         if not preferred_private_ip and private_ips:
             preferred_private_ip = private_ips[0]
+
         public_ok, gateway_ok = self._passthrough_wire_flags()
         hybrid_mode = bool(private_ips and public_ips)
+        same_address_mode = bool(cfg.get("same_address_mode", False))
+        if same_address_mode:
+            path_mode = "same-address"
+        elif hybrid_mode:
+            path_mode = "hybrid"
+        elif public_ips:
+            path_mode = "passthrough"
+        else:
+            path_mode = "lan"
+
         return {
             "sender_ids": sender_ids,
             "sender_kinds": sender_kinds,
@@ -38373,12 +39004,14 @@ class HyperVRouterManager:
             "public_ok": bool(public_ok),
             "gateway_ok": bool(gateway_ok),
             "passthrough_enabled": bool(cfg.get("enabled", False)),
-            "path_mode": "hybrid" if hybrid_mode else ("passthrough" if public_ips else "lan"),
+            "same_address_mode": same_address_mode,
+            "path_mode": path_mode,
             "address_hints": local_ips,
             "address_roles": roles,
             "private_ips": private_ips,
             "public_ips": public_ips,
             "preferred_private_ip": preferred_private_ip,
+            "observed_source_required_for_shared_public": True,
         }
 
     def _build_hello_message(
@@ -39142,12 +39775,6 @@ class HyperVRouterManager:
             return False
         if self._is_private_ipv4(ip_s):
             return True
-        parts = self._ipv4_parts(ip_s)
-        if parts and parts[:2] == [169, 254]:
-            return any(
-                (self._ipv4_parts(local_ip) or [])[:2] == [169, 254]
-                for local_ip in self._ordered_local_transport_ips()
-            )
         return bool(self._allow_public_discovery if discovery else self._allow_public_peer_data)
 
     def _peer_transport_ip_allowed(
@@ -39157,28 +39784,44 @@ class HyperVRouterManager:
             *,
             discovery: bool,
     ) -> bool:
-        ip_s = str(ip or "").strip()
+        ip_s = self._sanitize_peer_ip(ip)
+        if not ip_s:
+            return False
+        if peer is not None and peer.segment_id != self.segment_id:
+            return False
+
+        observed_ips = set(getattr(peer, "observed_ips", set()) or set()) if peer is not None else set()
+        if self._is_unobserved_local_alias(ip_s, ip_s if ip_s in observed_ips else "") and ip_s not in observed_ips:
+            return False
+
         if self._transport_ip_allowed(ip_s, discovery=discovery):
             return True
-        if peer is None or not self._is_usable_unicast_ipv4(ip_s):
-            return False
-        if peer.segment_id != self.segment_id:
+        if peer is None:
             return False
         if self._is_private_ipv4(ip_s):
             return True
+
         known = ip_s in {
             peer.listen_ip,
             peer.advertised_ip,
             peer.last_hello_from_ip,
             peer.last_data_from_ip,
             peer.last_success_ip,
+            getattr(peer, "last_observed_ip", ""),
             *peer.candidate_ips.keys(),
             *peer.public_ips,
+            *observed_ips,
         }
         return bool(
             known
             and self._hybrid_allow_passthrough_public
-            and (peer.public_ok or peer.passthrough_enabled or ip_s in peer.public_ips)
+            and (
+                ip_s in observed_ips
+                or peer.public_ok
+                or peer.passthrough_enabled
+                or getattr(peer, "same_address_mode", False)
+                or ip_s in peer.public_ips
+            )
         )
 
     def configure_wire_security(
@@ -39248,6 +39891,8 @@ class HyperVRouterManager:
             return False
         if parts[0] in {0, 127} or parts[0] >= 224:
             return False
+        if parts[:2] == [169, 254] and not self._allow_link_local_transport:
+            return False
         if parts == [255, 255, 255, 255]:
             return False
         if parts[-1] == 255 and self._same_ipv4_subnet(str(ip), self.bind_ip):
@@ -39273,15 +39918,65 @@ class HyperVRouterManager:
             return True
         return False
 
+    def _is_link_local_ipv4(self, ip: Any) -> bool:
+        parts = self._ipv4_parts(ip)
+        return bool(parts and parts[:2] == [169, 254])
+
+    def _is_probably_virtual_interface_name(self, iface_name: Any) -> bool:
+        name = str(iface_name or "").strip().lower()
+        if not name:
+            return True
+        virtual_tokens = (
+            "vethernet", "hyper-v", "hyperv", "default switch", "wsl",
+            "docker", "container", "vmware", "virtualbox", "loopback",
+            "npcap", "windivert", "wintun", "wireguard", "zerotier",
+            "tailscale", "protonvpn", "openvpn", "tap-windows", "tunnel",
+        )
+        return any(token in name for token in virtual_tokens)
+
+    def _is_local_transport_ip(self, ip: Any) -> bool:
+        ip_s = self._sanitize_peer_ip(ip)
+        if not ip_s:
+            return False
+        with self._lock:
+            local = set(self._local_transport_roles.keys())
+            cfg = dict(self._ip_passthrough_config)
+            for value in (
+                    self.bind_ip,
+                    self._primary_bind_ip,
+                    cfg.get("public_ip"),
+                    cfg.get("lan_ip"),
+                    cfg.get("bind_ip"),
+            ):
+                candidate = self._sanitize_peer_ip(value)
+                if candidate:
+                    local.add(candidate)
+        return ip_s in local
+
+    def _is_unobserved_local_alias(self, candidate_ip: Any, observed_ip: Any = "") -> bool:
+        candidate = self._sanitize_peer_ip(candidate_ip)
+        observed = self._sanitize_peer_ip(observed_ip)
+        if not candidate or not self._suppress_local_address_as_peer_hint:
+            return False
+        return bool(candidate != observed and self._is_local_transport_ip(candidate))
+
     def _advertised_fallback_plausible(
             self,
             observed_ip: str,
             advertised_ip: str,
             peer: Optional[_Peer] = None,
     ) -> bool:
-        if not advertised_ip or not self._peer_transport_ip_allowed(peer, advertised_ip, discovery=True):
+        observed_ip = self._sanitize_peer_ip(observed_ip)
+        advertised_ip = self._sanitize_peer_ip(advertised_ip)
+        if not advertised_ip:
+            return False
+        if self._is_unobserved_local_alias(advertised_ip, observed_ip):
+            return False
+        if not self._peer_transport_ip_allowed(peer, advertised_ip, discovery=True):
             return False
         if advertised_ip == observed_ip or self._same_ipv4_subnet(advertised_ip, observed_ip):
+            return True
+        if peer is not None and advertised_ip in set(getattr(peer, "observed_ips", set()) or set()):
             return True
         if peer is not None and peer.public_ok and advertised_ip in peer.public_ips:
             return bool(self._hybrid_allow_passthrough_public)
@@ -39299,36 +39994,80 @@ class HyperVRouterManager:
             *,
             confirmed: bool,
             data_path: bool,
+            observed: bool = False,
     ) -> None:
         ip = self._sanitize_peer_ip(ip)
         if not ip:
             return
-        peer.candidate_ips[ip] = time.time()
-        if data_path and 1 <= int(port or 0) <= 65535:
-            peer.candidate_data_ports[ip] = int(port)
+        if not observed and self._is_unobserved_local_alias(ip, ""):
+            return
+
+        now = time.time()
+        peer.candidate_ips[ip] = now
+        stable_port = self._safe_port(port, peer.data_port or self.data_port)
+        if data_path and stable_port:
+            peer.candidate_data_ports[ip] = stable_port
         if confirmed:
             peer.confirmed_ips.add(ip)
 
+        if observed:
+            peer.observed_ips.add(ip)
+            peer.last_observed_ip = ip
+            peer.last_observed_port = stable_port
+            if stable_port:
+                peer.observed_data_ports[ip] = stable_port
+
         if self._is_private_ipv4(ip):
             peer.private_ips.add(ip)
-            peer.address_roles.setdefault(ip, "lan-private")
-            if not peer.preferred_private_ip or confirmed:
+            peer.address_roles.setdefault(ip, "observed-lan" if observed else "lan-private")
+            if not peer.preferred_private_ip or observed or confirmed:
                 peer.preferred_private_ip = ip
         else:
             peer.public_ips.add(ip)
-            peer.address_roles.setdefault(ip, "passthrough-public" if peer.public_ok or peer.passthrough_enabled else "public")
+            if observed:
+                role = "observed-passthrough"
+            elif peer.same_address_mode:
+                role = "passthrough-lan-wan"
+            else:
+                role = "passthrough-public" if peer.public_ok or peer.passthrough_enabled else "public"
+            peer.address_roles.setdefault(ip, role)
 
         if len(peer.candidate_ips) > 12:
-            keep = sorted(peer.candidate_ips.items(), key=lambda kv: kv[1], reverse=True)[:12]
+            keep = sorted(
+                peer.candidate_ips.items(),
+                key=lambda kv: (
+                    kv[0] in peer.observed_ips,
+                    kv[0] in peer.confirmed_ips,
+                    kv[1],
+                ),
+                reverse=True,
+            )[:12]
             keep_ips = {candidate_ip for candidate_ip, _ in keep}
             peer.candidate_ips = dict(keep)
-            peer.candidate_data_ports = {candidate_ip: p for candidate_ip, p in peer.candidate_data_ports.items() if candidate_ip in keep_ips}
+            peer.candidate_data_ports = {
+                candidate_ip: p for candidate_ip, p in peer.candidate_data_ports.items()
+                if candidate_ip in keep_ips
+            }
             peer.confirmed_ips.intersection_update(keep_ips)
+            peer.observed_ips.intersection_update(keep_ips)
+            peer.observed_data_ports = {
+                candidate_ip: p for candidate_ip, p in peer.observed_data_ports.items()
+                if candidate_ip in keep_ips
+            }
             peer.private_ips.intersection_update(keep_ips)
             peer.public_ips.intersection_update(keep_ips)
-            peer.address_roles = {candidate_ip: role for candidate_ip, role in peer.address_roles.items() if candidate_ip in keep_ips}
-            peer.path_successes = {candidate_ip: n for candidate_ip, n in peer.path_successes.items() if candidate_ip in keep_ips}
-            peer.path_failures = {candidate_ip: n for candidate_ip, n in peer.path_failures.items() if candidate_ip in keep_ips}
+            peer.address_roles = {
+                candidate_ip: role for candidate_ip, role in peer.address_roles.items()
+                if candidate_ip in keep_ips
+            }
+            peer.path_successes = {
+                candidate_ip: n for candidate_ip, n in peer.path_successes.items()
+                if candidate_ip in keep_ips
+            }
+            peer.path_failures = {
+                candidate_ip: n for candidate_ip, n in peer.path_failures.items()
+                if candidate_ip in keep_ips
+            }
 
     def _best_peer_ip_locked(self, peer: _Peer) -> str:
         targets = self._candidate_peer_targets(peer)
@@ -39348,9 +40087,11 @@ class HyperVRouterManager:
                 peer.last_hello_from_ip,
                 peer.last_data_from_ip,
                 peer.last_success_ip,
+                getattr(peer, "last_observed_ip", ""),
                 *peer.candidate_ips.keys(),
                 *peer.private_ips,
                 *peer.public_ips,
+                *getattr(peer, "observed_ips", set()),
             }
 
     def _wire_source_matches_peer(
@@ -39371,6 +40112,24 @@ class HyperVRouterManager:
                     not self._wire_require_known_peer_for_data
                     and self._transport_ip_allowed(ip, discovery=False)
                 )
+
+            # ACKs may return through a translated public/private path that is
+            # different from the path used for discovery. A matching random
+            # frame_id plus matching peer node is sufficient to accept the ACK;
+            # wire authentication, when configured, was already verified.
+            if mtype == "ack":
+                frame_id = self._bounded_text(
+                    msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128
+                )
+                with self._pending_lock:
+                    pending = self._pending_frames.get(frame_id)
+                    if (
+                            pending is not None
+                            and str(pending.get("peer_node_id") or "") == str(node_id)
+                            and self._is_usable_unicast_ipv4(ip)
+                    ):
+                        return True
+
             if not self._peer_transport_ip_allowed(peer, ip, discovery=False):
                 return False
             known_ips = {
@@ -39379,18 +40138,14 @@ class HyperVRouterManager:
                 peer.last_hello_from_ip,
                 peer.last_data_from_ip,
                 peer.last_success_ip,
+                getattr(peer, "last_observed_ip", ""),
                 *peer.candidate_ips.keys(),
                 *peer.private_ips,
                 *peer.public_ips,
+                *getattr(peer, "observed_ips", set()),
             }
             if ip in known_ips:
                 return True
-            if mtype == "ack":
-                frame_id = self._bounded_text(msg.get("frame_id") or msg.get("id") or msg.get("ref"), 128)
-                with self._pending_lock:
-                    pending = self._pending_frames.get(frame_id)
-                    if pending is not None and str(pending.get("peer_node_id") or "") == str(node_id):
-                        return True
             if self._allow_peer_ip_migration and self._is_private_ipv4(ip):
                 for known in known_ips:
                     if known and self._is_private_ipv4(known) and (
@@ -39464,10 +40219,6 @@ class HyperVRouterManager:
                 peer.candidate_ips.pop(ip, None)
                 peer.candidate_data_ports.pop(ip, None)
             peer.listen_ip = self._best_peer_ip_locked(peer)
-
-
-
-
 
 @dataclass
 class PacketRecord:
