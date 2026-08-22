@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QLabel, QFormLayout,
                              QToolButton, QSizePolicy,
                              QDialogButtonBox, QListWidget, QDialog,
-                             QCheckBox, QGridLayout, QComboBox, QSlider, QPlainTextEdit)
+                             QCheckBox, QGridLayout, QComboBox, QSlider, QPlainTextEdit, QSpinBox)
 from PyQt5.QtCore import  pyqtSignal,  pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 
@@ -374,6 +374,59 @@ class MiningConfigBox(QWidget):
         self.yield_checkbox.setToolTip("Recommended. Improves system responsiveness.")
         self.yield_checkbox.setChecked(True)
 
+        # ---- GPU settings ----
+        # XMRig Default is intentionally first and selected by default. In this mode
+        # the application enables a detected NVIDIA GPU but does not inject an rx
+        # launch table, allowing XMRig/CUDA to choose its own stock launch settings.
+        self.gpu_preset = QComboBox()
+        self.gpu_preset.addItem("XMRig Default", "xmrig_default")
+        self.gpu_preset.addItem("Existing Auto-Tuned Preset", "auto_tuned")
+        self.gpu_preset.addItem("Manual CUDA Preset", "manual")
+        self.gpu_preset.setCurrentIndex(0)
+        self.gpu_preset.setToolTip(
+            "XMRig Default leaves CUDA launch parameters to XMRig.\n"
+            "Existing Auto-Tuned Preset uses the GPU tuner already included in this client.\n"
+            "Manual CUDA Preset uses the values below."
+        )
+
+        self.cuda_enabled = QCheckBox("Enable NVIDIA CUDA mining")
+        self.cuda_enabled.setChecked(True)
+        self.cuda_enabled.setToolTip(
+            "Enabled by default when an NVIDIA GPU is detected. Disable this to mine CPU-only."
+        )
+
+        self.opencl_enabled = QCheckBox("Enable OpenCL mining")
+        self.opencl_enabled.setChecked(False)
+        self.opencl_enabled.setToolTip(
+            "Enable only when your XMRig build includes the OpenCL plugin and you want AMD/Intel GPU mining."
+        )
+
+        self.gpu_threads = QSpinBox()
+        self.gpu_threads.setRange(1, 128)
+        self.gpu_threads.setValue(32)
+        self.gpu_threads.setToolTip("Manual CUDA threads per block.")
+
+        self.gpu_blocks = QSpinBox()
+        self.gpu_blocks.setRange(1, 4096)
+        self.gpu_blocks.setValue(24)
+        self.gpu_blocks.setToolTip("Manual CUDA block count.")
+
+        self.gpu_bfactor = QSpinBox()
+        self.gpu_bfactor.setRange(0, 12)
+        self.gpu_bfactor.setValue(6)
+        self.gpu_bfactor.setToolTip("Higher values split GPU work into smaller portions and improve responsiveness.")
+
+        self.gpu_bsleep = QSpinBox()
+        self.gpu_bsleep.setRange(0, 1000)
+        self.gpu_bsleep.setValue(25)
+        self.gpu_bsleep.setSuffix(" us")
+        self.gpu_bsleep.setToolTip("Delay between CUDA work portions. Zero gives maximum throughput.")
+
+        self.gpu_dataset_host = QCheckBox("Keep RandomX dataset in host memory")
+        self.gpu_dataset_host.setChecked(False)
+
+        self.gpu_preset.currentIndexChanged.connect(self._update_gpu_manual_controls)
+
         # ---- Buttons ----
         self.mine_button = QPushButton("Start Mining")
         self.stop_button = QPushButton("Stop Mining")
@@ -460,11 +513,39 @@ class MiningConfigBox(QWidget):
         layout.addLayout(power_layout, row, 1, 1, 3)
         row += 1
 
-        # Row 6: Buttons (mine + stop)
+        # GPU controls. They are part of the same profile system as the existing CPU presets.
+        layout.addWidget(QLabel("GPU Preset:"), row, 0)
+        layout.addWidget(self.gpu_preset, row, 1)
+        layout.addWidget(self.cuda_enabled, row, 2)
+        layout.addWidget(self.opencl_enabled, row, 3)
+        row += 1
+
+        layout.addWidget(QLabel("CUDA Threads:"), row, 0)
+        layout.addWidget(self.gpu_threads, row, 1)
+        layout.addWidget(QLabel("CUDA Blocks:"), row, 2)
+        layout.addWidget(self.gpu_blocks, row, 3)
+        row += 1
+
+        layout.addWidget(QLabel("CUDA B-Factor:"), row, 0)
+        layout.addWidget(self.gpu_bfactor, row, 1)
+        layout.addWidget(QLabel("CUDA B-Sleep:"), row, 2)
+        layout.addWidget(self.gpu_bsleep, row, 3)
+        row += 1
+
+        layout.addWidget(self.gpu_dataset_host, row, 0, 1, 4)
+        row += 1
+
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.mine_button)
         button_layout.addWidget(self.stop_button)
-        layout.addLayout(button_layout, row, 0, 1, 4)  # Span across all 4 columns
+        layout.addLayout(button_layout, row, 0, 1, 4)
+        self._update_gpu_manual_controls()
+
+    def _update_gpu_manual_controls(self):
+        manual = self.gpu_preset.currentData() == "manual"
+        for widget in (self.gpu_threads, self.gpu_blocks, self.gpu_bfactor,
+                       self.gpu_bsleep, self.gpu_dataset_host):
+            widget.setEnabled(manual)
 
     def get_values(self):
         """Returns all mining parameters in a dictionary."""
@@ -481,6 +562,14 @@ class MiningConfigBox(QWidget):
                 "priority_boost": self.priority_boost_checkbox.isChecked(),
                 "pl1_pl2": self.power_limit_slider.value(),
                 "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
+                "gpu_preset": self.gpu_preset.currentData(),
+                "cuda_enabled": self.cuda_enabled.isChecked(),
+                "opencl_enabled": self.opencl_enabled.isChecked(),
+                "gpu_threads": self.gpu_threads.value(),
+                "gpu_blocks": self.gpu_blocks.value(),
+                "gpu_bfactor": self.gpu_bfactor.value(),
+                "gpu_bsleep": self.gpu_bsleep.value(),
+                "gpu_dataset_host": self.gpu_dataset_host.isChecked(),
             }
         except (ValueError, TypeError):
             return None  # Indicates invalid input
@@ -500,6 +589,14 @@ class MiningConfigBox(QWidget):
             "priority_boost": self.priority_boost_checkbox.isChecked(),
             "pl1_pl2": self.power_limit_slider.value(),
             "xmrig_msr": self.xmrig_msr_checkbox.isChecked(),
+            "gpu_preset": self.gpu_preset.currentData(),
+            "cuda_enabled": self.cuda_enabled.isChecked(),
+            "opencl_enabled": self.opencl_enabled.isChecked(),
+            "gpu_threads": self.gpu_threads.value(),
+            "gpu_blocks": self.gpu_blocks.value(),
+            "gpu_bfactor": self.gpu_bfactor.value(),
+            "gpu_bsleep": self.gpu_bsleep.value(),
+            "gpu_dataset_host": self.gpu_dataset_host.isChecked(),
         }
 
     def apply_settings(self, settings):
@@ -515,6 +612,18 @@ class MiningConfigBox(QWidget):
         self.priority_boost_checkbox.setChecked(settings.get("priority_boost", False))
         self.power_limit_slider.setValue(settings.get("pl1_pl2", int(self.xmrig_data.hardware_monitor.get_max_power_draw() / 2)))
         self.xmrig_msr_checkbox.setChecked(settings.get("xmrig_msr", False))
+
+        preset = settings.get("gpu_preset", "xmrig_default")
+        preset_index = self.gpu_preset.findData(preset)
+        self.gpu_preset.setCurrentIndex(preset_index if preset_index >= 0 else 0)
+        self.cuda_enabled.setChecked(settings.get("cuda_enabled", True))
+        self.opencl_enabled.setChecked(settings.get("opencl_enabled", False))
+        self.gpu_threads.setValue(int(settings.get("gpu_threads", 32)))
+        self.gpu_blocks.setValue(int(settings.get("gpu_blocks", 24)))
+        self.gpu_bfactor.setValue(int(settings.get("gpu_bfactor", 6)))
+        self.gpu_bsleep.setValue(int(settings.get("gpu_bsleep", 25)))
+        self.gpu_dataset_host.setChecked(settings.get("gpu_dataset_host", False))
+        self._update_gpu_manual_controls()
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""
@@ -562,4 +671,3 @@ class StatsDisplay(QWidget):
         self.power_draw_label.setText(str(stats_payload.get('power_draw', "N/A")))
         self.cpu_shares_label.setText(str(stats_payload.get('cpu_accepted_shares', 0)))
         self.gpu_shares_label.setText(str(stats_payload.get('nvidia_accepted_shares', 0)))
-

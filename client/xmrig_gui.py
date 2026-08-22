@@ -537,6 +537,14 @@ class MinerGui(QWidget):
             self.xmrig_miner.priority_boost = params["priority_boost"]
             self.xmrig_miner.pl1_pl2 = params["pl1_pl2"]
             self.xmrig_miner.xmrig_msr = params["xmrig_msr"]
+            self.xmrig_miner.gpu_preset = params["gpu_preset"]
+            self.xmrig_miner.cuda_enabled = params["cuda_enabled"]
+            self.xmrig_miner.opencl_enabled = params["opencl_enabled"]
+            self.xmrig_miner.gpu_threads = params["gpu_threads"]
+            self.xmrig_miner.gpu_blocks = params["gpu_blocks"]
+            self.xmrig_miner.gpu_bfactor = params["gpu_bfactor"]
+            self.xmrig_miner.gpu_bsleep = params["gpu_bsleep"]
+            self.xmrig_miner.gpu_dataset_host = params["gpu_dataset_host"]
             self._submit_async(self.xmrig_miner.start_miner(params["pool"], params["threads"]))
 
     def handle_stop_mining(self):

@@ -725,6 +725,18 @@ class XmrigMiner:
         self.priority_boost = False
         self.pl1_pl2 = None
         self.xmrig_msr = False
+
+        # GPU defaults mirror stock XMRig behavior: enable a detected NVIDIA GPU,
+        # but leave launch geometry to XMRig unless the user selects a preset.
+        self.gpu_preset = "xmrig_default"
+        self.cuda_enabled = True
+        self.opencl_enabled = False
+        self.gpu_threads = 32
+        self.gpu_blocks = 24
+        self.gpu_bfactor = 6
+        self.gpu_bsleep = 25
+        self.gpu_dataset_host = False
+
         self.cpu_info_flags = set()
 
         self._spawn_lock = asyncio.Lock()
@@ -997,31 +1009,62 @@ class XmrigMiner:
             self.logger.log_message(f"[+] Thread yielding: {'enabled' if config['cpu']['yield'] else 'disabled'}")
 
             has_nvidia_gpu = False
-            if getattr(self.xmrig_data, "hardware_monitor", None):
-                has_nvidia_gpu = bool(self.xmrig_data.hardware_monitor.has_nvidia_gpu)
+            hardware_monitor = getattr(self.xmrig_data, "hardware_monitor", None)
+            if hardware_monitor is not None:
+                has_nvidia_gpu = bool(getattr(hardware_monitor, "has_nvidia_gpu", False))
 
             config.setdefault("cuda", {})
-            config["cuda"]["enabled"] = has_nvidia_gpu
+            cuda_active = bool(self.cuda_enabled and has_nvidia_gpu)
+            config["cuda"]["enabled"] = cuda_active
 
-            if has_nvidia_gpu:
-                if self.xmrig_data.hardware_monitor.tuner:
+            # Always remove stale launch tables first. XMRig Default intentionally
+            # leaves rx absent so XMRig/CUDA can generate its own stock settings.
+            config["cuda"].pop("rx", None)
+
+            if cuda_active and self.gpu_preset == "auto_tuned":
+                tuner = getattr(hardware_monitor, "tuner", None)
+                if tuner:
                     config["cuda"]["rx"] = [{
                         "index": 0,
-                        "threads": self.xmrig_data.hardware_monitor.tuner["threads"],
-                        "blocks": self.xmrig_data.hardware_monitor.tuner["blocks"],
-                        "bfactor": self.xmrig_data.hardware_monitor.tuner["bfactor"],
-                        "bsleep": self.xmrig_data.hardware_monitor.tuner["bsleep"],
+                        "threads": int(tuner["threads"]),
+                        "blocks": int(tuner["blocks"]),
+                        "bfactor": int(tuner["bfactor"]),
+                        "bsleep": int(tuner["bsleep"]),
                         "affinity": -1,
                         "dataset_host": False,
                     }]
-                    self.logger.log_message(
-                        f"[+] Auto CUDA tuning applied: {self.xmrig_data.hardware_monitor.tuner}"
-                    )
+                    self.logger.log_message(f"[+] Existing auto-tuned CUDA preset applied: {tuner}")
                 else:
-                    config["cuda"]["rx"] = []
-                    self.logger.log_message("[!] Failed to determine optimal CUDA tuning")
-            else:
-                config["cuda"]["rx"] = []
+                    self.logger.log_message(
+                        "[!] Auto-tuned CUDA preset selected, but no tuner result exists; using XMRig defaults."
+                    )
+
+            elif cuda_active and self.gpu_preset == "manual":
+                config["cuda"]["rx"] = [{
+                    "index": 0,
+                    "threads": max(1, int(self.gpu_threads)),
+                    "blocks": max(1, int(self.gpu_blocks)),
+                    "bfactor": max(0, min(12, int(self.gpu_bfactor))),
+                    "bsleep": max(0, int(self.gpu_bsleep)),
+                    "affinity": -1,
+                    "dataset_host": bool(self.gpu_dataset_host),
+                }]
+                self.logger.log_message(
+                    "[+] Manual CUDA preset applied: "
+                    f"threads={self.gpu_threads}, blocks={self.gpu_blocks}, "
+                    f"bfactor={self.gpu_bfactor}, bsleep={self.gpu_bsleep}, "
+                    f"dataset_host={self.gpu_dataset_host}"
+                )
+
+            elif cuda_active:
+                self.logger.log_message(
+                    "[+] CUDA enabled with XMRig Default launch settings (no custom rx table injected)."
+                )
+
+            # OpenCL is opt-in because many CUDA-focused XMRig bundles do not ship
+            # the OpenCL plugin. Preserve any existing OpenCL tuning table.
+            config.setdefault("opencl", {})
+            config["opencl"]["enabled"] = bool(self.opencl_enabled)
 
             config["cpu"]["enabled"] = True
             config["cpu"]["rx"] = list(range(int(thread_count)))
@@ -1041,7 +1084,8 @@ class XmrigMiner:
 
         self.logger.log_message(
             f"[+] Updated config.json with {thread_count} threads, pool: {pool_url}, "
-            f"CUDA enabled: {has_nvidia_gpu}"
+            f"CUDA enabled: {cuda_active}, GPU preset: {self.gpu_preset}, "
+            f"OpenCL enabled: {bool(self.opencl_enabled)}"
         )
 
     async def kill_all_xmrig_processes(self):
