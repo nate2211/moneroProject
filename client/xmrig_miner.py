@@ -11,6 +11,13 @@ import time
 
 from contextlib import suppress
 from xmrig_managers import AsyncPsutilManager
+from xmrig_identity import compose_wallet_user, is_gulf_moneroocean_pool, read_mining_identity
+from xmrig_optional_runtime import OptionalPythonDllServices
+from xmrig_native import (
+    EVENT_FATAL_ERROR, EVENT_GPU_STATS, EVENT_HASHRATE, EVENT_JOB,
+    EVENT_POOL_ACTIVITY, EVENT_SHARE, EVENT_TRANSIENT_ERROR,
+    RESTART_NONE, NativeMiningEngine, python_pool_profile,
+)
 
 REPORT_INTERVAL_SECONDS = 5
 SERVER_POLL_INTERVAL_SECONDS = 5
@@ -277,6 +284,7 @@ class OutputMonitor:
         self.xmrig_data = xmrig_data
         self.logger = logger
         self.xmrig_miner = xmrig_miner
+        self.native = getattr(xmrig_miner, "native_engine", None)
         self.reset_runtime_state()
 
     def reset_runtime_state(self):
@@ -291,9 +299,22 @@ class OutputMonitor:
         self.connected_once = False
         self.current_pool = ""
         self.last_pool_error = ""
+        active_native = self._active_native()
+        if active_native is not None:
+            active_native.watchdog_reset()
 
     def mark_process_started(self):
         self.reset_runtime_state()
+
+    def _active_native(self):
+        if self.native is None or not self.native.available:
+            return None
+        if not getattr(self.xmrig_miner, "use_moneroocean_native", False):
+            return None
+        pool = getattr(self.xmrig_data, "custom_pool_url", "") or self.current_pool
+        if not is_gulf_moneroocean_pool(pool):
+            return None
+        return self.native
 
     async def handle_line(self, line_bytes: bytes):
         decoded = line_bytes.decode("utf-8", errors="ignore").strip()
@@ -309,35 +330,70 @@ class OutputMonitor:
 
             decoded = clean_line
             self.logger.log_message(f"[XMRIG] {decoded}")
+            optional_services = getattr(self.xmrig_miner, "optional_dlls", None)
+            if optional_services is not None:
+                try:
+                    optional_services.observe_output(decoded)
+                except BaseException:
+                    # Optional diagnostics are never allowed to interrupt
+                    # XMRig output handling.
+                    pass
 
             low = decoded.lower()
             now = time.monotonic()
             self.last_output_at = now
 
+            active_native = self._active_native()
+            native_event = active_native.parse_line(decoded) if active_native is not None else None
+
+            if native_event and native_event.get("fatal"):
+                self.logger.log_message("[!] Fatal miner output detected by native parser. Restart requested.")
+                return "restart"
+
             if self._is_fatal_output(low):
                 self.logger.log_message("[!] Fatal miner output detected. Restart requested.")
                 return "restart"
 
-            if self._is_pool_activity(low):
+            if (native_event and native_event.get("pool_activity")) or self._is_pool_activity(low):
                 self.last_pool_activity_at = now
                 self.connected_once = True
                 self.consecutive_pool_errors = 0
                 self.last_pool_error = ""
 
-            if "accepted" in low:
+            if (native_event and native_event.get("share")) or "accepted" in low:
                 self.last_share_at = now
-                self._parse_accepted_shares(decoded)
+                if native_event and native_event.get("accepted", 0):
+                    if "nvidia" in low:
+                        self.xmrig_data._latest_nvidia_accepted_shares = native_event["accepted"]
+                    else:
+                        self.xmrig_data._latest_cpu_accepted_shares = native_event["accepted"]
+                else:
+                    self._parse_accepted_shares(decoded)
 
-            if "nvidia" in low and "c" in low:
+            if native_event and native_event.get("gpu_temp_c"):
+                self.xmrig_data._latest_gpu_temp = f"{native_event['gpu_temp_c']}c"
+                if native_event.get("gpu_fan_percent"):
+                    self.xmrig_data._latest_gpu_fan = f"{native_event['gpu_fan_percent']}%"
+            elif "nvidia" in low and "c" in low:
                 self._parse_gpu_stats(decoded)
 
-            if "miner" in low and "speed" in low:
+            if native_event and native_event.get("hashrate_hs", 0.0) > 0:
+                self.xmrig_data._latest_hashrate = float(native_event["hashrate_hs"])
+            elif "miner" in low and "speed" in low:
                 self._parse_hashrate(decoded)
 
-            if "new job from" in low:
-                await self._handle_new_job(decoded)
+            if optional_services is not None:
+                try:
+                    optional_services.update_hashrate(
+                        self.xmrig_data._latest_hashrate
+                    )
+                except BaseException:
+                    pass
 
-            if self._is_transient_pool_error(low):
+            if (native_event and native_event.get("job")) or "new job from" in low:
+                await self._handle_new_job(decoded, native_event=native_event)
+
+            if (native_event and native_event.get("transient_error")) or self._is_transient_pool_error(low):
                 self.last_pool_error_at = now
                 self.consecutive_pool_errors += 1
                 self.last_pool_error = decoded
@@ -355,6 +411,18 @@ class OutputMonitor:
 
     def should_force_pool_recovery(self, now=None) -> bool:
         now = time.monotonic() if now is None else now
+
+        active_native = self._active_native()
+        if active_native is not None:
+            reason = active_native.watchdog_restart_reason(
+                error_streak_limit=POOL_RESTART_ERROR_STREAK,
+                bootstrap_seconds=POOL_BOOTSTRAP_RESTART_SECONDS,
+                pool_stall_seconds=POOL_RESTART_STALL_SECONDS,
+                quiet_seconds=0,
+                cooldown_seconds=15,
+            )
+            if reason != RESTART_NONE:
+                return True
 
         if self.last_pool_error_at <= 0:
             return False
@@ -415,7 +483,7 @@ class OutputMonitor:
         if match:
             self.xmrig_data._latest_hashrate = float(match.group(1))
 
-    async def _handle_new_job(self, line):
+    async def _handle_new_job(self, line, native_event=None):
         self.xmrig_data.last_pool_job_at = time.monotonic()
 
         try:
@@ -424,17 +492,17 @@ class OutputMonitor:
                 return
 
             match = re.search(
-                r"new job from ([\d.:]+).*?diff (\d+).*?algo ([^\s]+).*?height (\d+).*?\((\d+) tx\)",
+                r"new job from ([^\s]+).*?diff (\d+).*?algo ([^\s]+).*?height (\d+).*?\((\d+) tx\)",
                 line,
             )
-            if match:
+            if match or (native_event and native_event.get("job")):
                 job_info = {
                     "client_id": self.xmrig_data.client_id,
-                    "ip": match.group(1),
-                    "difficulty": int(match.group(2)),
-                    "algo": match.group(3),
-                    "height": int(match.group(4)),
-                    "tx_count": int(match.group(5)),
+                    "ip": (native_event or {}).get("pool") or (match.group(1) if match else ""),
+                    "difficulty": int((native_event or {}).get("difficulty") or (match.group(2) if match else 0)),
+                    "algo": (native_event or {}).get("algorithm") or (match.group(3) if match else "unknown"),
+                    "height": int((native_event or {}).get("height") or (match.group(4) if match else 0)),
+                    "tx_count": int(match.group(5)) if match else 0,
                 }
                 await session.post(
                     f"{self.xmrig_data.FLASK_SERVER_URL}/newjob",
@@ -706,6 +774,8 @@ class XmrigMiner:
         self.psutil_xmrig_manager = None
         self.psutil_xmrig = None
 
+        self.native_engine = NativeMiningEngine(self.logger)
+        self.optional_dlls = OptionalPythonDllServices(self.logger)
         self.periodic_reporter = PeriodicReporter(self, self.xmrig_data, self.logger)
         self.server_poller = ServerPoller(self, self.xmrig_data, self.logger)
         self.monitor = OutputMonitor(self, self.xmrig_data, self.logger)
@@ -737,6 +807,15 @@ class XmrigMiner:
         self.gpu_bsleep = 25
         self.gpu_dataset_host = False
 
+        identity = read_mining_identity(self.xmrig_data.CONFIG_PATH)
+        self.wallet = identity.wallet
+        self.append_wallet_difficulty = identity.append_difficulty
+        self.wallet_difficulty = identity.difficulty
+        self.use_moneroocean_native = is_gulf_moneroocean_pool(identity.pool_url)
+        self.python_runtime_enabled = False
+        self.python_usage_enabled = False
+        self.python_usage_interval_ms = 1000
+
         self.cpu_info_flags = set()
 
         self._spawn_lock = asyncio.Lock()
@@ -747,6 +826,16 @@ class XmrigMiner:
             self.cpu_info_flags = set(get_cpu_info().get("flags", []))
         except Exception:
             self.logger.log_message("[!] Failed to detect CPU features")
+
+        native_cpu = self.native_engine.cpu_info() if self.native_engine.available else None
+        if native_cpu:
+            self.logger.log_message(
+                "[Native] CPU topology: "
+                f"logical={native_cpu['logical_processors']} physical={native_cpu['physical_cores']} "
+                f"L3={native_cpu['l3_bytes'] // (1024 * 1024)} MiB; "
+                f"RandomX balanced={native_cpu['recommended_threads_balanced']} "
+                f"max={native_cpu['recommended_threads_max']}"
+            )
 
     def is_running(self) -> bool:
         proc = self.xmrig_data.xmrig_process
@@ -763,6 +852,11 @@ class XmrigMiner:
 
     async def close(self):
         await self.supervisor.close()
+        await asyncio.to_thread(self.optional_dlls.shutdown)
+
+    def _python_usage_sample(self) -> int:
+        value = float(getattr(self.xmrig_data, "_latest_hashrate", 0.0) or 0.0)
+        return int(max(0.0, min(value, 2_147_483_647.0)))
 
     async def _spawn_miner_process(self, pool_url="", thread_count=None):
         async with self._spawn_lock:
@@ -808,15 +902,21 @@ class XmrigMiner:
                     self.xmrig_data.threads,
                 )
 
+            # Optional diagnostic DLLs are deliberately not initialized here.
+            # XMRig must be launched first so a native helper failure can never
+            # prevent the actual miner from starting.
             self.logger.log_message("[+] Starting miner...")
 
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
             proc = await asyncio.create_subprocess_exec(
                 self.xmrig_data.XMRIG_PATH,
+                "--config",
+                self.xmrig_data.CONFIG_PATH,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 creationflags=creationflags,
+                cwd=os.path.dirname(self.xmrig_data.XMRIG_PATH),
             )
 
             self.monitor.mark_process_started()
@@ -824,6 +924,21 @@ class XmrigMiner:
             self.psutil_xmrig_manager = AsyncPsutilManager(proc.pid, self.logger)
             self.psutil_xmrig = self.psutil_xmrig_manager.proc
             self.xmrig_data.client_status = "Started"
+
+            # Start PythonRuntime/PythonUsage only after XMRig exists, and keep
+            # both DLLs in an isolated child process.  Even a native access
+            # violation in either DLL now leaves the miner process untouched.
+            try:
+                self.optional_dlls.configure(
+                    self.python_runtime_enabled,
+                    self.python_usage_enabled,
+                    self.python_usage_interval_ms,
+                    self._python_usage_sample,
+                )
+            except BaseException as e:
+                self.logger.log_message(
+                    f"[Optional DLLs] Initialization failed; mining continues normally: {e}"
+                )
 
             try:
                 await self._apply_process_settings()
@@ -906,6 +1021,7 @@ class XmrigMiner:
 
     async def _terminate_current_process(self):
         async with self._terminate_lock:
+            await asyncio.to_thread(self.optional_dlls.stop_active)
             proc = self.xmrig_data.xmrig_process
 
             if proc is not None:
@@ -988,9 +1104,7 @@ class XmrigMiner:
         with open(self.xmrig_data.CONFIG_PATH, "r+", encoding="utf-8") as f:
             config = json.load(f)
 
-            config["algo"] = "rx"
             config.setdefault("randomx", {})
-            config["randomx"]["algo"] = "rx"
 
             flags = self.cpu_info_flags
             supports_aes = "aes" in flags
@@ -1069,12 +1183,60 @@ class XmrigMiner:
             config["cpu"]["enabled"] = True
             config["cpu"]["rx"] = list(range(int(thread_count)))
 
-            if config.get("pools") and isinstance(config["pools"], list):
-                for pool in config["pools"]:
-                    pool["url"] = pool_url
+            use_native_profile = (
+                self.use_moneroocean_native
+                and self.native_engine.available
+                and is_gulf_moneroocean_pool(pool_url)
+            )
+            profile = self.native_engine.pool_profile(pool_url) if use_native_profile else None
+            if profile is None:
+                profile = python_pool_profile(pool_url)
+
+            effective_wallet = compose_wallet_user(
+                self.wallet,
+                self.append_wallet_difficulty,
+                self.wallet_difficulty,
+            )
+            if not effective_wallet:
+                raise ValueError("Wallet value is empty")
+            self.xmrig_data.wallet = self.wallet
+            self.xmrig_data.effective_wallet = effective_wallet
+            self.xmrig_data.wallet_difficulty = (
+                int(self.wallet_difficulty) if self.append_wallet_difficulty else 0
+            )
+
+            pools = config.get("pools")
+            if not isinstance(pools, list):
+                pools = []
+                config["pools"] = pools
+            if not any(isinstance(item, dict) for item in pools):
+                pools.append({})
+
+            allow_negotiation = bool(profile.get("allow_algo_negotiation"))
+            if allow_negotiation:
+                config["algo"] = None
+                config["randomx"].pop("algo", None)
+            else:
+                config["algo"] = "rx"
+                config["randomx"]["algo"] = "rx"
+
+            for pool in pools:
+                if not isinstance(pool, dict):
+                    continue
+                pool["url"] = profile.get("normalized_url") or pool_url
+                pool["user"] = effective_wallet
+                pool["keepalive"] = True
+                pool["tls"] = bool(profile.get("tls"))
+                pool["sni"] = bool(profile.get("sni"))
+                pool["nicehash"] = False
+
+                if allow_negotiation:
+                    # Gulf MoneroOcean can select the best supported algorithm.
+                    pool["algo"] = None
+                    pool["coin"] = None
+                else:
                     pool["algo"] = "rx/0"
-                    pool["coin"] = "XMR"
-                    pool["keepalive"] = True
+                    pool["coin"] = "monero"
 
             config["randomx"]["wrmsr"] = self.xmrig_msr
 
@@ -1082,8 +1244,12 @@ class XmrigMiner:
             json.dump(config, f, indent=4)
             f.truncate()
 
+        wallet_preview = effective_wallet if len(effective_wallet) <= 28 else (
+            f"{effective_wallet[:14]}...{effective_wallet[-10:]}"
+        )
         self.logger.log_message(
-            f"[+] Updated config.json with {thread_count} threads, pool: {pool_url}, "
+            f"[+] Updated config.json with {thread_count} threads, pool: {profile.get('normalized_url') or pool_url}, "
+            f"wallet user: {wallet_preview}, native MoneroOcean mode: {use_native_profile}, "
             f"CUDA enabled: {cuda_active}, GPU preset: {self.gpu_preset}, "
             f"OpenCL enabled: {bool(self.opencl_enabled)}"
         )

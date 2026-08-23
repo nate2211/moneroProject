@@ -1,11 +1,13 @@
 import psutil
 
+from xmrig_identity import compose_wallet_user, is_gulf_moneroocean_pool, read_mining_identity
+
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QLabel, QFormLayout,
                              QToolButton, QSizePolicy,
                              QDialogButtonBox, QListWidget, QDialog,
-                             QCheckBox, QGridLayout, QComboBox, QSlider, QPlainTextEdit, QSpinBox)
+                             QCheckBox, QGridLayout, QComboBox, QSlider, QPlainTextEdit, QSpinBox, QScrollArea)
 from PyQt5.QtCore import  pyqtSignal,  pyqtSlot, QParallelAnimationGroup, QPropertyAnimation, \
     QAbstractAnimation, Qt
 
@@ -147,20 +149,65 @@ class SettingsDialog(QDialog):
             return self.profiles[current_row]
         return None
 class CollapsibleBox(QWidget):
-    """A collapsible box widget."""
+    """Collapsible section with optional internal scrolling.
 
-    def __init__(self, title="", parent=None, start_expanded=False):
-        super(CollapsibleBox, self).__init__(parent)
+    Normal sections retain their original natural-size behavior.  Large
+    sections, such as Mining Configuration, can opt into a capped scrollable
+    viewport so every control remains reachable without fixing the main window
+    size.
+    """
 
-        self.toggle_button = QToolButton(text=title, checkable=True, checked=start_expanded)
-        self.toggle_button.setObjectName("collapsibleHeader") # Use stylesheet for styling
-        self.toggle_button.setToolButtonStyle(3)  # Qt.ToolButtonTextBesideIcon
-        self.toggle_button.setArrowType(1 if start_expanded else 2)  # Set initial arrow direction
+    def __init__(
+        self,
+        title="",
+        parent=None,
+        start_expanded=False,
+        scrollable=False,
+        max_content_height=360,
+        always_show_vertical_scrollbar=False,
+    ):
+        super().__init__(parent)
+        self._scrollable = bool(scrollable)
+        self._max_content_height = max(160, int(max_content_height))
+        self._expanded_content_height = 0
 
-        self.content_area = QWidget()
-        self.content_area.setMaximumHeight(0)
+        self.toggle_button = QToolButton(
+            text=title,
+            checkable=True,
+            checked=start_expanded,
+        )
+        self.toggle_button.setObjectName("collapsibleHeader")
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(
+            Qt.DownArrow if start_expanded else Qt.RightArrow
+        )
+
+        if self._scrollable:
+            self.content_area = QScrollArea(self)
+            self.content_area.setObjectName("collapsibleScrollArea")
+            self.content_area.setWidgetResizable(True)
+            self.content_area.setFrameStyle(0)
+            self.content_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            self.content_area.setVerticalScrollBarPolicy(
+                Qt.ScrollBarAlwaysOn
+                if always_show_vertical_scrollbar
+                else Qt.ScrollBarAsNeeded
+            )
+
+            self.content_container = QWidget()
+            self.content_container.setObjectName("collapsibleContent")
+            self.content_area_layout = QVBoxLayout(self.content_container)
+            self.content_area_layout.setContentsMargins(0, 0, 0, 0)
+            self.content_area_layout.setSpacing(0)
+            self.content_area.setWidget(self.content_container)
+        else:
+            self.content_area = QWidget(self)
+            self.content_area_layout = QVBoxLayout(self.content_area)
+            self.content_area_layout.setContentsMargins(0, 0, 0, 0)
+            self.content_area_layout.setSpacing(0)
+
         self.content_area.setMinimumHeight(0)
-        self.content_area_layout = QVBoxLayout(self.content_area)
+        self.content_area.setMaximumHeight(0)
 
         self.toggle_animation = QParallelAnimationGroup(self)
 
@@ -171,81 +218,102 @@ class CollapsibleBox(QWidget):
         main_layout.addWidget(self.content_area)
 
         self.toggle_button.clicked.connect(self.toggle)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+    def _collapsed_height(self):
+        return self.toggle_button.sizeHint().height() + 10
+
+    def _clear_content(self):
+        while self.content_area_layout.count():
+            item = self.content_area_layout.takeAt(0)
+            old_widget = item.widget()
+            if old_widget is not None:
+                old_widget.setParent(None)
+
+    def _configure_animation(self, content_height):
+        self._expanded_content_height = max(0, int(content_height))
+
+        while self.toggle_animation.animationCount():
+            self.toggle_animation.removeAnimation(
+                self.toggle_animation.animationAt(0)
+            )
+
+        collapsed_height = self._collapsed_height()
+        expanded_height = collapsed_height + self._expanded_content_height
+
+        self.toggle_animation.addAnimation(
+            QPropertyAnimation(self, b"minimumHeight")
+        )
+        self.toggle_animation.addAnimation(
+            QPropertyAnimation(self, b"maximumHeight")
+        )
+        self.toggle_animation.addAnimation(
+            QPropertyAnimation(self.content_area, b"maximumHeight")
+        )
+
+        for index in range(self.toggle_animation.animationCount()):
+            animation = self.toggle_animation.animationAt(index)
+            animation.setDuration(220)
+            if index < 2:
+                animation.setStartValue(collapsed_height)
+                animation.setEndValue(expanded_height)
+            else:
+                animation.setStartValue(0)
+                animation.setEndValue(self._expanded_content_height)
+
+        if self.toggle_button.isChecked():
+            self.setMinimumHeight(expanded_height)
+            self.setMaximumHeight(expanded_height)
+            self.content_area.setMaximumHeight(self._expanded_content_height)
+        else:
+            self.setMinimumHeight(collapsed_height)
+            self.setMaximumHeight(collapsed_height)
+            self.content_area.setMaximumHeight(0)
 
     @pyqtSlot(bool)
     def toggle(self, checked):
-        self.toggle_button.setArrowType(1 if checked else 2)  # DownArrow or RightArrow
-        self.toggle_animation.setDirection(QAbstractAnimation.Forward if checked else QAbstractAnimation.Backward)
+        self.toggle_button.setArrowType(
+            Qt.DownArrow if checked else Qt.RightArrow
+        )
+        self.toggle_animation.setDirection(
+            QAbstractAnimation.Forward
+            if checked
+            else QAbstractAnimation.Backward
+        )
         self.toggle_animation.start()
 
     def setContentLayout(self, layout):
-        self.content_area_layout.addLayout(layout)
-
-        collapsed_height = self.toggle_button.sizeHint().height() + 10
-        # Use a fixed height to ensure it's predictable on startup
-        content_height = 250
-
-        for i in range(self.toggle_animation.animationCount()):
-            self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
-
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
-
-        for i in range(self.toggle_animation.animationCount()):
-            animation = self.toggle_animation.animationAt(i)
-            animation.setDuration(300)
-            animation.setStartValue(collapsed_height)
-            animation.setEndValue(collapsed_height + content_height)
-
-        content_animation = self.toggle_animation.animationAt(2)
-        content_animation.setStartValue(0)
-        content_animation.setEndValue(content_height)
-
-        # Set initial state without animation
-        if self.toggle_button.isChecked():
-            self.content_area.setMaximumHeight(content_height)
-        else:
-            self.content_area.setMaximumHeight(0)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        host = QWidget()
+        host.setLayout(layout)
+        self.setContentWidget(host)
 
     def setContentWidget(self, widget: QWidget):
-        # Clear old layout
-        for i in reversed(range(self.content_area_layout.count())):
-            old_widget = self.content_area_layout.itemAt(i).widget()
-            if old_widget:
-                old_widget.setParent(None)
-            self.content_area_layout.removeItem(self.content_area_layout.itemAt(i))
+        self._clear_content()
 
-        self.content_area_layout.addWidget(widget)
-
-        collapsed_height = self.toggle_button.sizeHint().height() + 10
-        content_height = widget.sizeHint().height() + 20
-
-        # Remove existing animations
-        for i in range(self.toggle_animation.animationCount()):
-            self.toggle_animation.removeAnimation(self.toggle_animation.animationAt(0))
-
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
-        self.toggle_animation.addAnimation(QPropertyAnimation(self.content_area, b"maximumHeight"))
-
-        for i in range(self.toggle_animation.animationCount()):
-            animation = self.toggle_animation.animationAt(i)
-            animation.setDuration(300)
-            animation.setStartValue(collapsed_height)
-            animation.setEndValue(collapsed_height + content_height)
-
-        content_animation = self.toggle_animation.animationAt(2)
-        content_animation.setStartValue(0)
-        content_animation.setEndValue(content_height)
-
-        # Set initial state
-        if self.toggle_button.isChecked():
-            self.content_area.setMaximumHeight(content_height)
+        if self._scrollable:
+            widget.setParent(self.content_container)
         else:
-            self.content_area.setMaximumHeight(0)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            widget.setParent(self.content_area)
+
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        widget.ensurePolished()
+        if widget.layout() is not None:
+            widget.layout().activate()
+        widget.adjustSize()
+        natural_height = max(1, widget.sizeHint().height() + 8)
+
+        if self._scrollable:
+            # Preserve the full option page as scrollable content.  The Start
+            # and Stop buttons remain in the final grid row and are reachable
+            # by moving the vertical scrollbar to the bottom.
+            widget.setMinimumHeight(natural_height)
+            self.content_container.setMinimumHeight(natural_height)
+            viewport_height = min(self._max_content_height, natural_height)
+            self.content_area_layout.addWidget(widget)
+            self._configure_animation(viewport_height)
+        else:
+            self.content_area_layout.addWidget(widget)
+            self._configure_animation(natural_height)
 
 class ConnectionSettingsBox(QWidget):
     """A widget for managing connection settings."""
@@ -311,6 +379,7 @@ class MiningConfigBox(QWidget):
     def __init__(self, xmrig_data, parent=None):
         super().__init__(parent)
         self.xmrig_data = xmrig_data
+        self._config_identity = read_mining_identity(self.xmrig_data.CONFIG_PATH)
         # Use QGridLayout for more control over rows and columns
         layout = QGridLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -320,7 +389,58 @@ class MiningConfigBox(QWidget):
 
         # --- Create Widgets ---
         self.pool_ip_input = QLineEdit()
+        self.pool_ip_input.setPlaceholderText("gulf.moneroocean.stream:10128")
         self.thread_count_input = QLineEdit()
+
+        self.wallet_input = QLineEdit()
+        self.wallet_input.setPlaceholderText("Actual wallet address / pool username")
+        self.wallet_input.setToolTip(
+            "The base wallet value written to pools[].user. The optional difficulty suffix is managed separately."
+        )
+        self.append_difficulty_checkbox = QCheckBox("Append fixed difficulty to wallet")
+        self.append_difficulty_checkbox.setToolTip(
+            "Writes the effective pool user as wallet+difficulty. Leave disabled when your pool uses port-based difficulty."
+        )
+        self.wallet_difficulty = QSpinBox()
+        self.wallet_difficulty.setRange(1, 2_147_483_647)
+        self.wallet_difficulty.setValue(max(1, int(self._config_identity.difficulty)))
+        self.wallet_difficulty.setToolTip("Difficulty appended to the effective wallet username.")
+        self.effective_wallet_label = QLabel()
+        self.effective_wallet_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.use_moneroocean_native_checkbox = QCheckBox("Use MoneroOcean native DLL")
+        self.use_moneroocean_native_checkbox.setToolTip(
+            "Uses NateMiningNative.dll for Gulf MoneroOcean pool profiling, output parsing, and watchdog decisions. "
+            "Python fallbacks remain available."
+        )
+        self.python_runtime_checkbox = QCheckBox("Enable PythonRuntime.dll (isolated)")
+        self.python_runtime_checkbox.setToolTip(
+            "Enables the bounded native asynchronous diagnostics queue. XMRig remains the hashing engine."
+        )
+        self.python_usage_checkbox = QCheckBox("Enable PythonUsage.dll (isolated)")
+        self.python_usage_checkbox.setToolTip(
+            "Starts the native callback worker that samples the latest XMRig hashrate from Python."
+        )
+        self.python_usage_interval = QSpinBox()
+        self.python_usage_interval.setRange(50, 60_000)
+        self.python_usage_interval.setValue(1000)
+        self.python_usage_interval.setSuffix(" ms")
+        self.python_usage_interval.setToolTip("PythonUsage native callback interval.")
+        self.native_mode_label = QLabel()
+        self.native_mode_label.setWordWrap(True)
+        self.optional_dll_note_label = QLabel(
+            "PythonRuntime and PythonUsage run in a separate helper process. "
+            "They provide diagnostics only and cannot block XMRig hashing."
+        )
+        self.optional_dll_note_label.setWordWrap(True)
+
+        self.wallet_input.textChanged.connect(self._update_wallet_preview)
+        self.append_difficulty_checkbox.toggled.connect(self._update_wallet_preview)
+        self.append_difficulty_checkbox.toggled.connect(self.wallet_difficulty.setEnabled)
+        self.wallet_difficulty.valueChanged.connect(self._update_wallet_preview)
+        self.pool_ip_input.textChanged.connect(self._update_native_mode_label)
+        self.use_moneroocean_native_checkbox.toggled.connect(self._update_native_mode_label)
+        self.python_usage_checkbox.toggled.connect(self.python_usage_interval.setEnabled)
 
         # --- ADD THIS WIDGET ---
         self.high_priority_checkbox = QCheckBox("Run as High Priority Process")
@@ -465,47 +585,69 @@ class MiningConfigBox(QWidget):
 
 
         # --- Layout rows ---
+        row = 0
+        layout.addWidget(QLabel("Pool Address:"), row, 0)
+        layout.addWidget(self.pool_ip_input, row, 1)
+        layout.addWidget(QLabel("CPU Threads:"), row, 2)
+        layout.addWidget(self.thread_count_input, row, 3)
+        row += 1
 
-        # Row 0: Pool Address + CPU Threads
-        layout.addWidget(QLabel("Pool Address:"), 0, 0)
-        layout.addWidget(self.pool_ip_input, 0, 1)
-        layout.addWidget(QLabel("CPU Threads:"), 0, 2)
-        layout.addWidget(self.thread_count_input, 0, 3)
+        layout.addWidget(QLabel("Actual Wallet:"), row, 0)
+        layout.addWidget(self.wallet_input, row, 1, 1, 3)
+        row += 1
 
-        # Row 1: CPU Affinity + CPU Priority
-        layout.addWidget(QLabel("CPU Affinity:"), 1, 0)
+        layout.addWidget(self.append_difficulty_checkbox, row, 0, 1, 2)
+        layout.addWidget(QLabel("Wallet Difficulty:"), row, 2)
+        layout.addWidget(self.wallet_difficulty, row, 3)
+        row += 1
+
+        layout.addWidget(QLabel("Effective Pool User:"), row, 0)
+        layout.addWidget(self.effective_wallet_label, row, 1, 1, 3)
+        row += 1
+
+        layout.addWidget(self.use_moneroocean_native_checkbox, row, 0, 1, 2)
+        layout.addWidget(self.python_runtime_checkbox, row, 2)
+        layout.addWidget(self.python_usage_checkbox, row, 3)
+        row += 1
+
+        layout.addWidget(self.optional_dll_note_label, row, 0, 1, 4)
+        row += 1
+
+        layout.addWidget(QLabel("PythonUsage Interval:"), row, 0)
+        layout.addWidget(self.python_usage_interval, row, 1)
+        layout.addWidget(self.native_mode_label, row, 2, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("CPU Affinity:"), row, 0)
         affinity_layout = QHBoxLayout()
         affinity_layout.addWidget(self.cpu_affinity_slider)
         affinity_layout.addWidget(self.cpu_affinity_label)
-        layout.addLayout(affinity_layout, 1, 1)
+        layout.addLayout(affinity_layout, row, 1)
+        layout.addWidget(QLabel("CPU Priority:"), row, 2)
+        layout.addWidget(self.cpu_priority, row, 3)
+        row += 1
 
-        layout.addWidget(QLabel("CPU Priority:"), 1, 2)
-        layout.addWidget(self.cpu_priority, 1, 3)
+        layout.addWidget(QLabel("OS Priority:"), row, 0)
+        layout.addWidget(self.high_priority_checkbox, row, 1)
+        layout.addWidget(QLabel("CPU Yield:"), row, 2)
+        layout.addWidget(self.yield_checkbox, row, 3)
+        row += 1
 
-        # Row 2: OS Priority + CPU Yield
-        layout.addWidget(QLabel("OS Priority:"), 2, 0)
-        layout.addWidget(self.high_priority_checkbox, 2, 1)
-        layout.addWidget(QLabel("CPU Yield:"), 2, 2)
-        layout.addWidget(self.yield_checkbox, 2, 3)
-
-        # Row 3: I/O Priority + Memory Usage
-        layout.addWidget(QLabel("I/O Priority:"), 3, 0)
-        layout.addWidget(self.io_priority, 3, 1)
-
-        layout.addWidget(QLabel("Memory Usage:"), 3, 2)
+        layout.addWidget(QLabel("I/O Priority:"), row, 0)
+        layout.addWidget(self.io_priority, row, 1)
+        layout.addWidget(QLabel("Memory Usage:"), row, 2)
         mem_layout = QHBoxLayout()
         mem_layout.addWidget(self.memory_usage_slider)
         mem_layout.addWidget(self.memory_usage_label)
-        layout.addLayout(mem_layout, 3, 3)
+        layout.addLayout(mem_layout, row, 3)
+        row += 1
 
-        # Row 4: Priority Boost + Xmrig MSR
-        layout.addWidget(QLabel("Priority Boost:"), 4, 0)
-        layout.addWidget(self.priority_boost_checkbox, 4, 1)
-        layout.addWidget(QLabel("Xmrig MSR:"), 4, 2)
-        layout.addWidget(self.xmrig_msr_checkbox, 4, 3)
+        layout.addWidget(QLabel("Priority Boost:"), row, 0)
+        layout.addWidget(self.priority_boost_checkbox, row, 1)
+        layout.addWidget(QLabel("Xmrig MSR:"), row, 2)
+        layout.addWidget(self.xmrig_msr_checkbox, row, 3)
+        row += 1
 
-        # Row 5 (Intel Only): Power Limit slider
-        row = 5
         layout.addWidget(self.power_limit_desc_label, row, 0)
         power_layout = QHBoxLayout()
         power_layout.addWidget(self.power_limit_slider)
@@ -513,7 +655,6 @@ class MiningConfigBox(QWidget):
         layout.addLayout(power_layout, row, 1, 1, 3)
         row += 1
 
-        # GPU controls. They are part of the same profile system as the existing CPU presets.
         layout.addWidget(QLabel("GPU Preset:"), row, 0)
         layout.addWidget(self.gpu_preset, row, 1)
         layout.addWidget(self.cuda_enabled, row, 2)
@@ -540,6 +681,30 @@ class MiningConfigBox(QWidget):
         button_layout.addWidget(self.stop_button)
         layout.addLayout(button_layout, row, 0, 1, 4)
         self._update_gpu_manual_controls()
+        self._update_wallet_preview()
+        self._update_native_mode_label()
+        self.python_usage_interval.setEnabled(self.python_usage_checkbox.isChecked())
+
+    def _update_wallet_preview(self, *_):
+        effective = compose_wallet_user(
+            self.wallet_input.text(),
+            self.append_difficulty_checkbox.isChecked(),
+            self.wallet_difficulty.value(),
+        )
+        self.effective_wallet_label.setText(effective or "<wallet not set>")
+
+    def _update_native_mode_label(self, *_):
+        gulf = is_gulf_moneroocean_pool(self.pool_ip_input.text())
+        native = self.use_moneroocean_native_checkbox.isChecked()
+        if gulf and native:
+            text = "Gulf MoneroOcean: native pool parser/watchdog selected; algorithm negotiation stays enabled."
+        elif gulf:
+            text = "Gulf MoneroOcean: Python fallback selected; algorithm negotiation stays enabled."
+        elif native:
+            text = "Native DLL is enabled, but Gulf-specific behavior activates only for gulf.moneroocean.stream."
+        else:
+            text = "Python-only pool handling selected."
+        self.native_mode_label.setText(text)
 
     def _update_gpu_manual_controls(self):
         manual = self.gpu_preset.currentData() == "manual"
@@ -553,6 +718,18 @@ class MiningConfigBox(QWidget):
             return {
                 "pool": self.pool_ip_input.text().strip(),
                 "threads": int(self.thread_count_input.text().strip()),
+                "wallet": self.wallet_input.text().strip(),
+                "append_wallet_difficulty": self.append_difficulty_checkbox.isChecked(),
+                "wallet_difficulty": self.wallet_difficulty.value(),
+                "effective_wallet": compose_wallet_user(
+                    self.wallet_input.text(),
+                    self.append_difficulty_checkbox.isChecked(),
+                    self.wallet_difficulty.value(),
+                ),
+                "use_moneroocean_native": self.use_moneroocean_native_checkbox.isChecked(),
+                "python_runtime_enabled": self.python_runtime_checkbox.isChecked(),
+                "python_usage_enabled": self.python_usage_checkbox.isChecked(),
+                "python_usage_interval_ms": self.python_usage_interval.value(),
                 "cpu_priority": self.cpu_priority.currentData(),
                 "cpu_yield": self.yield_checkbox.isChecked(),
                 "high_priority": self.high_priority_checkbox.isChecked(),
@@ -580,6 +757,13 @@ class MiningConfigBox(QWidget):
         return {
             "pool_ip": values.get("pool") if values else "",
             "thread_count": str(values.get("threads")) if values else "",
+            "wallet": self.wallet_input.text().strip(),
+            "append_wallet_difficulty": self.append_difficulty_checkbox.isChecked(),
+            "wallet_difficulty": self.wallet_difficulty.value(),
+            "use_moneroocean_native": self.use_moneroocean_native_checkbox.isChecked(),
+            "python_runtime_enabled": self.python_runtime_checkbox.isChecked(),
+            "python_usage_enabled": self.python_usage_checkbox.isChecked(),
+            "python_usage_interval_ms": self.python_usage_interval.value(),
             "priority_index": self.cpu_priority.currentIndex(),
             "yield_cpu": self.yield_checkbox.isChecked(),
             "high_priority": self.high_priority_checkbox.isChecked(),
@@ -601,8 +785,21 @@ class MiningConfigBox(QWidget):
 
     def apply_settings(self, settings):
         """Applies a settings dictionary to this widget."""
-        self.pool_ip_input.setText(settings.get("pool_ip", "192.168.0.10:3333"))
+        default_pool = self._config_identity.pool_url or "gulf.moneroocean.stream:10128"
+        self.pool_ip_input.setText(settings.get("pool_ip", default_pool))
         self.thread_count_input.setText(settings.get("thread_count", "8"))
+        self.wallet_input.setText(settings.get("wallet", self._config_identity.wallet))
+        self.append_difficulty_checkbox.setChecked(settings.get(
+            "append_wallet_difficulty", self._config_identity.append_difficulty
+        ))
+        self.wallet_difficulty.setValue(int(settings.get(
+            "wallet_difficulty", self._config_identity.difficulty or 10000
+        )))
+        default_native = is_gulf_moneroocean_pool(self.pool_ip_input.text())
+        self.use_moneroocean_native_checkbox.setChecked(settings.get("use_moneroocean_native", default_native))
+        self.python_runtime_checkbox.setChecked(settings.get("python_runtime_enabled", False))
+        self.python_usage_checkbox.setChecked(settings.get("python_usage_enabled", False))
+        self.python_usage_interval.setValue(int(settings.get("python_usage_interval_ms", 1000)))
         self.cpu_priority.setCurrentIndex(settings.get("priority_index", 1))
         self.yield_checkbox.setChecked(settings.get("yield_cpu", True))
         self.high_priority_checkbox.setChecked(settings.get("high_priority", True))
@@ -624,6 +821,10 @@ class MiningConfigBox(QWidget):
         self.gpu_bsleep.setValue(int(settings.get("gpu_bsleep", 25)))
         self.gpu_dataset_host.setChecked(settings.get("gpu_dataset_host", False))
         self._update_gpu_manual_controls()
+        self.wallet_difficulty.setEnabled(self.append_difficulty_checkbox.isChecked())
+        self.python_usage_interval.setEnabled(self.python_usage_checkbox.isChecked())
+        self._update_wallet_preview()
+        self._update_native_mode_label()
 
 class StatsDisplay(QWidget):
     """A widget to display real-time miner statistics in columns."""

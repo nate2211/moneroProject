@@ -232,6 +232,9 @@ class XmrigData:
         self.last_known_pool_url = None
         self.last_known_thread_count = None
         self.custom_pool_url = None
+        self.wallet = ""
+        self.effective_wallet = ""
+        self.wallet_difficulty = 0
         self.client_status = "Stopped"
         self.threads = None
         self.aiohttp_client_session = None

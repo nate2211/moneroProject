@@ -120,6 +120,7 @@ class MinerGui(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("Nate's Mining Client")
+        # Keep the original resizable window behavior.
         self.setGeometry(100, 100, 800, 750)
         self.setStyleSheet(
             """
@@ -160,6 +161,37 @@ class MinerGui(QWidget):
                     border-radius: 4px;
                     color: #E0E0E0;
                     border: 1px solid #333333;
+                }
+                QScrollArea#collapsibleScrollArea {
+                    background-color: #121212;
+                    border: none;
+                }
+                QScrollBar:vertical {
+                    background: #191919;
+                    width: 14px;
+                    margin: 0;
+                }
+                QScrollBar::handle:vertical {
+                    background: #555555;
+                    min-height: 32px;
+                    border-radius: 6px;
+                }
+                QScrollBar::handle:vertical:hover { background: #777777; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0;
+                }
+                QScrollBar:horizontal {
+                    background: #191919;
+                    height: 14px;
+                    margin: 0;
+                }
+                QScrollBar::handle:horizontal {
+                    background: #555555;
+                    min-width: 32px;
+                    border-radius: 6px;
+                }
+                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                    width: 0;
                 }
                 QFrame[frameShape="4"] { border-top: 1px solid #333333; }
                 QToolButton#collapsibleHeader {
@@ -221,12 +253,20 @@ class MinerGui(QWidget):
         miner_page_layout.addWidget(self.stats_display)
 
         self.connection_box = ConnectionSettingsBox()
-        connection_collapsible = CollapsibleBox("Connection Settings", start_expanded=True)
+        connection_collapsible = CollapsibleBox(
+            "Connection Settings", start_expanded=True
+        )
         connection_collapsible.setContentWidget(self.connection_box)
         miner_page_layout.addWidget(connection_collapsible)
 
         self.mining_box = MiningConfigBox(self.xmrig_data)
-        mining_collapsible = CollapsibleBox("Mining Configuration", start_expanded=True)
+        mining_collapsible = CollapsibleBox(
+            "Mining Configuration",
+            start_expanded=True,
+            scrollable=True,
+            max_content_height=360,
+            always_show_vertical_scrollbar=True,
+        )
         mining_collapsible.setContentWidget(self.mining_box)
         miner_page_layout.addWidget(mining_collapsible)
 
@@ -517,12 +557,9 @@ class MinerGui(QWidget):
             )
 
     def handle_start_mining(self):
-        try:
-            params = self.mining_box.get_values()
-            if params["threads"] <= 0 or not params["pool"]:
-                raise ValueError
-        except ValueError:
-            self.logger.log_message("[!] Invalid thread count or pool address.")
+        params = self.mining_box.get_values()
+        if not params or params["threads"] <= 0 or not params["pool"] or not params["wallet"]:
+            self.logger.log_message("[!] Enter a valid thread count, pool address, and wallet value.")
             return
 
         if self.async_worker and self.async_worker.isRunning():
@@ -545,6 +582,13 @@ class MinerGui(QWidget):
             self.xmrig_miner.gpu_bfactor = params["gpu_bfactor"]
             self.xmrig_miner.gpu_bsleep = params["gpu_bsleep"]
             self.xmrig_miner.gpu_dataset_host = params["gpu_dataset_host"]
+            self.xmrig_miner.wallet = params["wallet"]
+            self.xmrig_miner.append_wallet_difficulty = params["append_wallet_difficulty"]
+            self.xmrig_miner.wallet_difficulty = params["wallet_difficulty"]
+            self.xmrig_miner.use_moneroocean_native = params["use_moneroocean_native"]
+            self.xmrig_miner.python_runtime_enabled = params["python_runtime_enabled"]
+            self.xmrig_miner.python_usage_enabled = params["python_usage_enabled"]
+            self.xmrig_miner.python_usage_interval_ms = params["python_usage_interval_ms"]
             self._submit_async(self.xmrig_miner.start_miner(params["pool"], params["threads"]))
 
     def handle_stop_mining(self):
