@@ -267,7 +267,7 @@ class PythonRouterManager:
         self.ollama_router_bridge = None
         # Tracks the extra on-link WAN address we may publish to NAT in double-NAT cases
         self._nat_last_marked_public_on_lan: Optional[str] = None
-
+        self.hyperv_enabled = False
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
 
     def _current_lan_transit_ifaces(self) -> set[str]:
@@ -5680,7 +5680,7 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if self.started:
                 self.router_logger.log_message("[Router] Start requested while already running; ignoring.")
                 return
-
+            self.hyperv_enabled = use_hyperv
             self._enable_dhcp_server = bool(enable_dhcp_server)
             self._serve_dhcp_on_wan = bool(serve_dhcp_on_wan)
             self._dhcp_server_settings = dict(
@@ -9949,7 +9949,7 @@ class WiresharkManager:
                     except Exception:
                         pass
 
-                    if self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(
+                    if self.router_manager.hyperv_enabled and self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(
                             scapy_pkt, scapy_raw, "WireShark"
                     ):
                         return
@@ -9960,30 +9960,15 @@ class WiresharkManager:
                                     src_ip)) or
                                 (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(dst_ip))
                         ):
-                            if (
-                                    self.router_manager.router_ip_out in str(src_ip)
-                                    and self.router_manager.router_ip_out in str(dst_ip)
-                            ):
-                                self.logger.log_message("[Wireshark-Process] Skipping Routers self forward")
-                                return
-
-                            if self.router_manager.router_ip_out in str(dst_ip):
-                                self.logger.log_message(
-                                    "[Wireshark-Process] 🪈 Sending Routers own packet via Scapy through PYPIPE"
-                                )
-                                self.router_manager.hyperv_manager.send_packet(scapy_raw)
-                            else:
                                 self.logger.log_message(
                                     "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
                                 )
                                 self.router_manager.process_packet(scapy_pkt, "WireShark")
-                            return
-
+                                return
                         self.logger.log_message(
                             "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
                         )
                         self.router_manager.process_packet(scapy_pkt, "WireShark")
-
                     except TypeError:
                         self.router_manager.process_packet(scapy_pkt)
 
