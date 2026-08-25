@@ -16,7 +16,6 @@ import json
 import math
 import re
 import collections
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Deque, Iterable
 import psutil
@@ -55,13 +54,6 @@ try:
 except ImportError:
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
     sys.exit(1)
-
-def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
-    """Local logging helper kept dependency-free to avoid router import cycles."""
-    import random
-    emoji = random.choice(emoticons) if emoticons else ""
-    return f"[{name}] {emoji} {message}".rstrip()
-
 
 # --- Load the libpcap library dynamically ---
 try:
@@ -341,11 +333,11 @@ class SnifferSoftware:
         # These defaults deliberately favor loss resistance without asking
         # Npcap for unbounded buffers that could destabilize a busy router.
         # ------------------------------------------------------------------
-        self.capture_snapshot_length = 262144
-        self.capture_kernel_buffer_bytes = 64 * 1024 * 1024
-        self.capture_read_timeout_ms = 100
+        self.capture_snapshot_length = 65535
+        self.capture_kernel_buffer_bytes = 8 * 1024 * 1024
+        self.capture_read_timeout_ms = 250
         self.capture_immediate_mode = False
-        self.capture_request_nanosecond_timestamps = True
+        self.capture_request_nanosecond_timestamps = False
         self.capture_stats_interval_sec = 1.0
         self.capture_raw_retention_limit = self.capture_snapshot_length
         self.capture_stream_tail_bytes = 512 * 1024
@@ -414,6 +406,19 @@ class SnifferSoftware:
         self.capture_fragment_idle_sec = _cfg_float(
             "fragment_idle_sec", self.capture_fragment_idle_sec, 5.0, 600.0
         )
+
+        # Driver-safety profile: large Npcap snapshots/buffers can amplify nonpaged
+        # pool pressure and expose buggy NIC filter drivers under sustained traffic.
+        # Keep Windows capture requests conservative; full TCP streams are rebuilt
+        # in bounded user-space state rather than requesting jumbo kernel buffers.
+        if os.name == "nt":
+            self.capture_snapshot_length = min(int(self.capture_snapshot_length), 65535)
+            self.capture_kernel_buffer_bytes = min(
+                max(1 * 1024 * 1024, int(self.capture_kernel_buffer_bytes)),
+                16 * 1024 * 1024,
+            )
+            self.capture_read_timeout_ms = max(50, int(self.capture_read_timeout_ms))
+            self.capture_immediate_mode = False
         for key, attr in (
             ("immediate_mode", "capture_immediate_mode"),
             ("nanosecond_timestamps", "capture_request_nanosecond_timestamps"),
@@ -459,13 +464,15 @@ class SnifferSoftware:
             22, 25, 53, 80, 88, 110, 135, 139, 143, 389, 443, 445,
             465, 587, 636, 853, 993, 995, 1433, 1521, 2375, 2376,
             3306, 3389, 4444, 5000, 5432, 5671, 5672, 6379, 8080,
-            8443, 8883, 9000, 9092, 10001, 10128, 18080, 18081,
-            18089, 3333, 4444, 5555, 7777,
+            8443, 8883, 9000, 9092, 10001, 10128, 10132, 14444,
+            18080, 18081, 18082, 18083, 18084, 18089, 24444,
+            28080, 28081, 3333, 4444, 5555, 6666, 7777, 8888,
+            9999,
         }
         self._high_value_udp_ports = {
             53, 67, 68, 88, 123, 161, 162, 389, 443, 500, 514,
-            520, 546, 547, 1900, 4500, 4789, 5353, 6081, 8472,
-            9090,
+            520, 546, 547, 1900, 3702, 4500, 4789, 51820, 5353,
+            5355, 6081, 8472, 9090, 9993,
         }
         self._stratum_method_names = {
             "mining.subscribe", "mining.authorize", "mining.configure",
@@ -1473,23 +1480,34 @@ class SnifferSoftware:
             pass
 
     def _payload_bytes(self, packet: Packet) -> bytes:
-        """Return the deepest readily available application payload."""
+        """Return the complete L4 application payload when possible.
+
+        Prefer bytes(TCP/UDP.payload) over the deepest Raw layer.  Scapy may
+        dissect a TLS record into TLS/handshake/Raw layers; selecting the deepest
+        Raw object strips the record header and makes a known Stratum-over-TLS
+        flow look like unrelated ciphertext.  The transport payload preserves
+        plaintext Stratum framing and complete TLS records alike.
+        """
         if packet is None:
             return b""
+
+        transport = self._find_transport_layer(packet)
+        if transport is not None:
+            try:
+                payload = getattr(transport, "payload", None)
+                if payload is not None and payload.__class__.__name__ != "NoPayload":
+                    data = bytes(payload)
+                    if data:
+                        return data
+            except Exception:
+                pass
+
         try:
             raw_layer = packet.getlayer(Raw)
             if raw_layer is not None:
                 return bytes(getattr(raw_layer, "load", b"") or b"")
         except Exception:
             pass
-        transport = self._find_transport_layer(packet)
-        if transport is not None:
-            try:
-                payload = getattr(transport, "payload", None)
-                if isinstance(payload, Raw):
-                    return bytes(payload.load or b"")
-            except Exception:
-                pass
         return b""
 
     def _packet_endpoint_tuple(self, packet: Packet):
@@ -2843,6 +2861,117 @@ class SnifferSoftware:
                 "window": int(getattr(tcp, "window", 0) or 0),
                 "options": self._tcp_options_metadata(tcp),
             }
+
+        # Control-plane and service hints remain metadata only; they never alter
+        # or decrypt traffic. They let the bounded ingress path preserve packets
+        # that are operationally valuable even when application payload is
+        # encrypted or fragmented.
+        try:
+            arp = packet.getlayer(ARP)
+            if arp is not None:
+                metadata["arp"] = {
+                    "operation": int(getattr(arp, "op", 0) or 0),
+                    "sender_ip": str(getattr(arp, "psrc", "") or ""),
+                    "target_ip": str(getattr(arp, "pdst", "") or ""),
+                }
+        except Exception:
+            pass
+
+        try:
+            ndp_types = (
+                (ICMPv6ND_NS, "neighbor-solicitation"),
+                (ICMPv6ND_NA, "neighbor-advertisement"),
+                (ICMPv6ND_RS, "router-solicitation"),
+                (ICMPv6ND_RA, "router-advertisement"),
+                (ICMPv6ND_Redirect, "redirect"),
+            )
+            for layer_type, name in ndp_types:
+                layer = packet.getlayer(layer_type)
+                if layer is not None:
+                    metadata["ndp"] = {
+                        "message": name,
+                        "target": str(getattr(layer, "tgt", "") or ""),
+                    }
+                    break
+        except Exception:
+            pass
+
+        for layer_type, key in ((ESP, "esp"), (AH, "ah"), (ISAKMP, "ike"), (EAPOL, "eapol"), (Kerberos, "kerberos")):
+            try:
+                if packet.getlayer(layer_type) is not None:
+                    metadata[key] = {"protocol": key}
+            except Exception:
+                pass
+
+        tcp_services = {
+            21: "ftp", 22: "ssh", 25: "smtp", 53: "dns-tcp", 80: "http",
+            88: "kerberos", 110: "pop3", 135: "msrpc", 139: "netbios",
+            143: "imap", 389: "ldap", 443: "tls", 445: "smb",
+            465: "smtps", 587: "smtp-submission", 636: "ldaps", 853: "dot",
+            993: "imaps", 995: "pop3s", 1433: "mssql", 1521: "oracle",
+            2375: "docker", 2376: "docker-tls", 3306: "mysql", 3389: "rdp",
+            5432: "postgres", 5671: "amqps", 5672: "amqp", 6379: "redis",
+            8080: "http-alt", 8443: "tls-alt", 8883: "mqtt-tls", 9092: "kafka",
+            10001: "gulf-moneroocean-stratum", 10128: "gulf-moneroocean-stratum",
+            10132: "gulf-moneroocean-stratum", 18080: "monero-p2p",
+            18081: "monero-rpc", 18082: "monero-zmq",
+        }
+        for port in (3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444):
+            tcp_services.setdefault(port, "stratum")
+        udp_services = {
+            53: "dns", 67: "dhcp-server", 68: "dhcp-client", 88: "kerberos",
+            123: "ntp", 161: "snmp", 162: "snmp-trap", 443: "quic",
+            500: "ike", 514: "syslog", 520: "rip", 546: "dhcpv6-client",
+            547: "dhcpv6-server", 1900: "ssdp", 3702: "ws-discovery",
+            4500: "ipsec-natt", 4789: "vxlan", 51820: "wireguard",
+            5353: "mdns", 5355: "llmnr", 6081: "geneve", 9993: "zerotier",
+        }
+        try:
+            if tcp is not None:
+                sport = int(getattr(tcp, "sport", 0) or 0)
+                dport = int(getattr(tcp, "dport", 0) or 0)
+                service_port = dport if dport in tcp_services else sport if sport in tcp_services else 0
+                if service_port:
+                    service_name = tcp_services[service_port]
+                    metadata["service"] = {
+                        "transport": "tcp",
+                        "port": service_port,
+                        "name": service_name,
+                    }
+
+                    # A configured Stratum service port is authoritative transport
+                    # metadata even when its application bytes are encrypted or the
+                    # capture begins on a SYN/ACK.  Keep any parsed plaintext JSON
+                    # metadata, but otherwise attach a bounded port-derived Stratum
+                    # identity so ingress preservation and transport dispatch do not
+                    # reduce the connection to only "initial" or "tls".
+                    if "stratum" in service_name and "stratum" not in metadata:
+                        tls_meta = metadata.get("tls")
+                        metadata["stratum"] = {
+                            "protocol": (
+                                "stratum-over-tls"
+                                if tls_meta is not None
+                                else "stratum-transport"
+                            ),
+                            "classification": "configured-service-port",
+                            "service_port": int(service_port),
+                            "service_name": service_name,
+                            "encrypted": bool(tls_meta is not None),
+                            "payload_visible": bool(payload),
+                            "json_visible": False,
+                        }
+            elif udp is not None:
+                sport = int(getattr(udp, "sport", 0) or 0)
+                dport = int(getattr(udp, "dport", 0) or 0)
+                service_port = dport if dport in udp_services else sport if sport in udp_services else 0
+                if service_port:
+                    metadata["service"] = {
+                        "transport": "udp",
+                        "port": service_port,
+                        "name": udp_services[service_port],
+                    }
+        except Exception:
+            pass
         return metadata
 
     def _shannon_entropy(self, data: bytes) -> float:
@@ -2892,17 +3021,34 @@ class SnifferSoftware:
             "stratum": 45,
             "tls": 35,
             "quic": 30,
+            "eapol": 35,
+            "ike": 28,
+            "esp": 26,
+            "ah": 24,
+            "kerberos": 25,
             "dns": 20,
-            "dhcp": 20,
+            "dhcp": 25,
+            "ndp": 22,
+            "arp": 14,
             "http": 20,
             "ssh": 20,
             "json_rpc": 18,
+            "service": 14,
             "tcp": 4,
         }
         for name, weight in weights.items():
             if name in metadata:
                 score += weight
                 reasons.append(name)
+
+        service = metadata.get("service") or {}
+        service_name = str(service.get("name") or "")
+        if "stratum" in service_name:
+            score += 32
+            reasons.append(service_name)
+        elif service_name in {"monero-p2p", "monero-rpc", "monero-zmq"}:
+            score += 24
+            reasons.append(service_name)
 
         tcp = packet.getlayer(TCP)
         if tcp is not None:
@@ -3865,8 +4011,8 @@ class SnifferSoftware:
                     pkt[IPv6].dst = "::1"
 
             if expect_reply:
-                return scapy_sr1(pkt, timeout=float(timeout), verbose=0)
-            scapy_send(pkt, verbose=0)
+                return scapy_sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0)
+            scapy_send(pkt, iface=loop_iface, verbose=0)
             return None
         except Exception as e:
             self.logger.log_message(f"[Loopback] Error: {type(e).__name__}: {e}")
@@ -5967,12 +6113,27 @@ class SnifferSoftware:
                     continue
         finally:
             if handle:
+                # Stop the read loop before closing the native handle.  Closing a
+                # pcap_t while another native read is still active is a common way
+                # to trigger use-after-close behavior in third-party filter drivers.
+                with contextlib.suppress(Exception):
+                    if getattr(self, "_pcap_has_breakloop", False):
+                        self.libpcap.pcap_breakloop(handle)
                 self._unregister_capture_handle(handle, active_iface)
-                self.libpcap.pcap_close(handle)
+                with contextlib.suppress(Exception):
+                    self.libpcap.pcap_close(handle)
+                handle = None
 
     def get_runtime_health(self) -> dict:
         with self._capture_state_lock:
             capture = {
+                "driver_safety_profile": {
+                    "snapshot_length": int(self.capture_snapshot_length),
+                    "kernel_buffer_bytes": int(self.capture_kernel_buffer_bytes),
+                    "read_timeout_ms": int(self.capture_read_timeout_ms),
+                    "immediate_mode": bool(self.capture_immediate_mode),
+                    "nanosecond_timestamps": bool(self.capture_request_nanosecond_timestamps),
+                },
                 "frames": self._capture_total_frames,
                 "captured_bytes": self._capture_total_bytes,
                 "wire_bytes": self._capture_total_wire_bytes,
@@ -6181,26 +6342,9 @@ class SnifferSoftware:
 
     def sr1(self, packet: Packet, iface: str = None, timeout: int = 2, verbose: int = 0,
             route_info: dict = None, dst_mac: str = None, src_mac: str = None) -> Optional[Packet]:
-        """Send one IPv4/IPv6 packet and receive one matching response.
-
-        Ethernet-wrapped multicast/link-local probes use srp1 so Scapy does not
-        discard the requested interface or emit its L3 ``iface`` warning.
-        """
+        """Send one IPv4/IPv6 packet and receive one matching response."""
         if isinstance(packet, Ether) and (IP in packet or IPv6 in packet):
-            try:
-                from scapy.sendrecv import srp1 as scapy_srp1
-                return scapy_srp1(packet, iface=iface, timeout=float(timeout), verbose=verbose)
-            except Exception as exc:
-                self._log_send_once(
-                    f"srp1:fallback:{str(iface)}:{type(exc).__name__}",
-                    RouterRandomMessages(
-                        "Sniffer/L2",
-                        f"request/reply failed on {iface}: {exc}",
-                        ["⚠️", "📡", "🧭"],
-                    ),
-                    every=10.0,
-                )
-                return None
+            packet = packet[IP] if IP in packet else packet[IPv6]
         if not isinstance(packet, (IP, IPv6)):
             packet, why = self._coerce_to_l3(packet)
             if packet is None:

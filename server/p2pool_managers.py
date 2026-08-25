@@ -1,4 +1,6 @@
 import asyncio
+import collections
+from collections import deque
 import base64
 import ctypes
 import hashlib
@@ -22,7 +24,6 @@ import sys
 import threading
 import json
 import time
-from collections import deque
 import psutil
 import requests
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -2084,6 +2085,104 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             except Exception:
                 return 1
 
+    @staticmethod
+    def _ingress_priority_value(packet) -> int:
+        """Return 0=normal, 1=elevated, 2=high, 3=critical.
+
+        Sniffer-enriched packets carry authoritative priority metadata. Raw
+        Hyper-V/WinDivert frames receive a bounded lightweight classification so
+        Stratum, DNS, TLS, DHCP, NDP, authentication, and control-plane traffic
+        is not preferentially discarded when an interface queue is pressured.
+        """
+        try:
+            label = str(getattr(packet, "_capture_priority", "") or "").casefold()
+            if label == "critical":
+                return 3
+            if label == "high" or bool(getattr(packet, "_capture_high_value", False)):
+                return 2
+            if label == "elevated":
+                return 1
+        except Exception:
+            pass
+
+        parsed = packet
+        if isinstance(packet, (bytes, bytearray, memoryview)):
+            raw = bytes(packet)
+            if not raw:
+                return 0
+            try:
+                version = (raw[0] >> 4) & 0x0F
+                if version == 4:
+                    parsed = IP(raw)
+                elif version == 6:
+                    parsed = IPv6(raw)
+                elif len(raw) >= 14:
+                    parsed = Ether(raw)
+            except Exception:
+                return 0
+
+        try:
+            if parsed.haslayer(DHCP) or parsed.haslayer(DHCP6):
+                return 3
+            if parsed.haslayer(DNS):
+                return 2
+            if parsed.haslayer(ARP):
+                return 1
+            if parsed.haslayer(ICMPv6ND_NS) or parsed.haslayer(ICMPv6ND_NA):
+                return 2
+        except Exception:
+            pass
+
+        critical_tcp = {
+            3333, 4444, 5555, 6666, 7777, 8888, 9999,
+            10001, 10128, 10132, 14444, 24444,
+        }
+        high_tcp = {
+            22, 25, 53, 80, 88, 110, 135, 139, 143, 389, 443, 445,
+            465, 587, 636, 853, 993, 995, 1433, 1521, 2375, 2376,
+            3306, 3389, 5432, 5671, 5672, 6379, 8080, 8443, 8883,
+            9092, 18080, 18081, 18082, 18083, 18084,
+        }
+        high_udp = {
+            53, 67, 68, 88, 123, 161, 162, 389, 443, 500, 514, 520,
+            546, 547, 1900, 3702, 4500, 4789, 51820, 5353, 5355,
+            6081, 8472, 9993,
+        }
+        try:
+            tcp = parsed.getlayer(TCP)
+            if tcp is not None:
+                ports = {int(tcp.sport), int(tcp.dport)}
+                if ports & critical_tcp:
+                    return 3
+                if ports & high_tcp:
+                    return 2
+            udp = parsed.getlayer(UDP)
+            if udp is not None and {int(udp.sport), int(udp.dport)} & high_udp:
+                return 2
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _drop_ingress_for_pressure(q: deque, incoming_priority: int):
+        if not q:
+            return None
+
+        # Prefer evicting the oldest packet in the lowest available priority.
+        lowest = min(int(item[3]) for item in q)
+        if int(incoming_priority) < lowest:
+            # Preserve a queue made entirely of more important traffic.
+            return None
+
+        drop_index = 0
+        for index, item in enumerate(q):
+            if int(item[3]) == lowest:
+                drop_index = index
+                break
+        dropped = q[drop_index]
+        del q[drop_index]
+        return dropped
+
     def _ensure_ingress_state(self, inbound_iface: str) -> Dict[str, Any]:
         key = str(inbound_iface or "Unknown")
         with self._ingress_lock:
@@ -2102,10 +2201,10 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "enqueued": 0,
                 "processed": 0,
                 "dropped": 0,
+                "dropped_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
+                "queued_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
                 "errors": 0,
                 "last_progress": time.monotonic(),
-                "pressure_dropped_pending": 0,
-                "pressure_last_log": 0.0,
             }
             thread = threading.Thread(
                 target=self._ingress_worker_loop,
@@ -2132,50 +2231,58 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         if isinstance(packet, (bytearray, memoryview)):
             packet = bytes(packet)
 
+        priority = self._ingress_priority_value(packet)
         cv = state["cv"]
         dropped_now = 0
+        dropped_priorities = collections.Counter()
         with cv:
             q = state["queue"]
             while q and (
                     len(q) >= self._ingress_max_frames
                     or int(state["bytes"]) + size > self._ingress_max_bytes
             ):
-                _old_packet, old_size, _old_ts = q.popleft()
+                dropped = self._drop_ingress_for_pressure(q, priority)
+                if dropped is None:
+                    break
+                _old_packet, old_size, _old_ts, old_priority = dropped
                 state["bytes"] = max(0, int(state["bytes"]) - int(old_size))
                 state["dropped"] += 1
+                state["dropped_by_priority"][int(old_priority)] += 1
+                state["queued_by_priority"][int(old_priority)] = max(
+                    0,
+                    int(state["queued_by_priority"][int(old_priority)]) - 1,
+                )
                 self._ingress_total_dropped += 1
+                dropped_priorities[int(old_priority)] += 1
                 dropped_now += 1
 
             if len(q) >= self._ingress_max_frames or int(state["bytes"]) + size > self._ingress_max_bytes:
                 state["dropped"] += 1
+                state["dropped_by_priority"][int(priority)] += 1
                 self._ingress_total_dropped += 1
                 return False
 
-            q.append((packet, size, time.monotonic()))
+            q.append((packet, size, time.monotonic(), int(priority)))
             state["bytes"] = int(state["bytes"]) + size
             state["enqueued"] += 1
+            state["queued_by_priority"][int(priority)] += 1
             self._ingress_total_enqueued += 1
             cv.notify()
 
         if dropped_now:
-            # Keep every drop in counters, but summarize only this newly-added
-            # pressure diagnostic. Existing router logs are never filtered.
-            now = time.monotonic()
-            state["pressure_dropped_pending"] = int(state.get("pressure_dropped_pending", 0)) + dropped_now
-            last_notice = float(state.get("pressure_last_log", 0.0) or 0.0)
-            if (now - last_notice) >= 30.0:
-                pending = int(state.get("pressure_dropped_pending", 0))
-                state["pressure_dropped_pending"] = 0
-                state["pressure_last_log"] = now
-                self.router_logger.log_message(
-                    RouterRandomMessages(
-                        "Router/Ingress",
-                        f"pressure on {state['iface']}; dropped_oldest={pending} "
-                        f"queued={len(state['queue'])} bytes={state['bytes']} "
-                        f"total_dropped={state['dropped']}",
-                        ["⚠️", "🚦", "📦"],
-                    )
-                )
+            self._ingress_log_sparse(
+                f"pressure:{state['iface']}",
+                RouterRandomMessages(
+                    name="RouterIngress",
+                    message=(
+                        f"pressure on {state['iface']}; evicted={dropped_now} "
+                        f"priorities={dict(dropped_priorities)} "
+                        f"queued={len(state['queue'])} bytes={state['bytes']}"
+                    ),
+                    emoticons=["⚠️", "📦", "🛡️"],
+                ),
+                every=30.0,
+            )
         return True
 
     ingest_packet = enqueue_ingress_packet
@@ -2191,8 +2298,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     cv.wait(timeout=0.25)
                 if stop_event.is_set() and not state["queue"]:
                     break
-                packet, size, queued_ts = state["queue"].popleft()
+                packet, size, queued_ts, priority = state["queue"].popleft()
                 state["bytes"] = max(0, int(state["bytes"]) - int(size))
+                state["queued_by_priority"][int(priority)] = max(
+                    0,
+                    int(state["queued_by_priority"][int(priority)]) - 1,
+                )
 
             try:
                 self.process_packet(packet, iface)
@@ -2219,6 +2330,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     self._ingress_total_dropped += dropped
                     state["queue"].clear()
                     state["bytes"] = 0
+                    state["queued_by_priority"] = {0: 0, 1: 0, 2: 0, 3: 0}
                 state["cv"].notify_all()
 
         for state in states:
@@ -2241,6 +2353,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     "enqueued": int(state["enqueued"]),
                     "processed": int(state["processed"]),
                     "dropped": int(state["dropped"]),
+                    "dropped_by_priority": dict(state.get("dropped_by_priority", {})),
+                    "queued_by_priority": dict(state.get("queued_by_priority", {})),
                     "errors": int(state["errors"]),
                     "worker_alive": bool(state.get("thread") and state["thread"].is_alive()),
                     "last_progress_age_sec": max(0.0, time.monotonic() - float(state["last_progress"])),
@@ -6844,8 +6958,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self.dns_manager.configure_runtime(
                 upstream_iface=self.interface_out_full_name,
                 upstream_iface_selector=self._select_dns_upstream_iface,
-                socket_source_ipv4=self.router_ip_out,
-                socket_source_ipv6=self.router_ipv6_out,
+                # Do not pin DNS sockets to a WAN address that may be stale
+                # while DHCP, static mode, or AT&T IP passthrough converges.
+                # DNSManager still accepts explicit sources, but OS route/source
+                # selection is the safest default for long-running operation.
+                socket_source_ipv4=None,
+                socket_source_ipv6=None,
                 socket_resolution_mode="prefer",
                 reply_source_policy="query-destination",
             )
@@ -8750,40 +8868,55 @@ class PacketManager:
             )
             return "ERROR", None
 
-    def _direct_sr1(self, packet: Packet, iface: Optional[str], timeout: int):
-        """
-        Prefer self.sniffer.sr1 when available, otherwise use Scapy sr1.
+    @staticmethod
+    def _is_router_sniffer_method(method: Any) -> bool:
+        """Return True only for this project's routed SnifferSoftware methods.
+
+        Generic Scapy L3 send()/sr1() accepts an ``iface`` keyword for legacy
+        compatibility but warns that it has no effect.  The local
+        SnifferSoftware methods intentionally accept ``iface`` because they
+        resolve a Windows/Npcap route and construct an Ethernet frame.
         """
         try:
-            if self.sniffer is not None and hasattr(self.sniffer, "sr1"):
-                try:
-                    return self.sniffer.sr1(packet, timeout=timeout, verbose=0, iface=iface)
-                except TypeError:
-                    return self.sniffer.sr1(packet, timeout=timeout, verbose=0)
+            module_name = str(getattr(method, "__module__", "") or "")
+            owner = getattr(method, "__self__", None)
+            owner_module = str(getattr(type(owner), "__module__", "") or "") if owner is not None else ""
+            return module_name == "p2pool_sniffer" or owner_module == "p2pool_sniffer"
+        except Exception:
+            return False
+
+    def _direct_sr1(self, packet: Packet, iface: Optional[str], timeout: int):
+        """Use the routed sniffer when present; otherwise use pure Scapy L3 I/O.
+
+        ``iface`` is never passed to generic Scapy ``sr1``.  For L3 I/O Scapy
+        selects the egress path from its route table and the packet source.
+        Multicast/link-local packets that require an exact adapter are handled
+        by SnifferSoftware's L2/Npcap implementation instead.
+        """
+        try:
+            method = getattr(self.sniffer, "sr1", None) if self.sniffer is not None else None
+            if callable(method) and self._is_router_sniffer_method(method):
+                return method(packet, timeout=timeout, verbose=0, iface=iface)
         except Exception:
             pass
 
-        try:
-            return sr1(packet, timeout=timeout, verbose=0, iface=iface)
-        except TypeError:
-            return sr1(packet, timeout=timeout, verbose=0)
+        return sr1(packet, timeout=timeout, verbose=0)
 
     def _direct_send(self, packet: Packet, iface: Optional[str]) -> None:
+        """Send through SnifferSoftware or generic Scapy without invalid iface use."""
         try:
-            if self.sniffer is not None and hasattr(self.sniffer, "send"):
-                try:
-                    self.sniffer.send(packet, iface=iface)
-                    return
-                except TypeError:
-                    self.sniffer.send(packet)
-                    return
+            method = getattr(self.sniffer, "send", None) if self.sniffer is not None else None
+            if callable(method) and self._is_router_sniffer_method(method):
+                method(packet, iface=iface, verbose=0)
+                return
         except Exception:
             pass
 
-        try:
-            send(packet, verbose=0, iface=iface)
-        except TypeError:
-            send(packet, verbose=0)
+        # Generic Scapy send() is Layer 3.  Passing iface= emits the warning:
+        # "'iface' has no effect on L3 I/O send()".  Route selection belongs to
+        # Scapy's route table; exact-interface multicast/link-local traffic must
+        # use the project's sendp()/srp1() path instead.
+        send(packet, verbose=0)
 
     def send_ping(
         self,

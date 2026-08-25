@@ -11574,6 +11574,18 @@ class TransportStratumManager:
             "btc_work_packets": 0,
             "signature_port_matches": 0,
 
+            # Transport identity metrics.  TLS-wrapped Stratum cannot be JSON
+            # decoded without session secrets, but it is still accepted and
+            # preserved as an opaque Stratum transport on configured/learned
+            # service ports.
+            "stratum_transport_packets": 0,
+            "stratum_transport_payload_bytes": 0,
+            "plaintext_stratum_packets": 0,
+            "tls_stratum_packets": 0,
+            "opaque_stratum_packets": 0,
+            "stratum_control_packets": 0,
+            "stratum_transport_flows": 0,
+
             # Runtime port learning / operational flow-health diagnostics.
             "dynamic_ports_learned": 0,
             "dynamic_ports_refreshed": 0,
@@ -11654,6 +11666,31 @@ class TransportStratumManager:
             rt["last_seen_ts"] = now
             rt["last_activity_ts"] = now
 
+            # Every packet admitted by matches_packet() belongs to a configured,
+            # learned, or strictly signature-matched Stratum transport.  Count it
+            # before application parsing so SYN/ACK, encrypted TLS records, split
+            # JSON, and capture-midstream packets all remain visible as Stratum.
+            self._metrics["stratum_transport_packets"] += 1
+            self._metrics["stratum_transport_payload_bytes"] += payload_len
+            if not rt.get("stratum_transport_counted"):
+                rt["stratum_transport_counted"] = True
+                self._metrics["stratum_transport_flows"] += 1
+
+            tls_record = self._looks_like_tls_record(payload)
+            if tls_record:
+                rt["stratum_wrapped_tls"] = True
+                rt["stratum_transport"] = "tls"
+            elif payload and not rt.get("stratum_wrapped_tls"):
+                rt["stratum_transport"] = "plaintext-or-unknown"
+
+            if not payload:
+                self._metrics["stratum_control_packets"] += 1
+            elif rt.get("stratum_wrapped_tls"):
+                self._metrics["tls_stratum_packets"] += 1
+                self._metrics["opaque_stratum_packets"] += 1
+            else:
+                self._metrics["plaintext_stratum_packets"] += 1
+
             if direction == "c2s":
                 rt["packets_c2s"] += 1
                 rt["bytes_c2s"] += payload_len
@@ -11677,37 +11714,51 @@ class TransportStratumManager:
             if payload:
                 self._track_duplicate_payload(st, payload, now)
 
-                contiguous, prepend = self._reassemble_stratum_payload(
-                    st=st,
-                    direction=direction,
-                    packet=packet,
-                    payload=payload,
-                )
-                if contiguous:
-                    buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
-                    if prepend:
-                        combined = bytes(contiguous) + bytes(st.get(buf_key, b"") or b"")
-                        st[buf_key] = combined[-self.MAX_BUF_PER_DIR:]
-                    else:
-                        st[buf_key] = self._append_buf(st.get(buf_key, b""), contiguous)
-
-                    self._consume_stratum_buffer(
-                        packet=packet,
+                if rt.get("stratum_wrapped_tls"):
+                    # Ciphertext on a known Stratum transport is accepted and
+                    # forwarded, but never fed into the plaintext JSON parser.
+                    # Emit one identification line per flow rather than one per
+                    # TLS record so continuous mining does not spam the GUI.
+                    if not rt.get("stratum_tls_identity_logged"):
+                        rt["stratum_tls_identity_logged"] = True
+                        self._emit(
+                            f"{self._tag_prefix(st)}[🔐 STRATUM/TLS] "
+                            f"{src_ip}:{sport} -> {dst_ip}:{dport} "
+                            f"dir={direction} iface={iface} "
+                            f"opaque_payload=yes bytes={payload_len}"
+                        )
+                else:
+                    contiguous, prepend = self._reassemble_stratum_payload(
                         st=st,
-                        buf_key=buf_key,
-                        flags=flags,
-                        inbound_iface=inbound_iface,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        sport=sport,
-                        dport=dport,
-                        iface=iface,
                         direction=direction,
-                        now=now,
+                        packet=packet,
+                        payload=payload,
                     )
+                    if contiguous:
+                        buf_key = "buf_c2s" if direction == "c2s" else "buf_s2c"
+                        if prepend:
+                            combined = bytes(contiguous) + bytes(st.get(buf_key, b"") or b"")
+                            st[buf_key] = combined[-self.MAX_BUF_PER_DIR:]
+                        else:
+                            st[buf_key] = self._append_buf(st.get(buf_key, b""), contiguous)
 
-                    stream = st["tcp_reassembly"][direction]
-                    stream["can_prepend"] = bool(st.get(buf_key))
+                        self._consume_stratum_buffer(
+                            packet=packet,
+                            st=st,
+                            buf_key=buf_key,
+                            flags=flags,
+                            inbound_iface=inbound_iface,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            sport=sport,
+                            dport=dport,
+                            iface=iface,
+                            direction=direction,
+                            now=now,
+                        )
+
+                        stream = st["tcp_reassembly"][direction]
+                        stream["can_prepend"] = bool(st.get(buf_key))
             else:
                 control_event = self._make_control_event(flags)
                 if control_event is not None:
@@ -13279,21 +13330,45 @@ class TransportStratumManager:
             return "-"
 
     def _payload_sample(self, packet, *, cap: int) -> bytes:
+        # Prefer the complete TCP payload.  A deepest Raw lookup can return only
+        # the encrypted fragment inside a dissected TLS record, hiding the TLS
+        # header and preventing Stratum-over-TLS flow identification.
+        try:
+            tcp = packet[TCP]
+            payload = getattr(tcp, "payload", None)
+            if payload is not None and payload.__class__.__name__ != "NoPayload":
+                data = bytes(payload)
+                if data:
+                    return data[:cap]
+        except Exception:
+            pass
+
         try:
             if Raw is not None and packet.haslayer(Raw):
                 return bytes(packet[Raw].load)[:cap]
         except Exception:
             pass
 
-        try:
-            tcp = packet[TCP]
-            payload = getattr(tcp, "payload", None)
-            if payload is not None:
-                return bytes(payload)[:cap]
-        except Exception:
-            pass
-
         return b""
+
+    @staticmethod
+    def _looks_like_tls_record(payload: bytes) -> bool:
+        """Recognize a complete TLS/SSLv3-style record header conservatively."""
+        try:
+            data = bytes(payload or b"")
+            if len(data) < 5:
+                return False
+            content_type = int(data[0])
+            major = int(data[1])
+            minor = int(data[2])
+            record_len = int.from_bytes(data[3:5], "big")
+            if content_type not in {20, 21, 22, 23, 24}:
+                return False
+            if major != 3 or minor not in {0, 1, 2, 3, 4}:
+                return False
+            return 0 <= record_len <= 18432
+        except Exception:
+            return False
 
     def _append_buf(self, prior: bytes, payload: bytes) -> bytes:
         out = bytes(prior or b"") + bytes(payload or b"")
@@ -31423,98 +31498,220 @@ class TransportSNMPManager:
 
             return ",".join(out) if out else None
 class GulfMoneroOceanTransportManager:
-    """MoneroOcean Gulf transport binding layered over TransportStratumManager.
+    """Gulf MoneroOcean transport binding layered over TransportStratumManager.
 
-    It never mutates pool traffic and never parses a flow twice. It identifies
-    Gulf service ports, delegates reassembly to the shared Stratum manager, and
-    keeps bounded health counters suitable for routers that run continuously.
+    It owns no second TCP reassembler. The shared Stratum manager receives each
+    packet exactly once, while this adapter tracks Gulf endpoint identity,
+    connection health, jobs, logins, submits, and share results. DNS resolution
+    runs on a daemon thread so packet dispatch never blocks on getaddrinfo().
     """
 
-    DEFAULT_HOST = "gulf.moneroocean.stream"
+    DEFAULT_HOSTS = ("gulf.moneroocean.stream",)
     DEFAULT_PORTS = {10001, 10128, 10132}
+    RESOLVE_INTERVAL_SEC = 300.0
+    FLOW_TTL_SEC = 30 * 60
+    MAX_FLOWS = 8192
 
-    def __init__(self, logger, stratum_manager, *, ports=None, host=DEFAULT_HOST):
+    def __init__(self, logger, stratum_manager: TransportStratumManager, *, hosts=None, ports=None):
         self.logger = logger
         self.stratum_manager = stratum_manager
-        self.host = str(host or self.DEFAULT_HOST).strip().lower()
-        self.ports = {int(p) for p in (ports or self.DEFAULT_PORTS)}
+        self.hosts = tuple(str(x).strip() for x in (hosts or self.DEFAULT_HOSTS) if str(x).strip())
+        self.ports = set(int(x) for x in (ports or self.DEFAULT_PORTS))
         self._lock = threading.RLock()
-        self._flows = collections.OrderedDict()
-        self._max_flows = 8192
-        self._last_health_log = 0.0
+        self._stop_event = threading.Event()
+        self._resolved_ips: set[str] = set()
+        self._flows: "collections.OrderedDict[Tuple, Dict[str, Any]]" = collections.OrderedDict()
         self._metrics = collections.Counter()
-        self._log(
-            f"bound to {self.host} ports={sorted(self.ports)} through TransportStratumManager",
-            ["🌊", "⛏️", "🔗"],
+        self._last_log: Dict[str, float] = {}
+        self._resolver_thread = threading.Thread(
+            target=self._resolver_loop,
+            name="GulfMoneroOceanResolver",
+            daemon=True,
+        )
+        self._resolver_thread.start()
+        self._emit_sparse(
+            "ready",
+            f"[Transport][GulfMoneroOcean] ready hosts={list(self.hosts)} ports={sorted(self.ports)}",
+            every=3600.0,
         )
 
-    def _log(self, message: str, emoticons=None) -> None:
+    def _emit_sparse(self, key: str, message: str, *, every: float = 30.0) -> None:
+        now = time.monotonic()
+        with self._lock:
+            last = float(self._last_log.get(key, 0.0) or 0.0)
+            if now - last < max(0.1, float(every)):
+                return
+            self._last_log[key] = now
         try:
-            self.logger.log_message(
-                RouterRandomMessages("Transport/GulfMoneroOcean", message, emoticons or [])
-            )
+            self.logger.log_message(message)
         except Exception:
             pass
 
-    def matches(self, sport: int, dport: int) -> bool:
+    def _resolver_loop(self) -> None:
+        while not self._stop_event.is_set():
+            resolved = set()
+            for host in self.hosts:
+                try:
+                    for info in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+                        sockaddr = info[4]
+                        if sockaddr:
+                            resolved.add(str(sockaddr[0]).split("%", 1)[0])
+                except Exception:
+                    self._metrics["resolution_failures"] += 1
+            if resolved:
+                with self._lock:
+                    changed = resolved != self._resolved_ips
+                    self._resolved_ips = resolved
+                if changed:
+                    self._emit_sparse(
+                        "resolved",
+                        f"[Transport][GulfMoneroOcean] endpoint set refreshed count={len(resolved)}",
+                        every=60.0,
+                    )
+            self._stop_event.wait(self.RESOLVE_INTERVAL_SEC)
+
+    @staticmethod
+    def _payload(packet) -> bytes:
         try:
-            return int(sport) in self.ports or int(dport) in self.ports
+            tcp = packet.getlayer(TCP)
+            if tcp is not None:
+                payload = getattr(tcp, "payload", None)
+                if payload is not None and payload.__class__.__name__ != "NoPayload":
+                    data = bytes(payload)
+                    if data:
+                        return data
+        except Exception:
+            pass
+        try:
+            raw_layer = packet.getlayer(Raw)
+            return bytes(raw_layer.load) if raw_layer is not None else b""
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _flow_key(src_ip, sport, dst_ip, dport):
+        left = (str(src_ip), int(sport))
+        right = (str(dst_ip), int(dport))
+        return (left, right) if left <= right else (right, left)
+
+    def matches_packet(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int) -> bool:
+        try:
+            ports_match = int(sport) in self.ports or int(dport) in self.ports
+            with self._lock:
+                ip_match = (
+                    str(src_ip).split("%", 1)[0] in self._resolved_ips
+                    or str(dst_ip).split("%", 1)[0] in self._resolved_ips
+                )
+            if not (ports_match or ip_match):
+                return False
+            return bool(
+                ports_match
+                or self.stratum_manager.matches_packet(packet, src_ip, dst_ip, sport, dport)
+            )
         except Exception:
             return False
 
-    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
-        if not self.matches(sport, dport):
-            return False
-        now = time.time()
-        key = tuple(sorted(((str(src_ip), int(sport)), (str(dst_ip), int(dport)))))
-        with self._lock:
-            state = self._flows.get(key)
-            if state is None:
-                state = {"first": now, "last": now, "packets": 0, "bytes": 0}
-                self._flows[key] = state
-                self._metrics["flows"] += 1
-            state["last"] = now
-            state["packets"] += 1
+    def _observe_json(self, payload: bytes) -> None:
+        if not payload:
+            return
+        decoder = json.JSONDecoder()
+        text = payload.decode("utf-8", "replace").replace("\x00", "\n")
+        for line in text.splitlines()[:256]:
+            candidate = line.strip()
+            if not candidate or candidate[:1] not in "[{":
+                continue
             try:
-                state["bytes"] += len(bytes(packet))
+                value, _end = decoder.raw_decode(candidate)
             except Exception:
-                pass
-            self._metrics["packets"] += 1
-            self._flows.move_to_end(key)
-            while len(self._flows) > self._max_flows:
-                self._flows.popitem(last=False)
-                self._metrics["flow_evictions"] += 1
+                continue
+            objects = value if isinstance(value, list) else [value]
+            for obj in objects[:256]:
+                if not isinstance(obj, dict):
+                    continue
+                method = str(obj.get("method") or obj.get("command") or "").casefold()
+                if method in {"login", "mining.authorize", "mining.subscribe"}:
+                    self._metrics["login_messages"] += 1
+                elif method in {"job", "mining.notify", "mining.set_target", "mining.set_difficulty"}:
+                    self._metrics["job_messages"] += 1
+                elif method in {"submit", "mining.submit"}:
+                    self._metrics["submit_messages"] += 1
+                elif method in {"keepalived", "keepalive"}:
+                    self._metrics["keepalive_messages"] += 1
+                if obj.get("error") not in (None, False, 0, ""):
+                    self._metrics["rejected_or_error_results"] += 1
+                elif "result" in obj and obj.get("id") is not None:
+                    self._metrics["accepted_or_success_results"] += 1
 
-        handled = bool(
-            self.stratum_manager.handle(
-                packet, src_ip, dst_ip, int(sport), int(dport), inbound_iface
-            )
-        )
-        self._metrics["stratum_handled" if handled else "stratum_unclassified"] += 1
-        return handled
+    def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
+        if not self.matches_packet(packet, src_ip, dst_ip, sport, dport):
+            return False
+        now = time.monotonic()
+        key = self._flow_key(src_ip, sport, dst_ip, dport)
+        payload = self._payload(packet)
+
+        # When Gulf is identified by a resolved endpoint rather than one of the
+        # default ports, teach the shared Stratum manager which endpoint-side
+        # port is the service port before delegation.  This keeps custom Gulf
+        # ports and DNS-address changes in the same single reassembly path.
+        try:
+            src_clean = str(src_ip).split("%", 1)[0]
+            dst_clean = str(dst_ip).split("%", 1)[0]
+            with self._lock:
+                resolved = set(self._resolved_ips)
+            endpoint_port = None
+            if src_clean in resolved:
+                endpoint_port = int(sport)
+            elif dst_clean in resolved:
+                endpoint_port = int(dport)
+            if endpoint_port and not self.stratum_manager._is_service_port(sport, dport):
+                self.stratum_manager.register_service_port(
+                    int(endpoint_port),
+                    source="gulf-resolved-endpoint",
+                    ttl_sec=self.stratum_manager.DYNAMIC_PORT_TTL_SEC,
+                    persistent=False,
+                )
+        except Exception:
+            pass
+        with self._lock:
+            state = self._flows.pop(key, None) or {
+                "created": now,
+                "packets": 0,
+                "bytes": 0,
+                "last_seen": now,
+                "iface": str(inbound_iface or ""),
+            }
+            state["packets"] += 1
+            state["bytes"] += len(payload)
+            state["last_seen"] = now
+            self._flows[key] = state
+            self._metrics["packets"] += 1
+            self._metrics["payload_bytes"] += len(payload)
+            self._metrics["flows_seen"] = len(self._flows)
+            cutoff = now - self.FLOW_TTL_SEC
+            while self._flows and (
+                len(self._flows) > self.MAX_FLOWS
+                or float(next(iter(self._flows.values())).get("last_seen", now)) < cutoff
+            ):
+                self._flows.popitem(last=False)
+                self._metrics["flows_evicted"] += 1
+        self._observe_json(payload)
+        return bool(self.stratum_manager.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface))
 
     def snapshot_metrics(self) -> Dict[str, Any]:
         with self._lock:
-            out = dict(self._metrics)
-            out.update({
-                "host": self.host,
+            return {
+                "hosts": list(self.hosts),
                 "ports": sorted(self.ports),
+                "resolved_ips": sorted(self._resolved_ips),
                 "active_flows": len(self._flows),
-            })
-            return out
+                "metrics": dict(self._metrics),
+            }
 
-    def update_binding(self, *, ports=None, host=None) -> None:
-        if ports is not None:
-            resolved = {int(p) for p in ports if 1 <= int(p) <= 65535}
-            if not resolved:
-                raise ValueError("Gulf MoneroOcean requires at least one valid port")
-            self.ports = resolved
-        if host is not None:
-            self.host = str(host).strip().lower() or self.DEFAULT_HOST
-        self._log(
-            f"binding updated host={self.host} ports={sorted(self.ports)}",
-            ["⚙️", "🌊", "⛏️"],
-        )
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._resolver_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
 
 
 class TransportManager:
@@ -31573,6 +31770,7 @@ class TransportManager:
         "_handle_scada_tcp_packet": "scada",
         "_handle_scada_udp_packet": "scada",
         "_handle_http_packet": "http",
+        "_handle_gulf_stratum_packet": "stratum",
         "_handle_stratum_packet": "stratum",
         "_handle_https_packet": "https",
         "_handle_domain_tcp_packet": "dns",
@@ -31690,13 +31888,12 @@ class TransportManager:
         self.transport_undecoded = TransportUndecodedManager(self.logger)
         self.transport_stratum = TransportStratumManager(
             self.logger,
-            ports={3333, 4444, 5555, 7777, 9999},
+            ports=TransportStratumManager.DEFAULT_PORTS,
             packet_writer=self.packet_writer
         )
-        self.transport_gulf_moneroocean = GulfMoneroOceanTransportManager(
+        self.transport_gulf = GulfMoneroOceanTransportManager(
             self.logger,
             self.transport_stratum,
-            ports=GulfMoneroOceanTransportManager.DEFAULT_PORTS,
         )
         self.transport_ike = TransportIkeManager(self.logger)
         self.transport_monero = TransportMoneroManager(
@@ -31745,8 +31942,6 @@ class TransportManager:
         protocol_enabled: Optional[Dict[str, bool]] = None,
         stratum_ports=None,
         monero_ports=None,
-        gulf_moneroocean_ports=None,
-        gulf_moneroocean_host: str = GulfMoneroOceanTransportManager.DEFAULT_HOST,
         voip_port_start: int = 10000,
         voip_port_end: int = 20000,
         parallel_analysis: bool = True,
@@ -31814,9 +32009,15 @@ class TransportManager:
                 float(inspection_flow_cooldown_sec),
             ),
         )
+        old_gulf = getattr(self, "transport_gulf", None)
+        if old_gulf is not None:
+            try:
+                old_gulf.stop()
+            except Exception:
+                pass
         self.transport_stratum = TransportStratumManager(
             self.logger,
-            ports=resolved_stratum_ports,
+            ports=resolved_stratum_ports | GulfMoneroOceanTransportManager.DEFAULT_PORTS,
             packet_writer=self.packet_writer,
             log_rps=max(0.01, float(stratum_log_rps)),
             log_burst=max(1, int(stratum_log_burst)),
@@ -31825,15 +32026,9 @@ class TransportManager:
                 float(stratum_flow_cooldown_sec),
             ),
         )
-        resolved_gulf_ports = self._normalize_port_set(
-            gulf_moneroocean_ports,
-            GulfMoneroOceanTransportManager.DEFAULT_PORTS,
-        )
-        self.transport_gulf_moneroocean = GulfMoneroOceanTransportManager(
+        self.transport_gulf = GulfMoneroOceanTransportManager(
             self.logger,
             self.transport_stratum,
-            ports=resolved_gulf_ports,
-            host=gulf_moneroocean_host,
         )
         self.transport_monero = TransportMoneroManager(
             self.logger,
@@ -31886,11 +32081,11 @@ class TransportManager:
             "monero_ports": sorted(
                 getattr(self.transport_monero, "ports", set())
             ),
-            "gulf_moneroocean_ports": sorted(
-                getattr(self.transport_gulf_moneroocean, "ports", set())
+            "gulf_moneroocean_hosts": list(
+                getattr(self.transport_gulf, "hosts", ())
             ),
-            "gulf_moneroocean_host": str(
-                getattr(self.transport_gulf_moneroocean, "host", GulfMoneroOceanTransportManager.DEFAULT_HOST)
+            "gulf_moneroocean_ports": sorted(
+                getattr(self.transport_gulf, "ports", set())
             ),
             "voip_port_start": int(self.voip_port_range.start),
             "voip_port_end": int(self.voip_port_range.stop - 1),
@@ -31954,8 +32149,8 @@ class TransportManager:
             self.transport_scraper,
             self.transport_llmnr,
             self.transport_undecoded,
+            self.transport_gulf,
             self.transport_stratum,
-            self.transport_gulf_moneroocean,
             self.transport_ike,
             self.transport_monero,
             self.transport_scada,
@@ -32337,18 +32532,30 @@ class TransportManager:
         handler = None
 
         # Signature-aware dispatch must happen before generic high-port handling.
-        # Existing flows also match so later packets without an application payload
-        # stay attached to the same protocol observer.
+        # Gulf MoneroOcean is a thin binding over the shared Stratum parser, so
+        # packets are reassembled exactly once.
         try:
             if (
-                self._handler_is_enabled(self._handle_stratum_packet)
-                and self.transport_stratum.matches_packet(
+                self._handler_is_enabled(self._handle_gulf_stratum_packet)
+                and self.transport_gulf.matches_packet(
                     packet, src_ip, dst_ip, sport, dport
                 )
             ):
-                handler = self._handle_stratum_packet
+                handler = self._handle_gulf_stratum_packet
         except Exception:
             handler = None
+
+        if handler is None:
+            try:
+                if (
+                    self._handler_is_enabled(self._handle_stratum_packet)
+                    and self.transport_stratum.matches_packet(
+                        packet, src_ip, dst_ip, sport, dport
+                    )
+                ):
+                    handler = self._handle_stratum_packet
+            except Exception:
+                handler = None
 
         if handler is None:
             try:
@@ -32372,6 +32579,10 @@ class TransportManager:
         rules = [
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
+            (
+                sorted(self.transport_gulf.ports),
+                self._handle_gulf_stratum_packet,
+            ),
             (
                 sorted(self.transport_stratum.ports),
                 self._handle_stratum_packet,
@@ -32548,11 +32759,11 @@ class TransportManager:
         self.transport_domain.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
         self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    def _handle_gulf_stratum_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        self.transport_gulf.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
     def _handle_stratum_packet(self,packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        gulf = getattr(self, "transport_gulf_moneroocean", None)
-        if gulf is not None and gulf.matches(sport, dport):
-            return gulf.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
-        return self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

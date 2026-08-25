@@ -11332,6 +11332,24 @@ class ResolutionOutcome:
 
 
 class _SocketTransportBase:
+    """Shared DNS socket helpers with route-safe source binding.
+
+    The router's WAN address can change while AT&T Internet Air/IP passthrough,
+    DHCP, static configuration, or adapter repair is still converging.  A
+    configured source address is therefore a preference, not a requirement.
+    WinError 10049 / EADDRNOTAVAIL falls back to an unbound socket so Windows
+    can select the currently valid source address from its routing table.
+    """
+
+    _SOURCE_BIND_FALLBACK_CODES = {
+        int(getattr(errno, "EADDRNOTAVAIL", 99)),
+        int(getattr(errno, "EINVAL", 22)),
+        99,      # Linux EADDRNOTAVAIL
+        22,      # invalid argument / stale scope
+        10022,   # WSAEINVAL
+        10049,   # WSAEADDRNOTAVAIL: address is not valid in its context
+    }
+
     def __init__(self, source_selector: Callable[[int], Optional[str]], max_response_bytes: int = 65535):
         self._source_selector = source_selector
         self._max_response_bytes = int(max_response_bytes)
@@ -11343,24 +11361,119 @@ class _SocketTransportBase:
             raise TimeoutError("DNS transport deadline expired")
         return max(0.05, remaining)
 
-    def _bind_source(self, sock: socket.socket, family: int):
-        source = self._source_selector(family)
-        if not source:
-            return
-        source = str(source).split("%", 1)[0]
-        if family == socket.AF_INET:
-            sock.bind((source, 0))
-        elif family == socket.AF_INET6:
-            sock.bind((source, 0, 0, 0))
+    @classmethod
+    def _is_optional_bind_failure(cls, exc: BaseException) -> bool:
+        code = int(
+            getattr(exc, "winerror", 0)
+            or getattr(exc, "errno", 0)
+            or 0
+        )
+        if code in cls._SOURCE_BIND_FALLBACK_CODES:
+            return True
+        message = str(exc).casefold()
+        return (
+            "address is not valid in its context" in message
+            or "cannot assign requested address" in message
+            or "address family" in message
+        )
 
     @staticmethod
-    def _sockaddr(endpoint: UpstreamEndpoint, socktype: int) -> Tuple[int, Tuple]:
+    def _scope_id(zone: str) -> int:
+        zone = str(zone or "").strip()
+        if not zone:
+            return 0
+        try:
+            return max(0, int(zone))
+        except Exception:
+            pass
+        try:
+            return max(0, int(socket.if_nametoindex(zone)))
+        except Exception:
+            return 0
+
+    def _source_sockaddr(self, family: int) -> Optional[Tuple]:
+        try:
+            selected = self._source_selector(family)
+        except Exception:
+            selected = None
+        if not selected:
+            return None
+
+        raw = str(selected).strip()
+        if not raw:
+            return None
+        host, _sep, zone = raw.partition("%")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+
+        if family == socket.AF_INET:
+            if address.version != 4 or address.is_unspecified or address.is_multicast:
+                return None
+            return (str(address), 0)
+
+        if family == socket.AF_INET6:
+            if address.version != 6 or address.is_unspecified or address.is_multicast:
+                return None
+            scope_id = self._scope_id(zone)
+            # Binding a link-local IPv6 source without a scope is ambiguous on
+            # Windows and frequently produces WSAEADDRNOTAVAIL.
+            if address.is_link_local and scope_id <= 0:
+                return None
+            return (str(address), 0, 0, scope_id)
+        return None
+
+    def _bind_source(self, sock: socket.socket, family: int) -> bool:
+        sockaddr = self._source_sockaddr(family)
+        if sockaddr is None:
+            return False
+        try:
+            sock.bind(sockaddr)
+            return True
+        except OSError as exc:
+            if self._is_optional_bind_failure(exc):
+                # Leave the socket unbound. connect()/send() will ask the OS to
+                # select the valid source address and interface for this route.
+                return False
+            raise
+
+    @staticmethod
+    def _sockaddrs(endpoint: UpstreamEndpoint, socktype: int) -> List[Tuple[int, Tuple]]:
         host = endpoint.bootstrap_ip or endpoint.host
         infos = socket.getaddrinfo(host, endpoint.port, socket.AF_UNSPEC, socktype)
         if not infos:
             raise OSError(f"no address information for {host}")
-        family, _socktype, _proto, _canonname, sockaddr = infos[0]
-        return family, sockaddr
+
+        unique: List[Tuple[int, Tuple]] = []
+        seen = set()
+        for family, _socktype, _proto, _canonname, sockaddr in infos:
+            if family not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            key = (family, tuple(sockaddr))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((family, sockaddr))
+
+        if not unique:
+            raise OSError(f"no usable IPv4/IPv6 address information for {host}")
+
+        # Preserve resolver ordering while preferring the family for which a
+        # configured source is actually usable. Otherwise IPv4 first avoids a
+        # dead IPv6 candidate delaying ordinary dual-stack endpoint requests.
+        def sort_key(item):
+            family, _sockaddr = item
+            has_source = 0 if family in (socket.AF_INET, socket.AF_INET6) else 1
+            family_rank = 0 if family == socket.AF_INET else 1
+            return (has_source, family_rank)
+
+        return sorted(unique, key=sort_key)
+
+    @staticmethod
+    def _sockaddr(endpoint: UpstreamEndpoint, socktype: int) -> Tuple[int, Tuple]:
+        # Compatibility helper retained with its original signature.
+        return _SocketTransportBase._sockaddrs(endpoint, socktype)[0]
 
     @staticmethod
     def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -11372,96 +11485,125 @@ class _SocketTransportBase:
             chunks.extend(part)
         return bytes(chunks)
 
+    @staticmethod
+    def _raise_all_failed(label: str, failures: List[str]):
+        detail = "; ".join(failures[-4:]) if failures else "no candidate addresses"
+        raise OSError(f"{label} failed for every resolved endpoint address: {detail}")
+
 
 class UDPDNSUpstreamTransport(_SocketTransportBase):
     def exchange(self, query: bytes, upstream: UpstreamEndpoint, deadline: float) -> TransportResult:
-        family, sockaddr = self._sockaddr(upstream, socket.SOCK_DGRAM)
-        sock = socket.socket(family, socket.SOCK_DGRAM)
         started = time.perf_counter()
-        try:
-            sock.settimeout(self._remaining(deadline))
-            self._bind_source(sock, family)
-            sock.connect(sockaddr)
-            sock.send(query)
-            wire = sock.recv(self._max_response_bytes)
-        finally:
-            sock.close()
-        if len(wire) < 12:
-            raise DNSValidationFailure("UDP DNS response was shorter than the DNS header")
-        flags = struct.unpack("!H", wire[2:4])[0]
-        if flags & 0x0200:
-            raise DNSTruncated("UDP DNS response was truncated")
-        return TransportResult(
-            wire_response=wire,
-            transport="udp",
-            endpoint_key=upstream.key,
-            rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
-        )
+        failures: List[str] = []
+        for family, sockaddr in self._sockaddrs(upstream, socket.SOCK_DGRAM):
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            try:
+                sock.settimeout(self._remaining(deadline))
+                self._bind_source(sock, family)
+                sock.connect(sockaddr)
+                sock.send(query)
+                wire = sock.recv(self._max_response_bytes)
+                if len(wire) < 12:
+                    raise DNSValidationFailure("UDP DNS response was shorter than the DNS header")
+                flags = struct.unpack("!H", wire[2:4])[0]
+                if flags & 0x0200:
+                    raise DNSTruncated("UDP DNS response was truncated")
+                return TransportResult(
+                    wire_response=wire,
+                    transport="udp",
+                    endpoint_key=upstream.key,
+                    rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
+                )
+            except DNSTruncated:
+                raise
+            except Exception as exc:
+                failures.append(f"{sockaddr}: {type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        self._raise_all_failed("UDP DNS exchange", failures)
 
 
 class TCPDNSUpstreamTransport(_SocketTransportBase):
     def exchange(self, query: bytes, upstream: UpstreamEndpoint, deadline: float) -> TransportResult:
-        family, sockaddr = self._sockaddr(upstream, socket.SOCK_STREAM)
-        sock = socket.socket(family, socket.SOCK_STREAM)
         started = time.perf_counter()
-        try:
-            sock.settimeout(self._remaining(deadline))
-            self._bind_source(sock, family)
-            sock.connect(sockaddr)
-            sock.sendall(struct.pack("!H", len(query)) + query)
-            response_len = struct.unpack("!H", self._recv_exact(sock, 2))[0]
-            if response_len <= 0 or response_len > self._max_response_bytes:
-                raise DNSValidationFailure(f"invalid DNS-over-TCP response length {response_len}")
-            wire = self._recv_exact(sock, response_len)
-        finally:
-            sock.close()
-        return TransportResult(
-            wire_response=wire,
-            transport="tcp",
-            endpoint_key=upstream.key,
-            rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
-        )
+        failures: List[str] = []
+        for family, sockaddr in self._sockaddrs(upstream, socket.SOCK_STREAM):
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(self._remaining(deadline))
+                self._bind_source(sock, family)
+                sock.connect(sockaddr)
+                sock.sendall(struct.pack("!H", len(query)) + query)
+                response_len = struct.unpack("!H", self._recv_exact(sock, 2))[0]
+                if response_len <= 0 or response_len > self._max_response_bytes:
+                    raise DNSValidationFailure(f"invalid DNS-over-TCP response length {response_len}")
+                wire = self._recv_exact(sock, response_len)
+                return TransportResult(
+                    wire_response=wire,
+                    transport="tcp",
+                    endpoint_key=upstream.key,
+                    rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
+                )
+            except Exception as exc:
+                failures.append(f"{sockaddr}: {type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        self._raise_all_failed("TCP DNS exchange", failures)
 
 
 class DoTUpstreamTransport(_SocketTransportBase):
     def exchange(self, query: bytes, upstream: UpstreamEndpoint, deadline: float) -> TransportResult:
-        family, sockaddr = self._sockaddr(upstream, socket.SOCK_STREAM)
-        raw_sock = socket.socket(family, socket.SOCK_STREAM)
         started = time.perf_counter()
-        try:
-            raw_sock.settimeout(self._remaining(deadline))
-            self._bind_source(raw_sock, family)
-            raw_sock.connect(sockaddr)
-            if upstream.verify_tls:
-                context = ssl.create_default_context()
-                server_name = upstream.server_name or (None if _is_ip_literal(upstream.host) else upstream.host)
-                if not server_name:
-                    raise DNSResolutionError(
-                        "verified DoT to an IP literal requires ?server_name=<certificate-name>"
-                    )
-            else:
-                context = ssl._create_unverified_context()
-                server_name = upstream.server_name or (None if _is_ip_literal(upstream.host) else upstream.host)
-            tls_sock = context.wrap_socket(raw_sock, server_hostname=server_name)
-            raw_sock = None
+        failures: List[str] = []
+
+        if upstream.verify_tls:
+            context = ssl.create_default_context()
+            server_name = upstream.server_name or (None if _is_ip_literal(upstream.host) else upstream.host)
+            if not server_name:
+                raise DNSResolutionError(
+                    "verified DoT to an IP literal requires ?server_name=<certificate-name>"
+                )
+        else:
+            context = ssl._create_unverified_context()
+            server_name = upstream.server_name or (None if _is_ip_literal(upstream.host) else upstream.host)
+
+        for family, sockaddr in self._sockaddrs(upstream, socket.SOCK_STREAM):
+            raw_sock = socket.socket(family, socket.SOCK_STREAM)
+            tls_sock = None
             try:
+                raw_sock.settimeout(self._remaining(deadline))
+                self._bind_source(raw_sock, family)
+                raw_sock.connect(sockaddr)
+                tls_sock = context.wrap_socket(raw_sock, server_hostname=server_name)
+                raw_sock = None
                 tls_sock.settimeout(self._remaining(deadline))
                 tls_sock.sendall(struct.pack("!H", len(query)) + query)
                 response_len = struct.unpack("!H", self._recv_exact(tls_sock, 2))[0]
                 if response_len <= 0 or response_len > self._max_response_bytes:
                     raise DNSValidationFailure(f"invalid DNS-over-TLS response length {response_len}")
                 wire = self._recv_exact(tls_sock, response_len)
+                return TransportResult(
+                    wire_response=wire,
+                    transport="dot",
+                    endpoint_key=upstream.key,
+                    rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
+                )
+            except Exception as exc:
+                failures.append(f"{sockaddr}: {type(exc).__name__}: {exc}")
             finally:
-                tls_sock.close()
-        finally:
-            if raw_sock is not None:
-                raw_sock.close()
-        return TransportResult(
-            wire_response=wire,
-            transport="dot",
-            endpoint_key=upstream.key,
-            rtt_ms=max(0.1, (time.perf_counter() - started) * 1000.0),
-        )
+                for candidate in (tls_sock, raw_sock):
+                    if candidate is not None:
+                        try:
+                            candidate.close()
+                        except Exception:
+                            pass
+        self._raise_all_failed("DNS-over-TLS exchange", failures)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -11479,11 +11621,23 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._connect_host = connect_host or host
 
     def connect(self):
-        self.sock = socket.create_connection(
-            (self._connect_host, self.port),
-            self.timeout,
-            source_address=self.source_address,
-        )
+        target = (self._connect_host, self.port)
+        try:
+            self.sock = socket.create_connection(
+                target,
+                self.timeout,
+                source_address=self.source_address,
+            )
+        except OSError:
+            if not self.source_address:
+                raise
+            # Source addresses can become stale during DHCP/IP-passthrough
+            # transitions. Retry once with OS route/source selection.
+            self.sock = socket.create_connection(
+                target,
+                self.timeout,
+                source_address=None,
+            )
         if self._tunnel_host:
             self._tunnel()
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
@@ -11501,10 +11655,11 @@ class DoHUpstreamTransport(_SocketTransportBase):
         source_address = None
         bootstrap = upstream.bootstrap_ip
         try:
-            family = socket.AF_INET6 if bootstrap and ":" in bootstrap else socket.AF_INET
-            source = self._source_selector(family)
-            if source:
-                source_address = (str(source).split("%", 1)[0], 0)
+            connect_host = bootstrap or upstream.host
+            family = socket.AF_INET6 if ":" in str(connect_host) else socket.AF_INET
+            source_address = self._source_sockaddr(family)
+            # http.client/socket.create_connection accepts a two-tuple source
+            # address for IPv4 and a four-tuple for IPv6 on modern Python.
         except Exception:
             source_address = None
 
@@ -12115,6 +12270,27 @@ class DNSManager:
             ["🌐", "🛰️", "🧭"],
         )
 
+    @staticmethod
+    def _sanitize_socket_source(value: Optional[str], family: int) -> Optional[str]:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        host, separator, zone = raw.partition("%")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        if int(address.version) != int(family):
+            return None
+        if address.is_unspecified or address.is_multicast:
+            return None
+        if address.version == 6 and address.is_link_local and not zone:
+            # A zone-less link-local address cannot identify the outbound NIC.
+            return None
+        return str(address) + (("%" + zone) if separator and zone else "")
+
     def configure_runtime(
         self,
         *,
@@ -12137,8 +12313,8 @@ class DNSManager:
             self._upstream_iface = upstream_iface
             self._upstream_iface_selector = upstream_iface_selector
             self._packet_context_provider = packet_context_provider
-            self._socket_source_ipv4 = socket_source_ipv4
-            self._socket_source_ipv6 = socket_source_ipv6
+            self._socket_source_ipv4 = self._sanitize_socket_source(socket_source_ipv4, 4)
+            self._socket_source_ipv6 = self._sanitize_socket_source(socket_source_ipv6, 6)
             self.OS_SOCKET_RESOLUTION_MODE = mode
             self.REPLY_SOURCE_POLICY = reply_policy
             self._install_default_transports()
@@ -34582,8 +34758,6 @@ class HyperVRouterManager:
         # Wire hardening. Authentication remains optional for compatibility.
         self._wire_shared_secret: bytes = b""
         self._wire_require_auth = False
-        self._wire_encrypt_payloads = False
-        self._wire_encryption_key: bytes = b""
         self._wire_max_clock_skew_sec = max(90.0, self.peer_timeout_sec * 2.0)
         self._wire_require_known_peer_for_data = True
         self._allow_peer_ip_migration = True
@@ -36728,29 +36902,6 @@ class HyperVRouterManager:
 
         if not isinstance(msg, dict):
             return
-
-        if int(msg.get("enc_v", 0) or 0) == 1:
-            if not self._wire_encryption_key:
-                return
-            try:
-                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-                nonce = base64.b64decode(str(msg.get("nonce") or ""), validate=True)
-                ciphertext = base64.b64decode(str(msg.get("ciphertext") or ""), validate=True)
-                clear = AESGCM(self._wire_encryption_key).decrypt(
-                    nonce, ciphertext, self.segment_id.encode("utf-8")
-                )
-                msg = json.loads(clear.decode("utf-8"))
-            except Exception:
-                self._log_sparse(
-                    f"wire-decrypt:{from_ip}",
-                    "security",
-                    f"encrypted peer packet rejected source={from_ip}",
-                    ["🔐", "🛡️", "⚠️"],
-                    every=10.0,
-                )
-                return
-            if not isinstance(msg, dict):
-                return
 
         magic = str(msg.get("magic") or "").strip()
         if magic not in self.ACCEPT_MAGICS:
@@ -40193,30 +40344,17 @@ class HyperVRouterManager:
             self,
             *,
             shared_secret: Optional[str] = None,
-            server_key: Optional[str] = None,
             require_auth: bool = False,
-            encrypt_payloads: bool = False,
             allow_public_peer_data: Optional[bool] = None,
             allow_public_discovery: Optional[bool] = None,
             allow_cross_subnet_private_hints: Optional[bool] = None,
             allow_same_segment_passthrough_public: Optional[bool] = None,
     ) -> None:
-        secret_text = server_key if server_key is not None else shared_secret
-        secret = str(secret_text or "").encode("utf-8")
+        secret = str(shared_secret or "").encode("utf-8")
         if require_auth and not secret:
             raise ValueError("require_auth=True requires a non-empty shared_secret")
         self._wire_shared_secret = secret
         self._wire_require_auth = bool(require_auth)
-        self._wire_encrypt_payloads = bool(encrypt_payloads)
-        self._wire_encryption_key = hashlib.sha256(secret).digest() if secret else b""
-        if self._wire_encrypt_payloads and not self._wire_encryption_key:
-            raise ValueError("encrypt_payloads=True requires shared_secret or server_key")
-        if self._wire_encrypt_payloads:
-            try:
-                from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
-            except Exception as exc:
-                self._wire_encrypt_payloads = False
-                raise RuntimeError("Encrypted peer packets require the cryptography package") from exc
         if allow_public_peer_data is not None:
             self._allow_public_peer_data = bool(allow_public_peer_data)
         if allow_public_discovery is not None:
@@ -40227,7 +40365,7 @@ class HyperVRouterManager:
             self._hybrid_allow_passthrough_public = bool(allow_same_segment_passthrough_public)
         self._log_evt(
             "security",
-            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} encryption={'aes-gcm' if self._wire_encrypt_payloads else 'off'} "
+            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} "
             f"public_data={int(self._allow_public_peer_data)} public_discovery={int(self._allow_public_discovery)} "
             f"same_segment_passthrough_public={int(self._hybrid_allow_passthrough_public)} "
             f"cross_subnet_private_hints={int(self._allow_cross_subnet_private_peer_hints)}",
@@ -40571,17 +40709,6 @@ class HyperVRouterManager:
             out["auth_v"] = 1
             out["auth"] = self._wire_message_mac(out)
         raw = json.dumps(out, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        if self._wire_encrypt_payloads:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            nonce = os.urandom(12)
-            ciphertext = AESGCM(self._wire_encryption_key).encrypt(nonce, raw, self.segment_id.encode("utf-8"))
-            envelope = {
-                "enc_v": 1,
-                "segment_id": self.segment_id,
-                "nonce": base64.b64encode(nonce).decode("ascii"),
-                "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
-            }
-            raw = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
         if len(raw) > int(self._wire_message_max_bytes):
             raise ValueError(f"wire message too large: {len(raw)} bytes")
         return raw

@@ -150,14 +150,17 @@ def _coerce_chunk_bytes(chunk) -> bytes:
 
 
 class CppLogger:
-    """Thread-safe C++ log forwarder that never rate-suppresses lines."""
-
     def __init__(self, logger):
         self._logger = logger
         self._prefix = "[C++]"
         self._lock = threading.Lock()
         self._closing = False
-        self._max_line_length = 64 * 1024
+        self._window_seconds = 1.0
+        self._max_lines_per_window = 60
+        self._window_start = time.monotonic()
+        self._lines_in_window = 0
+        self._suppressed_in_window = 0
+        self._max_line_length = 4000
 
     def set_prefix(self, prefix: str):
         self._prefix = prefix
@@ -165,22 +168,49 @@ class CppLogger:
     def _format_line(self, msg: str) -> str:
         text = str(msg).rstrip()
         if len(text) > self._max_line_length:
-            text = text[: self._max_line_length] + " ... [truncated oversized line]"
+            text = text[: self._max_line_length] + " ... [truncated]"
         if self._prefix == "":
             return text
         return f"{self._prefix} {text}"
+
+    def _emit_summary_locked(self):
+        if self._suppressed_in_window > 0 and self._logger:
+            try:
+                self._logger.log_message(
+                    f"{self._prefix} [GUI] ⚠️ Suppressed {self._suppressed_in_window} C++ log lines to protect the UI."
+                )
+            except Exception:
+                pass
+            self._suppressed_in_window = 0
 
     def log_message(self, msg: str):
         try:
             if not self._logger:
                 return
+
             line = self._format_line(msg)
             if not line:
                 return
+
+            now = time.monotonic()
+
             with self._lock:
                 if self._closing:
                     return
-                self._logger.log_message(line)
+
+                if (now - self._window_start) >= self._window_seconds:
+                    self._emit_summary_locked()
+                    self._window_start = now
+                    self._lines_in_window = 0
+
+                if self._lines_in_window >= self._max_lines_per_window:
+                    self._suppressed_in_window += 1
+                    return
+
+                self._lines_in_window += 1
+
+            self._logger.log_message(line)
+
         except Exception:
             pass
 
@@ -188,6 +218,7 @@ class CppLogger:
         try:
             with self._lock:
                 self._closing = True
+                self._emit_summary_locked()
         except Exception:
             pass
 
