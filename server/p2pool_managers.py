@@ -22,6 +22,7 @@ import sys
 import threading
 import json
 import time
+from collections import deque
 import psutil
 import requests
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -148,6 +149,19 @@ class PythonRouterManager:
         self._sniff_threads = {}
         self._worker_threads = {}
         self._stop_sniffing_event = threading.Event()
+
+        # Runtime readiness and bounded ingress isolation. Capture callbacks,
+        # WinDivert/WinTun pipe readers, and peer transports enqueue here and
+        # return immediately; per-interface workers own process_packet().
+        self._runtime_network_ready = threading.Event()
+        self._ingress_lock = threading.RLock()
+        self._ingress_states: Dict[str, Dict[str, Any]] = {}
+        self._ingress_max_frames = 4096
+        self._ingress_max_bytes = 64 * 1024 * 1024
+        self._ingress_log_ts: Dict[str, float] = {}
+        self._ingress_total_enqueued = 0
+        self._ingress_total_processed = 0
+        self._ingress_total_dropped = 0
         self._sniff_threads_lock = threading.Lock() # Lock for _sniff_threads dictionary
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
@@ -1190,6 +1204,52 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 "[HostRoute] ⚠️ Could not fully apply host-preserving upstream mode."
             )
         return ok
+    def _find_active_default_route_interface(self) -> Tuple[Optional[str], Optional[str]]:
+        """Return the Windows interface alias and IPv4 next hop for the best default route."""
+        if os.name != "nt":
+            return None, None
+        script = r'''
+$ErrorActionPreference = "SilentlyContinue"
+$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "0.0.0.0/0" |
+    Where-Object { $_.State -ne "Invalid" -and $_.NextHop -ne "0.0.0.0" } |
+    Sort-Object @{Expression={$_.RouteMetric + $_.InterfaceMetric}}, RouteMetric, InterfaceMetric |
+    Select-Object -First 1 InterfaceAlias,NextHop
+if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
+'''
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            }
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                **kwargs,
+            )
+            line = next((x.strip() for x in (result.stdout or "").splitlines() if "|" in x), "")
+            if line:
+                alias, gateway = line.split("|", 1)
+                return alias.strip() or None, gateway.strip() or None
+        except Exception:
+            pass
+        return None, None
+
+    @staticmethod
+    def _usable_interface_ipv4(friendly_name: str) -> Tuple[Optional[str], Optional[str]]:
+        for addr in psutil.net_if_addrs().get(str(friendly_name or ""), []):
+            if addr.family != socket.AF_INET:
+                continue
+            try:
+                parsed = ipaddress.IPv4Address(addr.address)
+            except Exception:
+                continue
+            if parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified or parsed.is_multicast:
+                continue
+            return str(parsed), str(addr.netmask or "255.255.255.0")
+        return None, None
+
     def _auto_configure_interfaces(self, use_dhcp_out, use_dhcp_in, router_ip_in: str = None,
                                    router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
                                    router_netmask_out: str = "255.255.255.0"):
@@ -1268,6 +1328,60 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     f"[Router] Found Ethernet 2 interface")
             if in_iface_info is not None and out_iface_info is not None and loopback_iface_info is not None and ethernet_2_info is not None:
                 break  # All found, exit loop
+        # AT&T Internet Air IP Passthrough can put the host's public default
+        # route on an adapter named "Ethernet". Prefer the route Windows is
+        # actually using when the old name-based Wi-Fi OUT choice has no route.
+        default_alias, default_gateway = self._find_active_default_route_interface()
+        if default_alias:
+            route_iface = next(
+                (item for item in self._discovered_tshark_interfaces
+                 if str(item.get("friendly_name") or "").casefold() == default_alias.casefold()),
+                None,
+            )
+            named_out_has_gateway = False
+            if out_iface_info is not None:
+                try:
+                    named_out_has_gateway = bool(
+                        self._get_default_gateway_for_interface(out_iface_info.get("friendly_name", ""))
+                    )
+                except Exception:
+                    named_out_has_gateway = False
+
+            if route_iface is not None and (out_iface_info is None or not named_out_has_gateway):
+                previous_out = out_iface_info
+                out_iface_info = route_iface
+                self.router_logger.log_message(
+                    f"[Router][Uplink] 🧭 Using Windows default-route adapter "
+                    f"'{default_alias}' via {default_gateway or 'existing route'} as OUT."
+                )
+
+                if in_iface_info is route_iface or (
+                        in_iface_info and in_iface_info.get("full_name") == route_iface.get("full_name")
+                ):
+                    alternatives = [
+                        item for item in self._discovered_tshark_interfaces
+                        if item.get("full_name") != route_iface.get("full_name")
+                        and not self._is_wifi_host_interface(item.get("full_name"), item.get("friendly_name"))
+                        and "loopback" not in str(item.get("friendly_name") or "").casefold()
+                    ]
+                    preferred = []
+                    if previous_out is not None and previous_out in alternatives:
+                        preferred.append(previous_out)
+                    preferred.extend(sorted(
+                        alternatives,
+                        key=lambda x: (
+                            0 if any(token in str(x.get("friendly_name") or "").casefold()
+                                     for token in ("ethernet 2", "local area connection", "vethernet")) else 1,
+                            str(x.get("friendly_name") or "").casefold(),
+                        ),
+                    ))
+                    if preferred:
+                        in_iface_info = preferred[0]
+                        self.router_logger.log_message(
+                            f"[Router][Uplink] 🏠 Reassigned IN to "
+                            f"'{in_iface_info.get('friendly_name')}' to keep WAN and LAN distinct."
+                        )
+
         # Handle cases where IN or OUT are not found
 
         if in_iface_info is None or out_iface_info is None:
@@ -1400,15 +1514,20 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.router_logger.log_message(
                     f"[Router] Using user-provided static IP for OUT interface: {current_out_ip}/{current_out_netmask}")
             else:  # No user-provided static IP for OUT, try to get current OS static config
-                for addr in psutil.net_if_addrs().get(self.interface_out_friendly_name, []):
-                    if addr.family == socket.AF_INET:
-                        current_out_ip = addr.address
-                        current_out_netmask = addr.netmask
-                        current_out_gateway = self._get_default_gateway_for_interface(self.interface_out_friendly_name)
-                        break
+                current_out_ip, current_out_netmask = self._usable_interface_ipv4(
+                    self.interface_out_friendly_name
+                )
+                current_out_gateway = self._get_default_gateway_for_interface(
+                    self.interface_out_friendly_name
+                )
                 if current_out_ip and current_out_netmask:
                     self.router_logger.log_message(
                         f"[Router] Using current static IP for OUT interface '{self.interface_out_friendly_name}': {current_out_ip}/{current_out_netmask}, Gateway: {current_out_gateway}")
+                    if not current_out_gateway:
+                        self.router_logger.log_message(
+                            "[Router][Uplink] ⚠️ No IPv4 default gateway is active. "
+                            "Starting in local-only/degraded mode; external socket opens are deferred."
+                        )
                 else:
                     self.router_logger.log_message(
                         "[Router] CRITICAL ERROR: Could not determine static IP for OUT interface. Please configure it manually or use DHCP.")
@@ -1941,6 +2060,280 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
         except Exception:
             return None
+    def _ingress_log_sparse(self, key: str, message: str, every: float = 2.0) -> None:
+        now = time.monotonic()
+        with self._ingress_lock:
+            last = float(self._ingress_log_ts.get(key, 0.0) or 0.0)
+            if now - last < max(0.1, float(every)):
+                return
+            self._ingress_log_ts[key] = now
+        try:
+            self.router_logger.log_message(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _estimate_ingress_size(packet) -> int:
+        if isinstance(packet, (bytes, bytearray, memoryview)):
+            return len(packet)
+        try:
+            return max(1, len(packet))
+        except Exception:
+            try:
+                return max(1, len(bytes(packet)))
+            except Exception:
+                return 1
+
+    def _ensure_ingress_state(self, inbound_iface: str) -> Dict[str, Any]:
+        key = str(inbound_iface or "Unknown")
+        with self._ingress_lock:
+            state = self._ingress_states.get(key)
+            if state is not None and state.get("thread") and state["thread"].is_alive():
+                return state
+
+            stop_event = threading.Event()
+            state = {
+                "iface": key,
+                "queue": deque(),
+                "bytes": 0,
+                "cv": threading.Condition(threading.RLock()),
+                "stop": stop_event,
+                "thread": None,
+                "enqueued": 0,
+                "processed": 0,
+                "dropped": 0,
+                "errors": 0,
+                "last_progress": time.monotonic(),
+                "pressure_dropped_pending": 0,
+                "pressure_last_log": 0.0,
+            }
+            thread = threading.Thread(
+                target=self._ingress_worker_loop,
+                args=(state,),
+                name=f"RouterIngress-{key.split('_')[-1]}",
+                daemon=True,
+            )
+            state["thread"] = thread
+            self._ingress_states[key] = state
+            thread.start()
+            return state
+
+    def enqueue_ingress_packet(self, packet, inbound_iface: str = "Unknown") -> bool:
+        """Non-blocking ingress API used by capture and virtual-pipe readers."""
+        if packet is None or self._stop_sniffing_event.is_set():
+            return False
+
+        state = self._ensure_ingress_state(inbound_iface)
+        size = self._estimate_ingress_size(packet)
+        if size > self._ingress_max_bytes:
+            self._ingress_total_dropped += 1
+            return False
+
+        if isinstance(packet, (bytearray, memoryview)):
+            packet = bytes(packet)
+
+        cv = state["cv"]
+        dropped_now = 0
+        with cv:
+            q = state["queue"]
+            while q and (
+                    len(q) >= self._ingress_max_frames
+                    or int(state["bytes"]) + size > self._ingress_max_bytes
+            ):
+                _old_packet, old_size, _old_ts = q.popleft()
+                state["bytes"] = max(0, int(state["bytes"]) - int(old_size))
+                state["dropped"] += 1
+                self._ingress_total_dropped += 1
+                dropped_now += 1
+
+            if len(q) >= self._ingress_max_frames or int(state["bytes"]) + size > self._ingress_max_bytes:
+                state["dropped"] += 1
+                self._ingress_total_dropped += 1
+                return False
+
+            q.append((packet, size, time.monotonic()))
+            state["bytes"] = int(state["bytes"]) + size
+            state["enqueued"] += 1
+            self._ingress_total_enqueued += 1
+            cv.notify()
+
+        if dropped_now:
+            # Keep every drop in counters, but summarize only this newly-added
+            # pressure diagnostic. Existing router logs are never filtered.
+            now = time.monotonic()
+            state["pressure_dropped_pending"] = int(state.get("pressure_dropped_pending", 0)) + dropped_now
+            last_notice = float(state.get("pressure_last_log", 0.0) or 0.0)
+            if (now - last_notice) >= 30.0:
+                pending = int(state.get("pressure_dropped_pending", 0))
+                state["pressure_dropped_pending"] = 0
+                state["pressure_last_log"] = now
+                self.router_logger.log_message(
+                    RouterRandomMessages(
+                        "Router/Ingress",
+                        f"pressure on {state['iface']}; dropped_oldest={pending} "
+                        f"queued={len(state['queue'])} bytes={state['bytes']} "
+                        f"total_dropped={state['dropped']}",
+                        ["⚠️", "🚦", "📦"],
+                    )
+                )
+        return True
+
+    ingest_packet = enqueue_ingress_packet
+
+    def _ingress_worker_loop(self, state: Dict[str, Any]) -> None:
+        cv = state["cv"]
+        stop_event = state["stop"]
+        iface = state["iface"]
+
+        while not stop_event.is_set():
+            with cv:
+                while not state["queue"] and not stop_event.is_set():
+                    cv.wait(timeout=0.25)
+                if stop_event.is_set() and not state["queue"]:
+                    break
+                packet, size, queued_ts = state["queue"].popleft()
+                state["bytes"] = max(0, int(state["bytes"]) - int(size))
+
+            try:
+                self.process_packet(packet, iface)
+                state["processed"] += 1
+                self._ingress_total_processed += 1
+                state["last_progress"] = time.monotonic()
+            except Exception as exc:
+                state["errors"] += 1
+                self._ingress_log_sparse(
+                    f"worker-error:{iface}",
+                    f"[Router][Ingress] ❗ worker error on {iface}: {type(exc).__name__}: {exc}",
+                )
+
+    def _stop_ingress_workers(self, *, discard: bool = True) -> None:
+        with self._ingress_lock:
+            states = list(self._ingress_states.values())
+
+        for state in states:
+            state["stop"].set()
+            with state["cv"]:
+                if discard:
+                    dropped = len(state["queue"])
+                    state["dropped"] += dropped
+                    self._ingress_total_dropped += dropped
+                    state["queue"].clear()
+                    state["bytes"] = 0
+                state["cv"].notify_all()
+
+        for state in states:
+            thread = state.get("thread")
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                try:
+                    thread.join(timeout=2.0)
+                except Exception:
+                    pass
+
+        with self._ingress_lock:
+            self._ingress_states.clear()
+
+    def get_runtime_health(self) -> Dict[str, Any]:
+        with self._ingress_lock:
+            ingress = {
+                name: {
+                    "queued_frames": len(state["queue"]),
+                    "queued_bytes": int(state["bytes"]),
+                    "enqueued": int(state["enqueued"]),
+                    "processed": int(state["processed"]),
+                    "dropped": int(state["dropped"]),
+                    "errors": int(state["errors"]),
+                    "worker_alive": bool(state.get("thread") and state["thread"].is_alive()),
+                    "last_progress_age_sec": max(0.0, time.monotonic() - float(state["last_progress"])),
+                }
+                for name, state in self._ingress_states.items()
+            }
+        out = {
+            "started": bool(self.started),
+            "network_ready": self._runtime_network_ready.is_set(),
+            "ingress_total_enqueued": self._ingress_total_enqueued,
+            "ingress_total_processed": self._ingress_total_processed,
+            "ingress_total_dropped": self._ingress_total_dropped,
+            "ingress": ingress,
+        }
+        try:
+            out["hyperv_pipe"] = self.hyperv_manager.get_pipe_stats()
+        except Exception:
+            pass
+        return out
+
+    def _safe_stop_component(self, label: str, component, method: str = "stop") -> bool:
+        if component is None:
+            return True
+        fn = getattr(component, method, None)
+        if not callable(fn):
+            return True
+        try:
+            fn()
+            return True
+        except Exception as exc:
+            self._ingress_log_sparse(
+                f"safe-stop:{label}",
+                f"[Router][Cleanup] ⚠️ {label}.{method} failed: {type(exc).__name__}: {exc}",
+                every=1.0,
+            )
+            return False
+
+    def _best_effort_runtime_core_stop(
+            self,
+            *,
+            use_hyperv: bool = False,
+            use_stratum_comm: bool = False,
+    ) -> None:
+        """Idempotent fallback cleanup used after partial startup/stop failures."""
+        self._runtime_network_ready.clear()
+        self._stop_sniffing_event.set()
+        self._stop_ingress_workers(discard=True)
+
+        self._safe_stop_component("SocketInterface", self.socket_interface)
+        self._safe_stop_component("TransportManager", self.transport_manager)
+        self._safe_stop_component("HyperVRouterManager", self.hypervrouter_manager)
+
+        if use_hyperv or self.hyperv_enabled:
+            self._safe_stop_component("WinDivertManager", self.windivert_manager)
+            self._safe_stop_component("WinTunManager", self.wintun_manager)
+            self._safe_stop_component("HyperVManager", self.hyperv_manager, "teardown")
+            self.hyperv_enabled = False
+
+        if use_stratum_comm:
+            self._safe_stop_component("MoneroDaemonManager", self.daemon_manager)
+            self._safe_stop_component("StratumConnectionManager", self.stratum_connection_manager)
+
+        seen = set()
+        for role, server in (
+                ("DHCP-IN", self.dhcp_server_in),
+                ("DHCP-OUT", self.dhcp_server_out),
+                *[(f"DHCP-{name}", obj) for name, obj in (getattr(self, "dhcp_interface_servers", {}) or {}).items()],
+        ):
+            if server is None or id(server) in seen:
+                continue
+            seen.add(id(server))
+            self._safe_stop_component(role, server)
+
+        # These components are expected to tolerate repeated stop calls and own
+        # background workers or open handles that should not survive rollback.
+        for label, component in (
+                ("CodeOutputManager", self.code_output_manager),
+                ("RIPManager", self.rip_manager),
+                ("EthernetBridgeManager", self.ethernet_manager),
+                ("PacketWriter", self.packet_writer),
+                ("NATManager", self.nat_manager),
+                ("DNSManager", self.dns_manager),
+                ("P2PPeerManager", self.p2p_manager),
+                ("NetRouteManager", self.netroute_manager),
+                ("HostConnectivityBoundaryManager", self.host_connectivity_boundary),
+                ("LanManager", self.lan_manager),
+                ("GatewayManager", self.gateway_manager),
+                ("UplinkManager", self.upstream_manager or self.uplink_manager),
+        ):
+            self._safe_stop_component(label, component)
+
+        self.started = False
+
     def _start_single_sniffer(self, iface_name: str, promisc = False):
         """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
 
@@ -1960,7 +2353,11 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                     pkt2 = self._coerce_ingress_packet(pkt)
                     if pkt2 is None:
                         return
-                    self.process_packet(pkt2, iface_name)
+                    if not self.enqueue_ingress_packet(pkt2, iface_name):
+                        self._ingress_log_sparse(
+                            f"capture-drop:{iface_name}",
+                            f"[Sniffer] ⚠️ ingress queue rejected packet on {iface_name}",
+                        )
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
@@ -4875,8 +5272,8 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 return
             dst_ip = ip_layer.dst
 
-            link_local_ip_bare = self.router_ipv6_link_local_out.split('%')[0]
-            if dst_ip == link_local_ip_bare or ip_layer.src== link_local_ip_bare:
+            link_local_ip_bare = str(self.router_ipv6_link_local_out or "").split('%')[0]
+            if link_local_ip_bare and (dst_ip == link_local_ip_bare or ip_layer.src == link_local_ip_bare):
                 self.function_call_tracker.track(
                     identifier="DroppedLinkLocal",
                     threshold=100,
@@ -5680,6 +6077,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             if self.started:
                 self.router_logger.log_message("[Router] Start requested while already running; ignoring.")
                 return
+            self._runtime_network_ready.clear()
+            self._stop_sniffing_event.clear()
+            self._stop_ingress_workers(discard=True)
             self.hyperv_enabled = use_hyperv
             self._enable_dhcp_server = bool(enable_dhcp_server)
             self._serve_dhcp_on_wan = bool(serve_dhcp_on_wan)
@@ -5934,7 +6334,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
 
             if use_socket:
                 self.socket_interface = SocketInterface(self, self.router_logger)
-                self.socket_interface.start()
+                self.router_logger.log_message(
+                    "[SocketInterface] ⏳ startup deferred until interfaces and routes are ready."
+                )
             self.dns_manager = DNSManager(
                 self.router_logger,
                 self.packet_writer,
@@ -6649,16 +7051,31 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 self.parallel_python.increase_ram_usage(1500)
             else:
                 self.hyperv_enabled = False
+
+            self._runtime_network_ready.set()
+            if self.hypervrouter_manager:
+                try:
+                    notify_ready = getattr(self.hypervrouter_manager, "notify_network_ready", None)
+                    if callable(notify_ready):
+                        notify_ready()
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[HyperVRouterManager] ⚠️ Network-ready notification deferred: {exc}"
+                    )
+            if self.socket_interface:
+                self.socket_interface.start()
             self.started = True
-        except Exception as e:
-            self.started = False
-            try:
-                if self.transport_manager:
-                    self.transport_manager.stop()
-            except Exception:
-                pass
             self.router_logger.log_message(
-                f"[Router] ❌ Startup failed: {type(e).__name__}: {e}"
+                "[Router] ✅ Runtime ready; capture, virtual pipes, and socket promotion are isolated."
+            )
+        except Exception as e:
+            self._best_effort_runtime_core_stop(
+                use_hyperv=bool(use_hyperv),
+                use_stratum_comm=bool(use_stratum_comm),
+            )
+            self.router_logger.log_message(
+                f"[Router] ❌ Startup failed and runtime rollback completed: "
+                f"{type(e).__name__}: {e}"
             )
 
 
@@ -6666,6 +7083,9 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
+            self._runtime_network_ready.clear()
+            self._stop_sniffing_event.set()
+            self._stop_ingress_workers(discard=True)
             if use_hyperv:
                 self.hypervrouter_manager.stop()
                 self.windivert_manager.stop()
@@ -6712,7 +7132,6 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
                 )
             if use_static:
                 self._deconfigure_interface_settings()
-            self._stop_sniffing_event.set()
             self.parallel_python.stop()
             stopped_dhcp_ids = set()
 
@@ -6796,7 +7215,18 @@ Write-Output ("Configured host-preserving upstream mode. WAN='{0}' GW='{1}' LANs
             self.started = False
             self.router_logger.log_message("[Router] All services stopped.")
         except Exception as e:
-            self.router_logger.log_message(f"[Router] Error shutting down {e}")
+            self.router_logger.log_message(
+                f"[Router] Error during normal shutdown: {type(e).__name__}: {e}; "
+                "running best-effort cleanup."
+            )
+            self._best_effort_runtime_core_stop(
+                use_hyperv=bool(use_hyperv),
+                use_stratum_comm=bool(use_stratum_comm),
+            )
+        finally:
+            self._runtime_network_ready.clear()
+            self._stop_sniffing_event.set()
+            self.started = False
 
     def _select_dns_upstream_iface(
             self,

@@ -2,6 +2,7 @@
 import atexit
 import ctypes
 import os
+import queue
 import signal
 import struct
 import subprocess
@@ -149,17 +150,14 @@ def _coerce_chunk_bytes(chunk) -> bytes:
 
 
 class CppLogger:
+    """Thread-safe C++ log forwarder that never rate-suppresses lines."""
+
     def __init__(self, logger):
         self._logger = logger
         self._prefix = "[C++]"
         self._lock = threading.Lock()
         self._closing = False
-        self._window_seconds = 1.0
-        self._max_lines_per_window = 60
-        self._window_start = time.monotonic()
-        self._lines_in_window = 0
-        self._suppressed_in_window = 0
-        self._max_line_length = 4000
+        self._max_line_length = 64 * 1024
 
     def set_prefix(self, prefix: str):
         self._prefix = prefix
@@ -167,49 +165,22 @@ class CppLogger:
     def _format_line(self, msg: str) -> str:
         text = str(msg).rstrip()
         if len(text) > self._max_line_length:
-            text = text[: self._max_line_length] + " ... [truncated]"
+            text = text[: self._max_line_length] + " ... [truncated oversized line]"
         if self._prefix == "":
             return text
         return f"{self._prefix} {text}"
-
-    def _emit_summary_locked(self):
-        if self._suppressed_in_window > 0 and self._logger:
-            try:
-                self._logger.log_message(
-                    f"{self._prefix} [GUI] ⚠️ Suppressed {self._suppressed_in_window} C++ log lines to protect the UI."
-                )
-            except Exception:
-                pass
-            self._suppressed_in_window = 0
 
     def log_message(self, msg: str):
         try:
             if not self._logger:
                 return
-
             line = self._format_line(msg)
             if not line:
                 return
-
-            now = time.monotonic()
-
             with self._lock:
                 if self._closing:
                     return
-
-                if (now - self._window_start) >= self._window_seconds:
-                    self._emit_summary_locked()
-                    self._window_start = now
-                    self._lines_in_window = 0
-
-                if self._lines_in_window >= self._max_lines_per_window:
-                    self._suppressed_in_window += 1
-                    return
-
-                self._lines_in_window += 1
-
-            self._logger.log_message(line)
-
+                self._logger.log_message(line)
         except Exception:
             pass
 
@@ -217,7 +188,6 @@ class CppLogger:
         try:
             with self._lock:
                 self._closing = True
-                self._emit_summary_locked()
         except Exception:
             pass
 
@@ -271,6 +241,31 @@ class HyperVManager:
         self._packet_pipe_maintain_interval = max(0.25, float(packet_pipe_maintain_interval))
         self._packet_pipe_stop = threading.Event()
         self._packet_pipe_thread: Optional[threading.Thread] = None
+
+        # The router hot path must never wait for a named pipe.  One dedicated
+        # writer owns the C++ pipe and drains this bounded byte-aware queue.
+        # When pressure is sustained, oldest frames are discarded so current
+        # traffic continues moving instead of allowing stale traffic to wedge
+        # the router and Qt log thread.
+        self._packet_tx_cv = threading.Condition(threading.RLock())
+        self._packet_tx_q = deque()
+        self._packet_tx_bytes = 0
+        self._packet_tx_max_frames = 4096
+        self._packet_tx_max_bytes = 64 * 1024 * 1024
+        self._packet_tx_thread: Optional[threading.Thread] = None
+        self._packet_tx_stop = threading.Event()
+        self._packet_tx_retries = 2
+        self._packet_tx_retry_backoff = 0.05
+        self._packet_tx_max_age_sec = 3.0
+        self._packet_tx_stats = {
+            "accepted": 0,
+            "written": 0,
+            "write_failures": 0,
+            "dropped_pressure": 0,
+            "dropped_shutdown": 0,
+            "reconnects": 0,
+        }
+        self._packet_tx_last_log = {}
 
         self._stop_timeout_soft = float(stop_timeout_soft)
         self._stop_timeout_hard = float(stop_timeout_hard)
@@ -413,6 +408,7 @@ class HyperVManager:
                     None,
                 )
                 self._pipe_handle = h
+                self._packet_tx_stats["reconnects"] += 1
                 return h
             except pywintypes.error:
                 if time.monotonic() >= deadline:
@@ -484,6 +480,196 @@ class HyperVManager:
         with self._packet_pipe_lock:
             self._packet_pipe_thread = None
 
+    # ---------- non-blocking packet writer ----------
+
+    def _pipe_log_sparse(self, key: str, message: str, every: float = 2.0) -> None:
+        now = time.monotonic()
+        last = float(self._packet_tx_last_log.get(key, 0.0) or 0.0)
+        if now - last < max(0.1, float(every)):
+            return
+        self._packet_tx_last_log[key] = now
+        self._logger.log_message(message)
+
+    def _start_packet_writer(self) -> None:
+        with self._packet_tx_cv:
+            thr = self._packet_tx_thread
+            if thr is not None and thr.is_alive():
+                return
+            self._packet_tx_stop.clear()
+            self._packet_tx_thread = threading.Thread(
+                target=self._packet_writer_loop,
+                name="HyperVPacketPipeWriter",
+                daemon=True,
+            )
+            self._packet_tx_thread.start()
+
+    def _stop_packet_writer(self, *, discard: bool = True) -> None:
+        self._packet_tx_stop.set()
+        with self._packet_tx_cv:
+            if discard and self._packet_tx_q:
+                self._packet_tx_stats["dropped_shutdown"] += len(self._packet_tx_q)
+                self._packet_tx_q.clear()
+                self._packet_tx_bytes = 0
+            self._packet_tx_cv.notify_all()
+            thr = self._packet_tx_thread
+
+        if thr and thr.is_alive() and thr is not threading.current_thread():
+            try:
+                thr.join(timeout=3.0)
+            except Exception:
+                pass
+
+        with self._packet_tx_cv:
+            self._packet_tx_thread = None
+
+    def _enqueue_packet_payload(self, payload: bytes) -> bool:
+        n = len(payload)
+        if n <= 4 or n > (4 * 1024 * 1024):
+            return False
+
+        with self._packet_tx_cv:
+            if self._packet_tx_stop.is_set() or self._stopping:
+                return False
+
+            dropped = 0
+            while self._packet_tx_q and (
+                len(self._packet_tx_q) >= self._packet_tx_max_frames
+                or self._packet_tx_bytes + n > self._packet_tx_max_bytes
+            ):
+                old_payload, _old_ts = self._packet_tx_q.popleft()
+                self._packet_tx_bytes = max(0, self._packet_tx_bytes - len(old_payload))
+                dropped += 1
+
+            if len(self._packet_tx_q) >= self._packet_tx_max_frames or self._packet_tx_bytes + n > self._packet_tx_max_bytes:
+                self._packet_tx_stats["dropped_pressure"] += 1
+                self._pipe_log_sparse(
+                    "queue-hard-full",
+                    "[HyperV][PIPE] ⚠️ outbound pipe queue at hard limit; newest frame dropped.",
+                )
+                return False
+
+            if dropped:
+                self._packet_tx_stats["dropped_pressure"] += dropped
+                self._pipe_log_sparse(
+                    "queue-pressure",
+                    f"[HyperV][PIPE] ⚠️ outbound queue pressure; dropped_oldest={dropped} "
+                    f"queued={len(self._packet_tx_q)} bytes={self._packet_tx_bytes}.",
+                )
+
+            self._packet_tx_q.append((payload, time.monotonic()))
+            self._packet_tx_bytes += n
+            self._packet_tx_stats["accepted"] += 1
+            self._packet_tx_cv.notify()
+            return True
+
+    def _dequeue_packet_payload(self) -> Optional[tuple[bytes, float]]:
+        with self._packet_tx_cv:
+            while not self._packet_tx_q and not self._packet_tx_stop.is_set():
+                self._packet_tx_cv.wait(timeout=0.25)
+            if not self._packet_tx_q:
+                return None
+            payload, queued_at = self._packet_tx_q.popleft()
+            self._packet_tx_bytes = max(0, self._packet_tx_bytes - len(payload))
+            return payload, float(queued_at)
+
+    @staticmethod
+    def _write_result_count(result, expected: int) -> int:
+        try:
+            if isinstance(result, tuple) and len(result) >= 2:
+                value = result[1]
+                if isinstance(value, int):
+                    return int(value)
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    return len(value)
+            if isinstance(result, int):
+                return int(result)
+        except Exception:
+            pass
+        # Synchronous pywin32 WriteFile commonly reports success with a tuple
+        # whose second value is implementation-dependent.  No exception means
+        # the complete buffer was accepted by the byte-mode pipe.
+        return int(expected)
+
+    def _write_pipe_payload(self, payload: bytes) -> bool:
+        with self._packet_pipe_lock:
+            h = self._open_packet_pipe_locked(timeout=0.35)
+            if h is None:
+                return False
+            try:
+                result = win32file.WriteFile(h, payload)
+                written = self._write_result_count(result, len(payload))
+                if written != len(payload):
+                    raise OSError(f"short pipe write {written}/{len(payload)}")
+                return True
+            except Exception:
+                self._close_packet_pipe_locked()
+                raise
+
+    def _packet_writer_loop(self) -> None:
+        current: Optional[tuple[bytes, float]] = None
+        retry_count = 0
+
+        while not self._packet_tx_stop.is_set():
+            if current is None:
+                current = self._dequeue_packet_payload()
+                retry_count = 0
+                if current is None:
+                    continue
+
+            payload, queued_at = current
+            if (time.monotonic() - queued_at) > self._packet_tx_max_age_sec:
+                self._packet_tx_stats["dropped_pressure"] += 1
+                current = None
+                retry_count = 0
+                self._pipe_log_sparse(
+                    "stale-drop",
+                    "[HyperV][PIPE] ⚠️ dropped stale outbound frame while pipe was unavailable.",
+                    every=2.0,
+                )
+                continue
+
+            if not self.is_running():
+                if self._packet_tx_stop.wait(0.10):
+                    break
+                continue
+
+            try:
+                if self._write_pipe_payload(payload):
+                    self._packet_tx_stats["written"] += 1
+                    current = None
+                    retry_count = 0
+                    continue
+            except Exception as exc:
+                self._packet_tx_stats["write_failures"] += 1
+                self._pipe_log_sparse(
+                    "write-failed",
+                    f"[HyperV][PIPE] Write failed; reconnecting without blocking router: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+            retry_count += 1
+            if retry_count > self._packet_tx_retries:
+                self._packet_tx_stats["dropped_pressure"] += 1
+                current = None
+                retry_count = 0
+            else:
+                self._packet_tx_stop.wait(self._packet_tx_retry_backoff * retry_count)
+
+        if current is not None:
+            self._packet_tx_stats["dropped_shutdown"] += 1
+
+    def get_pipe_stats(self) -> dict:
+        with self._packet_tx_cv:
+            out = dict(self._packet_tx_stats)
+            out.update({
+                "queued_frames": len(self._packet_tx_q),
+                "queued_bytes": self._packet_tx_bytes,
+                "connected": self._pipe_handle is not None,
+                "process_running": self.is_running(),
+                "writer_alive": bool(self._packet_tx_thread and self._packet_tx_thread.is_alive()),
+            })
+            return out
+
     # ---------- public API ----------
 
     def start(self) -> bool:
@@ -491,6 +677,7 @@ class HyperVManager:
             if self._proc and self._proc.poll() is None:
                 self._logger.log_message("[HyperV] Process already running.")
                 self._start_packet_pipe_maintainer()
+                self._start_packet_writer()
                 return True
 
             if not self._exe_path.exists():
@@ -529,6 +716,7 @@ class HyperVManager:
                 )
                 self._reader_thread.start()
                 self._start_packet_pipe_maintainer()
+                self._start_packet_writer()
 
                 self._logger.log_message(f"[HyperV] Started {self._exe_path.name} (pid {self._proc.pid})")
                 return True
@@ -536,6 +724,7 @@ class HyperVManager:
             except Exception as e:
                 self._proc = None
                 self._reader_thread = None
+                self._stop_packet_writer(discard=True)
                 self._stop_packet_pipe_maintainer()
                 self._logger.log_message(f"[HyperV] Error starting process: {e}")
                 return False
@@ -564,6 +753,7 @@ class HyperVManager:
         with self._proc_lock:
             proc = self._proc
             if not proc:
+                self._stop_packet_writer(discard=True)
                 self._stop_packet_pipe_maintainer()
                 return
             if self._stopping:
@@ -571,6 +761,7 @@ class HyperVManager:
             self._stopping = True
             self._suppress_exit_log = True
 
+        self._stop_packet_writer(discard=True)
         self._stop_packet_pipe_maintainer()
 
         self.send_enter()
@@ -619,30 +810,31 @@ class HyperVManager:
         self._logger.log_message("[HyperV] Teardown complete.")
 
     def send_packet(self, packet, connect_timeout: float = 3.0) -> bool:
+        """Queue a framed packet for C++ without blocking the routing thread.
+
+        ``connect_timeout`` remains in the public signature for compatibility,
+        but connection/reconnection is owned by the writer thread.
+        """
         frame = _normalize_pipe_payload(packet)
         if not frame:
-            self._logger.log_message("[HyperV][PIPE] Could not normalize packet to bytes.")
+            self._pipe_log_sparse(
+                "normalize-failed",
+                "[HyperV][PIPE] Could not normalize packet to bytes.",
+            )
+            return False
+        if len(frame) > (4 * 1024 * 1024):
+            self._pipe_log_sparse(
+                "oversize",
+                f"[HyperV][PIPE] Refusing oversized frame len={len(frame)}.",
+            )
             return False
 
+        if not self.is_running():
+            return False
+
+        self._start_packet_writer()
         payload = struct.pack("<I", len(frame)) + frame
-
-        with self._packet_pipe_lock:
-            h = self._open_packet_pipe_locked(timeout=connect_timeout)
-            if h is None:
-                self._logger.log_message("[HyperV][PIPE] Could not connect to packet pipe.")
-                return False
-
-            try:
-                win32file.WriteFile(h, payload)
-                return True
-            except pywintypes.error as e:
-                self._close_packet_pipe_locked()
-                self._logger.log_message(f"[HyperV][PIPE] Write failed; pipe reset: {e}")
-                return False
-            except Exception as e:
-                self._close_packet_pipe_locked()
-                self._logger.log_message(f"[HyperV][PIPE] Write exception; pipe reset: {e}")
-                return False
+        return self._enqueue_packet_payload(payload)
 
 
 # ----------------- shared pipe reader base -----------------
@@ -703,6 +895,10 @@ class _PipeFrameReaderBase:
 
         self._max_frames = max(1, int(max_frames_per_batch))
         self._max_bytes = max(4096, int(max_bytes_per_batch))
+        # Match the outbound framing limit.  A malformed larger prefix still
+        # forces reconnect, but valid captures are not rejected merely because
+        # they exceed the legacy 65,535-byte cap.
+        self._max_frame_size = 4 * 1024 * 1024
 
         self._pipe_handle = None
         self._pipe_handle_lock = threading.Lock()
@@ -893,8 +1089,11 @@ class _PipeFrameReaderBase:
 
     def _get_process_packet(self):
         try:
-            fn = getattr(self.router_manager, "process_packet", None)
-            return fn if callable(fn) else None
+            for name in ("enqueue_ingress_packet", "process_packet"):
+                fn = getattr(self.router_manager, name, None)
+                if callable(fn):
+                    return fn
+            return None
         except Exception:
             return None
 
@@ -1096,22 +1295,34 @@ class _PipeFrameReaderBase:
         frame = bytes(frame)
         n = len(frame)
 
-        if not (14 <= n <= 65535):
+        if not (14 <= n <= self._max_frame_size):
             self.frames_badlen += 1
             self._maybe_log_badlen_sample()
             return False
 
         with self._q_cv:
+            dropped_now = 0
+            while self._q and (
+                    len(self._q) >= self._q_max_frames
+                    or (self._q_bytes + n) > self._q_max_bytes
+            ):
+                old = self._q.popleft()
+                self._q_bytes = max(0, self._q_bytes - len(old))
+                self.frames_dropped_queuefull += 1
+                dropped_now += 1
+
             if len(self._q) >= self._q_max_frames or (self._q_bytes + n) > self._q_max_bytes:
                 self.frames_dropped_queuefull += 1
+                return False
+
+            if dropped_now:
                 now = time.monotonic()
                 if (now - self._drop_last_log) >= self._drop_log_every:
                     self._drop_last_log = now
                     self._log(
-                        f"[{self.LOG_PREFIX}] ⚠️ queue full; "
-                        f"dropped={self.frames_dropped_queuefull} queued={len(self._q)} bytes={self._q_bytes}"
+                        f"[{self.LOG_PREFIX}] ⚠️ queue pressure; dropped_oldest={dropped_now} "
+                        f"total_dropped={self.frames_dropped_queuefull} queued={len(self._q)} bytes={self._q_bytes}"
                     )
-                return False
 
             self._q.append(frame)
             self._q_bytes += n
@@ -1166,7 +1377,7 @@ class _PipeFrameReaderBase:
                         break
 
                     pkt_len = int.from_bytes(hdr, "little", signed=False)
-                    if not (14 <= pkt_len <= 65535):
+                    if not (14 <= pkt_len <= self._max_frame_size):
                         self.frames_badlen += 1
                         self._maybe_log_badlen_sample()
                         disconnect_reason = f"bad length prefix {pkt_len}"

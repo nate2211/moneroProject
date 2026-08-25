@@ -808,7 +808,132 @@ class SocketInterface:
         self._identity_cache_ts: float = 0.0
         self._identity_cache: Dict[str, Dict[str, Any]] = {}
 
+        # Startup/route guard.  Packet observation can begin before Windows has
+        # installed an ATT Air/IP-passthrough route; socket promotion waits for
+        # a real route instead of generating WSAENETUNREACH/WSAEHOSTUNREACH.
+        self._route_ready_cache: Dict[Tuple[int, str], Tuple[bool, float, str]] = {}
+        self._route_ready_cache_ttl = 2.0
+        self._transient_log_ts: Dict[str, float] = {}
+        self._deferred_open_count = 0
+
         self.logger.log_message("[SocketInterface] 🧠 initialized (stream-backed connection mode, tightened admission)")
+
+    def _log_sparse(self, key: str, message: str, every: float = 4.0) -> None:
+        now = time.monotonic()
+        last = float(self._transient_log_ts.get(key, 0.0) or 0.0)
+        if now - last < max(0.2, float(every)):
+            return
+        self._transient_log_ts[key] = now
+        try:
+            self.logger.log_message(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_transient_network_error(value: Any) -> bool:
+        code = 0
+        if isinstance(value, int):
+            code = int(value)
+        else:
+            try:
+                code = int(getattr(value, "winerror", 0) or getattr(value, "errno", 0) or 0)
+            except Exception:
+                code = 0
+        transient = {
+            errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL,
+            errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN,
+            10035, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10060, 10064, 10065,
+        }
+        return code in transient
+
+    def _candidate_route_ready(self, candidate: SocketCandidate) -> Tuple[bool, str]:
+        ready_event = getattr(self.router, "_runtime_network_ready", None)
+        if ready_event is not None and hasattr(ready_event, "is_set") and not ready_event.is_set():
+            return False, "router-startup"
+
+        remote_ip = self._normalize_ip_text(candidate.remote_ip)
+        if not remote_ip:
+            return False, "missing-remote"
+
+        cache_key = (int(candidate.family), remote_ip)
+        now = time.monotonic()
+        cached = self._route_ready_cache.get(cache_key)
+        if cached and now - cached[1] < self._route_ready_cache_ttl:
+            return bool(cached[0]), str(cached[2])
+
+        try:
+            remote_obj = ipaddress.ip_address(remote_ip)
+            if remote_obj.is_unspecified or remote_obj.is_multicast or remote_obj.is_link_local:
+                result = (False, now, "non-routable-remote")
+                self._route_ready_cache[cache_key] = result
+                return result[0], result[2]
+        except Exception:
+            result = (False, now, "bad-remote")
+            self._route_ready_cache[cache_key] = result
+            return result[0], result[2]
+
+        # Prefer the router's already-built route table.
+        route_manager = getattr(self.router, "rip_manager", None)
+        if route_manager is not None:
+            for name in ("find_route", "get_forwarding_route"):
+                fn = getattr(route_manager, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    route = fn(remote_ip)
+                    if route:
+                        result = (True, now, f"router:{name}")
+                        self._route_ready_cache[cache_key] = result
+                        return result[0], result[2]
+                except Exception:
+                    pass
+
+        # A private peer may be directly connected even without a WAN gateway.
+        try:
+            remote_obj = ipaddress.ip_address(remote_ip)
+            if remote_obj.is_private:
+                cfgs = getattr(self.router, "_interfaces_config", {}) or {}
+                for cfg in cfgs.values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    network = cfg.get("network")
+                    try:
+                        if network and remote_obj in ipaddress.ip_network(str(network), strict=False):
+                            result = (True, now, "direct-private")
+                            self._route_ready_cache[cache_key] = result
+                            return result[0], result[2]
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # UDP connect performs a route lookup without sending a datagram.
+        probe = None
+        try:
+            family = socket.AF_INET6 if candidate.family == 6 else socket.AF_INET
+            probe = socket.socket(family, socket.SOCK_DGRAM)
+            probe.settimeout(0.25)
+            target = self._make_sockaddr(family, remote_ip, max(1, int(candidate.remote_port or 9)))
+            if target is None:
+                raise OSError(errno.EHOSTUNREACH, "invalid target")
+            probe.connect(target)
+            source = probe.getsockname()[0]
+            if not source or source in {"0.0.0.0", "::"}:
+                raise OSError(errno.ENETUNREACH, "no selected source")
+            result = (True, now, "os-route")
+        except OSError as exc:
+            result = (False, now, f"os-route:{getattr(exc, 'winerror', None) or getattr(exc, 'errno', None) or 'fail'}")
+        except Exception as exc:
+            result = (False, now, f"os-route:{type(exc).__name__}")
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+
+        self._route_ready_cache[cache_key] = result
+        return result[0], result[2]
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -1042,6 +1167,7 @@ class SocketInterface:
 
     def _service_open_requests_locked(self) -> None:
         opened = 0
+        deferred = 0
         while self._open_requests and opened < self.MAX_OPEN_REQUESTS_PER_TICK:
             key = self._open_requests.popleft()
             candidate = self.candidates.get(key)
@@ -1049,6 +1175,22 @@ class SocketInterface:
                 continue
             if key in self.connections:
                 continue
+
+            route_ready, reason = self._candidate_route_ready(candidate)
+            if not route_ready:
+                candidate.cooldown_until = max(candidate.cooldown_until, time.time() + 2.0)
+                self._open_requests.append(key)
+                self._deferred_open_count += 1
+                deferred += 1
+                self._log_sparse(
+                    f"route-wait:{candidate.remote_ip}",
+                    f"[SocketInterface] ⏳ deferred {candidate.proto} open to "
+                    f"{candidate.remote_ip}:{candidate.remote_port}; route not ready ({reason}).",
+                    every=5.0,
+                )
+                # Do not spin through the same not-ready queue in one tick.
+                break
+
             self._open_connection_from_candidate_locked(candidate)
             opened += 1
 
@@ -1196,6 +1338,11 @@ class SocketInterface:
             self._wake_io()
 
     def _open_connection_from_candidate_locked(self, candidate: SocketCandidate) -> bool:
+        route_ready, route_reason = self._candidate_route_ready(candidate)
+        if not route_ready:
+            candidate.cooldown_until = max(candidate.cooldown_until, time.time() + 2.0)
+            return False
+
         if not candidate.remote_ip or not candidate.remote_port or not candidate.local_ip or not candidate.local_port:
             candidate.apply_feedback("open:missing-endpoints", time.time())
             return False
@@ -1260,6 +1407,9 @@ class SocketInterface:
                         s.close()
                     except Exception:
                         pass
+                    if self._is_transient_network_error(err):
+                        candidate.cooldown_until = max(candidate.cooldown_until, time.time() + 3.0)
+                        self._route_ready_cache.pop((int(candidate.family), str(candidate.remote_ip)), None)
                     continue
 
                 stream = SocketStream(
@@ -1308,6 +1458,9 @@ class SocketInterface:
 
             except OSError as e:
                 last_err = f"{type(e).__name__}:{e}"
+                if self._is_transient_network_error(e):
+                    candidate.cooldown_until = max(candidate.cooldown_until, time.time() + 3.0)
+                    self._route_ready_cache.pop((int(candidate.family), str(candidate.remote_ip)), None)
                 try:
                     if s is not None:
                         s.close()
@@ -1321,11 +1474,26 @@ class SocketInterface:
                 except Exception:
                     pass
 
-        candidate.apply_feedback(f"open:{last_err or 'failed'}", time.time())
-        self.logger.log_message(
-            f"[SocketInterface] ❌ promote failed {candidate.proto} "
-            f"{candidate.remote_ip}:{candidate.remote_port}: {last_err or 'failed'}"
-        )
+        is_transient = False
+        if last_err:
+            match = re.search(r"(?:connect_ex=|WinError |Errno )(\d+)", str(last_err))
+            if match:
+                is_transient = self._is_transient_network_error(int(match.group(1)))
+        if is_transient:
+            self._log_sparse(
+                f"promote-deferred:{candidate.remote_ip}:{candidate.remote_port}",
+                f"[SocketInterface] ⏳ network not ready for {candidate.proto} "
+                f"{candidate.remote_ip}:{candidate.remote_port}; retrying later ({last_err}).",
+                every=5.0,
+            )
+        else:
+            candidate.apply_feedback(f"open:{last_err or 'failed'}", time.time())
+            self._log_sparse(
+                f"promote-failed:{candidate.remote_ip}:{candidate.remote_port}",
+                f"[SocketInterface] ❌ promote failed {candidate.proto} "
+                f"{candidate.remote_ip}:{candidate.remote_port}: {last_err or 'failed'}",
+                every=3.0,
+            )
         return False
 
     def _close_connection_locked(self, conn: SocketConnection, reason: str = "") -> None:
@@ -31254,6 +31422,101 @@ class TransportSNMPManager:
                     out.append(p)
 
             return ",".join(out) if out else None
+class GulfMoneroOceanTransportManager:
+    """MoneroOcean Gulf transport binding layered over TransportStratumManager.
+
+    It never mutates pool traffic and never parses a flow twice. It identifies
+    Gulf service ports, delegates reassembly to the shared Stratum manager, and
+    keeps bounded health counters suitable for routers that run continuously.
+    """
+
+    DEFAULT_HOST = "gulf.moneroocean.stream"
+    DEFAULT_PORTS = {10001, 10128, 10132}
+
+    def __init__(self, logger, stratum_manager, *, ports=None, host=DEFAULT_HOST):
+        self.logger = logger
+        self.stratum_manager = stratum_manager
+        self.host = str(host or self.DEFAULT_HOST).strip().lower()
+        self.ports = {int(p) for p in (ports or self.DEFAULT_PORTS)}
+        self._lock = threading.RLock()
+        self._flows = collections.OrderedDict()
+        self._max_flows = 8192
+        self._last_health_log = 0.0
+        self._metrics = collections.Counter()
+        self._log(
+            f"bound to {self.host} ports={sorted(self.ports)} through TransportStratumManager",
+            ["🌊", "⛏️", "🔗"],
+        )
+
+    def _log(self, message: str, emoticons=None) -> None:
+        try:
+            self.logger.log_message(
+                RouterRandomMessages("Transport/GulfMoneroOcean", message, emoticons or [])
+            )
+        except Exception:
+            pass
+
+    def matches(self, sport: int, dport: int) -> bool:
+        try:
+            return int(sport) in self.ports or int(dport) in self.ports
+        except Exception:
+            return False
+
+    def handle(self, packet, src_ip, dst_ip, sport, dport, inbound_iface) -> bool:
+        if not self.matches(sport, dport):
+            return False
+        now = time.time()
+        key = tuple(sorted(((str(src_ip), int(sport)), (str(dst_ip), int(dport)))))
+        with self._lock:
+            state = self._flows.get(key)
+            if state is None:
+                state = {"first": now, "last": now, "packets": 0, "bytes": 0}
+                self._flows[key] = state
+                self._metrics["flows"] += 1
+            state["last"] = now
+            state["packets"] += 1
+            try:
+                state["bytes"] += len(bytes(packet))
+            except Exception:
+                pass
+            self._metrics["packets"] += 1
+            self._flows.move_to_end(key)
+            while len(self._flows) > self._max_flows:
+                self._flows.popitem(last=False)
+                self._metrics["flow_evictions"] += 1
+
+        handled = bool(
+            self.stratum_manager.handle(
+                packet, src_ip, dst_ip, int(sport), int(dport), inbound_iface
+            )
+        )
+        self._metrics["stratum_handled" if handled else "stratum_unclassified"] += 1
+        return handled
+
+    def snapshot_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            out = dict(self._metrics)
+            out.update({
+                "host": self.host,
+                "ports": sorted(self.ports),
+                "active_flows": len(self._flows),
+            })
+            return out
+
+    def update_binding(self, *, ports=None, host=None) -> None:
+        if ports is not None:
+            resolved = {int(p) for p in ports if 1 <= int(p) <= 65535}
+            if not resolved:
+                raise ValueError("Gulf MoneroOcean requires at least one valid port")
+            self.ports = resolved
+        if host is not None:
+            self.host = str(host).strip().lower() or self.DEFAULT_HOST
+        self._log(
+            f"binding updated host={self.host} ports={sorted(self.ports)}",
+            ["⚙️", "🌊", "⛏️"],
+        )
+
+
 class TransportManager:
     """
     Safer TransportManager for Hyper-V / WinDivert / WinTun environments.
@@ -31430,6 +31693,11 @@ class TransportManager:
             ports={3333, 4444, 5555, 7777, 9999},
             packet_writer=self.packet_writer
         )
+        self.transport_gulf_moneroocean = GulfMoneroOceanTransportManager(
+            self.logger,
+            self.transport_stratum,
+            ports=GulfMoneroOceanTransportManager.DEFAULT_PORTS,
+        )
         self.transport_ike = TransportIkeManager(self.logger)
         self.transport_monero = TransportMoneroManager(
             self.logger,
@@ -31477,6 +31745,8 @@ class TransportManager:
         protocol_enabled: Optional[Dict[str, bool]] = None,
         stratum_ports=None,
         monero_ports=None,
+        gulf_moneroocean_ports=None,
+        gulf_moneroocean_host: str = GulfMoneroOceanTransportManager.DEFAULT_HOST,
         voip_port_start: int = 10000,
         voip_port_end: int = 20000,
         parallel_analysis: bool = True,
@@ -31555,6 +31825,16 @@ class TransportManager:
                 float(stratum_flow_cooldown_sec),
             ),
         )
+        resolved_gulf_ports = self._normalize_port_set(
+            gulf_moneroocean_ports,
+            GulfMoneroOceanTransportManager.DEFAULT_PORTS,
+        )
+        self.transport_gulf_moneroocean = GulfMoneroOceanTransportManager(
+            self.logger,
+            self.transport_stratum,
+            ports=resolved_gulf_ports,
+            host=gulf_moneroocean_host,
+        )
         self.transport_monero = TransportMoneroManager(
             self.logger,
             self.packet_writer,
@@ -31605,6 +31885,12 @@ class TransportManager:
             ),
             "monero_ports": sorted(
                 getattr(self.transport_monero, "ports", set())
+            ),
+            "gulf_moneroocean_ports": sorted(
+                getattr(self.transport_gulf_moneroocean, "ports", set())
+            ),
+            "gulf_moneroocean_host": str(
+                getattr(self.transport_gulf_moneroocean, "host", GulfMoneroOceanTransportManager.DEFAULT_HOST)
             ),
             "voip_port_start": int(self.voip_port_range.start),
             "voip_port_end": int(self.voip_port_range.stop - 1),
@@ -31669,6 +31955,7 @@ class TransportManager:
             self.transport_llmnr,
             self.transport_undecoded,
             self.transport_stratum,
+            self.transport_gulf_moneroocean,
             self.transport_ike,
             self.transport_monero,
             self.transport_scada,
@@ -32262,7 +32549,10 @@ class TransportManager:
         self.transport_dns.handle_tcp_segment(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_stratum_packet(self,packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        gulf = getattr(self, "transport_gulf_moneroocean", None)
+        if gulf is not None and gulf.matches(sport, dport):
+            return gulf.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        return self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

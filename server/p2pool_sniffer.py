@@ -16,6 +16,7 @@ import json
 import math
 import re
 import collections
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Deque, Iterable
 import psutil
@@ -54,6 +55,13 @@ try:
 except ImportError:
     print("[Sniffer] Scapy library not found. Please install it using: pip install scapy")
     sys.exit(1)
+
+def RouterRandomMessages(name: str, message: str, emoticons: list[str]) -> str:
+    """Local logging helper kept dependency-free to avoid router import cycles."""
+    import random
+    emoji = random.choice(emoticons) if emoticons else ""
+    return f"[{name}] {emoji} {message}".rstrip()
+
 
 # --- Load the libpcap library dynamically ---
 try:
@@ -553,6 +561,18 @@ class SnifferSoftware:
         self.setup_scapy_bindings()
         self._define_pcap_prototypes()
         self.logged_packets = collections.deque(maxlen=8192)
+
+        # Capture logging is sampled independently of packet delivery. Emitting
+        # one Qt signal per frame can freeze the UI and make a healthy router
+        # appear dead while Npcap continues receiving.
+        self._packet_log_lock = threading.RLock()
+        self._packet_log_window_start = time.monotonic()
+        self._packet_log_lines_in_window = 0
+        self._packet_log_max_per_second = 25
+        self._packet_log_suppressed = 0
+        self._packet_log_last_summary = 0.0
+        self._startup_monotonic = time.monotonic()
+        self._network_startup_grace_sec = 12.0
         self.hyperv_manager = hyperv_manager
         self.banned_ips = ["89.222.103.1"]
 
@@ -3845,8 +3865,8 @@ class SnifferSoftware:
                     pkt[IPv6].dst = "::1"
 
             if expect_reply:
-                return scapy_sr1(pkt, timeout=float(timeout), iface=loop_iface, verbose=0)
-            scapy_send(pkt, iface=loop_iface, verbose=0)
+                return scapy_sr1(pkt, timeout=float(timeout), verbose=0)
+            scapy_send(pkt, verbose=0)
             return None
         except Exception as e:
             self.logger.log_message(f"[Loopback] Error: {type(e).__name__}: {e}")
@@ -5657,6 +5677,38 @@ class SnifferSoftware:
             )
 
         return packet, meta
+    def _log_capture_packet(self, message: str, *, fingerprint: str = "") -> None:
+        now = time.monotonic()
+        emit_summary = None
+        with self._packet_log_lock:
+            if now - self._packet_log_window_start >= 1.0:
+                if self._packet_log_suppressed:
+                    emit_summary = (
+                        f"[Sniffer] ⚠️ suppressed {self._packet_log_suppressed} per-packet log lines "
+                        f"to protect routing/UI throughput."
+                    )
+                self._packet_log_window_start = now
+                self._packet_log_lines_in_window = 0
+                self._packet_log_suppressed = 0
+
+            if self._packet_log_lines_in_window >= self._packet_log_max_per_second:
+                self._packet_log_suppressed += 1
+                should_emit = False
+            else:
+                self._packet_log_lines_in_window += 1
+                should_emit = True
+
+        if emit_summary:
+            try:
+                self.logger.log_message(emit_summary)
+            except Exception:
+                pass
+        if should_emit:
+            try:
+                self.logger.log_message(message)
+            except Exception:
+                pass
+
     def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
               session=None):
         """
@@ -5756,15 +5808,21 @@ class SnifferSoftware:
 
                 try:
                     try:
-                        if packet.summary() not in self.logged_packets:
-                            self.logger.log_message(
+                        packet_summary = packet.summary()
+                        if packet_summary not in self.logged_packets:
+                            self._log_capture_packet(
                                 f"[Packet] iface={active_iface} caplen={packet_len} wire={wire_len} "
-                                f"capture={capture_tag} | {packet.summary()}"
+                                f"capture={capture_tag} | {packet_summary}",
+                                fingerprint=packet_summary,
                             )
-                            self.logged_packets.append(packet.summary())
+                            self.logged_packets.append(packet_summary)
 
                             if "Loopback" in active_iface:
-                                processed_packet = session().process(pkt=packet, cls=None) if session else packet
+                                # Deliver every captured frame immediately. This
+                                # sniffer already maintains bounded TCP stream
+                                # metadata; constructing a new Scapy TCPSession
+                                # per packet adds latency and cannot reassemble.
+                                processed_packet = packet
                                 try:
                                     if prn and processed_packet is not None:
                                         prn(processed_packet)
@@ -5772,7 +5830,7 @@ class SnifferSoftware:
                                 except Exception:
                                     pass
                     except Exception:
-                        self.logger.log_message(
+                        self._log_capture_packet(
                             f"[Packet] iface={active_iface} caplen={packet_len} wire={wire_len} "
                             f"capture={capture_tag} | <decode error>"
                         )
@@ -5897,10 +5955,10 @@ class SnifferSoftware:
                                     "iface": iface, "timestamp": time.time(), "emojis": ["🚫", "🗺️", "🛑"]
                                 }, cooldown_seconds=20, cooldown_key="rip_unsolicited")
 
-                    processed_packet = session().process(pkt=packet, cls=None) if session else packet
+                    processed_packet = packet
                     try:
                         if prn and processed_packet is not None:
-                            prn(session().process(pkt=packet, cls=None) if session else packet)
+                            prn(processed_packet)
                     except Exception:
                         pass
 
@@ -5911,6 +5969,24 @@ class SnifferSoftware:
             if handle:
                 self._unregister_capture_handle(handle, active_iface)
                 self.libpcap.pcap_close(handle)
+
+    def get_runtime_health(self) -> dict:
+        with self._capture_state_lock:
+            capture = {
+                "frames": self._capture_total_frames,
+                "captured_bytes": self._capture_total_bytes,
+                "wire_bytes": self._capture_total_wire_bytes,
+                "truncated": self._capture_total_truncated,
+                "decode_failures": self._capture_decode_failures,
+                "active_handles": list(self._active_capture_handles.keys()),
+            }
+        with self._packet_log_lock:
+            capture["packet_logs_suppressed_current_window"] = self._packet_log_suppressed
+        try:
+            capture["hyperv_pipe"] = self.hyperv_manager.get_pipe_stats() if self.hyperv_manager else None
+        except Exception:
+            capture["hyperv_pipe"] = None
+        return capture
 
     def sendp(self, packet: Packet, iface: str, verbose: int = 0) -> bool:
         """Transmit an Ethernet frame with alias resolution and safe failover.
@@ -6052,8 +6128,14 @@ class SnifferSoftware:
 
         route = self._resolve_route_info(packet, iface=iface, route_info=route_info)
         if not route:
-            self.logger.log_message(
-                f"[Sniffer] Error: no RIP, OS, or built-in route for destination {getattr(packet, 'dst', '?')}"
+            dst = str(getattr(packet, 'dst', '?'))
+            startup = (time.monotonic() - self._startup_monotonic) < self._network_startup_grace_sec
+            self._log_send_once(
+                f"send:no-route:{dst}",
+                (f"[Sniffer] ⏳ route not ready for {dst}; packet deferred/dropped during startup."
+                 if startup else
+                 f"[Sniffer] Error: no RIP, OS, or built-in route for destination {dst}"),
+                every=5.0,
             )
             return False
 
@@ -6099,9 +6181,26 @@ class SnifferSoftware:
 
     def sr1(self, packet: Packet, iface: str = None, timeout: int = 2, verbose: int = 0,
             route_info: dict = None, dst_mac: str = None, src_mac: str = None) -> Optional[Packet]:
-        """Send one IPv4/IPv6 packet and receive one matching response."""
+        """Send one IPv4/IPv6 packet and receive one matching response.
+
+        Ethernet-wrapped multicast/link-local probes use srp1 so Scapy does not
+        discard the requested interface or emit its L3 ``iface`` warning.
+        """
         if isinstance(packet, Ether) and (IP in packet or IPv6 in packet):
-            packet = packet[IP] if IP in packet else packet[IPv6]
+            try:
+                from scapy.sendrecv import srp1 as scapy_srp1
+                return scapy_srp1(packet, iface=iface, timeout=float(timeout), verbose=verbose)
+            except Exception as exc:
+                self._log_send_once(
+                    f"srp1:fallback:{str(iface)}:{type(exc).__name__}",
+                    RouterRandomMessages(
+                        "Sniffer/L2",
+                        f"request/reply failed on {iface}: {exc}",
+                        ["⚠️", "📡", "🧭"],
+                    ),
+                    every=10.0,
+                )
+                return None
         if not isinstance(packet, (IP, IPv6)):
             packet, why = self._coerce_to_l3(packet)
             if packet is None:
@@ -6110,8 +6209,11 @@ class SnifferSoftware:
 
         initial_route = self._resolve_route_info(packet, iface=iface, route_info=route_info)
         if not initial_route:
-            self.logger.log_message(
-                f"[Sniffer] Error: no RIP, OS, or built-in route for destination {getattr(packet, 'dst', '?')}"
+            dst = str(getattr(packet, 'dst', '?'))
+            self._log_send_once(
+                f"sr1:no-route:{dst}",
+                f"[Sniffer] sr1 route unavailable for {dst}; not opening a socket on an unreachable path.",
+                every=5.0,
             )
             return None
 

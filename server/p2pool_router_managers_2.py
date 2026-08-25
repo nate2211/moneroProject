@@ -34469,6 +34469,22 @@ class HyperVRouterManager:
         self._health_thread: Optional[threading.Thread] = None
         self._net_thread: Optional[threading.Thread] = None
         self._router_thread: Optional[threading.Thread] = None
+        self._socket_recovery_thread: Optional[threading.Thread] = None
+
+        # Runtime socket repair. Adapter resets, ATT Air route changes, and
+        # IP-passthrough renewals can invalidate every UDP handle without
+        # stopping the process. A dedicated repair worker rebinds sockets while
+        # packet/router workers continue running.
+        self._socket_reopen_event = threading.Event()
+        self._socket_reopen_lock = threading.RLock()
+        self._socket_reopen_reason = ""
+        self._socket_reopen_backoff_sec = 0.5
+        self._socket_reopen_max_backoff_sec = 15.0
+        self._socket_reopen_last_attempt = 0.0
+        self._socket_reopen_count = 0
+        self._socket_runtime_failures = 0
+        self._route_probe_cache: Dict[Tuple[str, str], Tuple[bool, float, str]] = {}
+        self._route_probe_cache_ttl_sec = 2.0
 
         self._senders: Dict[str, _LocalSender] = {}
         self._peers: Dict[str, _Peer] = {}
@@ -34566,6 +34582,8 @@ class HyperVRouterManager:
         # Wire hardening. Authentication remains optional for compatibility.
         self._wire_shared_secret: bytes = b""
         self._wire_require_auth = False
+        self._wire_encrypt_payloads = False
+        self._wire_encryption_key: bytes = b""
         self._wire_max_clock_skew_sec = max(90.0, self.peer_timeout_sec * 2.0)
         self._wire_require_known_peer_for_data = True
         self._allow_peer_ip_migration = True
@@ -35250,7 +35268,19 @@ class HyperVRouterManager:
                     ["⚠️", "🧯"],
                 )
 
-        self._open_sockets()
+        try:
+            self._open_sockets()
+        except Exception as e:
+            self._close_sockets()
+            self._request_socket_reopen(f"startup:{type(e).__name__}:{e}")
+            self._log_sparse(
+                "socket-startup-degraded",
+                "socket",
+                f"transport sockets not ready at startup; continuing local-only and retrying: "
+                f"{type(e).__name__}: {e}",
+                ["⚠️", "🧯", "🔄"],
+                every=2.0,
+            )
 
         with self._lock:
             for state in self._senders.values():
@@ -35262,22 +35292,35 @@ class HyperVRouterManager:
         self._net_thread = threading.Thread(target=self._network_sender_loop, name="HyperVRouterWireSend", daemon=True)
         self._router_thread = threading.Thread(target=self._router_ingress_loop, name="HyperVRouterIngress",
                                                daemon=True)
+        self._socket_recovery_thread = threading.Thread(
+            target=self._socket_recovery_loop,
+            name="HyperVRouterSocketRecovery",
+            daemon=True,
+        )
 
         self._hello_thread.start()
         self._recv_thread.start()
         self._health_thread.start()
         self._net_thread.start()
         self._router_thread.start()
+        self._socket_recovery_thread.start()
 
-        try:
-            self._send_hello(startup=True)
-        except Exception as e:
-            self._log_sparse(
-                "startup-hello",
-                "peer",
-                f"initial discovery send failed: {type(e).__name__}: {e}",
-                ["⚠️", "📡", "🧯"],
-                every=2.0,
+        if self._router_runtime_ready():
+            try:
+                self._send_hello(startup=True)
+            except Exception as e:
+                self._log_sparse(
+                    "startup-hello",
+                    "peer",
+                    f"initial discovery send failed: {type(e).__name__}: {e}",
+                    ["⚠️", "📡", "🧯"],
+                    every=2.0,
+                )
+        else:
+            self._log_evt(
+                "lifecycle",
+                "initial discovery deferred until router routes are ready",
+                ["⏳", "📡", "🧭"],
             )
         self._router_ingest_fn = self._resolve_router_ingest_callable()
         if self._data_sock is None:
@@ -35293,12 +35336,38 @@ class HyperVRouterManager:
         else:
             self._log_evt("lifecycle", "HyperVRouterManager started", ["🚀", "🌐"])
 
+    def notify_network_ready(self) -> None:
+        """Kick discovery only after the owning router installed its routes."""
+        if self._stop_event.is_set() or not self._started:
+            return
+        if not self._router_runtime_ready():
+            return
+        with self._sock_lock:
+            missing = not self._data_socks or not self._discovery_tx_socks
+        if missing:
+            self._request_socket_reopen("router-runtime-ready")
+        try:
+            self._send_hello(startup=True)
+        except Exception as exc:
+            if self._is_transport_socket_error(exc):
+                self._request_socket_reopen(
+                    f"ready-hello:{self._transport_socket_error_code(exc)}"
+                )
+            self._log_sparse(
+                "ready-hello",
+                "peer",
+                f"network-ready discovery deferred: {type(exc).__name__}: {exc}",
+                ["⚠️", "📡", "🔄"],
+                every=2.0,
+            )
+
     def stop(self) -> None:
         with self._lock:
             if not self._started:
                 return
             self._started = False
             self._stop_event.set()
+            self._socket_reopen_event.set()
 
         self._close_sockets()
 
@@ -35329,7 +35398,10 @@ class HyperVRouterManager:
         except Exception:
             pass
 
-        for t in (self._hello_thread, self._recv_thread, self._health_thread, self._net_thread, self._router_thread):
+        for t in (
+                self._hello_thread, self._recv_thread, self._health_thread,
+                self._net_thread, self._router_thread, self._socket_recovery_thread,
+        ):
             if t and t.is_alive():
                 t.join(timeout=3.0)
 
@@ -35338,6 +35410,8 @@ class HyperVRouterManager:
         self._health_thread = None
         self._net_thread = None
         self._router_thread = None
+        self._socket_recovery_thread = None
+        self._socket_reopen_event.clear()
 
         with self._lock:
             senders = list(self._senders.values())
@@ -35791,6 +35865,155 @@ class HyperVRouterManager:
     # discovery / transport
     # ---------------------------------------------------------
 
+    @staticmethod
+    def _transport_socket_error_code(exc: BaseException) -> int:
+        try:
+            return int(getattr(exc, "winerror", 0) or getattr(exc, "errno", 0) or 0)
+        except Exception:
+            return 0
+
+    @classmethod
+    def _is_transport_socket_error(cls, exc: BaseException) -> bool:
+        code = cls._transport_socket_error_code(exc)
+        return code in {
+            errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH,
+            errno.EADDRNOTAVAIL, errno.EBADF, errno.ENOTSOCK,
+            10038, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10064, 10065,
+        }
+
+    def _request_socket_reopen(self, reason: str) -> None:
+        if self._stop_event.is_set():
+            return
+        with self._socket_reopen_lock:
+            self._socket_reopen_reason = str(reason or "runtime-repair")[:512]
+        self._socket_reopen_event.set()
+
+    def _router_runtime_ready(self) -> bool:
+        try:
+            router = self._resolve_router()
+            event = getattr(router, "_runtime_network_ready", None) if router is not None else None
+            if event is not None and hasattr(event, "is_set"):
+                return bool(event.is_set())
+        except Exception:
+            pass
+        return True
+
+    def _target_route_ready(
+            self,
+            source_ip: str,
+            target_ip: str,
+            target_port: int,
+            *,
+            discovery: bool = False,
+    ) -> Tuple[bool, str]:
+        """Check the Windows route without sending on a long-lived transport socket."""
+        try:
+            target_obj = ipaddress.ip_address(str(target_ip or "").strip())
+            if target_obj.is_multicast or target_obj.is_unspecified:
+                return True, "discovery-special" if discovery else "special"
+            if str(target_obj) == "255.255.255.255":
+                return True, "discovery-broadcast"
+        except Exception:
+            return False, "invalid-target"
+
+        source = str(source_ip or "").strip()
+        target = str(target_ip or "").strip()
+        cache_key = (source, target)
+        now = time.monotonic()
+        cached = self._route_probe_cache.get(cache_key)
+        if cached and (now - float(cached[1])) < self._route_probe_cache_ttl_sec:
+            return bool(cached[0]), str(cached[2])
+
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.settimeout(0.25)
+            if self._is_valid_bind_ip(source):
+                probe.bind((source, 0))
+            probe.connect((target, max(1, int(target_port or 9))))
+            selected = str(probe.getsockname()[0] or "")
+            if not selected or selected == "0.0.0.0":
+                raise OSError(errno.ENETUNREACH, "no route-selected source")
+            result = (True, now, f"source={selected}")
+        except OSError as exc:
+            code = self._transport_socket_error_code(exc)
+            result = (False, now, f"route-error={code or type(exc).__name__}")
+        except Exception as exc:
+            result = (False, now, f"route-error={type(exc).__name__}")
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+
+        self._route_probe_cache[cache_key] = result
+        if len(self._route_probe_cache) > 2048:
+            cutoff = now - max(10.0, self._route_probe_cache_ttl_sec * 4.0)
+            self._route_probe_cache = {
+                key: value for key, value in self._route_probe_cache.items()
+                if float(value[1]) >= cutoff
+            }
+        return bool(result[0]), str(result[2])
+
+    def _socket_recovery_loop(self) -> None:
+        backoff = self._socket_reopen_backoff_sec
+        while not self._stop_event.is_set():
+            self._socket_reopen_event.wait(timeout=1.0)
+            self._socket_reopen_event.clear()
+            if self._stop_event.is_set():
+                break
+
+            with self._sock_lock:
+                has_data = bool(self._data_socks)
+                has_discovery_tx = bool(self._discovery_tx_socks)
+            if has_data and has_discovery_tx:
+                backoff = self._socket_reopen_backoff_sec
+                continue
+
+            if not self._router_runtime_ready():
+                self._socket_reopen_event.set()
+                self._stop_event.wait(0.5)
+                continue
+
+            now = time.monotonic()
+            if now - self._socket_reopen_last_attempt < backoff:
+                self._socket_reopen_event.set()
+                self._stop_event.wait(min(0.5, backoff))
+                continue
+            self._socket_reopen_last_attempt = now
+
+            with self._socket_reopen_lock:
+                reason = self._socket_reopen_reason or "missing-runtime-sockets"
+
+            try:
+                self._open_sockets()
+                self._socket_reopen_count += 1
+                backoff = self._socket_reopen_backoff_sec
+                self._log_evt(
+                    "socket",
+                    f"transport sockets recovered reason={reason} count={self._socket_reopen_count}",
+                    ["✅", "🔄", "🌐"],
+                )
+                try:
+                    self._send_hello(startup=True)
+                except Exception:
+                    pass
+            except Exception as e:
+                self._socket_runtime_failures += 1
+                self._close_sockets()
+                backoff = min(self._socket_reopen_max_backoff_sec, max(0.5, backoff * 2.0))
+                self._log_sparse(
+                    "socket-recovery-failed",
+                    "socket",
+                    f"transport socket repair deferred ({reason}): {type(e).__name__}: {e}; "
+                    f"retry_backoff={backoff:.1f}s",
+                    ["⚠️", "🔄", "🧯"],
+                    every=2.0,
+                )
+                self._socket_reopen_event.set()
+                self._stop_event.wait(backoff)
+
     def _open_sockets(self) -> None:
         with self._sock_lock:
             self._close_sockets_locked()
@@ -36034,12 +36257,15 @@ class HyperVRouterManager:
         self._bound_discovery_port = self.discovery_port
         self._bound_data_port = self.data_port
         self._route_source_cache.clear()
+        self._route_probe_cache.clear()
 
         if self._socket_close_wait_sec > 0:
             time.sleep(self._socket_close_wait_sec)
 
     def _hello_loop(self) -> None:
         while not self._stop_event.wait(self.heartbeat_sec):
+            if not self._router_runtime_ready():
+                continue
             try:
                 self._send_hello()
             except Exception as e:
@@ -36058,10 +36284,22 @@ class HyperVRouterManager:
             except queue.Empty:
                 continue
 
-            if item is None:
-                break
-
             try:
+                if item is None:
+                    break
+
+                queued_ts = float(item.get("queued_ts", 0.0) or 0.0)
+                age = max(0.0, time.monotonic() - queued_ts) if queued_ts else 0.0
+                mtype = str(item.get("mtype") or "")
+                max_age = 3.0 if mtype == "frame" else 15.0
+                if queued_ts and age > max_age:
+                    self._stats["peer_send_stale_dropped"] = int(self._stats.get("peer_send_stale_dropped", 0)) + 1
+                    frame_id = str(item.get("frame_id") or "")
+                    if frame_id:
+                        with self._pending_lock:
+                            self._pending_frames.pop(frame_id, None)
+                    continue
+
                 self._send_network_item_inline(item)
             except Exception as e:
                 self._log_sparse(
@@ -36071,6 +36309,11 @@ class HyperVRouterManager:
                     ["⚠️", "📤", "🧯"],
                     every=2.0,
                 )
+            finally:
+                try:
+                    self._net_tx_q.task_done()
+                except Exception:
+                    pass
 
     def _recv_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -36108,7 +36351,11 @@ class HyperVRouterManager:
                     data, addr = sock_obj.recvfrom(int(self._wire_message_max_bytes))
                 except socket.timeout:
                     continue
-                except OSError:
+                except OSError as e:
+                    if self._is_transport_socket_error(e):
+                        self._request_socket_reopen(
+                            f"recv:{which}:{self._transport_socket_error_code(e)}"
+                        )
                     continue
                 except Exception:
                     continue
@@ -36481,6 +36728,29 @@ class HyperVRouterManager:
 
         if not isinstance(msg, dict):
             return
+
+        if int(msg.get("enc_v", 0) or 0) == 1:
+            if not self._wire_encryption_key:
+                return
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                nonce = base64.b64decode(str(msg.get("nonce") or ""), validate=True)
+                ciphertext = base64.b64decode(str(msg.get("ciphertext") or ""), validate=True)
+                clear = AESGCM(self._wire_encryption_key).decrypt(
+                    nonce, ciphertext, self.segment_id.encode("utf-8")
+                )
+                msg = json.loads(clear.decode("utf-8"))
+            except Exception:
+                self._log_sparse(
+                    f"wire-decrypt:{from_ip}",
+                    "security",
+                    f"encrypted peer packet rejected source={from_ip}",
+                    ["🔐", "🛡️", "⚠️"],
+                    every=10.0,
+                )
+                return
+            if not isinstance(msg, dict):
+                return
 
         magic = str(msg.get("magic") or "").strip()
         if magic not in self.ACCEPT_MAGICS:
@@ -37847,6 +38117,39 @@ class HyperVRouterManager:
     def _complete_pending_frames_for_peer(self, node_id: str, *, reason: str, min_age_sec: float = 0.0) -> int:
         return 0
 
+    def _drop_queued_network_item(self, *, prefer_frame: bool = True) -> Optional[Dict[str, Any]]:
+        q = self._net_tx_q
+        victim = None
+        try:
+            with q.mutex:
+                items = list(q.queue)
+                if not items:
+                    return None
+                index = None
+                if prefer_frame:
+                    for i, candidate in enumerate(items):
+                        if isinstance(candidate, dict) and str(candidate.get("mtype") or "") == "frame":
+                            index = i
+                            break
+                if index is None:
+                    index = 0
+                victim = items.pop(index)
+                q.queue.clear()
+                q.queue.extend(items)
+                if q.unfinished_tasks > 0:
+                    q.unfinished_tasks -= 1
+                q.not_full.notify()
+        except Exception:
+            return None
+
+        if isinstance(victim, dict):
+            frame_id = str(victim.get("frame_id") or "")
+            if frame_id:
+                with self._pending_lock:
+                    self._pending_frames.pop(frame_id, None)
+            return victim
+        return None
+
     def _queue_network_message(
             self,
             *,
@@ -37872,6 +38175,7 @@ class HyperVRouterManager:
             "status": str(status),
             "protocol_tag": str(protocol_tag),
             "dst_sender_id": str(dst_sender_id),
+            "queued_ts": time.monotonic(),
         }
 
         try:
@@ -37879,6 +38183,19 @@ class HyperVRouterManager:
             return True
         except queue.Full:
             self._stats["peer_send_queue_full"] = int(self._stats.get("peer_send_queue_full", 0)) + 1
+            # ACK/hello control must not be trapped behind stale mirrored frames.
+            # For frame traffic, replace the oldest queued frame so current
+            # packets continue moving instead of freezing on an old backlog.
+            control = str(mtype) in {"ack", "hello", "hello_ack", "hello_reply"}
+            victim = self._drop_queued_network_item(prefer_frame=True)
+            if victim is not None:
+                try:
+                    self._net_tx_q.put_nowait(item)
+                    self._stats["peer_send_queue_replaced"] = int(self._stats.get("peer_send_queue_replaced", 0)) + 1
+                    return True
+                except queue.Full:
+                    pass
+
             self._log_sparse(
                 f"net-q-full:{mtype}",
                 "network",
@@ -37917,6 +38234,30 @@ class HyperVRouterManager:
                 except Exception:
                     source_port = int(self._bound_data_ports_by_ip.get(source_ip, self.data_port))
 
+        if sock_obj is None:
+            return False
+        if not self._router_runtime_ready():
+            return False
+        route_ready, route_reason = self._target_route_ready(
+            source_ip,
+            ip,
+            port,
+            discovery=is_discovery,
+        )
+        if not route_ready:
+            self._stats["peer_send_route_deferred"] = int(
+                self._stats.get("peer_send_route_deferred", 0)
+            ) + 1
+            self._log_sparse(
+                f"route-deferred:{source_ip}:{ip}",
+                "network",
+                f"peer send deferred until route exists source={source_ip or '-'} "
+                f"target={ip}:{port} reason={route_reason}",
+                ["⏳", "🧭", "🌐"],
+                every=3.0,
+            )
+            return False
+
         attempt_ts = time.time()
         if mtype == "frame" and frame_id:
             with self._pending_lock:
@@ -37931,9 +38272,6 @@ class HyperVRouterManager:
                     if target_key not in attempted:
                         attempted.append(target_key)
                     pending["attempted_targets"] = attempted[-8:]
-
-        if sock_obj is None:
-            return False
 
         raw_to_send = self._retarget_wire_source_metadata(
             bytes(item.get("raw") or b""), source_ip=source_ip, source_port=source_port
@@ -37967,6 +38305,18 @@ class HyperVRouterManager:
             return True
         except Exception as e:
             self._stats["peer_send_fail"] += 1
+            if self._is_transport_socket_error(e):
+                code = self._transport_socket_error_code(e)
+                if code in {errno.ENETUNREACH, errno.EHOSTUNREACH, 10051, 10064, 10065}:
+                    self._route_probe_cache[(str(source_ip or ""), str(ip))] = (
+                        False,
+                        time.monotonic(),
+                        f"send-route-error={code}",
+                    )
+                else:
+                    self._request_socket_reopen(
+                        f"send:{source_ip or '-'}:{code}"
+                    )
             if peer_node_id:
                 self._note_peer_path_failure(peer_node_id, ip)
             if mtype == "frame" and frame_id:
@@ -38138,6 +38488,19 @@ class HyperVRouterManager:
         except queue.Full:
             self._stats["remote_ingress_queue_full"] = int(self._stats.get("remote_ingress_queue_full", 0)) + 1
             self._stats["remote_ingress_busy"] = int(self._stats.get("remote_ingress_busy", 0)) + 1
+            try:
+                old_item = self._router_ingress_q.get_nowait()
+                try:
+                    self._router_ingress_q.task_done()
+                except Exception:
+                    pass
+                self._router_ingress_q.put_nowait(item)
+                self._stats["remote_ingress_replaced_oldest"] = int(
+                    self._stats.get("remote_ingress_replaced_oldest", 0)
+                ) + 1
+                return True
+            except Exception:
+                pass
             self._record_remote_ingress_queue_full(
                 src_node_id=src_node_id,
                 src_sender_id=src_sender_id,
@@ -38517,6 +38880,8 @@ class HyperVRouterManager:
         def _call_ingest(target) -> bool:
             nonlocal tried_any
             for fn_name in (
+                    "enqueue_ingress_packet",
+                    "ingest_packet",
                     "process_packet",
                     "handle_packet",
                     "_process_packet",
@@ -39828,17 +40193,30 @@ class HyperVRouterManager:
             self,
             *,
             shared_secret: Optional[str] = None,
+            server_key: Optional[str] = None,
             require_auth: bool = False,
+            encrypt_payloads: bool = False,
             allow_public_peer_data: Optional[bool] = None,
             allow_public_discovery: Optional[bool] = None,
             allow_cross_subnet_private_hints: Optional[bool] = None,
             allow_same_segment_passthrough_public: Optional[bool] = None,
     ) -> None:
-        secret = str(shared_secret or "").encode("utf-8")
+        secret_text = server_key if server_key is not None else shared_secret
+        secret = str(secret_text or "").encode("utf-8")
         if require_auth and not secret:
             raise ValueError("require_auth=True requires a non-empty shared_secret")
         self._wire_shared_secret = secret
         self._wire_require_auth = bool(require_auth)
+        self._wire_encrypt_payloads = bool(encrypt_payloads)
+        self._wire_encryption_key = hashlib.sha256(secret).digest() if secret else b""
+        if self._wire_encrypt_payloads and not self._wire_encryption_key:
+            raise ValueError("encrypt_payloads=True requires shared_secret or server_key")
+        if self._wire_encrypt_payloads:
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+            except Exception as exc:
+                self._wire_encrypt_payloads = False
+                raise RuntimeError("Encrypted peer packets require the cryptography package") from exc
         if allow_public_peer_data is not None:
             self._allow_public_peer_data = bool(allow_public_peer_data)
         if allow_public_discovery is not None:
@@ -39849,7 +40227,7 @@ class HyperVRouterManager:
             self._hybrid_allow_passthrough_public = bool(allow_same_segment_passthrough_public)
         self._log_evt(
             "security",
-            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} "
+            f"wire security configured auth={'required' if self._wire_require_auth else ('optional' if secret else 'off')} encryption={'aes-gcm' if self._wire_encrypt_payloads else 'off'} "
             f"public_data={int(self._allow_public_peer_data)} public_discovery={int(self._allow_public_discovery)} "
             f"same_segment_passthrough_public={int(self._hybrid_allow_passthrough_public)} "
             f"cross_subnet_private_hints={int(self._allow_cross_subnet_private_peer_hints)}",
@@ -40193,6 +40571,17 @@ class HyperVRouterManager:
             out["auth_v"] = 1
             out["auth"] = self._wire_message_mac(out)
         raw = json.dumps(out, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if self._wire_encrypt_payloads:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            nonce = os.urandom(12)
+            ciphertext = AESGCM(self._wire_encryption_key).encrypt(nonce, raw, self.segment_id.encode("utf-8"))
+            envelope = {
+                "enc_v": 1,
+                "segment_id": self.segment_id,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+            }
+            raw = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
         if len(raw) > int(self._wire_message_max_bytes):
             raise ValueError(f"wire message too large: {len(raw)} bytes")
         return raw

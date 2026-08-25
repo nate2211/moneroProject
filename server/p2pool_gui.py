@@ -4,9 +4,11 @@ import queue
 import threading
 import asyncio
 import json
+import time
+from collections import deque
 
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
-from PyQt5.QtCore import QObject, pyqtSignal, QThread
+from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread
 from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
     PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab, OllamaModelTab, OllamaLogger
 
@@ -122,13 +124,121 @@ class PacketLogger(QObject):
     def log_message(self, msg): self.message_signal.emit(str(msg).rstrip())
 
 class RouterLogger(QObject):
+    """Bounded asynchronous logger that protects Qt from packet-log bursts.
+
+    Router workers may log from many native/Python threads. Emitting a Qt signal
+    for every line directly from those hot paths can build an effectively
+    unbounded queued-signal backlog and make the GUI appear frozen.  Producers
+    now only append to a bounded deque; one small drain thread owns signal
+    emission and applies drop-oldest backpressure.
+    """
+
     message_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+        self._queue = deque()
+        self._queue_bytes = 0
+        self._max_queue_lines = 12000
+        self._max_queue_bytes = 16 * 1024 * 1024
+        self._batch_size = 80
+        self._condition = threading.Condition(threading.RLock())
+        self._stop_event = threading.Event()
+        self._dropped = 0
+        self._last_drop_notice = 0.0
+        self._drain_thread = threading.Thread(
+            target=self._drain_loop,
+            name="RouterLoggerDrain",
+            daemon=True,
+        )
+        self._drain_thread.start()
+
+    @staticmethod
+    def _line_size(text: str) -> int:
+        return len(text.encode("utf-8", errors="replace")) + 1
 
     def log_message(self, msg):
-        self.message_signal.emit(str(msg).rstrip())
+        if self._stop_event.is_set():
+            return
+        try:
+            text = str(msg).rstrip()
+        except Exception:
+            return
+        if not text:
+            return
+        if len(text) > 12000:
+            text = text[:12000] + " ... [truncated]"
+        size = self._line_size(text)
+
+        with self._condition:
+            while self._queue and (
+                len(self._queue) >= self._max_queue_lines
+                or self._queue_bytes + size > self._max_queue_bytes
+            ):
+                old = self._queue.popleft()
+                self._queue_bytes = max(0, self._queue_bytes - self._line_size(old))
+                self._dropped += 1
+            self._queue.append(text)
+            self._queue_bytes += size
+            self._condition.notify()
+
+    def _drain_loop(self):
+        while not self._stop_event.is_set():
+            batch = []
+            drop_notice = None
+            with self._condition:
+                if not self._queue and not self._stop_event.is_set():
+                    self._condition.wait(timeout=0.05)
+                if self._stop_event.is_set():
+                    break
+
+                # Keep signal production bounded even when packet workers are hot.
+                limit = self._batch_size
+                if len(self._queue) > (self._max_queue_lines // 2):
+                    limit = min(240, self._batch_size * 3)
+                for _ in range(min(limit, len(self._queue))):
+                    line = self._queue.popleft()
+                    self._queue_bytes = max(
+                        0,
+                        self._queue_bytes - self._line_size(line),
+                    )
+                    batch.append(line)
+
+                now = time.monotonic()
+                if self._dropped and (now - self._last_drop_notice) >= 1.0:
+                    drop_notice = (
+                        "[RouterLogger] ⚠️ Dropped "
+                        f"{self._dropped} oldest log lines under sustained load."
+                    )
+                    self._dropped = 0
+                    self._last_drop_notice = now
+
+            if drop_notice:
+                try:
+                    self.message_signal.emit(drop_notice)
+                except RuntimeError:
+                    return
+            for line in batch:
+                try:
+                    self.message_signal.emit(line)
+                except RuntimeError:
+                    return
+
+            # Yield to Qt and to packet workers instead of continuously emitting.
+            if batch:
+                self._stop_event.wait(0.01)
+
+    def shutdown(self):
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._drain_thread.is_alive() and threading.current_thread() is not self._drain_thread:
+            self._drain_thread.join(timeout=1.5)
+        with self._condition:
+            self._queue.clear()
+            self._queue_bytes = 0
 class GeminiLogger(QObject):
     """A dedicated logger for Gemini chat messages."""
     message_signal = pyqtSignal(str, str)  # Now emits content and message_type
@@ -167,6 +277,8 @@ class P2PoolGUI(QMainWindow):
     trigger_send_tcp_syn = pyqtSignal(str, int, str, str, int)
     trigger_send_udp_packet = pyqtSignal(str, int, bytes, str, str, int)
     trigger_send_dns_query = pyqtSignal(str, str, str, str, str, int)
+    router_start_completed = pyqtSignal(bool, str, object)
+    router_stop_completed = pyqtSignal(bool, str)
 
     def __init__(self, gui_logger, wireshark_logger, packet_logger, router_logger, gemini_logger, nmap_logger, gobuster_logger, scraping_logger,
                  application_main_loop, p2pool_helper, parent=None):
@@ -196,6 +308,16 @@ class P2PoolGUI(QMainWindow):
         self.packet_sender_qthread = None
         self.packet_sender_worker = None
         self.packet_sending_thread = None
+
+        # Router lifecycle operations may perform DHCP, adapter discovery,
+        # named-pipe startup, and socket recovery.  Never execute them on Qt's
+        # GUI thread.
+        self._router_operation_lock = threading.RLock()
+        self._router_operation = None
+        self._router_start_thread = None
+        self._router_stop_thread = None
+        self._active_router_stop_flags = {}
+        self._closing = False
 
         # --- UI Setup ---
         self.setWindowTitle("Nate's Server")
@@ -294,6 +416,8 @@ class P2PoolGUI(QMainWindow):
 
         self.router_tab.start_router_button.clicked.connect(self.start_router)
         self.router_tab.stop_router_button.clicked.connect(self.stop_router)
+        self.router_start_completed.connect(self._on_router_start_completed)
+        self.router_stop_completed.connect(self._on_router_stop_completed)
 
         self.packet_sender_tab.send_ping_requested.connect(self.trigger_send_ping)
         self.packet_sender_tab.send_tcp_syn_requested.connect(self.trigger_send_tcp_syn)
@@ -1426,83 +1550,65 @@ class P2PoolGUI(QMainWindow):
             )
             return
 
-        try:
-            self.helper.router_manager.start_routing(
-                use_dhcp_out=use_dhcp_out,
-                use_dhcp_in=use_dhcp_in,
-                router_ip_out=router_ip_out,
-                netmask_out=netmask_out,
-                use_static=use_static,
-                use_hyperv=use_hyperv,
-                use_stratum_comm=use_stratum_comm,
-                p2pool_server_ip=p2pool_server_ip,
-                ipc_emit_host=ipc_emit_host,
-                use_peer_to_peer=use_peer_to_peer,
-                use_blocknet=use_blocknet,
-                blocknet_relay=blocknet_relay,
-                blocknet_token=blocknet_token,
-                use_netroute=use_netroute,
-                use_hostbypass=use_hostbypass,
-                use_gateway=use_gateway,
-                use_lan=use_lan,
-                use_uplink=use_uplink,
-                nat_os=nat_os,
-                python_server=python_server,
-                promisc=promisc,
-                use_socket=use_socket,
-                use_ollama=use_ollama,
-                use_scrapewebsite=use_scrapewebsite,
-                scrapewebsite_endpoint=scrapewebsite_endpoint,
-                use_wifi_host=use_wifi_host,
-                wifi_ssid=wifi_ssid,
-                wifi_password=(
-                    wifi_password
-                    if use_wifi_host
-                    else None
-                ),
-                wifi_executable_path=None,
-                router_ip_in=router_ip_in or None,
-                netmask_in=netmask_in,
-                enable_dhcp_server=enable_dhcp_server,
-                serve_dhcp_on_wan=serve_dhcp_on_wan,
-                dhcp_server_settings=dhcp_server_settings,
-                wan_dhcp_server_settings=wan_dhcp_server_settings,
-                dhcp_interface_profiles=dhcp_interface_profiles,
-                gateway_settings=gateway_settings,
-                lan_settings=lan_settings,
-                uplink_settings=uplink_settings,
-                python_server_settings=python_server_settings,
-                wifi_settings=wifi_settings,
-                stratum_connection_mode=stratum_mode,
-                stratum_pool_port=stratum_pool_port,
-                stratum_wallet=stratum_wallet,
-                stratum_password=stratum_password,
-                stratum_worker=stratum_worker,
-                stratum_proxy_host=stratum_proxy_host,
-                stratum_proxy_port=stratum_proxy_port,
-                stratum_enable_proxy=stratum_enable_proxy,
-                stratum_use_tls=stratum_use_tls,
-                stratum_tls_hostname=stratum_tls_hostname,
-                stratum_user_agent=stratum_user_agent,
-                stratum_daemon_url=stratum_daemon_url,
-                stratum_zmq_address=stratum_zmq_address,
-                manager_settings=manager_settings,
-                transport_settings=transport_settings,
-            )
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[RouterTab] ❌ Exception during router start: {e}"
-            )
-            return
-
-        if not getattr(self.helper.router_manager, "started", False):
-            self.router_logger.log_message(
-                "[RouterTab] ❌ Router startup did not complete. "
-                "Review the Router log for the failing manager."
-            )
-            return
-
-        self._active_router_stop_flags = {
+        start_kwargs = {
+            "use_dhcp_out": use_dhcp_out,
+            "use_dhcp_in": use_dhcp_in,
+            "router_ip_out": router_ip_out,
+            "netmask_out": netmask_out,
+            "use_static": use_static,
+            "use_hyperv": use_hyperv,
+            "use_stratum_comm": use_stratum_comm,
+            "p2pool_server_ip": p2pool_server_ip,
+            "ipc_emit_host": ipc_emit_host,
+            "use_peer_to_peer": use_peer_to_peer,
+            "use_blocknet": use_blocknet,
+            "blocknet_relay": blocknet_relay,
+            "blocknet_token": blocknet_token,
+            "use_netroute": use_netroute,
+            "use_hostbypass": use_hostbypass,
+            "use_gateway": use_gateway,
+            "use_lan": use_lan,
+            "use_uplink": use_uplink,
+            "nat_os": nat_os,
+            "python_server": python_server,
+            "promisc": promisc,
+            "use_socket": use_socket,
+            "use_ollama": use_ollama,
+            "use_scrapewebsite": use_scrapewebsite,
+            "scrapewebsite_endpoint": scrapewebsite_endpoint,
+            "use_wifi_host": use_wifi_host,
+            "wifi_ssid": wifi_ssid,
+            "wifi_password": wifi_password if use_wifi_host else None,
+            "wifi_executable_path": None,
+            "router_ip_in": router_ip_in or None,
+            "netmask_in": netmask_in,
+            "enable_dhcp_server": enable_dhcp_server,
+            "serve_dhcp_on_wan": serve_dhcp_on_wan,
+            "dhcp_server_settings": dhcp_server_settings,
+            "wan_dhcp_server_settings": wan_dhcp_server_settings,
+            "dhcp_interface_profiles": dhcp_interface_profiles,
+            "gateway_settings": gateway_settings,
+            "lan_settings": lan_settings,
+            "uplink_settings": uplink_settings,
+            "python_server_settings": python_server_settings,
+            "wifi_settings": wifi_settings,
+            "stratum_connection_mode": stratum_mode,
+            "stratum_pool_port": stratum_pool_port,
+            "stratum_wallet": stratum_wallet,
+            "stratum_password": stratum_password,
+            "stratum_worker": stratum_worker,
+            "stratum_proxy_host": stratum_proxy_host,
+            "stratum_proxy_port": stratum_proxy_port,
+            "stratum_enable_proxy": stratum_enable_proxy,
+            "stratum_use_tls": stratum_use_tls,
+            "stratum_tls_hostname": stratum_tls_hostname,
+            "stratum_user_agent": stratum_user_agent,
+            "stratum_daemon_url": stratum_daemon_url,
+            "stratum_zmq_address": stratum_zmq_address,
+            "manager_settings": manager_settings,
+            "transport_settings": transport_settings,
+        }
+        stop_flags = {
             "use_stratum_comm": use_stratum_comm,
             "use_dhcp_out": use_dhcp_out,
             "use_dhcp_in": use_dhcp_in,
@@ -1512,8 +1618,82 @@ class P2PoolGUI(QMainWindow):
             "nat_os": nat_os,
             "use_ollama": use_ollama,
         }
+
+        if not self._claim_router_operation("start"):
+            self.router_logger.log_message(
+                "[RouterTab] Router start/stop operation is already running."
+            )
+            return
+
         self.router_tab.start_router_button.setEnabled(False)
-        self.router_tab.stop_router_button.setEnabled(True)
+        self.router_tab.start_router_button.setText("Starting...")
+        self.router_tab.stop_router_button.setEnabled(False)
+
+        manager = self.helper.router_manager
+
+        def _start_backend():
+            ok = False
+            message = ""
+            try:
+                manager.start_routing(**start_kwargs)
+                ok = bool(getattr(manager, "started", False))
+                if not ok:
+                    message = (
+                        "Router startup did not complete. Review the Router log "
+                        "for the failing manager."
+                    )
+            except Exception as exc:
+                message = f"Exception during router start: {exc}"
+            finally:
+                self._release_router_operation("start")
+                if not self._closing:
+                    self.router_start_completed.emit(ok, message, stop_flags)
+
+        self._router_start_thread = threading.Thread(
+            target=_start_backend,
+            name="RouterStartWorker",
+            daemon=True,
+        )
+        try:
+            self._router_start_thread.start()
+        except Exception as exc:
+            self._release_router_operation("start")
+            self.router_tab.start_router_button.setText("Start Router")
+            self.router_tab.start_router_button.setEnabled(True)
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ Could not launch router start worker: {exc}"
+            )
+
+    def _claim_router_operation(self, name: str) -> bool:
+        with self._router_operation_lock:
+            if self._router_operation is not None:
+                return False
+            self._router_operation = str(name)
+            return True
+
+    def _release_router_operation(self, name: str) -> None:
+        with self._router_operation_lock:
+            if self._router_operation == str(name):
+                self._router_operation = None
+
+    @pyqtSlot(bool, str, object)
+    def _on_router_start_completed(self, ok: bool, message: str, stop_flags):
+        if self._closing:
+            return
+        self.router_tab.start_router_button.setText("Start Router")
+        if ok:
+            self._active_router_stop_flags = dict(stop_flags or {})
+            self.router_tab.start_router_button.setEnabled(False)
+            self.router_tab.stop_router_button.setEnabled(True)
+            self.router_logger.log_message(
+                "[RouterTab] ✅ Router startup completed; packet workers remain asynchronous."
+            )
+        else:
+            self.router_tab.start_router_button.setEnabled(True)
+            self.router_tab.stop_router_button.setEnabled(False)
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ {message or 'Router startup failed.'}"
+            )
 
     def stop_router(self):
         self.router_logger.log_message("[GUI] Requesting to stop Router...")
@@ -1521,78 +1701,151 @@ class P2PoolGUI(QMainWindow):
         if not self.helper.router_manager:
             self.router_logger.log_message("[GUI] Router manager not available.")
             return
-
-        # Prevent double-stop clicks immediately
-        self.router_tab.stop_router_button.setEnabled(False)
-
-        try:
-            active_flags = getattr(
-                self,
-                "_active_router_stop_flags",
-                {},
-            )
-            use_stratum_comm = active_flags.get(
-                "use_stratum_comm",
-                self.router_tab.stratum_comm_checkbox.isChecked(),
-            )
-            use_dhcp_out = active_flags.get(
-                "use_dhcp_out",
-                self.router_tab.dhcp_out_checkbox.isChecked(),
-            )
-            use_dhcp_in = active_flags.get(
-                "use_dhcp_in",
-                self.router_tab.dhcp_in_checkbox.isChecked(),
-            )
-            use_static = active_flags.get(
-                "use_static",
-                self.router_tab.use_static_checkbox.isChecked(),
-            )
-            use_hyperv = active_flags.get(
-                "use_hyperv",
-                self.router_tab.use_hyperv_checkbox.isChecked(),
-            )
-            use_netroute = active_flags.get(
-                "use_netroute",
-                self.router_tab.use_netroute_checkbox.isChecked(),
-            )
-            nat_os = active_flags.get(
-                "nat_os",
-                self.router_tab.nat_os_checkbox.isChecked(),
-            )
+        if not self._claim_router_operation("stop"):
             self.router_logger.log_message(
-                f"[GUI] stop_router flags: "
-                f"stratum={use_stratum_comm}, "
-                f"dhcp_out={use_dhcp_out}, "
-                f"dhcp_in={use_dhcp_in}, "
-                f"static={use_static}, "
-                f"hyperv={use_hyperv}"
+                "[RouterTab] Router start/stop operation is already running."
             )
-            use_ollama = active_flags.get(
-                "use_ollama",
-                self.router_tab.ollama_checkbox.isChecked(),
-            )
-            self.helper.router_manager.stop_routing(
-                use_dhcp_out,
-                use_dhcp_in,
-                use_static,
-                use_hyperv,
-                use_stratum_comm,
-                use_netroute,
-                nat_os,
-                use_ollama,
+            return
+
+        active_flags = dict(getattr(self, "_active_router_stop_flags", {}) or {})
+        tab = self.router_tab
+        use_stratum_comm = active_flags.get(
+            "use_stratum_comm", tab.stratum_comm_checkbox.isChecked()
+        )
+        use_dhcp_out = active_flags.get(
+            "use_dhcp_out", tab.dhcp_out_checkbox.isChecked()
+        )
+        use_dhcp_in = active_flags.get(
+            "use_dhcp_in", tab.dhcp_in_checkbox.isChecked()
+        )
+        use_static = active_flags.get(
+            "use_static", tab.use_static_checkbox.isChecked()
+        )
+        use_hyperv = active_flags.get(
+            "use_hyperv", tab.use_hyperv_checkbox.isChecked()
+        )
+        use_netroute = active_flags.get(
+            "use_netroute", tab.use_netroute_checkbox.isChecked()
+        )
+        nat_os = active_flags.get("nat_os", tab.nat_os_checkbox.isChecked())
+        use_ollama = active_flags.get(
+            "use_ollama", tab.ollama_checkbox.isChecked()
+        )
+
+        self.router_tab.stop_router_button.setEnabled(False)
+        self.router_tab.stop_router_button.setText("Stopping...")
+        self.router_tab.start_router_button.setEnabled(False)
+        self.router_logger.log_message(
+            f"[GUI] stop_router flags: stratum={use_stratum_comm}, "
+            f"dhcp_out={use_dhcp_out}, dhcp_in={use_dhcp_in}, "
+            f"static={use_static}, hyperv={use_hyperv}"
+        )
+        manager = self.helper.router_manager
+
+        def _stop_backend():
+            ok = False
+            message = ""
+            try:
+                manager.stop_routing(
+                    use_dhcp_out,
+                    use_dhcp_in,
+                    use_static,
+                    use_hyperv,
+                    use_stratum_comm,
+                    use_netroute,
+                    nat_os,
+                    use_ollama,
+                )
+                ok = True
+            except Exception as exc:
+                message = f"Exception during router stop: {exc}"
+            finally:
+                self._release_router_operation("stop")
+                if not self._closing:
+                    self.router_stop_completed.emit(ok, message)
+
+        self._router_stop_thread = threading.Thread(
+            target=_stop_backend,
+            name="RouterStopWorker",
+            daemon=True,
+        )
+        try:
+            self._router_stop_thread.start()
+        except Exception as exc:
+            self._release_router_operation("stop")
+            self.router_tab.stop_router_button.setText("Stop Router")
+            self.router_tab.stop_router_button.setEnabled(True)
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ Could not launch router stop worker: {exc}"
             )
 
+    @pyqtSlot(bool, str)
+    def _on_router_stop_completed(self, ok: bool, message: str):
+        if self._closing:
+            return
+        self.router_tab.stop_router_button.setText("Stop Router")
+        if ok:
+            self._active_router_stop_flags = {}
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
-            self._active_router_stop_flags = {}
-
-        except Exception as e:
-            self.router_logger.log_message(f"[GUI] Exception during router stop: {e}")
+            self.router_logger.log_message("[RouterTab] ✅ Router stopped cleanly.")
+        else:
+            self.router_tab.start_router_button.setEnabled(False)
             self.router_tab.stop_router_button.setEnabled(True)
+            self.router_logger.log_message(
+                f"[RouterTab] ❌ {message or 'Router stop failed.'}"
+            )
 
     def closeEvent(self, event):
         """Ensures all worker threads are cleanly shut down on application exit."""
+        self._closing = True
         self.gui_logger.log_message("[GUI] Closing. Signaling all services to shut down...")
+
+        # A backend start/stop may still be working.  Give it a short bounded
+        # window, then request a best-effort router stop without blocking Qt
+        # indefinitely on DHCP, sockets, or a missing C++ pipe.
+        for worker in (self._router_start_thread, self._router_stop_thread):
+            if worker and worker.is_alive():
+                worker.join(timeout=1.0)
+
+        # Never start a second stop_routing call while the normal stop worker
+        # still owns teardown. Give that worker the remaining bounded window.
+        stop_in_progress = bool(
+            self._router_stop_thread and self._router_stop_thread.is_alive()
+        )
+        if stop_in_progress:
+            self._router_stop_thread.join(timeout=2.0)
+            stop_in_progress = self._router_stop_thread.is_alive()
+
+        manager = getattr(self.helper, "router_manager", None)
+        if manager and getattr(manager, "started", False) and not stop_in_progress:
+            flags = dict(getattr(self, "_active_router_stop_flags", {}) or {})
+
+            def _close_router_backend():
+                try:
+                    manager.stop_routing(
+                        flags.get("use_dhcp_out", False),
+                        flags.get("use_dhcp_in", False),
+                        flags.get("use_static", False),
+                        flags.get("use_hyperv", False),
+                        flags.get("use_stratum_comm", False),
+                        flags.get("use_netroute", False),
+                        flags.get("nat_os", False),
+                        flags.get("use_ollama", False),
+                    )
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[GUI] Router close cleanup error: {exc}"
+                    )
+
+            close_worker = threading.Thread(
+                target=_close_router_backend,
+                name="RouterCloseWorker",
+                daemon=True,
+            )
+            close_worker.start()
+            close_worker.join(timeout=3.0)
+
         try:
             if getattr(self, "router_tab", None):
                 self.router_tab.shutdown_logging()
@@ -1649,6 +1902,12 @@ class P2PoolGUI(QMainWindow):
             self.gui_logger.log_message(f"[GUI] Ollama tab shutdown error: {e}")
 
         self.gui_logger.log_message("[GUI] All GUI-managed threads cleanup attempted.")
+        try:
+            shutdown = getattr(self.router_logger, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        except Exception:
+            pass
         event.accept()
 
 

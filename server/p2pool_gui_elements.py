@@ -6,6 +6,7 @@ from typing import List, Dict
 import queue
 import threading
 import asyncio
+import time
 from urllib.parse import urljoin, urlparse, quote_plus, parse_qs
 from collections import defaultdict, deque
 import requests
@@ -1753,12 +1754,20 @@ class RouterTab(QWidget):
         }
 
         # -------- safe logging state --------
+        # The RouterLogger already applies producer-side pressure.  This second
+        # bounded queue protects the GUI consumer and limits both line count and
+        # memory, while a small time budget keeps paint/input events responsive.
         self._log_queue = deque()
-        self._max_log_queue = 8000
-        self._flush_batch_size = 250
+        self._log_queue_bytes = 0
+        self._max_log_queue = 10000
+        self._max_log_queue_bytes = 12 * 1024 * 1024
+        self._flush_batch_size = 300
+        self._flush_time_budget_seconds = 0.012
         self._logging_shutdown = False
         self._flush_in_progress = False
         self._dropping_logs = False
+        self._dropped_log_lines = 0
+        self._last_drop_notice = 0.0
 
         self._create_widgets()
         self._configure_layout()
@@ -1768,7 +1777,7 @@ class RouterTab(QWidget):
             self._add_console_pane("General")
 
         self._log_flush_timer = QTimer(self)
-        self._log_flush_timer.setInterval(50)
+        self._log_flush_timer.setInterval(33)
         self._log_flush_timer.timeout.connect(self._flush_log_queue)
         self._log_flush_timer.start()
 
@@ -4057,6 +4066,10 @@ class RouterTab(QWidget):
         except RuntimeError:
             self._logging_shutdown = True
 
+    @staticmethod
+    def _queued_log_size(message: str) -> int:
+        return len(message.encode("utf-8", errors="replace")) + 1
+
     @pyqtSlot(str)
     def log_message(self, message: str):
         if self._logging_shutdown:
@@ -4070,42 +4083,79 @@ class RouterTab(QWidget):
         if not msg:
             return
 
-        if len(msg) > 8000:
-            msg = msg[:8000] + " ... [truncated]"
+        if len(msg) > 10000:
+            msg = msg[:10000] + " ... [truncated]"
 
-        if len(self._log_queue) >= self._max_log_queue:
-            try:
-                self._log_queue.popleft()
-            except Exception:
-                pass
+        msg_size = self._queued_log_size(msg)
+        dropped_now = 0
+        while self._log_queue and (
+            len(self._log_queue) >= self._max_log_queue
+            or self._log_queue_bytes + msg_size > self._max_log_queue_bytes
+        ):
+            old = self._log_queue.popleft()
+            self._log_queue_bytes = max(
+                0,
+                self._log_queue_bytes - self._queued_log_size(old),
+            )
+            dropped_now += 1
 
-            if not self._dropping_logs:
-                self._dropping_logs = True
-                self._log_queue.append("[RouterTab] ⚠️ Log queue overflow; dropping oldest messages.")
-        else:
+        if dropped_now:
+            self._dropped_log_lines += dropped_now
+            self._dropping_logs = True
+        elif len(self._log_queue) < (self._max_log_queue // 2):
             self._dropping_logs = False
 
         self._log_queue.append(msg)
+        self._log_queue_bytes += msg_size
 
     @pyqtSlot()
     def _flush_log_queue(self):
         if self._logging_shutdown:
             self._log_queue.clear()
+            self._log_queue_bytes = 0
             return
 
         if self._flush_in_progress:
             return
 
         self._flush_in_progress = True
+        started = time.monotonic()
         try:
             per_pane = defaultdict(list)
             processed = 0
+            backlog = len(self._log_queue)
+            batch_limit = self._flush_batch_size
+            if backlog > (self._max_log_queue // 2):
+                batch_limit = min(1200, self._flush_batch_size * 4)
+            elif backlog > (self._max_log_queue // 4):
+                batch_limit = min(750, self._flush_batch_size * 2)
 
-            while self._log_queue and processed < self._flush_batch_size:
+            now = started
+            if self._dropped_log_lines and (now - self._last_drop_notice) >= 1.0:
+                notice = (
+                    "[RouterTab] ⚠️ Dropped "
+                    f"{self._dropped_log_lines} oldest GUI log lines under sustained load."
+                )
+                pane_name = self._route_message_to_pane(notice)
+                per_pane[pane_name].append(notice)
+                self._dropped_log_lines = 0
+                self._last_drop_notice = now
+
+            while self._log_queue and processed < batch_limit:
                 message = self._log_queue.popleft()
+                self._log_queue_bytes = max(
+                    0,
+                    self._log_queue_bytes - self._queued_log_size(message),
+                )
                 pane_name = self._route_message_to_pane(message)
                 per_pane[pane_name].append(message)
                 processed += 1
+
+                # Do not monopolize Qt when thousands of packets arrive at once.
+                if processed % 32 == 0 and (
+                    time.monotonic() - started
+                ) >= self._flush_time_budget_seconds:
+                    break
 
             for pane_name, messages in per_pane.items():
                 self._append_batch_to_pane(pane_name, messages)
@@ -4128,6 +4178,8 @@ class RouterTab(QWidget):
             pass
 
         self._log_queue.clear()
+        self._log_queue_bytes = 0
+        self._dropped_log_lines = 0
 
 
 
