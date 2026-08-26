@@ -21,6 +21,10 @@ import ipaddress
 import threading
 import json
 import time
+try:
+    import psutil
+except Exception:  # optional on non-Windows validation hosts
+    psutil = None
 import numpy as np
 import select
 import zmq
@@ -9234,6 +9238,9 @@ class TransportHTTPSManager:
 
         self._tls_flows: "OrderedDict[tuple, dict]" = OrderedDict()
         self._peek_tcp_meta_cached = None
+        self._external_tls_context: "OrderedDict[tuple, dict]" = OrderedDict()
+        self._dns_name_resolver: Optional[Callable[[str], Any]] = None
+        self._process_resolver: Optional[Callable[[str, int, str, int], Any]] = None
 
         # Keep legacy metric keys for callers, and add address-family/service
         # counters. A flow is counted once for IPv4/IPv6 even when packets are
@@ -9323,6 +9330,157 @@ class TransportHTTPSManager:
             self._metrics["errors"] += 1
             self._safe_log(f"[Transport][🔒 HTTPS] ⚠️ handle failed: {exc}")
             return False
+
+    def set_dns_name_resolver(self, resolver: Optional[Callable[[str], Any]]) -> None:
+        self._dns_name_resolver = resolver if callable(resolver) else None
+
+    def set_process_resolver(self, resolver: Optional[Callable[[str, int, str, int], Any]]) -> None:
+        self._process_resolver = resolver if callable(resolver) else None
+
+    def _enrich_midstream_context(self, state: dict, src_ip: str, sport: int, dst_ip: str, dport: int) -> None:
+        """Add transparent correlation hints when the TLS hello was not captured.
+
+        DNS/process correlation is explicitly tagged as inferred. ALPN and cipher
+        are never guessed from encrypted application bytes.
+        """
+        server = state.get("server")
+        if isinstance(server, (tuple, list)) and len(server) >= 2:
+            remote_ip = str(server[0])
+        elif int(dport) in self.BROWSER_TLS_PORTS | self.APNS_PORTS | self.FCM_PORTS:
+            remote_ip = str(dst_ip)
+        else:
+            remote_ip = str(src_ip)
+
+        if not state.get("sni") and callable(self._dns_name_resolver):
+            try:
+                answer = self._dns_name_resolver(remote_ip)
+                if isinstance(answer, dict):
+                    hostname = answer.get("hostname") or answer.get("name")
+                    source = answer.get("source") or "dns-correlation"
+                    confidence = float(answer.get("confidence") or 0.62)
+                else:
+                    hostname = answer
+                    source = "dns-correlation"
+                    confidence = 0.62
+                if hostname:
+                    state["sni"] = str(hostname).rstrip(".")
+                    state["sni_source"] = str(source)
+                    state["sni_inferred"] = True
+                    state["confidence"] = max(float(state.get("confidence", 0.0)), confidence)
+                    self._note_flow(state, "sni_dns_correlated")
+            except Exception:
+                pass
+
+        if not state.get("browser_family_hint") and callable(self._process_resolver):
+            try:
+                answer = self._process_resolver(str(src_ip), int(sport), str(dst_ip), int(dport))
+                if isinstance(answer, dict):
+                    browser = answer.get("browser") or answer.get("process")
+                    source = answer.get("source") or "socket-owner"
+                else:
+                    browser = answer
+                    source = "socket-owner"
+                if browser:
+                    state["browser_family_hint"] = str(browser)
+                    state["browser_source"] = str(source)
+                    state["browser_inferred"] = True
+                    self._note_flow(state, "browser_socket_owner")
+            except Exception:
+                pass
+
+        opaque = state.get("proto_hint") == self._PROTO_HINT_OPAQUE or bool(state.get("midstream"))
+        if opaque:
+            state.setdefault("metadata_gap_reason", "capture-started-after-tls-handshake")
+
+    def _display_sni(self, state: dict) -> str:
+        value = state.get("sni")
+        if value:
+            suffix = "~dns" if state.get("sni_inferred") else ""
+            return f"{value}{suffix}"
+        return "unknown(midstream)" if state.get("proto_hint") == self._PROTO_HINT_OPAQUE else "-"
+
+    def _display_alpn(self, state: dict) -> str:
+        value = state.get("selected_alpn") or state.get("alpn")
+        if value not in (None, "", [], {}):
+            return self._compact_list(value, 3)
+        return "unknown(midstream)" if state.get("proto_hint") == self._PROTO_HINT_OPAQUE else "-"
+
+    def _display_cipher(self, state: dict) -> str:
+        value = state.get("cipher")
+        if value not in (None, "", [], {}):
+            return self._cipher_name(value)
+        return "unknown(midstream)" if state.get("proto_hint") == self._PROTO_HINT_OPAQUE else "-"
+
+    def _display_browser(self, state: dict) -> str:
+        value = state.get("browser_family_hint")
+        if value:
+            return str(value) + ("~process" if state.get("browser_inferred") else "")
+        return "unknown" if state.get("proto_hint") == self._PROTO_HINT_OPAQUE else "-"
+
+    def _display_metadata_sources(self, state: dict) -> str:
+        sources = []
+        if state.get("sni_source"):
+            sources.append(str(state["sni_source"]))
+        if state.get("browser_source"):
+            sources.append(str(state["browser_source"]))
+        if state.get("handshake_context_seq") is not None:
+            sources.append("handshake-manager")
+        return ",".join(dict.fromkeys(sources)) or "packet"
+
+    def learn_tls_context(self, src_ip: str, sport: int, dst_ip: str, dport: int, context: Optional[Dict[str, Any]]) -> None:
+        """Merge HandshakeManager metadata before the first HTTPS log line."""
+        if not context:
+            return
+        key = self._flow_key(str(src_ip), int(sport), str(dst_ip), int(dport))
+        normalized = dict(context)
+        self._external_tls_context[key] = normalized
+        self._external_tls_context.move_to_end(key)
+        while len(self._external_tls_context) > self.flow_cache_max:
+            self._external_tls_context.popitem(last=False)
+        state = self._tls_flows.get(key)
+        if state is not None:
+            self._merge_external_context(state, normalized)
+
+    def _merge_external_context(self, state: dict, context: Dict[str, Any]) -> None:
+        tls = dict(context.get("tls") or {})
+        event_data = dict(context.get("event_data") or {})
+        messages = list(event_data.get("messages") or [])
+        hello = next((dict(m) for m in messages if m.get("type") == "ClientHello"), {})
+        server = next((dict(m) for m in messages if m.get("type") == "ServerHello"), {})
+        candidates = [hello, server, tls, event_data, context]
+        def first(*names):
+            for source in candidates:
+                for name in names:
+                    value = source.get(name)
+                    if value not in (None, "", [], {}):
+                        return value
+            return None
+        mapping = {
+            "sni": first("sni", "server_name"),
+            "alpn": first("alpn", "alpn_protocols"),
+            "cipher": first("cipher_suite_int", "cipher_suite", "cipher"),
+            "ja3": first("ja3_md5", "ja3"),
+            "ja3s": first("ja3s_md5", "ja3s"),
+            "tls_version": first("version_name", "negotiated_version", "version"),
+        }
+        for name, value in mapping.items():
+            if value not in (None, "", [], {}):
+                state[name] = value
+        state["handshake_context"] = context
+        state["handshake_context_seq"] = context.get("seq")
+        if mapping["sni"]:
+            state["sni_source"] = "handshake-manager"
+            state["sni_inferred"] = False
+        if mapping["alpn"]:
+            state["alpn_source"] = "handshake-manager"
+        if mapping["cipher"]:
+            state["cipher_source"] = "handshake-manager"
+        if context.get("midstream"):
+            state["midstream"] = True
+        if mapping["sni"]:
+            state["classified"] = True
+            state["proto_hint"] = self._PROTO_HINT_TLS
+            state["confidence"] = max(float(state.get("confidence", 0.0)), 0.98)
 
     def snapshot_metrics(self) -> dict:
         return dict(self._metrics)
@@ -9457,6 +9615,9 @@ class TransportHTTPSManager:
 
         fkey = self._flow_key(src_ip, sport, dst_ip, dport)
         existing = self._tls_flows.get(fkey)
+        external_context = self._external_tls_context.get(fkey)
+        if existing is not None and external_context:
+            self._merge_external_context(existing, external_context)
         first_header = self._peek_tls_record_header_mv(memoryview(raw)) if raw else None
         sslv2 = self._peek_sslv2_header(memoryview(raw)) if raw and not first_header else None
 
@@ -9465,6 +9626,8 @@ class TransportHTTPSManager:
             return False
 
         st = self._get_or_create_flow(fkey, now)
+        if external_context:
+            self._merge_external_context(st, external_context)
         self._apply_ip_family_metadata(st, src_ip, dst_ip, "tcp")
         self._touch_flow(fkey, st, now)
         self._update_flow_roles(st, src_ip, sport, dst_ip, dport, tmeta)
@@ -9494,6 +9657,7 @@ class TransportHTTPSManager:
                 self._metrics["tcp_443_header_only"] += 1
                 st["proto_hint"] = st.get("proto_hint") or self._PROTO_HINT_TCP_443
                 st["confidence"] = max(float(st.get("confidence", 0.0)), 0.25)
+            self._enrich_midstream_context(st, src_ip, sport, dst_ip, dport)
             self._classify_service(st, sport, dport)
             if self.log_packet_prefix and self._should_log_flow(st, now):
                 self._safe_log(
@@ -9543,11 +9707,13 @@ class TransportHTTPSManager:
             st["proto_hint"] = self._PROTO_HINT_OPAQUE
             st["confidence"] = max(float(st.get("confidence", 0.0)), 0.35)
             st["parse_reason"] = "tcp443_encrypted_or_midstream_payload"
+            st["midstream"] = True
             self._note_flow(st, "opaque_or_midstream_443")
         elif push_port:
             st["classified"] = True
             st["confidence"] = max(float(st.get("confidence", 0.0)), 0.70)
 
+        self._enrich_midstream_context(st, src_ip, sport, dst_ip, dport)
         self._classify_service(st, sport, dport)
         self._derive_browser_metadata(st)
         self._update_organic_bucket(st)
@@ -9628,6 +9794,14 @@ class TransportHTTPSManager:
             "browser_ready": False,
             "browser_protocol": None,
             "browser_family_hint": None,
+            "browser_source": None,
+            "browser_inferred": False,
+            "sni_source": None,
+            "sni_inferred": False,
+            "alpn_source": None,
+            "cipher_source": None,
+            "metadata_gap_reason": None,
+            "midstream": False,
             "organic_browser_score": 0,
             "service_hint": None,
             "microsoft_authenticator_candidate": False,
@@ -11071,10 +11245,10 @@ class TransportHTTPSManager:
         payload_kind = (phase or {}).get("payload_kind")
         if payload_kind:
             extra.append(f"payload={payload_kind}")
-        if st.get("sni"):
-            extra.append(f"sni={st['sni']}")
-        if st.get("browser_family_hint"):
-            extra.append(f"browser={st['browser_family_hint']}")
+        extra.append(f"sni={self._display_sni(st)}")
+        extra.append(f"alpn={self._display_alpn(st)}")
+        extra.append(f"cipher={self._display_cipher(st)}")
+        extra.append(f"browser={self._display_browser(st)}")
         extra.append(f"organic={int(st.get('organic_browser_score', 0) or 0)}")
         if st.get("service_hint"):
             extra.append(f"service={st['service_hint']}")
@@ -11127,8 +11301,8 @@ class TransportHTTPSManager:
             f"{src_ip}:{sport} > {dst_ip}:{dport} len={length} "
             f"phase={phase_name} tcp_state={st.get('tcp_state', self._TCP_STATE_INIT)} "
             f"tls_state={st.get('tls_state', self._TLS_STATE_INIT)} "
-            f"sni={st.get('sni') or '-'} alpn={self._compact_list(st.get('alpn'), 3)} "
-            f"cipher={cipher_str} browser={st.get('browser_family_hint') or '-'} "
+            f"sni={self._display_sni(st)} alpn={self._display_alpn(st)} "
+            f"cipher={self._display_cipher(st)} browser={self._display_browser(st)} "
             f"organic={int(st.get('organic_browser_score', 0) or 0)} "
             f"service={st.get('service_hint') or '-'}"
         )
@@ -11200,11 +11374,12 @@ class TransportHTTPSManager:
             f"{src_ip}:{sport} → {dst_ip}:{dport} on {self._iface_suffix(inbound_iface)} "
             f"phase={phase_name} hint={proto_hint} "
             f"conf={float(st.get('confidence', 0.0)):.2f} kind={kind} "
-            f"sni={st.get('sni') or '-'} alpn={self._compact_list(st.get('alpn'), 3)} "
-            f"cipher={self._cipher_name(st.get('cipher'))} "
-            f"browser={st.get('browser_family_hint') or '-'} "
+            f"sni={self._display_sni(st)} alpn={self._display_alpn(st)} "
+            f"cipher={self._display_cipher(st)} "
+            f"browser={self._display_browser(st)} "
             f"organic={int(st.get('organic_browser_score', 0) or 0)} "
             f"service={st.get('service_hint') or '-'} "
+            f"meta_source={self._display_metadata_sources(st)} "
             f"notes={self._compact_list(st.get('notes'), 4)}"
         )
         if dyn_tag:
@@ -11489,6 +11664,7 @@ class TransportStratumManager:
         self._flow_cool = float(flow_cooldown_s)
 
         self._flows: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._external_handshake_context: "OrderedDict[tuple, dict]" = OrderedDict()
         self._last_gc = time.time()
 
         # Non-standard service ports learned from strict plaintext Stratum
@@ -11619,6 +11795,54 @@ class TransportStratumManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def learn_handshake_context(
+            self,
+            src_ip: str,
+            sport: int,
+            dst_ip: str,
+            dport: int,
+            context: Optional[Dict[str, Any]],
+    ) -> None:
+        if not context:
+            return
+        key = self._flow_key(str(src_ip), int(sport), str(dst_ip), int(dport))
+        normalized = dict(context)
+        self._external_handshake_context[key] = normalized
+        self._external_handshake_context.move_to_end(key)
+        while len(self._external_handshake_context) > self.FLOW_SOFT_MAX:
+            self._external_handshake_context.popitem(last=False)
+        state = self._flows.get(key)
+        if state is not None:
+            self._merge_handshake_context(state, normalized)
+
+    def _merge_handshake_context(self, state: Dict[str, Any], context: Dict[str, Any]) -> None:
+        stratum = dict(context.get("stratum") or {})
+        event_data = dict(context.get("event_data") or {})
+        candidates = (event_data, stratum, context)
+        def first(*names):
+            for source in candidates:
+                for name in names:
+                    value = source.get(name)
+                    if value not in (None, "", [], {}):
+                        return value
+            return None
+        mapping = {
+            "last_worker": first("worker", "login", "user"),
+            "last_job_id": first("job_id", "jobid"),
+            "last_height": first("height", "block_height"),
+            "last_algo": first("algo", "algorithm"),
+            "last_target": first("target", "share_target"),
+            "last_diff": first("difficulty", "diff"),
+        }
+        for field, value in mapping.items():
+            if value not in (None, "", [], {}):
+                state[field] = value
+        runtime = state.get("runtime") or {}
+        runtime["handshake_state"] = first("handshake_state") or runtime.get("handshake_state") or "unknown"
+        runtime["stratum_transport"] = first("transport") or runtime.get("stratum_transport") or "unknown"
+        state["handshake_context"] = context
+        state["handshake_context_seq"] = context.get("seq")
+
     def handle(self, packet, src_ip: str, dst_ip: str, sport: int, dport: int, inbound_iface: str) -> bool:
         try:
             if TCP is None or not packet or not packet.haslayer(TCP):
@@ -11654,6 +11878,10 @@ class TransportStratumManager:
                     )
                     if learned_port is not None:
                         st["dynamic_service_port"] = int(learned_port)
+
+            handshake_context = self._external_handshake_context.get(fkey)
+            if handshake_context:
+                self._merge_handshake_context(st, handshake_context)
 
             st["last"] = now
             st["iface"] = iface
@@ -11725,7 +11953,13 @@ class TransportStratumManager:
                             f"{self._tag_prefix(st)}[🔐 STRATUM/TLS] "
                             f"{src_ip}:{sport} -> {dst_ip}:{dport} "
                             f"dir={direction} iface={iface} "
-                            f"opaque_payload=yes bytes={payload_len}"
+                            f"opaque_payload=yes bytes={payload_len} "
+                            f"height={st.get('last_height') if st.get('last_height') is not None else 'unknown'} "
+                            f"worker={st.get('last_worker') or 'unknown'} "
+                            f"algo={st.get('last_algo') or 'unknown'} "
+                            f"target={st.get('last_target') or 'unknown'} "
+                            f"handshake={rt.get('handshake_state') or 'encrypted'} "
+                            f"security={rt.get('stratum_transport') or 'tls'}"
                         )
                 else:
                     contiguous, prepend = self._reassemble_stratum_payload(
@@ -12387,7 +12621,11 @@ class TransportStratumManager:
             "last_worker": None,
             "last_job_id": None,
             "last_height": None,
+            "last_algo": None,
+            "last_target": None,
             "last_diff": None,
+            "handshake_context": None,
+            "handshake_context_seq": None,
             "last_job_ts": None,
             "last_submit_ts": None,
             "last_result_ts": None,
@@ -12415,6 +12653,8 @@ class TransportStratumManager:
             "proto_family": None,
             "proto_confidence": 0.0,
             "proto_reason": None,
+            "handshake_state": "unknown",
+            "stratum_transport": "unknown",
             "state": "new",
             "pending_ids": {},
             "packets_c2s": 0,
@@ -12911,9 +13151,22 @@ class TransportStratumManager:
         if height is not None:
             st["last_height"] = height
 
+        algo = event.get("algo")
+        if algo not in (None, "", [], {}):
+            st["last_algo"] = algo
+
+        target = event.get("target")
+        if target not in (None, "", [], {}):
+            st["last_target"] = target
+
         diff = event.get("difficulty")
         if diff is not None:
             st["last_diff"] = diff
+
+        if kind in ("login", "subscribe", "authorize"):
+            rt["handshake_state"] = "authenticated" if kind in ("login", "authorize") else "subscribed"
+        elif kind in ("notify", "job") and rt.get("handshake_state") in (None, "unknown"):
+            rt["handshake_state"] = "midstream-active"
 
         if event.get("family"):
             changed = self._apply_family_hint(
@@ -13195,15 +13448,24 @@ class TransportStratumManager:
         tag = self._tag_prefix(st)
 
         kind = event.get("kind")
-        worker = event.get("worker") or st.get("last_worker") or "-"
-        job_id = event.get("job_id") or st.get("last_job_id") or "-"
+        def known(value, fallback="unknown"):
+            return fallback if value in (None, "", [], {}) else value
+        worker = known(event.get("worker") or st.get("last_worker"))
+        job_id = known(event.get("job_id") or st.get("last_job_id"))
+        height = known(event.get("height") if event.get("height") is not None else st.get("last_height"))
+        algo = known(event.get("algo") or st.get("last_algo"))
+        target = known(event.get("target") or st.get("last_target"))
+        runtime = st.get("runtime") or {}
+        handshake_state = known(runtime.get("handshake_state"))
+        security = known(runtime.get("stratum_transport"))
 
         if kind in ("job", "notify"):
             self._emit(
                 f"{tag}[🧩 JOB] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
-                f"job_id={job_id} height={event.get('height', st.get('last_height', '-'))} "
-                f"worker={worker} algo={event.get('algo', '-')} target={event.get('target', '-')}"
+                f"job_id={job_id} height={height} "
+                f"worker={worker} algo={algo} target={target} "
+                f"handshake={handshake_state} security={security}"
             )
             return
 
@@ -13242,7 +13504,8 @@ class TransportStratumManager:
             self._emit(
                 f"{tag}[🔐 AUTH] {src_ip}:{sport} -> {dst_ip}:{dport} "
                 f"dir={direction} iface={iface} "
-                f"kind={kind} id={event.get('id')} worker={worker} agent={event.get('agent', '-')}"
+                f"kind={kind} id={event.get('id')} worker={worker} agent={known(event.get('agent'))} "
+                f"handshake={handshake_state} security={security}"
             )
             return
 
@@ -13803,15 +14066,40 @@ class TransportStratumManager:
         sport: int,
         dport: int,
     ) -> bool:
-        """Return True for configured ports, an already learned flow, or a strict Stratum signature."""
+        """Return True for configured ports, learned flows/context, or a strict signature."""
         sport = int(sport)
         dport = int(dport)
         if self._is_service_port(sport, dport):
             return True
 
+        # HandshakeManager reconstructs split JSON-RPC before NAT/transport
+        # dispatch. Accept its packet-attached context even when this individual
+        # segment contains only a partial object or NAT changed the tuple.
+        try:
+            packet_context = getattr(packet, "_handshake_transport_context", None) or {}
+            packet_stratum = dict(packet_context.get("stratum") or {})
+            if (
+                    packet_stratum.get("detected")
+                    or packet_stratum.get("transport")
+                    or (packet_stratum.get("candidate") and packet_stratum.get("port_hint"))
+                    or str(packet_context.get("event") or "").startswith("stratum_")
+            ):
+                return True
+        except Exception:
+            pass
+
         try:
             fkey = self._flow_key(src_ip, sport, dst_ip, dport)
             if fkey in self._flows:
+                return True
+            learned = dict(self._external_handshake_context.get(fkey) or {})
+            learned_stratum = dict(learned.get("stratum") or {})
+            if (
+                    learned_stratum.get("detected")
+                    or learned_stratum.get("transport")
+                    or (learned_stratum.get("candidate") and learned_stratum.get("port_hint"))
+                    or str(learned.get("event") or "").startswith("stratum_")
+            ):
                 return True
         except Exception:
             pass
@@ -20034,10 +20322,51 @@ class TransportDNSManager:
         self._rcode_window = rcode_anomaly_window_sec
         # key = client_ip -> [list of failure timestamps]
         self._rcode_failures: Dict[str, List[float]] = collections.defaultdict(list)
+        self._ip_name_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._ip_name_cache_max = 32768
+        self._ip_name_default_ttl = 300
 
         self.log.log_message("[Transport][🔎 DNS] Manager ready (Rebind Protection: "
                              f"{'ON' if self._alert_on_rebind else 'OFF'}, "
                              f"RCODE Anomaly: {'ON' if self._rcode_threshold > 0 else 'OFF'}).")
+
+    def _remember_ip_name(self, owner: str, rr: Any) -> None:
+        try:
+            rr_type = int(getattr(rr, "type", 0) or 0)
+            if rr_type not in (1, 28):
+                return
+            value = getattr(rr, "rdata", None)
+            if isinstance(value, bytes):
+                value = value.decode("ascii", errors="ignore")
+            ip_text = str(value or "").strip()
+            ipaddress.ip_address(ip_text)
+            hostname = str(owner or "").strip().rstrip(".")
+            if not hostname:
+                return
+            ttl = int(getattr(rr, "ttl", self._ip_name_default_ttl) or self._ip_name_default_ttl)
+            ttl = max(15, min(ttl, 86400))
+            self._ip_name_cache[ip_text] = {
+                "hostname": hostname,
+                "expires": time.time() + ttl,
+                "source": "dns-answer",
+                "confidence": 0.72,
+            }
+            self._ip_name_cache.move_to_end(ip_text)
+            while len(self._ip_name_cache) > self._ip_name_cache_max:
+                self._ip_name_cache.popitem(last=False)
+        except Exception:
+            return
+
+    def lookup_hostname(self, ip_text: str) -> Optional[Dict[str, Any]]:
+        key = str(ip_text or "").split("%", 1)[0].strip()
+        item = self._ip_name_cache.get(key)
+        if not item:
+            return None
+        if float(item.get("expires", 0.0)) <= time.time():
+            self._ip_name_cache.pop(key, None)
+            return None
+        self._ip_name_cache.move_to_end(key)
+        return dict(item)
 
     # ---------- Public entry point ----------
 
@@ -20249,6 +20578,8 @@ class TransportDNSManager:
                 self.log.log_message(f"[Transport][🔎 DNS][📜 Answer] (Unable to group {an} answers)")
 
             for name, rrs in grouped_answers.items():
+                for rr in rrs:
+                    self._remember_ip_name(name, rr)
                 # ---- ENHANCED: Pass rebind_check and query name to formatter ----
                 rr_lines = [self._fmt_rr(rr, name, rebind_check) for rr in rrs[:self._max_ans]]
 
@@ -31839,8 +32170,16 @@ class TransportManager:
         self._dispatch_lock = threading.RLock()
         self._tls_lock = threading.RLock()
         self._analysis_parallel_enabled = hasattr(self.parallel_python, "run_parallel")
+        self._handshake_manager = None
+        self._handshake_detach = None
+        self._tls_learning_enabled = True
+        self._https_init_context = True
+        self._tls_context_cache: "OrderedDict[tuple, dict]" = OrderedDict()
+        self._learning_consumers: List[Callable[[Dict[str, Any]], None]] = []
+        self._process_owner_cache: "OrderedDict[tuple, dict]" = OrderedDict()
+        self._process_owner_cache_ttl = 3.0
 
-        # TLS record manager + callbacks
+        # Fallback TLS parser. HandshakeManager becomes authoritative once bound.
         self.tls_manager = TLSRecordManager(self.logger)
         self._wire_tls_callbacks()
 
@@ -31904,11 +32243,134 @@ class TransportManager:
         self.transport_rip = TransportRIPManager(self.logger)
         self.transport_domain = TransportDomainManager(self.logger)
         self.transport_snmp = TransportSNMPManager(self.logger)
+        self._wire_https_context_resolvers()
 
         if settings:
             self.configure(**dict(settings))
         else:
             self._settings = self.settings_snapshot()
+
+    def bind_handshake_manager(self, handshake_manager) -> None:
+        if self._handshake_detach:
+            try:
+                self._handshake_detach()
+            except Exception:
+                pass
+            self._handshake_detach = None
+        self._handshake_manager = handshake_manager
+        if handshake_manager is None:
+            return
+        add_sink = getattr(handshake_manager, "add_learning_sink", None)
+        if callable(add_sink):
+            self._handshake_detach = add_sink(self._on_handshake_learning)
+        shared_tls = getattr(handshake_manager, "_tls_mgr", None)
+        if shared_tls is not None:
+            self.tls_manager = shared_tls
+        self.logger.log_message(
+            "[Transport][Handshake Learning] ✅ Shared TLS and Stratum context enabled."
+        )
+
+    def register_learning_consumer(self, consumer: Callable[[Dict[str, Any]], None]) -> Callable[[], None]:
+        if not callable(consumer):
+            raise TypeError("Transport learning consumer must be callable")
+        if consumer not in self._learning_consumers:
+            self._learning_consumers.append(consumer)
+        def detach() -> None:
+            try:
+                self._learning_consumers.remove(consumer)
+            except ValueError:
+                pass
+        return detach
+
+    def _on_handshake_learning(self, event: Dict[str, Any]) -> None:
+        flow_key = event.get("flow_key")
+        context = dict(event.get("context") or {})
+        context["seq"] = event.get("seq")
+        context["event"] = event.get("event")
+        context["event_data"] = dict(event.get("data") or {})
+        if flow_key is not None:
+            self._tls_context_cache[flow_key] = context
+            self._tls_context_cache.move_to_end(flow_key)
+            while len(self._tls_context_cache) > 50000:
+                self._tls_context_cache.popitem(last=False)
+            if str(event.get("event") or "").startswith("stratum_"):
+                try:
+                    (left_ip, left_port), (right_ip, right_port) = flow_key
+                    self.transport_stratum.learn_handshake_context(
+                        left_ip, left_port, right_ip, right_port, context
+                    )
+                except Exception as exc:
+                    self.logger.log_message(
+                        f"[Transport][Stratum Learning] ⚠️ context merge failed: {exc}"
+                    )
+        for consumer in tuple(self._learning_consumers):
+            try:
+                consumer(event)
+            except Exception as exc:
+                self.logger.log_message(f"[Transport][TLS Learning] ⚠️ consumer failed: {exc}")
+
+    def _shared_tls_context(self, src_ip, sport, dst_ip, dport) -> Dict[str, Any]:
+        key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
+        context = self._tls_context_cache.get(key)
+        if context:
+            return dict(context)
+        getter = getattr(self._handshake_manager, "get_transport_context", None)
+        if callable(getter):
+            try:
+                context = getter(src_ip, sport, dst_ip, dport) or {}
+                if context:
+                    self._tls_context_cache[key] = dict(context)
+                return dict(context)
+            except Exception:
+                pass
+        return {}
+
+    def _wire_https_context_resolvers(self) -> None:
+        try:
+            self.transport_https.set_dns_name_resolver(self.transport_dns.lookup_hostname)
+            self.transport_https.set_process_resolver(self._resolve_socket_owner)
+        except Exception as exc:
+            self.logger.log_message(f"[Transport][HTTPS Context] ⚠️ resolver wiring failed: {exc}")
+
+    def _resolve_socket_owner(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Optional[Dict[str, Any]]:
+        if psutil is None:
+            return None
+        key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
+        now = time.time()
+        cached = self._process_owner_cache.get(key)
+        if cached and now - float(cached.get("ts", 0.0)) <= self._process_owner_cache_ttl:
+            return dict(cached.get("value") or {}) or None
+        browser_map = {
+            "chrome.exe": "Chrome", "msedge.exe": "Edge", "firefox.exe": "Firefox",
+            "brave.exe": "Brave", "opera.exe": "Opera", "vivaldi.exe": "Vivaldi",
+            "chrome": "Chrome", "msedge": "Edge", "firefox": "Firefox", "brave": "Brave",
+        }
+        result = None
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                laddr = getattr(conn, "laddr", None)
+                raddr = getattr(conn, "raddr", None)
+                if not laddr or not raddr:
+                    continue
+                pair = {(str(laddr.ip), int(laddr.port)), (str(raddr.ip), int(raddr.port))}
+                wanted = {(str(src_ip), int(sport)), (str(dst_ip), int(dport))}
+                if pair != wanted or not getattr(conn, "pid", None):
+                    continue
+                try:
+                    name = psutil.Process(conn.pid).name().casefold()
+                except Exception:
+                    continue
+                browser = browser_map.get(name)
+                if browser:
+                    result = {"browser": browser, "process": name, "pid": int(conn.pid), "source": "socket-owner"}
+                    break
+        except Exception:
+            result = None
+        self._process_owner_cache[key] = {"ts": now, "value": result or {}}
+        self._process_owner_cache.move_to_end(key)
+        while len(self._process_owner_cache) > 4096:
+            self._process_owner_cache.popitem(last=False)
+        return result
 
     @staticmethod
     def _normalize_port_set(value, default_ports) -> set[int]:
@@ -31962,6 +32424,8 @@ class TransportManager:
         https_logging: bool = True,
         https_parse_certificates: bool = True,
         https_parse_quic_crypto: bool = True,
+        tls_learning_enabled: bool = True,
+        https_init_context: bool = True,
     ) -> None:
         requested_protocols = dict(self.DEFAULT_PROTOCOL_ENABLED)
         for key, value in dict(protocol_enabled or {}).items():
@@ -31991,6 +32455,8 @@ class TransportManager:
 
         self.enabled = bool(enabled)
         self.protocol_enabled = requested_protocols
+        self._tls_learning_enabled = bool(tls_learning_enabled)
+        self._https_init_context = bool(https_init_context)
         self.voip_port_range = range(start_port, end_port + 1)
         self._analysis_parallel_enabled = (
             bool(parallel_analysis)
@@ -32058,6 +32524,7 @@ class TransportManager:
             parse_certificates=bool(https_parse_certificates),
             parse_quic_crypto=bool(https_parse_quic_crypto),
         )
+        self._wire_https_context_resolvers()
 
         self._settings = self.settings_snapshot()
         enabled_count = sum(
@@ -32092,6 +32559,9 @@ class TransportManager:
             "parallel_analysis": bool(
                 self._analysis_parallel_enabled
             ),
+            "tls_learning_enabled": bool(self._tls_learning_enabled),
+            "https_init_context": bool(self._https_init_context),
+            "shared_tls_contexts": len(self._tls_context_cache),
         }
 
     def is_protocol_enabled(self, protocol: str) -> bool:
@@ -32763,7 +33233,19 @@ class TransportManager:
         self.transport_gulf.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_stratum_packet(self,packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        if self._tls_learning_enabled:
+            context = dict(getattr(packet, "_handshake_transport_context", None) or {})
+            if not context:
+                context = self._shared_tls_context(src_ip, sport, dst_ip, dport)
+            if context:
+                self.transport_stratum.learn_handshake_context(
+                    src_ip, sport, dst_ip, dport, context
+                )
+                try:
+                    packet._transport_stratum_context = context
+                except Exception:
+                    pass
+        return self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
@@ -32785,8 +33267,20 @@ class TransportManager:
         self.transport_http.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
     def _handle_https_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
-        self.transport_https.handle(packet, inbound_iface)
-        self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+        if self._tls_learning_enabled and self._https_init_context:
+            context = dict(getattr(packet, "_handshake_transport_context", None) or {})
+            if not context:
+                context = self._shared_tls_context(src_ip, sport, dst_ip, dport)
+            if context:
+                self.transport_https.learn_tls_context(src_ip, sport, dst_ip, dport, context)
+                try:
+                    packet._transport_tls_context = context
+                except Exception:
+                    pass
+        handled = self.transport_https.handle(packet, inbound_iface)
+        if self._handshake_manager is None:
+            self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+        return handled
 
     def _handle_ssh_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_ssh.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

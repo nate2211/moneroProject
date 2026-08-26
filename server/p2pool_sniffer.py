@@ -5823,8 +5823,18 @@ class SnifferSoftware:
             )
 
         return packet, meta
+    @staticmethod
+    def _important_capture_log(message: str) -> bool:
+        lowered = str(message or "").casefold()
+        return any(token in lowered for token in (
+            "error", "failed", "reject", "drop", "truncated", "dhcp",
+            "lease", "tls", "handshake", "alert", "dns", "arp", "ndp",
+            "route", "gateway", "hyperv", "warning", "⚠", "❌",
+        ))
+
     def _log_capture_packet(self, message: str, *, fingerprint: str = "") -> None:
         now = time.monotonic()
+        important = self._important_capture_log(message)
         emit_summary = None
         with self._packet_log_lock:
             if now - self._packet_log_window_start >= 1.0:
@@ -5837,7 +5847,7 @@ class SnifferSoftware:
                 self._packet_log_lines_in_window = 0
                 self._packet_log_suppressed = 0
 
-            if self._packet_log_lines_in_window >= self._packet_log_max_per_second:
+            if self._packet_log_lines_in_window >= self._packet_log_max_per_second and not important:
                 self._packet_log_suppressed += 1
                 should_emit = False
             else:

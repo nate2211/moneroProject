@@ -58,7 +58,7 @@ from p2pool_router_managers_2 import ARPManager, OutboundLoadBalancer, DNSManage
     LinkAggregationManager, FirewallManager, DHCPServer, HandshakeManager, NATManager, mDNSManager, \
     StratumManager, StratumConnectionManager, MoneroDaemonManager, TLSRecordManager, BroadcastManager, NDPManager, \
     P2PPeerManager, NetRouteManager, HostConnectivityBoundaryManager, LanManager, GatewayManager, UplinkManager, UpstreamManager, \
-    HyperVRouterManager, PythonServerManager,ScrapeWebsiteManager, WifiManager
+    HyperVRouterManager, PeerInterfaceManager, PythonServerManager,ScrapeWebsiteManager, WifiManager
 from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackManager, PacketCatcherManager, \
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
@@ -110,6 +110,7 @@ class PythonRouterManager:
         self.router_logger = router_logger
         self.nat_instance_name = f"PythonRouterNAT_{socket.gethostname()}"
         self.code_output_manager = CodeOutputManager(self.router_logger)
+        self.code_output_manager.bind_router(self)
         self.parallel_python = ParallelPythonTool(router_logger)
         self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
         self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
@@ -157,8 +158,12 @@ class PythonRouterManager:
         self._runtime_network_ready = threading.Event()
         self._ingress_lock = threading.RLock()
         self._ingress_states: Dict[str, Dict[str, Any]] = {}
-        self._ingress_max_frames = 4096
-        self._ingress_max_bytes = 64 * 1024 * 1024
+        self._ingress_max_frames = 16384
+        self._ingress_max_bytes = 192 * 1024 * 1024
+        # High-value packets (TLS handshakes, DNS, DHCP, auth/control traffic)
+        # have a separate reserve instead of competing with bulk packet bursts.
+        self._ingress_priority_reserve_frames = 4096
+        self._ingress_priority_reserve_bytes = 64 * 1024 * 1024
         self._ingress_log_ts: Dict[str, float] = {}
         self._ingress_total_enqueued = 0
         self._ingress_total_processed = 0
@@ -166,6 +171,9 @@ class PythonRouterManager:
         self._sniff_threads_lock = threading.Lock() # Lock for _sniff_threads dictionary
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
+        # Only interfaces recorded here are restored during stop. The WAN is
+        # not reset merely because the router observed its native DHCP lease.
+        self._router_changed_ipv4_aliases: Dict[str, str] = {}
         self.scrapewebsite_manager = None
         self.function_call_tracker = FunctionCallTracker(router_logger)
 
@@ -265,6 +273,10 @@ class PythonRouterManager:
         self.uplink_manager = None
         self.upstream_manager = None
         self.hypervrouter_manager = None
+        self.peerinterface_manager = None
+        self.peerinterface_enabled = False
+        self._peerinterface_settings = {}
+        self._peerinterface_nat_ports = set()
         self.python_server_manager = None
         self.socket_interface = None
         # WAN/public-IP observation state
@@ -789,36 +801,67 @@ class PythonRouterManager:
         return None
 
     def _initialize_interface_discovery(self):
-        """Discover network interfaces using tshark -D and store them internally."""
+        """Discover current tshark interfaces without retaining stale runs.
+
+        Start/stop can invoke discovery repeatedly on one manager instance. The
+        previous implementation appended to the old snapshot, producing the
+        observed 20 -> 40 -> 60 interface growth.
+        """
         self._tshark_path = self._get_tshark_path()
         if not self._tshark_path:
+            self._discovered_tshark_interfaces = []
             self.router_logger.log_message("[Router] Cannot perform interface discovery: tshark not found.")
             return
 
         self.router_logger.log_message("[Router] Discovering network interfaces via tshark -D...")
         try:
             proc = subprocess.run(
-                [self._tshark_path, '-D'], capture_output=True, text=True, check=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                [self._tshark_path, "-D"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            pattern = re.compile(r"(\d+)\.\s+([^(]+)(?:\((.*)\))?")
-            interface_output_lines = proc.stdout.strip().split('\n')
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"tshark -D exited {proc.returncode}: "
+                    f"{(proc.stderr or proc.stdout or '').strip()}"
+                )
 
-            for line in interface_output_lines:
+            pattern = re.compile(r"(\d+)\.\s+([^(]+?)(?:\s*\((.*)\))?\s*$")
+            snapshot = []
+            seen_full_names = set()
+            for raw_line in (proc.stdout or "").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
                 match = pattern.match(line)
-                if match:
-                    full_name = match.group(2).strip()
-                    friendly_name = match.group(3) if match.group(3) else ""
+                if not match:
+                    continue
+                full_name = str(match.group(2) or "").strip()
+                friendly_name = str(match.group(3) or "").strip()
+                if not full_name:
+                    continue
+                key = full_name.casefold()
+                if key in seen_full_names:
+                    continue
+                seen_full_names.add(key)
+                snapshot.append({
+                    "id": str(match.group(1)),
+                    "full_name": full_name,
+                    "friendly_name": friendly_name,
+                })
 
-                    self._discovered_tshark_interfaces.append({
-                        'id': match.group(1),
-                        'full_name': full_name,
-                        'friendly_name': friendly_name
-                    })
+            self._discovered_tshark_interfaces = snapshot
             self.router_logger.log_message(
-                f"[Router] Discovered {len(self._discovered_tshark_interfaces)} interfaces via tshark.")
-        except Exception as e:
-            self.router_logger.log_message(f"[Router] Error during tshark interface discovery: {e}")
+                f"[Router] Discovered {len(snapshot)} unique interfaces via tshark."
+            )
+        except Exception as exc:
+            self._discovered_tshark_interfaces = []
+            self.router_logger.log_message(
+                f"[Router] Error during tshark interface discovery: {exc}"
+            )
 
     def _configure_firewall_rules(self):
         """
@@ -920,33 +963,267 @@ class PythonRouterManager:
             self.router_logger.log_message(f"[Netsh] UNEXPECTED ERROR during netsh execution: {e}")
             return False
 
+    @staticmethod
+    def _powershell_literal(value: Any) -> str:
+        """Return a safe single-quoted PowerShell literal."""
+        return "'" + str(value or "").replace("'", "''") + "'"
+
+    @staticmethod
+    def _windows_is_admin() -> bool:
+        if os.name != "nt":
+            return True
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _netmask_prefix_length(netmask: str) -> int:
+        return ipaddress.IPv4Network(
+            f"0.0.0.0/{str(netmask).strip()}", strict=False
+        ).prefixlen
+
+    @staticmethod
+    def _is_usable_unicast_ipv4(value: Any) -> bool:
+        try:
+            address = ipaddress.IPv4Address(str(value or "").strip())
+        except Exception:
+            return False
+        return not (
+            address.is_link_local
+            or address.is_loopback
+            or address.is_unspecified
+            or address.is_multicast
+            or address == ipaddress.IPv4Address("255.255.255.255")
+        )
+
+    def _resolve_psutil_interface_name(self, iface_friendly_name: str) -> Optional[str]:
+        wanted = str(iface_friendly_name or "").strip().casefold()
+        if not wanted:
+            return None
+        for candidate in psutil.net_if_addrs().keys():
+            if str(candidate).strip().casefold() == wanted:
+                return str(candidate)
+        return None
+
+    def _current_interface_ipv4(self, iface_friendly_name: str, *, usable_only: bool = False):
+        resolved = self._resolve_psutil_interface_name(iface_friendly_name)
+        if not resolved:
+            return None, None
+        for addr in psutil.net_if_addrs().get(resolved, []):
+            if addr.family != socket.AF_INET:
+                continue
+            if usable_only and not self._is_usable_unicast_ipv4(addr.address):
+                continue
+            return str(addr.address), str(addr.netmask or "255.255.255.0")
+        return None, None
+
+    def _verify_interface_ipv4(self, iface_friendly_name: str, ip_address: str,
+                               netmask: str, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while time.monotonic() < deadline:
+            current_ip, current_mask = self._current_interface_ipv4(iface_friendly_name)
+            if current_ip == str(ip_address) and current_mask == str(netmask):
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _run_network_powershell(self, script: str, operation: str) -> bool:
+        command = [
+            "powershell.exe", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-Command", script,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[Router][IPv4] PowerShell {operation} could not run: {exc}"
+            )
+            return False
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if result.returncode == 0:
+            if stdout:
+                self.router_logger.log_message(
+                    f"[Router][IPv4] PowerShell {operation}: {stdout}"
+                )
+            return True
+
+        self.router_logger.log_message(
+            f"[Router][IPv4] PowerShell {operation} failed rc={result.returncode}."
+        )
+        if stdout:
+            self.router_logger.log_message(f"[Router][IPv4] STDOUT: {stdout}")
+        if stderr:
+            self.router_logger.log_message(f"[Router][IPv4] STDERR: {stderr}")
+        return False
+
+    def _set_interface_dhcp(self, iface_friendly_name: str, *, reset_dns: bool = True,
+                            trigger_renew: bool = False, record_change: bool = True) -> bool:
+        alias = str(iface_friendly_name or "").strip()
+        if not alias:
+            return False
+        if not self._windows_is_admin():
+            self.router_logger.log_message(
+                f"[Router][IPv4] ⚠️ DHCP configuration for '{alias}' requires an elevated Administrator process."
+            )
+        ps_alias = self._powershell_literal(alias)
+        dns_line = (
+            "Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex "
+            "-ResetServerAddresses -ErrorAction SilentlyContinue;"
+            if reset_dns else ""
+        )
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$alias = {ps_alias}
+$adapter = Get-NetAdapter -Name $alias -IncludeHidden -ErrorAction Stop |
+    Sort-Object ifIndex | Select-Object -First 1
+if ($adapter.Status -eq 'Disabled') {{
+    Enable-NetAdapter -InputObject $adapter -Confirm:$false -ErrorAction Stop
+    Start-Sleep -Milliseconds 400
+    $adapter = Get-NetAdapter -Name $alias -IncludeHidden -ErrorAction Stop |
+        Sort-Object ifIndex | Select-Object -First 1
+}}
+Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+{dns_line}
+Write-Output ('DHCP enabled on ' + $alias + ' ifIndex=' + $adapter.ifIndex)
+"""
+        ok = self._run_network_powershell(script, f"enable DHCP on {alias}")
+        if not ok:
+            ok = self._execute_netsh([
+                "set", "address", f"name={alias}", "source=dhcp"
+            ])
+            if reset_dns:
+                self._execute_netsh([
+                    "set", "dnsservers", f"name={alias}", "source=dhcp"
+                ])
+        if not ok:
+            return False
+
+        if record_change:
+            self._router_changed_ipv4_aliases[alias.casefold()] = "dhcp"
+
+        if trigger_renew:
+            try:
+                subprocess.run(
+                    ["ipconfig", "/renew", alias],
+                    capture_output=True,
+                    text=True,
+                    timeout=35,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[Router][DHCP] Renew for '{alias}' returned early: {exc}"
+                )
+        return True
+
     def _assign_ip_to_interface(self, iface_friendly_name: str, ip_address: str, netmask: str,
                                 gateway: str = "") -> bool:
-        """Assigns a static IP and netmask (and optional gateway) to a specific interface using netsh."""
-        self.router_logger.log_message(
-            f"[Router] Assigning IP {ip_address}/{netmask} to '{iface_friendly_name}'...")
-
-        # Build the netsh command arguments in the correct order for 'set address'
-        netsh_args = [
-            "set", "address",
-            f'name={iface_friendly_name}',
-            "source=static",
-            f"address={ip_address}",
-            f"mask={netmask}"
-        ]
-
-        if gateway:
-            netsh_args.append(f"gateway={gateway}")
-            netsh_args.append("gwmetric=1")
-        else:
-            netsh_args.append("gateway=none")
-
-        if not self._execute_netsh(netsh_args):
+        """Assign and verify IPv4 using NetTCPIP cmdlets, then netsh fallback."""
+        alias = str(iface_friendly_name or "").strip()
+        try:
+            address = str(ipaddress.IPv4Address(str(ip_address).strip()))
+            prefix_length = self._netmask_prefix_length(netmask)
+            mask = str(ipaddress.IPv4Network(f"0.0.0.0/{prefix_length}").netmask)
+            gateway_address = (
+                str(ipaddress.IPv4Address(str(gateway).strip()))
+                if str(gateway or "").strip() else ""
+            )
+        except Exception as exc:
             self.router_logger.log_message(
-                f"[Router] ERROR: Failed to assign IP {ip_address} to '{iface_friendly_name}'.")
+                f"[Router][IPv4] Invalid static configuration for '{alias}': {exc}"
+            )
             return False
+
+        if not alias:
+            self.router_logger.log_message("[Router][IPv4] Empty interface alias; cannot assign address.")
+            return False
+
         self.router_logger.log_message(
-            f"[Router] Successfully assigned IP {ip_address} to '{iface_friendly_name}'.")
+            f"[Router] Assigning IP {address}/{mask} to '{alias}'..."
+        )
+        current_ip, current_mask = self._current_interface_ipv4(alias)
+        if current_ip == address and current_mask == mask:
+            self.router_logger.log_message(
+                f"[Router][IPv4] ✅ '{alias}' already owns {address}/{mask}."
+            )
+            return True
+
+        if not self._windows_is_admin():
+            self.router_logger.log_message(
+                f"[Router][IPv4] ⚠️ Static IP assignment for '{alias}' requires Run as administrator."
+            )
+        ps_alias = self._powershell_literal(alias)
+        ps_ip = self._powershell_literal(address)
+        ps_gateway = self._powershell_literal(gateway_address)
+        route_block = ""
+        if gateway_address:
+            route_block = f"""
+Get-NetRoute -InterfaceIndex $ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+New-NetRoute -InterfaceIndex $ifIndex -DestinationPrefix '0.0.0.0/0' -NextHop {ps_gateway} -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+"""
+
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$alias = {ps_alias}
+$targetIp = {ps_ip}
+$adapter = Get-NetAdapter -Name $alias -IncludeHidden -ErrorAction Stop |
+    Sort-Object ifIndex | Select-Object -First 1
+if ($adapter.Status -eq 'Disabled') {{
+    Enable-NetAdapter -InputObject $adapter -Confirm:$false -ErrorAction Stop
+    Start-Sleep -Milliseconds 500
+    $adapter = Get-NetAdapter -Name $alias -IncludeHidden -ErrorAction Stop |
+        Sort-Object ifIndex | Select-Object -First 1
+}}
+$ifIndex = $adapter.ifIndex
+Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+Start-Sleep -Milliseconds 250
+Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.IPAddress -ne $targetIp }} |
+    Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+$existing = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -IPAddress $targetIp -ErrorAction SilentlyContinue
+if (-not $existing) {{
+    New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress $targetIp -PrefixLength {prefix_length} -Type Unicast -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+}}
+{route_block}
+Write-Output ('Static IPv4 ' + $targetIp + '/{prefix_length} installed on ' + $alias + ' ifIndex=' + $ifIndex)
+"""
+        command_ok = self._run_network_powershell(script, f"assign {address} to {alias}")
+        if not command_ok:
+            netsh_args = [
+                "set", "address", f"name={alias}", "source=static",
+                f"address={address}", f"mask={mask}",
+                f"gateway={gateway_address}" if gateway_address else "gateway=none",
+            ]
+            if gateway_address:
+                netsh_args.append("gwmetric=1")
+            command_ok = self._execute_netsh(netsh_args)
+
+        verified = self._verify_interface_ipv4(alias, address, mask, timeout=10.0)
+        if not verified:
+            admin_hint = ""
+            if not self._windows_is_admin():
+                admin_hint = " The application is not elevated; restart it with Run as administrator."
+            self.router_logger.log_message(
+                f"[Router][IPv4] ❌ '{alias}' did not acquire {address}/{mask} after "
+                f"PowerShell/netsh assignment.{admin_hint}"
+            )
+            return False
+
+        self._router_changed_ipv4_aliases[alias.casefold()] = "static"
+        self.router_logger.log_message(
+            f"[Router][IPv4] ✅ Verified {address}/{mask} on '{alias}'."
+        )
         return True
 
     def _get_system_networks(self, router_ip_in: str = None, router_netmask_in: str = "255.255.255.0") -> list[
@@ -1430,16 +1707,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self.router_logger.log_message(
                 f"[Router][WanDHCP] 🌍 Enabling native DHCP on OUT interface '{self.interface_out_friendly_name}'.")
 
-            self._execute_netsh([
-                "set", "address",
-                f'name={self.interface_out_friendly_name}',
-                "source=dhcp",
-            ])
-            self._execute_netsh([
-                "set", "dnsservers",
-                f'name={self.interface_out_friendly_name}',
-                "source=dhcp",
-            ])
+            self._set_interface_dhcp(
+                self.interface_out_friendly_name,
+                reset_dns=True,
+                trigger_renew=False,
+                record_change=False,
+            )
 
             renew_kwargs = {
                 "capture_output": True,
@@ -1551,35 +1824,58 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         existing_networks_for_in = system_active_networks_updated + [self.router_network_out]
 
         current_in_ip, current_in_netmask = None, None
+        in_address_source = "static"
 
         if use_dhcp_in:
             self.router_logger.log_message(
                 f"[Router] 🏠 Setting IN interface '{self.interface_in_friendly_name}' to DHCP.")
-            if not self._execute_netsh(["set", "address", f'name={self.interface_in_friendly_name}', "source=dhcp"]):
+            dhcp_enabled = self._set_interface_dhcp(
+                self.interface_in_friendly_name,
+                reset_dns=True,
+                trigger_renew=True,
+                record_change=True,
+            )
+            if not dhcp_enabled:
                 self.router_logger.log_message(
-                    f"[Router] ⚠️ Failed to set IN interface to DHCP. Proceeding to retrieve current IP...")
-            time.sleep(5)
-            for addr in psutil.net_if_addrs().get(self.interface_in_friendly_name, []):
-                if addr.family == socket.AF_INET:
-                    current_in_ip = addr.address
-                    current_in_netmask = addr.netmask
+                    "[Router] ⚠️ Windows could not enable DHCP on IN; checking for an existing proper lease."
+                )
+
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                current_in_ip, current_in_netmask = self._current_interface_ipv4(
+                    self.interface_in_friendly_name, usable_only=True
+                )
+                if current_in_ip and current_in_netmask:
                     break
+                time.sleep(0.5)
+
             if current_in_ip and current_in_netmask:
+                in_address_source = "dhcp"
                 self.router_logger.log_message(
-                    f"[Router] ✅ IN interface successfully obtained IP via DHCP: {current_in_ip}/{current_in_netmask}")
+                    f"[Router] ✅ IN interface obtained a proper DHCP lease: {current_in_ip}/{current_in_netmask}")
             else:
-                self.router_logger.log_message(
-                    f"[Router] ❌ FAILED to get IP via DHCP for IN interface. Falling back to a private IP.")
-                unused_in_ip = self._find_unused_private_subnet(existing_networks_for_in)
-                if unused_in_ip:
-                    current_in_ip = unused_in_ip
-                    current_in_netmask = "255.255.255.0"
+                observed_ip, observed_mask = self._current_interface_ipv4(
+                    self.interface_in_friendly_name, usable_only=False
+                )
+                if observed_ip and not self._is_usable_unicast_ipv4(observed_ip):
                     self.router_logger.log_message(
-                        f"[Router] Dynamically assigned fallback private IP for IN interface '{self.interface_in_friendly_name}': {current_in_ip}/{current_in_netmask}")
-                else:
-                    self.router_logger.log_message("[Router] CRITICAL ERROR: Failed to assign any IP to IN interface.")
+                        f"[Router] ⚠️ Ignoring APIPA/non-routable IN address {observed_ip}/{observed_mask or '-'}; "
+                        "it is not a DHCP lease."
+                    )
+                self.router_logger.log_message(
+                    "[Router] DHCP IN did not receive a proper lease; selecting a private static fallback."
+                )
+                unused_in_ip = self._find_unused_private_subnet(existing_networks_for_in)
+                if not unused_in_ip:
+                    self.router_logger.log_message("[Router] CRITICAL ERROR: Failed to select an IN fallback address.")
                     return False
-        else:  # use_dhcp_in is False
+                current_in_ip = unused_in_ip
+                current_in_netmask = "255.255.255.0"
+                in_address_source = "static_fallback"
+                self.router_logger.log_message(
+                    f"[Router] Static fallback selected for IN '{self.interface_in_friendly_name}': "
+                    f"{current_in_ip}/{current_in_netmask}")
+        else:
             if router_ip_in:
                 current_in_ip = router_ip_in
                 current_in_netmask = router_netmask_in
@@ -1608,7 +1904,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self.router_logger.log_message(
             "[Router] Assigning IPs to interfaces via OS commands (Requires Admin). This may cause temporary network disruption.")
 
-        if not use_dhcp_in:
+        if in_address_source != "dhcp":
             if not self._assign_ip_to_interface(self.interface_in_friendly_name, self.router_ip_in,
                                                 self.router_netmask_in):
                 self.router_logger.log_message(
@@ -1628,54 +1924,90 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         # We will give them static IPs from the same subnet as the IN interface.
         # Note: These IPs must be unique and not conflict with other devices.
         if ethernet_2_info:
-            # Check for a pre-configured IP or assign one
+            # Reuse an address only when it is a usable member of the selected
+            # LAN. Never propagate Windows APIPA (169.254/16) into bridge/LAN
+            # configuration.
             eth2_ip = None
-            for addr in psutil.net_if_addrs().get(ethernet_2_info["friendly_name"], []):
-                if addr.family == socket.AF_INET:
-                    eth2_ip = addr.address
-                    break
+            observed_eth2_ip, _ = self._current_interface_ipv4(
+                ethernet_2_info["friendly_name"], usable_only=False
+            )
+            if observed_eth2_ip and self._is_usable_unicast_ipv4(observed_eth2_ip):
+                try:
+                    observed_obj = ipaddress.IPv4Address(observed_eth2_ip)
+                    if observed_obj in self.router_network_in and str(observed_obj) != self.router_ip_in:
+                        eth2_ip = str(observed_obj)
+                except Exception:
+                    eth2_ip = None
 
-            # If no static IP found, assign a new one from the IN subnet
             if not eth2_ip:
                 eth2_ip = str(self.router_network_in.network_address + 2)
 
-            self.router_logger.log_message(f"[Router] Attempting to assign IP {eth2_ip} to Ethernet 2.")
+            self.router_logger.log_message(f"[Router] Attempting to assign LAN IP {eth2_ip} to Ethernet 2.")
             if not self._assign_ip_to_interface(ethernet_2_info['friendly_name'], eth2_ip, self.router_netmask_in):
                 self.router_logger.log_message(
-                    f"[Router] CRITICAL ERROR: Failed to assign IP to Ethernet 2. Bridging may not work.")
-                return False
+                    "[Router] ⚠️ Ethernet 2 could not be configured; excluding it from this run instead of aborting the router."
+                )
+                ethernet_2_info = None
+                self.interface_ethernet_2_full_name = None
+                self.interface_ethernet_2_friendly_name = None
 
         if lac_2_info:
             lac_1_ip = None
-            for addr in psutil.net_if_addrs().get(lac_2_info["friendly_name"], []):
-                if addr.family == socket.AF_INET:
-                    lac_1_ip = addr.address
-                    break
+            observed_lac_ip, _ = self._current_interface_ipv4(
+                lac_2_info["friendly_name"], usable_only=False
+            )
+            if observed_lac_ip and self._is_usable_unicast_ipv4(observed_lac_ip):
+                try:
+                    observed_obj = ipaddress.IPv4Address(observed_lac_ip)
+                    if observed_obj in self.router_network_in and str(observed_obj) not in {
+                        self.router_ip_in,
+                        str(self.router_network_in.network_address + 2),
+                    }:
+                        lac_1_ip = str(observed_obj)
+                except Exception:
+                    lac_1_ip = None
 
             if not lac_1_ip:
                 lac_1_ip = str(self.router_network_in.network_address + 3)
 
-            self.router_logger.log_message(f"[Router] Attempting to assign IP {lac_1_ip} to LAC 1.")
+            self.router_logger.log_message(f"[Router] Attempting to assign LAN IP {lac_1_ip} to LAC 1.")
             if not self._assign_ip_to_interface(lac_2_info['friendly_name'], lac_1_ip, self.router_netmask_in):
                 self.router_logger.log_message(
-                    f"[Router] CRITICAL ERROR: Failed to assign IP to LAC 1. Bridging/LAG may not work.")
-                return False
+                    "[Router] ⚠️ LAC 1 could not be configured; excluding it from this run."
+                )
+                lac_2_info = None
+                self.interface_lac_full_name = None
+                self.interface_lac_friendly_name = None
 
         if lac_2_info_2:
             lac_2_ip = None
-            for addr in psutil.net_if_addrs().get(lac_2_info_2["friendly_name"], []):
-                if addr.family == socket.AF_INET:
-                    lac_2_ip = addr.address
-                    break
+            observed_lac2_ip, _ = self._current_interface_ipv4(
+                lac_2_info_2["friendly_name"], usable_only=False
+            )
+            if observed_lac2_ip and self._is_usable_unicast_ipv4(observed_lac2_ip):
+                try:
+                    observed_obj = ipaddress.IPv4Address(observed_lac2_ip)
+                    reserved = {
+                        self.router_ip_in,
+                        str(self.router_network_in.network_address + 2),
+                        str(self.router_network_in.network_address + 3),
+                    }
+                    if observed_obj in self.router_network_in and str(observed_obj) not in reserved:
+                        lac_2_ip = str(observed_obj)
+                except Exception:
+                    lac_2_ip = None
 
             if not lac_2_ip:
                 lac_2_ip = str(self.router_network_in.network_address + 4)
 
-            self.router_logger.log_message(f"[Router] Attempting to assign IP {lac_2_ip} to LAC 2.")
+            self.router_logger.log_message(f"[Router] Attempting to assign LAN IP {lac_2_ip} to LAC 2.")
             if not self._assign_ip_to_interface(lac_2_info_2['friendly_name'], lac_2_ip, self.router_netmask_in):
                 self.router_logger.log_message(
-                    f"[Router] CRITICAL ERROR: Failed to assign IP to LAC 2. Bridging/LAG may not work.")
-                return False
+                    "[Router] ⚠️ LAC 2 could not be configured; excluding it from this run."
+                )
+                lac_2_info_2 = None
+                self.interface_lac_2_full_name = None
+                self.interface_lac_2_friendly_name = None
 
         # Step 4: Update internal _interfaces_config with assigned IPs and MACs
         # Store configurations by full Scapy name
@@ -2224,22 +2556,36 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
         state = self._ensure_ingress_state(inbound_iface)
         size = self._estimate_ingress_size(packet)
-        if size > self._ingress_max_bytes:
+        priority = self._ingress_priority_value(packet)
+        single_packet_limit = self._ingress_max_bytes + (
+            self._ingress_priority_reserve_bytes if priority >= 2 else 0
+        )
+        if size > single_packet_limit:
             self._ingress_total_dropped += 1
+            self._ingress_log_sparse(
+                f"oversize:{inbound_iface}",
+                f"[RouterIngress] ❌ Oversize priority={priority} packet rejected on {inbound_iface}; bytes={size}",
+                every=1.0,
+            )
             return False
 
         if isinstance(packet, (bytearray, memoryview)):
             packet = bytes(packet)
 
-        priority = self._ingress_priority_value(packet)
         cv = state["cv"]
+        frame_limit = self._ingress_max_frames + (
+            self._ingress_priority_reserve_frames if priority >= 2 else 0
+        )
+        byte_limit = self._ingress_max_bytes + (
+            self._ingress_priority_reserve_bytes if priority >= 2 else 0
+        )
         dropped_now = 0
         dropped_priorities = collections.Counter()
         with cv:
             q = state["queue"]
             while q and (
-                    len(q) >= self._ingress_max_frames
-                    or int(state["bytes"]) + size > self._ingress_max_bytes
+                    len(q) >= frame_limit
+                    or int(state["bytes"]) + size > byte_limit
             ):
                 dropped = self._drop_ingress_for_pressure(q, priority)
                 if dropped is None:
@@ -2256,10 +2602,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 dropped_priorities[int(old_priority)] += 1
                 dropped_now += 1
 
-            if len(q) >= self._ingress_max_frames or int(state["bytes"]) + size > self._ingress_max_bytes:
+            if len(q) >= frame_limit or int(state["bytes"]) + size > byte_limit:
                 state["dropped"] += 1
                 state["dropped_by_priority"][int(priority)] += 1
                 self._ingress_total_dropped += 1
+                self._ingress_log_sparse(
+                    f"reject:{state['iface']}:{priority}",
+                    f"[RouterIngress] ❌ priority={priority} packet rejected on {state['iface']}; queued={len(q)} bytes={state['bytes']} limits={frame_limit}/{byte_limit}",
+                    every=1.0,
+                )
                 return False
 
             q.append((packet, size, time.monotonic(), int(priority)))
@@ -2396,6 +2747,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self,
             *,
             use_hyperv: bool = False,
+            use_peerinterface: bool = False,
             use_stratum_comm: bool = False,
     ) -> None:
         """Idempotent fallback cleanup used after partial startup/stop failures."""
@@ -2406,6 +2758,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self._safe_stop_component("SocketInterface", self.socket_interface)
         self._safe_stop_component("TransportManager", self.transport_manager)
         self._safe_stop_component("HyperVRouterManager", self.hypervrouter_manager)
+        self._safe_stop_component("PeerInterfaceManager", self.peerinterface_manager)
+        self.peerinterface_manager = None
+        self.peerinterface_enabled = False
 
         if use_hyperv or self.hyperv_enabled:
             self._safe_stop_component("WinDivertManager", self.windivert_manager)
@@ -2797,9 +3152,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         add_iface(denied, self.interface_loopback_full_name)
         add_iface(denied, SocketInterface.IFACE_NAME)
 
-        # The primary router IN interface is always a LAN candidate.
+        selected_ifaces = {
+            str(value).strip()
+            for value in self._dhcp_server_settings.get("selected_ifaces", []) or []
+            if str(value).strip()
+        }
+        # The primary router IN interface remains a LAN candidate; GUI-selected
+        # adapters add exact ownership across physical and virtual interfaces.
         add_iface(allowed, self.interface_in_full_name)
         add_iface(allowed, self.interface_in_friendly_name)
+        for iface in selected_ifaces:
+            add_iface(allowed, iface)
 
         try:
             configured_outbound = (
@@ -2869,6 +3232,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 add_iface(allowed, friendly)
 
         # A deny rule always overrides an allow rule.
+        selected_normalized = {str(iface).casefold() for iface in selected_ifaces}
+        denied = {
+            iface for iface in denied
+            if str(iface).casefold() not in selected_normalized
+        }
         denied_normalized = {
             str(iface).casefold()
             for iface in denied
@@ -2900,8 +3268,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if value:
                 target.add(value)
 
+        selected_ifaces = {
+            str(value).strip()
+            for value in self._wan_dhcp_server_settings.get("selected_ifaces", []) or []
+            if str(value).strip()
+        }
         add_iface(allowed, self.interface_out_full_name)
         add_iface(allowed, self.interface_out_friendly_name)
+        for iface in selected_ifaces:
+            add_iface(allowed, iface)
 
         add_iface(denied, self.interface_in_full_name)
         add_iface(denied, self.interface_in_friendly_name)
@@ -2923,6 +3298,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         except Exception:
             pass
 
+        selected_normalized = {str(iface).casefold() for iface in selected_ifaces}
+        denied = {
+            iface for iface in denied
+            if str(iface).casefold() not in selected_normalized
+        }
         allowed_normalized = {
             str(iface).casefold()
             for iface in allowed
@@ -5105,6 +5485,48 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         f"[Router] ⚠️ Packet parse failure on {iface_short}: {e}"
                     )
                     return
+            # HandshakeManager is an observer, not a consuming router stage.  It must
+            # see TCP bytes before LAN/Gateway/peer managers can return early.  This
+            # includes frames reinjected from PeerInterface and HyperVManager.
+            if (
+                    packet.haslayer(TCP)
+                    and self.handshake_manager is not None
+                    and self._manager_settings.get("enable_handshake", True)
+                    and not bool(getattr(packet, "_router_handshake_observed", False))
+            ):
+                try:
+                    self.handshake_manager.handle_packet(packet, inbound_iface)
+                    setattr(packet, "_router_handshake_observed", True)
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[Handshake] ⚠️ Early observation failed on {inbound_iface}: {exc}"
+                    )
+
+            # Mirror local frames to pure P2P peers without consuming the normal
+            # router pipeline. Remote frames re-enter as PeerInterface and are not
+            # reflected back, preventing a two-node loop.
+            peer_wire_packet = False
+            if packet.haslayer(UDP) and self._peerinterface_nat_ports:
+                try:
+                    peer_wire_packet = bool({
+                        int(packet[UDP].sport), int(packet[UDP].dport)
+                    } & set(self._peerinterface_nat_ports))
+                except Exception:
+                    peer_wire_packet = False
+            if (
+                    self.peerinterface_manager
+                    and inbound_iface != "PeerInterface"
+                    and not peer_wire_packet
+            ):
+                try:
+                    self.peerinterface_manager.handle_packet(packet, inbound_iface)
+                except Exception as exc:
+                    self._ingress_log_sparse(
+                        "peerinterface-mirror",
+                        f"[PeerInterfaceManager] ⚠️ frame mirror failed: {exc}",
+                        every=2.0,
+                    )
+
             upstream_observer = self.upstream_manager or self.uplink_manager
             if upstream_observer:
                 upstream_observer.observe_packet(packet, inbound_iface)
@@ -5334,13 +5756,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         True,
                     )
             ):
-                if self.handshake_manager.handle_packet(packet, inbound_iface):
-                    self.code_output_manager.submit_packet(
-                        packet,
-                        inbound_iface=inbound_iface,
-                        phase="handled",
-                        component="handshake",
-                    )
+                # Usually already observed before any consuming manager. Retain this
+                # fallback for packets injected directly into the later pipeline.
+                if not bool(getattr(packet, "_router_handshake_observed", False)):
+                    if self.handshake_manager.handle_packet(packet, inbound_iface):
+                        self.code_output_manager.submit_packet(
+                            packet,
+                            inbound_iface=inbound_iface,
+                            phase="handled",
+                            component="handshake",
+                        )
+                    setattr(packet, "_router_handshake_observed", True)
             nat_decision = self.nat_manager.handle_packet(
                 packet,
                 inbound_iface,
@@ -6185,7 +6611,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                       stratum_daemon_url="http://127.0.0.1:18081",
                       stratum_zmq_address="tcp://127.0.0.1:18083",
                       manager_settings=None,
-                      transport_settings=None,):
+                      transport_settings=None,
+                      code_output_settings=None,
+                      dhcp_out_mode="direct",
+                      dhcp_in_mode="direct",
+                      use_peerinterface=False,
+                      peerinterface_settings=None,):
         """Configures interfaces and starts all manager threads."""
         try:
             if self.started:
@@ -6195,6 +6626,16 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self._stop_sniffing_event.clear()
             self._stop_ingress_workers(discard=True)
             self.hyperv_enabled = use_hyperv
+            self.peerinterface_enabled = bool(use_peerinterface)
+            self._peerinterface_settings = dict(peerinterface_settings or {})
+            self._peerinterface_nat_ports = set()
+            self._dhcp_out_mode = str(dhcp_out_mode or "direct").strip().casefold()
+            self._dhcp_in_mode = str(dhcp_in_mode or "direct").strip().casefold()
+            valid_dhcp_modes = {"direct", "managed"}
+            if self._dhcp_out_mode not in valid_dhcp_modes:
+                raise ValueError("dhcp_out_mode must be direct or managed")
+            if self._dhcp_in_mode not in valid_dhcp_modes:
+                raise ValueError("dhcp_in_mode must be direct or managed")
             self._enable_dhcp_server = bool(enable_dhcp_server)
             self._serve_dhcp_on_wan = bool(serve_dhcp_on_wan)
             self._dhcp_server_settings = dict(
@@ -6216,6 +6657,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             requested_manager_settings = dict(
                 manager_settings or {}
             )
+            requested_code_output_settings = dict(code_output_settings or {})
+            self.code_output_manager.configure(**requested_code_output_settings)
             allowed_manager_settings = set(
                 self._manager_settings
             )
@@ -6313,6 +6756,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "https_logging",
                 "https_parse_certificates",
                 "https_parse_quic_crypto",
+                "tls_learning_enabled",
+                "https_init_context",
             }
             unknown_transport_settings = (
                 set(requested_transport_settings)
@@ -6429,7 +6874,16 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             # Normalize every interface record before any forwarding, DNS,
             # DHCP, NAT, or packet-writer manager consumes the shared map.
             self._normalize_all_interface_networks()
-            self._configure_host_preserving_upstream_mode()
+            managed_dhcp_requested = (
+                (bool(use_dhcp_out) and self._dhcp_out_mode == "managed")
+                or (bool(use_dhcp_in) and self._dhcp_in_mode == "managed")
+            )
+            if use_uplink or managed_dhcp_requested:
+                self._configure_host_preserving_upstream_mode()
+            elif use_dhcp_out or use_dhcp_in:
+                self.router_logger.log_message(
+                    "[DHCP][DirectLease] ✅ Direct lease mode active; Windows/TransportDHCP accepts the lease without host-preserving or uplink orchestration."
+                )
             if use_hostbypass:
                 self.host_connectivity_boundary = HostConnectivityBoundaryManager(
                     self.router_logger,
@@ -6505,15 +6959,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     "sync_managers_on_gateway_change": True,
                     "dispatch_gateway_packets_to_managers": True,
                     "auto_configure_router_interfaces": False,
-                    "use_dhcp_out": use_dhcp_out,
-                    "use_dhcp_in": use_dhcp_in,
+                    "use_dhcp_out": bool(use_dhcp_out and self._dhcp_out_mode == "managed"),
+                    "use_dhcp_in": bool(use_dhcp_in and self._dhcp_in_mode == "managed"),
                     "router_ip_out": self.router_ip_out,
                     "router_netmask_out": self.router_netmask_out,
                     "force_wan_to_dhcp_on_start": False,
                     "ensure_host_dns_from_wan": False,
                     "repair_on_failure": True,
                     "pin_gateway_arp": True,
-                    "runtime_set_wan_to_dhcp": bool(use_dhcp_out),
+                    "runtime_set_wan_to_dhcp": bool(use_dhcp_out and self._dhcp_out_mode == "managed"),
                     "disable_netroute_default_sync": True,
                     "disable_netroute_metric_tuning": True,
                 }
@@ -6711,7 +7165,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 self._configure_dhcp_control_plane(
                     reason="lan-manager-start"
                 )
-            if use_uplink or use_dhcp_out:
+            if use_uplink or (use_dhcp_out and self._dhcp_out_mode == "managed"):
                 self.upstream_manager = UpstreamManager(
                     self,
                     gateway_manager=self.gateway_manager,
@@ -6728,7 +7182,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     "disable_netroute_default_sync": True,
                     "disable_netroute_metric_tuning": True,
                     "remove_public_host_routes": True,
-                    "enable_wan_dhcp": bool(use_dhcp_out),
+                    "enable_wan_dhcp": bool(use_dhcp_out and self._dhcp_out_mode == "managed"),
                     "wan_dhcp_interfaces": [self.interface_out_friendly_name] if self.interface_out_friendly_name else [],
                     "wan_dhcp_bootstrap_timeout_sec": 35.0,
                     "wan_dhcp_retry_sec": 30.0,
@@ -6826,33 +7280,42 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         f"[WiFiManager] ⚠️ Router binding refresh failed: {exc}"
                     )
 
-            dhcp_client_ifaces = []
+            managed_dhcp_client_ifaces = []
+            direct_dhcp_client_ifaces = []
             if use_dhcp_out and self.interface_out_full_name:
-                dhcp_client_ifaces.append(
-                    self.interface_out_full_name
+                target = (
+                    managed_dhcp_client_ifaces
+                    if self._dhcp_out_mode == "managed"
+                    else direct_dhcp_client_ifaces
                 )
+                target.append(self.interface_out_full_name)
             if use_dhcp_in and self.interface_in_full_name:
-                dhcp_client_ifaces.append(
-                    self.interface_in_full_name
+                target = (
+                    managed_dhcp_client_ifaces
+                    if self._dhcp_in_mode == "managed"
+                    else direct_dhcp_client_ifaces
                 )
+                target.append(self.interface_in_full_name)
 
             if (
-                    dhcp_client_ifaces
-                    and self.transport_manager.is_protocol_enabled(
-                        "dhcp4"
-                    )
+                    managed_dhcp_client_ifaces
+                    and self.transport_manager.is_protocol_enabled("dhcp4")
             ):
-                self.transport_manager.transport_dhcp.enable_client(
-                    self.sniffer
-                )
-                for dhcp_client_iface in dict.fromkeys(
-                        dhcp_client_ifaces
-                ):
-                    self.transport_manager.transport_dhcp.client_start(
-                        dhcp_client_iface
-                    )
+                # Managed mode retains the active discover/request helper.
+                self.transport_manager.transport_dhcp.enable_client(self.sniffer)
+                for dhcp_client_iface in dict.fromkeys(managed_dhcp_client_ifaces):
+                    self.transport_manager.transport_dhcp.client_start(dhcp_client_iface)
                 self.parallel_python.inject_into(
                     self.transport_manager.transport_dhcp._active
+                )
+
+            if direct_dhcp_client_ifaces:
+                # Direct mode is deliberately passive inside the router. Windows
+                # owns DHCP discover/request/renew and the transport manager only
+                # observes/logs the resulting lease packets.
+                self.router_logger.log_message(
+                    "[DHCP][DirectLease] 👁️ Passive lease observation on "
+                    f"{list(dict.fromkeys(direct_dhcp_client_ifaces))}; no internal DHCP agent started."
                 )
 
             self.isakmp_manager = ISAKMPManager(self.router_logger, self.packet_writer, self.notification_manager, self._interfaces_config)
@@ -6913,6 +7376,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     self._manager_settings[
                         "handshake_log_tls_records"
                     ]
+                )
+                self.transport_manager.bind_handshake_manager(
+                    self.handshake_manager
+                )
+                self.code_output_manager.bind_handshake_manager(
+                    self.handshake_manager
                 )
                 self.handshake_manager.log_tls_application_data = (
                     self._manager_settings[
@@ -7088,8 +7557,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 except Exception as e:
                     self.router_logger.log_message(f"[Ollama] ⚠️ Failed to install bridge: {e}")
 
-            self.code_output_manager.set_verbose(2)
-            self.code_output_manager.register_tls_manager(TLSRecordManager(self.router_logger))
+            # Verbosity and active-probe behavior now come from GUI settings.
+            # TLS learning is bound to the real HandshakeManager above.
 
             self.default_analysis_extras = create_pipeline_extras(
                 logger=self.router_logger,  # <-- Pass your logger instance here
@@ -7170,6 +7639,104 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             else:
                 self.hyperv_enabled = False
 
+            if use_peerinterface:
+                peer_cfg = dict(peerinterface_settings or {})
+                discovery_group = str(peer_cfg.get("discovery_group") or "239.255.78.78").strip()
+                discovery_port = int(peer_cfg.get("discovery_port") or 47781)
+                data_port = int(peer_cfg.get("data_port") or peer_cfg.get("frame_port") or 47782)
+                segment_id = str(peer_cfg.get("segment_id") or "peer-main").strip() or "peer-main"
+                requested_bind = str(peer_cfg.get("bind_ip") or "").strip()
+                bind_candidates = [requested_bind, self.router_ip_out, self.router_ip_in]
+                bind_ip = next((str(ip).strip() for ip in bind_candidates if str(ip or "").strip() not in {"", "0.0.0.0", "127.0.0.1"}), "")
+                if not bind_ip:
+                    for name, addrs in psutil.net_if_addrs().items():
+                        for addr in addrs:
+                            if addr.family == socket.AF_INET:
+                                candidate = str(addr.address or "").strip()
+                                try:
+                                    ip_obj = ipaddress.ip_address(candidate)
+                                except ValueError:
+                                    continue
+                                if not (ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified):
+                                    bind_ip = candidate
+                                    break
+                        if bind_ip:
+                            break
+                if not bind_ip:
+                    raise RuntimeError("PeerInterface requires one usable local IPv4 address")
+
+                self.peerinterface_manager = PeerInterfaceManager(
+                    self.router_logger,
+                    discovery_group=discovery_group,
+                    discovery_port=discovery_port,
+                    data_port=data_port,
+                    heartbeat_sec=float(peer_cfg.get("heartbeat_sec") or 15.0),
+                    peer_timeout_sec=float(peer_cfg.get("peer_timeout_sec") or 45.0),
+                    max_network_queue=int(peer_cfg.get("max_network_queue") or 128),
+                )
+                lan_bind_ips = [ip for ip in (self.router_ip_in, self.router_ip_out) if ip]
+                self.peerinterface_manager.configure(
+                    segment_id=segment_id,
+                    bind_ip=bind_ip,
+                    lan_bind_ips=lan_bind_ips,
+                    auto_detect_local_ips=True,
+                )
+                configure_security = getattr(self.peerinterface_manager, "configure_wire_security", None)
+                if callable(configure_security):
+                    configure_security(
+                        shared_secret=str(peer_cfg.get("shared_secret") or ""),
+                        require_auth=bool(peer_cfg.get("require_auth", False)),
+                    )
+                self.peerinterface_manager.attach_router(self)
+                if self.host_connectivity_boundary:
+                    self.peerinterface_manager.attach_hostboundary_manager(self.host_connectivity_boundary)
+                self.peerinterface_manager.start()
+                self.peerinterface_enabled = True
+                self._peerinterface_nat_ports = {discovery_port, data_port}
+                self._interfaces_config.setdefault("PeerInterface", {
+                    "friendly_name": "PeerInterface",
+                    "full_name": "PeerInterface",
+                    "logical": True,
+                    "virtual": True,
+                    "capture_enabled": False,
+                    "bind_ip": bind_ip,
+                    "segment_id": segment_id,
+                })
+                self._ensure_peerinterface_firewall_rules(sorted(self._peerinterface_nat_ports))
+                self.router_logger.log_message(
+                    f"[PeerInterfaceManager] ✅ Started {segment_id} on {bind_ip}; "
+                    f"discovery=UDP/{discovery_port} frames=UDP/{data_port}."
+                )
+                # Add software-NAT self-service mappings after the manager knows its
+                # actual ports. These mappings are independent from Windows NetNat.
+                if self.nat_manager:
+                    try:
+                        configure_services = getattr(self.nat_manager, "configure_router_self_services", None)
+                        if callable(configure_services):
+                            existing_udp = set(
+                                getattr(self.nat_manager, "_router_self_service_udp_ports", set()) or set()
+                            )
+                            configure_services(
+                                udp_ports=sorted(existing_udp | self._peerinterface_nat_ports),
+                            )
+                        else:
+                            for port in sorted(self._peerinterface_nat_ports):
+                                self.nat_manager.add_port_forward_rule(
+                                    external_port=port,
+                                    internal_ip=self.router_ip_in or bind_ip,
+                                    internal_port=port,
+                                    protocol="udp",
+                                )
+                    except Exception as exc:
+                        self.router_logger.log_message(
+                            f"[PeerInterfaceManager][NAT] ⚠️ Software mapping failed: {exc}"
+                        )
+                if nat_os:
+                    self._install_peerinterface_netnat_mappings(
+                        sorted(self._peerinterface_nat_ports),
+                        internal_ip=self.router_ip_in or bind_ip,
+                    )
+
             self._runtime_network_ready.set()
             if self.hypervrouter_manager:
                 try:
@@ -7180,6 +7747,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     self.router_logger.log_message(
                         f"[HyperVRouterManager] ⚠️ Network-ready notification deferred: {exc}"
                     )
+            if self.peerinterface_manager:
+                try:
+                    notify_ready = getattr(self.peerinterface_manager, "notify_network_ready", None)
+                    if callable(notify_ready):
+                        notify_ready()
+                except Exception as exc:
+                    self.router_logger.log_message(
+                        f"[PeerInterfaceManager] ⚠️ Network-ready notification deferred: {exc}"
+                    )
             if self.socket_interface:
                 self.socket_interface.start()
             self.started = True
@@ -7189,6 +7765,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         except Exception as e:
             self._best_effort_runtime_core_stop(
                 use_hyperv=bool(use_hyperv),
+                use_peerinterface=bool(use_peerinterface),
                 use_stratum_comm=bool(use_stratum_comm),
             )
             self.router_logger.log_message(
@@ -7197,13 +7774,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             )
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os, use_ollama):
+    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os, use_ollama, use_peerinterface=False):
         """Stops all manager threads and cleans up network interfaces."""
         try:
             self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
             self._runtime_network_ready.clear()
             self._stop_sniffing_event.set()
             self._stop_ingress_workers(discard=True)
+            if use_peerinterface or self.peerinterface_enabled or self.peerinterface_manager:
+                self._safe_stop_component("PeerInterfaceManager", self.peerinterface_manager)
+                self.peerinterface_manager = None
+                self.peerinterface_enabled = False
             if use_hyperv:
                 self.hypervrouter_manager.stop()
                 self.windivert_manager.stop()
@@ -7339,6 +7920,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             )
             self._best_effort_runtime_core_stop(
                 use_hyperv=bool(use_hyperv),
+                use_peerinterface=bool(use_peerinterface),
                 use_stratum_comm=bool(use_stratum_comm),
             )
         finally:
@@ -7804,218 +8386,114 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             f"(gateway={gateway_ip or 'unchanged'})"
         )
         return True
-    def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, use_hyperv: bool, router_ip_in: str = None,
-                                      router_netmask_in: str = "255.255.255.0", router_ip_out: str = None,
+    def _configure_interface_settings(self, use_dhcp_out: bool, use_dhcp_in: bool, use_hyperv: bool,
+                                      router_ip_in: str = None,
+                                      router_netmask_in: str = "255.255.255.0",
+                                      router_ip_out: str = None,
                                       router_netmask_out: str = "255.255.255.0") -> bool:
-        """
-        Configures all interfaces defined in self._interfaces_config using PowerShell.
-        Automatically determines gateway and DNS settings. Skips configuration for interfaces
-        based on DHCP flags or if missing essential data.
-
-        Args:
-            use_dhcp_out (bool): True to configure OUT interface via DHCP, False for static.
-            use_dhcp_in (bool): True to configure IN interface via DHCP, False for static.
-            router_ip_in (str, optional): Static IP for the IN interface. Used if use_dhcp_in is False.
-            router_netmask_in (str, optional): Netmask for the IN interface.
-            router_ip_out (str, optional): Static IP for the OUT interface. Used if use_dhcp_out is False.
-            router_netmask_out (str, optional): Netmask for the OUT interface.
-
-        Returns:
-            bool: True if all configurations succeeded, False otherwise.
-        """
+        """Apply GUI static/DHCP settings through the verified IPv4 helpers."""
         all_success = True
-
-        for iface_full_name, config in self._interfaces_config.items():
-            iface_friendly_name = self._get_friendly_name_from_full(iface_full_name)
-            # Skip loopback and other specific internal interfaces if they are not meant for dynamic config
+        for iface_full_name, config in list(self._interfaces_config.items()):
+            if not isinstance(config, dict):
+                continue
+            iface_friendly_name = str(
+                config.get("friendly_name")
+                or self._get_friendly_name_from_full(iface_full_name)
+                or iface_full_name
+            ).strip()
             if self._should_skip_managed_iface_config(iface_full_name, iface_friendly_name):
                 self.router_logger.log_message(
                     f"[Router] ⏭️ Skipping configuration for internal/virtual interface: '{iface_friendly_name}'."
                 )
                 continue
-            ip_address_config = config.get('ip_addr')
-            network_config = self._get_interface_network(
-                iface_full_name,
-                config,
-                persist=True,
+
+            is_out_iface = iface_full_name == self.interface_out_full_name
+            is_in_iface = iface_full_name == self.interface_in_full_name
+            should_use_dhcp = (
+                (is_out_iface and bool(use_dhcp_out))
+                or (is_in_iface and bool(use_dhcp_in))
             )
-
-            is_out_iface = (iface_full_name == self.interface_out_full_name)
-            is_in_iface = (iface_full_name == self.interface_in_full_name)
-
-            # Determine if this specific interface should be configured via DHCP
-            should_use_dhcp_for_this_iface = False
-            if is_out_iface and use_dhcp_out:
-                should_use_dhcp_for_this_iface = True
-            elif is_in_iface and use_dhcp_in:
-                should_use_dhcp_for_this_iface = True
-
-            if should_use_dhcp_for_this_iface:
-                self.router_logger.log_message(f"[Router] ⏭️ Setting '{iface_friendly_name}' to DHCP.")
-                ps_command = f"""
-                  $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
-                  if (-not $iface) {{
-                      Write-Output \"SKIP\"
-                      exit 0
-                  }}
-                  Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Enabled -ErrorAction Stop
-                  Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-                  """
-                result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-                if result.returncode == 0:
-                    self.router_logger.log_message(f"[Router] ✅ Successfully set '{iface_friendly_name}' to DHCP.")
-                else:
-                    self.router_logger.log_message(f"[Router] ❌ Failed to set '{iface_friendly_name}' to DHCP.")
-                    self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
+            if should_use_dhcp:
+                # Native WAN DHCP is not router-owned and therefore is not
+                # scheduled for cleanup. IN DHCP is recorded because the router
+                # explicitly changed that adapter's state.
+                ok = self._set_interface_dhcp(
+                    iface_friendly_name,
+                    reset_dns=True,
+                    trigger_renew=False,
+                    record_change=not is_out_iface,
+                )
+                if not ok:
                     all_success = False
-                continue  # Move to the next interface
+                continue
 
-            # --- For static configuration ---
-            # Determine the correct IP and netmask based on whether it's IN or OUT
-            ip_to_assign = None
-            netmask_to_assign = None
+            network_config = self._get_interface_network(
+                iface_full_name, config, persist=True
+            )
+            ip_to_assign = str(config.get("ip_addr") or "").strip()
+            netmask_to_assign = str(config.get("netmask") or "").strip()
             gateway_to_assign = ""
-            dns_server_to_assign = ""
 
             if is_out_iface:
-                ip_to_assign = router_ip_out if router_ip_out else ip_address_config
-                netmask_to_assign = (
+                ip_to_assign = str(router_ip_out or ip_to_assign).strip()
+                netmask_to_assign = str(
                     router_netmask_out
-                    if router_netmask_out
-                    else str(network_config.netmask)
-                    if network_config is not None
-                    else str(config.get("netmask") or "255.255.255.0")
+                    or (network_config.netmask if network_config is not None else netmask_to_assign)
+                    or "255.255.255.0"
                 )
-                gateway_to_assign = self.router_gateway_out_ip  # Use the discovered/configured gateway for OUT
-
-                # FIX:
-                # Do NOT point the desktop/WAN adapter at self.router_ip_in for DNS.
-                # Preserve/use the real upstream DNS already known on this adapter.
-                upstream_dns = self._get_windows_dns_servers(iface_friendly_name)
-                if upstream_dns:
-                    dns_server_to_assign = upstream_dns[0]
-                elif self.router_gateway_out_ip:
-                    # Last-resort fallback: many home routers are also the DNS forwarder
-                    dns_server_to_assign = self.router_gateway_out_ip
-                else:
-                    dns_server_to_assign = ""
-
+                gateway_to_assign = str(self.router_gateway_out_ip or "").strip()
             elif is_in_iface:
-                ip_to_assign = router_ip_in if router_ip_in else ip_address_config
-                netmask_to_assign = (
+                ip_to_assign = str(router_ip_in or ip_to_assign).strip()
+                netmask_to_assign = str(
                     router_netmask_in
-                    if router_netmask_in
-                    else str(network_config.netmask)
-                    if network_config is not None
-                    else str(config.get("netmask") or "255.255.255.0")
+                    or (network_config.netmask if network_config is not None else netmask_to_assign)
+                    or "255.255.255.0"
                 )
-                # IN interface typically doesn't have a gateway configured on itself, it *is* the gateway
-                gateway_to_assign = ""
-                dns_server_to_assign = ip_to_assign  # Router itself is DNS for IN clients
+            else:
+                netmask_to_assign = str(
+                    (network_config.netmask if network_config is not None else netmask_to_assign)
+                    or "255.255.255.0"
+                )
 
-            else:  # For other interfaces not explicitly IN/OUT (e.g. Ethernet 2, LAC)
-                ip_to_assign = ip_address_config
-                netmask_to_assign = str(network_config.netmask) if network_config else "255.255.255.0"
-                gateway_to_assign = ""
-                dns_server_to_assign = ""
-
-            if not ip_to_assign or not netmask_to_assign:
+            if not ip_to_assign:
                 self.router_logger.log_message(
-                    f"[Router] ⚠️ Skipping '{iface_friendly_name}' — missing IP or network for static config.")
+                    f"[Router] ⚠️ Skipping '{iface_friendly_name}' — no static IPv4 address is available."
+                )
                 all_success = False
                 continue
 
-            try:
-                # Convert netmask string to prefix length
-                prefix_len = ipaddress.IPv4Network(f"0.0.0.0/{netmask_to_assign}", strict=False).prefixlen
-            except ValueError:
-                self.router_logger.log_message(
-                    f"[Router] ❌ Invalid netmask '{netmask_to_assign}' for '{iface_friendly_name}'. Skipping static config.")
+            if not self._assign_ip_to_interface(
+                    iface_friendly_name,
+                    ip_to_assign,
+                    netmask_to_assign,
+                    gateway_to_assign,
+            ):
                 all_success = False
                 continue
 
-            self.router_logger.log_message(
-                f"[Router] 🛠️ Configuring '{iface_friendly_name}' → IP: {ip_to_assign}/{prefix_len}, "
-                f"Gateway: {gateway_to_assign or 'None'}, DNS: {dns_server_to_assign or 'None'}"
-            )
+            # DNS is intentionally configured after address verification.
+            dns_servers = []
+            if is_out_iface:
+                dns_servers = self._get_windows_dns_servers(iface_friendly_name)
+                if not dns_servers and gateway_to_assign:
+                    dns_servers = [gateway_to_assign]
+            elif is_in_iface and ip_to_assign:
+                dns_servers = [ip_to_assign]
 
-            try:
-                # The core change is here: check if gateway_to_assign is not empty before attempting to add a route
-                ps_command = f"""
-                  $iface = Get-NetAdapter -Name \"{iface_friendly_name}\" -ErrorAction SilentlyContinue
-                  if (-not $iface) {{
-                      Write-Output \"SKIP\"
-                      exit 0
-                  }}
-
-                  # Ensure DHCP is disabled before static configuration
-                  Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
-                  Start-Sleep -Milliseconds 500
-
-                  # --- FIX: Wait for DHCP state to be 'Disabled' ---
-                  $tries = 0
-                  do {{
-                      $state = (Get-NetIPInterface -InterfaceIndex $iface.IfIndex).Dhcp
-                      if ($state -eq "Enabled") {{
-                          # Optionally re-attempt disabling if it's still enabled
-                          Set-NetIPInterface -InterfaceIndex $iface.IfIndex -Dhcp Disabled -ErrorAction SilentlyContinue
-                      }}
-                      Start-Sleep -Milliseconds 200
-                      $tries++
-                  }} while ($state -ne "Disabled" -and $tries -lt 10) # Max 10 tries = 2 seconds
-
-                  if ($state -ne "Disabled") {{
-                      Write-Error "Failed to disable DHCP on interface '{iface_friendly_name}' after multiple attempts. Current state: $state"
-                      exit 1 # Exit PowerShell script with error
-                  }}
-                  # --- END FIX ---
-
-                  # Remove all existing IPv4 addresses
-                  Get-NetIPAddress -InterfaceIndex $iface.IfIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-                  Start-Sleep -Milliseconds 500
-
-                  # Assign static IP
-                  New-NetIPAddress -InterfaceIndex $iface.IfIndex -IPAddress \"{ip_to_assign}\" -PrefixLength {prefix_len} -ErrorAction Stop
-
-                  # Handle default gateway
-                  # --- FIX: New conditional block to handle cases where there is no gateway ---
-                  if (\"{gateway_to_assign}\") {{
-                      # Remove existing default route for this interface if it exists
-                      Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                      Start-Sleep -Milliseconds 500
-                      # Add the new default route
-                      New-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix 0.0.0.0/0 -NextHop \"{gateway_to_assign}\" -ErrorAction Stop
-                  }} else {{
-                      # Ensure no default route exists if none is specified
-                      Get-NetRoute -InterfaceIndex $iface.IfIndex -DestinationPrefix \"0.0.0.0/0\" -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                  }}
-                  # --- END FIX ---
-
-                  # Set DNS server
-                  if (\"{dns_server_to_assign}\") {{
-                      Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ServerAddresses \"{dns_server_to_assign}\" -ErrorAction Stop
-                  }} else {{
-                      # Clear DNS if no server is specified
-                      Set-DnsClientServerAddress -InterfaceIndex $iface.IfIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-                  }}
-                  """
-
-                result = subprocess.run(["powershell.exe", "-Command", ps_command], capture_output=True, text=True,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-
-                if result.returncode == 0:
-                    self.router_logger.log_message(f"[Router] ✅ Successfully configured '{iface_friendly_name}'.")
-                else:
-                    self.router_logger.log_message(f"[Router] ❌ Failed to configure '{iface_friendly_name}'.")
-                    self.router_logger.log_message(
-                        f"[Router] PowerShell STDOUT: {result.stdout.strip()}")  # Log stdout too
-                    self.router_logger.log_message(f"[Router] PowerShell STDERR: {result.stderr.strip()}")
+            if dns_servers:
+                ps_alias = self._powershell_literal(iface_friendly_name)
+                ps_dns = ",".join(self._powershell_literal(x) for x in dns_servers[:4])
+                dns_script = f"""
+$ErrorActionPreference = 'Stop'
+$adapter = Get-NetAdapter -Name {ps_alias} -IncludeHidden -ErrorAction Stop |
+    Sort-Object ifIndex | Select-Object -First 1
+Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @({ps_dns}) -ErrorAction Stop
+Write-Output ('DNS updated on ' + $adapter.Name)
+"""
+                if not self._run_network_powershell(
+                        dns_script, f"set DNS on {iface_friendly_name}"
+                ):
                     all_success = False
-
-            except Exception as e:
-                self.router_logger.log_message(f"[Router] ❌ Exception configuring '{iface_friendly_name}': {e}")
-                all_success = False
 
         return all_success
 
@@ -8131,9 +8609,104 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                                     creationflags=subprocess.CREATE_NO_WINDOW)
 
             self.router_logger.log_message(f"[NAT Setup] ✅ NAT '{nat_name}' successfully bound to {lan_network_cidr}")
+            if self._peerinterface_nat_ports:
+                self._install_peerinterface_netnat_mappings(
+                    sorted(self._peerinterface_nat_ports),
+                    internal_ip=self.router_ip_in,
+                )
 
         except subprocess.CalledProcessError as e:
             self.router_logger.log_message(f"[NAT Setup] ❌ Kernel Error: {e.stderr.strip()}")
+
+    def _ensure_peerinterface_firewall_rules(self, ports) -> None:
+        """Allow the configured PeerInterface UDP listeners through Windows Firewall."""
+        if platform.system() != "Windows":
+            return
+        for raw_port in ports or ():
+            try:
+                port = int(raw_port)
+                if not 1 <= port <= 65535:
+                    continue
+                name = f"PythonRouter-Allow-PeerInterface-UDP-{port}"
+                script = f"""
+                $ErrorActionPreference = 'Stop'
+                Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue |
+                    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+                New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Allow `
+                    -Protocol UDP -LocalPort {port} -Profile Any
+                """
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if result.returncode == 0:
+                    self.router_logger.log_message(
+                        f"[PeerInterfaceManager][Firewall] ✅ Allowed inbound UDP/{port}."
+                    )
+                else:
+                    detail = (result.stderr or result.stdout or "unknown PowerShell failure").strip()
+                    self.router_logger.log_message(
+                        f"[PeerInterfaceManager][Firewall] ⚠️ Could not allow UDP/{port}: {detail}"
+                    )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[PeerInterfaceManager][Firewall] ⚠️ UDP/{raw_port} rule failed: {exc}"
+                )
+
+    def _install_peerinterface_netnat_mappings(self, ports, *, internal_ip: str) -> None:
+        """Install explicit Windows NetNat UDP mappings for PeerInterface ports.
+
+        NetNat translations are best-effort: LAN peer discovery continues even if
+        Windows rejects a public static mapping (for example, when the upstream
+        gateway owns NAT). Existing mappings owned by this NAT name are replaced.
+        """
+        if platform.system() != "Windows":
+            return
+        target = str(internal_ip or "").strip()
+        try:
+            target_obj = ipaddress.ip_address(target)
+            if target_obj.version != 4 or target_obj.is_unspecified:
+                raise ValueError(target)
+        except ValueError:
+            self.router_logger.log_message(
+                f"[PeerInterfaceManager][NAT] ⚠️ Invalid internal IPv4 for NetNat mappings: {target!r}"
+            )
+            return
+        for raw_port in ports or ():
+            try:
+                port = int(raw_port)
+                if not 1 <= port <= 65535:
+                    raise ValueError(port)
+                script = f"""
+                $ErrorActionPreference = 'Stop'
+                $old = Get-NetNatStaticMapping -NatName '{self.nat_instance_name}' -ErrorAction SilentlyContinue |
+                    Where-Object {{ $_.Protocol -eq 'UDP' -and $_.ExternalPort -eq {port} }}
+                if ($old) {{ $old | Remove-NetNatStaticMapping -Confirm:$false -ErrorAction SilentlyContinue }}
+                Add-NetNatStaticMapping -NatName '{self.nat_instance_name}' -Protocol UDP `
+                    -ExternalIPAddress '0.0.0.0' -ExternalPort {port} `
+                    -InternalIPAddress '{target}' -InternalPort {port}
+                """
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if result.returncode == 0:
+                    self.router_logger.log_message(
+                        f"[PeerInterfaceManager][NAT] ✅ NetNat UDP/{port} -> {target}:{port}"
+                    )
+                else:
+                    detail = (result.stderr or result.stdout or "unknown PowerShell failure").strip()
+                    self.router_logger.log_message(
+                        f"[PeerInterfaceManager][NAT] ⚠️ NetNat UDP/{port} mapping unavailable: {detail}"
+                    )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[PeerInterfaceManager][NAT] ⚠️ UDP/{raw_port} mapping failed: {exc}"
+                )
 
     def _disable_nat_forwarding(self):
         """
@@ -8376,49 +8949,49 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         )
         return True
     def cleanup_all_network_changes(self):
-        """
-        Cleans up all network changes made by the router, reverting IPs and DNS
-        to DHCP for the interfaces it managed.
-        Note: Loopback interface configuration is typically OS-managed and
-        does not need DHCP reset.
-        """
+        """Restore only IPv4 adapters modified by this router run."""
         self.router_logger.log_message("\n--- Cleaning up all network changes made by Python Router ---")
         self._remove_firewall_rules()
-        if self.interface_in_friendly_name and self.router_ip_in:
-            self.router_logger.log_message(
-                f"[Router] Cleaning up IN interface '{self.interface_in_friendly_name}'...")
-            self._cleanup_interface_ip(self.interface_in_friendly_name)
-        else:
-            self.router_logger.log_message(
-                "[Router] No IN interface IP to clean up (not assigned or auto-config failed).")
 
-        if self.interface_out_friendly_name and self.router_ip_out:
+        changed = dict(self._router_changed_ipv4_aliases)
+        self._router_changed_ipv4_aliases.clear()
+        if not changed:
             self.router_logger.log_message(
-                f"[Router] Cleaning up OUT interface '{self.interface_out_friendly_name}'...")
-            self._cleanup_interface_ip(self.interface_out_friendly_name)
-        else:
+                "[Router] No router-owned IPv4 changes require cleanup."
+            )
+        for alias_key, previous_mode in changed.items():
+            alias = None
+            for candidate in psutil.net_if_addrs().keys():
+                if str(candidate).strip().casefold() == alias_key:
+                    alias = str(candidate)
+                    break
+            alias = alias or alias_key
             self.router_logger.log_message(
-                "[Router] No OUT interface IP to clean up (not assigned or auto-config failed).")
+                f"[Router] Cleaning up router-owned IPv4 state on '{alias}' (was {previous_mode})..."
+            )
+            self._cleanup_interface_ip(alias)
 
-        # No cleanup for loopback needed as it's typically managed by OS and static.
         self.router_logger.log_message("--- Network cleanup complete. ---")
 
     def _cleanup_interface_ip(self, iface_friendly_name: str):
-        """
-        Resets the IP configuration of an interface to DHCP.
-        """
+        """Return a router-modified interface to native DHCP."""
         self.router_logger.log_message(
             f"[Router] Cleaning up IP for '{iface_friendly_name}' (setting to DHCP)...")
-
-        netsh_args = ["set", "address", f'name={iface_friendly_name}', "source=dhcp"]
-
-        if self._execute_netsh(netsh_args):
-            self.router_logger.log_message(f"[Router] Successfully set '{iface_friendly_name}' to DHCP.")
-            return True
-        else:
+        if self._set_interface_dhcp(
+                iface_friendly_name,
+                reset_dns=True,
+                trigger_renew=False,
+                record_change=False,
+        ):
             self.router_logger.log_message(
-                f"[Router] WARNING: Failed to set '{iface_friendly_name}' to DHCP. Manual reset may be required.")
-            return False
+                f"[Router] Successfully set '{iface_friendly_name}' to DHCP."
+            )
+            return True
+        self.router_logger.log_message(
+            f"[Router] WARNING: Failed to set '{iface_friendly_name}' to DHCP. "
+            "The detailed PowerShell/netsh error is shown above."
+        )
+        return False
 
     def _get_all_local_ips(self) -> set[str]:
         """

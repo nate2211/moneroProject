@@ -31,7 +31,7 @@ from p2pool_gui import (
 )
 from p2pool_helper import p2pool_helper
 from p2pool_managers import PythonRouterManager
-from server.p2pool_managers import PacketManager
+from p2pool_managers import PacketManager
 
 _non_qt_background_threads: list[threading.Thread] = []
 _flask_thread: Optional[threading.Thread] = None

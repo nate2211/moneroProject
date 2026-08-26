@@ -157,6 +157,15 @@ class RouterLogger(QObject):
     def _line_size(text: str) -> int:
         return len(text.encode("utf-8", errors="replace")) + 1
 
+    @staticmethod
+    def _is_important(text: str) -> bool:
+        lowered = str(text or "").casefold()
+        return any(token in lowered for token in (
+            "error", "exception", "failed", "crash", "reject", "drop",
+            "dhcp", "lease", "tls", "handshake", "alert", "firewall",
+            "route", "gateway", "hyperv", "packet", "warning", "⚠", "❌",
+        ))
+
     def log_message(self, msg):
         if self._stop_event.is_set():
             return
@@ -169,16 +178,29 @@ class RouterLogger(QObject):
         if len(text) > 12000:
             text = text[:12000] + " ... [truncated]"
         size = self._line_size(text)
+        important = self._is_important(text)
 
         with self._condition:
             while self._queue and (
                 len(self._queue) >= self._max_queue_lines
                 or self._queue_bytes + size > self._max_queue_bytes
             ):
-                old = self._queue.popleft()
-                self._queue_bytes = max(0, self._queue_bytes - self._line_size(old))
+                # Preserve important control/security/lease lines. Prefer the
+                # oldest ordinary line; only evict an important line when every
+                # queued line is important and the hard memory cap is reached.
+                drop_index = 0
+                for index, queued in enumerate(self._queue):
+                    queued_text = queued[0] if isinstance(queued, tuple) else queued
+                    queued_important = queued[1] if isinstance(queued, tuple) else self._is_important(queued_text)
+                    if not queued_important:
+                        drop_index = index
+                        break
+                old = self._queue[drop_index]
+                del self._queue[drop_index]
+                old_text = old[0] if isinstance(old, tuple) else old
+                self._queue_bytes = max(0, self._queue_bytes - self._line_size(old_text))
                 self._dropped += 1
-            self._queue.append(text)
+            self._queue.append((text, important))
             self._queue_bytes += size
             self._condition.notify()
 
@@ -197,7 +219,8 @@ class RouterLogger(QObject):
                 if len(self._queue) > (self._max_queue_lines // 2):
                     limit = min(240, self._batch_size * 3)
                 for _ in range(min(limit, len(self._queue))):
-                    line = self._queue.popleft()
+                    queued = self._queue.popleft()
+                    line = queued[0] if isinstance(queued, tuple) else queued
                     self._queue_bytes = max(
                         0,
                         self._queue_bytes - self._line_size(line),
@@ -416,6 +439,9 @@ class P2PoolGUI(QMainWindow):
 
         self.router_tab.start_router_button.clicked.connect(self.start_router)
         self.router_tab.stop_router_button.clicked.connect(self.stop_router)
+        self.router_tab.codeoutput_probe_requested.connect(
+            self.run_codeoutput_probe
+        )
         self.router_start_completed.connect(self._on_router_start_completed)
         self.router_stop_completed.connect(self._on_router_stop_completed)
 
@@ -689,6 +715,23 @@ class P2PoolGUI(QMainWindow):
                     f"{router_address}."
                 )
 
+    @pyqtSlot(dict)
+    def run_codeoutput_probe(self, request: dict):
+        manager = getattr(self.helper, "router_manager", None)
+        code_output = getattr(manager, "code_output_manager", None) if manager else None
+        if code_output is None:
+            self.router_logger.log_message("[CodeOutput][GUI] ❌ Manager is unavailable.")
+            return
+        try:
+            request_id = code_output.submit_probe(**dict(request or {}))
+            self.router_logger.log_message(
+                f"[CodeOutput][GUI] ✅ Probe submitted id={request_id}."
+            )
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[CodeOutput][GUI] ❌ Probe could not be submitted: {exc}"
+            )
+
     def start_router(self):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
 
@@ -708,8 +751,22 @@ class P2PoolGUI(QMainWindow):
 
             use_dhcp_out = tab.dhcp_out_checkbox.isChecked()
             use_dhcp_in = tab.dhcp_in_checkbox.isChecked()
+            dhcp_out_mode = (
+                "direct" if tab.dhcp_out_mode_dropdown.currentText() == "Direct Lease Only" else "managed"
+            )
+            dhcp_in_mode = (
+                "direct" if tab.dhcp_in_mode_dropdown.currentText() == "Direct Lease Only" else "managed"
+            )
             use_static = tab.use_static_checkbox.isChecked()
             use_hyperv = tab.use_hyperv_checkbox.isChecked()
+            use_peerinterface = tab.use_peerinterface_checkbox.isChecked()
+            peerinterface_segment = tab.peerinterface_segment_input.text().strip()
+            peerinterface_bind_ip = tab.peerinterface_bind_ip_input.text().strip()
+            peerinterface_discovery_group = tab.peerinterface_discovery_group_input.text().strip()
+            peerinterface_discovery_port = int(tab.peerinterface_discovery_port_input.value())
+            peerinterface_data_port = int(tab.peerinterface_data_port_input.value())
+            peerinterface_shared_secret = tab.peerinterface_shared_secret_input.text()
+            peerinterface_require_auth = tab.peerinterface_require_auth_checkbox.isChecked()
             use_netroute = tab.use_netroute_checkbox.isChecked()
             router_ip_out = tab.router_ip_out_input.text().strip()
             netmask_out = tab.router_netmask_out_input.text().strip()
@@ -987,6 +1044,7 @@ class P2PoolGUI(QMainWindow):
                     "additional_ifaces": self._csv_setting(
                         tab.dhcp_additional_ifaces_input.text()
                     ),
+                    "selected_ifaces": tab.selected_lan_dhcp_interfaces(),
                 }
 
                 profile_text = tab.dhcp_interface_profiles_input.toPlainText().strip()
@@ -1103,6 +1161,7 @@ class P2PoolGUI(QMainWindow):
                         else "log"
                     ),
                     "dhcp_relay_target_ip": wan_relay_target,
+                    "selected_ifaces": tab.selected_wan_dhcp_interfaces(),
                 }
 
                 self.router_logger.log_message(
@@ -1469,6 +1528,12 @@ class P2PoolGUI(QMainWindow):
                 "https_parse_quic_crypto": (
                     tab.transport_https_quic_crypto_checkbox.isChecked()
                 ),
+                "tls_learning_enabled": (
+                    tab.transport_tls_learning_checkbox.isChecked()
+                ),
+                "https_init_context": (
+                    tab.transport_https_init_context_checkbox.isChecked()
+                ),
             }
             if (
                     transport_settings["voip_port_start"]
@@ -1479,11 +1544,72 @@ class P2PoolGUI(QMainWindow):
                     "the end port."
                 )
 
+            # ---------------- CodeOutput ----------------
+            code_output_settings = {
+                "enabled": tab.codeoutput_enabled_checkbox.isChecked(),
+                "verbose": int(tab.codeoutput_verbose_input.value()),
+                "auto_emit": tab.codeoutput_auto_emit_checkbox.isChecked(),
+                "emit_interval": self._float_setting(
+                    tab.codeoutput_emit_interval_input.text(),
+                    "CodeOutput emit interval", minimum=0.5,
+                ),
+                "emit_jitter": self._float_setting(
+                    tab.codeoutput_emit_jitter_input.text(),
+                    "CodeOutput emit jitter", minimum=0.0,
+                ),
+                "min_new_packets": int(tab.codeoutput_min_packets_input.value()),
+                "max_generated_chars": int(tab.codeoutput_max_chars_input.value()),
+                "active_probes": tab.codeoutput_active_probes_checkbox.isChecked(),
+                "allow_public_targets": tab.codeoutput_allow_public_checkbox.isChecked(),
+                "probe_timeout": self._float_setting(
+                    tab.codeoutput_probe_timeout_input.text(),
+                    "CodeOutput probe timeout", minimum=0.25,
+                ),
+                "probe_rate_per_minute": int(tab.codeoutput_probe_rate_input.value()),
+                "probe_max_concurrent": int(tab.codeoutput_probe_concurrency_input.value()),
+                "probe_default_iface": tab.codeoutput_iface_dropdown.currentText().strip(),
+            }
+
             # ---------------- Wi-Fi host ----------------
             use_wifi_host = tab.use_wifi_host_checkbox.isChecked()
             wifi_ssid = tab.wifi_ssid_input.text().strip()
             wifi_password = tab.wifi_password_input.text()
             wifi_settings = {}
+
+            if use_peerinterface:
+                if not peerinterface_segment:
+                    raise ValueError("PeerInterface segment cannot be empty.")
+                try:
+                    discovery_group_obj = ipaddress.IPv4Address(peerinterface_discovery_group)
+                except Exception as exc:
+                    raise ValueError("PeerInterface discovery group must be a valid IPv4 address.") from exc
+                if not discovery_group_obj.is_multicast:
+                    raise ValueError("PeerInterface discovery group must be an IPv4 multicast address.")
+                if peerinterface_bind_ip:
+                    try:
+                        bind_obj = ipaddress.IPv4Address(peerinterface_bind_ip)
+                    except Exception as exc:
+                        raise ValueError("PeerInterface bind IPv4 is invalid.") from exc
+                    if bind_obj.is_loopback or bind_obj.is_multicast or bind_obj.is_unspecified:
+                        raise ValueError("PeerInterface bind IPv4 must be a usable local unicast address.")
+                if peerinterface_discovery_port == peerinterface_data_port:
+                    raise ValueError("PeerInterface discovery and frame/ACK ports must be different.")
+                if peerinterface_require_auth and not peerinterface_shared_secret:
+                    raise ValueError("PeerInterface authentication requires a shared secret.")
+
+            peerinterface_settings = {
+                "segment_id": peerinterface_segment or "peer-main",
+                "bind_ip": peerinterface_bind_ip,
+                "discovery_group": peerinterface_discovery_group or "239.255.78.78",
+                "discovery_port": peerinterface_discovery_port,
+                "data_port": peerinterface_data_port,
+                "shared_secret": peerinterface_shared_secret,
+                "require_auth": peerinterface_require_auth,
+                "auto_detect_local_ips": True,
+                "heartbeat_sec": 15.0,
+                "peer_timeout_sec": 45.0,
+                "max_network_queue": 128,
+            }
 
             if use_wifi_host:
                 if not wifi_ssid:
@@ -1553,10 +1679,14 @@ class P2PoolGUI(QMainWindow):
         start_kwargs = {
             "use_dhcp_out": use_dhcp_out,
             "use_dhcp_in": use_dhcp_in,
+            "dhcp_out_mode": dhcp_out_mode,
+            "dhcp_in_mode": dhcp_in_mode,
             "router_ip_out": router_ip_out,
             "netmask_out": netmask_out,
             "use_static": use_static,
             "use_hyperv": use_hyperv,
+            "use_peerinterface": use_peerinterface,
+            "peerinterface_settings": peerinterface_settings,
             "use_stratum_comm": use_stratum_comm,
             "p2pool_server_ip": p2pool_server_ip,
             "ipc_emit_host": ipc_emit_host,
@@ -1607,6 +1737,7 @@ class P2PoolGUI(QMainWindow):
             "stratum_zmq_address": stratum_zmq_address,
             "manager_settings": manager_settings,
             "transport_settings": transport_settings,
+            "code_output_settings": code_output_settings,
         }
         stop_flags = {
             "use_stratum_comm": use_stratum_comm,
@@ -1614,6 +1745,7 @@ class P2PoolGUI(QMainWindow):
             "use_dhcp_in": use_dhcp_in,
             "use_static": use_static,
             "use_hyperv": use_hyperv,
+            "use_peerinterface": use_peerinterface,
             "use_netroute": use_netroute,
             "nat_os": nat_os,
             "use_ollama": use_ollama,
@@ -1724,6 +1856,9 @@ class P2PoolGUI(QMainWindow):
         use_hyperv = active_flags.get(
             "use_hyperv", tab.use_hyperv_checkbox.isChecked()
         )
+        use_peerinterface = active_flags.get(
+            "use_peerinterface", tab.use_peerinterface_checkbox.isChecked()
+        )
         use_netroute = active_flags.get(
             "use_netroute", tab.use_netroute_checkbox.isChecked()
         )
@@ -1738,7 +1873,7 @@ class P2PoolGUI(QMainWindow):
         self.router_logger.log_message(
             f"[GUI] stop_router flags: stratum={use_stratum_comm}, "
             f"dhcp_out={use_dhcp_out}, dhcp_in={use_dhcp_in}, "
-            f"static={use_static}, hyperv={use_hyperv}"
+            f"static={use_static}, hyperv={use_hyperv}, peerinterface={use_peerinterface}"
         )
         manager = self.helper.router_manager
 
@@ -1755,6 +1890,7 @@ class P2PoolGUI(QMainWindow):
                     use_netroute,
                     nat_os,
                     use_ollama,
+                    use_peerinterface,
                 )
                 ok = True
             except Exception as exc:
@@ -1832,6 +1968,7 @@ class P2PoolGUI(QMainWindow):
                         flags.get("use_netroute", False),
                         flags.get("nat_os", False),
                         flags.get("use_ollama", False),
+                        flags.get("use_peerinterface", False),
                     )
                 except Exception as exc:
                     self.router_logger.log_message(

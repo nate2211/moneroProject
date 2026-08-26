@@ -10,11 +10,12 @@ import time
 from urllib.parse import urljoin, urlparse, quote_plus, parse_qs
 from collections import defaultdict, deque
 import requests
+import psutil
 from PyQt5.QtGui import QTextCursor, QIcon, QPixmap
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
     QVBoxLayout, QHBoxLayout, QTextEdit, QListWidget, QCheckBox, QTreeWidgetItem, QTreeWidget, QTabWidget, QHeaderView, \
     QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem, QSpinBox, \
-    QSplitter
+    QSplitter, QAbstractItemView
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer, Qt
 from pygments.formatters.html import HtmlFormatter
 
@@ -1724,6 +1725,7 @@ class WiresharkTab(QWidget):
 
 
 class RouterTab(QWidget):
+    codeoutput_probe_requested = pyqtSignal(dict)
     _PREFIX_RE = re.compile(r"\[([^\[\]]{1,64})\]")
 
     def __init__(self, logger, parent=None):
@@ -1881,6 +1883,35 @@ class RouterTab(QWidget):
 
         self.dhcp_in_checkbox = QCheckBox("DHCP IN")
         self.dhcp_in_checkbox.setChecked(False)
+
+        self.dhcp_out_mode_dropdown = QComboBox()
+        self.dhcp_out_mode_dropdown.addItems([
+            "Direct Lease Only", "Managed / Repair"
+        ])
+        self.dhcp_out_mode_dropdown.setToolTip(
+            "Direct Lease Only accepts the adapter DHCP lease without starting "
+            "host-preservation, uplink repair, or extra interprocess orchestration."
+        )
+        self.dhcp_in_mode_dropdown = QComboBox()
+        self.dhcp_in_mode_dropdown.addItems([
+            "Direct Lease Only", "Managed / Repair"
+        ])
+        self.dhcp_in_mode_dropdown.setToolTip(
+            "Direct Lease Only accepts the LAN-side adapter lease directly."
+        )
+
+        self.dhcp_interface_refresh_button = QPushButton("Refresh Interfaces")
+        self.dhcp_lan_interfaces_list = QListWidget()
+        self.dhcp_wan_interfaces_list = QListWidget()
+        for interface_list in (
+            self.dhcp_lan_interfaces_list,
+            self.dhcp_wan_interfaces_list,
+        ):
+            interface_list.setSelectionMode(QAbstractItemView.MultiSelection)
+            interface_list.setMinimumHeight(100)
+            interface_list.setToolTip(
+                "Select every physical or virtual adapter that belongs to this DHCP role."
+            )
 
         self.dhcp_server_checkbox = QCheckBox("Run LAN DHCP Server")
         self.dhcp_server_checkbox.setChecked(True)
@@ -2122,6 +2153,57 @@ class RouterTab(QWidget):
             "Parse QUIC Crypto"
         )
         self.transport_https_quic_crypto_checkbox.setChecked(True)
+        self.transport_tls_learning_checkbox = QCheckBox(
+            "Feed Handshake/TLS Learning into Transport"
+        )
+        self.transport_tls_learning_checkbox.setChecked(True)
+        self.transport_https_init_context_checkbox = QCheckBox(
+            "Use TLS Context in Initial HTTPS Logs"
+        )
+        self.transport_https_init_context_checkbox.setChecked(True)
+
+        self.codeoutput_enabled_checkbox = QCheckBox("Enable CodeOutput Manager")
+        self.codeoutput_enabled_checkbox.setChecked(True)
+        self.codeoutput_auto_emit_checkbox = QCheckBox("Automatic Code Generation")
+        self.codeoutput_auto_emit_checkbox.setChecked(True)
+        self.codeoutput_active_probes_checkbox = QCheckBox(
+            "Enable Active Packet/Socket Probes"
+        )
+        self.codeoutput_active_probes_checkbox.setChecked(False)
+        self.codeoutput_allow_public_checkbox = QCheckBox(
+            "Allow Public Internet Targets"
+        )
+        self.codeoutput_allow_public_checkbox.setChecked(False)
+        self.codeoutput_verbose_input = QSpinBox()
+        self.codeoutput_verbose_input.setRange(0, 5)
+        self.codeoutput_verbose_input.setValue(2)
+        self.codeoutput_emit_interval_input = QLineEdit("10.0")
+        self.codeoutput_emit_jitter_input = QLineEdit("2.0")
+        self.codeoutput_min_packets_input = QSpinBox()
+        self.codeoutput_min_packets_input.setRange(1, 100000)
+        self.codeoutput_min_packets_input.setValue(4)
+        self.codeoutput_max_chars_input = QSpinBox()
+        self.codeoutput_max_chars_input.setRange(4096, 2000000)
+        self.codeoutput_max_chars_input.setValue(250000)
+        self.codeoutput_probe_timeout_input = QLineEdit("3.0")
+        self.codeoutput_probe_rate_input = QSpinBox()
+        self.codeoutput_probe_rate_input.setRange(1, 600)
+        self.codeoutput_probe_rate_input.setValue(30)
+        self.codeoutput_probe_concurrency_input = QSpinBox()
+        self.codeoutput_probe_concurrency_input.setRange(1, 16)
+        self.codeoutput_probe_concurrency_input.setValue(2)
+        self.codeoutput_target_input = QLineEdit()
+        self.codeoutput_target_input.setPlaceholderText("IP address or hostname")
+        self.codeoutput_protocol_dropdown = QComboBox()
+        self.codeoutput_protocol_dropdown.addItems(["TCP", "UDP", "ICMP"])
+        self.codeoutput_port_input = QSpinBox()
+        self.codeoutput_port_input.setRange(0, 65535)
+        self.codeoutput_port_input.setValue(443)
+        self.codeoutput_payload_input = QLineEdit()
+        self.codeoutput_payload_input.setPlaceholderText("Optional payload text")
+        self.codeoutput_iface_dropdown = QComboBox()
+        self.codeoutput_iface_dropdown.setEditable(True)
+        self.codeoutput_probe_button = QPushButton("Send CodeOutput Probe")
 
         self.core_firewall_checkbox = QCheckBox("Firewall Manager")
         self.core_firewall_checkbox.setChecked(True)
@@ -2199,6 +2281,26 @@ class RouterTab(QWidget):
         self.use_hostbypass_checkbox.setChecked(False)
         self.use_hyperv_checkbox = QCheckBox("Use C++ HyperV")
         self.use_hyperv_checkbox.setChecked(False)
+        self.use_peerinterface_checkbox = QCheckBox("Use PeerInterface P2P")
+        self.use_peerinterface_checkbox.setChecked(False)
+        self.peerinterface_segment_input = QLineEdit()
+        self.peerinterface_segment_input.setText("peer-main")
+        self.peerinterface_segment_input.setPlaceholderText("Shared peer segment name")
+        self.peerinterface_bind_ip_input = QLineEdit()
+        self.peerinterface_bind_ip_input.setPlaceholderText("Blank = auto-select active LAN/WAN IPv4")
+        self.peerinterface_discovery_group_input = QLineEdit()
+        self.peerinterface_discovery_group_input.setText("239.255.78.78")
+        self.peerinterface_discovery_port_input = QSpinBox()
+        self.peerinterface_discovery_port_input.setRange(1024, 65535)
+        self.peerinterface_discovery_port_input.setValue(47781)
+        self.peerinterface_data_port_input = QSpinBox()
+        self.peerinterface_data_port_input.setRange(1024, 65535)
+        self.peerinterface_data_port_input.setValue(47782)
+        self.peerinterface_shared_secret_input = QLineEdit()
+        self.peerinterface_shared_secret_input.setEchoMode(QLineEdit.Password)
+        self.peerinterface_shared_secret_input.setPlaceholderText("Optional shared authentication secret")
+        self.peerinterface_require_auth_checkbox = QCheckBox("Require authenticated peer frames")
+        self.peerinterface_require_auth_checkbox.setChecked(False)
         self.use_gateway_checkbox = QCheckBox("Use Gateway Manager")
         self.use_gateway_checkbox.setChecked(False)
         self.gateway_health_interval_input = QLineEdit()
@@ -2370,6 +2472,7 @@ class RouterTab(QWidget):
 
         self._load_presets("Full")
         self._autofill_router_wan_ip(log_result=False)
+        self.refresh_network_interfaces()
         self._sync_enable_states()
 
     def _configure_layout(self):
@@ -2423,12 +2526,33 @@ class RouterTab(QWidget):
         routing_grid.addWidget(self.dhcp_in_checkbox, 0, 1)
         routing_grid.addWidget(self.use_static_checkbox, 0, 2)
         routing_grid.addWidget(self.use_hyperv_checkbox, 0, 3)
+        routing_grid.addWidget(self.use_peerinterface_checkbox, 0, 4)
 
         routing_grid.addWidget(self.use_netroute_checkbox, 1, 0)
         routing_grid.addWidget(self.use_hostbypass_checkbox, 1, 1)
         routing_grid.addWidget(self.use_socket, 1, 2)
         routing_grid.addWidget(self.promisc_checkbox, 1, 3)
         routing_grid.addWidget(self.ollama_checkbox, 1, 4)
+
+        peerinterface_content = QWidget()
+        peerinterface_form = QFormLayout(peerinterface_content)
+        peerinterface_form.setContentsMargins(8, 8, 8, 8)
+        peerinterface_form.setHorizontalSpacing(12)
+        peerinterface_form.setVerticalSpacing(8)
+        peerinterface_form.addRow(QLabel("Segment:"), self.peerinterface_segment_input)
+        peerinterface_form.addRow(QLabel("Bind IPv4:"), self.peerinterface_bind_ip_input)
+        peerinterface_form.addRow(QLabel("Discovery group:"), self.peerinterface_discovery_group_input)
+        peerinterface_form.addRow(QLabel("Discovery port:"), self.peerinterface_discovery_port_input)
+        peerinterface_form.addRow(QLabel("Frame/ACK port:"), self.peerinterface_data_port_input)
+        peerinterface_form.addRow(QLabel("Shared secret:"), self.peerinterface_shared_secret_input)
+        peerinterface_form.addRow(self.peerinterface_require_auth_checkbox)
+        peerinterface_help = QLabel(
+            "PeerInterface creates a UDP P2P frame network with discovery, retries, "
+            "deduplication, and ACKs. It does not start or require Hyper-V. When OS NAT is enabled, "
+            "the selected discovery and frame ports are also published through NetNat and Windows Firewall."
+        )
+        peerinterface_help.setWordWrap(True)
+        peerinterface_form.addRow(peerinterface_help)
 
         core_managers_content = QWidget()
         core_managers_grid = QGridLayout(core_managers_content)
@@ -2813,6 +2937,20 @@ class RouterTab(QWidget):
             1,
             2,
         )
+        transport_tuning_grid.addWidget(
+            self.transport_tls_learning_checkbox,
+            12,
+            0,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_https_init_context_checkbox,
+            12,
+            2,
+            1,
+            2,
+        )
 
         transport_protocol_box = QGroupBox(
             "Protocol Managers"
@@ -2831,6 +2969,41 @@ class RouterTab(QWidget):
 
         transport_layout.addWidget(transport_tuning_box)
         transport_layout.addWidget(transport_protocol_box)
+
+        codeoutput_content = QWidget()
+        codeoutput_grid = QGridLayout(codeoutput_content)
+        codeoutput_grid.setContentsMargins(8, 8, 8, 8)
+        codeoutput_grid.setColumnStretch(1, 1)
+        codeoutput_grid.setColumnStretch(3, 1)
+        codeoutput_grid.addWidget(self.codeoutput_enabled_checkbox, 0, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_emit_checkbox, 0, 2, 1, 2)
+        codeoutput_grid.addWidget(QLabel("Verbose:"), 1, 0)
+        codeoutput_grid.addWidget(self.codeoutput_verbose_input, 1, 1)
+        codeoutput_grid.addWidget(QLabel("Max generated chars:"), 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_max_chars_input, 1, 3)
+        codeoutput_grid.addWidget(QLabel("Emit interval:"), 2, 0)
+        codeoutput_grid.addWidget(self.codeoutput_emit_interval_input, 2, 1)
+        codeoutput_grid.addWidget(QLabel("Jitter:"), 2, 2)
+        codeoutput_grid.addWidget(self.codeoutput_emit_jitter_input, 2, 3)
+        codeoutput_grid.addWidget(QLabel("Minimum new packets:"), 3, 0)
+        codeoutput_grid.addWidget(self.codeoutput_min_packets_input, 3, 1)
+        codeoutput_grid.addWidget(self.codeoutput_active_probes_checkbox, 4, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_allow_public_checkbox, 4, 2, 1, 2)
+        codeoutput_grid.addWidget(QLabel("Probe timeout:"), 5, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_timeout_input, 5, 1)
+        codeoutput_grid.addWidget(QLabel("Rate/min:"), 5, 2)
+        codeoutput_grid.addWidget(self.codeoutput_probe_rate_input, 5, 3)
+        codeoutput_grid.addWidget(QLabel("Target:"), 6, 0)
+        codeoutput_grid.addWidget(self.codeoutput_target_input, 6, 1)
+        codeoutput_grid.addWidget(self.codeoutput_protocol_dropdown, 6, 2)
+        codeoutput_grid.addWidget(self.codeoutput_port_input, 6, 3)
+        codeoutput_grid.addWidget(QLabel("Interface/source IP:"), 7, 0)
+        codeoutput_grid.addWidget(self.codeoutput_iface_dropdown, 7, 1)
+        codeoutput_grid.addWidget(QLabel("Payload:"), 7, 2)
+        codeoutput_grid.addWidget(self.codeoutput_payload_input, 7, 3)
+        codeoutput_grid.addWidget(QLabel("Concurrency:"), 8, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 8, 1)
+        codeoutput_grid.addWidget(self.codeoutput_probe_button, 8, 2, 1, 2)
 
         comms_content = QWidget()
         comms_form = QFormLayout(comms_content)
@@ -2886,6 +3059,20 @@ class RouterTab(QWidget):
         dhcp_layout.setContentsMargins(8, 8, 8, 8)
         dhcp_layout.setSpacing(8)
 
+        lease_mode_box = QGroupBox("DHCP Client Lease Modes")
+        lease_mode_grid = QGridLayout(lease_mode_box)
+        lease_mode_grid.addWidget(self.dhcp_out_checkbox, 0, 0)
+        lease_mode_grid.addWidget(QLabel("DHCP OUT mode:"), 0, 1)
+        lease_mode_grid.addWidget(self.dhcp_out_mode_dropdown, 0, 2)
+        lease_mode_grid.addWidget(self.dhcp_in_checkbox, 1, 0)
+        lease_mode_grid.addWidget(QLabel("DHCP IN mode:"), 1, 1)
+        lease_mode_grid.addWidget(self.dhcp_in_mode_dropdown, 1, 2)
+        direct_help = QLabel(
+            "Direct Lease Only accepts the adapter lease and skips host-preserving/uplink orchestration."
+        )
+        direct_help.setWordWrap(True)
+        lease_mode_grid.addWidget(direct_help, 2, 0, 1, 3)
+
         lan_dhcp_box = QGroupBox("LAN DHCP Server")
         lan_dhcp_grid = QGridLayout(lan_dhcp_box)
         lan_dhcp_grid.setColumnStretch(1, 1)
@@ -2934,17 +3121,22 @@ class RouterTab(QWidget):
         interface_dhcp_box = QGroupBox("DHCP Interface Assignment")
         interface_dhcp_grid = QGridLayout(interface_dhcp_box)
         interface_dhcp_grid.setColumnStretch(1, 1)
-        interface_dhcp_grid.addWidget(QLabel("Share LAN scope on:"), 0, 0)
-        interface_dhcp_grid.addWidget(self.dhcp_additional_ifaces_input, 0, 1)
-        interface_dhcp_grid.addWidget(QLabel("Independent scopes (JSON):"), 1, 0)
-        interface_dhcp_grid.addWidget(self.dhcp_interface_profiles_input, 1, 1)
+        interface_dhcp_grid.addWidget(self.dhcp_interface_refresh_button, 0, 0, 1, 2)
+        interface_dhcp_grid.addWidget(QLabel("LAN DHCP interfaces:"), 1, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_lan_interfaces_list, 1, 1)
+        interface_dhcp_grid.addWidget(QLabel("WAN DHCP interfaces:"), 2, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_wan_interfaces_list, 2, 1)
+        interface_dhcp_grid.addWidget(QLabel("Additional LAN aliases:"), 3, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_additional_ifaces_input, 3, 1)
+        interface_dhcp_grid.addWidget(QLabel("Independent scopes (JSON):"), 4, 0)
+        interface_dhcp_grid.addWidget(self.dhcp_interface_profiles_input, 4, 1)
         interface_help = QLabel(
             "Shared aliases reuse the LAN pool. Independent scopes create one DHCP "
             "server per virtual interface. WAN remains denied unless WAN DHCP is "
             "explicitly enabled."
         )
         interface_help.setWordWrap(True)
-        interface_dhcp_grid.addWidget(interface_help, 2, 0, 1, 2)
+        interface_dhcp_grid.addWidget(interface_help, 5, 0, 1, 2)
 
         wan_dhcp_box = QGroupBox("WAN DHCP Server (Advanced)")
         wan_dhcp_grid = QGridLayout(wan_dhcp_box)
@@ -3005,6 +3197,7 @@ class RouterTab(QWidget):
             3,
         )
 
+        dhcp_layout.addWidget(lease_mode_box)
         dhcp_layout.addWidget(lan_dhcp_box)
         dhcp_layout.addWidget(interface_dhcp_box)
         dhcp_layout.addWidget(wan_dhcp_box)
@@ -3201,6 +3394,12 @@ class RouterTab(QWidget):
         )
         settings_layout.addWidget(
             self._make_settings_section(
+                "PeerInterface P2P",
+                peerinterface_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
                 "Core Packet Managers",
                 core_managers_content,
             )
@@ -3209,6 +3408,12 @@ class RouterTab(QWidget):
             self._make_settings_section(
                 "Transport Managers",
                 transport_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "CodeOutput Interface",
+                codeoutput_content,
             )
         )
         settings_layout.addWidget(
@@ -3681,6 +3886,18 @@ class RouterTab(QWidget):
         self.detect_wan_ip_button.clicked.connect(
             lambda: self._autofill_router_wan_ip(True)
         )
+        self.dhcp_interface_refresh_button.clicked.connect(
+            self.refresh_network_interfaces
+        )
+        self.codeoutput_probe_button.clicked.connect(
+            self._emit_codeoutput_probe
+        )
+        self.codeoutput_active_probes_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.codeoutput_enabled_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
         self.add_pane_button.clicked.connect(self._on_add_pane)
         self.remove_pane_button.clicked.connect(self._on_remove_pane)
         self.preset_dropdown.currentTextChanged.connect(self._on_preset_selected)
@@ -3729,12 +3946,66 @@ class RouterTab(QWidget):
         self.use_wifi_host_checkbox.stateChanged.connect(
             self._sync_enable_states
         )
+        self.use_peerinterface_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+
+    def _selected_interface_names(self, widget: QListWidget) -> List[str]:
+        return [item.text() for item in widget.selectedItems() if item.text().strip()]
+
+    def selected_lan_dhcp_interfaces(self) -> List[str]:
+        return self._selected_interface_names(self.dhcp_lan_interfaces_list)
+
+    def selected_wan_dhcp_interfaces(self) -> List[str]:
+        return self._selected_interface_names(self.dhcp_wan_interfaces_list)
+
+    @pyqtSlot()
+    def refresh_network_interfaces(self):
+        previous_lan = set(self.selected_lan_dhcp_interfaces()) if hasattr(self, "dhcp_lan_interfaces_list") else set()
+        previous_wan = set(self.selected_wan_dhcp_interfaces()) if hasattr(self, "dhcp_wan_interfaces_list") else set()
+        names = sorted(psutil.net_if_addrs().keys(), key=str.casefold)
+        for widget in (self.dhcp_lan_interfaces_list, self.dhcp_wan_interfaces_list):
+            widget.clear()
+            widget.addItems(names)
+        self.codeoutput_iface_dropdown.clear()
+        self.codeoutput_iface_dropdown.addItem("")
+        self.codeoutput_iface_dropdown.addItems(names + ["PeerInterface", "HyperVManager"])
+        for index in range(self.dhcp_lan_interfaces_list.count()):
+            item = self.dhcp_lan_interfaces_list.item(index)
+            name = item.text()
+            default_lan = any(token in name.casefold() for token in ("ethernet", "veth", "bridge", "lan"))
+            item.setSelected(name in previous_lan or (not previous_lan and default_lan))
+        for index in range(self.dhcp_wan_interfaces_list.count()):
+            item = self.dhcp_wan_interfaces_list.item(index)
+            name = item.text()
+            default_wan = any(token in name.casefold() for token in ("wi-fi", "wifi", "wireless", "wan"))
+            item.setSelected(name in previous_wan or (not previous_wan and default_wan))
+
+    @pyqtSlot()
+    def _emit_codeoutput_probe(self):
+        protocol = self.codeoutput_protocol_dropdown.currentText().strip().lower()
+        port = int(self.codeoutput_port_input.value())
+        self.codeoutput_probe_requested.emit({
+            "target": self.codeoutput_target_input.text().strip(),
+            "protocol": protocol,
+            "port": None if protocol == "icmp" else port,
+            "payload": self.codeoutput_payload_input.text(),
+            "timeout": float(self.codeoutput_probe_timeout_input.text().strip() or 3.0),
+            "iface": self.codeoutput_iface_dropdown.currentText().strip(),
+            "expect_response": True,
+        })
 
     def _sync_enable_states(self):
         use_static = self.use_static_checkbox.isChecked()
 
         self.dhcp_out_checkbox.setEnabled(not use_static)
         self.dhcp_in_checkbox.setEnabled(not use_static)
+        self.dhcp_out_mode_dropdown.setEnabled(
+            not use_static and self.dhcp_out_checkbox.isChecked()
+        )
+        self.dhcp_in_mode_dropdown.setEnabled(
+            not use_static and self.dhcp_in_checkbox.isChecked()
+        )
 
         self.router_ip_out_input.setEnabled(not self.dhcp_out_checkbox.isChecked())
         self.router_netmask_out_input.setEnabled(
@@ -3766,6 +4037,8 @@ class RouterTab(QWidget):
             self.dhcp_search_domains_input,
             self.dhcp_additional_ifaces_input,
             self.dhcp_interface_profiles_input,
+            self.dhcp_lan_interfaces_list,
+            self.dhcp_interface_refresh_button,
         ):
             widget.setEnabled(use_lan_dhcp)
 
@@ -3782,8 +4055,47 @@ class RouterTab(QWidget):
             self.wan_dhcp_enforce_subnet_checkbox,
             self.wan_dhcp_rogue_policy_dropdown,
             self.wan_dhcp_relay_input,
+            self.dhcp_wan_interfaces_list,
         ):
             widget.setEnabled(use_wan_dhcp)
+
+        codeoutput_enabled = self.codeoutput_enabled_checkbox.isChecked()
+        probe_enabled = codeoutput_enabled and self.codeoutput_active_probes_checkbox.isChecked()
+        for widget in (
+            self.codeoutput_auto_emit_checkbox,
+            self.codeoutput_verbose_input,
+            self.codeoutput_emit_interval_input,
+            self.codeoutput_emit_jitter_input,
+            self.codeoutput_min_packets_input,
+            self.codeoutput_max_chars_input,
+            self.codeoutput_active_probes_checkbox,
+        ):
+            widget.setEnabled(codeoutput_enabled)
+        for widget in (
+            self.codeoutput_allow_public_checkbox,
+            self.codeoutput_probe_timeout_input,
+            self.codeoutput_probe_rate_input,
+            self.codeoutput_probe_concurrency_input,
+            self.codeoutput_target_input,
+            self.codeoutput_protocol_dropdown,
+            self.codeoutput_port_input,
+            self.codeoutput_payload_input,
+            self.codeoutput_iface_dropdown,
+            self.codeoutput_probe_button,
+        ):
+            widget.setEnabled(probe_enabled)
+
+        peerinterface_enabled = self.use_peerinterface_checkbox.isChecked()
+        for widget in (
+            self.peerinterface_segment_input,
+            self.peerinterface_bind_ip_input,
+            self.peerinterface_discovery_group_input,
+            self.peerinterface_discovery_port_input,
+            self.peerinterface_data_port_input,
+            self.peerinterface_shared_secret_input,
+            self.peerinterface_require_auth_checkbox,
+        ):
+            widget.setEnabled(peerinterface_enabled)
 
         for widget in (
             self.gateway_health_interval_input,
@@ -4070,6 +4382,15 @@ class RouterTab(QWidget):
     def _queued_log_size(message: str) -> int:
         return len(message.encode("utf-8", errors="replace")) + 1
 
+    @staticmethod
+    def _important_log_message(message: str) -> bool:
+        lowered = str(message or "").casefold()
+        return any(token in lowered for token in (
+            "error", "exception", "failed", "crash", "reject", "drop",
+            "dhcp", "lease", "tls", "handshake", "alert", "firewall",
+            "route", "gateway", "hyperv", "packet", "warning", "⚠", "❌",
+        ))
+
     @pyqtSlot(str)
     def log_message(self, message: str):
         if self._logging_shutdown:
@@ -4087,15 +4408,25 @@ class RouterTab(QWidget):
             msg = msg[:10000] + " ... [truncated]"
 
         msg_size = self._queued_log_size(msg)
+        important = self._important_log_message(msg)
         dropped_now = 0
         while self._log_queue and (
             len(self._log_queue) >= self._max_log_queue
             or self._log_queue_bytes + msg_size > self._max_log_queue_bytes
         ):
-            old = self._log_queue.popleft()
+            drop_index = 0
+            for index, queued in enumerate(self._log_queue):
+                queued_msg = queued[0] if isinstance(queued, tuple) else queued
+                queued_important = queued[1] if isinstance(queued, tuple) else self._important_log_message(queued_msg)
+                if not queued_important:
+                    drop_index = index
+                    break
+            old = self._log_queue[drop_index]
+            del self._log_queue[drop_index]
+            old_msg = old[0] if isinstance(old, tuple) else old
             self._log_queue_bytes = max(
                 0,
-                self._log_queue_bytes - self._queued_log_size(old),
+                self._log_queue_bytes - self._queued_log_size(old_msg),
             )
             dropped_now += 1
 
@@ -4105,7 +4436,7 @@ class RouterTab(QWidget):
         elif len(self._log_queue) < (self._max_log_queue // 2):
             self._dropping_logs = False
 
-        self._log_queue.append(msg)
+        self._log_queue.append((msg, important))
         self._log_queue_bytes += msg_size
 
     @pyqtSlot()
@@ -4142,7 +4473,8 @@ class RouterTab(QWidget):
                 self._last_drop_notice = now
 
             while self._log_queue and processed < batch_limit:
-                message = self._log_queue.popleft()
+                queued = self._log_queue.popleft()
+                message = queued[0] if isinstance(queued, tuple) else queued
                 self._log_queue_bytes = max(
                     0,
                     self._log_queue_bytes - self._queued_log_size(message),

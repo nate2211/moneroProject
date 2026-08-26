@@ -5329,6 +5329,16 @@ class HandshakeManager:
         10001, 10128, 10132, 14444, 24444,
     }
 
+    # Passive plaintext/TLS Stratum transport hints. Payload signatures are also
+    # accepted on non-standard ports, but a port match alone remains a candidate.
+    STRATUM_TCP_PORT_HINTS = XMR_TCP_PORT_HINTS | {
+        3332, 3334, 3355, 3366, 3377, 3388, 3399,
+        9000, 9998, 10000, 10002, 18080, 18081,
+    }
+    STRATUM_BUFFER_MAX = 1024 * 1024
+    STRATUM_MAX_MESSAGES_PER_PACKET = 64
+    STRATUM_METHOD_PREFIXES = ("mining.", "eth_", "stratum.")
+
     SYN_SENT = "SYN_SENT"
     SYN_ACK = "SYN_ACK_RECEIVED"
     EST = "ESTABLISHED"
@@ -5376,6 +5386,10 @@ class HandshakeManager:
         self.on_flow_established = None
         self.on_flow_closed = None
         self.on_flow_timeout = None
+        # Shared knowledge bus. Transport, CodeOutput and future managers subscribe
+        # here instead of creating disconnected TLSRecordManager instances.
+        self._learning_sinks: List[Callable[[Dict[str, Any]], None]] = []
+        self._learning_seq = 0
 
         # Runtime switches; no constructor signature changes.
         self.log_tcp_lifecycle = True
@@ -5394,7 +5408,8 @@ class HandshakeManager:
         self._log_message(
             "[Handshake] Manager ready "
             "(IPv4/IPv6 TCP reassembly + TLS 1.3 key-aware record processing + "
-            "Microsoft Authenticator + XMR/exchange endpoint classification)."
+            "Microsoft Authenticator + XMR/exchange endpoint classification + "
+            "bounded Stratum JSON-RPC handshake reconstruction)."
         )
 
     def _log_message(self, message: str):
@@ -5405,6 +5420,65 @@ class HandshakeManager:
                 self.logger(message)
         except Exception:
             pass
+
+    def add_learning_sink(self, sink: Callable[[Dict[str, Any]], None]) -> Callable[[], None]:
+        if not callable(sink):
+            raise TypeError("Handshake learning sink must be callable")
+        with self._lock:
+            if sink not in self._learning_sinks:
+                self._learning_sinks.append(sink)
+
+        def detach() -> None:
+            with self._lock:
+                try:
+                    self._learning_sinks.remove(sink)
+                except ValueError:
+                    pass
+        return detach
+
+    def get_transport_context(self, src_ip: str, src_port: int, dst_ip: str, dst_port: int) -> Dict[str, Any]:
+        key = _get_canonical_session_key(str(src_ip), int(src_port), str(dst_ip), int(dst_port))
+        snapshot = self.snapshot_flow(key) or {}
+        snapshot["flow_key"] = key
+        return snapshot
+
+    def _publish_learning(self, event_type: str, *, rec=None, data=None, flow_key=None, reason=None) -> None:
+        try:
+            if flow_key is None and rec is not None:
+                flow_key = _get_canonical_session_key(rec.src, rec.src_port, rec.dst, rec.dst_port)
+            context = self.snapshot_flow(flow_key) if flow_key is not None else None
+            self._learning_seq += 1
+            event = {
+                "seq": self._learning_seq,
+                "event": str(event_type),
+                "timestamp": time.time(),
+                "flow_key": flow_key,
+                "context": context or {},
+                "data": dict(data or {}),
+                "reason": reason,
+            }
+            if rec is not None:
+                event["record"] = {
+                    "content_type": getattr(rec, "content_type", None),
+                    "version": getattr(rec, "version", None),
+                    "length": getattr(rec, "length", None),
+                    "direction": getattr(rec, "direction", None),
+                    "src": getattr(rec, "src", None),
+                    "src_port": getattr(rec, "src_port", None),
+                    "dst": getattr(rec, "dst", None),
+                    "dst_port": getattr(rec, "dst_port", None),
+                    "decrypted": bool(getattr(rec, "decrypted", False)),
+                    "encrypted": bool(getattr(rec, "encrypted", False)),
+                }
+            with self._lock:
+                sinks = tuple(self._learning_sinks)
+            for sink in sinks:
+                try:
+                    sink(event)
+                except Exception as exc:
+                    self._log_message(f"[Handshake][Learning] ⚠️ sink failed: {exc}")
+        except Exception as exc:
+            self._log_message(f"[Handshake][Learning] ⚠️ publish failed: {exc}")
 
     def start(self):
         if not self._cleanup_thread.is_alive():
@@ -5460,7 +5534,10 @@ class HandshakeManager:
         duplicate_capture = self._is_duplicate_capture(flow, fingerprint, now)
         if duplicate_capture:
             flow["counters"]["duplicate_capture"] += 1
-            return bool(flow.get("tls_detected"))
+            return bool(
+                flow.get("tls_detected")
+                or flow.get("stratum", {}).get("detected")
+            )
 
         self._parse_tcp_options(flow, tcp, src_ip, sport, logical_dst_ip, logical_dport)
         progressed = self._advance_fsm(flow, tcp, now, inbound_iface)
@@ -5468,9 +5545,25 @@ class HandshakeManager:
             self._close_flow(key, flow, reason="teardown")
             return False
 
-        fed = self._maybe_feed_tls(flow, key, pkt, ip, tcp, now)
+        fed_tls = self._maybe_feed_tls(flow, key, pkt, ip, tcp, now)
+        fed_stratum = self._maybe_feed_stratum(flow, key, pkt, ip, tcp, now)
         self._last_tcp_pkt[(key, direction)] = pkt
-        return fed
+        recognized = bool(
+            fed_tls
+            or fed_stratum
+            or flow.get("tls_detected")
+            or flow.get("stratum", {}).get("detected")
+        )
+        # Preserve the exact pre-NAT learning result on this packet. NAT may
+        # rewrite endpoints before TransportManager runs, so a cache lookup by
+        # the post-NAT tuple alone is not always sufficient.
+        try:
+            setattr(pkt, "_handshake_flow_key", key)
+            setattr(pkt, "_handshake_transport_context", self.snapshot_flow(key) or {})
+            setattr(pkt, "_handshake_recognized", recognized)
+        except Exception:
+            pass
+        return recognized
 
     def _extract_layers(self, pkt: Packet):
         if not pkt or TCP is None:
@@ -5567,6 +5660,29 @@ class HandshakeManager:
                         "pending_bytes": 0,
                     },
                 },
+                "stratum_stream": {
+                    "c2s": {"next_seq": None, "pending": {}, "pending_bytes": 0},
+                    "s2c": {"next_seq": None, "pending": {}, "pending_bytes": 0},
+                },
+                "stratum_buffers": {"c2s": b"", "s2c": b""},
+                "stratum": {
+                    "candidate": False,
+                    "detected": False,
+                    "port_hint": False,
+                    "transport": None,
+                    "handshake_state": "unknown",
+                    "method": None,
+                    "worker": None,
+                    "job_id": None,
+                    "height": None,
+                    "algo": None,
+                    "target": None,
+                    "difficulty": None,
+                    "last_event": None,
+                    "message_count": 0,
+                    "last_message_ts": None,
+                    "tls_opaque_published": False,
+                },
                 "app_bytes": {"c2s": 0, "s2c": 0},
                 "fin_seen": set(),
                 "directions_seen": set(),
@@ -5620,6 +5736,10 @@ class HandshakeManager:
         if dport in self.COMMON_TLS_PORTS and sport not in self.COMMON_TLS_PORTS:
             flow["client"], flow["server"] = src, dst
         elif sport in self.COMMON_TLS_PORTS and dport not in self.COMMON_TLS_PORTS:
+            flow["client"], flow["server"] = dst, src
+        elif dport in self.STRATUM_TCP_PORT_HINTS and sport not in self.STRATUM_TCP_PORT_HINTS:
+            flow["client"], flow["server"] = src, dst
+        elif sport in self.STRATUM_TCP_PORT_HINTS and dport not in self.STRATUM_TCP_PORT_HINTS:
             flow["client"], flow["server"] = dst, src
 
     @staticmethod
@@ -6027,6 +6147,314 @@ class HandshakeManager:
         self._last_tcp_pkt[(key, direction)] = pkt
         return parsed or bool(flow.get("tls_detected"))
 
+    def _reassemble_stratum_payload(
+            self,
+            flow: Dict[str, Any],
+            direction: str,
+            seq: int,
+            payload: bytes,
+    ) -> bytes:
+        """Loss-aware, bounded TCP reconstruction dedicated to JSON-RPC bytes."""
+        if not payload:
+            return b""
+        stream = flow["stratum_stream"][direction]
+        next_seq = stream.get("next_seq")
+        pending: Dict[int, bytes] = stream["pending"]
+        if next_seq is None:
+            next_seq = int(seq)
+            stream["next_seq"] = next_seq
+        if seq != next_seq and self._seq_less(seq, next_seq):
+            overlap = (next_seq - seq) & 0xFFFFFFFF
+            if overlap >= len(payload):
+                flow["counters"][f"{direction}_stratum_duplicate"] += 1
+                return b""
+            payload = payload[overlap:]
+            seq = next_seq
+            flow["counters"][f"{direction}_stratum_overlap_trim"] += 1
+        if seq != next_seq:
+            old = pending.get(seq)
+            if old is None or len(payload) > len(old):
+                pending[seq] = payload
+            stream["pending_bytes"] = sum(len(v) for v in pending.values())
+            if stream["pending_bytes"] > self.STRATUM_BUFFER_MAX:
+                for pending_seq in sorted(pending)[: max(1, len(pending) // 2)]:
+                    pending.pop(pending_seq, None)
+                stream["pending_bytes"] = sum(len(v) for v in pending.values())
+                flow["counters"][f"{direction}_stratum_pending_drop"] += 1
+            return b""
+        chunks = [payload]
+        next_seq = (next_seq + len(payload)) & 0xFFFFFFFF
+        while True:
+            exact = pending.pop(next_seq, None)
+            if exact is not None:
+                chunks.append(exact)
+                next_seq = (next_seq + len(exact)) & 0xFFFFFFFF
+                continue
+            overlap_key = None
+            overlap_data = None
+            for candidate_seq, candidate_data in pending.items():
+                if self._seq_less(candidate_seq, next_seq):
+                    overlap = (next_seq - candidate_seq) & 0xFFFFFFFF
+                    if overlap < len(candidate_data):
+                        overlap_key = candidate_seq
+                        overlap_data = candidate_data[overlap:]
+                        break
+            if overlap_key is None:
+                break
+            pending.pop(overlap_key, None)
+            chunks.append(overlap_data)
+            next_seq = (next_seq + len(overlap_data)) & 0xFFFFFFFF
+        stream["next_seq"] = next_seq
+        stream["pending_bytes"] = sum(len(v) for v in pending.values())
+        return b"".join(chunks)
+
+    @staticmethod
+    def _stratum_safe_value(value: Any, max_len: int = 512) -> Any:
+        if value in (None, "", [], {}):
+            return None
+        if isinstance(value, (int, float, bool)):
+            return value
+        text = str(value).strip()
+        return text[:max_len] if text else None
+
+    @classmethod
+    def _stratum_pick(cls, *sources: Any, names: Tuple[str, ...]) -> Any:
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for name in names:
+                value = source.get(name)
+                if value not in (None, "", [], {}):
+                    return cls._stratum_safe_value(value)
+        return None
+
+    @classmethod
+    def _looks_like_stratum_json(cls, payload: bytes) -> bool:
+        sample = bytes(payload or b"")[:4096].lstrip()
+        if not sample or sample[:1] not in (b"{", b"["):
+            return False
+        lowered = sample.lower()
+        signatures = (
+            b'"method"', b'"jsonrpc"', b'"mining.', b'"login"',
+            b'"job"', b'"blob"', b'"target"', b'"seed_hash"',
+        )
+        return any(sig in lowered for sig in signatures)
+
+    def _extract_stratum_messages(self, flow: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
+        """Extract complete newline-delimited or concatenated JSON values."""
+        raw_buffer = bytes(flow["stratum_buffers"].get(direction) or b"")
+        if not raw_buffer:
+            return []
+        messages: List[Dict[str, Any]] = []
+        consumed = 0
+        decoder = json.JSONDecoder()
+        text = raw_buffer.decode("utf-8", errors="replace")
+        index = 0
+        length = len(text)
+        while index < length and len(messages) < self.STRATUM_MAX_MESSAGES_PER_PACKET:
+            while index < length and text[index].isspace():
+                index += 1
+            if index >= length:
+                consumed = len(raw_buffer)
+                break
+            if text[index] not in "[{":
+                newline = text.find("\n", index)
+                if newline < 0:
+                    break
+                index = newline + 1
+                consumed = len(text[:index].encode("utf-8", errors="replace"))
+                continue
+            try:
+                value, end = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                break
+            if isinstance(value, dict):
+                messages.append(value)
+            elif isinstance(value, list):
+                messages.extend(item for item in value if isinstance(item, dict))
+            index = end
+            consumed = len(text[:index].encode("utf-8", errors="replace"))
+        if consumed:
+            raw_buffer = raw_buffer[min(consumed, len(raw_buffer)):]
+        if len(raw_buffer) > self.STRATUM_BUFFER_MAX:
+            raw_buffer = raw_buffer[-self.STRATUM_BUFFER_MAX:]
+            flow["counters"][f"{direction}_stratum_buffer_trim"] += 1
+        flow["stratum_buffers"][direction] = raw_buffer
+        return messages[: self.STRATUM_MAX_MESSAGES_PER_PACKET]
+
+    @classmethod
+    def _is_stratum_message(cls, message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict):
+            return False
+        method = str(message.get("method") or "").strip().casefold()
+        known_methods = {
+            "login", "submit", "job", "keepalived", "keepalive",
+            "mining.subscribe", "mining.authorize", "mining.notify",
+            "mining.submit", "mining.set_difficulty", "mining.set_extranonce",
+            "eth_submitlogin", "eth_getwork", "eth_submitwork",
+            "stratum.subscribe",
+        }
+        if method in known_methods or method.startswith(cls.STRATUM_METHOD_PREFIXES):
+            return True
+        containers = [message]
+        for key in ("params", "result", "job"):
+            value = message.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+                nested = value.get("job")
+                if isinstance(nested, dict):
+                    containers.append(nested)
+        mining_keys = {
+            "blob", "target", "seed_hash", "job_id", "jobid", "height",
+            "difficulty", "nonce", "worker", "login", "algo", "algorithm",
+        }
+        return any(mining_keys.intersection(container.keys()) for container in containers)
+
+    def _classify_stratum_message(
+            self,
+            flow: Dict[str, Any],
+            message: Dict[str, Any],
+            direction: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        method = str(message.get("method") or "").strip()
+        params = message.get("params")
+        result = message.get("result")
+        error = message.get("error")
+        param_dict = params if isinstance(params, dict) else {}
+        result_dict = result if isinstance(result, dict) else {}
+        nested_job = result_dict.get("job") if isinstance(result_dict.get("job"), dict) else {}
+        if isinstance(param_dict.get("job"), dict):
+            nested_job = param_dict.get("job")
+        params_list = params if isinstance(params, list) else []
+
+        worker = self._stratum_pick(
+            param_dict, result_dict, message,
+            names=("worker", "worker_name", "login", "user", "username", "address"),
+        )
+        if worker is None and params_list and method in {"mining.authorize", "login", "submit", "mining.submit"}:
+            worker = self._stratum_safe_value(params_list[0])
+
+        job_id = self._stratum_pick(
+            nested_job, param_dict, result_dict,
+            names=("job_id", "jobid"),
+        )
+        if method == "mining.notify" and params_list:
+            job_id = self._stratum_safe_value(params_list[0]) or job_id
+        elif method == "mining.submit" and len(params_list) > 1:
+            job_id = self._stratum_safe_value(params_list[1]) or job_id
+
+        height = self._stratum_pick(nested_job, param_dict, result_dict, message, names=("height", "block_height"))
+        algo = self._stratum_pick(nested_job, param_dict, result_dict, message, names=("algo", "algorithm", "variant"))
+        target = self._stratum_pick(nested_job, param_dict, result_dict, message, names=("target", "share_target"))
+        difficulty = self._stratum_pick(param_dict, result_dict, message, names=("difficulty", "diff"))
+        if method == "mining.set_difficulty" and params_list:
+            difficulty = self._stratum_safe_value(params_list[0])
+
+        lower_method = method.casefold()
+        if lower_method in {"mining.subscribe", "mining.authorize", "login", "eth_submitlogin", "stratum.subscribe"}:
+            event_type = "stratum_handshake"
+            state = "authenticated" if lower_method in {"mining.authorize", "login", "eth_submitlogin"} else "subscribed"
+        elif lower_method in {"mining.notify", "job", "mining.set_difficulty", "mining.set_extranonce"} or (
+                nested_job or any(k in message for k in ("blob", "target", "seed_hash", "height"))
+        ):
+            event_type = "stratum_job"
+            state = "active"
+        elif lower_method in {"mining.submit", "submit", "eth_submitwork"}:
+            event_type = "stratum_submit"
+            state = "submitting"
+        elif error not in (None, False, [], {}) or result is not None:
+            event_type = "stratum_result"
+            state = "active" if error in (None, False, [], {}) else "error"
+        else:
+            event_type = "stratum_message"
+            state = flow["stratum"].get("handshake_state") or "observed"
+
+        data = {
+            "direction": direction,
+            "method": method or None,
+            "id": self._stratum_safe_value(message.get("id")),
+            "worker": worker,
+            "job_id": job_id,
+            "height": height,
+            "algo": algo,
+            "target": target,
+            "difficulty": difficulty,
+            "has_result": result is not None,
+            "has_error": error not in (None, False, [], {}),
+            "transport": "plaintext-jsonrpc",
+            "handshake_state": state,
+        }
+        return event_type, data
+
+    def _maybe_feed_stratum(self, flow, key, pkt, ip, tcp, now) -> bool:
+        payload = bytes(tcp.payload) if tcp.payload else b""
+        if not payload:
+            return bool(flow.get("stratum", {}).get("detected"))
+        src_ip, src_port = str(ip.src), int(tcp.sport)
+        direction = "c2s" if self._is_c2s(flow, src_ip, src_port) else "s2c"
+        server_port = int(flow.get("server", ("", 0))[1])
+        state = flow["stratum"]
+        hinted = server_port in self.STRATUM_TCP_PORT_HINTS or int(tcp.sport) in self.STRATUM_TCP_PORT_HINTS or int(tcp.dport) in self.STRATUM_TCP_PORT_HINTS
+        signature = self._looks_like_stratum_json(payload)
+        weak_json_start = bytes(payload).lstrip()[:1] in (b"{", b"[")
+        if not (hinted or signature or weak_json_start or state.get("candidate") or state.get("detected")):
+            return False
+        state["candidate"] = True
+        if hinted:
+            state["port_hint"] = True
+
+        # Encrypted Stratum is still a useful handshake classification, but the
+        # JSON fields cannot be recovered without session keys.
+        if flow.get("tls_detected") or self._looks_tlsish(payload):
+            state["transport"] = "tls-opaque"
+            state["handshake_state"] = "encrypted"
+            if not state.get("tls_opaque_published"):
+                state["tls_opaque_published"] = True
+                self._publish_learning(
+                    "stratum_handshake",
+                    flow_key=key,
+                    data={
+                        "transport": "tls-opaque",
+                        "handshake_state": "encrypted",
+                        "server_port": server_port,
+                        "direction": direction,
+                    },
+                )
+            return True
+
+        contiguous = self._reassemble_stratum_payload(flow, direction, int(tcp.seq), payload)
+        if not contiguous:
+            return bool(state.get("detected"))
+        buffer = bytes(flow["stratum_buffers"].get(direction) or b"") + contiguous
+        if len(buffer) > self.STRATUM_BUFFER_MAX:
+            buffer = buffer[-self.STRATUM_BUFFER_MAX:]
+            flow["counters"][f"{direction}_stratum_buffer_trim"] += 1
+        flow["stratum_buffers"][direction] = buffer
+        messages = self._extract_stratum_messages(flow, direction)
+        if not messages:
+            return bool(state.get("detected") or signature)
+
+        accepted_messages = [
+            message for message in messages
+            if hinted or self._is_stratum_message(message)
+        ]
+        if not accepted_messages:
+            return bool(state.get("detected"))
+        state["detected"] = True
+        state["transport"] = "plaintext-jsonrpc"
+        for message in accepted_messages:
+            event_type, data = self._classify_stratum_message(flow, message, direction)
+            state["message_count"] = int(state.get("message_count", 0)) + 1
+            state["last_message_ts"] = now
+            state["last_event"] = event_type
+            state["handshake_state"] = data.get("handshake_state") or state.get("handshake_state")
+            state["method"] = data.get("method") or state.get("method")
+            for field in ("worker", "job_id", "height", "algo", "target", "difficulty"):
+                if data.get(field) not in (None, "", [], {}):
+                    state[field] = data[field]
+            self._publish_learning(event_type, flow_key=key, data=data)
+        return True
+
     @staticmethod
     def _looks_tlsish(b: bytes) -> bool:
         if len(b) >= 5 and TLSRecordManager._looks_like_tls_header(b):
@@ -6041,9 +6469,10 @@ class HandshakeManager:
             return True
         if server and endpoint == server:
             return False
-        if server and int(server[1]) in self.COMMON_TLS_PORTS and int(src_port) not in self.COMMON_TLS_PORTS:
+        service_ports = self.COMMON_TLS_PORTS | self.STRATUM_TCP_PORT_HINTS
+        if server and int(server[1]) in service_ports and int(src_port) not in service_ports:
             return True
-        if int(src_port) in self.COMMON_TLS_PORTS:
+        if int(src_port) in service_ports:
             return False
         return True
 
@@ -6058,7 +6487,10 @@ class HandshakeManager:
             or flow.get("tls_candidate")
             or flow.get("microsoft_authenticator_candidate")
             or flow.get("microsoft_authenticator_detected")
+            or flow.get("stratum", {}).get("candidate")
+            or flow.get("stratum", {}).get("detected")
             or server_port in self.COMMON_TLS_PORTS
+            or server_port in self.STRATUM_TCP_PORT_HINTS
         )
 
     def _cleanup_loop(self):
@@ -6116,6 +6548,15 @@ class HandshakeManager:
             flow["tls"] = self._tls_mgr.get_session_summary(key)
         except Exception:
             flow["tls"] = None
+        self._publish_learning(
+            "flow_closed", flow_key=key,
+            data={
+                "state": flow.get("state"),
+                "tls": flow.get("tls"),
+                "stratum": dict(flow.get("stratum") or {}),
+            },
+            reason=reason,
+        )
         if callable(self.on_flow_closed):
             try:
                 self.on_flow_closed(key, flow, reason)
@@ -6163,6 +6604,13 @@ class HandshakeManager:
                 "microsoft_authenticator_detection_source": flow.get(
                     "microsoft_authenticator_detection_source"
                 ),
+                "crypto_service_candidate": bool(flow.get("crypto_service_candidate")),
+                "crypto_service_detected": bool(flow.get("crypto_service_detected")),
+                "crypto_service_category": flow.get("crypto_service_category"),
+                "crypto_service_name": flow.get("crypto_service_name"),
+                "crypto_service_sni": flow.get("crypto_service_sni"),
+                "crypto_service_detection_source": flow.get("crypto_service_detection_source"),
+                "stratum": dict(flow.get("stratum") or {}),
                 "midstream": bool(flow.get("midstream")),
             }
         result["tls"] = self._tls_mgr.get_session_summary(key) if flow.get("tls_detected") else None
@@ -6389,6 +6837,7 @@ class HandshakeManager:
         return self._tls_mgr.get_tls13_key_state(canonical_key)
 
     def _on_tls_record(self, rec: "TLSRecord"):
+        self._publish_learning("tls_record", rec=rec)
         if not self.log_tls_records:
             return
         type_name = {
@@ -6413,6 +6862,7 @@ class HandshakeManager:
 
 
     def _on_tls_handshake(self, rec: "TLSRecord", info: Dict):
+        self._publish_learning("tls_handshake", rec=rec, data=info)
         for message in info.get("messages", []):
             message_type = message.get("type")
             prefix = (
@@ -6511,12 +6961,14 @@ class HandshakeManager:
                 )
 
     def _on_tls_alert(self, rec: "TLSRecord", alert: Dict):
+        self._publish_learning("tls_alert", rec=rec, data=alert)
         self._log_message(
             f"[TLS][Alert] {alert.get('level_name')} {alert.get('description_name')} "
             f"{rec.direction} {rec.src}:{rec.src_port} -> {rec.dst}:{rec.dst_port}"
         )
 
     def _on_tls_application_data(self, rec: "TLSRecord"):
+        self._publish_learning("tls_application_data", rec=rec)
         # Packet capture remains observation-only. Explicit encrypt_for_server()
         # returns a TLS record to the endpoint that owns the socket; this callback
         # never fabricates or re-injects TCP segments.
@@ -6529,6 +6981,10 @@ class HandshakeManager:
 
     def _on_tls_event(self, evt: Dict):
         kind = evt.get("kind")
+        self._publish_learning(
+            "tls_event", flow_key=evt.get("flow"),
+            data={"kind": kind, **dict(evt.get("data") or {})},
+        )
         if kind in ("block", "quarantine", "policy_alert"):
             data = evt.get("data", {})
             self._log_message(
@@ -6536,6 +6992,14 @@ class HandshakeManager:
             )
 
     def _on_tls_decision(self, flow_key, rec: "TLSRecord", decision):
+        self._publish_learning(
+            "tls_decision", rec=rec, flow_key=flow_key,
+            data={
+                "action": getattr(decision, "action", None),
+                "reason": getattr(decision, "reason", None),
+                "tags": list(getattr(decision, "tags", []) or []),
+            },
+        )
         if decision.action != "allow":
             self._log_message(
                 f"[TLS][Decision] {decision.action.upper()} flow={flow_key} "
@@ -9104,6 +9568,8 @@ class NATManager:
         38888: ("Blocknet", "❤️"),
         25565: ("Minecraft", "🧱"),
         47772: ("HyperVManager", "🖥️"),
+        47781: ("PeerInterface Discovery", "📡"),
+        47782: ("PeerInterface Frames/ACK", "🤝"),
     }
 
     NAT_PORT_MIN = 49152
@@ -34519,6 +34985,7 @@ class HyperVRouterManager:
       - explicitly ignores HVRM control/discovery packets seen on WireShark
     """
 
+    LOG_NAME = "HyperVRouterManager"
     MAGIC = "HVRM5"
     ACCEPT_MAGICS = {"HVRM4", "HVRM5", "HVRM6"}
     INBOUND_IFACE_NAME = "HyperVManager"
@@ -34718,7 +35185,14 @@ class HyperVRouterManager:
         self._flow_activity: Dict[str, Dict[str, float]] = {}
         self._flow_activity_order: Deque[str] = deque()
         self._flow_activity_cap = 4096
-        self._tls_allowlist_ports: Set[int] = set()
+        # Permit bounded TLS control/handshake traffic by default so peer
+        # transports can teach HandshakeManager and TransportHTTPSManager.
+        # The existing payload-size and per-flow pressure limits still prevent
+        # this sidecar from becoming an unlimited encrypted-stream tunnel.
+        self._tls_allowlist_ports: Set[int] = {
+            443, 465, 853, 993, 995,
+            2083, 2087, 2096, 8443, 8883, 9443, 10443,
+        }
         self._tls_allowlist_hosts: Set[str] = set()
 
         self._direct_hello_every_sec = max(30.0, self.heartbeat_sec * 2.0)
@@ -35368,6 +35842,20 @@ class HyperVRouterManager:
         self._maybe_capture_router_ref(hostboundary_manager)
         self._log_evt("attach", "attached HostConnectivityBoundaryManager", ["🛡️", "🤝"])
 
+    def attach_router(self, router: Any) -> None:
+        """Attach the owning router directly for remote-frame reinjection.
+
+        HyperVRouterManager historically discovered the router through a Hyper-V,
+        WinTun, or WinDivert backend.  A pure UDP peer interface has no such
+        backend, so direct attachment is required to guarantee that decoded TCP
+        frames enter the normal HandshakeManager and TransportManager pipeline.
+        """
+        if router is None:
+            raise ValueError(f"{self.LOG_NAME}.attach_router() requires a router instance")
+        self._router_ref = router
+        self._router_ingest_fn = self._resolve_router_ingest_callable()
+        self._log_evt("attach", "attached owning router ingress", ["🧠", "🔌", "✅"])
+
     def _register_generic_sender(
             self,
             *,
@@ -35460,15 +35948,16 @@ class HyperVRouterManager:
             for state in self._senders.values():
                 self._start_sender_worker(state)
 
-        self._hello_thread = threading.Thread(target=self._hello_loop, name="HyperVRouterHello", daemon=True)
-        self._recv_thread = threading.Thread(target=self._recv_loop, name="HyperVRouterRecv", daemon=True)
-        self._health_thread = threading.Thread(target=self._health_loop, name="HyperVRouterHealth", daemon=True)
-        self._net_thread = threading.Thread(target=self._network_sender_loop, name="HyperVRouterWireSend", daemon=True)
-        self._router_thread = threading.Thread(target=self._router_ingress_loop, name="HyperVRouterIngress",
+        thread_prefix = str(getattr(self, "LOG_NAME", "HyperVRouterManager")).replace("Manager", "")
+        self._hello_thread = threading.Thread(target=self._hello_loop, name=f"{thread_prefix}Hello", daemon=True)
+        self._recv_thread = threading.Thread(target=self._recv_loop, name=f"{thread_prefix}Recv", daemon=True)
+        self._health_thread = threading.Thread(target=self._health_loop, name=f"{thread_prefix}Health", daemon=True)
+        self._net_thread = threading.Thread(target=self._network_sender_loop, name=f"{thread_prefix}WireSend", daemon=True)
+        self._router_thread = threading.Thread(target=self._router_ingress_loop, name=f"{thread_prefix}Ingress",
                                                daemon=True)
         self._socket_recovery_thread = threading.Thread(
             target=self._socket_recovery_loop,
-            name="HyperVRouterSocketRecovery",
+            name=f"{thread_prefix}SocketRecovery",
             daemon=True,
         )
 
@@ -35508,7 +35997,7 @@ class HyperVRouterManager:
         elif self._discovery_sock is None:
             self._log_evt("lifecycle", "started with discovery disabled; direct peers only", ["⚠️", "📡"])
         else:
-            self._log_evt("lifecycle", "HyperVRouterManager started", ["🚀", "🌐"])
+            self._log_evt("lifecycle", f"{self.LOG_NAME} started", ["🚀", "🌐"])
 
     def notify_network_ready(self) -> None:
         """Kick discovery only after the owning router installed its routes."""
@@ -35612,7 +36101,7 @@ class HyperVRouterManager:
         with self._pending_lock:
             self._pending_frames.clear()
 
-        self._log_evt("lifecycle", "HyperVRouterManager stopped", ["🌙", "🛑"])
+        self._log_evt("lifecycle", f"{self.LOG_NAME} stopped", ["🌙", "🛑"])
 
     # ---------------------------------------------------------
     # router hot path
@@ -37567,12 +38056,22 @@ class HyperVRouterManager:
                 preferred_socket=recv_sock,
             )
 
-        setattr(pkt, "_hyperv_remote_frame", True)
+        # Generic remote-transport metadata is authoritative.  Historical
+        # Hyper-V aliases remain for compatibility with older downstream code.
+        setattr(pkt, "_remote_peer_frame", True)
+        setattr(pkt, "_remote_transport_interface", self.INBOUND_IFACE_NAME)
+        setattr(pkt, "_remote_node_id", src_node_id)
+        setattr(pkt, "_remote_host_name", src_host_name)
+        setattr(pkt, "_remote_sender_id", src_sender_id)
+        setattr(pkt, "_remote_trace_id", trace_id)
+        setattr(pkt, "_remote_duplicate_hint", duplicate_hint)
+        setattr(pkt, "_hyperv_remote_frame", self.INBOUND_IFACE_NAME == "HyperVManager")
         setattr(pkt, "_hyperv_remote_node_id", src_node_id)
         setattr(pkt, "_hyperv_remote_host_name", src_host_name)
         setattr(pkt, "_hyperv_remote_sender_id", src_sender_id)
         setattr(pkt, "_hyperv_remote_trace_id", trace_id)
         setattr(pkt, "_hyperv_duplicate_hint", duplicate_hint)
+        setattr(pkt, "_peerinterface_remote_frame", self.INBOUND_IFACE_NAME == "PeerInterface")
         setattr(pkt, "sniffed_on", self.INBOUND_IFACE_NAME)
 
         _ = self._consult_hostboundary(pkt, self.INBOUND_IFACE_NAME)
@@ -39715,8 +40214,17 @@ class HyperVRouterManager:
         if not blob:
             return b""
 
-        idx = blob.find(b'{"magic":"HVRM')
-        if idx >= 0:
+        indexes = []
+        for magic in sorted(self.ACCEPT_MAGICS):
+            for marker in (
+                    f'{{"magic":"{magic}'.encode("ascii", "ignore"),
+                    f'{{"magic": "{magic}'.encode("ascii", "ignore"),
+            ):
+                idx = blob.find(marker)
+                if idx >= 0:
+                    indexes.append(idx)
+        if indexes:
+            idx = min(indexes)
             return blob[idx: idx + self._control_payload_scan_limit]
 
         stripped = blob.strip(b"\x00\r\n\t ")
@@ -39757,7 +40265,11 @@ class HyperVRouterManager:
 
         preview = bytes(blob[: self._control_payload_scan_limit])
 
-        if b'"magic":"HVRM' not in preview and b'"magic": "HVRM' not in preview:
+        magic_markers = []
+        for magic in sorted(self.ACCEPT_MAGICS):
+            magic_b = magic.encode("ascii", "ignore")
+            magic_markers.extend((b'"magic":"' + magic_b, b'"magic": "' + magic_b))
+        if not any(marker in preview for marker in magic_markers):
             return False
 
         try:
@@ -40078,7 +40590,7 @@ class HyperVRouterManager:
         try:
             msg_cls = globals().get("RouterRandomMessages")
             if msg_cls is not None:
-                self.router_logger.log_message(msg_cls("HyperVRouterManager", message, emojis or []))
+                self.router_logger.log_message(msg_cls(getattr(self, "LOG_NAME", "HyperVRouterManager"), message, emojis or []))
                 return
         except Exception:
             pass
@@ -40735,6 +41247,127 @@ class HyperVRouterManager:
                 peer.candidate_ips.pop(ip, None)
                 peer.candidate_data_ports.pop(ip, None)
             peer.listen_ip = self._best_peer_ip_locked(peer)
+
+class PeerInterfaceManager(HyperVRouterManager):
+    """Pure UDP/LAN P2P frame transport with ACKs and no Hyper-V dependency.
+
+    The implementation deliberately reuses the mature discovery, path selection,
+    deduplication, bounded queues, frame hashing, retry, and ACK machinery from
+    HyperVRouterManager while maintaining a separate wire identity.  Packets
+    received from peers are reinjected into the owning router as if they arrived
+    on the logical ``PeerInterface`` interface.
+    """
+
+    LOG_NAME = "PeerInterfaceManager"
+    MAGIC = "PIFM1"
+    ACCEPT_MAGICS = {"PIFM1"}
+    INBOUND_IFACE_NAME = "PeerInterface"
+    DEFAULT_DISCOVERY_GROUP = "239.255.78.78"
+    DEFAULT_DISCOVERY_PORT = 47781
+    DEFAULT_DATA_PORT = 47782
+    PEER_SENDER_ID = "peer-interface"
+
+    def __init__(
+            self,
+            router_logger,
+            *,
+            discovery_group: str = DEFAULT_DISCOVERY_GROUP,
+            discovery_port: int = DEFAULT_DISCOVERY_PORT,
+            data_port: int = DEFAULT_DATA_PORT,
+            heartbeat_sec: float = 15.0,
+            peer_timeout_sec: float = 45.0,
+            sender_failure_cooldown_sec: float = 5.0,
+            dedupe_ttl_sec: float = 20.0,
+            recent_cache_size: int = 8192,
+            max_network_queue: int = 128,
+            sender_queue_size: int = 64,
+    ):
+        super().__init__(
+            router_logger,
+            discovery_group=discovery_group,
+            discovery_port=discovery_port,
+            data_port=data_port,
+            heartbeat_sec=heartbeat_sec,
+            peer_timeout_sec=peer_timeout_sec,
+            sender_failure_cooldown_sec=sender_failure_cooldown_sec,
+            dedupe_ttl_sec=dedupe_ttl_sec,
+            recent_cache_size=recent_cache_size,
+            max_network_queue=max_network_queue,
+            sender_queue_size=sender_queue_size,
+        )
+        # No C++ helper, virtual switch, WinTun, or WinDivert lifecycle is owned
+        # by this manager.  UDP sockets plus direct router attachment are enough.
+        self._manage_wintun_lifecycle = False
+        self._manage_windivert_lifecycle = False
+
+    def register_hyperv_backend(self, *args, **kwargs) -> None:
+        raise RuntimeError(
+            "PeerInterfaceManager is transport-only and does not accept Hyper-V backends"
+        )
+
+    def _wire_identity_fields(self, advertised_ip: str = "") -> Dict[str, Any]:
+        fields = super()._wire_identity_fields(advertised_ip)
+        fields["sender_ids"] = [self.PEER_SENDER_ID]
+        fields["sender_kinds"] = {self.PEER_SENDER_ID: "peerinterface"}
+        fields["allow_protocols"] = sorted(self.DEFAULT_PROTOCOLS)
+        fields["logical_interface"] = self.INBOUND_IFACE_NAME
+        fields["requires_hyperv"] = False
+        return fields
+
+    def _infer_ingress_kind(self, iface_name: str) -> str:
+        normalized = self._normalize_iface_token(iface_name)
+        if normalized in {
+                self._normalize_iface_token(self.INBOUND_IFACE_NAME),
+                "peerinterface",
+                "peer-interface",
+                "peer_interface",
+        }:
+            return "peerinterface"
+        return super()._infer_ingress_kind(iface_name)
+
+    def _handle_remote_frame(
+            self,
+            msg: dict,
+            from_ip: str,
+            from_port: int,
+            recv_sock: Optional[socket.socket] = None,
+    ) -> None:
+        # The parent validates, ACKs, decodes, and queues the frame.  Attribute
+        # aliases added below make diagnostics and downstream policy independent
+        # from the historical Hyper-V naming.
+        super()._handle_remote_frame(msg, from_ip, from_port, recv_sock)
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            peers = [
+                {
+                    "node_id": peer.node_id,
+                    "host_name": peer.host_name,
+                    "listen_ip": peer.listen_ip,
+                    "data_port": peer.data_port,
+                    "online": bool(peer.online),
+                    "last_seen": float(peer.last_seen),
+                    "rx_frames": int(peer.rx_frames),
+                    "tx_frames": int(peer.tx_frames),
+                }
+                for peer in self._peers.values()
+            ]
+        with self._pending_lock:
+            pending = len(self._pending_frames)
+        return {
+            "started": bool(self._started),
+            "interface": self.INBOUND_IFACE_NAME,
+            "segment_id": self.segment_id,
+            "node_id": self.node_id,
+            "bind_ip": self.bind_ip,
+            "discovery_group": self.discovery_group,
+            "discovery_port": self.discovery_port,
+            "data_port": self.data_port,
+            "pending_frames": pending,
+            "peers": peers,
+            "stats": dict(self._stats),
+        }
+
 
 @dataclass
 class PacketRecord:

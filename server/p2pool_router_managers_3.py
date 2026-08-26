@@ -6,6 +6,10 @@ import math
 import os
 import queue
 import random
+import socket
+import ipaddress
+import subprocess
+import uuid
 import threading
 import time
 import re
@@ -1960,7 +1964,10 @@ class CodeOutputManager:
         self._gen_thread: Optional[threading.Thread] = None
         self._clean_thread: Optional[threading.Thread] = None
         self._emit_thread: Optional[threading.Thread] = None
+        self._probe_thread: Optional[threading.Thread] = None
+        self._probe_threads: List[threading.Thread] = []
         self._generation_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self._probe_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=512)
         self._bus_queue: "queue.Queue[Any]" = queue.Queue()
         self._knowledge_by_topic: Dict[str, Deque[KnowledgePacket]] = {}
         self._recent_packet_hashes: Deque[str] = deque(maxlen=4096)
@@ -1976,12 +1983,282 @@ class CodeOutputManager:
         self._emit_seq = 0
         self._stats = Stats()
         self._hooks: Dict[str, List[Callable[..., None]]] = defaultdict(list)
+        self._router = None
+        self._handshake_detach = None
+        self._settings = {
+            "enabled": True,
+            "verbose": 2,
+            "auto_emit": True,
+            "emit_interval": 10.0,
+            "emit_jitter": 2.0,
+            "min_new_packets": 4,
+            "max_generated_chars": 250000,
+            "active_probes": False,
+            "allow_public_targets": False,
+            "probe_timeout": 3.0,
+            "probe_rate_per_minute": 30,
+            "probe_max_concurrent": 2,
+            "probe_default_iface": "",
+        }
+        self._probe_history: Deque[float] = deque(maxlen=512)
+        self._probe_results: Deque[Dict[str, Any]] = deque(maxlen=512)
         self.packet_learner = PacketLearnerManager(keep_raw_samples=True, logger=self._log, log_level=2)
         self.stats_manager = StatisticsManager()
         self.method_generator = SnapshotMethodGenerator()
         self.ask_manager = AskManager(co_manager_ref=self, rng_seed=9999)
         self.snapshot_builder = SnapshotBuilder(logger=self._log, ask_manager_ref=self.ask_manager, packet_learner_ref=self.packet_learner, rng_seed=2342)
         self.log_message("[CodeOutput] Manager initialized (advanced rewrite).")
+
+    def configure(self, **settings) -> Dict[str, Any]:
+        unknown = set(settings) - set(self._settings)
+        if unknown:
+            raise ValueError("Unknown CodeOutput setting(s): " + ", ".join(sorted(unknown)))
+        merged = dict(self._settings)
+        merged.update(settings)
+        merged["enabled"] = bool(merged["enabled"])
+        merged["auto_emit"] = bool(merged["auto_emit"])
+        merged["active_probes"] = bool(merged["active_probes"])
+        merged["allow_public_targets"] = bool(merged["allow_public_targets"])
+        merged["verbose"] = max(0, min(5, int(merged["verbose"])))
+        merged["emit_interval"] = max(0.5, float(merged["emit_interval"]))
+        merged["emit_jitter"] = max(0.0, float(merged["emit_jitter"]))
+        merged["min_new_packets"] = max(1, int(merged["min_new_packets"]))
+        merged["max_generated_chars"] = max(4096, int(merged["max_generated_chars"]))
+        merged["probe_timeout"] = max(0.25, min(60.0, float(merged["probe_timeout"])))
+        merged["probe_rate_per_minute"] = max(1, int(merged["probe_rate_per_minute"]))
+        merged["probe_max_concurrent"] = max(1, min(16, int(merged["probe_max_concurrent"])))
+        merged["probe_default_iface"] = str(merged["probe_default_iface"] or "").strip()
+        self._settings = merged
+        self.set_verbose(merged["verbose"])
+        self.set_auto_emit_config(
+            every_s=merged["emit_interval"],
+            jitter_s=merged["emit_jitter"],
+            min_new_packets=merged["min_new_packets"],
+        )
+        self.log_message(
+            "[CodeOutput] ⚙️ Configured "
+            f"enabled={merged['enabled']} probes={merged['active_probes']} "
+            f"public={merged['allow_public_targets']} max_code={merged['max_generated_chars']}"
+        )
+        return self.settings_snapshot()
+
+    def settings_snapshot(self) -> Dict[str, Any]:
+        out = dict(self._settings)
+        out.update({
+            "probe_queue": self._probe_queue.qsize(),
+            "probe_results": len(self._probe_results),
+            "router_bound": self._router is not None,
+        })
+        return out
+
+    def bind_router(self, router: Any) -> None:
+        self._router = router
+        self.log_message("[CodeOutput] ✅ Router packet/response context attached.")
+
+    def bind_handshake_manager(self, handshake_manager: Any) -> None:
+        self._handshake_manager = handshake_manager
+        if self._handshake_detach:
+            try:
+                self._handshake_detach()
+            except Exception:
+                pass
+            self._handshake_detach = None
+        add_sink = getattr(handshake_manager, "add_learning_sink", None)
+        if callable(add_sink):
+            self._handshake_detach = add_sink(self._learn_handshake_event)
+            self.log_message("[CodeOutput] ✅ Shared TLS/Handshake learning attached.")
+
+    def _learn_handshake_event(self, event: Dict[str, Any]) -> None:
+        context = dict(event.get("context") or {})
+        attrs = {
+            "event": event.get("event"),
+            "seq": event.get("seq"),
+            "flow": str(event.get("flow_key")),
+            "reason": event.get("reason"),
+            "context": context,
+            "event_data": dict(event.get("data") or {}),
+            "record": dict(event.get("record") or {}),
+        }
+        event_name = str(event.get("event") or "event")
+        topic = "stratum" if event_name.startswith("stratum_") else "tls"
+        tags = ["handshake-learning", event_name]
+        if topic == "stratum":
+            tags.append("jsonrpc-stream")
+        self.submit_event(
+            topic, attributes=attrs,
+            tags=tags,
+            importance=3,
+            source="HandshakeManager",
+        )
+
+    def submit_probe(
+            self,
+            target: str,
+            *,
+            protocol: str = "tcp",
+            port: Optional[int] = None,
+            payload: Union[str, bytes] = b"",
+            timeout: Optional[float] = None,
+            iface: Optional[str] = None,
+            expect_response: bool = True,
+    ) -> str:
+        if not self._settings.get("enabled", True):
+            raise RuntimeError("CodeOutput is disabled")
+        if not self._settings.get("active_probes", False):
+            raise RuntimeError("Active CodeOutput probes are disabled in GUI settings")
+        request_id = uuid.uuid4().hex[:12]
+        request = {
+            "id": request_id,
+            "target": str(target or "").strip(),
+            "protocol": str(protocol or "tcp").strip().lower(),
+            "port": int(port) if port not in (None, "", 0) else None,
+            "payload": payload.encode("utf-8") if isinstance(payload, str) else bytes(payload or b""),
+            "timeout": float(timeout if timeout is not None else self._settings["probe_timeout"]),
+            "iface": str(iface or self._settings.get("probe_default_iface") or "").strip(),
+            "expect_response": bool(expect_response),
+            "submitted": time.time(),
+        }
+        if not request["target"]:
+            raise ValueError("Probe target is required")
+        if request["protocol"] not in {"tcp", "udp", "icmp"}:
+            raise ValueError("Probe protocol must be tcp, udp, or icmp")
+        if request["protocol"] in {"tcp", "udp"} and not request["port"]:
+            raise ValueError("TCP/UDP probes require a destination port")
+        try:
+            self._probe_queue.put_nowait(request)
+        except queue.Full as exc:
+            raise RuntimeError("CodeOutput probe queue is full") from exc
+        self.submit_event(
+            "transport",
+            attributes={k: v for k, v in request.items() if k != "payload"} | {"payload_len": len(request["payload"])},
+            tags=["codeoutput", "probe-request"], importance=2, source="CodeOutput",
+        )
+        self.log_message(
+            f"[CodeOutput][Probe] ➡️ queued id={request_id} {request['protocol']} "
+            f"{request['target']}:{request['port'] or '-'} iface={request['iface'] or 'route-default'}"
+        )
+        return request_id
+
+    def recent_probe_results(self) -> List[Dict[str, Any]]:
+        return list(self._probe_results)
+
+    def _probe_allowed(self, resolved_ip: str) -> bool:
+        address = ipaddress.ip_address(resolved_ip)
+        if self._settings.get("allow_public_targets", False):
+            return True
+        return bool(
+            address.is_private or address.is_loopback or address.is_link_local
+            or address.is_multicast or address.is_unspecified
+        )
+
+    def _rate_limit_probe(self) -> None:
+        now = time.monotonic()
+        cutoff = now - 60.0
+        while self._probe_history and self._probe_history[0] < cutoff:
+            self._probe_history.popleft()
+        limit = int(self._settings.get("probe_rate_per_minute", 30))
+        if len(self._probe_history) >= limit:
+            sleep_for = max(0.05, 60.0 - (now - self._probe_history[0]))
+            self._stop_event.wait(min(sleep_for, 5.0))
+        self._probe_history.append(time.monotonic())
+
+    def _run_probe(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        started = time.monotonic()
+        result = {
+            "id": request["id"], "target": request["target"],
+            "protocol": request["protocol"], "port": request.get("port"),
+            "iface": request.get("iface"), "ok": False, "response": b"",
+            "error": None, "resolved_ip": None,
+        }
+        try:
+            infos = socket.getaddrinfo(
+                request["target"], request.get("port") or 0,
+                0, socket.SOCK_DGRAM if request["protocol"] == "udp" else socket.SOCK_STREAM,
+            )
+            if not infos:
+                raise OSError("target did not resolve")
+            family, _, _, _, sockaddr = infos[0]
+            resolved_ip = str(sockaddr[0])
+            result["resolved_ip"] = resolved_ip
+            if not self._probe_allowed(resolved_ip):
+                raise PermissionError("public probe target blocked by CodeOutput settings")
+            timeout = max(0.25, min(60.0, float(request["timeout"])))
+            iface = request.get("iface") or ""
+            if request["protocol"] == "icmp":
+                flag = "-n" if os.name == "nt" else "-c"
+                wait_flag = "-w" if os.name == "nt" else "-W"
+                wait_value = str(max(1, int(timeout * (1000 if os.name == "nt" else 1))))
+                completed = subprocess.run(
+                    ["ping", flag, "1", wait_flag, wait_value, resolved_ip],
+                    capture_output=True, text=True, timeout=timeout + 2.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+                )
+                result["ok"] = completed.returncode == 0
+                result["response"] = (completed.stdout or completed.stderr or "").encode("utf-8", "replace")[:8192]
+            else:
+                sock_type = socket.SOCK_STREAM if request["protocol"] == "tcp" else socket.SOCK_DGRAM
+                with socket.socket(family, sock_type) as sock:
+                    sock.settimeout(timeout)
+                    if iface:
+                        try:
+                            if os.name == "nt":
+                                # Windows supports binding by source IP. Interface names
+                                # remain routing hints and are preserved in the result.
+                                ipaddress.ip_address(iface)
+                                sock.bind((iface, 0))
+                            elif hasattr(socket, "SO_BINDTODEVICE"):
+                                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
+                        except Exception as bind_exc:
+                            result["bind_warning"] = str(bind_exc)
+                    endpoint = (resolved_ip, int(request["port"]))
+                    if request["protocol"] == "tcp":
+                        sock.connect(endpoint)
+                        result["ok"] = True
+                        if request["payload"]:
+                            sock.sendall(request["payload"])
+                        if request["expect_response"]:
+                            try:
+                                result["response"] = sock.recv(65535)
+                            except socket.timeout:
+                                result["response"] = b""
+                    else:
+                        sock.sendto(request["payload"] or b"\x00", endpoint)
+                        result["ok"] = True
+                        if request["expect_response"]:
+                            response, peer = sock.recvfrom(65535)
+                            result["response"] = response
+                            result["peer"] = peer
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        result["elapsed_ms"] = round((time.monotonic() - started) * 1000.0, 3)
+        result["response_len"] = len(result.get("response") or b"")
+        result["response_preview"] = (result.get("response") or b"")[:256].decode("utf-8", "replace")
+        return result
+
+    def _probe_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                request = self._probe_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if request is None:
+                break
+            self._rate_limit_probe()
+            result = self._run_probe(request)
+            self._probe_results.append(result)
+            public = {k: v for k, v in result.items() if k != "response"}
+            self.submit_event(
+                "transport", attributes=public,
+                tags=["codeoutput", "probe-response", "ok" if result["ok"] else "failed"],
+                importance=3 if result["ok"] else 2, source="CodeOutput",
+            )
+            self._fire_hooks("probe_result", result=result)
+            self.log_message(
+                f"[CodeOutput][Probe] {'✅' if result['ok'] else '❌'} id={result['id']} "
+                f"{result['protocol']} {result.get('resolved_ip') or result['target']}:"
+                f"{result.get('port') or '-'} elapsed={result['elapsed_ms']}ms "
+                f"response={result['response_len']}B error={result.get('error') or '-'}"
+            )
 
     def ask(self, prompt: str) -> str:
         return self.ask_manager.ask(prompt)
@@ -2033,6 +2310,9 @@ class CodeOutputManager:
                 self._log(f"[CodeOutput] Hook error ({event}): {ex}", 1)
 
     def start(self):
+        if not self._settings.get("enabled", True):
+            self.log_message("[CodeOutput] Disabled by GUI settings; workers not started.")
+            return
         if self._bus_thread and self._bus_thread.is_alive():
             return
         self._stop_event.clear()
@@ -2040,15 +2320,30 @@ class CodeOutputManager:
         self._gen_thread = threading.Thread(target=self._generation_loop, daemon=True, name="CodeOutputGen")
         self._clean_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="CodeOutputCleanup")
         self._emit_thread = threading.Thread(target=self._auto_emit_loop, daemon=True, name="CodeOutputEmit")
+        probe_workers = int(self._settings.get("probe_max_concurrent", 2))
+        self._probe_threads = [
+            threading.Thread(
+                target=self._probe_loop,
+                daemon=True,
+                name=f"CodeOutputProbe-{index + 1}",
+            )
+            for index in range(max(1, probe_workers))
+        ]
+        self._probe_thread = self._probe_threads[0]
         self._bus_thread.start()
         self._gen_thread.start()
         self._clean_thread.start()
         self._emit_thread.start()
-        self._log("[CodeOutput] Threads started.", 1)
+        for probe_thread in self._probe_threads:
+            probe_thread.start()
+        self._log(
+            f"[CodeOutput] Threads started (learning + generation + {len(self._probe_threads)} active probe workers).",
+            1,
+        )
 
     def stop(self):
         self._stop_event.set()
-        for q in (self._generation_queue, self._bus_queue):
+        for q in (self._generation_queue, self._bus_queue, self._probe_queue):
             try:
                 q.put_nowait(None)
             except Exception:
@@ -2060,9 +2355,15 @@ class CodeOutputManager:
                 pass
             if t.is_alive():
                 t.join(timeout=1.5)
-        for t in (self._bus_thread, self._gen_thread, self._clean_thread, self._emit_thread):
+        worker_threads = [
+            self._bus_thread, self._gen_thread, self._clean_thread, self._emit_thread,
+            *list(self._probe_threads),
+        ]
+        for t in worker_threads:
             if t and t.is_alive():
                 t.join(timeout=2.0)
+        self._probe_threads = []
+        self._probe_thread = None
         self._log("[CodeOutput] Manager stopped.", 1)
 
     def submit_packet(self, packet: Any, inbound_iface: Optional[str] = None, **context) -> None:
@@ -2236,7 +2537,17 @@ class CodeOutputManager:
         gatherer = self._gather_knowledge_aggregate if attr_aggregate == "list" else self._gather_knowledge
         stats_computer = lambda: self.compute_statistics_from_learned_data(topics=config.get("topics") or [], percentiles=list(config.get("percentiles", [5, 25, 50, 75, 95])), topk_categorical=int(config.get("topk_categorical", 10)), min_count_for_stats=int(config.get("min_count_for_stats", 2)))
         method_generator = lambda stats: self._default_snapshot_methods(stats)
-        return self.snapshot_builder.build(config=config, knowledge_gatherer=gatherer, insights_fetcher=self._insights_for_topics, stats_computer=stats_computer, method_generator=method_generator)
+        code = self.snapshot_builder.build(config=config, knowledge_gatherer=gatherer, insights_fetcher=self._insights_for_topics, stats_computer=stats_computer, method_generator=method_generator)
+        max_chars = int(self._settings.get("max_generated_chars", 250000))
+        if len(code) > max_chars:
+            # This is a soft warning, not destructive truncation. Generated code
+            # must remain complete and executable even when it is longer than the
+            # preferred GUI display budget.
+            self._log(
+                f"[CodeOutput] Generated output exceeded the GUI display budget ({len(code)}>{max_chars}); full code preserved.",
+                1,
+            )
+        return code
 
     def _generation_loop(self):
         while not self._stop_event.is_set():

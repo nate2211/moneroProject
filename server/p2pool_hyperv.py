@@ -165,6 +165,15 @@ class CppLogger:
     def set_prefix(self, prefix: str):
         self._prefix = prefix
 
+    @staticmethod
+    def _is_important_line(text: str) -> bool:
+        lowered = str(text or "").casefold()
+        return any(token in lowered for token in (
+            "error", "exception", "failed", "crash", "exit", "disconnect",
+            "dhcp", "lease", "tls", "handshake", "alert", "reject", "drop",
+            "route", "gateway", "pipe", "packet", "warning", "⚠", "❌",
+        ))
+
     def _format_line(self, msg: str) -> str:
         text = str(msg).rstrip()
         if len(text) > self._max_line_length:
@@ -203,7 +212,8 @@ class CppLogger:
                     self._window_start = now
                     self._lines_in_window = 0
 
-                if self._lines_in_window >= self._max_lines_per_window:
+                important = self._is_important_line(line)
+                if self._lines_in_window >= self._max_lines_per_window and not important:
                     self._suppressed_in_window += 1
                     return
 
@@ -306,6 +316,15 @@ class HyperVManager:
         self._suppress_exit_log = False
         self._last_exit_code: Optional[int] = None
         self._exit_logged = False
+        self._auto_restart = True
+        self._restart_stop = threading.Event()
+        self._restart_lock = threading.RLock()
+        self._restart_thread: Optional[threading.Thread] = None
+        self._restart_history = deque(maxlen=32)
+        self._restart_base_backoff = 0.75
+        self._restart_max_backoff = 15.0
+        self._restart_window_sec = 120.0
+        self._restart_limit_per_window = 8
 
         atexit.register(self.teardown)
 
@@ -327,6 +346,64 @@ class HyperVManager:
         except Exception:
             return False
 
+    @staticmethod
+    def _format_exit_code(rc: Optional[int]) -> str:
+        if rc is None:
+            return "unknown"
+        value = int(rc)
+        unsigned = value & 0xFFFFFFFF
+        signed = unsigned if unsigned < 0x80000000 else unsigned - 0x100000000
+        return f"{value} (signed={signed}, hex=0x{unsigned:08X})"
+
+    def _schedule_restart(self, rc: Optional[int]) -> None:
+        if self._stopping or self._restart_stop.is_set() or not self._auto_restart:
+            return
+        with self._restart_lock:
+            if self._restart_thread and self._restart_thread.is_alive():
+                return
+            now = time.monotonic()
+            while self._restart_history and now - self._restart_history[0] > self._restart_window_sec:
+                self._restart_history.popleft()
+            if len(self._restart_history) >= self._restart_limit_per_window:
+                self._logger.log_message(
+                    "[HyperV] ❌ Restart circuit open after repeated exits; router remains alive without the C++ helper."
+                )
+                return
+            attempt = len(self._restart_history) + 1
+            delay = min(self._restart_max_backoff, self._restart_base_backoff * (2 ** max(0, attempt - 1)))
+            self._restart_history.append(now)
+            self._restart_thread = threading.Thread(
+                target=self._restart_worker,
+                args=(delay, rc, attempt),
+                name="HyperVRestartSupervisor",
+                daemon=True,
+            )
+            self._restart_thread.start()
+
+    def _restart_worker(self, delay: float, rc: Optional[int], attempt: int) -> None:
+        self._logger.log_message(
+            f"[HyperV] ⚠️ Helper exited with {self._format_exit_code(rc)}; restart attempt {attempt} scheduled in {delay:.2f}s."
+        )
+        retry = False
+        if self._restart_stop.wait(delay) or self._stopping:
+            with self._restart_lock:
+                self._restart_thread = None
+            return
+        try:
+            if self.start():
+                self._logger.log_message("[HyperV] ✅ Helper restarted; router processing continued without a process-level crash.")
+            else:
+                retry = True
+                self._logger.log_message("[HyperV] ⚠️ Helper restart failed; another supervised attempt will be made.")
+        except Exception as exc:
+            retry = True
+            self._logger.log_message(f"[HyperV] ⚠️ Restart supervisor caught: {exc}")
+        finally:
+            with self._restart_lock:
+                self._restart_thread = None
+        if retry and not self._restart_stop.is_set() and not self._stopping:
+            self._schedule_restart(rc)
+
     def _log_exit(self, rc: Optional[int]) -> None:
         with self._proc_lock:
             if self._exit_logged:
@@ -338,14 +415,14 @@ class HyperVManager:
             return
 
         if self._suppress_exit_log or (self._stopping and self._is_expected_exit(rc)):
-            self._logger.log_message(f"[HyperV] Process stopped cleanly (exit={rc}).")
+            self._logger.log_message(f"[HyperV] Process stopped cleanly (exit={self._format_exit_code(rc)}).")
             return
 
         if self._stopping:
-            self._logger.log_message(f"[HyperV] Process stopped during teardown (exit={rc}).")
+            self._logger.log_message(f"[HyperV] Process stopped during teardown (exit={self._format_exit_code(rc)}).")
             return
 
-        self._logger.log_message(f"[HyperV] Process exited unexpectedly with code {rc}.")
+        self._logger.log_message(f"[HyperV] Process exited unexpectedly with code {self._format_exit_code(rc)}.")
 
     def _wait_proc(self, proc: Optional[subprocess.Popen], timeout: float) -> Optional[int]:
         if not proc:
@@ -381,7 +458,15 @@ class HyperVManager:
                 self._logger.log_message(f"[HyperV] stdout pump error: {e}")
         finally:
             rc = self._wait_proc(proc, 1.0)
+            with self._proc_lock:
+                if self._proc is proc:
+                    self._proc = None
+                    self._reader_thread = None
+            with self._packet_pipe_lock:
+                self._close_packet_pipe_locked()
             self._log_exit(rc)
+            if not self._stopping and not self._restart_stop.is_set():
+                self._schedule_restart(rc)
 
     def _safe_close_stdin(self) -> None:
         with self._proc_lock:
@@ -704,6 +789,7 @@ class HyperVManager:
     # ---------- public API ----------
 
     def start(self) -> bool:
+        self._restart_stop.clear()
         with self._proc_lock:
             if self._proc and self._proc.poll() is None:
                 self._logger.log_message("[HyperV] Process already running.")
@@ -781,11 +867,14 @@ class HyperVManager:
             self._close_packet_pipe_locked()
 
     def teardown(self) -> None:
+        self._restart_stop.set()
         with self._proc_lock:
             proc = self._proc
             if not proc:
+                self._stopping = True
                 self._stop_packet_writer(discard=True)
                 self._stop_packet_pipe_maintainer()
+                self._stopping = False
                 return
             if self._stopping:
                 return
