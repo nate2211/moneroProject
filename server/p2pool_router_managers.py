@@ -42,7 +42,8 @@ from scapy.layers.inet6 import IPv6, ICMPv6DestUnreach, ICMPv6EchoReply, ICMPv6E
     ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo, ICMPv6ND_RS, IPv6ExtHdrRouting, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment, \
     getmacbyip6, ICMPv6NDOptUnknown, ICMPv6NDOptDstLLAddr, ICMPv6NDOptMTU
 from scapy.layers.isakmp import ISAKMP
-from scapy.layers.l2 import ARP, Ether, Dot1Q, getmacbyip
+from scapy.layers.ipsec import ESP, AH
+from scapy.layers.l2 import ARP, Ether, Dot1Q, GRE, getmacbyip
 from scapy.libs.rfc3961 import Key
 from scapy.packet import Packet, Raw, NoPayload
 from scapy.layers.inet import IP, UDP
@@ -3502,8 +3503,24 @@ class ESPManager:
 
         # Concurrency
         self._lock = threading.RLock()
+        self.log_success_packets = False
+        self._log_ts = {}
+        self._loop_cache = OrderedDict()
+        self._loop_cache_ttl = 0.75
 
-        self.log.log_message("[ESP] Manager initialized.")
+        self.log.log_message("[Tunnel] ESP/AH/GRE manager initialized.")
+
+    def _log_sparse(self, key: str, message: str, every: float = 10.0) -> None:
+        now = time.monotonic()
+        with self._lock:
+            previous = float(self._log_ts.get(key, 0.0) or 0.0)
+            if now - previous < max(0.25, float(every)):
+                return
+            self._log_ts[key] = now
+        try:
+            self.log.log_message(message)
+        except Exception:
+            pass
 
     # -------------------------
     # Public config methods
@@ -3538,6 +3555,16 @@ class ESPManager:
                 handled = self._handle_natt(pkt, inbound_iface, router_interfaces, get_mac_function, find_route_function)
             elif self._is_esp(pkt):
                 handled = self._handle_native_esp(pkt, inbound_iface, router_interfaces, get_mac_function, find_route_function)
+            elif self._is_ah(pkt):
+                handled = self._handle_stateless_tunnel(
+                    pkt, inbound_iface, router_interfaces, get_mac_function,
+                    find_route_function, protocol_name="AH",
+                )
+            elif self._is_gre(pkt):
+                handled = self._handle_stateless_tunnel(
+                    pkt, inbound_iface, router_interfaces, get_mac_function,
+                    find_route_function, protocol_name="GRE",
+                )
 
             # Periodic GC
             now = time.time()
@@ -3561,6 +3588,22 @@ class ESPManager:
         if v6 and getattr(v6, "nh", None) == 50:
             return True
         return False
+
+    @staticmethod
+    def _is_ah(pkt) -> bool:
+        ip = pkt.getlayer(IP)
+        if ip and getattr(ip, "proto", None) == 51:
+            return True
+        v6 = pkt.getlayer(IPv6)
+        return bool(v6 and getattr(v6, "nh", None) == 51) or bool(pkt.haslayer(AH))
+
+    @staticmethod
+    def _is_gre(pkt) -> bool:
+        ip = pkt.getlayer(IP)
+        if ip and getattr(ip, "proto", None) == 47:
+            return True
+        v6 = pkt.getlayer(IPv6)
+        return bool(v6 and getattr(v6, "nh", None) == 47) or bool(pkt.haslayer(GRE))
 
     def _is_natt(self, pkt) -> bool:
         udp = pkt.getlayer(UDP)
@@ -3687,6 +3730,23 @@ class ESPManager:
             # Deliver back to learned LAN iface/MAC
             return self._deliver_to_lan(pkt, entry, router_ifaces, note=f"[ESP] ⬅️ ESP spi=0x{spi:08x}")
 
+    def _handle_stateless_tunnel(
+            self, pkt, inbound_iface: str, router_ifaces: dict,
+            get_mac_function, find_route_function, *, protocol_name: str,
+    ) -> bool:
+        ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        if ip is None:
+            return False
+        return self._forward(
+            pkt,
+            outbound_to=self._dst(ip),
+            router_ifaces=router_ifaces,
+            get_mac_function=get_mac_function,
+            find_route_function=find_route_function,
+            inbound_iface=inbound_iface,
+            note=f"[Tunnel:{protocol_name}]",
+        )
+
     # -------------------------
     # Forwarding helpers
     # -------------------------
@@ -3698,13 +3758,19 @@ class ESPManager:
         """
         route = find_route_function(outbound_to)
         if not route or not route.get("interface"):
-            self.log.log_message(f"{note} ❌ No route to {outbound_to}")
+            self._log_sparse(
+                f"no-route:{note}:{outbound_to}",
+                f"{note} ❌ No route to {outbound_to}",
+            )
             return False
 
         egress = route["interface"]
         cfg = router_ifaces.get(egress)
         if not cfg:
-            self.log.log_message(f"{note} ❌ Missing iface config for {egress}")
+            self._log_sparse(
+                f"missing-iface:{note}:{egress}",
+                f"{note} ❌ Missing iface config for {egress}",
+            )
             return False
 
         fwd = pkt.copy()
@@ -3714,14 +3780,45 @@ class ESPManager:
             nh = route.get("next_hop") or outbound_to
             mac = get_mac_function(nh, egress)
             if not mac:
-                self.log.log_message(f"{note} ❌ Unknown MAC for next-hop {nh} (iface {egress.split('_')[-1]})")
-                return True  # ARP resolution will be triggered elsewhere; we consumed the packet.
+                self._log_sparse(
+                    f"unknown-mac:{note}:{egress}:{nh}",
+                    f"{note} ❌ Unknown MAC for next-hop {nh} (iface {egress.split('_')[-1]})",
+                )
+                return True  # ARP/ND resolution can complete asynchronously.
             fwd[Ether].dst = mac
 
-        # (We do NOT change IP src/dst; checksums not touched)
-        self.log.log_message(f"{note} {self._five_tuple_str(fwd)} via {egress.split('_')[-1]}")
-        self.pw._send_raw_packet(fwd, egress, allow_dst_ours=True)
-        return True
+        # Same-interface tunnel forwarding is valid for intra-LAN paths, but the
+        # recaptured frame must not circulate forever. Exact tunnel frames are
+        # suppressed briefly only after a successful same-interface send.
+        loop_key = None
+        if str(egress).casefold() == str(inbound_iface).casefold():
+            try:
+                loop_key = hashlib.blake2s(
+                    bytes(fwd), digest_size=12
+                ).hexdigest() + ":" + str(egress).casefold()
+                now = time.monotonic()
+                with self._lock:
+                    previous = float(self._loop_cache.get(loop_key, 0.0) or 0.0)
+                    if previous and now - previous <= self._loop_cache_ttl:
+                        return True
+                    self._loop_cache[loop_key] = now
+                    self._loop_cache.move_to_end(loop_key)
+                    while self._loop_cache and (
+                            len(self._loop_cache) > 2048
+                            or now - float(next(iter(self._loop_cache.values()))) > 5.0
+                    ):
+                        self._loop_cache.popitem(last=False)
+            except Exception:
+                loop_key = None
+
+        # IP headers remain unchanged; PacketWriter owns the concrete egress.
+        if self.log_success_packets:
+            self._log_sparse(
+                f"success:{note}:{egress}:{outbound_to}",
+                f"{note} {self._five_tuple_str(fwd)} via {egress.split('_')[-1]}",
+                every=1.0,
+            )
+        return bool(self.pw._send_raw_packet(fwd, egress, allow_dst_ours=True))
 
     def _deliver_to_lan(self, pkt, entry: dict, router_ifaces: dict, note: str) -> bool:
         lan_if = entry.get("lan_iface")
@@ -15062,12 +15159,16 @@ class TransportMoneroManager:
 
             sport = int(sport)
             dport = int(dport)
-            if not self._is_service_port(sport, dport):
+            family = str(
+                getattr(packet, "_transport_monero_family", "") or ""
+            ).strip().casefold()
+            if family not in {"monero_rpc", "monero_p2p", "p2pool"}:
+                family = self._service_family_from_ports(sport, dport)
+            if family == "unknown" and not self._is_service_port(sport, dport):
                 return False
 
             now = time.time()
             iface = self._iface_suffix(inbound_iface)
-            family = self._service_family_from_ports(sport, dport)
 
             fkey = self._flow_key(src_ip, sport, dst_ip, dport)
             st = self._flows.get(fkey)
@@ -32103,6 +32204,7 @@ class TransportManager:
         "_handle_http_packet": "http",
         "_handle_gulf_stratum_packet": "stratum",
         "_handle_stratum_packet": "stratum",
+        "_handle_stratum_tls_packet": "stratum",
         "_handle_https_packet": "https",
         "_handle_domain_tcp_packet": "dns",
         "_handle_dns_packet": "dns",
@@ -32111,6 +32213,7 @@ class TransportManager:
         "_handle_kerberos_packet": "kerberos",
         "_handle_rdp_packet": "rdp",
         "_handle_monero_packet": "monero",
+        "_handle_monero_tls_packet": "monero",
         "_handle_tcp_steam_packet": "steam",
         "_handle_udp_steam_packet": "steam",
         "_handle_tcp_ephemeral_packet": "tcp_ephemeral",
@@ -32158,6 +32261,22 @@ class TransportManager:
         self.started = True
         self.protocol_enabled = dict(self.DEFAULT_PROTOCOL_ENABLED)
         self._settings: Dict[str, Any] = {}
+
+        # Classification policy.  Ports are hints by default; protocol bytes,
+        # handshake context, and endpoint identity decide the primary manager.
+        self.classification_mode = "strict"
+        self.stratum_port_policy = "hint"
+        self.stratum_tls_requires_endpoint_evidence = True
+        self.analysis_payload_only = True
+        self.analysis_sample_rate = 0.15
+        self.analysis_flow_cooldown_sec = 0.25
+        self._analysis_flow_last: "OrderedDict[tuple, float]" = OrderedDict()
+        self._analysis_flow_cache_max = 65536
+        # Confirm encrypted Stratum per connection.  Never promote a learned
+        # destination port into a global protocol rule.
+        self._stratum_tls_flows: "OrderedDict[tuple, float]" = OrderedDict()
+        self._stratum_tls_flow_ttl_sec = 1800.0
+        self._stratum_tls_flow_cache_max = 65536
 
         self.logger.log_message("[Transport] Manager initialized (safe Hyper-V mode).")
 
@@ -32426,6 +32545,12 @@ class TransportManager:
         https_parse_quic_crypto: bool = True,
         tls_learning_enabled: bool = True,
         https_init_context: bool = True,
+        classification_mode: str = "strict",
+        stratum_port_policy: str = "hint",
+        stratum_tls_requires_endpoint_evidence: bool = True,
+        analysis_payload_only: bool = True,
+        analysis_sample_rate: float = 0.15,
+        analysis_flow_cooldown_sec: float = 0.25,
     ) -> None:
         requested_protocols = dict(self.DEFAULT_PROTOCOL_ENABLED)
         for key, value in dict(protocol_enabled or {}).items():
@@ -32452,11 +32577,42 @@ class TransportManager:
             monero_ports,
             TransportMoneroManager.DEFAULT_PORTS,
         )
+        # A daemon/P2P/P2Pool port cannot simultaneously become a global
+        # Stratum rule. Strict payload evidence can still identify an unusual
+        # Stratum flow on one of these ports, but port learning cannot steal it.
+        monero_stratum_overlap = resolved_stratum_ports & resolved_monero_ports
+        if monero_stratum_overlap:
+            resolved_stratum_ports -= monero_stratum_overlap
+            self.logger.log_message(
+                "[Transport][Classification] 🪙 Reserved Monero ports removed "
+                f"from Stratum port hints: {sorted(monero_stratum_overlap)}"
+            )
+
+        classification_mode = str(classification_mode or "strict").strip().casefold()
+        if classification_mode not in {"strict", "balanced", "legacy"}:
+            raise ValueError("classification_mode must be strict, balanced, or legacy")
+        stratum_port_policy = str(stratum_port_policy or "hint").strip().casefold()
+        if stratum_port_policy not in {"hint", "authoritative"}:
+            raise ValueError("stratum_port_policy must be hint or authoritative")
+        analysis_sample_rate = float(analysis_sample_rate)
+        if not 0.0 <= analysis_sample_rate <= 1.0:
+            raise ValueError("analysis_sample_rate must be between 0.0 and 1.0")
+        analysis_flow_cooldown_sec = max(0.0, float(analysis_flow_cooldown_sec))
 
         self.enabled = bool(enabled)
         self.protocol_enabled = requested_protocols
         self._tls_learning_enabled = bool(tls_learning_enabled)
         self._https_init_context = bool(https_init_context)
+        self.classification_mode = classification_mode
+        self.stratum_port_policy = stratum_port_policy
+        self.stratum_tls_requires_endpoint_evidence = bool(
+            stratum_tls_requires_endpoint_evidence
+        )
+        self.analysis_payload_only = bool(analysis_payload_only)
+        self.analysis_sample_rate = analysis_sample_rate
+        self.analysis_flow_cooldown_sec = analysis_flow_cooldown_sec
+        self._analysis_flow_last.clear()
+        self._stratum_tls_flows.clear()
         self.voip_port_range = range(start_port, end_port + 1)
         self._analysis_parallel_enabled = (
             bool(parallel_analysis)
@@ -32535,7 +32691,10 @@ class TransportManager:
             f"enabled={self.enabled} protocols="
             f"{enabled_count}/{len(self.protocol_enabled)} "
             f"stratum_ports={sorted(resolved_stratum_ports)} "
-            f"monero_ports={sorted(resolved_monero_ports)}"
+            f"monero_ports={sorted(resolved_monero_ports)} "
+            f"classification={self.classification_mode} "
+            f"stratum_port_policy={self.stratum_port_policy} "
+            f"analysis_sample={self.analysis_sample_rate:.2f}"
         )
 
     def settings_snapshot(self) -> Dict[str, Any]:
@@ -32559,6 +32718,14 @@ class TransportManager:
             "parallel_analysis": bool(
                 self._analysis_parallel_enabled
             ),
+            "classification_mode": self.classification_mode,
+            "stratum_port_policy": self.stratum_port_policy,
+            "stratum_tls_requires_endpoint_evidence": bool(
+                self.stratum_tls_requires_endpoint_evidence
+            ),
+            "analysis_payload_only": bool(self.analysis_payload_only),
+            "analysis_sample_rate": float(self.analysis_sample_rate),
+            "analysis_flow_cooldown_sec": float(self.analysis_flow_cooldown_sec),
             "tls_learning_enabled": bool(self._tls_learning_enabled),
             "https_init_context": bool(self._https_init_context),
             "shared_tls_contexts": len(self._tls_context_cache),
@@ -32581,6 +32748,345 @@ class TransportManager:
             if protocol is not None
             else bool(self.enabled and self.started)
         )
+
+    @staticmethod
+    def _tcp_payload_bytes(packet, cap: int = 256 * 1024) -> bytes:
+        try:
+            tcp = packet.getlayer(TCP)
+            payload = getattr(tcp, "payload", None) if tcp is not None else None
+            if payload is None or payload.__class__.__name__ == "NoPayload":
+                return b""
+            return bytes(payload)[:max(0, int(cap))]
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _tls_payload_kind(payload: bytes) -> Optional[str]:
+        if len(payload) < 5:
+            return None
+        content_type = int(payload[0])
+        version = int.from_bytes(payload[1:3], "big")
+        length = int.from_bytes(payload[3:5], "big")
+        if content_type not in {20, 21, 22, 23, 24}:
+            return None
+        if not 0x0300 <= version <= 0x0304 or length > 18432:
+            return None
+        if content_type == 22:
+            return "handshake"
+        if content_type in {20, 21}:
+            return "control"
+        if content_type == 23:
+            return "application"
+        return "heartbeat"
+
+    def _remember_stratum_tls_flow(self, src_ip, sport, dst_ip, dport) -> None:
+        key = self._canonical_flow_key(
+            str(src_ip), int(sport), str(dst_ip), int(dport)
+        )
+        now = time.monotonic()
+        self._stratum_tls_flows[key] = now
+        self._stratum_tls_flows.move_to_end(key)
+        while len(self._stratum_tls_flows) > self._stratum_tls_flow_cache_max:
+            self._stratum_tls_flows.popitem(last=False)
+
+    def _flow_has_confirmed_stratum(self, src_ip, sport, dst_ip, dport) -> bool:
+        now = time.monotonic()
+        canonical = self._canonical_flow_key(
+            str(src_ip), int(sport), str(dst_ip), int(dport)
+        )
+        learned_at = self._stratum_tls_flows.get(canonical)
+        if learned_at is not None:
+            if now - float(learned_at) <= self._stratum_tls_flow_ttl_sec:
+                self._stratum_tls_flows.move_to_end(canonical)
+                return True
+            self._stratum_tls_flows.pop(canonical, None)
+        try:
+            key = self.transport_stratum._flow_key(
+                str(src_ip), int(sport), str(dst_ip), int(dport)
+            )
+            state = self.transport_stratum._flows.get(key)
+            if not state:
+                return False
+            runtime = dict(state.get("runtime") or {})
+            return bool(
+                runtime.get("proto_family") in {"monero_stratum", "btc_stratum"}
+                or runtime.get("handshake_state") in {"subscribed", "authenticated", "active"}
+                or state.get("last_job_id")
+                or state.get("last_worker")
+            )
+        except Exception:
+            return False
+
+    def _gulf_endpoint_evidence(self, src_ip, sport, dst_ip, dport) -> bool:
+        try:
+            src_clean = str(src_ip).split("%", 1)[0]
+            dst_clean = str(dst_ip).split("%", 1)[0]
+            with self.transport_gulf._lock:
+                resolved = set(self.transport_gulf._resolved_ips)
+            endpoint_match = src_clean in resolved or dst_clean in resolved
+            port_match = int(sport) in self.transport_gulf.ports or int(dport) in self.transport_gulf.ports
+            return bool(endpoint_match and port_match)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _context_has_confirmed_stratum(packet) -> bool:
+        try:
+            context = dict(getattr(packet, "_handshake_transport_context", None) or {})
+            data = dict(context.get("stratum") or {})
+            event = str(context.get("event") or "").casefold()
+            transport = str(data.get("transport") or "").casefold()
+            candidate_only = transport in {"port-hint", "tls-port-hint"} or bool(
+                data.get("candidate")
+                and data.get("port_hint")
+                and not data.get("detected")
+                and not data.get("confirmed")
+            )
+            # Candidate + port_hint alone is deliberately not proof.
+            return bool(
+                not candidate_only
+                and (
+                    data.get("detected")
+                    or data.get("confirmed")
+                    or transport in {
+                        "plaintext-jsonrpc", "stratum", "stratum-over-tls", "tls-opaque"
+                    }
+                    or event in {
+                        "stratum_handshake", "stratum_job", "stratum_submit",
+                        "stratum_result", "stratum_message"
+                    }
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _json_objects_from_payload(payload: bytes) -> List[Dict[str, Any]]:
+        objects: List[Dict[str, Any]] = []
+        text = bytes(payload or b"").decode("utf-8", "ignore").strip()
+        if not text:
+            return objects
+        for line in text.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if not line or line[:1] not in "{[":
+                continue
+            try:
+                decoded = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(decoded, dict):
+                objects.append(decoded)
+            elif isinstance(decoded, list):
+                objects.extend(item for item in decoded if isinstance(item, dict))
+        return objects
+
+    def _monero_payload_evidence(self, payload: bytes, sport: int, dport: int) -> Dict[str, Any]:
+        family = self.transport_monero._service_family_from_ports(sport, dport)
+        evidence: List[str] = []
+        confidence = 0.0
+        raw_payload = bytes(payload or b"")
+        lowered = raw_payload[:65536].lower()
+
+        levin_magic = struct.pack("<Q", TransportMoneroManager.LEVIN_SIGNATURE)
+        if raw_payload.startswith(levin_magic):
+            family = "monero_p2p"
+            evidence.append("levin-signature")
+            confidence = 1.0
+
+        rpc_paths = (
+            b"/json_rpc", b"/get_height", b"/get_info", b"/get_block_template",
+            b"/submit_block", b"/get_transactions", b"/mining_status",
+            b"/start_mining", b"/stop_mining", b"/get_version",
+        )
+        http_like = lowered.startswith((b"get ", b"post ", b"http/1."))
+        if http_like and any(path in lowered[:8192] for path in rpc_paths):
+            family = "monero_rpc"
+            evidence.append("monero-rpc-http-path")
+            confidence = max(confidence, 0.99)
+
+        daemon_methods = {
+            "get_height", "get_info", "get_block_template", "submit_block",
+            "get_transactions", "get_transaction_pool", "get_version",
+            "sync_info", "mining_status", "start_mining", "stop_mining",
+            "get_balance", "get_address", "get_transfers", "transfer",
+            "relay_tx", "flush_txpool", "hard_fork_info", "get_fee_estimate",
+        }
+        for obj in self._json_objects_from_payload(raw_payload):
+            method = str(obj.get("method") or "").strip().casefold()
+            if method in daemon_methods:
+                family = "monero_rpc"
+                evidence.append(f"monero-rpc-method:{method}")
+                confidence = max(confidence, 0.99)
+                break
+
+        return {
+            "family": family,
+            "strong": bool(evidence),
+            "confidence": confidence,
+            "evidence": evidence,
+            "configured_port": family != "unknown",
+        }
+
+    def _classify_tcp_primary(self, packet, src_ip, dst_ip, sport, dport) -> Dict[str, Any]:
+        payload = self._tcp_payload_bytes(packet)
+        tls_kind = self._tls_payload_kind(payload)
+        monero = self._monero_payload_evidence(payload, int(sport), int(dport))
+        strict_stratum = False
+        try:
+            strict_stratum = self.transport_stratum._looks_like_stratum_payload(payload)
+        except Exception:
+            strict_stratum = False
+        confirmed_flow = self._flow_has_confirmed_stratum(src_ip, sport, dst_ip, dport)
+        context_stratum = self._context_has_confirmed_stratum(packet)
+        gulf_endpoint = self._gulf_endpoint_evidence(src_ip, sport, dst_ip, dport)
+        configured_port = bool(
+            int(sport) in self.transport_stratum.ports
+            or int(dport) in self.transport_stratum.ports
+        )
+
+        result = {
+            "primary": None,
+            "confidence": 0.0,
+            "evidence": [],
+            "payload": payload,
+            "tls_kind": tls_kind,
+            "configured_stratum_port": configured_port,
+            "configured_monero_port": bool(monero["configured_port"]),
+            "monero_family": monero["family"],
+        }
+
+        # Daemon RPC and Levin/P2Pool signatures are definitive and outrank the
+        # generic fact that both protocols may contain JSON.
+        if monero["strong"]:
+            result.update(
+                primary="monero", confidence=monero["confidence"],
+                evidence=list(monero["evidence"]),
+            )
+            return result
+
+        # Mining JSON-RPC remains Stratum even on an unusual Monero daemon port.
+        if strict_stratum:
+            result.update(primary="stratum", confidence=1.0, evidence=["strict-mining-jsonrpc-signature"])
+            return result
+
+        if tls_kind:
+            endpoint_evidence = confirmed_flow or context_stratum or gulf_endpoint
+            if endpoint_evidence:
+                result.update(
+                    primary="stratum_tls", confidence=0.95,
+                    evidence=["tls-record", "confirmed-stratum-endpoint"],
+                )
+            elif monero["configured_port"]:
+                result.update(
+                    primary="monero_tls", confidence=0.88,
+                    evidence=["tls-record", f"monero-service-port:{monero['family']}"],
+                )
+            elif (
+                not self.stratum_tls_requires_endpoint_evidence
+                and configured_port
+            ):
+                result.update(
+                    primary="stratum_tls", confidence=0.65,
+                    evidence=["tls-record", "configured-stratum-port"],
+                )
+            else:
+                result.update(primary="https", confidence=0.95, evidence=["tls-record"])
+            return result
+
+        if confirmed_flow or context_stratum:
+            result.update(
+                primary="stratum", confidence=0.9,
+                evidence=["confirmed-stratum-flow"],
+            )
+            return result
+
+        if gulf_endpoint:
+            result.update(
+                primary="gulf_stratum", confidence=0.85,
+                evidence=["resolved-gulf-endpoint", "gulf-service-port"],
+            )
+            return result
+
+        if monero["configured_port"]:
+            result.update(
+                primary="monero", confidence=0.78,
+                evidence=[f"monero-service-port:{monero['family']}"],
+            )
+            return result
+
+        if configured_port and (
+            self.stratum_port_policy == "authoritative"
+            or self.classification_mode == "legacy"
+        ):
+            result.update(
+                primary="stratum", confidence=0.5,
+                evidence=["authoritative-port-policy"],
+            )
+            return result
+
+        try:
+            if self.transport_http.matches_packet(packet, src_ip, dst_ip, sport, dport):
+                result.update(primary="http", confidence=0.9, evidence=["http-signature"])
+                return result
+        except Exception:
+            pass
+        return result
+
+    def _should_run_passive_analysis(self, packet, src_ip, dst_ip, sport, dport) -> bool:
+        payload = self._tcp_payload_bytes(packet) if packet.haslayer(TCP) else b""
+        if packet.haslayer(UDP):
+            try:
+                udp = packet.getlayer(UDP)
+                udp_payload = getattr(udp, "payload", None)
+                payload = (
+                    bytes(udp_payload)
+                    if udp_payload is not None and udp_payload.__class__.__name__ != "NoPayload"
+                    else b""
+                )
+            except Exception:
+                payload = b""
+        if self.analysis_payload_only and not payload:
+            return False
+
+        # Always analyze first-class protocol signatures and control packets.
+        if self._tls_payload_kind(payload):
+            return True
+        try:
+            if self.transport_stratum._looks_like_stratum_payload(payload):
+                return True
+        except Exception:
+            pass
+        try:
+            tcp = packet.getlayer(TCP)
+            flags = int(getattr(tcp, "flags", 0) or 0) if tcp is not None else 0
+            if flags & (0x02 | 0x04 | 0x01):
+                return True
+        except Exception:
+            pass
+
+        key = self._canonical_flow_key(src_ip, int(sport), dst_ip, int(dport))
+        now = time.monotonic()
+        last = float(self._analysis_flow_last.get(key, 0.0) or 0.0)
+        if now - last < self.analysis_flow_cooldown_sec:
+            return False
+        if self.analysis_sample_rate <= 0.0:
+            return False
+        # Re-sample over time instead of permanently selecting or excluding a
+        # flow based only on its endpoints.
+        sample_window = max(1.0, self.analysis_flow_cooldown_sec)
+        sample_bucket = int(now / sample_window)
+        digest = hashlib.blake2s(
+            repr((key, sample_bucket)).encode("utf-8", "replace"),
+            digest_size=2,
+        ).digest()
+        selected = int.from_bytes(digest, "big") / 65535.0 <= self.analysis_sample_rate
+        if not selected:
+            return False
+        self._analysis_flow_last[key] = now
+        self._analysis_flow_last.move_to_end(key)
+        while len(self._analysis_flow_last) > self._analysis_flow_cache_max:
+            self._analysis_flow_last.popitem(last=False)
+        return True
 
     def start(self) -> None:
         self.started = True
@@ -32904,8 +33410,11 @@ class TransportManager:
         if isinstance(transport_layer, TCP):
             sport = int(transport_layer.sport)
             dport = int(transport_layer.dport)
+            run_passive_analysis = self._should_run_passive_analysis(
+                local_packet, src_ip, dst_ip, sport, dport
+            )
 
-            if self.is_protocol_enabled("inspection"):
+            if run_passive_analysis and self.is_protocol_enabled("inspection"):
                 self._queue_analysis_from_raw(
                     self._inspect_from_raw,
                     raw_packet,
@@ -32916,7 +33425,7 @@ class TransportManager:
                     iface_short,
                     queue_name="transport_inspect_tcp_packets",
                 )
-            if self.is_protocol_enabled("scraper"):
+            if run_passive_analysis and self.is_protocol_enabled("scraper"):
                 self._queue_analysis_from_raw(
                     self._scrape_from_raw,
                     raw_packet,
@@ -32934,8 +33443,11 @@ class TransportManager:
         if isinstance(transport_layer, UDP):
             sport = int(transport_layer.sport)
             dport = int(transport_layer.dport)
+            run_passive_analysis = self._should_run_passive_analysis(
+                local_packet, src_ip, dst_ip, sport, dport
+            )
 
-            if self.is_protocol_enabled("inspection"):
+            if run_passive_analysis and self.is_protocol_enabled("inspection"):
                 self._queue_analysis_from_raw(
                     self._inspect_from_raw,
                     raw_packet,
@@ -32946,7 +33458,7 @@ class TransportManager:
                     iface_short,
                     queue_name="transport_inspect_udp_packets",
                 )
-            if self.is_protocol_enabled("scraper"):
+            if run_passive_analysis and self.is_protocol_enabled("scraper"):
                 self._queue_analysis_from_raw(
                     self._scrape_from_raw,
                     raw_packet,
@@ -32984,13 +33496,11 @@ class TransportManager:
 
 
     def _handle_tcp_packet(self, packet, src_ip, dst_ip, sport, dport, iface_short):
-        """
-        Dispatch TCP packets with content-aware precedence for HTTP and Stratum.
+        """Classify once, observe once, and forward once.
 
-        This preserves the existing port table but prevents valid Stratum work from
-        falling through to the generic high-port handler merely because a pool uses
-        a non-default port. HTTP signatures get the same treatment for alternate
-        cleartext ports. HTTPS remains passive and forwarding continues normally.
+        Content and per-flow evidence outrank service-port hints.  The fallback
+        port table remains available for legacy/authoritative mode, but learned
+        Stratum ports never become global rules in strict mode.
         """
         tcp = packet[TCP]
         flags = tcp.sprintf("%TCP.flags%")
@@ -32999,45 +33509,36 @@ class TransportManager:
             key = self._canonical_flow_key(src_ip, sport, dst_ip, dport)
             self._initiators[key] = (src_ip, int(sport))
 
-        handler = None
-
-        # Signature-aware dispatch must happen before generic high-port handling.
-        # Gulf MoneroOcean is a thin binding over the shared Stratum parser, so
-        # packets are reassembled exactly once.
-        try:
-            if (
-                self._handler_is_enabled(self._handle_gulf_stratum_packet)
-                and self.transport_gulf.matches_packet(
-                    packet, src_ip, dst_ip, sport, dport
-                )
-            ):
-                handler = self._handle_gulf_stratum_packet
-        except Exception:
+        classification = self._classify_tcp_primary(
+            packet, src_ip, dst_ip, sport, dport
+        )
+        primary = classification.get("primary")
+        handler_by_primary = {
+            "stratum_tls": self._handle_stratum_tls_packet,
+            "gulf_stratum": self._handle_gulf_stratum_packet,
+            "stratum": self._handle_stratum_packet,
+            "monero": self._handle_monero_packet,
+            "monero_tls": self._handle_monero_tls_packet,
+            "https": self._handle_https_packet,
+            "http": self._handle_http_packet,
+        }
+        handler = handler_by_primary.get(primary)
+        if handler is not None and not self._handler_is_enabled(handler):
             handler = None
 
-        if handler is None:
-            try:
-                if (
-                    self._handler_is_enabled(self._handle_stratum_packet)
-                    and self.transport_stratum.matches_packet(
-                        packet, src_ip, dst_ip, sport, dport
-                    )
-                ):
-                    handler = self._handle_stratum_packet
-            except Exception:
-                handler = None
-
-        if handler is None:
-            try:
-                if (
-                    self._handler_is_enabled(self._handle_http_packet)
-                    and self.transport_http.matches_packet(
-                        packet, src_ip, dst_ip, sport, dport
-                    )
-                ):
-                    handler = self._handle_http_packet
-            except Exception:
-                handler = None
+        try:
+            packet._transport_primary_classification = primary
+            packet._transport_classification_confidence = float(
+                classification.get("confidence") or 0.0
+            )
+            packet._transport_classification_evidence = tuple(
+                classification.get("evidence") or ()
+            )
+            packet._transport_monero_family = str(
+                classification.get("monero_family") or ""
+            )
+        except Exception:
+            pass
 
         https_ports = sorted(
             set(getattr(self.transport_https, "BROWSER_TLS_PORTS", {443}))
@@ -33049,47 +33550,48 @@ class TransportManager:
         rules = [
             ([502, 2404, 102, 4840, 20000], self._handle_scada_tcp_packet),
             ([80], self._handle_http_packet),
-            (
-                sorted(self.transport_gulf.ports),
-                self._handle_gulf_stratum_packet,
-            ),
-            (
-                sorted(self.transport_stratum.ports),
-                self._handle_stratum_packet,
-            ),
             (https_ports, self._handle_https_packet),
             ([53], self._handle_domain_tcp_packet),
             ([22], self._handle_ssh_packet),
             ([21], self._handle_ftp_packet),
             ([88], self._handle_kerberos_packet),
             ([3389], self._handle_rdp_packet),
-            (
-                sorted(self.transport_monero.ports),
-                self._handle_monero_packet,
-            ),
+            (sorted(self.transport_monero.ports), self._handle_monero_packet),
             ([(27014, 27050)], self._handle_tcp_steam_packet),
             ([(33981, 59713), (60000, 61000)], self._handle_tcp_ephemeral_packet),
             ([445, 139, 62078], self._handle_files_packet),
             ([161, 162, 10161, 10162], self._handle_snmp_tcp_packet),
-            ([(1024, 65535)], self._handle_high_server_packet),
         ]
+
+        # Compatibility escape hatch.  Strict/hint mode intentionally omits
+        # Stratum ports here so a learned or configured port cannot swallow
+        # unrelated TLS/HTTP/application traffic.
+        if (
+            self.stratum_port_policy == "authoritative"
+            or self.classification_mode == "legacy"
+        ):
+            rules[2:2] = [
+                (sorted(self.transport_gulf.ports), self._handle_gulf_stratum_packet),
+                (sorted(self.transport_stratum.ports), self._handle_stratum_packet),
+            ]
+
+        rules.append(([(1024, 65535)], self._handle_high_server_packet))
 
         if handler is None:
             for ports, candidate in rules:
-                for p in ports:
-                    if isinstance(p, tuple):
-                        lo, hi = p
+                for port_spec in ports:
+                    if isinstance(port_spec, tuple):
+                        lo, hi = port_spec
                         matched = lo <= sport <= hi or lo <= dport <= hi
                     else:
-                        matched = p in (sport, dport)
-
+                        matched = port_spec in (sport, dport)
                     if not matched:
                         continue
                     if not self._handler_is_enabled(candidate):
-                        return False
+                        continue
                     handler = candidate
                     break
-                if handler:
+                if handler is not None:
                     break
 
         if self.packet_writer.should_drop_packet(
@@ -33097,7 +33599,7 @@ class TransportManager:
         ):
             return False
 
-        if not handler:
+        if handler is None:
             return False
 
         if handler == self._handle_tcp_ephemeral_packet:
@@ -33232,6 +33734,41 @@ class TransportManager:
     def _handle_gulf_stratum_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_gulf.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
 
+    def _handle_stratum_tls_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        """Observe encrypted Stratum as TLS without feeding ciphertext to JSON-RPC.
+
+        The Stratum identity is retained only for this bidirectional flow and
+        shared as handshake context; forwarding is still performed once by the
+        caller.
+        """
+        self._remember_stratum_tls_flow(src_ip, sport, dst_ip, dport)
+        context = dict(getattr(packet, "_handshake_transport_context", None) or {})
+        if not context:
+            context = self._shared_tls_context(src_ip, sport, dst_ip, dport)
+        context = dict(context or {})
+        stratum_context = dict(context.get("stratum") or {})
+        stratum_context.update({
+            "confirmed": True,
+            "detected": True,
+            "transport": "stratum-over-tls",
+        })
+        context["stratum"] = stratum_context
+        context.setdefault("handshake_state", "encrypted")
+        self.transport_stratum.learn_handshake_context(
+            src_ip, sport, dst_ip, dport, context
+        )
+        try:
+            packet._transport_stratum_context = context
+        except Exception:
+            pass
+        if self.is_protocol_enabled("https"):
+            return self._handle_https_packet(
+                packet, src_ip, dst_ip, sport, dport, inbound_iface
+            )
+        if self._handshake_manager is None:
+            self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+        return True
+
     def _handle_stratum_packet(self,packet, src_ip, dst_ip, sport, dport, inbound_iface):
         if self._tls_learning_enabled:
             context = dict(getattr(packet, "_handshake_transport_context", None) or {})
@@ -33246,6 +33783,16 @@ class TransportManager:
                 except Exception:
                     pass
         return self.transport_stratum.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+
+    def _handle_monero_tls_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
+        # Keep Monero as the primary family while still allowing the TLS observer
+        # to record SNI/handshake metadata. Ciphertext is never fed to Stratum.
+        self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        if self.is_protocol_enabled("https"):
+            self._handle_https_packet(packet, src_ip, dst_ip, sport, dport, inbound_iface)
+        elif self._handshake_manager is None:
+            self._feed_to_tls_manager(packet, src_ip, dst_ip, sport, dport)
+        return True
 
     def _handle_monero_packet(self, packet, src_ip, dst_ip, sport, dport, inbound_iface):
         self.transport_monero.handle(packet, src_ip, dst_ip, sport, dport, inbound_iface)

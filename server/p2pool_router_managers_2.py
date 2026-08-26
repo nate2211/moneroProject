@@ -5333,7 +5333,7 @@ class HandshakeManager:
     # accepted on non-standard ports, but a port match alone remains a candidate.
     STRATUM_TCP_PORT_HINTS = XMR_TCP_PORT_HINTS | {
         3332, 3334, 3355, 3366, 3377, 3388, 3399,
-        9000, 9998, 10000, 10002, 18080, 18081,
+        9000, 9998, 10000, 10002,
     }
     STRATUM_BUFFER_MAX = 1024 * 1024
     STRATUM_MAX_MESSAGES_PER_PACKET = 64
@@ -6403,9 +6403,28 @@ class HandshakeManager:
         if hinted:
             state["port_hint"] = True
 
-        # Encrypted Stratum is still a useful handshake classification, but the
-        # JSON fields cannot be recovered without session keys.
+        # A TLS record on a common mining port is not, by itself, Stratum.
+        # Require per-flow proof: prior plaintext Stratum evidence or a pool SNI
+        # that the TLS parser positively classified.  This prevents ordinary
+        # HTTPS sessions from being promoted globally by runtime port learning.
         if flow.get("tls_detected") or self._looks_tlsish(payload):
+            pool_services = {"moneroocean", "supportxmr", "nanopool-xmr"}
+            pool_sni_evidence = bool(
+                flow.get("crypto_service_detected")
+                and flow.get("crypto_service_category") == "xmr"
+                and flow.get("crypto_service_name") in pool_services
+            )
+            prior_stratum_evidence = bool(
+                state.get("detected")
+                or int(state.get("message_count") or 0) > 0
+                or state.get("transport") == "plaintext-jsonrpc"
+            )
+            if not (pool_sni_evidence or prior_stratum_evidence):
+                state["transport"] = "tls-port-hint" if hinted else state.get("transport")
+                state["handshake_state"] = "candidate" if hinted else state.get("handshake_state")
+                return False
+
+            state["detected"] = True
             state["transport"] = "tls-opaque"
             state["handshake_state"] = "encrypted"
             if not state.get("tls_opaque_published"):
@@ -6418,6 +6437,9 @@ class HandshakeManager:
                         "handshake_state": "encrypted",
                         "server_port": server_port,
                         "direction": direction,
+                        "endpoint_evidence": (
+                            "pool-sni" if pool_sni_evidence else "prior-stratum-flow"
+                        ),
                     },
                 )
             return True
@@ -21262,6 +21284,62 @@ class DHCPServer:
                 out.add(norm)
         return out
 
+    def _coerce_ipv4_network(
+        self,
+        value=None,
+        *,
+        ip_addr=None,
+        netmask=None,
+        prefixlen=None,
+    ):
+        """Return an IPv4Network for every network representation used by the router.
+
+        ``_interfaces_config`` is shared by several managers. Some paths store an
+        ``IPv4Network`` while GUI/JSON/profile paths may retain a CIDR string. DHCP
+        membership checks must never operate directly on that mixed representation.
+        """
+        try:
+            if isinstance(value, self.ipaddress.IPv4Network):
+                return value
+            if isinstance(value, self.ipaddress.IPv4Interface):
+                return value.network
+            if isinstance(value, self.ipaddress.IPv6Network):
+                return None
+        except Exception:
+            pass
+
+        candidates = []
+        if value not in (None, ""):
+            candidates.append(value)
+        if ip_addr not in (None, "") and netmask not in (None, ""):
+            candidates.append(f"{ip_addr}/{netmask}")
+        if ip_addr not in (None, "") and prefixlen not in (None, ""):
+            candidates.append(f"{ip_addr}/{prefixlen}")
+
+        for candidate in candidates:
+            try:
+                parsed = self.ipaddress.ip_network(str(candidate).strip(), strict=False)
+            except Exception:
+                continue
+            if isinstance(parsed, self.ipaddress.IPv4Network):
+                return parsed
+        return None
+
+    def _normalize_cfg_ipv4_network(self, cfg: dict) -> dict:
+        cfg = dict(cfg or {})
+        network = self._coerce_ipv4_network(
+            cfg.get("network") or cfg.get("cidr"),
+            ip_addr=cfg.get("ip_addr"),
+            netmask=cfg.get("netmask") or cfg.get("mask"),
+            prefixlen=cfg.get("prefixlen"),
+        )
+        if network is not None:
+            cfg["network"] = network
+            cfg.setdefault("cidr", str(network))
+            cfg.setdefault("netmask", str(network.netmask))
+            cfg.setdefault("prefixlen", int(network.prefixlen))
+        return cfg
+
     def _iface_aliases(self, inbound_iface: str) -> set[str]:
         raw = str(inbound_iface or "").strip()
         aliases = {self._normalize_iface_name(raw)} if raw else set()
@@ -21831,6 +21909,7 @@ class DHCPServer:
 
     def _build_v4_reply_options(self, message_type: str, router_in_ip: str, net):
         opts = [("message-type", message_type)]
+        net = self._coerce_ipv4_network(net, ip_addr=router_in_ip)
 
         if net is not None:
             try:
@@ -21874,6 +21953,7 @@ class DHCPServer:
         except Exception:
             return False
 
+        net = self._coerce_ipv4_network(net)
         norm_mac = str(client_mac or "").lower()
         now = self.time.time()
 
@@ -21925,6 +22005,7 @@ class DHCPServer:
         except Exception:
             return False
 
+        net = self._coerce_ipv4_network(net)
         if self.enforce_same_subnet and net and requested_ip not in net:
             return False
 
@@ -22022,15 +22103,14 @@ class DHCPServer:
 
     def _iface_cfg_for(self, inbound_iface: str) -> dict:
         inbound_iface = str(inbound_iface or "")
-        cfg = dict(self._interfaces_config.get(inbound_iface, {}) or {})
-        lan_cfg = dict(self._interfaces_config.get(self.in_iface, {}) or {})
+        cfg = self._normalize_cfg_ipv4_network(
+            self._interfaces_config.get(inbound_iface, {}) or {}
+        )
+        lan_cfg = self._normalize_cfg_ipv4_network(
+            self._interfaces_config.get(self.in_iface, {}) or {}
+        )
 
         if cfg.get("ip_addr"):
-            if not cfg.get("network") and cfg.get("cidr"):
-                try:
-                    cfg["network"] = self.ipaddress.ip_network(str(cfg["cidr"]), strict=False)
-                except Exception:
-                    pass
             return cfg
 
         low = inbound_iface.lower()
@@ -22045,22 +22125,12 @@ class DHCPServer:
 
         if is_bridge_alias and lan_cfg:
             merged = dict(lan_cfg)
-            for key in ("mac", "dynamic", "kind"):
+            for key in ("mac", "dynamic", "kind", "guid", "if_index", "friendly_name", "full_name"):
                 if cfg.get(key) is not None:
                     merged[key] = cfg[key]
-            if not merged.get("network") and merged.get("cidr"):
-                try:
-                    merged["network"] = self.ipaddress.ip_network(str(merged["cidr"]), strict=False)
-                except Exception:
-                    pass
-            return merged
+            return self._normalize_cfg_ipv4_network(merged)
 
         if lan_cfg:
-            if not lan_cfg.get("network") and lan_cfg.get("cidr"):
-                try:
-                    lan_cfg["network"] = self.ipaddress.ip_network(str(lan_cfg["cidr"]), strict=False)
-                except Exception:
-                    pass
             return lan_cfg
 
         return cfg
@@ -22103,19 +22173,12 @@ class DHCPServer:
         router_in_ip = in_cfg.get("ip_addr")
         router_in_mac = in_cfg.get("mac")
 
-        net = None
-        try:
-            net = in_cfg.get("network")
-            if net is None:
-                ip_addr = in_cfg.get("ip_addr")
-                netmask = in_cfg.get("netmask") or in_cfg.get("mask")
-                prefixlen = in_cfg.get("prefixlen")
-                if ip_addr and netmask:
-                    net = self.ipaddress.IPv4Network(f"{ip_addr}/{netmask}", strict=False)
-                elif ip_addr and prefixlen is not None:
-                    net = self.ipaddress.IPv4Network(f"{ip_addr}/{int(prefixlen)}", strict=False)
-        except Exception:
-            net = None
+        net = self._coerce_ipv4_network(
+            in_cfg.get("network") or in_cfg.get("cidr"),
+            ip_addr=in_cfg.get("ip_addr"),
+            netmask=in_cfg.get("netmask") or in_cfg.get("mask"),
+            prefixlen=in_cfg.get("prefixlen"),
+        )
 
         with self._policy_lock:
             self._policy_counters["observed" if observe_only else "served"] += 1
@@ -26365,6 +26428,8 @@ class HostConnectivityBoundaryManager:
         router_dns_ports: Optional[Set[int]] = None,
         router_udp_service_ports: Optional[Set[int]] = None,
         router_tcp_service_ports: Optional[Set[int]] = None,
+        host_application_tcp_ports: Optional[Set[int]] = None,
+        host_application_udp_ports: Optional[Set[int]] = None,
     ):
         self.router_logger = router_logger
 
@@ -26386,6 +26451,12 @@ class HostConnectivityBoundaryManager:
         self.router_dns_ports = set(router_dns_ports or {53, 5353})
         self.router_udp_service_ports = set(router_udp_service_ports or {67, 68, 69, 88, 123, 137, 138, 161, 389, 464, 500, 520, 4500})
         self.router_tcp_service_ports = set(router_tcp_service_ports or {53, 88, 135, 139, 389, 443, 445, 464})
+        self.host_application_tcp_ports = {
+            int(p) for p in (host_application_tcp_ports or set()) if int(p) > 0
+        }
+        self.host_application_udp_ports = {
+            int(p) for p in (host_application_udp_ports or set()) if int(p) > 0
+        }
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -26618,7 +26689,22 @@ class HostConnectivityBoundaryManager:
         if wan_ip:
             local_ips.add(wan_ip)
 
-        # 1) Explicit router-service traffic should continue
+        # 1) Explicit local application ports are host-owned even if psutil's
+        # socket snapshot is late or unavailable. This protects the in-process
+        # Flask/API listener on port 5000 from HTTP/JSON/Stratum classifiers.
+        host_application = self._is_definitely_host_application_service(
+            src_ip, dst_ip, proto, sport, dport, local_ips
+        )
+        if host_application:
+            self._remember_owner(packet, "host")
+            return PacketBoundaryDecision(
+                action="bypass",
+                reason="host-application-service",
+                explanation=host_application,
+                confidence=100,
+            )
+
+        # 2) Explicit router-service traffic should continue
         router_service = self._is_definitely_router_service(packet, src_ip, dst_ip, proto, sport, dport, local_ips)
         if router_service:
             return PacketBoundaryDecision(
@@ -26724,6 +26810,37 @@ class HostConnectivityBoundaryManager:
     # ---------------------------------------------------------
     # router service detection
     # ---------------------------------------------------------
+
+    @staticmethod
+    def _endpoint_is_local(ip_value: Optional[str], local_ips: Set[str]) -> bool:
+        host = str(ip_value or "").split("%", 1)[0]
+        if not host:
+            return False
+        if host in local_ips:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except Exception:
+            return False
+
+    def _is_definitely_host_application_service(
+        self, src_ip: Optional[str], dst_ip: Optional[str], proto: str,
+        sport: int, dport: int, local_ips: Set[str],
+    ) -> Optional[str]:
+        ports = (
+            self.host_application_tcp_ports if proto == "TCP"
+            else self.host_application_udp_ports if proto == "UDP"
+            else set()
+        )
+        if not ports or not ({int(sport), int(dport)} & ports):
+            return None
+        if not (
+            self._endpoint_is_local(src_ip, local_ips)
+            or self._endpoint_is_local(dst_ip, local_ips)
+        ):
+            return None
+        matched = sorted({int(sport), int(dport)} & ports)
+        return f"{proto} local application port(s) {matched} are owned by this host process"
 
     def _is_definitely_router_service(
         self,

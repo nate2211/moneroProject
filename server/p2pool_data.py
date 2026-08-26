@@ -50,11 +50,23 @@ class AsyncEventLogger:
 
 
 class P2PoolProcessor:
-    def __init__(self, p2pooldata_instance, logger, stop_event, preferred_stratum_ip: str = "192.168.0.10"):
+    def __init__(self, p2pooldata_instance, logger, stop_event, preferred_stratum_ip: str = "auto"):
         self.p2pool_data = p2pooldata_instance
         self.logger = logger
         self.stop_event = stop_event
-        self.preferred_stratum_ip = preferred_stratum_ip
+        # "auto" is intentionally the default.  Older builds hard-coded
+        # 192.168.0.10, which fails on ATT Internet Air IP-passthrough hosts and
+        # on any LAN using a different subnet.  Auto binds the Stratum listener
+        # to all local IPv4 addresses unless the operator requests a specific
+        # local/public address.
+        initial_bind = str(preferred_stratum_ip or "auto").strip()
+        self.preferred_stratum_ip = initial_bind
+        self.stratum_bind_mode = (
+            "auto"
+            if initial_bind.casefold() in {"", "auto", "all", "0.0.0.0", "*"}
+            else "explicit"
+        )
+        self.stratum_port = 3333
 
         self.cpu_usage = 0.0
         self.ram_usage_mb = 0.0
@@ -105,6 +117,117 @@ class P2PoolProcessor:
         finally:
             temp_socket.close()
 
+    @staticmethod
+    def _usable_ipv4(ip_address: str) -> bool:
+        try:
+            import ipaddress
+            ip_obj = ipaddress.IPv4Address(str(ip_address).split("%", 1)[0])
+            return not (
+                ip_obj.is_unspecified
+                or ip_obj.is_loopback
+                or ip_obj.is_multicast
+                or ip_obj.is_link_local
+            )
+        except Exception:
+            return False
+
+    def _local_ipv4_candidates(self):
+        """Return active local IPv4 addresses with public addresses first.
+
+        ATT Internet Air IP passthrough can place a public IPv4 directly on the
+        Windows adapter.  That address is a valid local bind target; it must not
+        be confused with the public address reported by an external web service.
+        """
+        candidates = []
+        try:
+            stats = psutil.net_if_stats()
+            for iface, addrs in psutil.net_if_addrs().items():
+                stat = stats.get(iface)
+                if stat is not None and not stat.isup:
+                    continue
+                for addr in addrs:
+                    if getattr(addr, "family", None) != socket.AF_INET:
+                        continue
+                    ip_text = str(getattr(addr, "address", "") or "").split("%", 1)[0]
+                    if not self._usable_ipv4(ip_text):
+                        continue
+                    try:
+                        import ipaddress
+                        ip_obj = ipaddress.IPv4Address(ip_text)
+                        rank = 0 if ip_obj.is_global else 1 if ip_obj.is_private else 2
+                    except Exception:
+                        rank = 3
+                    candidates.append((rank, str(iface), ip_text))
+        except Exception as exc:
+            self.logger.log_message(f"[P2PoolProcessor] Could not enumerate local IPv4 addresses: {exc}")
+
+        seen = set()
+        ordered = []
+        for _rank, iface, ip_text in sorted(candidates, key=lambda item: (item[0], item[1], item[2])):
+            if ip_text in seen:
+                continue
+            seen.add(ip_text)
+            ordered.append((iface, ip_text))
+        return ordered
+
+    def configure_stratum_bind(self, bind_mode: str = "auto", bind_ip: Optional[str] = None, port: int = 3333):
+        mode = str(bind_mode or "auto").strip().casefold()
+        if mode not in {"auto", "passthrough", "lan", "explicit", "all"}:
+            raise ValueError("P2Pool Stratum bind mode must be auto, passthrough, lan, explicit, or all.")
+        parsed_port = int(port)
+        if not 1 <= parsed_port <= 65535:
+            raise ValueError("P2Pool Stratum port must be between 1 and 65535.")
+        explicit = str(bind_ip or "").strip()
+        if mode == "explicit" and not self._usable_ipv4(explicit):
+            raise ValueError("Explicit P2Pool Stratum bind IPv4 is invalid or unusable.")
+        self.stratum_bind_mode = mode
+        self.preferred_stratum_ip = explicit if mode == "explicit" else mode
+        self.stratum_port = parsed_port
+
+    def _select_stratum_bind_ip(self) -> str:
+        mode = str(getattr(self, "stratum_bind_mode", "auto") or "auto").strip().casefold()
+        requested = str(self.preferred_stratum_ip or "auto").strip()
+        requested_cf = requested.casefold()
+
+        if mode in {"auto", "all"} or requested_cf in {"", "auto", "all", "0.0.0.0", "*"}:
+            # Binding all local addresses is the most reliable choice for a
+            # computer that simultaneously owns an ATT passthrough/public IPv4
+            # and one or more private LAN/Hyper-V addresses.
+            return "0.0.0.0"
+
+        candidates = self._local_ipv4_candidates()
+        if mode == "explicit" or requested_cf not in {"passthrough", "public", "lan", "private"}:
+            if self._usable_ipv4(requested) and self._is_ip_bindable(requested):
+                return requested
+            self.logger.log_message(
+                f"[P2PoolProcessor] Requested bind address {requested!r} is not assigned locally; using all interfaces."
+            )
+            return "0.0.0.0"
+
+        try:
+            import ipaddress
+            if mode == "passthrough" or requested_cf in {"passthrough", "public"}:
+                for iface, ip_text in candidates:
+                    if ipaddress.IPv4Address(ip_text).is_global and self._is_ip_bindable(ip_text):
+                        self.logger.log_message(
+                            f"[P2PoolProcessor] ATT passthrough bind selected {ip_text} on {iface}."
+                        )
+                        return ip_text
+            if mode == "lan" or requested_cf in {"lan", "private"}:
+                for iface, ip_text in candidates:
+                    if ipaddress.IPv4Address(ip_text).is_private and self._is_ip_bindable(ip_text):
+                        self.logger.log_message(
+                            f"[P2PoolProcessor] LAN bind selected {ip_text} on {iface}."
+                        )
+                        return ip_text
+        except Exception as exc:
+            self.logger.log_message(f"[P2PoolProcessor] Automatic bind selection failed: {exc}")
+
+        self.logger.log_message(
+            "[P2PoolProcessor] No requested local address was bindable; using 0.0.0.0 so public-passthrough and LAN adapters remain reachable."
+        )
+        return "0.0.0.0"
+
     async def _cancel_task(self, task, label: str):
         if task and not task.done():
             task.cancel()
@@ -117,13 +240,13 @@ class P2PoolProcessor:
         if not os.path.exists(exe_path):
             return None, None
 
-        stratum_host = self.preferred_stratum_ip if self.preferred_stratum_ip and self._is_ip_bindable(self.preferred_stratum_ip) else "0.0.0.0"
+        stratum_host = self._select_stratum_bind_ip()
         args = [
             exe_path,
             "--host", "127.0.0.1",
             "--wallet", self.p2pool_data.WALLET,
             "--mini",
-            "--stratum", f"{stratum_host}:3333",
+            "--stratum", f"{stratum_host}:{int(self.stratum_port)}",
             "--no-upnp",
             "--no-color",
             "--p2p", "0.0.0.0:37888",

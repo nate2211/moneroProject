@@ -532,7 +532,30 @@ class P2PoolGUI(QMainWindow):
     def start_p2pool(self):
         self.gui_logger.log_message("[GUI] Requesting to start P2Pool...")
         if self.helper.asyncio_main_loop and self.helper.processor:
-            asyncio.run_coroutine_threadsafe(self.helper.processor.start_p2pool(), self.helper.asyncio_main_loop)
+            try:
+                bind_mode = str(
+                    self.p2pool_tab.stratum_bind_mode_combo.currentData()
+                    or "auto"
+                )
+                bind_ip = self.p2pool_tab.stratum_bind_ip_input.text().strip()
+                port = int(self.p2pool_tab.stratum_listen_port_input.text().strip() or "3333")
+                self.helper.processor.configure_stratum_bind(
+                    bind_mode=bind_mode,
+                    bind_ip=bind_ip,
+                    port=port,
+                )
+                self.gui_logger.log_message(
+                    f"[GUI] P2Pool Stratum bind mode={bind_mode} "
+                    f"address={bind_ip or 'auto/all'} port={port}."
+                )
+            except Exception as exc:
+                self.gui_logger.log_message(f"[GUI] Invalid P2Pool listener setting: {exc}")
+                return
+
+            asyncio.run_coroutine_threadsafe(
+                self.helper.processor.start_p2pool(),
+                self.helper.asyncio_main_loop,
+            )
             self.p2pool_tab.start_p2pool_button.setEnabled(False)
             self.p2pool_tab.stop_p2pool_button.setEnabled(True)
         else:
@@ -550,7 +573,13 @@ class P2PoolGUI(QMainWindow):
     def start_wireshark(self):
         self.wireshark_logger.log_message("[GUI] Requesting to start Wireshark capture...")
         if self.helper.wireshark_manager:
-            if self.helper.wireshark_manager.start_capture(main_interface_name='Wi-Fi', router_manager=self.helper.router_manager):
+            capture_settings = self.wireshark_tab.capture_settings()
+            if self.helper.wireshark_manager.start_capture(
+                    main_interface_name=capture_settings.get("main_interface", "Auto"),
+                    router_manager=self.helper.router_manager,
+                    promiscuous=bool(capture_settings.get("promiscuous", True)),
+                    settings=capture_settings,
+            ):
                 self.wireshark_tab.start_wireshark_button.setEnabled(False)
                 self.wireshark_tab.stop_wireshark_button.setEnabled(True)
             else:
@@ -651,6 +680,7 @@ class P2PoolGUI(QMainWindow):
         label: str,
         *,
         minimum: float | None = None,
+        maximum: float | None = None,
     ) -> float:
         raw = str(value or "").strip()
         if not raw:
@@ -661,6 +691,8 @@ class P2PoolGUI(QMainWindow):
             raise ValueError(f"{label} must be numeric.") from exc
         if minimum is not None and parsed < minimum:
             raise ValueError(f"{label} must be at least {minimum}.")
+        if maximum is not None and parsed > maximum:
+            raise ValueError(f"{label} must be at most {maximum}.")
         return parsed
 
     @staticmethod
@@ -1416,6 +1448,16 @@ class P2PoolGUI(QMainWindow):
                 "packet_catcher_default_rate": (
                     packet_catcher_default_rate
                 ),
+                "sniff_mac_filter_only": tab.sniff_mac_only_checkbox.isChecked(),
+                "sniff_allow_l3_loopback": tab.sniff_allow_loopback_l3_checkbox.isChecked(),
+                "sniff_allow_l3_virtual": tab.sniff_allow_virtual_l3_checkbox.isChecked(),
+                "ingress_dedupe_noise": tab.ingress_dedupe_noise_checkbox.isChecked(),
+                "tunnel_log_success": tab.tunnel_success_logs_checkbox.isChecked(),
+                "ingress_max_frames": int(tab.ingress_max_frames_input.value()),
+                "ingress_max_bytes_mb": int(tab.ingress_max_mb_input.value()),
+                "ingress_priority_reserve_frames": int(tab.ingress_reserve_frames_input.value()),
+                "ingress_worker_batch": int(tab.ingress_worker_batch_input.value()),
+                "ingress_summary_interval": int(tab.ingress_summary_interval_input.value()),
             }
 
             # ---------------- transport managers ----------------
@@ -1450,6 +1492,31 @@ class P2PoolGUI(QMainWindow):
                 ),
                 "parallel_analysis": (
                     tab.transport_parallel_analysis_checkbox.isChecked()
+                ),
+                "classification_mode": str(
+                    tab.transport_classification_mode_combo.currentData()
+                    or "strict"
+                ),
+                "stratum_port_policy": str(
+                    tab.transport_stratum_port_policy_combo.currentData()
+                    or "hint"
+                ),
+                "stratum_tls_requires_endpoint_evidence": (
+                    tab.transport_stratum_tls_endpoint_checkbox.isChecked()
+                ),
+                "analysis_payload_only": (
+                    tab.transport_analysis_payload_only_checkbox.isChecked()
+                ),
+                "analysis_sample_rate": self._float_setting(
+                    tab.transport_analysis_sample_rate_input.text(),
+                    "Passive analysis sample rate",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+                "analysis_flow_cooldown_sec": self._float_setting(
+                    tab.transport_analysis_cooldown_input.text(),
+                    "Passive analysis flow cooldown",
+                    minimum=0.0,
                 ),
                 "inspection_log_rps": self._float_setting(
                     tab.transport_inspection_rps_input.text(),
@@ -1567,7 +1634,9 @@ class P2PoolGUI(QMainWindow):
                 ),
                 "probe_rate_per_minute": int(tab.codeoutput_probe_rate_input.value()),
                 "probe_max_concurrent": int(tab.codeoutput_probe_concurrency_input.value()),
-                "probe_default_iface": tab.codeoutput_iface_dropdown.currentText().strip(),
+                "probe_default_iface": tab.selected_codeoutput_interface(),
+                "probe_use_router_path": tab.codeoutput_use_router_path_checkbox.isChecked(),
+                "virtual_wan_enabled": tab.codeoutput_virtual_wan_checkbox.isChecked(),
             }
 
             # ---------------- Wi-Fi host ----------------

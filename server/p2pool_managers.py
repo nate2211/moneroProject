@@ -87,6 +87,7 @@ class PythonRouterManager:
     DEFAULT_LOOPBACK_IFACE_FRIENDLY_NAME = "Loopback"
     NOTIFICATION_TARGET_IP = "127.0.0.1"  # IP of the machine to receive alerts
     NOTIFICATION_TARGET_PORT = 12345  # UDP Port to listen on
+    CODEOUTPUT_INTERFACE_NAME = "CodeOutputInterface"
 
     # Default private IP ranges to try for the IN interface if auto-picking
     PRIVATE_SUBNETS_TO_TRY = [
@@ -158,8 +159,15 @@ class PythonRouterManager:
         self._runtime_network_ready = threading.Event()
         self._ingress_lock = threading.RLock()
         self._ingress_states: Dict[str, Dict[str, Any]] = {}
-        self._ingress_max_frames = 16384
+        self._ingress_max_frames = 32768
         self._ingress_max_bytes = 192 * 1024 * 1024
+        self._ingress_worker_batch = 64
+        self._ingress_summary_interval = 15.0
+        self._ingress_dedupe_noise = True
+        self._ingress_noise_ttl = 0.20
+        self._sniff_mac_filter_only = True
+        self._sniff_allow_l3_loopback = True
+        self._sniff_allow_l3_virtual = True
         # High-value packets (TLS handshakes, DNS, DHCP, auth/control traffic)
         # have a separate reserve instead of competing with bulk packet bursts.
         self._ingress_priority_reserve_frames = 4096
@@ -233,6 +241,16 @@ class PythonRouterManager:
             "packet_catcher_tcp_rate": 0.60,
             "packet_catcher_udp_rate": 0.60,
             "packet_catcher_default_rate": 0.60,
+            "sniff_mac_filter_only": True,
+            "sniff_allow_l3_loopback": True,
+            "sniff_allow_l3_virtual": True,
+            "ingress_dedupe_noise": True,
+            "tunnel_log_success": False,
+            "ingress_max_frames": 32768,
+            "ingress_max_bytes_mb": 192,
+            "ingress_priority_reserve_frames": 4096,
+            "ingress_worker_batch": 64,
+            "ingress_summary_interval": 15,
         }
         self.firewall_manager = FirewallManager(router_logger)
         self.syn_scanner = None
@@ -296,6 +314,375 @@ class PythonRouterManager:
         self._nat_last_marked_public_on_lan: Optional[str] = None
         self.hyperv_enabled = False
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
+
+    @staticmethod
+    def _normalize_interface_guid(value) -> str:
+        """Return a stable ``{GUID}`` for Windows adapter selectors."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        match = re.search(
+            r"\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}?",
+            text,
+        )
+        return "{" + match.group(1).upper() + "}" if match else ""
+
+    def _windows_interface_identity_catalog(self) -> list[dict]:
+        """Build runtime adapter identities keyed by GUID, not display order/name."""
+        discovered = list(getattr(self, "_discovered_tshark_interfaces", None) or [])
+        psutil_addrs = dict(psutil.net_if_addrs() or {})
+        records: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            windows_rows = list(get_windows_if_list() or [])
+        except Exception:
+            windows_rows = []
+
+        def ipv4_for(names, row) -> str:
+            for raw in row.get("ips", []) or []:
+                try:
+                    addr = ipaddress.ip_address(str(raw).split("%", 1)[0])
+                    if addr.version == 4 and not addr.is_unspecified:
+                        return str(addr)
+                except Exception:
+                    pass
+            folded = {str(x or "").strip().casefold() for x in names if str(x or "").strip()}
+            for ifname, addrs in psutil_addrs.items():
+                if str(ifname).strip().casefold() not in folded:
+                    continue
+                for addr in addrs:
+                    if getattr(addr, "family", None) == socket.AF_INET:
+                        return str(getattr(addr, "address", "") or "")
+            return ""
+
+        for row in windows_rows:
+            guid = self._normalize_interface_guid(
+                row.get("guid") or row.get("name") or row.get("network_name")
+            )
+            friendly = str(
+                row.get("win_name") or row.get("friendlyname")
+                or row.get("description") or row.get("name") or guid
+            ).strip()
+            aliases = {
+                str(v).strip() for v in (
+                    row.get("name"), row.get("win_name"), row.get("friendlyname"),
+                    row.get("description"), row.get("network_name"), guid,
+                    f"guid:{guid}" if guid else "",
+                    f"\\Device\\NPF_{guid}" if guid else "",
+                ) if str(v or "").strip()
+            }
+            full_name = ""
+            for item in discovered:
+                full = str(item.get("full_name") or "").strip()
+                shown = str(item.get("friendly_name") or "").strip()
+                if (guid and self._normalize_interface_guid(full) == guid) or (
+                    friendly and shown.casefold() == friendly.casefold()
+                ):
+                    full_name = full
+                    aliases.update({full, shown})
+                    break
+            if not full_name:
+                full_name = str(row.get("name") or friendly or guid).strip()
+            aliases.add(full_name)
+            key = (guid.casefold(), full_name.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if_index = int(row.get("index") or row.get("if_index") or 0)
+            except Exception:
+                if_index = 0
+            records.append({
+                "selector": f"guid:{guid}" if guid else full_name,
+                "guid": guid,
+                "full_name": full_name,
+                "friendly_name": friendly or full_name,
+                "description": str(row.get("description") or "").strip(),
+                "if_index": if_index,
+                "ipv4": ipv4_for(aliases, row),
+                "aliases": sorted(a for a in aliases if a),
+            })
+
+        # Keep virtual/non-Windows interfaces usable even when they have no GUID.
+        existing_aliases = {
+            a.casefold()
+            for rec in records
+            for a in rec.get("aliases", [])
+        }
+        for item in discovered:
+            full = str(item.get("full_name") or "").strip()
+            friendly = str(item.get("friendly_name") or full).strip()
+            if not full or full.casefold() in existing_aliases:
+                continue
+            records.append({
+                "selector": full,
+                "guid": self._normalize_interface_guid(full),
+                "full_name": full,
+                "friendly_name": friendly,
+                "description": "",
+                "if_index": 0,
+                "ipv4": ipv4_for({full, friendly}, {}),
+                "aliases": sorted({full, friendly}),
+            })
+        return records
+
+    def resolve_interface_identity(self, selector) -> dict:
+        """Resolve a GUID token, NPF path, friendly name, or full name at runtime."""
+        raw = str(selector or "").strip()
+        if not raw:
+            return {}
+        special = {"peerinterface", "hypervmanager", SocketInterface.IFACE_NAME.casefold()}
+        if raw.casefold() in special:
+            return {
+                "selector": raw, "guid": "", "full_name": raw,
+                "friendly_name": raw, "if_index": 0, "ipv4": "",
+                "aliases": [raw],
+            }
+        wanted_guid = self._normalize_interface_guid(raw)
+        wanted = raw.removeprefix("guid:").strip().casefold()
+        for rec in self._windows_interface_identity_catalog():
+            aliases = {str(a).strip().casefold() for a in rec.get("aliases", [])}
+            if (wanted_guid and rec.get("guid") == wanted_guid) or wanted in aliases:
+                # Persist identity aliases into the shared interface map so DHCP's
+                # own policy matcher can compare incoming NPF names against GUIDs.
+                full = str(rec.get("full_name") or "").strip()
+                for cfg_key, cfg in list((self._interfaces_config or {}).items()):
+                    values = {str(cfg_key).strip().casefold()}
+                    if isinstance(cfg, dict):
+                        values.add(str(cfg.get("friendly_name") or "").strip().casefold())
+                    if values.intersection(aliases) or str(cfg_key).strip().casefold() == full.casefold():
+                        if isinstance(cfg, dict):
+                            cfg["guid"] = rec.get("guid") or cfg.get("guid")
+                            cfg["if_index"] = rec.get("if_index") or cfg.get("if_index")
+                            cfg["full_name"] = full or cfg_key
+                return dict(rec)
+        return {
+            "selector": raw,
+            "guid": wanted_guid,
+            "full_name": raw,
+            "friendly_name": raw,
+            "if_index": 0,
+            "ipv4": "",
+            "aliases": sorted({raw, wanted_guid, f"guid:{wanted_guid}" if wanted_guid else ""} - {""}),
+        }
+
+    def _expand_interface_selectors(self, selectors) -> set[str]:
+        if isinstance(selectors, str):
+            selectors = [selectors]
+        expanded: set[str] = set()
+        for selector in selectors or []:
+            identity = self.resolve_interface_identity(selector)
+            for value in identity.get("aliases", []) or []:
+                if str(value or "").strip():
+                    expanded.add(str(value).strip())
+            for key in ("selector", "guid", "full_name", "friendly_name"):
+                value = str(identity.get(key) or "").strip()
+                if value:
+                    expanded.add(value)
+            guid = str(identity.get("guid") or "").strip()
+            if guid:
+                expanded.add(f"guid:{guid}")
+        return expanded
+
+    def _is_local_p2pool_flask_packet(self, packet) -> bool:
+        """Keep this process's port-5000 Flask/API traffic out of router classifiers."""
+        try:
+            if not packet.haslayer(TCP):
+                return False
+            tcp = packet[TCP]
+            if 5000 not in {int(tcp.sport), int(tcp.dport)}:
+                return False
+            layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if layer is None:
+                return False
+            local_ips = set(self._get_all_local_ips() or set())
+            local_ips.update({"127.0.0.1", "::1"})
+            src = str(layer.src).split("%", 1)[0]
+            dst = str(layer.dst).split("%", 1)[0]
+            return src in local_ips or dst in local_ips
+        except Exception:
+            return False
+
+    def _ensure_codeoutput_ingress_interface(self, selector=None) -> tuple[str, dict]:
+        """Create a non-physical ingress identity for explicit CodeOutput injection.
+
+        Feeding an injected packet back through the selected physical adapter as
+        its *inbound* interface can trigger the router's hairpin/loop protection
+        when that same adapter is also the correct egress.  The synthetic ingress
+        keeps normal route lookup, NAT, firewall, classification, and forwarding
+        active without pretending that the packet was captured from the WAN/LAN.
+        """
+        identity = self.resolve_interface_identity(selector)
+        source_cfg = {}
+        candidate_names = [
+            identity.get("full_name"), identity.get("friendly_name"),
+            str(selector or "").strip(), self.interface_in_full_name,
+            self.interface_out_full_name,
+        ]
+        for candidate in candidate_names:
+            if not candidate:
+                continue
+            cfg = self._interfaces_config.get(candidate)
+            if isinstance(cfg, dict):
+                source_cfg = dict(cfg)
+                break
+
+        pseudo = self.CODEOUTPUT_INTERFACE_NAME
+        pseudo_cfg = dict(source_cfg)
+        ipv4 = str(identity.get("ipv4") or pseudo_cfg.get("ip_addr") or "").strip()
+        if ipv4:
+            pseudo_cfg["ip_addr"] = ipv4
+        pseudo_cfg.update({
+            "friendly_name": pseudo,
+            "full_name": pseudo,
+            "name": pseudo,
+            "alias": pseudo,
+            "kind": "codeoutput_virtual_wan",
+            "role": "wan",
+            "is_wan": True,
+            "route_capable": True,
+            "capture_capable": True,
+            "programmatic_interface": True,
+            "dynamic": True,
+            "codeoutput_source_selector": str(selector or "").strip(),
+            "codeoutput_source_guid": str(identity.get("guid") or "").strip(),
+            "codeoutput_source_full_name": str(identity.get("full_name") or "").strip(),
+        })
+        # Keep a usable MAC for managers that inspect ingress metadata, but this
+        # pseudo interface is never passed to Npcap/WinDivert for transmission.
+        pseudo_cfg.setdefault("mac", self.mac_in or self.mac_out or "02:00:00:00:00:01")
+        self._interfaces_config[pseudo] = pseudo_cfg
+        return pseudo, identity
+
+    def ingest_codeoutput_packet(
+            self, packet, *, source_iface=None, direction: str = "wan-in",
+            metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Queue a programmatically received packet as CodeOutput WAN ingress."""
+        if not self.code_output_manager.settings_snapshot().get("virtual_wan_enabled", True):
+            return False
+        pkt = self._coerce_ingress_packet(packet)
+        if pkt is None or self._is_local_p2pool_flask_packet(pkt):
+            return False
+        pseudo, identity = self._ensure_codeoutput_ingress_interface(source_iface)
+        setattr(pkt, "sniffed_on", pseudo)
+        setattr(pkt, "_codeoutput_virtual_capture", True)
+        setattr(pkt, "_codeoutput_direction", str(direction or "wan-in"))
+        setattr(pkt, "_codeoutput_metadata", dict(metadata or {}))
+        setattr(pkt, "_capture_interface", pseudo)
+        accepted = self.enqueue_ingress_packet(pkt, pseudo)
+        if accepted:
+            self.code_output_manager.submit_event(
+                "router",
+                attributes={
+                    "mode": "virtual-wan-ingress",
+                    "direction": str(direction or "wan-in"),
+                    "source_iface": identity.get("full_name") or source_iface,
+                    "source_guid": identity.get("guid"),
+                },
+                tags=["codeoutput", "virtual-wan", "ingress"],
+                importance=2,
+                source="CodeOutputInterface",
+            )
+        return bool(accepted)
+
+    def route_codeoutput_packet(
+            self, packet, *, inbound_iface=None, egress_iface=None,
+            reason: str = "codeoutput-explicit",
+    ) -> bool:
+        """Route an explicitly requested CodeOutput packet through the live router.
+
+        Passive CodeOutput observations remain read-only.  An explicit egress uses
+        PacketWriter immediately; an automatic route enters the normal router on a
+        synthetic ingress so route lookup cannot mistake it for a physical hairpin.
+        """
+        pkt = self._coerce_ingress_packet(packet)
+        if pkt is None:
+            return False
+        if self._is_local_p2pool_flask_packet(pkt):
+            self.router_logger.log_message(
+                "[CodeOutput][Route] ⏭️ Refused to reinject local P2Pool Flask/API traffic."
+            )
+            return False
+
+        setattr(pkt, "_codeoutput_explicit_route", True)
+        setattr(pkt, "_codeoutput_route_reason", str(reason or "codeoutput-explicit"))
+
+        if egress_iface:
+            identity = self.resolve_interface_identity(egress_iface)
+            target_iface = str(identity.get("full_name") or "").strip()
+            if not target_iface:
+                self.router_logger.log_message(
+                    f"[CodeOutput][Route] ❌ Could not resolve egress interface {egress_iface!r}."
+                )
+                return False
+            self.code_output_manager.submit_event(
+                "router",
+                attributes={
+                    "reason": reason,
+                    "mode": "explicit-egress",
+                    "egress_iface": target_iface,
+                    "egress_guid": identity.get("guid"),
+                },
+                tags=["codeoutput", "explicit-route"], importance=3,
+                source="CodeOutput",
+            )
+            sent = bool(self.packet_writer._send_raw_packet(
+                pkt, target_iface, allow_dst_ours=True, no_consume=True
+            ))
+            self.router_logger.log_message(
+                f"[CodeOutput][Route] {'✅' if sent else '❌'} explicit egress={target_iface} reason={reason}."
+            )
+            return sent
+
+        source_iface, identity = self._ensure_codeoutput_ingress_interface(inbound_iface)
+        self.code_output_manager.submit_event(
+            "router",
+            attributes={
+                "reason": reason,
+                "mode": "router-lookup",
+                "ingress_iface": source_iface,
+                "selected_source_iface": identity.get("full_name") or inbound_iface,
+                "selected_source_guid": identity.get("guid"),
+            },
+            tags=["codeoutput", "explicit-route", "router-lookup"],
+            importance=3,
+            source="CodeOutput",
+        )
+        accepted = self.enqueue_ingress_packet(pkt, source_iface)
+        if not accepted:
+            self._ingress_log_sparse(
+                "codeoutput-route-rejected",
+                f"[CodeOutput][Route] Router ingress queue rejected packet reason={reason}.",
+                every=10.0,
+            )
+        return bool(accepted)
+
+    def _current_wan_transit_ifaces(self) -> set[str]:
+        result: set[str] = set()
+        try:
+            result.update(self.outbound_load_balancer.get_configured_interfaces() or set())
+        except Exception:
+            pass
+        for value in (
+                getattr(self, "interface_out_full_name", None),
+                getattr(self, "interface_out_friendly_name", None),
+        ):
+            value = str(value or "").strip()
+            if value:
+                result.add(value)
+        for iface, cfg in list((self._interfaces_config or {}).items()):
+            if not isinstance(cfg, dict):
+                continue
+            if bool(cfg.get("is_wan")) or str(cfg.get("role") or "").casefold() == "wan":
+                result.add(str(iface))
+                for key in ("full_name", "friendly_name", "name", "alias"):
+                    value = str(cfg.get(key) or "").strip()
+                    if value:
+                        result.add(value)
+        return result
 
     def _current_lan_transit_ifaces(self) -> set[str]:
         """
@@ -2418,19 +2805,114 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 return 1
 
     @staticmethod
-    def _ingress_priority_value(packet) -> int:
+    def _ingress_flow_key(packet) -> str:
+        parsed = packet
+        if isinstance(packet, (bytes, bytearray, memoryview)):
+            raw_bytes = bytes(packet)
+            if not raw_bytes:
+                return "raw:empty"
+            try:
+                version = (raw_bytes[0] >> 4) & 0x0F
+                if version == 4:
+                    parsed = IP(raw_bytes)
+                elif version == 6:
+                    parsed = IPv6(raw_bytes)
+                elif len(raw_bytes) >= 14:
+                    parsed = Ether(raw_bytes)
+            except Exception:
+                return f"raw:{hashlib.sha1(raw_bytes[:96]).hexdigest()[:12]}"
+        try:
+            ip_layer = parsed.getlayer(IP) or parsed.getlayer(IPv6)
+            tcp = parsed.getlayer(TCP)
+            udp = parsed.getlayer(UDP)
+            if ip_layer is not None and tcp is not None:
+                left = (str(ip_layer.src), int(tcp.sport))
+                right = (str(ip_layer.dst), int(tcp.dport))
+                a, b = (left, right) if left <= right else (right, left)
+                return f"tcp:{a[0]}:{a[1]}-{b[0]}:{b[1]}"
+            if ip_layer is not None and udp is not None:
+                left = (str(ip_layer.src), int(udp.sport))
+                right = (str(ip_layer.dst), int(udp.dport))
+                a, b = (left, right) if left <= right else (right, left)
+                return f"udp:{a[0]}:{a[1]}-{b[0]}:{b[1]}"
+            if parsed.haslayer(ARP):
+                arp = parsed.getlayer(ARP)
+                return f"arp:{getattr(arp, 'psrc', '')}->{getattr(arp, 'pdst', '')}"
+        except Exception:
+            pass
+        return "other"
+
+    @staticmethod
+    def _strict_stratum_payload(payload: bytes) -> bool:
+        if not payload:
+            return False
+        sample = bytes(payload[:16384]).lstrip(b" \t\r\n\x00").lower()
+        if not sample:
+            return False
+        strong = (
+            b'"method":"mining.subscribe"', b'"method": "mining.subscribe"',
+            b'"method":"mining.authorize"', b'"method": "mining.authorize"',
+            b'"method":"mining.notify"', b'"method": "mining.notify"',
+            b'"method":"mining.submit"', b'"method": "mining.submit"',
+            b'"method":"login"', b'"method": "login"',
+            b'"method":"job"', b'"method": "job"',
+            b'"method":"submit"', b'"method": "submit"',
+            b'"method":"keepalived"', b'"method": "keepalived"',
+        )
+        if any(token in sample for token in strong):
+            return True
+        mining_keys = sum(
+            int(token in sample)
+            for token in (
+                b'"job_id"', b'"blob"', b'"target"', b'"seed_hash"',
+                b'"nonce"', b'"difficulty"', b'"algo"',
+            )
+        )
+        return mining_keys >= 4 and (sample.startswith(b"{") or sample.startswith(b"["))
+
+    @staticmethod
+    def _tls_payload_kind(payload: bytes) -> str:
+        if len(payload) < 5:
+            return ""
+        content_type = int(payload[0])
+        version = int.from_bytes(payload[1:3], "big")
+        record_len = int.from_bytes(payload[3:5], "big")
+        if content_type not in {20, 21, 22, 23, 24}:
+            return ""
+        if not 0x0300 <= version <= 0x0304 or record_len > 18432:
+            return ""
+        if content_type == 22:
+            if len(payload) >= 6 and payload[5] in {1, 2, 4, 8, 11, 13, 15, 20}:
+                return "handshake"
+            return "handshake-fragment"
+        if content_type in {20, 21}:
+            return "control"
+        if content_type == 23:
+            return "application"
+        return "heartbeat"
+
+    def _ingress_priority_value(self, packet) -> int:
         """Return 0=normal, 1=elevated, 2=high, 3=critical.
 
-        Sniffer-enriched packets carry authoritative priority metadata. Raw
-        Hyper-V/WinDivert frames receive a bounded lightweight classification so
-        Stratum, DNS, TLS, DHCP, NDP, authentication, and control-plane traffic
-        is not preferentially discarded when an interface queue is pressured.
+        Priority is based on packet evidence, not merely a popular port number.
+        This prevents busy TLS/application-data and unrelated traffic on a
+        learned Stratum port from occupying the protected queue reserve.
         """
         try:
             label = str(getattr(packet, "_capture_priority", "") or "").casefold()
-            if label == "critical":
+            metadata = dict(getattr(packet, "_protocol_metadata", None) or {})
+            # Trust enriched critical/high labels only when the parser attached
+            # real protocol evidence.  Port-hint-only labels are downgraded.
+            authoritative = any(
+                key in metadata
+                for key in ("stratum", "dhcp", "dns", "ndp", "eapol", "ike", "kerberos")
+            )
+            tls_meta = dict(metadata.get("tls") or {})
+            if tls_meta.get("client_hello") or tls_meta.get("server_hello"):
+                authoritative = True
+            if label == "critical" and authoritative:
                 return 3
-            if label == "high" or bool(getattr(packet, "_capture_high_value", False)):
+            if label == "high" and authoritative:
                 return 2
             if label == "elevated":
                 return 1
@@ -2439,17 +2921,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
         parsed = packet
         if isinstance(packet, (bytes, bytearray, memoryview)):
-            raw = bytes(packet)
-            if not raw:
+            raw_bytes = bytes(packet)
+            if not raw_bytes:
                 return 0
             try:
-                version = (raw[0] >> 4) & 0x0F
+                version = (raw_bytes[0] >> 4) & 0x0F
                 if version == 4:
-                    parsed = IP(raw)
+                    parsed = IP(raw_bytes)
                 elif version == 6:
-                    parsed = IPv6(raw)
-                elif len(raw) >= 14:
-                    parsed = Ether(raw)
+                    parsed = IPv6(raw_bytes)
+                elif len(raw_bytes) >= 14:
+                    parsed = Ether(raw_bytes)
             except Exception:
                 return 0
 
@@ -2459,61 +2941,181 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if parsed.haslayer(DNS):
                 return 2
             if parsed.haslayer(ARP):
-                return 1
+                return 2
             if parsed.haslayer(ICMPv6ND_NS) or parsed.haslayer(ICMPv6ND_NA):
                 return 2
         except Exception:
             pass
 
-        critical_tcp = {
+        stratum_ports = {
             3333, 4444, 5555, 6666, 7777, 8888, 9999,
             10001, 10128, 10132, 14444, 24444,
         }
-        high_tcp = {
-            22, 25, 53, 80, 88, 110, 135, 139, 143, 389, 443, 445,
-            465, 587, 636, 853, 993, 995, 1433, 1521, 2375, 2376,
-            3306, 3389, 5432, 5671, 5672, 6379, 8080, 8443, 8883,
-            9092, 18080, 18081, 18082, 18083, 18084,
+        important_tcp = {
+            22, 53, 80, 88, 389, 443, 445, 636, 853, 3389, 8443,
+            18080, 18081, 18082, 18083, 18084,
         }
-        high_udp = {
-            53, 67, 68, 88, 123, 161, 162, 389, 443, 500, 514, 520,
-            546, 547, 1900, 3702, 4500, 4789, 51820, 5353, 5355,
-            6081, 8472, 9993,
+        important_udp = {
+            53, 67, 68, 88, 123, 161, 162, 443, 500, 520,
+            546, 547, 4500, 51820, 5353, 5355,
         }
         try:
             tcp = parsed.getlayer(TCP)
             if tcp is not None:
-                ports = {int(tcp.sport), int(tcp.dport)}
-                if ports & critical_tcp:
+                flags = int(getattr(tcp, "flags", 0) or 0)
+                payload_obj = getattr(tcp, "payload", None)
+                payload = (
+                    bytes(payload_obj)
+                    if payload_obj is not None and payload_obj.__class__.__name__ != "NoPayload"
+                    else b""
+                )
+                if self._strict_stratum_payload(payload):
                     return 3
-                if ports & high_tcp:
+                tls_kind = self._tls_payload_kind(payload)
+                if tls_kind in {"handshake", "handshake-fragment", "control"}:
                     return 2
+                if flags & 0x04 or (flags & 0x02 and not flags & 0x10):
+                    return 2
+                if flags & 0x01:
+                    return 1
+                # Port numbers alone never receive queue protection. This keeps
+                # ordinary HTTPS, Monero daemon, and learned-Stratum-port bulk data
+                # from crowding out unrelated flows. Payload/control evidence above
+                # remains protected.
+                return 0
             udp = parsed.getlayer(UDP)
-            if udp is not None and {int(udp.sport), int(udp.dport)} & high_udp:
-                return 2
+            if udp is not None:
+                ports = {int(udp.sport), int(udp.dport)}
+                if ports & {500, 4500}:  # IKE/NAT-T control plane
+                    return 2
+                if ports & {51820}:      # WireGuard handshake/data hint
+                    return 1
+                return 0
         except Exception:
             pass
         return 0
 
     @staticmethod
-    def _drop_ingress_for_pressure(q: deque, incoming_priority: int):
+    def _ingress_noise_fingerprint(packet, priority: int) -> Optional[str]:
+        """Return a short fingerprint only for repeatable low-value fan-out traffic."""
+        if int(priority) != 0:
+            return None
+        parsed = packet
+        raw_bytes = b""
+        try:
+            if isinstance(packet, (bytes, bytearray, memoryview)):
+                raw_bytes = bytes(packet)
+                if not raw_bytes:
+                    return None
+                version = (raw_bytes[0] >> 4) & 0x0F
+                if version == 4:
+                    parsed = IP(raw_bytes)
+                elif version == 6:
+                    parsed = IPv6(raw_bytes)
+                elif len(raw_bytes) >= 14:
+                    parsed = Ether(raw_bytes)
+            ip_layer = parsed.getlayer(IP) or parsed.getlayer(IPv6)
+            ether = parsed.getlayer(Ether)
+            multicast_or_broadcast = False
+            if ip_layer is not None:
+                dst = ipaddress.ip_address(str(ip_layer.dst).split("%", 1)[0])
+                multicast_or_broadcast = bool(dst.is_multicast)
+                if dst.version == 4 and str(dst) == "255.255.255.255":
+                    multicast_or_broadcast = True
+            if ether is not None and str(ether.dst).casefold() == "ff:ff:ff:ff:ff:ff":
+                multicast_or_broadcast = True
+            if not multicast_or_broadcast:
+                return None
+            if parsed.haslayer(DHCP) or parsed.haslayer(DHCP6) or parsed.haslayer(ARP):
+                return None
+            if not raw_bytes:
+                raw_bytes = bytes(parsed)
+            return hashlib.blake2s(raw_bytes[:512], digest_size=12).hexdigest()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _drop_ingress_for_pressure(
+            q: deque, incoming_priority: int, *, now: Optional[float] = None,
+            stale_after: float = 2.0,
+    ):
         if not q:
             return None
+        now = time.monotonic() if now is None else float(now)
 
-        # Prefer evicting the oldest packet in the lowest available priority.
-        lowest = min(int(item[3]) for item in q)
-        if int(incoming_priority) < lowest:
-            # Preserve a queue made entirely of more important traffic.
+        # Never evict a more valuable lane for a lower-value arrival. Within the
+        # lowest eligible lane, stale work goes first, then the oldest frame from
+        # the most overrepresented flow. Queue order is otherwise unchanged.
+        eligible_priorities = sorted({
+            int(item[3]) for item in q if int(item[3]) <= int(incoming_priority)
+        })
+        if not eligible_priorities:
+            return None
+        lane = eligible_priorities[0]
+        lane_items = [
+            (index, item) for index, item in enumerate(q) if int(item[3]) == lane
+        ]
+        if not lane_items:
             return None
 
-        drop_index = 0
-        for index, item in enumerate(q):
-            if int(item[3]) == lowest:
-                drop_index = index
-                break
+        stale = [
+            (index, item) for index, item in lane_items
+            if now - float(item[2]) >= max(0.1, float(stale_after))
+        ]
+        if stale:
+            drop_index = stale[0][0]
+        else:
+            flow_counts = collections.Counter(
+                str(item[4] if len(item) > 4 else "other")
+                for _, item in lane_items
+            )
+            heaviest_flow = flow_counts.most_common(1)[0][0]
+            drop_index = next(
+                index for index, item in lane_items
+                if str(item[4] if len(item) > 4 else "other") == heaviest_flow
+            )
         dropped = q[drop_index]
         del q[drop_index]
         return dropped
+
+    def _maybe_log_ingress_summary(self, state: Dict[str, Any], *, force: bool = False) -> None:
+        now = time.monotonic()
+        interval = max(5.0, float(self._ingress_summary_interval))
+        cv = state["cv"]
+        with cv:
+            previous = float(state.get("last_summary", 0.0) or 0.0)
+            changed = any(
+                int(state.get(name, 0)) != int(state.get(f"summary_{name}", 0))
+                for name in ("enqueued", "processed", "dropped", "rejected", "coalesced", "evicted")
+            )
+            if not force and (not changed or now - previous < interval):
+                return
+            state["last_summary"] = now
+            snapshot = {
+                name: int(state.get(name, 0))
+                for name in ("enqueued", "processed", "dropped", "rejected", "coalesced", "evicted")
+            }
+            deltas = {
+                name: snapshot[name] - int(state.get(f"summary_{name}", 0))
+                for name in snapshot
+            }
+            for name, value in snapshot.items():
+                state[f"summary_{name}"] = value
+            queued = len(state["queue"])
+            queued_bytes = int(state["bytes"])
+            max_depth = int(state.get("max_depth", 0))
+            latency_ms = float(state.get("latency_ewma_ms", 0.0))
+            priorities = dict(state.get("queued_by_priority", {}))
+        try:
+            self.router_logger.log_message(
+                f"[RouterIngress] {state['iface']} queued={queued}/{self._ingress_max_frames} "
+                f"bytes={queued_bytes}/{self._ingress_max_bytes} lanes={priorities} "
+                f"delta(enq={deltas['enqueued']} ok={deltas['processed']} evict={deltas['evicted']} "
+                f"reject={deltas['rejected']} coalesce={deltas['coalesced']}) "
+                f"max_depth={max_depth} latency_ewma_ms={latency_ms:.2f}"
+            )
+        except Exception:
+            pass
 
     def _ensure_ingress_state(self, inbound_iface: str) -> Dict[str, Any]:
         key = str(inbound_iface or "Unknown")
@@ -2533,10 +3135,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "enqueued": 0,
                 "processed": 0,
                 "dropped": 0,
+                "rejected": 0,
+                "coalesced": 0,
+                "evicted": 0,
                 "dropped_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
                 "queued_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
                 "errors": 0,
                 "last_progress": time.monotonic(),
+                "last_summary": time.monotonic(),
+                "max_depth": 0,
+                "latency_ewma_ms": 0.0,
+                "recent_noise": collections.OrderedDict(),
             }
             thread = threading.Thread(
                 target=self._ingress_worker_loop,
@@ -2550,23 +3159,24 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             return state
 
     def enqueue_ingress_packet(self, packet, inbound_iface: str = "Unknown") -> bool:
-        """Non-blocking ingress API used by capture and virtual-pipe readers."""
+        """Non-blocking, evidence-prioritized ingress with aggregated pressure reporting."""
         if packet is None or self._stop_sniffing_event.is_set():
             return False
 
         state = self._ensure_ingress_state(inbound_iface)
         size = self._estimate_ingress_size(packet)
         priority = self._ingress_priority_value(packet)
+        flow_key = self._ingress_flow_key(packet)
         single_packet_limit = self._ingress_max_bytes + (
             self._ingress_priority_reserve_bytes if priority >= 2 else 0
         )
         if size > single_packet_limit:
+            with state["cv"]:
+                state["dropped"] += 1
+                state["rejected"] += 1
+                state["dropped_by_priority"][int(priority)] += 1
             self._ingress_total_dropped += 1
-            self._ingress_log_sparse(
-                f"oversize:{inbound_iface}",
-                f"[RouterIngress] ❌ Oversize priority={priority} packet rejected on {inbound_iface}; bytes={size}",
-                every=1.0,
-            )
+            self._maybe_log_ingress_summary(state)
             return False
 
         if isinstance(packet, (bytearray, memoryview)):
@@ -2579,62 +3189,76 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         byte_limit = self._ingress_max_bytes + (
             self._ingress_priority_reserve_bytes if priority >= 2 else 0
         )
-        dropped_now = 0
-        dropped_priorities = collections.Counter()
+        now = time.monotonic()
+        noise_fp = (
+            self._ingress_noise_fingerprint(packet, priority)
+            if self._ingress_dedupe_noise else None
+        )
+
         with cv:
-            q = state["queue"]
-            while q and (
-                    len(q) >= frame_limit
-                    or int(state["bytes"]) + size > byte_limit
-            ):
-                dropped = self._drop_ingress_for_pressure(q, priority)
-                if dropped is None:
-                    break
-                _old_packet, old_size, _old_ts, old_priority = dropped
-                state["bytes"] = max(0, int(state["bytes"]) - int(old_size))
-                state["dropped"] += 1
-                state["dropped_by_priority"][int(old_priority)] += 1
-                state["queued_by_priority"][int(old_priority)] = max(
-                    0,
-                    int(state["queued_by_priority"][int(old_priority)]) - 1,
-                )
-                self._ingress_total_dropped += 1
-                dropped_priorities[int(old_priority)] += 1
-                dropped_now += 1
+            if noise_fp:
+                recent = state["recent_noise"]
+                previous = float(recent.get(noise_fp, 0.0) or 0.0)
+                recent[noise_fp] = now
+                recent.move_to_end(noise_fp)
+                while recent and (
+                        len(recent) > 4096
+                        or now - float(next(iter(recent.values()))) > 2.0
+                ):
+                    recent.popitem(last=False)
+                if previous and now - previous <= self._ingress_noise_ttl:
+                    state["dropped"] += 1
+                    state["coalesced"] += 1
+                    state["dropped_by_priority"][int(priority)] += 1
+                    self._ingress_total_dropped += 1
+                    accepted = False
+                else:
+                    accepted = None
+            else:
+                accepted = None
 
-            if len(q) >= frame_limit or int(state["bytes"]) + size > byte_limit:
-                state["dropped"] += 1
-                state["dropped_by_priority"][int(priority)] += 1
-                self._ingress_total_dropped += 1
-                self._ingress_log_sparse(
-                    f"reject:{state['iface']}:{priority}",
-                    f"[RouterIngress] ❌ priority={priority} packet rejected on {state['iface']}; queued={len(q)} bytes={state['bytes']} limits={frame_limit}/{byte_limit}",
-                    every=1.0,
-                )
-                return False
+            if accepted is False:
+                pass
+            else:
+                q = state["queue"]
+                while q and (
+                        len(q) >= frame_limit
+                        or int(state["bytes"]) + size > byte_limit
+                ):
+                    dropped = self._drop_ingress_for_pressure(
+                        q, priority, now=now,
+                        stale_after=max(0.5, self._ingress_summary_interval / 3.0),
+                    )
+                    if dropped is None:
+                        break
+                    _old_packet, old_size, _old_ts, old_priority, _old_flow = dropped
+                    state["bytes"] = max(0, int(state["bytes"]) - int(old_size))
+                    state["dropped"] += 1
+                    state["evicted"] += 1
+                    state["dropped_by_priority"][int(old_priority)] += 1
+                    state["queued_by_priority"][int(old_priority)] = max(
+                        0, int(state["queued_by_priority"][int(old_priority)]) - 1,
+                    )
+                    self._ingress_total_dropped += 1
 
-            q.append((packet, size, time.monotonic(), int(priority)))
-            state["bytes"] = int(state["bytes"]) + size
-            state["enqueued"] += 1
-            state["queued_by_priority"][int(priority)] += 1
-            self._ingress_total_enqueued += 1
-            cv.notify()
+                if len(q) >= frame_limit or int(state["bytes"]) + size > byte_limit:
+                    state["dropped"] += 1
+                    state["rejected"] += 1
+                    state["dropped_by_priority"][int(priority)] += 1
+                    self._ingress_total_dropped += 1
+                    accepted = False
+                else:
+                    q.append((packet, size, now, int(priority), flow_key))
+                    state["bytes"] = int(state["bytes"]) + size
+                    state["enqueued"] += 1
+                    state["queued_by_priority"][int(priority)] += 1
+                    state["max_depth"] = max(int(state["max_depth"]), len(q))
+                    self._ingress_total_enqueued += 1
+                    cv.notify()
+                    accepted = True
 
-        if dropped_now:
-            self._ingress_log_sparse(
-                f"pressure:{state['iface']}",
-                RouterRandomMessages(
-                    name="RouterIngress",
-                    message=(
-                        f"pressure on {state['iface']}; evicted={dropped_now} "
-                        f"priorities={dict(dropped_priorities)} "
-                        f"queued={len(state['queue'])} bytes={state['bytes']}"
-                    ),
-                    emoticons=["⚠️", "📦", "🛡️"],
-                ),
-                every=30.0,
-            )
-        return True
+        self._maybe_log_ingress_summary(state)
+        return bool(accepted)
 
     ingest_packet = enqueue_ingress_packet
 
@@ -2644,29 +3268,42 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         iface = state["iface"]
 
         while not stop_event.is_set():
+            batch = []
             with cv:
                 while not state["queue"] and not stop_event.is_set():
                     cv.wait(timeout=0.25)
                 if stop_event.is_set() and not state["queue"]:
                     break
-                packet, size, queued_ts, priority = state["queue"].popleft()
-                state["bytes"] = max(0, int(state["bytes"]) - int(size))
-                state["queued_by_priority"][int(priority)] = max(
-                    0,
-                    int(state["queued_by_priority"][int(priority)]) - 1,
-                )
+                batch_size = min(max(1, int(self._ingress_worker_batch)), len(state["queue"]))
+                for _ in range(batch_size):
+                    packet, size, queued_ts, priority, flow_key = state["queue"].popleft()
+                    state["bytes"] = max(0, int(state["bytes"]) - int(size))
+                    state["queued_by_priority"][int(priority)] = max(
+                        0, int(state["queued_by_priority"][int(priority)]) - 1,
+                    )
+                    batch.append((packet, size, queued_ts, priority, flow_key))
 
-            try:
-                self.process_packet(packet, iface)
-                state["processed"] += 1
-                self._ingress_total_processed += 1
-                state["last_progress"] = time.monotonic()
-            except Exception as exc:
-                state["errors"] += 1
-                self._ingress_log_sparse(
-                    f"worker-error:{iface}",
-                    f"[Router][Ingress] ❗ worker error on {iface}: {type(exc).__name__}: {exc}",
-                )
+            for packet, size, queued_ts, priority, flow_key in batch:
+                try:
+                    self.process_packet(packet, iface)
+                    latency_ms = max(0.0, (time.monotonic() - float(queued_ts)) * 1000.0)
+                    with cv:
+                        previous = float(state.get("latency_ewma_ms", 0.0))
+                        state["latency_ewma_ms"] = latency_ms if previous <= 0 else (previous * 0.90 + latency_ms * 0.10)
+                        state["processed"] += 1
+                        state["last_progress"] = time.monotonic()
+                    self._ingress_total_processed += 1
+                except Exception as exc:
+                    with cv:
+                        state["errors"] += 1
+                    self._ingress_log_sparse(
+                        f"worker-error:{iface}",
+                        f"[Router][Ingress] ❗ worker error on {iface}: {type(exc).__name__}: {exc}",
+                        every=5.0,
+                    )
+            self._maybe_log_ingress_summary(state)
+            if len(batch) >= max(1, int(self._ingress_worker_batch)):
+                time.sleep(0)
 
     def _stop_ingress_workers(self, *, discard: bool = True) -> None:
         with self._ingress_lock:
@@ -2704,6 +3341,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     "enqueued": int(state["enqueued"]),
                     "processed": int(state["processed"]),
                     "dropped": int(state["dropped"]),
+                    "rejected": int(state.get("rejected", 0)),
+                    "coalesced": int(state.get("coalesced", 0)),
+                    "evicted": int(state.get("evicted", 0)),
+                    "max_depth": int(state.get("max_depth", 0)),
+                    "latency_ewma_ms": float(state.get("latency_ewma_ms", 0.0)),
                     "dropped_by_priority": dict(state.get("dropped_by_priority", {})),
                     "queued_by_priority": dict(state.get("queued_by_priority", {})),
                     "errors": int(state["errors"]),
@@ -2822,11 +3464,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     pkt2 = self._coerce_ingress_packet(pkt)
                     if pkt2 is None:
                         return
-                    if not self.enqueue_ingress_packet(pkt2, iface_name):
-                        self._ingress_log_sparse(
-                            f"capture-drop:{iface_name}",
-                            f"[Sniffer] ⚠️ ingress queue rejected packet on {iface_name}",
-                        )
+                    self.enqueue_ingress_packet(pkt2, iface_name)
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
@@ -2839,7 +3477,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     promisc=promisc,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
-                    mac_filter_only=True,
+                    mac_filter_only=self._sniff_mac_filter_only,
+                    allow_l3_on_loopback=self._sniff_allow_l3_loopback,
+                    allow_l3_on_virtual=self._sniff_allow_l3_virtual,
                     session=TCPSession,
                 )
             except Exception as e:
@@ -3152,11 +3792,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         add_iface(denied, self.interface_loopback_full_name)
         add_iface(denied, SocketInterface.IFACE_NAME)
 
-        selected_ifaces = {
-            str(value).strip()
-            for value in self._dhcp_server_settings.get("selected_ifaces", []) or []
-            if str(value).strip()
-        }
+        selected_ifaces = self._expand_interface_selectors(
+            self._dhcp_server_settings.get("selected_ifaces", []) or []
+        )
         # The primary router IN interface remains a LAN candidate; GUI-selected
         # adapters add exact ownership across physical and virtual interfaces.
         add_iface(allowed, self.interface_in_full_name)
@@ -3268,11 +3906,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if value:
                 target.add(value)
 
-        selected_ifaces = {
-            str(value).strip()
-            for value in self._wan_dhcp_server_settings.get("selected_ifaces", []) or []
-            if str(value).strip()
-        }
+        selected_ifaces = self._expand_interface_selectors(
+            self._wan_dhcp_server_settings.get("selected_ifaces", []) or []
+        )
         add_iface(allowed, self.interface_out_full_name)
         add_iface(allowed, self.interface_out_friendly_name)
         for iface in selected_ifaces:
@@ -3747,6 +4383,61 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self._configure_dhcp_control_plane(
             reason="server-start"
         )
+
+    def _dispatch_tunnel_packet(self, packet, inbound_iface: str) -> bool:
+        """Process ESP, AH, GRE, ISAKMP, and IKEv2 without a Hyper-V fallback."""
+        try:
+            is_tunnel = any((
+                packet.haslayer(ESP),
+                packet.haslayer(AH),
+                packet.haslayer(GRE),
+            ))
+        except Exception:
+            is_tunnel = False
+
+        if is_tunnel:
+            handled = bool(self.esp_manager.handle_packet(
+                packet,
+                inbound_iface,
+                self._interfaces_config,
+                self.arp_manager.get_mac,
+                self.rip_manager.find_route,
+            ))
+            if handled:
+                component = (
+                    "esp-manager" if packet.haslayer(ESP)
+                    else "ah-manager" if packet.haslayer(AH)
+                    else "gre-manager"
+                )
+                self.code_output_manager.submit_packet(
+                    packet,
+                    inbound_iface=inbound_iface,
+                    phase="handled",
+                    component=component,
+                )
+                return True
+            # Manager could not route it. Let ordinary forwarding continue rather
+            # than handing it to a C++/Hyper-V pipe or silently consuming it.
+            return False
+
+        try:
+            if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
+                handled = bool(self.isakmp_manager.handle_packet(packet, inbound_iface))
+                if handled:
+                    self.code_output_manager.submit_packet(
+                        packet,
+                        inbound_iface=inbound_iface,
+                        phase="handled",
+                        component="isakmp-manager",
+                    )
+                return handled
+        except Exception as exc:
+            self._ingress_log_sparse(
+                f"tunnel-dispatch:{inbound_iface}",
+                f"[Tunnel] ⚠️ manager dispatch failed on {inbound_iface}: {type(exc).__name__}: {exc}",
+                every=10.0,
+            )
+        return False
 
     def _dispatch_dhcp_packet(
             self,
@@ -5485,6 +6176,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         f"[Router] ⚠️ Packet parse failure on {iface_short}: {e}"
                     )
                     return
+            # The in-process dashboard/API listener must be bypassed before the
+            # early HandshakeManager observer. Otherwise its HTTP/JSON payloads
+            # could enter TLS/Stratum learning even though the host owns port 5000.
+            if self._is_local_p2pool_flask_packet(packet):
+                return
+
             # HandshakeManager is an observer, not a consuming router stage.  It must
             # see TCP bytes before LAN/Gateway/peer managers can return early.  This
             # includes frames reinjected from PeerInterface and HyperVManager.
@@ -5541,6 +6238,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if self.gateway_manager and self.gateway_manager.handle_packet(packet, inbound_iface):
                 return
             if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface) and inbound_iface != "HyperVManager":
+                return
+            # The in-process P2Pool dashboard/API is a host application, not
+            # transit HTTP/JSON. Keep both request and response copies away from
+            # PacketPipeline, TransportManager, NAT, and CodeOutput classification.
+            if self._is_local_p2pool_flask_packet(packet):
                 return
             if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
                                                                                                         inbound_iface):
@@ -5747,6 +6449,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
                     # transit-passthrough intentionally falls through to handshake,
                     # NAT, transport and ordinary router forwarding.
+            if self._dispatch_tunnel_packet(packet, inbound_iface):
+                return
+
             transport_layer = self.sniffer._find_transport_layer(packet)
             if (
                     isinstance(transport_layer, TCP)
@@ -5771,9 +6476,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 packet,
                 inbound_iface,
                 router_ips=self._get_all_local_ips(),
-                wan_ifaces=set(
-                    self.outbound_load_balancer.get_configured_interfaces()
-                ),
+                wan_ifaces=self._current_wan_transit_ifaces(),
                 lan_ifaces=self._current_lan_transit_ifaces(),
             )
 
@@ -5827,54 +6530,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
 
-            if IP in packet:
-                if packet.haslayer(ESP):
-                    if self.hyperv_enabled:
-                        handled = self.esp_manager.handle_packet(
-                            packet, inbound_iface, self._interfaces_config, self.arp_manager.get_mac,
-                            self.rip_manager.find_route
-                        )
-                        if handled:
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
-                            )
-                            return
-                        else:
-                            self.router_logger.log_message(
-                                f"[ESP] Sending ESP packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
-                            )
-                            self.hyperv_manager.send_packet(packet)
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-c++"
-                            )
-                            return
-                    else:
-                        handled = self.esp_manager.handle_packet(
-                            packet, inbound_iface, self._interfaces_config, self.arp_manager.get_mac,
-                            self.rip_manager.find_route
-                        )
-                        if handled:
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
-                            )
-                            return
 
-                if packet.haslayer(AH):
-                    if self.hyperv_enabled:
-                        self.router_logger.log_message(
-                            f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
-                        )
-                        self.hyperv_manager.send_packet(packet)
-                        return True
-                if packet.haslayer(GRE):
-                    if self.hyperv_enabled:
-                        self.router_logger.log_message(
-                            f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst}")
-                        self.hyperv_manager.send_packet(packet)
-                        return True
-            if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
-                if self.isakmp_manager.handle_packet(packet, inbound_iface):
-                    return
 
 
             is_for_router = dst_ip in self._get_all_local_ips()
@@ -6688,6 +7344,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "handshake_log_tls_records",
                 "handshake_log_application_data",
                 "handshake_log_tls13_key_events",
+                "sniff_mac_filter_only",
+                "sniff_allow_l3_loopback",
+                "sniff_allow_l3_virtual",
+                "ingress_dedupe_noise",
+                "tunnel_log_success",
             }
             for setting_name in bool_manager_settings:
                 self._manager_settings[setting_name] = bool(
@@ -6710,6 +7371,36 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         f"{setting_name} must be at least 1."
                     )
                 self._manager_settings[setting_name] = parsed_value
+
+            queue_integer_limits = {
+                "ingress_max_frames": (2048, 131072),
+                "ingress_max_bytes_mb": (32, 1024),
+                "ingress_priority_reserve_frames": (256, 32768),
+                "ingress_worker_batch": (1, 1024),
+                "ingress_summary_interval": (5, 300),
+            }
+            for setting_name, (minimum, maximum) in queue_integer_limits.items():
+                parsed_value = int(self._manager_settings[setting_name])
+                if not minimum <= parsed_value <= maximum:
+                    raise ValueError(
+                        f"{setting_name} must be between {minimum} and {maximum}."
+                    )
+                self._manager_settings[setting_name] = parsed_value
+
+            self._sniff_mac_filter_only = bool(self._manager_settings["sniff_mac_filter_only"])
+            self._sniff_allow_l3_loopback = bool(self._manager_settings["sniff_allow_l3_loopback"])
+            self._sniff_allow_l3_virtual = bool(self._manager_settings["sniff_allow_l3_virtual"])
+            self._ingress_dedupe_noise = bool(self._manager_settings["ingress_dedupe_noise"])
+            self._ingress_max_frames = int(self._manager_settings["ingress_max_frames"])
+            self._ingress_max_bytes = int(self._manager_settings["ingress_max_bytes_mb"]) * 1024 * 1024
+            self._ingress_priority_reserve_frames = int(
+                self._manager_settings["ingress_priority_reserve_frames"]
+            )
+            self._ingress_worker_batch = int(self._manager_settings["ingress_worker_batch"])
+            self._ingress_summary_interval = float(self._manager_settings["ingress_summary_interval"])
+            self.esp_manager.log_success_packets = bool(
+                self._manager_settings["tunnel_log_success"]
+            )
 
             for setting_name, protocol_name in (
                     ("packet_catcher_tcp_rate", "TCP"),
@@ -6758,6 +7449,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "https_parse_quic_crypto",
                 "tls_learning_enabled",
                 "https_init_context",
+                "classification_mode",
+                "stratum_port_policy",
+                "stratum_tls_requires_endpoint_evidence",
+                "analysis_payload_only",
+                "analysis_sample_rate",
+                "analysis_flow_cooldown_sec",
             }
             unknown_transport_settings = (
                 set(requested_transport_settings)
@@ -6896,7 +7593,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     health_probe_fn=self._probe_host_internet_health,
                     fail_open_after_failures=3,
                     recover_after_successes=3,
-                    transit_ifaces_fn=self._boundary_transit_ifaces,  # <-- add this
+                    transit_ifaces_fn=self._boundary_transit_ifaces,
+                    host_application_tcp_ports={5000},
                 )
                 self.host_connectivity_boundary.start()
 
@@ -9004,7 +9702,22 @@ Write-Output ('DNS updated on ' + $adapter.Name)
             if config.get("ip_addr"):
                 local_ips.add(config["ip_addr"])
 
-        local_ips.add(self.router_ipv6_link_local_out)
+        if self.router_ipv6_link_local_out:
+            local_ips.add(str(self.router_ipv6_link_local_out).split("%", 1)[0])
+
+        # Include every address Windows currently owns, including an ATT Air
+        # passthrough address that may not yet have been copied into router
+        # metadata when the first Flask/API packet is captured.
+        try:
+            for addresses in psutil.net_if_addrs().values():
+                for addr in addresses:
+                    if getattr(addr, "family", None) not in {socket.AF_INET, socket.AF_INET6}:
+                        continue
+                    value = str(getattr(addr, "address", "") or "").split("%", 1)[0]
+                    if value:
+                        local_ips.add(value)
+        except Exception:
+            pass
         return local_ips
 
     def get_interface_mac(self, iface_full_name: str) -> str:
@@ -9389,6 +10102,15 @@ class PacketManager:
 
         iface_str = str(iface).strip()
 
+        try:
+            if self.router and hasattr(self.router, "resolve_interface_identity"):
+                identity = self.router.resolve_interface_identity(iface_str)
+                resolved = str(identity.get("full_name") or "").strip()
+                if resolved:
+                    return resolved
+        except Exception:
+            pass
+
         # Exact full-name match
         for item in self.get_interfaces():
             if str(item.get("full_name", "")).strip() == iface_str:
@@ -9646,18 +10368,60 @@ class WiresharkManager:
         self.logger = logger
         self.tshark_procs = {}
         self.redirect_threads = {}
+        self.stderr_threads = {}
         self.stop_event = threading.Event()
         self.geoip_reader = None
-        self._decompressed_db_path = None  # To store the path to the decompressed database
+        self._decompressed_db_path = None
 
-        # Attributes for stateful correlation engine
+        # Stateful correlation engine.
         self.correlation_lock = threading.Lock()
-
-        self.stream_map = {}  # Stores the final loopback <-> VPN mappings
+        self.stream_map = {}
         self.loopback_interface_id = None
         self.vpn_interface_id = None
-        self.min_packet_len = 60
+        self.min_packet_len = 0
         self.router_manager = None
+
+        # Live-capture bookkeeping.  tshark is intentionally kept outside the
+        # Qt thread; all packet and stderr readers are bounded daemon threads.
+        self._capture_lock = threading.RLock()
+        self._capture_iface_names = {}
+        self._capture_commands = {}
+        self._stderr_tail = collections.defaultdict(lambda: deque(maxlen=40))
+        self._capture_stats = collections.defaultdict(lambda: {
+            "packets": 0,
+            "stdout_lines": 0,
+            "stdout_bytes": 0,
+            "parse_errors": 0,
+            "empty_records": 0,
+            "stderr_lines": 0,
+            "router_accepted": 0,
+            "router_rejected": 0,
+            "started_at": 0.0,
+            "last_packet_at": 0.0,
+        })
+        self._status_thread = None
+        self._status_interval = 5.0
+        self._last_status_total = -1
+        self._last_status_log = 0.0
+
+        self._capture_settings = {
+            "main_interface": "Auto",
+            "include_loopback": True,
+            "include_vpn": True,
+            "include_multicast": False,
+            "include_discovery": False,
+            "include_dhcp": True,
+            "include_localhost": True,
+            "promiscuous": True,
+            "full_details": True,
+            "feed_router": False,
+            "log_packet_summaries": False,
+            "log_payloads": False,
+            "log_filtered_packets": False,
+            "min_packet_len": 0,
+            "max_interfaces": 8,
+            "custom_bpf": "",
+        }
 
     def _looks_like_json_text(self, value: str) -> bool:
         s = str(value or "").lstrip()
@@ -10366,11 +11130,8 @@ class WiresharkManager:
             try:
                 ip_obj = ipaddress.ip_address(ip_address)
                 if ip_obj.is_private:
-                    self.logger.log_message(f"[GeoIP Debug] IP: {ip_address} identified as Private IP (RFC1918).")
                     return "Private IP"
             except ValueError:
-                # If ip_address is not a valid IP string, log and return
-                self.logger.log_message(f"[GeoIP Debug] IP: {ip_address} identified as Invalid IP Format.")
                 return "Invalid IP Format"
 
             # Attempt to look up the IP in the GeoIP database.
@@ -10383,254 +11144,585 @@ class WiresharkManager:
             return f"{city}, {country}"
 
         except geoip2.errors.AddressNotFoundError:
-            self.logger.log_message(
-                f"[GeoIP] AddressNotFoundError for IP: {ip_address} - IP not found in database (might be non-public or unlisted).")
             return "Unknown"
         except Exception as e:
             self.logger.log_message(f"[GeoIP] Lookup Error for IP: {ip_address} - Details: {e}")
             return "Lookup Error"
 
     def _get_tshark_path(self) -> str | None:
+        """Resolve tshark in development, PyInstaller and normal installs."""
+        candidates = []
+
+        def add(value):
+            if not value:
+                return
+            try:
+                candidates.append(Path(value).expanduser())
+            except Exception:
+                pass
+
         if getattr(sys, "frozen", False):
-            self.logger.log_message("[Wireshark] Running in bundled mode.")
-            exe = Path(self.p2pool_data.P2POOL_DIR) / "Wireshark" / "tshark.exe"
-            return str(exe) if exe.exists() else None
-        self.logger.log_message("[Wireshark] Running in development mode. Using relative path.")
+            meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+            exe_dir = Path(sys.executable).resolve().parent
+            add(meipass / "tools" / "Wireshark" / "tshark.exe")
+            add(meipass / "Wireshark" / "tshark.exe")
+            add(exe_dir / "tools" / "Wireshark" / "tshark.exe")
+            add(exe_dir / "Wireshark" / "tshark.exe")
+
+        p2pool_dir = Path(str(getattr(self.p2pool_data, "P2POOL_DIR", "") or "."))
+        add(p2pool_dir / "tools" / "Wireshark" / "tshark.exe")
+        add(p2pool_dir / "Wireshark" / "tshark.exe")
+
         server_dir = Path(__file__).resolve().parent
         project_root = server_dir.parent
-        tools_dir = project_root / "client" / "tools" / "Wireshark"
-        candidate = tools_dir / "tshark.exe"
-        if candidate.exists():
-            self.logger.log_message(f"[Wireshark] Found tshark at: {candidate}")
-            return str(candidate)
-        system_tshark = shutil.which("tshark")
+        add(project_root / "client" / "tools" / "Wireshark" / "tshark.exe")
+        add(server_dir / "tools" / "Wireshark" / "tshark.exe")
+
+        for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+            root = os.environ.get(env_name)
+            if root:
+                add(Path(root) / "Wireshark" / "tshark.exe")
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            add(Path(local_app_data) / "Programs" / "Wireshark" / "tshark.exe")
+
+        system_tshark = shutil.which("tshark") or shutil.which("tshark.exe")
         if system_tshark:
-            self.logger.log_message(f"[Wireshark] Falling back to system tshark at: {system_tshark}")
-            return system_tshark
+            add(system_tshark)
+
+        seen = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=False)
+            except Exception:
+                resolved = candidate
+            key = os.path.normcase(str(resolved))
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                self.logger.log_message(f"[Wireshark] Using tshark: {candidate}")
+                return str(candidate)
+
+        searched = ", ".join(str(p) for p in candidates[:8])
         self.logger.log_message(
-            f"[Wireshark] Error: tshark.exe not found. Looked in {candidate} and on PATH."
+            "[Wireshark] Error: tshark.exe was not found. "
+            f"Checked PATH and: {searched or '(no candidate paths)'}."
         )
         return None
 
     def _list_interfaces(self, tshark_path: str) -> list[dict]:
-        self.logger.log_message("[Wireshark] Discovering network interfaces...")
-        interfaces = []
+        """Return the current tshark capture inventory with stable metadata."""
+        self.logger.log_message("[Wireshark] Discovering capture interfaces with tshark -D...")
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
         try:
             proc = subprocess.run(
-                [tshark_path, '-D'], capture_output=True, text=True, check=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                [tshark_path, "-D"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=20,
+                creationflags=creationflags,
             )
-            pattern = re.compile(r"(\d+)\.\s+(.*)")
-            interface_output_lines = proc.stdout.strip().split('\n')
+        except Exception as exc:
+            self.logger.log_message(f"[Wireshark] Interface discovery failed: {type(exc).__name__}: {exc}")
+            return []
 
-            self.logger.log_message("[Wireshark] Available Network Interfaces:")
-            for line in interface_output_lines:
-                match = pattern.match(line)
-                if match:
-                    iface_id = match.group(1)
-                    iface_name = match.group(2).strip()
-                    interfaces.append({'id': iface_id, 'name': iface_name})
-                    self.logger.log_message(f"  ID: {iface_id}, Name: {iface_name}")
+        output = str(proc.stdout or "")
+        stderr = str(proc.stderr or "").strip()
+        if proc.returncode != 0:
+            self.logger.log_message(
+                f"[Wireshark] tshark -D exited {proc.returncode}: {stderr or output.strip() or 'no details'}"
+            )
+            return []
 
-            self.logger.log_message(f"[Wireshark] Found {len(interfaces)} interfaces.")
-        except Exception as e:
-            self.logger.log_message(f"[Wireshark] An error occurred while listing interfaces: {e}")
+        pattern = re.compile(r"^\s*(\d+)\.\s+(.+?)\s*$")
+        guid_re = re.compile(r"\{[0-9A-Fa-f-]{36}\}")
+        interfaces = []
+        for raw_line in output.splitlines():
+            match = pattern.match(raw_line)
+            if not match:
+                continue
+            iface_id, iface_name = match.group(1), match.group(2).strip()
+            lowered = iface_name.casefold()
+            guid_match = guid_re.search(iface_name)
+            row = {
+                "id": iface_id,
+                "name": iface_name,
+                "guid": guid_match.group(0) if guid_match else "",
+                "is_npf": "npf_" in lowered and "device" in lowered,
+                "is_loopback": "loopback" in lowered or "npf_loopback" in lowered,
+                "is_extcap": any(token in lowered for token in (
+                    "sshdump", "randpkt", "udpdump", "wifidump", "ciscodump",
+                    "androiddump", "sdjournal", "etwdump", "bluetooth",
+                )),
+            }
+            interfaces.append(row)
+
+        if not interfaces:
+            self.logger.log_message(
+                "[Wireshark] tshark returned no parseable interfaces. "
+                f"stderr={stderr or '-'} stdout={output[:500]!r}"
+            )
+            return []
+
+        self.logger.log_message(f"[Wireshark] Found {len(interfaces)} capture interfaces.")
+        if self._capture_settings.get("log_interface_inventory", False):
+            for row in interfaces:
+                self.logger.log_message(f"[Wireshark]   {row['id']}: {row['name']}")
         return interfaces
 
-    def start_capture(self, main_interface_name: str = 'Wi-Fi', router_manager = None, promiscuous=True):
-        self._initialize_geoip()
+    def configure_capture(self, **settings) -> dict:
+        merged = dict(self._capture_settings)
+        known = set(merged)
+        unknown = set(settings) - known
+        if unknown:
+            raise ValueError("Unknown Wireshark capture setting(s): " + ", ".join(sorted(unknown)))
+        merged.update(settings)
+        for key in (
+                "include_loopback", "include_vpn", "include_multicast",
+                "include_discovery", "include_dhcp", "include_localhost",
+                "promiscuous", "full_details", "feed_router",
+                "log_packet_summaries", "log_payloads", "log_filtered_packets",
+        ):
+            merged[key] = bool(merged[key])
+        merged["main_interface"] = str(merged.get("main_interface") or "Auto").strip()
+        merged["custom_bpf"] = str(merged.get("custom_bpf") or "").strip()
+        merged["min_packet_len"] = max(0, min(65535, int(merged["min_packet_len"])))
+        merged["max_interfaces"] = max(1, min(32, int(merged["max_interfaces"])))
+        self._capture_settings = merged
+        self.min_packet_len = merged["min_packet_len"]
+        return dict(merged)
+
+    @staticmethod
+    def _interface_name_matches(selector: str, iface_name: str) -> bool:
+        selector = str(selector or "").strip().casefold()
+        iface_name = str(iface_name or "").strip().casefold()
+        if not selector or selector == "auto":
+            return False
+        raw = selector.removeprefix("guid:").strip("{}")
+        return selector in iface_name or (raw and raw in iface_name)
+
+    @staticmethod
+    def _creation_flags() -> int:
+        return int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+
+    @staticmethod
+    def _capture_interface_candidate(row: dict) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if row.get("is_extcap"):
+            return False
+        name = str(row.get("name") or "").casefold()
+        return bool(row.get("is_npf") or "ethernet" in name or "wi-fi" in name or "wifi" in name)
+
+    def _extract_layers_from_record(self, packet_data: dict) -> dict:
+        """Accept normal tshark JSON and normalized line-oriented records."""
+        if not isinstance(packet_data, dict):
+            return {}
+        source = packet_data.get("_source")
+        if isinstance(source, dict) and isinstance(source.get("layers"), dict):
+            return source.get("layers") or {}
+        layers = packet_data.get("layers")
+        if isinstance(layers, dict):
+            return layers
+        return {}
+
+    def _build_capture_filter(self, capture: dict, *, include_custom: bool = True) -> str:
+        # Keep the kernel filter deliberately conservative.  Detailed length and
+        # application filtering occurs after decode so short DHCP, loopback and
+        # control packets are still available to the manager/router.
+        parts = ["(ip or ip6 or arp)"]
+        if not capture.get("include_multicast", False):
+            parts.append("not (ip multicast or ip6 multicast)")
+        if not capture.get("include_discovery", False):
+            parts.append(
+                "not (udp port 5353 or udp port 1900 or udp port 3702 "
+                "or udp port 5355 or tcp port 5357)"
+            )
+        if not capture.get("include_dhcp", True):
+            parts.append("not (port 67 or port 68 or port 546 or port 547)")
+        if not capture.get("include_localhost", True):
+            parts.extend(("not host 127.0.0.1", "not host ::1"))
+        parts.append("not (udp port 137 and net 169.254.0.0/16)")
+        custom = str(capture.get("custom_bpf") or "").strip()
+        if include_custom and custom:
+            parts.append(f"({custom})")
+        return "(" + " and ".join(parts) + ")"
+
+    def _build_tshark_command(
+            self,
+            tshark_path: str,
+            interface_id: str,
+            capture_filter: str,
+            capture: dict,
+    ) -> list[str]:
+        # -T json already emits the complete protocol tree.  Combining -V with
+        # JSON is unnecessary and has caused immediate exits on some tshark
+        # releases, so full_details is handled in Python rather than with -V.
+        command = [
+            tshark_path,
+            "-l",                 # flush live output after each packet
+            "-n",                 # avoid resolver latency in the capture path
+            "-T", "json",
+            "-i", str(interface_id),
+            "-s", "0",          # preserve complete frames
+            "-B", "16",         # bounded Npcap capture buffer (MiB)
+            "-o", "tcp.desegment_tcp_streams:TRUE",
+        ]
+        if capture_filter:
+            command.extend(("-f", capture_filter))
+        if not capture.get("promiscuous", True):
+            command.append("-p")
+        return command
+
+    @staticmethod
+    def _looks_like_filter_error(lines) -> bool:
+        text = " ".join(str(x) for x in (lines or ())).casefold()
+        return any(token in text for token in (
+            "invalid capture filter", "capture filter syntax", "syntax error",
+            "can't parse filter", "cannot parse filter", "not a valid capture filter",
+            "pcap_compile", "data link type",
+        ))
+
+    def _spawn_capture_process(self, row: dict, command: list[str]) -> subprocess.Popen | None:
+        iface_id = str(row.get("id") or "")
+        iface_name = str(row.get("name") or iface_id)
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=self._creation_flags(),
+            )
+        except Exception as exc:
+            self.logger.log_message(
+                f"[Wireshark] Failed to launch {iface_name} ({iface_id}): {type(exc).__name__}: {exc}"
+            )
+            return None
+
+        with self._capture_lock:
+            self.tshark_procs[iface_id] = proc
+            self._capture_iface_names[iface_id] = iface_name
+            self._capture_commands[iface_id] = list(command)
+            stats = self._capture_stats[iface_id]
+            stats["started_at"] = time.monotonic()
+
+        stdout_thread = threading.Thread(
+            target=self._redirect_output,
+            args=(proc, iface_id),
+            daemon=True,
+            name=f"TsharkStdout-{iface_id}",
+        )
+        stderr_thread = threading.Thread(
+            target=self._redirect_stderr,
+            args=(proc, iface_id),
+            daemon=True,
+            name=f"TsharkStderr-{iface_id}",
+        )
+        self.redirect_threads[iface_id] = stdout_thread
+        self.stderr_threads[iface_id] = stderr_thread
+        stdout_thread.start()
+        stderr_thread.start()
+        return proc
+
+    def _remove_dead_capture(self, iface_id: str) -> None:
+        with self._capture_lock:
+            self.tshark_procs.pop(str(iface_id), None)
+            self._capture_commands.pop(str(iface_id), None)
+
+    def _capture_status_loop(self) -> None:
+        while not self.stop_event.wait(self._status_interval):
+            with self._capture_lock:
+                process_snapshot = dict(self.tshark_procs)
+                stats_snapshot = {key: dict(value) for key, value in self._capture_stats.items()}
+            alive = sum(1 for proc in process_snapshot.values() if proc.poll() is None)
+            total = sum(int(s.get("packets", 0)) for s in stats_snapshot.values())
+            parse_errors = sum(int(s.get("parse_errors", 0)) for s in stats_snapshot.values())
+            router_ok = sum(int(s.get("router_accepted", 0)) for s in stats_snapshot.values())
+            router_no = sum(int(s.get("router_rejected", 0)) for s in stats_snapshot.values())
+            now = time.monotonic()
+            changed = total != self._last_status_total
+            due = (now - self._last_status_log) >= 15.0
+            if changed or due:
+                self._last_status_total = total
+                self._last_status_log = now
+                self.logger.log_message(
+                    f"[Wireshark] Capture status: alive={alive}/{len(process_snapshot)} "
+                    f"packets={total} parse_errors={parse_errors} "
+                    f"router={router_ok} accepted/{router_no} rejected."
+                )
+            if process_snapshot and alive == 0:
+                self.logger.log_message("[Wireshark] All tshark capture processes have exited.")
+                return
+
+    def capture_status(self) -> dict:
+        with self._capture_lock:
+            processes = dict(self.tshark_procs)
+            stats = {key: dict(value) for key, value in self._capture_stats.items()}
+        return {
+            "running": any(proc.poll() is None for proc in processes.values()),
+            "interfaces": {
+                iface_id: {
+                    "name": self._capture_iface_names.get(iface_id, iface_id),
+                    "alive": proc.poll() is None,
+                    "returncode": proc.poll(),
+                    "stats": stats.get(iface_id, {}),
+                    "stderr_tail": list(self._stderr_tail.get(iface_id, ())),
+                }
+                for iface_id, proc in processes.items()
+            },
+        }
+    def start_capture(
+            self, main_interface_name: str = "Auto", router_manager=None,
+            promiscuous=True, settings: Optional[Dict[str, Any]] = None,
+    ):
+        capture = self.configure_capture(**dict(settings or {}))
+        capture["main_interface"] = str(main_interface_name or capture["main_interface"] or "Auto").strip()
+        capture["promiscuous"] = bool(promiscuous)
+        self._capture_settings = capture
         self.router_manager = router_manager
-        tshark_path = self._get_tshark_path()
-        if not tshark_path: return False
+
+        # Do not allow stale exited children to make the manager appear active.
+        with self._capture_lock:
+            stale = [key for key, proc in self.tshark_procs.items() if proc.poll() is not None]
+            for key in stale:
+                self.tshark_procs.pop(key, None)
         if self.tshark_procs:
             self.logger.log_message("[Wireshark] Capture is already running.")
             return False
 
-        # Ensure GeoIP reader is initialized before starting capture
-        if self.geoip_reader is None:
-            self.logger.log_message("[GeoIP] GeoIP reader is not initialized. Attempting to initialize it now.")
-            self._initialize_geoip()
-            if self.geoip_reader is None:  # If initialization still failed
-                self.logger.log_message("[GeoIP] Failed to initialize GeoIP reader. Proceeding without GeoIP lookups.")
-                # You might want to return False here if GeoIP is critical for your application
-                # For now, we'll allow capture to proceed without GeoIP if it fails.
-
+        self._initialize_geoip()
+        tshark_path = self._get_tshark_path()
+        if not tshark_path:
+            return False
         available_interfaces = self._list_interfaces(tshark_path)
-        if not available_interfaces: return False
+        if not available_interfaces:
+            return False
 
-        # --- NEW LOGIC: Resolve main_interface_name to its ID ---
-        main_interface_id = None
-        for iface in available_interfaces:
-            # We need to be careful with string matching for interface names
-            # Use 'in' for partial matches, or '==' for exact matches
-            # For "Wi-Fi", a simple "Wi-Fi" in iface['name'] should work.
-            if main_interface_name.lower() in iface['name'].lower():
-                main_interface_id = iface['id']
-                self.logger.log_message(
-                    f"[Wireshark] Resolved '{main_interface_name}' to ID: {main_interface_id}")
+        self.loopback_interface_id = None
+        self.vpn_interface_id = None
+        selector = capture["main_interface"]
+        preferred_tokens = [selector]
+        if selector.casefold() == "auto":
+            preferred_tokens = []
+            if router_manager is not None:
+                preferred_tokens.extend((
+                    getattr(router_manager, "interface_out_full_name", ""),
+                    getattr(router_manager, "interface_out_friendly_name", ""),
+                    getattr(router_manager, "interface_out_guid", ""),
+                ))
+            preferred_tokens.extend(("Wi-Fi", "Ethernet"))
+
+        main = None
+        for token in preferred_tokens:
+            if not str(token or "").strip():
+                continue
+            main = next(
+                (row for row in available_interfaces
+                 if self._interface_name_matches(str(token), row.get("name", ""))),
+                None,
+            )
+            if main:
                 break
 
-        if not main_interface_id:
+        if main is None:
+            main = next(
+                (row for row in available_interfaces
+                 if self._capture_interface_candidate(row) and not row.get("is_loopback")),
+                None,
+            )
+        if main is None:
+            main = next(
+                (row for row in available_interfaces if not row.get("is_loopback") and not row.get("is_extcap")),
+                available_interfaces[0],
+            )
             self.logger.log_message(
-                f"[Wireshark] Error: Main interface '{main_interface_name}' not found. Available interfaces: "
-                f"{[iface['name'] for iface in available_interfaces]}")
-            return False
-        # --- END NEW LOGIC ---
+                f"[Wireshark] Main selector {selector!r} was not found; using {main['name']}."
+            )
+        else:
+            self.logger.log_message(
+                f"[Wireshark] Main interface {selector!r} resolved to {main['id']}: {main['name']}"
+            )
 
-        interfaces_to_capture = {main_interface_id}  # Start with the resolved main interface
-
-        # Add VPN and Loopback interfaces dynamically
-        for iface in available_interfaces:
-            if "WireGuard Tunnel" in iface['name'] or "ProtonVPN" in iface['name']:
-                self.logger.log_message(
-                    f"[Wireshark] Detected active VPN interface: {iface['name']} (ID: {iface['id']}). Adding to capture.")
-                interfaces_to_capture.add(iface['id'])
-                # Set VPN interface ID for correlation engine if not already set
+        capture_rows = [main]
+        for row in available_interfaces:
+            name = str(row.get("name", ""))
+            lowered = name.casefold()
+            if capture.get("include_loopback", True) and row.get("is_loopback"):
+                self.loopback_interface_id = str(row["id"])
+                capture_rows.append(row)
+            if capture.get("include_vpn", True) and any(token in lowered for token in (
+                    "wireguard", "protonvpn", "openvpn", "wintun", "tap-windows", "vpn", "zerotier"
+            )):
                 if self.vpn_interface_id is None:
-                    self.vpn_interface_id = iface['id']
-            elif "Loopback" in iface['name']:
-                self.logger.log_message(
-                    f"[Wireshark] Detected Loopback interface: {iface['name']} (ID: {iface['id']}). Adding to capture.")
-                interfaces_to_capture.add(iface['id'])
-                # Set Loopback interface ID for correlation engine if not already set
-                if self.loopback_interface_id is None:
-                    self.loopback_interface_id = iface['id']
+                    self.vpn_interface_id = str(row["id"])
+                capture_rows.append(row)
 
-        self.logger.log_message(f"[Wireshark] Final capture list (IDs): {list(interfaces_to_capture)}")
-        self.logger.log_message(
-            f"[CorrelationEngine] Watching for 'cause' on Loopback ID: {self.loopback_interface_id}")
-        self.logger.log_message(f"[CorrelationEngine] Watching for 'effect' on VPN ID: {self.vpn_interface_id}")
+        unique_rows = []
+        seen_ids = set()
+        for row in capture_rows:
+            iface_id = str(row.get("id") or "")
+            if not iface_id or iface_id in seen_ids or row.get("is_extcap"):
+                continue
+            seen_ids.add(iface_id)
+            unique_rows.append(row)
+            if len(unique_rows) >= int(capture["max_interfaces"]):
+                break
+        if not unique_rows:
+            self.logger.log_message("[Wireshark] No usable live-capture interfaces were selected.")
+            return False
 
+        requested_filter = self._build_capture_filter(capture, include_custom=True)
+        safe_filter = self._build_capture_filter(capture, include_custom=False)
         self.stop_event.clear()
+        self._last_status_total = -1
+        self._last_status_log = 0.0
+        self._capture_stats.clear()
+        self._stderr_tail.clear()
 
-        def _bpf_addr(a: str | None) -> str | None:
-            # strip IPv6 zone index, e.g. 'fe80::1%Ethernet'
-            return a.split("%", 1)[0] if isinstance(a, str) else None
+        launched = {}
+        for row in unique_rows:
+            command = self._build_tshark_command(
+                tshark_path, str(row["id"]), requested_filter, capture
+            )
+            proc = self._spawn_capture_process(row, command)
+            if proc is not None:
+                launched[str(row["id"])] = row
 
-        def build_capture_filter() -> str:
+        # tshark compiles the capture filter and opens Npcap immediately.  A
+        # short health check prevents the GUI from reporting success when every
+        # child exited with a filter/adapter error.
+        time.sleep(1.0)
+        failed = []
+        for iface_id, row in list(launched.items()):
+            proc = self.tshark_procs.get(iface_id)
+            if proc is None or proc.poll() is not None:
+                failed.append((iface_id, row, list(self._stderr_tail.get(iface_id, ()))))
+                self._remove_dead_capture(iface_id)
 
-            public_ip = str(getattr(self.router_manager, "public_ip_observed", "") or "").strip()
-            # A list of BPF parts that will be joined with 'and'
-            STR_BCAST_PART1 = 0x5354525f  # Represents "STR_"
-            STR_BCAST_PART2 = 0x42434153  # Represents "BCAS"4
-            parts = [
-                # 1. Basic IP traffic only
-                f"(ip or ip6 or arp or host {public_ip})",
-                # 2. Filter Multicast and common Discovery/Chatter protocols
-                "not (ip multicast or ip6 multicast)",
-                "not (udp port 5353 or udp port 1900 or udp port 3702 or udp port 5355)",
-                "not (port 67 or port 68 or port 546 or port 547)",
+        # Invalid custom BPF must not leave the entire capture dead. Retry only
+        # filter-related failures with the known-safe generated filter.
+        if requested_filter != safe_filter:
+            for iface_id, row, tail in failed[:]:
+                if not self._looks_like_filter_error(tail):
+                    continue
+                self.logger.log_message(
+                    f"[Wireshark] Custom BPF failed on {row['name']}; retrying without the custom expression."
+                )
+                command = self._build_tshark_command(
+                    tshark_path, str(row["id"]), safe_filter, capture
+                )
+                proc = self._spawn_capture_process(row, command)
+                if proc is not None:
+                    time.sleep(0.8)
+                    if proc.poll() is None:
+                        failed = [item for item in failed if item[0] != iface_id]
+                    else:
+                        self._remove_dead_capture(iface_id)
 
-                # 3. Filter local loopback traffic (IPv4 and IPv6)
-                "not host 127.0.0.1",
-                "not host ::1",
-                "not host 10.2.0.2",
-                # 4. Filter NetBIOS Name Service noise on the APIPA/link-local network
-                "not (udp port 137 and net 169.254.0.0/16)",
+        alive = {
+            iface_id: proc for iface_id, proc in self.tshark_procs.items()
+            if proc.poll() is None
+        }
+        if not alive:
+            details = []
+            for iface_id, row, tail in failed:
+                msg = " | ".join(tail[-4:]).strip()
+                details.append(f"{row['name']}: {msg or 'tshark exited during startup'}")
+            self.logger.log_message(
+                "[Wireshark] Capture could not start on any selected interface. "
+                + ("; ".join(details) if details else "Check Npcap permissions and adapter availability.")
+            )
+            self.stop_event.set()
+            return False
 
-                "not port 5357",
-                "not port 889",
-                f"not (udp[8:4] = {STR_BCAST_PART1} and udp[12:4] = {STR_BCAST_PART2})",
-
-                #Banned IPS
-                "not host 89.222.103.1"
-            ]
-            parts.append(f"not (src host {self.router_manager.router_ip_out} and dst host {self.router_manager.router_ip_out})")
-            parts.append("not (ip broadcast and udp and dst port 22222)")
-            # Exclude very small frames
-            min_len = int(getattr(self, "min_packet_len", 0) or 0)
-            if min_len > 0:
-                parts.append(f"greater {max(0, min_len - 1)}")
-
-            return "(" + " and ".join(parts) + ")"
-        if self.router_manager.started:
-            capture_filter = build_capture_filter()
-        else:
-            capture_filter = ""
-        base_command = [
-            tshark_path, "-l", "-T", "json", "-V",
-            "-o", "tcp.desegment_tcp_streams:TRUE",
-            "-f", capture_filter
-        ]
-        if not promiscuous:
-            base_command.append('-p')
-        def start_capture():
-            started_count = 0
-            for iface_id in interfaces_to_capture:
-                self.logger.log_message(f"[Wireshark] Starting capture on interface {iface_id}...")
-                command = base_command + ['-i', str(iface_id)]
+        self._status_thread = threading.Thread(
+            target=self._capture_status_loop,
+            daemon=True,
+            name="WiresharkCaptureStatus",
+        )
+        self._status_thread.start()
+        names = [self._capture_iface_names.get(key, key) for key in alive]
+        active_filters = {}
+        for iface_id in alive:
+            cmd = list(self._capture_commands.get(iface_id, ()))
+            active_filter = ""
+            if "-f" in cmd:
                 try:
-                    proc = subprocess.Popen(
-                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                    self.tshark_procs[iface_id] = proc
-                    thread = threading.Thread(target=self._redirect_output, args=(proc, iface_id), daemon=True)
-                    self.redirect_threads[iface_id] = thread
-                    thread.start()
-                    self.logger.log_message(f"[Wireshark] Capture started on interface {iface_id} with PID: {proc.pid}")
-                    started_count += 1
-                except Exception as e:
-                    self.logger.log_message(f"[Wireshark] Failed to start capture on interface {iface_id}: {e}")
-            return started_count > 0
-
-        if self.router_manager.started:
-            self.logger.log_message(f"[Wireshark] Parallel Capture started")
-            funcs = []
-            def capture_helper(iface_id):
-                self.logger.log_message(f"[Wireshark] Starting capture on interface {iface_id}...")
-                command = base_command + ['-i', str(iface_id)]
-                try:
-                    proc = subprocess.Popen(
-                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                    self.tshark_procs[iface_id] = proc
-                    thread = threading.Thread(target=self._redirect_output, args=(proc, iface_id), daemon=True)
-                    self.redirect_threads[iface_id] = thread
-                    thread.start()
-                    self.logger.log_message(
-                        f"[Wireshark] Capture started on interface {iface_id} with PID: {proc.pid}")
-                except Exception as e:
-                    self.logger.log_message(f"[Wireshark] Failed to start capture on interface {iface_id}: {e}")
-            started_count = 0
-            for iface_id in interfaces_to_capture:
-                funcs.append((capture_helper, (iface_id,)))
-                started_count +=1
-            self.router_manager.parallel_python.increase_ram_usage(2500)
-            self.router_manager.parallel_python.run_all_parallel(funcs,
-                                                             return_type="void")
-            return started_count
-        else:
-            return start_capture()
+                    active_filter = cmd[cmd.index("-f") + 1]
+                except Exception:
+                    active_filter = ""
+            active_filters[iface_id] = active_filter or "<none>"
+        self.logger.log_message(
+            f"[Wireshark] Capture active on {len(alive)} interface(s): {names}. "
+            f"feed_router={capture['feed_router']} filters={active_filters}"
+        )
+        return True
 
     def stop_capture(self):
-        if not self.tshark_procs:
+        with self._capture_lock:
+            processes = dict(self.tshark_procs)
+        if not processes:
             self.logger.log_message("[Wireshark] Capture is not running.")
             return
 
-        self.logger.log_message("[Wireshark] Stopping all captures...")
+        self.logger.log_message("[Wireshark] Stopping capture...")
         self.stop_event.set()
-        for iface_id, proc in self.tshark_procs.items():
+        for proc in processes.values():
             if proc.poll() is None:
-                proc.terminate()
-        for iface_id, proc in self.tshark_procs.items():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        for iface_id, proc in processes.items():
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=4)
             except subprocess.TimeoutExpired:
-                self.logger.log_message(f"[Wireshark] Process for interface {iface_id} did not terminate, killing.")
-                proc.kill()
+                self.logger.log_message(f"[Wireshark] Killing unresponsive tshark interface {iface_id}.")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+
+        for thread in list(self.redirect_threads.values()) + list(self.stderr_threads.values()):
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        if self._status_thread and self._status_thread.is_alive() and self._status_thread is not threading.current_thread():
+            self._status_thread.join(timeout=1.0)
 
         if self.geoip_reader:
-            self.geoip_reader.close()
-            self.logger.log_message("[GeoIP] Database closed.")
+            try:
+                self.geoip_reader.close()
+            except Exception:
+                pass
+            self.geoip_reader = None
+        self._decompressed_db_path = None
 
-        # The decompressed file is now persistent, no need to delete it on stop.
-        self._decompressed_db_path = None  # Clear the path reference
-
-        self.logger.log_message("[Wireshark] All capture processes stopped.")
-        self.tshark_procs.clear()
-        self.redirect_threads.clear()
+        status = self.capture_status()
+        total = sum(
+            int(item.get("stats", {}).get("packets", 0))
+            for item in status.get("interfaces", {}).values()
+        )
+        self.logger.log_message(f"[Wireshark] Capture stopped after {total} decoded packet(s).")
+        with self._capture_lock:
+            self.tshark_procs.clear()
+            self.redirect_threads.clear()
+            self.stderr_threads.clear()
+            self._capture_commands.clear()
+            self._capture_iface_names.clear()
     def _as_int(self, x: Any, default: Optional[int] = None) -> Optional[int]:
         try:
             return int(str(x))
@@ -10692,13 +11784,18 @@ class WiresharkManager:
 
     def _process_packet(self, packet_data: dict | str, interface_id: str) -> None:
         """Parse tshark JSON, log/filter like before, THEN wrap into Scapy and pass to router_manager with iface='WireShark'."""
-        yield_no_gil(0.1)
+        settings = dict(self._capture_settings)
+        log_filtered = bool(settings.get("log_filtered_packets", False))
+        log_summaries = bool(settings.get("log_packet_summaries", True))
+        log_payloads = bool(settings.get("log_payloads", False))
+        feed_router = bool(settings.get("feed_router", False))
         if not isinstance(packet_data, dict):
             return
 
         try:
-            layers = packet_data.get("_source", {}).get("layers", {})
+            layers = self._extract_layers_from_record(packet_data)
             if not layers:
+                self._capture_stats[str(interface_id)]["empty_records"] += 1
                 return
 
             def _nz(ip: str) -> str:
@@ -10802,9 +11899,10 @@ class WiresharkManager:
 
             try:
                 if int(packet_len) < self.min_packet_len:
-                    self.logger.log_message(
-                        f"[Wireshark Filter] Filtering small packet (Len: {packet_len}) on interface {interface_id}."
-                    )
+                    if log_filtered:
+                        self.logger.log_message(
+                            f"[Wireshark Filter] Filtering small packet (Len: {packet_len}) on interface {interface_id}."
+                        )
                     return
             except ValueError:
                 pass
@@ -10813,17 +11911,19 @@ class WiresharkManager:
             src_ip = ip_layer.get("ip.src", ip_layer.get("ipv6.src", "N/A")) if ip_layer else "N/A"
             dst_ip = ip_layer.get("ip.dst", ip_layer.get("ipv6.dst", "N/A")) if ip_layer else "N/A"
 
-            if self._is_ipv4_broadcast(dst_ip):
-                self.logger.log_message(
-                    f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}."
-                )
+            if not settings.get("include_multicast", False) and self._is_ipv4_broadcast(dst_ip):
+                if log_filtered:
+                    self.logger.log_message(
+                        f"[Wireshark Filter] Filtering IPv4 Broadcast packet to {dst_ip} on interface {interface_id}."
+                    )
                 return
 
             dst_is_mcast = self._is_multicast_or_llm(dst_ip)
-            if dst_is_mcast:
-                self.logger.log_message(
-                    f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}."
-                )
+            if not settings.get("include_multicast", False) and dst_is_mcast:
+                if log_filtered:
+                    self.logger.log_message(
+                        f"[Wireshark Filter] Filtering Multicast/Discovery packet to {dst_ip} on interface {interface_id}."
+                    )
                 return
 
             try:
@@ -10831,17 +11931,23 @@ class WiresharkManager:
             except ValueError:
                 dst_obj = None
 
-            if "icmpv6" in layers and dst_obj and dst_obj.is_multicast:
-                self.logger.log_message(
-                    f"[Wireshark Filter] Filtering ICMPv6 multicast to {dst_ip} on interface {interface_id}."
-                )
+            if (not settings.get("include_multicast", False)
+                    and "icmpv6" in layers and dst_obj and dst_obj.is_multicast):
+                if log_filtered:
+                    self.logger.log_message(
+                        f"[Wireshark Filter] Filtering ICMPv6 multicast to {dst_ip} on interface {interface_id}."
+                    )
                 return
 
-            if _is_loopback_addr(src_ip) and _is_loopback_addr(dst_ip):
-                self.logger.log_message(f"[Wireshark] Skipping local loopback packet {src_ip} -> {dst_ip}")
+            if ((not settings.get("include_loopback", True)
+                     or not settings.get("include_localhost", True))
+                    and _is_loopback_addr(src_ip) and _is_loopback_addr(dst_ip)):
+                if log_filtered:
+                    self.logger.log_message(f"[Wireshark] Skipping local loopback packet {src_ip} -> {dst_ip}")
                 return
 
-            if self.router_manager and self.router_manager.started and src_ip == dst_ip:
+            if (not settings.get("include_localhost", True)
+                    and self.router_manager and self.router_manager.started and src_ip == dst_ip):
                 is_legitimate_loopback = False
                 try:
                     ip_obj = ipaddress.ip_address(src_ip)
@@ -10851,23 +11957,26 @@ class WiresharkManager:
                     is_legitimate_loopback = False
 
                 if is_legitimate_loopback:
-                    self.logger.log_message(
-                        f"[Wireshark] 💧 Dropping loopback public IP packet: {src_ip} -> {dst_ip}"
-                    )
+                    if log_filtered:
+                        self.logger.log_message(
+                            f"[Wireshark] Dropping self-addressed local packet: {src_ip} -> {dst_ip}"
+                        )
                     return
                 else:
-                    self.logger.log_message(
-                        f"[Wireshark] 💧 Dropping suspicious self-addressed public IP packet: {src_ip} -> {dst_ip}"
-                    )
+                    if log_filtered:
+                        self.logger.log_message(
+                            f"[Wireshark] Dropping suspicious self-addressed public packet: {src_ip} -> {dst_ip}"
+                        )
                     return
 
-            if self.router_manager and self.router_manager.started:
+            if not settings.get("include_localhost", True) and self.router_manager and self.router_manager.started:
                 try:
-                    link_local_ip_bare = self.router_manager.router_ipv6_link_local_out.split('%')[0]
-                    if dst_ip == link_local_ip_bare or src_ip == link_local_ip_bare:
-                        self.logger.log_message(
-                            f"[Wireshark] 💧 Dropping packet to our own link-local address: {dst_ip}"
-                        )
+                    link_local_ip_bare = str(self.router_manager.router_ipv6_link_local_out or "").split('%')[0]
+                    if link_local_ip_bare and (dst_ip == link_local_ip_bare or src_ip == link_local_ip_bare):
+                        if log_filtered:
+                            self.logger.log_message(
+                                f"[Wireshark] Dropping packet to our own link-local address: {dst_ip}"
+                            )
                         return
                 except Exception:
                     pass
@@ -10881,19 +11990,23 @@ class WiresharkManager:
             src_ip = ip_layer.get("ip.src", ip_layer.get("ipv6.src", "N/A"))
             dst_ip = ip_layer.get("ip.dst", ip_layer.get("ipv6.dst", "N/A"))
 
-            common_noisy_ports = {
-                "5353", "1900", "137", "138", "139", "445", "520", "161", "162",
-                "67", "68", "546", "547", "5678", "5679", "3702", "5355", "22222"
-            }
+            common_noisy_ports = set()
+            if not settings.get("include_discovery", False):
+                common_noisy_ports.update({
+                    "5353", "1900", "137", "138", "3702", "5355", "5357", "22222"
+                })
+            if not settings.get("include_dhcp", True):
+                common_noisy_ports.update({"67", "68", "546", "547"})
 
             if "udp" in layers:
                 udp_layer = layers["udp"]
                 dst_port = udp_layer.get("udp.dstport", "N/A")
                 src_port = udp_layer.get("udp.srcport", "N/A")
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
-                    self.logger.log_message(
-                        f"[Wireshark Filter] Filtering Discovery/Idle UDP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
-                    )
+                    if log_filtered:
+                        self.logger.log_message(
+                            f"[Wireshark Filter] Filtering Discovery/Idle UDP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
+                        )
                     return
 
             if "tcp" in layers:
@@ -10901,9 +12014,10 @@ class WiresharkManager:
                 dst_port = tcp_layer.get("tcp.dstport", "N/A")
                 src_port = tcp_layer.get("tcp.srcport", "N/A")
                 if dst_port in common_noisy_ports or src_port in common_noisy_ports:
-                    self.logger.log_message(
-                        f"[Wireshark Filter] Filtering Discovery/Idle TCP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
-                    )
+                    if log_filtered:
+                        self.logger.log_message(
+                            f"[Wireshark Filter] Filtering Discovery/Idle TCP packet on port {dst_port} from {src_ip} to {dst_ip} on interface {interface_id}."
+                        )
                     return
 
             def _is_private(addr: str) -> bool:
@@ -10972,89 +12086,93 @@ class WiresharkManager:
 
             # HARD DROP BEFORE ANY LOGGING OF JSON / PAYLOAD / GEOIP
             if _is_hvrm_control_json_block(decoded_payload, payload_bytes, src_port, dst_port, src_ip, dst_ip):
-                self.logger.log_message(
-                    f"[Wireshark Filter] Blocking HVRM control JSON {src_ip}:{src_port} -> {dst_ip}:{dst_port} on interface {interface_id}."
-                )
+                if log_filtered:
+                    self.logger.log_message(
+                        f"[Wireshark Filter] Blocking HVRM control JSON {src_ip}:{src_port} -> {dst_ip}:{dst_port} on interface {interface_id}."
+                    )
                 return
 
             src_location = ""
             dst_location = ""
-            try:
-                if hasattr(self, "_get_geoip_location"):
-                    src_location = self._get_geoip_location(src_ip)
-                    dst_location = self._get_geoip_location(dst_ip)
-            except Exception:
-                src_location = ""
-                dst_location = ""
+            if log_summaries:
+                try:
+                    if hasattr(self, "_get_geoip_location"):
+                        src_location = self._get_geoip_location(src_ip)
+                        dst_location = self._get_geoip_location(dst_ip)
+                except Exception:
+                    src_location = ""
+                    dst_location = ""
 
-            src_loc_str = f"({src_location})" if src_location else ""
-            dst_loc_str = f"({dst_location})" if dst_location else ""
-
-            tag_str = f" [{' | '.join(context_tags)}]" if context_tags else ""
-            app_str = f" | App:{app_layer}" + (f" ({app_detail})" if app_detail else "")
-            self.logger.log_message(
-                f"[NetTrace-{interface_id}] Pkt:{packet_num:<6} | {timestamp} | Len:{packet_len:<5} | "
-                f"{src_ip}:{src_port} {src_loc_str} -> {dst_ip}:{dst_port} {dst_loc_str} | "
-                f"Proto:{highest_proto}{app_str}{tag_str}"
-            )
-
-            if app_layer == "HTTP":
-                http = layers.get("http", {})
-                if "http.request.method" in http:
-                    host = http.get("http.host", "")
-                    uri = http.get("http.request.full_uri", "")
-                    self.logger.log_message(
-                        f"[HTTP-{interface_id}] {src_ip} → {host}{uri} ({http['http.request.method']}){tag_str}"
-                    )
-                elif "http.response.code" in http:
-                    code = http["http.response.code"]
-                    self.logger.log_message(
-                        f"[HTTP-{interface_id}] {dst_ip} ← {code}{tag_str}"
-                    )
-
-            elif app_layer == "TLS":
-                tls = layers.get("ssl", layers.get("tls", {}))
-                if "tls.handshake.extensions_server_name" in tls:
-                    sni = tls["tls.handshake.extensions_server_name"]
-                    self.logger.log_message(
-                        f"[TLS-{interface_id}] SNI={sni} {src_ip}:{src_port} → {dst_ip}:{dst_port}{tag_str}"
-                    )
-
-            elif app_layer == "DNS":
-                dns = layers.get("dns", {})
-                qname = dns.get("dns.qry.name", "")
-                qtype = dns.get("dns.qry.type", "")
-                answer = dns.get("dns.a", dns.get("dns.aaaa", ""))
+            if log_summaries:
+                src_loc_str = f"({src_location})" if src_location else ""
+                dst_loc_str = f"({dst_location})" if dst_location else ""
+    
+                tag_str = f" [{' | '.join(context_tags)}]" if context_tags else ""
+                app_str = f" | App:{app_layer}" + (f" ({app_detail})" if app_detail else "")
                 self.logger.log_message(
-                    f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}"
+                    f"[NetTrace-{interface_id}] Pkt:{packet_num:<6} | {timestamp} | Len:{packet_len:<5} | "
+                    f"{src_ip}:{src_port} {src_loc_str} -> {dst_ip}:{dst_port} {dst_loc_str} | "
+                    f"Proto:{highest_proto}{app_str}{tag_str}"
                 )
-
-            elif app_layer in {"JSON", "JSON-RPC"}:
-                preview = decoded_payload[:400] if decoded_payload else ""
-                self.logger.log_message(
-                    f"[JSON-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
-                )
-
-            elif app_layer in {"XML", "SOAP"}:
-                preview = decoded_payload[:400] if decoded_payload else ""
-                self.logger.log_message(
-                    f"[XML-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
-                )
-
-            if payload_bytes:
-                raw_payload_hex_str = payload_bytes.hex()
-                truncated_hex_display = raw_payload_hex_str[:128] + ("..." if len(raw_payload_hex_str) > 128 else "")
-                self.logger.log_message(f"[Payload-Wireshark] 📦 Raw payload (hex): {truncated_hex_display}")
-
-                if decoded_payload and decoded_payload.strip():
-                    self.logger.log_message(f"[Payload-Wireshark] 📝 Decoded payload: {decoded_payload[:1200]}")
+    
+                if app_layer == "HTTP":
+                    http = layers.get("http", {})
+                    if "http.request.method" in http:
+                        host = http.get("http.host", "")
+                        uri = http.get("http.request.full_uri", "")
+                        self.logger.log_message(
+                            f"[HTTP-{interface_id}] {src_ip} → {host}{uri} ({http['http.request.method']}){tag_str}"
+                        )
+                    elif "http.response.code" in http:
+                        code = http["http.response.code"]
+                        self.logger.log_message(
+                            f"[HTTP-{interface_id}] {dst_ip} ← {code}{tag_str}"
+                        )
+    
+                elif app_layer == "TLS":
+                    tls = layers.get("ssl", layers.get("tls", {}))
+                    if "tls.handshake.extensions_server_name" in tls:
+                        sni = tls["tls.handshake.extensions_server_name"]
+                        self.logger.log_message(
+                            f"[TLS-{interface_id}] SNI={sni} {src_ip}:{src_port} → {dst_ip}:{dst_port}{tag_str}"
+                        )
+    
+                elif app_layer == "DNS":
+                    dns = layers.get("dns", {})
+                    qname = dns.get("dns.qry.name", "")
+                    qtype = dns.get("dns.qry.type", "")
+                    answer = dns.get("dns.a", dns.get("dns.aaaa", ""))
+                    self.logger.log_message(
+                        f"[DNS-{interface_id}] {qname} ({qtype}) → {answer or 'NO-ANSWER'}{tag_str}"
+                    )
+    
+                elif app_layer in {"JSON", "JSON-RPC"}:
+                    preview = decoded_payload[:400] if decoded_payload else ""
+                    self.logger.log_message(
+                        f"[JSON-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
+                    )
+    
+                elif app_layer in {"XML", "SOAP"}:
+                    preview = decoded_payload[:400] if decoded_payload else ""
+                    self.logger.log_message(
+                        f"[XML-{interface_id}] {src_ip}:{src_port} -> {dst_ip}:{dst_port} {preview}"
+                    )
+    
+            if log_payloads:
+                if payload_bytes:
+                    raw_payload_hex_str = payload_bytes.hex()
+                    truncated_hex_display = raw_payload_hex_str[:128] + ("..." if len(raw_payload_hex_str) > 128 else "")
+                    self.logger.log_message(f"[Payload-Wireshark] 📦 Raw payload (hex): {truncated_hex_display}")
+    
+                    if decoded_payload and decoded_payload.strip():
+                        self.logger.log_message(f"[Payload-Wireshark] 📝 Decoded payload: {decoded_payload[:1200]}")
+                    else:
+                        self.logger.log_message("[Payload-Wireshark] ⚠️ Decoded payload not considered human-readable.")
                 else:
-                    self.logger.log_message("[Payload-Wireshark] ⚠️ Decoded payload not considered human-readable.")
-            else:
-                self.logger.log_message("[Payload-Wireshark] 📦 No reassembled payload data found.")
-
+                    self.logger.log_message("[Payload-Wireshark] 📦 No reassembled payload data found.")
+    
             try:
-                if self.router_manager and self.router_manager.started:
+                if feed_router and self.router_manager and self.router_manager.started:
                     scapy_pkt = self._build_scapy_from_tshark(layers)
                     if scapy_pkt is None:
                         self.logger.log_message(
@@ -11085,28 +12203,18 @@ class WiresharkManager:
                     except Exception:
                         pass
 
-                    if self.router_manager.hyperv_enabled and self.router_manager.hypervrouter_manager._should_drop_wireshark_hvrm(
-                            scapy_pkt, scapy_raw, "WireShark"
-                    ):
-                        return
-
-                    try:
-                        if self.router_manager.started and (
-                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(
-                                    src_ip)) or
-                                (self.router_manager.router_ip_out and self.router_manager.router_ip_out in str(dst_ip))
-                        ):
-                                self.logger.log_message(
-                                    "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
-                                )
-                                self.router_manager.process_packet(scapy_pkt, "WireShark")
-                                return
-                        self.logger.log_message(
-                            "[Wireshark-Process] 🪈 Sending packet via Scapy through router as WireShark."
-                        )
-                        self.router_manager.process_packet(scapy_pkt, "WireShark")
-                    except TypeError:
-                        self.router_manager.process_packet(scapy_pkt)
+                    accepted = self.router_manager.enqueue_ingress_packet(
+                        scapy_pkt, "WireShark"
+                    )
+                    stats = self._capture_stats[str(interface_id)]
+                    if accepted:
+                        stats["router_accepted"] += 1
+                    else:
+                        stats["router_rejected"] += 1
+                        if log_filtered:
+                            self.logger.log_message(
+                                "[Wireshark-Process] Router ingress queue did not accept reconstructed packet."
+                            )
 
             except Exception as e:
                 self.logger.log_message(f"[Wireshark-Process] ❌ Scapy build/dispatch error: {e}")
@@ -11117,25 +12225,96 @@ class WiresharkManager:
             )
 
     def _redirect_output(self, process: subprocess.Popen, interface_id: str):
-        if not process.stdout: return
-        json_buffer = ""
+        """Incrementally decode tshark's live JSON array without waiting for exit."""
+        if not process.stdout:
+            return
         decoder = json.JSONDecoder()
-        for line in iter(process.stdout.readline, ''):
-            if self.stop_event.is_set(): break
-            json_buffer += line
-            while True:
-                start_index = json_buffer.find('{')
-                if start_index == -1:
-                    json_buffer = ""
-                    break
-                json_buffer = json_buffer[start_index:]
+        buffer = ""
+        max_buffer = 16 * 1024 * 1024
+
+        def consume(current: str) -> str:
+            while current:
+                current = current.lstrip("\ufeff\r\n\t ,[]")
+                if not current:
+                    return ""
+                if not current.startswith("{"):
+                    start = current.find("{")
+                    if start < 0:
+                        return current[-4096:]
+                    current = current[start:]
                 try:
-                    packet_data, index = decoder.raw_decode(json_buffer)
-                    self._process_packet(packet_data, interface_id)
-                    json_buffer = json_buffer[index:]
+                    record, index = decoder.raw_decode(current)
                 except json.JSONDecodeError:
+                    return current
+                current = current[index:]
+                layers = self._extract_layers_from_record(record) if isinstance(record, dict) else {}
+                if not layers:
+                    self._capture_stats[interface_id]["empty_records"] += 1
+                    continue
+                try:
+                    self._process_packet(record, interface_id)
+                    stats = self._capture_stats[interface_id]
+                    stats["packets"] += 1
+                    stats["last_packet_at"] = time.monotonic()
+                except Exception as exc:
+                    self._capture_stats[interface_id]["parse_errors"] += 1
+                    if self._capture_stats[interface_id]["parse_errors"] <= 3:
+                        self.logger.log_message(
+                            f"[Wireshark] Packet decode error on {interface_id}: {type(exc).__name__}: {exc}"
+                        )
+            return current
+
+        try:
+            for line in iter(process.stdout.readline, ""):
+                if self.stop_event.is_set():
                     break
-        self.logger.log_message(f"[Wireshark] Output stream ended for interface {interface_id}.")
+                stats = self._capture_stats[interface_id]
+                stats["stdout_lines"] += 1
+                stats["stdout_bytes"] += len(line.encode("utf-8", "replace"))
+                buffer += line
+                buffer = consume(buffer)
+                if len(buffer) > max_buffer:
+                    stats["parse_errors"] += 1
+                    self.logger.log_message(
+                        f"[Wireshark] Resetting oversized JSON buffer on interface {interface_id}."
+                    )
+                    start = buffer.rfind("{")
+                    buffer = buffer[start:] if start >= 0 else ""
+            if buffer:
+                consume(buffer)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.logger.log_message(
+                    f"[Wireshark] stdout reader failed on {interface_id}: {type(exc).__name__}: {exc}"
+                )
+        finally:
+            rc = process.poll()
+            if not self.stop_event.is_set():
+                self.logger.log_message(
+                    f"[Wireshark] Capture stream ended on {interface_id} (exit={rc})."
+                )
+
+    def _redirect_stderr(self, process: subprocess.Popen, interface_id: str):
+        if not process.stderr:
+            return
+        emitted = 0
+        try:
+            for raw_line in iter(process.stderr.readline, ""):
+                line = str(raw_line or "").strip()
+                if not line:
+                    continue
+                self._capture_stats[interface_id]["stderr_lines"] += 1
+                self._stderr_tail[interface_id].append(line)
+                lowered = line.casefold()
+                important = any(token in lowered for token in (
+                    "error", "failed", "invalid", "permission", "denied", "npcap",
+                    "couldn't", "cannot", "not found", "no such device",
+                ))
+                if important and emitted < 8:
+                    self.logger.log_message(f"[Wireshark/tshark {interface_id}] {line}")
+                    emitted += 1
+        except Exception:
+            pass
 
 class AsyncNmapManager:
     """An asynchronous manager for running Nmap through WSL."""

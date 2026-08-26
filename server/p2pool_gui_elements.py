@@ -1590,6 +1590,25 @@ class P2PoolTab(QWidget):
         self.stop_p2pool_button.setObjectName("stop_button")
         self.stop_p2pool_button.setEnabled(False)
 
+        self.stratum_bind_mode_combo = QComboBox()
+        self.stratum_bind_mode_combo.addItem("Auto / all local IPv4 addresses", "auto")
+        self.stratum_bind_mode_combo.addItem("ATT Air IP passthrough / public IPv4", "passthrough")
+        self.stratum_bind_mode_combo.addItem("Private LAN IPv4", "lan")
+        self.stratum_bind_mode_combo.addItem("Explicit local IPv4", "explicit")
+        self.stratum_bind_ip_input = QLineEdit()
+        self.stratum_bind_ip_input.setPlaceholderText(
+            "Used only with Explicit local IPv4; never defaults to 192.168.0.10"
+        )
+        self.stratum_bind_ip_input.setEnabled(False)
+        self.stratum_bind_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.stratum_bind_ip_input.setEnabled(
+                self.stratum_bind_mode_combo.currentData() == "explicit"
+            )
+        )
+        self.stratum_listen_port_input = QLineEdit()
+        self.stratum_listen_port_input.setText("3333")
+        self.stratum_listen_port_input.setPlaceholderText("P2Pool Stratum listen port")
+
         self.command_label = QLabel("P2Pool Command:")
         self.command_input = QLineEdit()
         self.command_input.setPlaceholderText("Type a P2Pool command and press Enter...")
@@ -1611,12 +1630,23 @@ class P2PoolTab(QWidget):
         control_layout.addWidget(self.stop_p2pool_button)
         control_layout.addStretch(1)
 
+        bind_group = QGroupBox("P2Pool Stratum Listener")
+        bind_layout = QGridLayout(bind_group)
+        bind_layout.addWidget(QLabel("Bind mode:"), 0, 0)
+        bind_layout.addWidget(self.stratum_bind_mode_combo, 0, 1)
+        bind_layout.addWidget(QLabel("Explicit IPv4:"), 1, 0)
+        bind_layout.addWidget(self.stratum_bind_ip_input, 1, 1)
+        bind_layout.addWidget(QLabel("Listen port:"), 0, 2)
+        bind_layout.addWidget(self.stratum_listen_port_input, 0, 3)
+        bind_layout.setColumnStretch(1, 1)
+
         command_layout = QHBoxLayout()
         command_layout.addWidget(self.command_label)
         command_layout.addWidget(self.command_input, 1)
         command_layout.addWidget(self.send_command_button)
 
         layout.addLayout(control_layout)
+        layout.addWidget(bind_group)
         layout.addLayout(command_layout)
         layout.addWidget(self.console_log)
 
@@ -1682,16 +1712,14 @@ class P2PoolTab(QWidget):
         self.console_log.appendPlainText(message)
 
 class WiresharkTab(QWidget):
-    """
-    A QWidget that encapsulates all UI elements and logic for the Wireshark Capture tab.
-    """
+    """Wireshark/tshark capture controls with bounded, explicit capture policy."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._create_widgets()
         self._configure_layout()
 
     def _create_widgets(self):
-        """Creates all the widgets for the tab."""
         self.start_wireshark_button = QPushButton("Start Wireshark Capture")
         self.start_wireshark_button.setObjectName("start_wireshark_button")
         self.start_wireshark_button.setEnabled(False)
@@ -1700,27 +1728,106 @@ class WiresharkTab(QWidget):
         self.stop_wireshark_button.setObjectName("stop_wireshark_button")
         self.stop_wireshark_button.setEnabled(False)
 
+        self.main_interface_input = QLineEdit("Auto")
+        self.main_interface_input.setPlaceholderText("Friendly name, GUID, NPF path, or Auto")
+
+        self.include_loopback_checkbox = QCheckBox("Capture loopback")
+        self.include_loopback_checkbox.setChecked(True)
+        self.include_vpn_checkbox = QCheckBox("Capture detected VPN adapters")
+        self.include_vpn_checkbox.setChecked(True)
+        self.include_multicast_checkbox = QCheckBox("Capture multicast")
+        self.include_multicast_checkbox.setChecked(False)
+        self.include_discovery_checkbox = QCheckBox("Capture mDNS/SSDP/WS-Discovery/LLMNR")
+        self.include_discovery_checkbox.setChecked(False)
+        self.include_dhcp_checkbox = QCheckBox("Capture DHCPv4/DHCPv6")
+        self.include_dhcp_checkbox.setChecked(True)
+        self.include_localhost_checkbox = QCheckBox("Capture localhost addresses")
+        self.include_localhost_checkbox.setChecked(True)
+        self.promiscuous_checkbox = QCheckBox("Promiscuous mode")
+        self.promiscuous_checkbox.setChecked(True)
+        self.full_details_checkbox = QCheckBox("Request full tshark protocol details")
+        self.full_details_checkbox.setChecked(True)
+        self.feed_router_checkbox = QCheckBox("Feed reconstructed packets into router queue")
+        self.feed_router_checkbox.setChecked(False)
+        self.feed_router_checkbox.setToolTip(
+            "Off by default because Npcap already feeds the router. Enable only when tshark is the intended capture source."
+        )
+        self.log_summaries_checkbox = QCheckBox("Log one summary per packet")
+        self.log_summaries_checkbox.setChecked(False)
+        self.log_payloads_checkbox = QCheckBox("Log decoded/raw payload previews")
+        self.log_payloads_checkbox.setChecked(False)
+        self.log_filtered_checkbox = QCheckBox("Log every filtered/noisy packet")
+        self.log_filtered_checkbox.setChecked(False)
+
+        self.min_packet_len_input = QSpinBox()
+        self.min_packet_len_input.setRange(0, 65535)
+        self.min_packet_len_input.setValue(0)
+        self.max_interfaces_input = QSpinBox()
+        self.max_interfaces_input.setRange(1, 32)
+        self.max_interfaces_input.setValue(8)
+        self.custom_bpf_input = QLineEdit()
+        self.custom_bpf_input.setPlaceholderText("Optional additional BPF expression")
+
         self.wireshark_log = QPlainTextEdit()
         self.wireshark_log.setReadOnly(True)
         self.wireshark_log.setMaximumBlockCount(10000)
 
+    def capture_settings(self) -> dict:
+        return {
+            "main_interface": self.main_interface_input.text().strip() or "Auto",
+            "include_loopback": self.include_loopback_checkbox.isChecked(),
+            "include_vpn": self.include_vpn_checkbox.isChecked(),
+            "include_multicast": self.include_multicast_checkbox.isChecked(),
+            "include_discovery": self.include_discovery_checkbox.isChecked(),
+            "include_dhcp": self.include_dhcp_checkbox.isChecked(),
+            "include_localhost": self.include_localhost_checkbox.isChecked(),
+            "promiscuous": self.promiscuous_checkbox.isChecked(),
+            "full_details": self.full_details_checkbox.isChecked(),
+            "feed_router": self.feed_router_checkbox.isChecked(),
+            "log_packet_summaries": self.log_summaries_checkbox.isChecked(),
+            "log_payloads": self.log_payloads_checkbox.isChecked(),
+            "log_filtered_packets": self.log_filtered_checkbox.isChecked(),
+            "min_packet_len": int(self.min_packet_len_input.value()),
+            "max_interfaces": int(self.max_interfaces_input.value()),
+            "custom_bpf": self.custom_bpf_input.text().strip(),
+        }
+
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
         layout = QVBoxLayout(self)
         control_layout = QHBoxLayout()
-
         control_layout.addWidget(self.start_wireshark_button)
         control_layout.addWidget(self.stop_wireshark_button)
         control_layout.addStretch(1)
-
         layout.addLayout(control_layout)
+
+        settings_box = QGroupBox("Capture Settings")
+        grid = QGridLayout(settings_box)
+        grid.addWidget(QLabel("Main interface:"), 0, 0)
+        grid.addWidget(self.main_interface_input, 0, 1, 1, 3)
+        grid.addWidget(self.include_loopback_checkbox, 1, 0)
+        grid.addWidget(self.include_vpn_checkbox, 1, 1)
+        grid.addWidget(self.include_multicast_checkbox, 1, 2)
+        grid.addWidget(self.include_discovery_checkbox, 1, 3)
+        grid.addWidget(self.include_dhcp_checkbox, 2, 0)
+        grid.addWidget(self.include_localhost_checkbox, 2, 1)
+        grid.addWidget(self.promiscuous_checkbox, 2, 2)
+        grid.addWidget(self.full_details_checkbox, 2, 3)
+        grid.addWidget(self.feed_router_checkbox, 3, 0, 1, 2)
+        grid.addWidget(self.log_summaries_checkbox, 3, 2)
+        grid.addWidget(self.log_payloads_checkbox, 3, 3)
+        grid.addWidget(self.log_filtered_checkbox, 4, 0, 1, 2)
+        grid.addWidget(QLabel("Minimum frame length:"), 5, 0)
+        grid.addWidget(self.min_packet_len_input, 5, 1)
+        grid.addWidget(QLabel("Maximum interfaces:"), 5, 2)
+        grid.addWidget(self.max_interfaces_input, 5, 3)
+        grid.addWidget(QLabel("Additional BPF:"), 6, 0)
+        grid.addWidget(self.custom_bpf_input, 6, 1, 1, 3)
+        layout.addWidget(settings_box)
         layout.addWidget(self.wireshark_log)
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """Appends a message to the Wireshark console log."""
         self.wireshark_log.appendPlainText(message)
-
 
 
 
@@ -2051,6 +2158,35 @@ class RouterTab(QWidget):
             "Parallel Passive Analysis"
         )
         self.transport_parallel_analysis_checkbox.setChecked(True)
+        self.transport_classification_mode_combo = QComboBox()
+        self.transport_classification_mode_combo.addItem(
+            "Strict evidence (recommended)", "strict"
+        )
+        self.transport_classification_mode_combo.addItem(
+            "Balanced evidence", "balanced"
+        )
+        self.transport_classification_mode_combo.addItem(
+            "Legacy port-first", "legacy"
+        )
+        self.transport_stratum_port_policy_combo = QComboBox()
+        self.transport_stratum_port_policy_combo.addItem(
+            "Port is a hint (recommended)", "hint"
+        )
+        self.transport_stratum_port_policy_combo.addItem(
+            "Port is authoritative (legacy)", "authoritative"
+        )
+        self.transport_stratum_tls_endpoint_checkbox = QCheckBox(
+            "Require endpoint/flow proof for Stratum over TLS"
+        )
+        self.transport_stratum_tls_endpoint_checkbox.setChecked(True)
+        self.transport_analysis_payload_only_checkbox = QCheckBox(
+            "Passive analysis only when payload exists"
+        )
+        self.transport_analysis_payload_only_checkbox.setChecked(True)
+        self.transport_analysis_sample_rate_input = QLineEdit()
+        self.transport_analysis_sample_rate_input.setText("0.15")
+        self.transport_analysis_cooldown_input = QLineEdit()
+        self.transport_analysis_cooldown_input.setText("0.25")
         self.transport_protocol_checkboxes = {}
         transport_protocol_labels = [
             ("inspection", "Deep Inspection"),
@@ -2174,6 +2310,18 @@ class RouterTab(QWidget):
             "Allow Public Internet Targets"
         )
         self.codeoutput_allow_public_checkbox.setChecked(False)
+        self.codeoutput_use_router_path_checkbox = QCheckBox(
+            "Resolve selected adapter GUID and use router path"
+        )
+        self.codeoutput_use_router_path_checkbox.setChecked(True)
+        self.codeoutput_virtual_wan_checkbox = QCheckBox(
+            "Expose CodeOutputInterface as a programmatic WAN capture interface"
+        )
+        self.codeoutput_virtual_wan_checkbox.setChecked(True)
+        self.codeoutput_virtual_wan_checkbox.setToolTip(
+            "Packets submitted through CodeOutput are queued into PythonRouterManager exactly like Npcap ingress, "
+            "without pretending the synthetic interface is a Windows/Npcap adapter."
+        )
         self.codeoutput_verbose_input = QSpinBox()
         self.codeoutput_verbose_input.setRange(0, 5)
         self.codeoutput_verbose_input.setValue(2)
@@ -2379,6 +2527,37 @@ class RouterTab(QWidget):
 
         self.promisc_checkbox = QCheckBox("Promiscuous")
         self.promisc_checkbox.setChecked(False)
+
+        self.sniff_mac_only_checkbox = QCheckBox("Require Ethernet/MAC frames on physical captures")
+        self.sniff_mac_only_checkbox.setChecked(True)
+        self.sniff_mac_only_checkbox.setToolTip(
+            "Default on. L3-only loopback and virtual-interface packets remain allowed by the two exceptions below."
+        )
+        self.sniff_allow_loopback_l3_checkbox = QCheckBox("Allow L3-only loopback packets")
+        self.sniff_allow_loopback_l3_checkbox.setChecked(True)
+        self.sniff_allow_virtual_l3_checkbox = QCheckBox("Allow L3-only virtual/CodeOutput packets")
+        self.sniff_allow_virtual_l3_checkbox.setChecked(True)
+        self.ingress_dedupe_noise_checkbox = QCheckBox("Coalesce repeated low-value multicast/broadcast frames")
+        self.ingress_dedupe_noise_checkbox.setChecked(True)
+        self.tunnel_success_logs_checkbox = QCheckBox("Log every successful ESP/AH/GRE forward")
+        self.tunnel_success_logs_checkbox.setChecked(False)
+
+        self.ingress_max_frames_input = QSpinBox()
+        self.ingress_max_frames_input.setRange(2048, 131072)
+        self.ingress_max_frames_input.setValue(32768)
+        self.ingress_max_mb_input = QSpinBox()
+        self.ingress_max_mb_input.setRange(32, 1024)
+        self.ingress_max_mb_input.setValue(192)
+        self.ingress_reserve_frames_input = QSpinBox()
+        self.ingress_reserve_frames_input.setRange(256, 32768)
+        self.ingress_reserve_frames_input.setValue(4096)
+        self.ingress_worker_batch_input = QSpinBox()
+        self.ingress_worker_batch_input.setRange(1, 1024)
+        self.ingress_worker_batch_input.setValue(64)
+        self.ingress_summary_interval_input = QSpinBox()
+        self.ingress_summary_interval_input.setRange(5, 300)
+        self.ingress_summary_interval_input.setValue(15)
+
         self.ollama_checkbox = QCheckBox("Ollama")
         self.ollama_checkbox.setChecked(False)
         self.use_wifi_host_checkbox = QCheckBox("Host Wireless Network")
@@ -2553,6 +2732,27 @@ class RouterTab(QWidget):
         )
         peerinterface_help.setWordWrap(True)
         peerinterface_form.addRow(peerinterface_help)
+
+        capture_queue_content = QWidget()
+        capture_queue_grid = QGridLayout(capture_queue_content)
+        capture_queue_grid.setContentsMargins(8, 8, 8, 8)
+        capture_queue_grid.setHorizontalSpacing(12)
+        capture_queue_grid.setVerticalSpacing(8)
+        capture_queue_grid.addWidget(self.sniff_mac_only_checkbox, 0, 0, 1, 2)
+        capture_queue_grid.addWidget(self.sniff_allow_loopback_l3_checkbox, 0, 2)
+        capture_queue_grid.addWidget(self.sniff_allow_virtual_l3_checkbox, 0, 3)
+        capture_queue_grid.addWidget(self.ingress_dedupe_noise_checkbox, 1, 0, 1, 2)
+        capture_queue_grid.addWidget(self.tunnel_success_logs_checkbox, 1, 2, 1, 2)
+        capture_queue_grid.addWidget(QLabel("Base queue frames:"), 2, 0)
+        capture_queue_grid.addWidget(self.ingress_max_frames_input, 2, 1)
+        capture_queue_grid.addWidget(QLabel("Queue memory MiB:"), 2, 2)
+        capture_queue_grid.addWidget(self.ingress_max_mb_input, 2, 3)
+        capture_queue_grid.addWidget(QLabel("Protected reserve frames:"), 3, 0)
+        capture_queue_grid.addWidget(self.ingress_reserve_frames_input, 3, 1)
+        capture_queue_grid.addWidget(QLabel("Worker batch:"), 3, 2)
+        capture_queue_grid.addWidget(self.ingress_worker_batch_input, 3, 3)
+        capture_queue_grid.addWidget(QLabel("Summary interval (s):"), 4, 0)
+        capture_queue_grid.addWidget(self.ingress_summary_interval_input, 4, 1)
 
         core_managers_content = QWidget()
         core_managers_grid = QGridLayout(core_managers_content)
@@ -2951,6 +3151,60 @@ class RouterTab(QWidget):
             1,
             2,
         )
+        transport_tuning_grid.addWidget(
+            QLabel("Classification mode:"),
+            13,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_classification_mode_combo,
+            13,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Stratum port policy:"),
+            13,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_port_policy_combo,
+            13,
+            3,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_tls_endpoint_checkbox,
+            14,
+            0,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_analysis_payload_only_checkbox,
+            14,
+            2,
+            1,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Passive analysis sample (0-1):"),
+            15,
+            0,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_analysis_sample_rate_input,
+            15,
+            1,
+        )
+        transport_tuning_grid.addWidget(
+            QLabel("Analysis flow cooldown:"),
+            15,
+            2,
+        )
+        transport_tuning_grid.addWidget(
+            self.transport_analysis_cooldown_input,
+            15,
+            3,
+        )
 
         transport_protocol_box = QGroupBox(
             "Protocol Managers"
@@ -2989,21 +3243,23 @@ class RouterTab(QWidget):
         codeoutput_grid.addWidget(self.codeoutput_min_packets_input, 3, 1)
         codeoutput_grid.addWidget(self.codeoutput_active_probes_checkbox, 4, 0, 1, 2)
         codeoutput_grid.addWidget(self.codeoutput_allow_public_checkbox, 4, 2, 1, 2)
-        codeoutput_grid.addWidget(QLabel("Probe timeout:"), 5, 0)
-        codeoutput_grid.addWidget(self.codeoutput_probe_timeout_input, 5, 1)
-        codeoutput_grid.addWidget(QLabel("Rate/min:"), 5, 2)
-        codeoutput_grid.addWidget(self.codeoutput_probe_rate_input, 5, 3)
-        codeoutput_grid.addWidget(QLabel("Target:"), 6, 0)
-        codeoutput_grid.addWidget(self.codeoutput_target_input, 6, 1)
-        codeoutput_grid.addWidget(self.codeoutput_protocol_dropdown, 6, 2)
-        codeoutput_grid.addWidget(self.codeoutput_port_input, 6, 3)
-        codeoutput_grid.addWidget(QLabel("Interface/source IP:"), 7, 0)
-        codeoutput_grid.addWidget(self.codeoutput_iface_dropdown, 7, 1)
-        codeoutput_grid.addWidget(QLabel("Payload:"), 7, 2)
-        codeoutput_grid.addWidget(self.codeoutput_payload_input, 7, 3)
-        codeoutput_grid.addWidget(QLabel("Concurrency:"), 8, 0)
-        codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 8, 1)
-        codeoutput_grid.addWidget(self.codeoutput_probe_button, 8, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_use_router_path_checkbox, 5, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_virtual_wan_checkbox, 5, 2, 1, 2)
+        codeoutput_grid.addWidget(QLabel("Probe timeout:"), 6, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_timeout_input, 6, 1)
+        codeoutput_grid.addWidget(QLabel("Rate/min:"), 6, 2)
+        codeoutput_grid.addWidget(self.codeoutput_probe_rate_input, 6, 3)
+        codeoutput_grid.addWidget(QLabel("Target:"), 7, 0)
+        codeoutput_grid.addWidget(self.codeoutput_target_input, 7, 1)
+        codeoutput_grid.addWidget(self.codeoutput_protocol_dropdown, 7, 2)
+        codeoutput_grid.addWidget(self.codeoutput_port_input, 7, 3)
+        codeoutput_grid.addWidget(QLabel("Interface GUID / source:"), 8, 0)
+        codeoutput_grid.addWidget(self.codeoutput_iface_dropdown, 8, 1)
+        codeoutput_grid.addWidget(QLabel("Payload:"), 8, 2)
+        codeoutput_grid.addWidget(self.codeoutput_payload_input, 8, 3)
+        codeoutput_grid.addWidget(QLabel("Concurrency:"), 9, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 9, 1)
+        codeoutput_grid.addWidget(self.codeoutput_probe_button, 9, 2, 1, 2)
 
         comms_content = QWidget()
         comms_form = QFormLayout(comms_content)
@@ -3396,6 +3652,12 @@ class RouterTab(QWidget):
             self._make_settings_section(
                 "PeerInterface P2P",
                 peerinterface_content,
+            )
+        )
+        settings_layout.addWidget(
+            self._make_settings_section(
+                "Capture & Ingress Queue",
+                capture_queue_content,
             )
         )
         settings_layout.addWidget(
@@ -3950,8 +4212,80 @@ class RouterTab(QWidget):
             self._sync_enable_states
         )
 
+    @staticmethod
+    def _normalize_interface_guid(value) -> str:
+        text = str(value or "").strip()
+        match = re.search(
+            r"\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}?",
+            text,
+        )
+        return "{" + match.group(1).upper() + "}" if match else ""
+
+    def _interface_identity_records(self) -> List[Dict[str, object]]:
+        """Return display rows whose saved value is the stable Windows GUID."""
+        psutil_names = sorted(psutil.net_if_addrs().keys(), key=str.casefold)
+        rows: List[Dict[str, object]] = []
+        claimed_names = set()
+        try:
+            from scapy.arch.windows import get_windows_if_list
+            windows_rows = list(get_windows_if_list() or [])
+        except Exception:
+            windows_rows = []
+
+        for raw in windows_rows:
+            guid = self._normalize_interface_guid(
+                raw.get("guid") or raw.get("name") or raw.get("network_name")
+            )
+            friendly = str(
+                raw.get("win_name") or raw.get("friendlyname")
+                or raw.get("description") or raw.get("name") or guid
+            ).strip()
+            candidates = {
+                str(v).strip().casefold() for v in (
+                    raw.get("name"), raw.get("win_name"), raw.get("friendlyname"),
+                    raw.get("description"), raw.get("network_name"), friendly,
+                ) if str(v or "").strip()
+            }
+            matched_name = next(
+                (name for name in psutil_names if name.casefold() in candidates),
+                friendly,
+            )
+            claimed_names.add(str(matched_name).casefold())
+            token = f"guid:{guid}" if guid else str(matched_name)
+            label = str(matched_name)
+            if guid:
+                label = f"{matched_name}  |  {guid}"
+            try:
+                if_index = int(raw.get("index") or raw.get("if_index") or 0)
+            except Exception:
+                if_index = 0
+            rows.append({
+                "label": label,
+                "token": token,
+                "guid": guid,
+                "friendly_name": matched_name,
+                "description": str(raw.get("description") or ""),
+                "if_index": if_index,
+            })
+
+        for name in psutil_names:
+            if name.casefold() in claimed_names:
+                continue
+            rows.append({
+                "label": name, "token": name, "guid": "",
+                "friendly_name": name, "description": "", "if_index": 0,
+            })
+        rows.sort(key=lambda row: str(row.get("friendly_name") or row.get("label")).casefold())
+        return rows
+
     def _selected_interface_names(self, widget: QListWidget) -> List[str]:
-        return [item.text() for item in widget.selectedItems() if item.text().strip()]
+        selected = []
+        for item in widget.selectedItems():
+            token = item.data(Qt.UserRole)
+            value = str(token if token not in (None, "") else item.text()).strip()
+            if value:
+                selected.append(value)
+        return selected
 
     def selected_lan_dhcp_interfaces(self) -> List[str]:
         return self._selected_interface_names(self.dhcp_lan_interfaces_list)
@@ -3959,27 +4293,62 @@ class RouterTab(QWidget):
     def selected_wan_dhcp_interfaces(self) -> List[str]:
         return self._selected_interface_names(self.dhcp_wan_interfaces_list)
 
+    def selected_codeoutput_interface(self) -> str:
+        index = self.codeoutput_iface_dropdown.currentIndex()
+        if index >= 0:
+            token = self.codeoutput_iface_dropdown.itemData(index, Qt.UserRole)
+            shown = self.codeoutput_iface_dropdown.itemText(index)
+            current = self.codeoutput_iface_dropdown.currentText().strip()
+            if token and current == shown:
+                return str(token).strip()
+        return self.codeoutput_iface_dropdown.currentText().strip()
+
     @pyqtSlot()
     def refresh_network_interfaces(self):
         previous_lan = set(self.selected_lan_dhcp_interfaces()) if hasattr(self, "dhcp_lan_interfaces_list") else set()
         previous_wan = set(self.selected_wan_dhcp_interfaces()) if hasattr(self, "dhcp_wan_interfaces_list") else set()
-        names = sorted(psutil.net_if_addrs().keys(), key=str.casefold)
+        previous_codeoutput = self.selected_codeoutput_interface() if hasattr(self, "codeoutput_iface_dropdown") else ""
+        records = self._interface_identity_records()
+
         for widget in (self.dhcp_lan_interfaces_list, self.dhcp_wan_interfaces_list):
             widget.clear()
-            widget.addItems(names)
+            for record in records:
+                item = QListWidgetItem(str(record["label"]))
+                item.setData(Qt.UserRole, str(record["token"]))
+                item.setData(Qt.UserRole + 1, dict(record))
+                item.setToolTip(
+                    f"Runtime selector: {record['token']}\n"
+                    f"Interface index: {record.get('if_index') or '-'}"
+                )
+                widget.addItem(item)
+
         self.codeoutput_iface_dropdown.clear()
-        self.codeoutput_iface_dropdown.addItem("")
-        self.codeoutput_iface_dropdown.addItems(names + ["PeerInterface", "HyperVManager"])
-        for index in range(self.dhcp_lan_interfaces_list.count()):
-            item = self.dhcp_lan_interfaces_list.item(index)
-            name = item.text()
-            default_lan = any(token in name.casefold() for token in ("ethernet", "veth", "bridge", "lan"))
-            item.setSelected(name in previous_lan or (not previous_lan and default_lan))
-        for index in range(self.dhcp_wan_interfaces_list.count()):
-            item = self.dhcp_wan_interfaces_list.item(index)
-            name = item.text()
-            default_wan = any(token in name.casefold() for token in ("wi-fi", "wifi", "wireless", "wan"))
-            item.setSelected(name in previous_wan or (not previous_wan and default_wan))
+        self.codeoutput_iface_dropdown.addItem("", "")
+        for record in records:
+            self.codeoutput_iface_dropdown.addItem(
+                str(record["label"]), str(record["token"])
+            )
+        self.codeoutput_iface_dropdown.addItem("PeerInterface", "PeerInterface")
+        self.codeoutput_iface_dropdown.addItem("HyperVManager", "HyperVManager")
+
+        for widget, previous, default_tokens in (
+            (self.dhcp_lan_interfaces_list, previous_lan, ("ethernet", "veth", "bridge", "lan")),
+            (self.dhcp_wan_interfaces_list, previous_wan, ("wi-fi", "wifi", "wireless", "wan")),
+        ):
+            for index in range(widget.count()):
+                item = widget.item(index)
+                token = str(item.data(Qt.UserRole) or item.text()).strip()
+                shown = item.text().casefold()
+                default_match = any(value in shown for value in default_tokens)
+                item.setSelected(token in previous or (not previous and default_match))
+
+        if previous_codeoutput:
+            for index in range(self.codeoutput_iface_dropdown.count()):
+                if str(self.codeoutput_iface_dropdown.itemData(index) or "") == previous_codeoutput:
+                    self.codeoutput_iface_dropdown.setCurrentIndex(index)
+                    break
+            else:
+                self.codeoutput_iface_dropdown.setEditText(previous_codeoutput)
 
     @pyqtSlot()
     def _emit_codeoutput_probe(self):
@@ -3991,7 +4360,7 @@ class RouterTab(QWidget):
             "port": None if protocol == "icmp" else port,
             "payload": self.codeoutput_payload_input.text(),
             "timeout": float(self.codeoutput_probe_timeout_input.text().strip() or 3.0),
-            "iface": self.codeoutput_iface_dropdown.currentText().strip(),
+            "iface": self.selected_codeoutput_interface(),
             "expect_response": True,
         })
 
@@ -4069,10 +4438,12 @@ class RouterTab(QWidget):
             self.codeoutput_min_packets_input,
             self.codeoutput_max_chars_input,
             self.codeoutput_active_probes_checkbox,
+            self.codeoutput_virtual_wan_checkbox,
         ):
             widget.setEnabled(codeoutput_enabled)
         for widget in (
             self.codeoutput_allow_public_checkbox,
+            self.codeoutput_use_router_path_checkbox,
             self.codeoutput_probe_timeout_input,
             self.codeoutput_probe_rate_input,
             self.codeoutput_probe_concurrency_input,
@@ -4143,6 +4514,12 @@ class RouterTab(QWidget):
         )
         for widget in (
             self.transport_parallel_analysis_checkbox,
+            self.transport_classification_mode_combo,
+            self.transport_stratum_port_policy_combo,
+            self.transport_stratum_tls_endpoint_checkbox,
+            self.transport_analysis_payload_only_checkbox,
+            self.transport_analysis_sample_rate_input,
+            self.transport_analysis_cooldown_input,
             self.transport_stratum_ports_input,
             self.transport_monero_ports_input,
             self.transport_voip_start_input,
@@ -4164,6 +4541,8 @@ class RouterTab(QWidget):
             self.transport_https_logging_checkbox,
             self.transport_https_certificates_checkbox,
             self.transport_https_quic_crypto_checkbox,
+            self.transport_tls_learning_checkbox,
+            self.transport_https_init_context_checkbox,
             *self.transport_protocol_checkboxes.values(),
         ):
             widget.setEnabled(transport_enabled)

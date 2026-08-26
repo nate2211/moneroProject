@@ -575,7 +575,7 @@ class SnifferSoftware:
         self._packet_log_lock = threading.RLock()
         self._packet_log_window_start = time.monotonic()
         self._packet_log_lines_in_window = 0
-        self._packet_log_max_per_second = 25
+        self._packet_log_max_per_second = 5
         self._packet_log_suppressed = 0
         self._packet_log_last_summary = 0.0
         self._startup_monotonic = time.monotonic()
@@ -2939,27 +2939,21 @@ class SnifferSoftware:
                         "name": service_name,
                     }
 
-                    # A configured Stratum service port is authoritative transport
-                    # metadata even when its application bytes are encrypted or the
-                    # capture begins on a SYN/ACK.  Keep any parsed plaintext JSON
-                    # metadata, but otherwise attach a bounded port-derived Stratum
-                    # identity so ingress preservation and transport dispatch do not
-                    # reduce the connection to only "initial" or "tls".
-                    if "stratum" in service_name and "stratum" not in metadata:
-                        tls_meta = metadata.get("tls")
-                        metadata["stratum"] = {
-                            "protocol": (
-                                "stratum-over-tls"
-                                if tls_meta is not None
-                                else "stratum-transport"
-                            ),
-                            "classification": "configured-service-port",
+                    # Port numbers are only service hints.  A common/learned
+                    # Stratum port must not overwrite payload evidence for TLS,
+                    # HTTP, SSH, or an unrelated application that happens to use
+                    # the same port.  Strict plaintext JSON-RPC parsing above is
+                    # the only path that creates metadata["stratum"].
+                    if "stratum" in service_name:
+                        metadata["stratum_hint"] = {
+                            "classification": "configured-service-port-hint",
                             "service_port": int(service_port),
                             "service_name": service_name,
-                            "encrypted": bool(tls_meta is not None),
+                            "tls_visible": bool(metadata.get("tls")),
                             "payload_visible": bool(payload),
-                            "json_visible": False,
+                            "authoritative": False,
                         }
+                        metadata["service"]["confidence"] = "hint"
             elif udp is not None:
                 sport = int(getattr(udp, "sport", 0) or 0)
                 dport = int(getattr(udp, "dport", 0) or 0)
@@ -3018,9 +3012,12 @@ class SnifferSoftware:
                 reasons.append("high-value-udp-port")
 
         weights = {
-            "stratum": 45,
-            "tls": 35,
-            "quic": 30,
+            # Application evidence outranks port hints.  TLS application-data
+            # packets are not all critical; only visible handshakes receive the
+            # additional score below.
+            "stratum": 42,
+            "tls": 18,
+            "quic": 20,
             "eapol": 35,
             "ike": 28,
             "esp": 26,
@@ -3030,11 +3027,11 @@ class SnifferSoftware:
             "dhcp": 25,
             "ndp": 22,
             "arp": 14,
-            "http": 20,
-            "ssh": 20,
-            "json_rpc": 18,
-            "service": 14,
-            "tcp": 4,
+            "http": 18,
+            "ssh": 18,
+            "json_rpc": 10,
+            "service": 2,
+            "tcp": 2,
         }
         for name, weight in weights.items():
             if name in metadata:
@@ -3044,11 +3041,29 @@ class SnifferSoftware:
         service = metadata.get("service") or {}
         service_name = str(service.get("name") or "")
         if "stratum" in service_name:
-            score += 32
-            reasons.append(service_name)
+            # Port-only Stratum identity is deliberately weak.  The strict
+            # parser contributes the strong metadata["stratum"] score above.
+            score += 3
+            reasons.append(f"{service_name}-hint")
         elif service_name in {"monero-p2p", "monero-rpc", "monero-zmq"}:
-            score += 24
+            score += 12
             reasons.append(service_name)
+
+        tls_meta = metadata.get("tls") or {}
+        if tls_meta.get("client_hello") or tls_meta.get("server_hello"):
+            score += 24
+            reasons.append("tls-handshake")
+        elif any(
+            int(record.get("content_type", 0) or 0) in {20, 21, 22}
+            for record in list(tls_meta.get("records") or [])[:8]
+        ):
+            score += 12
+            reasons.append("tls-control-record")
+
+        stratum_meta = metadata.get("stratum") or {}
+        if str(stratum_meta.get("protocol") or "").casefold() == "stratum-json-rpc":
+            score += 18
+            reasons.append("strict-stratum-json")
 
         tcp = packet.getlayer(TCP)
         if tcp is not None:
@@ -4530,6 +4545,15 @@ class SnifferSoftware:
         family = dst.version
         inventory = self._iface_inventory()
 
+        if dst.is_loopback:
+            loopbacks = [
+                row for row in inventory
+                if self._is_npf_loopback(str(row.get("pcap_name") or ""))
+                or "loopback" in str(row.get("name") or row.get("description") or "").casefold()
+            ]
+            if loopbacks:
+                return self._normalize_pcap_name(loopbacks[0].get("pcap_name"))
+
         if preferred:
             row = self._inventory_row_for_iface(preferred)
             if row and self._interface_score(row, family, str(dst), preferred) > -100000:
@@ -5105,7 +5129,7 @@ class SnifferSoftware:
             return "33:33:%02x:%02x:%02x:%02x" % (b[12], b[13], b[14], b[15])
 
 
-    def _log_route_once(self, key: str, message: str, every: float = 5.0) -> None:
+    def _log_route_once(self, key: str, message: str, every: float = 60.0) -> None:
         now = time.monotonic()
         previous = float(self._builtin_route_log_ts.get(key, 0.0) or 0.0)
         if now - previous < max(0.1, float(every)):
@@ -5121,6 +5145,8 @@ class SnifferSoftware:
         family = dst.version
         destination = str(dst)
         preferred = self._resolve_pcap_iface_alias(preferred_iface) or ""
+        if dst.is_loopback:
+            preferred = ""
         cache_key = (family, destination, preferred.casefold())
         now = time.monotonic()
 
@@ -5175,7 +5201,7 @@ class SnifferSoftware:
             f"{family}:{destination}:{route['interface']}",
             f"[Sniffer] Built-in IPv{family} route: {destination} -> {route['interface']} "
             f"src={source_ip or '-'} next_hop={next_hop} multicast={int(dst.is_multicast)}",
-            every=10.0,
+            every=60.0,
         )
         return route
 
@@ -5829,7 +5855,7 @@ class SnifferSoftware:
         return any(token in lowered for token in (
             "error", "failed", "reject", "drop", "truncated", "dhcp",
             "lease", "tls", "handshake", "alert", "dns", "arp", "ndp",
-            "route", "gateway", "hyperv", "warning", "⚠", "❌",
+            "gateway", "hyperv", "warning", "⚠", "❌",
         ))
 
     def _log_capture_packet(self, message: str, *, fingerprint: str = "") -> None:
@@ -5865,8 +5891,31 @@ class SnifferSoftware:
             except Exception:
                 pass
 
-    def sniff(self, iface, prn, promisc=True, stop_filter=None, filter=None, timeout=100, mac_filter_only=False,
-              session=None):
+    def _allow_l3_without_ether(
+            self, iface: str, packet: Packet, *,
+            allow_l3_on_loopback: bool, allow_l3_on_virtual: bool,
+    ) -> bool:
+        if not (packet.haslayer(IP) or packet.haslayer(IPv6)):
+            return False
+        name = str(iface or "").casefold()
+        if allow_l3_on_loopback and (
+                self._is_npf_loopback(iface)
+                or "loopback" in name
+        ):
+            return True
+        if allow_l3_on_virtual and any(token in name for token in (
+                "codeoutputinterface", "wireshark", "windivert", "wintun",
+                "peerinterface", "socketinterface", "vethernet", "hyper-v",
+                "hyperv", "virtual", "tunnel", "tap", "wireguard",
+        )):
+            return True
+        return False
+
+    def sniff(
+            self, iface, prn, promisc=True, stop_filter=None, filter=None,
+            timeout=100, mac_filter_only=False, session=None,
+            allow_l3_on_loopback=True, allow_l3_on_virtual=True,
+    ):
         """
         Live sniff loop that keeps going forever (unless stop_filter returns True).
         """
@@ -5973,18 +6022,6 @@ class SnifferSoftware:
                             )
                             self.logged_packets.append(packet_summary)
 
-                            if "Loopback" in active_iface:
-                                # Deliver every captured frame immediately. This
-                                # sniffer already maintains bounded TCP stream
-                                # metadata; constructing a new Scapy TCPSession
-                                # per packet adds latency and cannot reassemble.
-                                processed_packet = packet
-                                try:
-                                    if prn and processed_packet is not None:
-                                        prn(processed_packet)
-                                        continue
-                                except Exception:
-                                    pass
                     except Exception:
                         self._log_capture_packet(
                             f"[Packet] iface={active_iface} caplen={packet_len} wire={wire_len} "
@@ -6000,7 +6037,13 @@ class SnifferSoftware:
                     packet.sniffed_on = active_iface
 
                     if mac_filter_only and not packet.haslayer(Ether):
-                        continue
+                        if not self._allow_l3_without_ether(
+                                active_iface,
+                                packet,
+                                allow_l3_on_loopback=bool(allow_l3_on_loopback),
+                                allow_l3_on_virtual=bool(allow_l3_on_virtual),
+                        ):
+                            continue
 
                     if packet.haslayer(Ether):
                         # ARP handling
@@ -6284,7 +6327,7 @@ class SnifferSoftware:
             f"sendp:failed:{requested.casefold()}:{last_error.casefold()}",
             f"[Sniffer] sendp failed for {requested!r}; attempted={attempted_text}; "
             f"last_error={last_error or 'no active adapter'}",
-            every=5.0,
+            every=30.0,
         )
         return False
 

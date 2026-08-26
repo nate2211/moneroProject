@@ -7,6 +7,7 @@ import os
 import queue
 import random
 import socket
+import struct
 import ipaddress
 import subprocess
 import uuid
@@ -1926,6 +1927,8 @@ class CodeOutputManager:
         "dhcp": {"dhcp", "dhcpv6"},
         "arp": {"arp"},
         "http": {"http"},
+        "monero": {"monero", "xmr", "monero_rpc", "monero_p2p", "p2pool"},
+        "stratum": {"stratum", "mining", "jsonrpc-stream", "monero_stratum"},
         "quic": {"quic"},
         "vpn": {"ipsec", "isakmp", "natt", "esp", "ah", "vpn", "gre", "wireguard"},
         "kerberos": {"kerberos", "krb5"},
@@ -1936,13 +1939,16 @@ class CodeOutputManager:
         "misc": set(),
     }
     DEFAULT_TTLS: Dict[str, float] = {
-        "tls": 300.0, "dns": 180.0, "dhcp": 180.0, "arp": 60.0, "http": 180.0, "quic": 180.0,
+        "tls": 300.0, "dns": 180.0, "dhcp": 180.0, "arp": 60.0, "http": 180.0,
+        "monero": 300.0, "stratum": 300.0, "quic": 180.0,
         "vpn": 240.0, "kerberos": 300.0, "ntp": 300.0, "ssh": 300.0,
         "transport": 180.0, "router": 180.0, "misc": 120.0,
     }
     PORT_TOPIC_HINTS = {
         443: "tls", 8443: "tls", 4443: "tls",
-        80: "http", 8080: "http", 8000: "http", 18080: "http",
+        80: "http", 8080: "http", 8000: "http",
+        18080: "monero", 18081: "monero", 18083: "monero", 18089: "monero",
+        28080: "monero", 28081: "monero", 37888: "monero", 37889: "monero",
         53: "dns", 5353: "dns", 3702: "dns", 1900: "dns", 137: "dns",
         67: "dhcp", 68: "dhcp",
         500: "vpn", 4500: "vpn", 51820: "vpn",
@@ -1999,6 +2005,8 @@ class CodeOutputManager:
             "probe_rate_per_minute": 30,
             "probe_max_concurrent": 2,
             "probe_default_iface": "",
+            "probe_use_router_path": True,
+            "virtual_wan_enabled": True,
         }
         self._probe_history: Deque[float] = deque(maxlen=512)
         self._probe_results: Deque[Dict[str, Any]] = deque(maxlen=512)
@@ -2019,6 +2027,8 @@ class CodeOutputManager:
         merged["auto_emit"] = bool(merged["auto_emit"])
         merged["active_probes"] = bool(merged["active_probes"])
         merged["allow_public_targets"] = bool(merged["allow_public_targets"])
+        merged["probe_use_router_path"] = bool(merged["probe_use_router_path"])
+        merged["virtual_wan_enabled"] = bool(merged["virtual_wan_enabled"])
         merged["verbose"] = max(0, min(5, int(merged["verbose"])))
         merged["emit_interval"] = max(0.5, float(merged["emit_interval"]))
         merged["emit_jitter"] = max(0.0, float(merged["emit_jitter"]))
@@ -2038,7 +2048,8 @@ class CodeOutputManager:
         self.log_message(
             "[CodeOutput] ⚙️ Configured "
             f"enabled={merged['enabled']} probes={merged['active_probes']} "
-            f"public={merged['allow_public_targets']} max_code={merged['max_generated_chars']}"
+            f"public={merged['allow_public_targets']} router_path={merged['probe_use_router_path']} "
+            f"virtual_wan={merged['virtual_wan_enabled']} max_code={merged['max_generated_chars']}"
         )
         return self.settings_snapshot()
 
@@ -2080,16 +2091,98 @@ class CodeOutputManager:
             "record": dict(event.get("record") or {}),
         }
         event_name = str(event.get("event") or "event")
-        topic = "stratum" if event_name.startswith("stratum_") else "tls"
+        crypto = dict(context.get("crypto_service") or context.get("crypto") or {})
+        event_data = dict(event.get("data") or {})
+        category = str(
+            crypto.get("category") or event_data.get("crypto_service_category") or ""
+        ).casefold()
+        if event_name.startswith("stratum_"):
+            topic = "stratum"
+        elif category == "xmr" and not event_name.startswith("stratum_"):
+            topic = "monero"
+        else:
+            topic = "tls"
         tags = ["handshake-learning", event_name]
         if topic == "stratum":
             tags.append("jsonrpc-stream")
+        elif topic == "monero":
+            tags.append("xmr-endpoint")
         self.submit_event(
             topic, attributes=attrs,
             tags=tags,
             importance=3,
             source="HandshakeManager",
         )
+
+    def _resolve_probe_interface(self, selector: Optional[str]) -> Dict[str, Any]:
+        raw = str(selector or "").strip()
+        if not raw:
+            return {}
+        if self._router is not None:
+            resolver = getattr(self._router, "resolve_interface_identity", None)
+            if callable(resolver):
+                try:
+                    resolved = dict(resolver(raw) or {})
+                    if resolved:
+                        return resolved
+                except Exception as exc:
+                    self.log_message(
+                        f"[CodeOutput][Route] ⚠️ interface resolution failed for {raw}: {exc}"
+                    )
+        try:
+            ipaddress.ip_address(raw.split("%", 1)[0])
+            return {
+                "selector": raw, "full_name": raw, "friendly_name": raw,
+                "ipv4": raw if ":" not in raw else "", "if_index": 0,
+                "guid": "", "aliases": [raw],
+            }
+        except Exception:
+            return {"selector": raw, "full_name": raw, "friendly_name": raw, "aliases": [raw]}
+
+    def route_packet(
+            self, packet: Any, *, inbound_iface: Optional[str] = None,
+            egress_iface: Optional[str] = None,
+            reason: str = "codeoutput-explicit",
+    ) -> bool:
+        """Route an explicitly requested packet through the bound router.
+
+        Packets merely observed by CodeOutput are never retransmitted.  This API
+        exists for the CodeOutput interface/probe controls and marks the request
+        as explicit, preventing passive learning from becoming a packet loop.
+        """
+        if self._router is None:
+            raise RuntimeError("CodeOutput has no bound PythonRouterManager")
+        route = getattr(self._router, "route_codeoutput_packet", None)
+        if not callable(route):
+            raise RuntimeError("Bound router does not expose route_codeoutput_packet")
+        return bool(route(
+            packet, inbound_iface=inbound_iface, egress_iface=egress_iface,
+            reason=reason,
+        ))
+
+    def ingest_packet(
+            self, packet: Any, *, source_iface: Optional[str] = None,
+            direction: str = "wan-in", metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Submit a programmatically received frame as router ingress.
+
+        Ingress enters the same bounded queue used by Npcap callbacks. Explicit
+        egress remains the responsibility of route_packet(), preventing passive
+        learning from becoming a retransmission loop.
+        """
+        if not self._settings.get("enabled", True):
+            return False
+        if not self._settings.get("virtual_wan_enabled", True):
+            raise RuntimeError("CodeOutput virtual WAN ingress is disabled")
+        if self._router is None:
+            raise RuntimeError("CodeOutput has no bound PythonRouterManager")
+        ingest = getattr(self._router, "ingest_codeoutput_packet", None)
+        if not callable(ingest):
+            raise RuntimeError("Bound router does not expose ingest_codeoutput_packet")
+        return bool(ingest(
+            packet, source_iface=source_iface, direction=direction,
+            metadata=dict(metadata or {}),
+        ))
 
     def submit_probe(
             self,
@@ -2184,12 +2277,33 @@ class CodeOutputManager:
                 raise PermissionError("public probe target blocked by CodeOutput settings")
             timeout = max(0.25, min(60.0, float(request["timeout"])))
             iface = request.get("iface") or ""
+            identity = (
+                self._resolve_probe_interface(iface)
+                if iface and self._settings.get("probe_use_router_path", True)
+                else {}
+            )
+            source_ip = str(identity.get("ipv4") or "").strip()
+            route_iface = str(identity.get("full_name") or iface or "").strip()
+            try:
+                if_index = int(identity.get("if_index") or 0)
+            except Exception:
+                if_index = 0
+            result["resolved_iface"] = route_iface or None
+            result["resolved_guid"] = identity.get("guid") or None
+            result["source_ip"] = source_ip or None
+            result["if_index"] = if_index or None
             if request["protocol"] == "icmp":
                 flag = "-n" if os.name == "nt" else "-c"
                 wait_flag = "-w" if os.name == "nt" else "-W"
                 wait_value = str(max(1, int(timeout * (1000 if os.name == "nt" else 1))))
+                ping_cmd = ["ping", flag, "1", wait_flag, wait_value]
+                if source_ip:
+                    ping_cmd.extend(["-S" if os.name == "nt" else "-I", source_ip])
+                elif route_iface and os.name != "nt":
+                    ping_cmd.extend(["-I", route_iface])
+                ping_cmd.append(resolved_ip)
                 completed = subprocess.run(
-                    ["ping", flag, "1", wait_flag, wait_value, resolved_ip],
+                    ping_cmd,
                     capture_output=True, text=True, timeout=timeout + 2.0,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
                 )
@@ -2202,12 +2316,26 @@ class CodeOutputManager:
                     if iface:
                         try:
                             if os.name == "nt":
-                                # Windows supports binding by source IP. Interface names
-                                # remain routing hints and are preserved in the result.
-                                ipaddress.ip_address(iface)
-                                sock.bind((iface, 0))
-                            elif hasattr(socket, "SO_BINDTODEVICE"):
-                                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
+                                # Resolve the GUI's GUID token at runtime, bind to the
+                                # adapter's current source address, and also set the
+                                # Windows unicast interface index where supported.
+                                if family == socket.AF_INET and if_index:
+                                    opt = getattr(socket, "IP_UNICAST_IF", 31)
+                                    sock.setsockopt(
+                                        socket.IPPROTO_IP, opt, struct.pack("!I", if_index)
+                                    )
+                                elif family == socket.AF_INET6 and if_index:
+                                    opt = getattr(socket, "IPV6_UNICAST_IF", 31)
+                                    sock.setsockopt(socket.IPPROTO_IPV6, opt, if_index)
+                                if source_ip and family == socket.AF_INET:
+                                    sock.bind((source_ip, 0))
+                            elif route_iface and hasattr(socket, "SO_BINDTODEVICE"):
+                                sock.setsockopt(
+                                    socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                    route_iface.encode() + b"\0",
+                                )
+                                if source_ip and family == socket.AF_INET:
+                                    sock.bind((source_ip, 0))
                         except Exception as bind_exc:
                             result["bind_warning"] = str(bind_exc)
                     endpoint = (resolved_ip, int(request["port"]))
@@ -3000,6 +3128,16 @@ class CodeOutputManager:
             attrs.update(proto="arp", arp_op=getattr(arp, "op", None), arp_psrc=getattr(arp, "psrc", None), arp_pdst=getattr(arp, "pdst", None))
         else:
             attrs["proto"] = "l2"
+        primary = str(
+            getattr(pkt, "_transport_primary_classification", "") or ""
+        ).casefold()
+        if primary in {"monero", "monero_tls"}:
+            topic = "monero"
+            attrs["transport_primary"] = primary
+        elif primary in {"stratum", "stratum_tls", "gulf_stratum"}:
+            topic = "stratum"
+            attrs["transport_primary"] = primary
+
         if GRE and pkt.haslayer(GRE):
             topic = "vpn"
             attrs["gre_like"] = True
