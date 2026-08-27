@@ -1600,6 +1600,27 @@ class P2PoolTab(QWidget):
         self.stop_p2pool_button.setObjectName("stop_button")
         self.stop_p2pool_button.setEnabled(False)
 
+        self.stratum_bind_mode_combo = QComboBox()
+        self.stratum_bind_mode_combo.addItems([
+            "Auto / all local IPv4 addresses",
+            "ATT Air passthrough / public IPv4",
+            "Private LAN IPv4",
+            "Explicit local IPv4",
+        ])
+        self.stratum_bind_ip_input = QLineEdit()
+        self.stratum_bind_ip_input.setPlaceholderText(
+            "Used only for Explicit local IPv4"
+        )
+        self.stratum_bind_port_spin = QSpinBox()
+        self.stratum_bind_port_spin.setRange(1, 65535)
+        self.stratum_bind_port_spin.setValue(3333)
+        self.stratum_bind_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.stratum_bind_ip_input.setEnabled(
+                self.stratum_bind_mode_combo.currentIndex() == 3
+            )
+        )
+        self.stratum_bind_ip_input.setEnabled(False)
+
         self.command_label = QLabel("P2Pool Command:")
         self.command_input = QLineEdit()
         self.command_input.setPlaceholderText("Type a P2Pool command and press Enter...")
@@ -1626,9 +1647,44 @@ class P2PoolTab(QWidget):
         command_layout.addWidget(self.command_input, 1)
         command_layout.addWidget(self.send_command_button)
 
+        bind_group = QGroupBox("P2Pool Stratum Listener")
+        bind_grid = QGridLayout(bind_group)
+        bind_grid.addWidget(QLabel("Bind mode:"), 0, 0)
+        bind_grid.addWidget(self.stratum_bind_mode_combo, 0, 1, 1, 3)
+        bind_grid.addWidget(QLabel("Explicit IPv4:"), 1, 0)
+        bind_grid.addWidget(self.stratum_bind_ip_input, 1, 1)
+        bind_grid.addWidget(QLabel("Stratum port:"), 1, 2)
+        bind_grid.addWidget(self.stratum_bind_port_spin, 1, 3)
+        bind_help = QLabel(
+            "Auto binds 0.0.0.0 so ATT Air IP-passthrough, private LAN, "
+            "loopback, and virtual adapters can reach the same P2Pool listener."
+        )
+        bind_help.setWordWrap(True)
+        bind_grid.addWidget(bind_help, 2, 0, 1, 4)
+
         layout.addLayout(control_layout)
+        layout.addWidget(bind_group)
         layout.addLayout(command_layout)
         layout.addWidget(self.console_log)
+
+    def apply_bind_settings(self):
+        if not self.p2pool_helper:
+            raise RuntimeError("P2Pool helper is unavailable.")
+        labels = {
+            0: "auto",
+            1: "passthrough",
+            2: "lan",
+            3: "explicit",
+        }
+        mode = labels.get(self.stratum_bind_mode_combo.currentIndex(), "auto")
+        bind_ip = self.stratum_bind_ip_input.text().strip() or None
+        port = int(self.stratum_bind_port_spin.value())
+        self.p2pool_helper.processor.configure_stratum_bind(
+            bind_mode=mode,
+            bind_ip=bind_ip,
+            port=port,
+        )
+        return {"mode": mode, "bind_ip": bind_ip, "port": port}
 
     def set_p2pool_helper(self, p2pool_helper):
         self.p2pool_helper = p2pool_helper
@@ -2141,6 +2197,27 @@ class RouterTab(QWidget):
             "Parallel Passive Analysis"
         )
         self.transport_parallel_analysis_checkbox.setChecked(True)
+        self.transport_classification_mode_combo = QComboBox()
+        self.transport_classification_mode_combo.addItems([
+            "Strict evidence",
+            "Balanced evidence",
+            "Legacy port-weighted",
+        ])
+        self.transport_stratum_port_policy_combo = QComboBox()
+        self.transport_stratum_port_policy_combo.addItems([
+            "Port is a hint",
+            "Port is authoritative",
+        ])
+        self.transport_stratum_endpoint_proof_checkbox = QCheckBox(
+            "Require endpoint/flow proof for Stratum over TLS"
+        )
+        self.transport_stratum_endpoint_proof_checkbox.setChecked(True)
+        self.transport_analysis_payload_only_checkbox = QCheckBox(
+            "Passive analysis only when payload exists"
+        )
+        self.transport_analysis_payload_only_checkbox.setChecked(True)
+        self.transport_analysis_sample_rate_input = QLineEdit("0.15")
+        self.transport_analysis_flow_cooldown_input = QLineEdit("0.25")
         self.transport_protocol_checkboxes = {}
         transport_protocol_labels = [
             ("inspection", "Deep Inspection"),
@@ -2295,7 +2372,7 @@ class RouterTab(QWidget):
         self.codeoutput_iface_dropdown.setEditable(True)
         self.codeoutput_probe_button = QPushButton("Send CodeOutput Probe")
 
-        self.codeoutput_interface_checkbox = QCheckBox("Create and register real CodeOutput interface")
+        self.codeoutput_interface_checkbox = QCheckBox("Create/register CodeOutput interface (logical fallback supported)")
         self.codeoutput_interface_checkbox.setChecked(False)
         self.codeoutput_switch_name_input = QLineEdit("CodeOutput")
         self.codeoutput_adapter_name_input = QLineEdit("CodeOutput")
@@ -2333,6 +2410,27 @@ class RouterTab(QWidget):
         self.core_igmp_checkbox.setChecked(True)
         self.core_mdns_checkbox = QCheckBox("mDNS Manager")
         self.core_mdns_checkbox.setChecked(True)
+        self.require_ethernet_physical_checkbox = QCheckBox(
+            "Require Ethernet/MAC frames on physical captures"
+        )
+        self.require_ethernet_physical_checkbox.setChecked(True)
+        self.require_ethernet_physical_checkbox.setToolTip(
+            "L3-only packets remain accepted from loopback, Wireshark reconstruction, "
+            "CodeOutput, ProcessInterface, WinDivert, Wintun, TAP, socket, and peer interfaces."
+        )
+        self.tunnel_success_logs_checkbox = QCheckBox(
+            "Log successful ESP/AH/GRE forwarding"
+        )
+        self.tunnel_success_logs_checkbox.setChecked(False)
+        self.ingress_max_frames_input = QSpinBox()
+        self.ingress_max_frames_input.setRange(1024, 262144)
+        self.ingress_max_frames_input.setValue(32768)
+        self.ingress_batch_size_input = QSpinBox()
+        self.ingress_batch_size_input.setRange(1, 512)
+        self.ingress_batch_size_input.setValue(64)
+        self.ingress_summary_interval_input = QSpinBox()
+        self.ingress_summary_interval_input.setRange(5, 300)
+        self.ingress_summary_interval_input.setValue(30)
         self.handshake_half_open_timeout_input = QLineEdit()
         self.handshake_half_open_timeout_input.setText("60")
         self.handshake_established_timeout_input = QLineEdit()
@@ -2666,158 +2764,56 @@ class RouterTab(QWidget):
         core_managers_grid.setVerticalSpacing(8)
         core_managers_grid.setColumnStretch(1, 1)
         core_managers_grid.setColumnStretch(3, 1)
+        # Core manager toggles.
+        for index, checkbox in enumerate((
+                self.core_firewall_checkbox,
+                self.core_packet_analyzer_checkbox,
+                self.core_packet_catcher_checkbox,
+                self.core_handshake_checkbox,
+                self.core_syn_scanner_checkbox,
+                self.core_igmp_checkbox,
+                self.core_mdns_checkbox,
+                self.require_ethernet_physical_checkbox,
+        )):
+            core_managers_grid.addWidget(checkbox, index // 4, index % 4)
+
         core_managers_grid.addWidget(
-            self.core_firewall_checkbox,
-            0,
-            0,
+            self.tunnel_success_logs_checkbox, 2, 0, 1, 2
         )
+        core_managers_grid.addWidget(QLabel("Ingress max frames:"), 2, 2)
+        core_managers_grid.addWidget(self.ingress_max_frames_input, 2, 3)
+        core_managers_grid.addWidget(QLabel("Ingress batch size:"), 3, 0)
+        core_managers_grid.addWidget(self.ingress_batch_size_input, 3, 1)
+        core_managers_grid.addWidget(QLabel("Queue summary seconds:"), 3, 2)
+        core_managers_grid.addWidget(self.ingress_summary_interval_input, 3, 3)
+
+        core_managers_grid.addWidget(QLabel("Half-open timeout:"), 4, 0)
+        core_managers_grid.addWidget(self.handshake_half_open_timeout_input, 4, 1)
+        core_managers_grid.addWidget(QLabel("Established timeout:"), 4, 2)
+        core_managers_grid.addWidget(self.handshake_established_timeout_input, 4, 3)
+        core_managers_grid.addWidget(QLabel("Rate threshold:"), 5, 0)
+        core_managers_grid.addWidget(self.handshake_rate_threshold_input, 5, 1)
+        core_managers_grid.addWidget(QLabel("Rate period:"), 5, 2)
+        core_managers_grid.addWidget(self.handshake_rate_period_input, 5, 3)
+        core_managers_grid.addWidget(QLabel("Ban duration:"), 6, 0)
+        core_managers_grid.addWidget(self.handshake_ban_duration_input, 6, 1)
+        core_managers_grid.addWidget(QLabel("SYN scan interval:"), 6, 2)
+        core_managers_grid.addWidget(self.syn_scan_interval_input, 6, 3)
+
+        core_managers_grid.addWidget(self.handshake_log_tcp_checkbox, 7, 0)
+        core_managers_grid.addWidget(self.handshake_log_non_tls_checkbox, 7, 1)
+        core_managers_grid.addWidget(self.handshake_log_tls_records_checkbox, 7, 2)
+        core_managers_grid.addWidget(self.handshake_log_app_data_checkbox, 7, 3)
         core_managers_grid.addWidget(
-            self.core_packet_analyzer_checkbox,
-            0,
-            1,
+            self.handshake_log_tls13_keys_checkbox, 8, 0, 1, 4
         )
-        core_managers_grid.addWidget(
-            self.core_packet_catcher_checkbox,
-            0,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.core_handshake_checkbox,
-            0,
-            3,
-        )
-        core_managers_grid.addWidget(
-            self.core_syn_scanner_checkbox,
-            1,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.core_igmp_checkbox,
-            1,
-            1,
-        )
-        core_managers_grid.addWidget(
-            self.core_mdns_checkbox,
-            1,
-            2,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Half-open timeout:"),
-            2,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_half_open_timeout_input,
-            2,
-            1,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Established timeout:"),
-            2,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_established_timeout_input,
-            2,
-            3,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Rate threshold:"),
-            3,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_rate_threshold_input,
-            3,
-            1,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Rate period:"),
-            3,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_rate_period_input,
-            3,
-            3,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Ban duration:"),
-            4,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_ban_duration_input,
-            4,
-            1,
-        )
-        core_managers_grid.addWidget(
-            QLabel("SYN scan interval:"),
-            4,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.syn_scan_interval_input,
-            4,
-            3,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_log_tcp_checkbox,
-            5,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_log_non_tls_checkbox,
-            5,
-            1,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_log_tls_records_checkbox,
-            5,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_log_app_data_checkbox,
-            5,
-            3,
-        )
-        core_managers_grid.addWidget(
-            self.handshake_log_tls13_keys_checkbox,
-            6,
-            0,
-            1,
-            2,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Packet catch TCP rate:"),
-            7,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.packet_catcher_tcp_rate_input,
-            7,
-            1,
-        )
-        core_managers_grid.addWidget(
-            QLabel("UDP rate:"),
-            7,
-            2,
-        )
-        core_managers_grid.addWidget(
-            self.packet_catcher_udp_rate_input,
-            7,
-            3,
-        )
-        core_managers_grid.addWidget(
-            QLabel("Default catch rate:"),
-            8,
-            0,
-        )
-        core_managers_grid.addWidget(
-            self.packet_catcher_default_rate_input,
-            8,
-            1,
-        )
+
+        core_managers_grid.addWidget(QLabel("Packet catch TCP rate:"), 9, 0)
+        core_managers_grid.addWidget(self.packet_catcher_tcp_rate_input, 9, 1)
+        core_managers_grid.addWidget(QLabel("UDP rate:"), 9, 2)
+        core_managers_grid.addWidget(self.packet_catcher_udp_rate_input, 9, 3)
+        core_managers_grid.addWidget(QLabel("Default catch rate:"), 10, 0)
+        core_managers_grid.addWidget(self.packet_catcher_default_rate_input, 10, 1)
 
         transport_content = QWidget()
         transport_layout = QVBoxLayout(transport_content)
@@ -2831,230 +2827,84 @@ class RouterTab(QWidget):
         transport_tuning_grid.setColumnStretch(1, 1)
         transport_tuning_grid.setColumnStretch(3, 1)
         transport_tuning_grid.addWidget(
-            self.transport_enabled_checkbox,
-            0,
-            0,
-            1,
-            2,
+            self.transport_enabled_checkbox, 0, 0, 1, 2
         )
         transport_tuning_grid.addWidget(
-            self.transport_parallel_analysis_checkbox,
-            0,
-            2,
-            1,
-            2,
+            self.transport_parallel_analysis_checkbox, 0, 2, 1, 2
+        )
+        transport_tuning_grid.addWidget(QLabel("Classification:"), 1, 0)
+        transport_tuning_grid.addWidget(
+            self.transport_classification_mode_combo, 1, 1
+        )
+        transport_tuning_grid.addWidget(QLabel("Stratum port policy:"), 1, 2)
+        transport_tuning_grid.addWidget(
+            self.transport_stratum_port_policy_combo, 1, 3
         )
         transport_tuning_grid.addWidget(
-            QLabel("Stratum ports:"),
-            1,
-            0,
+            self.transport_stratum_endpoint_proof_checkbox, 2, 0, 1, 2
         )
         transport_tuning_grid.addWidget(
-            self.transport_stratum_ports_input,
-            1,
-            1,
-            1,
-            3,
+            self.transport_analysis_payload_only_checkbox, 2, 2, 1, 2
+        )
+        transport_tuning_grid.addWidget(QLabel("Analysis sample rate:"), 3, 0)
+        transport_tuning_grid.addWidget(
+            self.transport_analysis_sample_rate_input, 3, 1
+        )
+        transport_tuning_grid.addWidget(QLabel("Flow cooldown:"), 3, 2)
+        transport_tuning_grid.addWidget(
+            self.transport_analysis_flow_cooldown_input, 3, 3
+        )
+        transport_tuning_grid.addWidget(QLabel("Stratum ports:"), 4, 0)
+        transport_tuning_grid.addWidget(self.transport_stratum_ports_input, 4, 1)
+        transport_tuning_grid.addWidget(QLabel("Monero ports:"), 4, 2)
+        transport_tuning_grid.addWidget(self.transport_monero_ports_input, 4, 3)
+        transport_tuning_grid.addWidget(QLabel("VoIP start:"), 5, 0)
+        transport_tuning_grid.addWidget(self.transport_voip_start_input, 5, 1)
+        transport_tuning_grid.addWidget(QLabel("VoIP end:"), 5, 2)
+        transport_tuning_grid.addWidget(self.transport_voip_end_input, 5, 3)
+
+        rows = (
+            ("Inspection logs/sec:", self.transport_inspection_rps_input,
+             "Inspection burst:", self.transport_inspection_burst_input),
+            ("Inspection cooldown:", self.transport_inspection_cooldown_input,
+             "Stratum logs/sec:", self.transport_stratum_rps_input),
+            ("Stratum burst:", self.transport_stratum_burst_input,
+             "Stratum cooldown:", self.transport_stratum_cooldown_input),
+            ("Monero logs/sec:", self.transport_monero_rps_input,
+             "Monero burst:", self.transport_monero_burst_input),
+            ("Monero cooldown:", self.transport_monero_cooldown_input,
+             "DNS pending TTL:", self.transport_dns_pending_ttl_input),
+            ("DNS GC interval:", self.transport_dns_gc_interval_input,
+             "DHCP transaction TTL:", self.transport_dhcp_transaction_ttl_input),
+            ("Observed lease TTL:", self.transport_dhcp_lease_ttl_input,
+             "", None),
+        )
+        for row_index, (left_label, left_widget, right_label, right_widget) in enumerate(
+                rows, start=6
+        ):
+            transport_tuning_grid.addWidget(QLabel(left_label), row_index, 0)
+            transport_tuning_grid.addWidget(left_widget, row_index, 1)
+            if right_widget is not None:
+                transport_tuning_grid.addWidget(QLabel(right_label), row_index, 2)
+                transport_tuning_grid.addWidget(right_widget, row_index, 3)
+
+        transport_tuning_grid.addWidget(
+            self.transport_dns_rebind_alert_checkbox, 13, 0, 1, 2
         )
         transport_tuning_grid.addWidget(
-            QLabel("Monero ports:"),
-            2,
-            0,
+            self.transport_https_logging_checkbox, 13, 2
         )
         transport_tuning_grid.addWidget(
-            self.transport_monero_ports_input,
-            2,
-            1,
-            1,
-            3,
+            self.transport_https_certificates_checkbox, 13, 3
         )
         transport_tuning_grid.addWidget(
-            QLabel("VoIP start:"),
-            3,
-            0,
+            self.transport_https_quic_crypto_checkbox, 14, 0
         )
         transport_tuning_grid.addWidget(
-            self.transport_voip_start_input,
-            3,
-            1,
+            self.transport_tls_learning_checkbox, 14, 1
         )
         transport_tuning_grid.addWidget(
-            QLabel("VoIP end:"),
-            3,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_voip_end_input,
-            3,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Inspection logs/sec:"),
-            4,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_inspection_rps_input,
-            4,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Inspection burst:"),
-            4,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_inspection_burst_input,
-            4,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Inspection cooldown:"),
-            5,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_inspection_cooldown_input,
-            5,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Stratum logs/sec:"),
-            5,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_stratum_rps_input,
-            5,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Stratum burst:"),
-            6,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_stratum_burst_input,
-            6,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Stratum cooldown:"),
-            6,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_stratum_cooldown_input,
-            6,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Monero logs/sec:"),
-            7,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_monero_rps_input,
-            7,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Monero burst:"),
-            7,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_monero_burst_input,
-            7,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Monero cooldown:"),
-            8,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_monero_cooldown_input,
-            8,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("DNS pending TTL:"),
-            8,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_dns_pending_ttl_input,
-            8,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("DNS GC interval:"),
-            9,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_dns_gc_interval_input,
-            9,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_dns_rebind_alert_checkbox,
-            9,
-            2,
-            1,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("DHCP transaction TTL:"),
-            10,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_dhcp_transaction_ttl_input,
-            10,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Observed lease TTL:"),
-            10,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_dhcp_lease_ttl_input,
-            10,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_https_logging_checkbox,
-            11,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_https_certificates_checkbox,
-            11,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_https_quic_crypto_checkbox,
-            11,
-            2,
-            1,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_tls_learning_checkbox,
-            12,
-            0,
-            1,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_https_init_context_checkbox,
-            12,
-            2,
-            1,
-            2,
+            self.transport_https_init_context_checkbox, 14, 2, 1, 2
         )
 
         transport_protocol_box = QGroupBox(
@@ -3110,7 +2960,7 @@ class RouterTab(QWidget):
         codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 8, 1)
         codeoutput_grid.addWidget(self.codeoutput_probe_button, 8, 2, 1, 2)
         codeoutput_grid.addWidget(self.codeoutput_interface_checkbox, 9, 0, 1, 4)
-        codeoutput_grid.addWidget(QLabel("Hyper-V switch name:"), 10, 0)
+        codeoutput_grid.addWidget(QLabel("Switch/backend name:"), 10, 0)
         codeoutput_grid.addWidget(self.codeoutput_switch_name_input, 10, 1)
         codeoutput_grid.addWidget(QLabel("Windows adapter name:"), 10, 2)
         codeoutput_grid.addWidget(self.codeoutput_adapter_name_input, 10, 3)
@@ -4767,6 +4617,41 @@ class ProcessTab(QWidget):
         selector_layout.addLayout(dock_buttons, 1, 2)
         root.addWidget(selector_group)
 
+        bundle_group = QGroupBox("Reversible Managed Process Bundle")
+        bundle_grid = QGridLayout(bundle_group)
+        self.bundle_status_label = QLabel("Bundle: inactive")
+        self.bundle_profile_combo = QComboBox()
+        self.bundle_profile_combo.addItems([
+            "Balanced Shared",
+            "Split Cores",
+            "Router Responsive",
+            "Client Performance",
+            "Shared All Cores",
+        ])
+        self.bundle_process_button = QPushButton("Bundle Router + Selected Process")
+        self.bundle_process_button.clicked.connect(self.bundle_processes)
+        self.unbundle_process_button = QPushButton("Unbundle / Restore Both Processes")
+        self.unbundle_process_button.clicked.connect(self.unbundle_processes)
+        self.bundle_auto_dock_checkbox = QCheckBox("Dock selected window when bundling")
+        self.bundle_auto_dock_checkbox.setChecked(True)
+        bundle_grid.addWidget(self.bundle_status_label, 0, 0, 1, 3)
+        bundle_grid.addWidget(QLabel("Performance profile:"), 1, 0)
+        bundle_grid.addWidget(self.bundle_profile_combo, 1, 1)
+        bundle_buttons = QHBoxLayout()
+        bundle_buttons.addWidget(self.bundle_process_button)
+        bundle_buttons.addWidget(self.unbundle_process_button)
+        bundle_buttons.addStretch(1)
+        bundle_grid.addLayout(bundle_buttons, 2, 0, 1, 3)
+        bundle_grid.addWidget(self.bundle_auto_dock_checkbox, 3, 0, 1, 3)
+        bundle_help = QLabel(
+            "This does not fuse executable address spaces. It reversibly manages the "
+            "router and client as one performance group by coordinating CPU affinity, "
+            "priority, docking, and ProcessInterface routing, then restores the original settings."
+        )
+        bundle_help.setWordWrap(True)
+        bundle_grid.addWidget(bundle_help, 4, 0, 1, 3)
+        root.addWidget(bundle_group)
+
         self.process_splitter = QSplitter(Qt.Vertical)
         self.process_splitter.setChildrenCollapsible(False)
 
@@ -4798,7 +4683,7 @@ class ProcessTab(QWidget):
         self.prefix_spin.setRange(1, 30)
         self.prefix_spin.setValue(30)
         self.create_interface_checkbox = QCheckBox(
-            "Create/enable Hyper-V ProcessInterface before routing"
+            "Create/enable ProcessInterface (Hyper-V when available; logical fallback otherwise)"
         )
         self.create_interface_checkbox.setChecked(True)
         self.route_mode_combo = QComboBox()
@@ -5197,8 +5082,66 @@ class ProcessTab(QWidget):
             self.remove_interface_button,
             self.start_route_button,
             self.stop_route_button,
+            self.bundle_process_button,
+            self.unbundle_process_button,
         ):
             button.setEnabled(enabled)
+
+    def bundle_processes(self):
+        process_data = self.process_combo.currentData()
+        if not isinstance(process_data, dict):
+            self._append_log("[ProcessTab] Select a client process first.")
+            return
+        manager = self._manager()
+        if manager is None:
+            self._append_log("[ProcessTab] ProcessInterfaceManager is unavailable.")
+            return
+        router = getattr(manager, "router_manager", None)
+        if router is None or not getattr(router, "started", False):
+            self._append_log(
+                "[ProcessTab] Start the Router first. A managed bundle includes "
+                "ProcessInterface routing through the live router pipeline."
+            )
+            return
+        pid = int(process_data["pid"])
+        profile = self.bundle_profile_combo.currentText()
+        mode = self.route_mode_combo.currentText()
+        try:
+            ports = self._parse_ports()
+        except Exception as exc:
+            self._append_log(f"[ProcessTab] {exc}")
+            return
+        create_first = self.create_interface_checkbox.isChecked()
+        switch_name = self.switch_name_input.text().strip() or "ProcessInterface"
+        ipv4 = self.interface_ip_input.text().strip()
+        prefix = int(self.prefix_spin.value())
+        if self.bundle_auto_dock_checkbox.isChecked() and not self._docked_hwnd:
+            self.dock_selected_window()
+
+        def operation():
+            status = manager.status()
+            if create_first and not status.get("interface_ready"):
+                manager.create_interface(
+                    switch_name=switch_name,
+                    ipv4=ipv4,
+                    prefix_length=prefix,
+                )
+            manager.enable_process(pid, mode=mode, stratum_ports=ports)
+            return manager.bundle_with_router(pid, profile=profile)
+
+        self._run_operation("bundle-processes", operation)
+
+    def unbundle_processes(self):
+        manager = self._manager()
+        if manager is None:
+            return
+
+        def operation():
+            status = manager.unbundle_processes()
+            manager.disable_process()
+            return status
+
+        self._run_operation("unbundle-processes", operation)
 
     def create_interface(self):
         manager = self._manager()
@@ -5285,6 +5228,8 @@ class ProcessTab(QWidget):
         self._set_operation_buttons_enabled(True)
         if ok:
             self._append_log(f"[ProcessTab] ✅ {name} completed.")
+            if name == "unbundle-processes":
+                self.detach_window()
         else:
             self._append_log(f"[ProcessTab] ❌ {name} failed: {message}")
         self.refresh_status()
@@ -5308,7 +5253,7 @@ class ProcessTab(QWidget):
             )
         else:
             self.interface_status_label.setText(
-                "Interface: not created (Hyper-V + administrator rights required)"
+                "Interface: logical-only or not initialized"
             )
         if status.get("enabled"):
             self.route_status_label.setText(
@@ -5318,6 +5263,13 @@ class ProcessTab(QWidget):
             )
         else:
             self.route_status_label.setText("Process route: disabled")
+        if status.get("bundle_active"):
+            self.bundle_status_label.setText(
+                f"Bundle: router PID {status.get('bundle_router_pid')} + client PID "
+                f"{status.get('bundle_client_pid')} | profile={status.get('bundle_profile')}"
+            )
+        else:
+            self.bundle_status_label.setText("Bundle: inactive")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -5327,6 +5279,10 @@ class ProcessTab(QWidget):
         self.detach_window()
         manager = self._manager()
         if manager is not None:
+            try:
+                manager.unbundle_processes(silent=True)
+            except Exception:
+                pass
             try:
                 manager.disable_process()
             except Exception:

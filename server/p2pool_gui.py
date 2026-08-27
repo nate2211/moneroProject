@@ -556,7 +556,23 @@ class P2PoolGUI(QMainWindow):
     def start_p2pool(self):
         self.gui_logger.log_message("[GUI] Requesting to start P2Pool...")
         if self.helper.asyncio_main_loop and self.helper.processor:
-            asyncio.run_coroutine_threadsafe(self.helper.processor.start_p2pool(), self.helper.asyncio_main_loop)
+            try:
+                bind_settings = self.p2pool_tab.apply_bind_settings()
+            except Exception as exc:
+                self.gui_logger.log_message(
+                    f"[GUI][P2Pool] Invalid Stratum listener settings: {exc}"
+                )
+                return
+            self.gui_logger.log_message(
+                "[GUI][P2Pool] Stratum listener configured "
+                f"mode={bind_settings['mode']} "
+                f"address={bind_settings.get('bind_ip') or 'automatic'} "
+                f"port={bind_settings['port']}."
+            )
+            asyncio.run_coroutine_threadsafe(
+                self.helper.processor.start_p2pool(),
+                self.helper.asyncio_main_loop,
+            )
             self.p2pool_tab.start_p2pool_button.setEnabled(False)
             self.p2pool_tab.stop_p2pool_button.setEnabled(True)
         else:
@@ -1493,6 +1509,24 @@ class P2PoolGUI(QMainWindow):
                 "packet_catcher_default_rate": (
                     packet_catcher_default_rate
                 ),
+                "require_ethernet_on_physical_capture": (
+                    tab.require_ethernet_physical_checkbox.isChecked()
+                ),
+                "tunnel_log_success_packets": (
+                    tab.tunnel_success_logs_checkbox.isChecked()
+                ),
+                "ingress_max_frames": int(
+                    tab.ingress_max_frames_input.value()
+                ),
+                "ingress_max_bytes": 192 * 1024 * 1024,
+                "ingress_priority_reserve_frames": 4096,
+                "ingress_priority_reserve_bytes": 64 * 1024 * 1024,
+                "ingress_batch_size": int(
+                    tab.ingress_batch_size_input.value()
+                ),
+                "ingress_summary_interval_sec": float(
+                    tab.ingress_summary_interval_input.value()
+                ),
             }
 
             # ---------------- transport managers ----------------
@@ -1611,7 +1645,42 @@ class P2PoolGUI(QMainWindow):
                 "https_init_context": (
                     tab.transport_https_init_context_checkbox.isChecked()
                 ),
+                "classification_mode": {
+                    "Strict evidence": "strict",
+                    "Balanced evidence": "balanced",
+                    "Legacy port-weighted": "legacy",
+                }.get(
+                    tab.transport_classification_mode_combo.currentText(),
+                    "strict",
+                ),
+                "stratum_port_policy": {
+                    "Port is a hint": "hint",
+                    "Port is authoritative": "authoritative",
+                }.get(
+                    tab.transport_stratum_port_policy_combo.currentText(),
+                    "hint",
+                ),
+                "stratum_tls_requires_endpoint_evidence": (
+                    tab.transport_stratum_endpoint_proof_checkbox.isChecked()
+                ),
+                "analysis_payload_only": (
+                    tab.transport_analysis_payload_only_checkbox.isChecked()
+                ),
+                "analysis_sample_rate": self._float_setting(
+                    tab.transport_analysis_sample_rate_input.text(),
+                    "Transport analysis sample rate",
+                    minimum=0.0,
+                ),
+                "analysis_flow_cooldown_sec": self._float_setting(
+                    tab.transport_analysis_flow_cooldown_input.text(),
+                    "Transport analysis flow cooldown",
+                    minimum=0.0,
+                ),
             }
+            if transport_settings["analysis_sample_rate"] > 1.0:
+                raise ValueError(
+                    "Transport analysis sample rate must not exceed 1.0."
+                )
             if (
                     transport_settings["voip_port_start"]
                     > transport_settings["voip_port_end"]

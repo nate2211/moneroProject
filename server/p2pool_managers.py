@@ -160,25 +160,27 @@ class CodeOutputInterfaceManager:
         self.router_manager = router_manager
 
     def submit_packet(self, packet, metadata: Optional[dict] = None, *, phase: str = "interface") -> dict:
-        """Feed one CodeOutput packet into PythonRouterManager.process_packet()."""
+        """Feed one CodeOutput packet through the router's bounded ingress queue."""
         router = self.router_manager
-        process_packet = getattr(router, "process_packet", None)
-        if not callable(process_packet):
-            raise RuntimeError("CodeOutputInterface is not linked to PythonRouterManager.process_packet().")
+        ingest = getattr(router, "ingest_codeoutput_packet", None)
+        if not callable(ingest):
+            raise RuntimeError("CodeOutputInterface is not linked to PythonRouterManager.ingest_codeoutput_packet().")
         metadata = dict(metadata or {})
-        try:
-            setattr(packet, "_codeoutput_packet", True)
-            setattr(packet, "_codeoutput_metadata", metadata)
-            setattr(packet, "_router_ingress_owner", "CodeOutputInterfaceManager")
-        except Exception:
-            pass
+        metadata.setdefault("phase", phase)
         ingress = self.interface_full_name or self.interface_alias or self.LOGICAL_IFACE
-        # Synthetic/PacketLab packets use the stable logical interface label so
-        # they do not depend on Hyper-V being available on Windows Home.
         if phase in {"packetlab", "logical", "chat"}:
             ingress = self.LOGICAL_IFACE
-        process_packet(packet, ingress)
-        return {"status": "ROUTED", "interface": ingress, "summary": packet.summary()}
+        accepted = bool(ingest(
+            packet,
+            source_iface=ingress,
+            direction=str(metadata.get("direction") or "wan-in"),
+            metadata=metadata,
+        ))
+        return {
+            "status": "QUEUED" if accepted else "REJECTED",
+            "interface": ingress,
+            "summary": packet.summary(),
+        }
 
     def configure(self, **settings) -> dict:
         with self._lock:
@@ -294,10 +296,19 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
         if not ok:
             with self._lock:
                 self.last_error = detail or "unknown PowerShell failure"
-            raise RuntimeError(
-                "Could not create CodeOutput interface. Hyper-V and administrator rights "
-                f"are required. PowerShell: {detail or 'unknown failure'}"
+                self.interface_alias = self.LOGICAL_IFACE
+                self.interface_full_name = self.LOGICAL_IFACE
+                self.interface_index = None
+                self.interface_mac = None
+                self.interface_created_by_manager = False
+                self.interface_ready = True
+                self.enabled = True
+            self._register_router_interface(start_capture=False)
+            self._log(
+                "[CodeOutputInterface] ⚠️ Hyper-V adapter unavailable; using logical "
+                f"virtual-WAN ingress instead. PowerShell: {detail or 'unknown failure'}"
             )
+            return self.status()
 
         payload = {}
         for line in reversed((stdout or "").splitlines()):
@@ -375,6 +386,11 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             "is_default_gateway_iface": False,
             "logical_codeoutput_interface": True,
             "logical_only": True,
+            "programmatic_interface": True,
+            "capture_capable": True,
+            "route_capable": True,
+            "wan_capable": True,
+            "passive_observation_only": False,
             "routing_owner": "CodeOutputInterfaceManager",
             "dhcp_owner": "static-codeoutput-interface",
         }
@@ -386,16 +402,19 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
         })
         try:
             router._interfaces_config[self.LOGICAL_IFACE] = logical_config
-            router._interfaces_config[full_name] = physical_config
-            if mac:
-                router.interface_macs[full_name] = mac
+            if full_name and full_name != self.LOGICAL_IFACE:
+                router._interfaces_config[full_name] = physical_config
+                if mac:
+                    router.interface_macs[full_name] = mac
         except Exception:
             pass
         try:
             if router.lan_manager is not None:
                 lan_ifaces = getattr(router.lan_manager, "lan_ifaces", None)
                 if isinstance(lan_ifaces, set):
-                    lan_ifaces.update({self.LOGICAL_IFACE, full_name})
+                    lan_ifaces.add(self.LOGICAL_IFACE)
+                    if full_name and full_name != self.LOGICAL_IFACE:
+                        lan_ifaces.add(full_name)
         except Exception:
             pass
         try:
@@ -403,7 +422,7 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
                 router.rip_manager.add_static_route(
                     network_str=str(network),
                     next_hop="0.0.0.0",
-                    interface=full_name,
+                    interface=(full_name if full_name and full_name != self.LOGICAL_IFACE else self.LOGICAL_IFACE),
                     cost=1,
                 )
         except Exception as exc:
@@ -415,6 +434,9 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
         router = self.router_manager
         if router is None or not bool(getattr(router, "started", False)):
             return False
+        with self._lock:
+            if self.interface_index is None or self.interface_alias == self.LOGICAL_IFACE:
+                return False
         capture_name = self.interface_full_name or self._resolve_capture_interface()
         if not capture_name:
             return False
@@ -477,6 +499,14 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             switch_name = self.switch_name
             alias = self.interface_alias or self.adapter_name
             created = self.interface_created_by_manager
+            logical_only = self.interface_index is None or alias == self.LOGICAL_IFACE
+        if logical_only:
+            self._unregister_router_interface()
+            with self._lock:
+                self.interface_ready = False
+                self.capture_started = False
+            self._log("[CodeOutputInterface] Logical virtual-WAN interface unregistered.")
+            return True
         if not force and not created:
             self._log(
                 "[CodeOutputInterface] Interface pre-existed this run; unregistering it but leaving Windows unchanged."
@@ -531,6 +561,10 @@ if ($switch) {{ Remove-VMSwitch -Name '{self._ps_literal(switch_name)}' -Force -
                 "if_index": self.interface_index,
                 "mac": self.interface_mac,
                 "capture_started": bool(self.capture_started),
+                "logical_only": bool(
+                    self.interface_index is None
+                    or self.interface_alias == self.LOGICAL_IFACE
+                ),
                 "remove_on_shutdown": bool(self.remove_on_shutdown),
                 "last_error": self.last_error,
             }
@@ -592,6 +626,12 @@ class ProcessInterfaceManager:
         self._packets_tagged = 0
         self._refresh_interval = 0.25
         self._owns_windivert_lifecycle = False
+        self.bundle_active = False
+        self.bundle_profile = "balanced"
+        self.bundle_router_pid = os.getpid()
+        self.bundle_client_pid = None
+        self._bundle_original = {}
+        self._bundle_applied = {}
 
     def _log(self, message: str) -> None:
         try:
@@ -718,10 +758,21 @@ $adapter = Get-NetAdapter -Name $alias -ErrorAction Stop
         )
         ok, detail, stdout = self._run_powershell(script, timeout=55.0)
         if not ok:
-            raise RuntimeError(
-                "Could not create ProcessInterface. Hyper-V and administrator rights "
-                f"are required. PowerShell: {detail or 'unknown failure'}"
+            with self._lock:
+                self.switch_name = switch_name
+                self.interface_alias = self.LOGICAL_IFACE
+                self.interface_ipv4 = str(ip_obj)
+                self.prefix_length = prefix_length
+                self.network = network
+                self.interface_index = None
+                self.interface_created_by_manager = False
+                self.interface_ready = True
+            self._register_router_interface()
+            self._log(
+                "[ProcessInterface] ⚠️ Hyper-V adapter unavailable; using logical PID-scoped "
+                f"interface instead. PowerShell: {detail or 'unknown failure'}"
             )
+            return self.status()
 
         payload = {}
         for line in reversed((stdout or "").splitlines()):
@@ -755,6 +806,13 @@ $adapter = Get-NetAdapter -Name $alias -ErrorAction Stop
             switch_name = self.switch_name
             alias = self.interface_alias
             created_by_manager = self.interface_created_by_manager
+            logical_only = self.interface_index is None or alias == self.LOGICAL_IFACE
+        if logical_only:
+            self._unregister_router_interface()
+            with self._lock:
+                self.interface_ready = False
+            self._log("[ProcessInterface] Logical PID-scoped interface unregistered.")
+            return True
         if not force and not created_by_manager:
             self._log(
                 "[ProcessInterface] Interface existed before this session; leaving it in place. "
@@ -805,7 +863,11 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             "if_index": if_index,
             "is_default_gateway_iface": False,
             "logical_process_interface": True,
-            "logical_only": True,
+            "logical_only": bool(if_index is None or alias == self.LOGICAL_IFACE),
+            "programmatic_interface": True,
+            "capture_capable": True,
+            "route_capable": True,
+            "wan_capable": True,
             "routing_owner": "ProcessInterfaceManager",
             "dhcp_owner": "static-process-interface",
         }
@@ -924,11 +986,11 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         self.router_manager = router_manager
 
     def submit_packet(self, packet, metadata: Optional[dict] = None) -> dict:
-        """Feed a PID-owned packet into PythonRouterManager.process_packet()."""
+        """Feed a PID-owned packet through PythonRouterManager's bounded ingress queue."""
         router = self.router_manager
-        process_packet = getattr(router, "process_packet", None)
-        if not callable(process_packet):
-            raise RuntimeError("ProcessInterface is not linked to PythonRouterManager.process_packet().")
+        enqueue = getattr(router, "enqueue_ingress_packet", None)
+        if not callable(enqueue):
+            raise RuntimeError("ProcessInterface is not linked to PythonRouterManager.enqueue_ingress_packet().")
         with self._lock:
             pid = self.selected_pid
             name = self.selected_process_name
@@ -940,13 +1002,181 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             setattr(packet, "_router_ingress_owner", "ProcessInterfaceManager")
         except Exception:
             pass
-        ingress = (
-            getattr(self, "interface_full_name", None)
-            or getattr(self, "interface_alias", None)
-            or self.LOGICAL_IFACE
+        accepted = bool(enqueue(packet, self.LOGICAL_IFACE))
+        return {
+            "status": "QUEUED" if accepted else "REJECTED",
+            "interface": self.LOGICAL_IFACE,
+            "pid": pid,
+            "summary": packet.summary(),
+        }
+
+    @staticmethod
+    def _priority_name(value) -> str:
+        mapping = {
+            getattr(psutil, "IDLE_PRIORITY_CLASS", object()): "idle",
+            getattr(psutil, "BELOW_NORMAL_PRIORITY_CLASS", object()): "below-normal",
+            getattr(psutil, "NORMAL_PRIORITY_CLASS", object()): "normal",
+            getattr(psutil, "ABOVE_NORMAL_PRIORITY_CLASS", object()): "above-normal",
+            getattr(psutil, "HIGH_PRIORITY_CLASS", object()): "high",
+            getattr(psutil, "REALTIME_PRIORITY_CLASS", object()): "realtime",
+        }
+        return mapping.get(value, str(value))
+
+    @staticmethod
+    def _snapshot_process_tuning(process: psutil.Process) -> dict:
+        snapshot = {"pid": process.pid, "create_time": float(process.create_time())}
+        try:
+            snapshot["affinity"] = list(process.cpu_affinity())
+        except Exception:
+            snapshot["affinity"] = None
+        try:
+            snapshot["priority"] = process.nice()
+        except Exception:
+            snapshot["priority"] = None
+        try:
+            snapshot["io_priority"] = process.ionice()
+        except Exception:
+            snapshot["io_priority"] = None
+        return snapshot
+
+    @staticmethod
+    def _set_process_tuning(process: psutil.Process, *, affinity=None, priority=None, io_priority=None) -> dict:
+        applied = {"pid": process.pid}
+        if affinity:
+            process.cpu_affinity(sorted({int(x) for x in affinity}))
+            applied["affinity"] = list(process.cpu_affinity())
+        if priority is not None:
+            process.nice(priority)
+            applied["priority"] = process.nice()
+        if io_priority is not None:
+            try:
+                process.ionice(io_priority)
+                applied["io_priority"] = process.ionice()
+            except Exception:
+                pass
+        return applied
+
+    def bundle_with_router(self, pid: int, *, profile: str = "balanced") -> dict:
+        """Create a reversible managed bundle without merging address spaces.
+
+        Both executables remain separate Windows processes. The bundle coordinates
+        CPU affinity and priority so the packet router retains responsive cores
+        while the client keeps the remaining compute capacity.
+        """
+        client = psutil.Process(int(pid))
+        router_proc = psutil.Process(os.getpid())
+        if client.pid == router_proc.pid:
+            raise ValueError("Select a client process different from the router process.")
+        profile_key = str(profile or "balanced").strip().casefold().replace(" ", "-")
+        aliases = {
+            "balanced-shared": "balanced",
+            "balanced": "balanced",
+            "split-cores": "split",
+            "split": "split",
+            "router-responsive": "router-responsive",
+            "client-performance": "client-performance",
+            "shared-all-cores": "shared",
+            "shared": "shared",
+        }
+        profile_key = aliases.get(profile_key, profile_key)
+        if profile_key not in {"balanced", "split", "router-responsive", "client-performance", "shared"}:
+            raise ValueError("Unknown process bundle profile.")
+
+        self.unbundle_processes(silent=True)
+        total = max(1, int(psutil.cpu_count(logical=True) or 1))
+        all_cores = list(range(total))
+        reserve = max(1, min(4, total // 8 or 1))
+        router_cores = all_cores[:reserve]
+        client_cores = all_cores[reserve:] or all_cores
+        if profile_key == "split":
+            split_at = max(1, min(total - 1, total // 4)) if total > 1 else 1
+            router_cores = all_cores[:split_at]
+            client_cores = all_cores[split_at:] or all_cores
+        elif profile_key == "router-responsive":
+            reserve = max(2, min(6, total // 4 or 2)) if total >= 2 else 1
+            router_cores = all_cores[:reserve]
+            client_cores = all_cores[reserve:] or all_cores
+        elif profile_key == "client-performance":
+            router_cores = all_cores[:max(1, min(2, total))]
+            client_cores = all_cores
+        elif profile_key in {"balanced", "shared"}:
+            router_cores = all_cores
+            client_cores = all_cores
+
+        router_priority = getattr(psutil, "ABOVE_NORMAL_PRIORITY_CLASS", None) if os.name == "nt" else 0
+        client_priority = getattr(psutil, "NORMAL_PRIORITY_CLASS", None) if os.name == "nt" else 0
+        if profile_key == "client-performance" and os.name == "nt":
+            client_priority = getattr(psutil, "ABOVE_NORMAL_PRIORITY_CLASS", client_priority)
+        io_normal = getattr(psutil, "IOPRIO_NORMAL", None) if os.name == "nt" else None
+
+        original = {
+            router_proc.pid: self._snapshot_process_tuning(router_proc),
+            client.pid: self._snapshot_process_tuning(client),
+        }
+        # Store the snapshots before changing either process. If the second
+        # update fails, unbundle_processes() can transactionally restore the
+        # first process instead of leaving a half-applied performance profile.
+        with self._lock:
+            self.bundle_active = False
+            self.bundle_profile = profile_key
+            self.bundle_router_pid = router_proc.pid
+            self.bundle_client_pid = client.pid
+            self._bundle_original = original
+            self._bundle_applied = {}
+        try:
+            applied = {
+                router_proc.pid: self._set_process_tuning(
+                    router_proc, affinity=router_cores, priority=router_priority, io_priority=io_normal,
+                ),
+                client.pid: self._set_process_tuning(
+                    client, affinity=client_cores, priority=client_priority, io_priority=io_normal,
+                ),
+            }
+        except Exception:
+            self.unbundle_processes(silent=True)
+            raise
+        with self._lock:
+            self.bundle_active = True
+            self._bundle_applied = applied
+        self._log(
+            f"[ProcessBundle] ✅ Managed bundle active router={router_proc.pid} client={client.pid} "
+            f"profile={profile_key} router_cores={router_cores} client_cores={client_cores}."
         )
-        process_packet(packet, ingress)
-        return {"status": "ROUTED", "interface": ingress, "pid": pid, "summary": packet.summary()}
+        return self.status()
+
+    def unbundle_processes(self, *, silent: bool = False) -> dict:
+        with self._lock:
+            originals = dict(self._bundle_original)
+            was_active = bool(self.bundle_active)
+        restored = {}
+        for pid, snapshot in originals.items():
+            try:
+                process = psutil.Process(int(pid))
+                if abs(float(process.create_time()) - float(snapshot.get("create_time") or 0.0)) > 0.001:
+                    continue
+                affinity = snapshot.get("affinity")
+                if affinity:
+                    process.cpu_affinity(list(affinity))
+                if snapshot.get("priority") is not None:
+                    process.nice(snapshot.get("priority"))
+                if snapshot.get("io_priority") is not None:
+                    try:
+                        process.ionice(snapshot.get("io_priority"))
+                    except Exception:
+                        pass
+                restored[pid] = True
+            except Exception as exc:
+                restored[pid] = str(exc)
+        with self._lock:
+            self.bundle_active = False
+            self.bundle_profile = ""
+            self.bundle_router_pid = None
+            self.bundle_client_pid = None
+            self._bundle_original = {}
+            self._bundle_applied = {}
+        if was_active and not silent:
+            self._log(f"[ProcessBundle] ↔️ Bundle removed; original process settings restored: {restored}.")
+        return self.status()
 
     def _ensure_packet_capture(self) -> None:
         router = self.router_manager
@@ -995,6 +1225,7 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         self._log(f"[ProcessInterface] Process routing disabled for PID {pid or '-'}.")
 
     def shutdown(self, *, remove_interface: bool = False) -> None:
+        self.unbundle_processes(silent=True)
         self.disable_process()
         if remove_interface:
             try:
@@ -1185,11 +1416,20 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
                 "prefix_length": self.prefix_length,
                 "network": str(self.network),
                 "interface_index": self.interface_index,
+                "logical_only": bool(
+                    self.interface_index is None
+                    or self.interface_alias == self.LOGICAL_IFACE
+                ),
                 "flow_count": len(self._outbound_flows),
                 "flows": list(self._flow_details[:64]),
                 "packets_tagged": int(self._packets_tagged),
                 "last_refresh_at": float(self._last_refresh_at),
                 "last_error": self._last_refresh_error,
+                "bundle_active": bool(self.bundle_active),
+                "bundle_profile": self.bundle_profile,
+                "bundle_router_pid": self.bundle_router_pid,
+                "bundle_client_pid": self.bundle_client_pid,
+                "bundle_applied": dict(self._bundle_applied),
             }
 
 class PythonRouterManager:
@@ -1276,16 +1516,20 @@ class PythonRouterManager:
         self._runtime_network_ready = threading.Event()
         self._ingress_lock = threading.RLock()
         self._ingress_states: Dict[str, Dict[str, Any]] = {}
-        self._ingress_max_frames = 16384
+        self._ingress_max_frames = 32768
         self._ingress_max_bytes = 192 * 1024 * 1024
-        # High-value packets (TLS handshakes, DNS, DHCP, auth/control traffic)
-        # have a separate reserve instead of competing with bulk packet bursts.
+        # Protected control traffic has a bounded reserve. Ordinary HTTPS or a
+        # learned mining-port hint is not automatically protected.
         self._ingress_priority_reserve_frames = 4096
         self._ingress_priority_reserve_bytes = 64 * 1024 * 1024
+        self._ingress_batch_size = 64
+        self._ingress_summary_interval_sec = 30.0
         self._ingress_log_ts: Dict[str, float] = {}
         self._ingress_total_enqueued = 0
         self._ingress_total_processed = 0
         self._ingress_total_dropped = 0
+        self._ingress_total_coalesced = 0
+        self._ingress_total_evicted = 0
         self._sniff_threads_lock = threading.Lock() # Lock for _sniff_threads dictionary
         self._tshark_path = None
         self._discovered_tshark_interfaces = []
@@ -1351,6 +1595,14 @@ class PythonRouterManager:
             "packet_catcher_tcp_rate": 0.60,
             "packet_catcher_udp_rate": 0.60,
             "packet_catcher_default_rate": 0.60,
+            "require_ethernet_on_physical_capture": True,
+            "tunnel_log_success_packets": False,
+            "ingress_max_frames": 32768,
+            "ingress_max_bytes": 192 * 1024 * 1024,
+            "ingress_priority_reserve_frames": 4096,
+            "ingress_priority_reserve_bytes": 64 * 1024 * 1024,
+            "ingress_batch_size": 64,
+            "ingress_summary_interval_sec": 30.0,
         }
         self.firewall_manager = FirewallManager(router_logger)
         self.syn_scanner = None
@@ -3553,13 +3805,94 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 return 1
 
     @staticmethod
-    def _ingress_priority_value(packet) -> int:
-        """Return 0=normal, 1=elevated, 2=high, 3=critical.
+    def _ingress_parsed_packet(packet):
+        if not isinstance(packet, (bytes, bytearray, memoryview)):
+            return packet
+        raw_packet = bytes(packet)
+        if not raw_packet:
+            return packet
+        try:
+            version = (raw_packet[0] >> 4) & 0x0F
+            if version == 4:
+                return IP(raw_packet)
+            if version == 6:
+                return IPv6(raw_packet)
+            if len(raw_packet) >= 14:
+                return Ether(raw_packet)
+        except Exception:
+            pass
+        return packet
 
-        Sniffer-enriched packets carry authoritative priority metadata. Raw
-        Hyper-V/WinDivert frames receive a bounded lightweight classification so
-        Stratum, DNS, TLS, DHCP, NDP, authentication, and control-plane traffic
-        is not preferentially discarded when an interface queue is pressured.
+    @staticmethod
+    def _ingress_payload_bytes(packet, cap: int = 65536) -> bytes:
+        try:
+            layer = packet.getlayer(TCP) or packet.getlayer(UDP)
+            payload = getattr(layer, "payload", None) if layer is not None else None
+            if payload is None or payload.__class__.__name__ == "NoPayload":
+                return b""
+            return bytes(payload)[:max(0, int(cap))]
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _ingress_flow_key(packet):
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if ip_layer is None:
+                return ("frame", hashlib.sha1(bytes(packet)[:96]).hexdigest()[:16])
+            proto = "ip"
+            sport = dport = 0
+            if packet.haslayer(TCP):
+                proto = "tcp"
+                sport = int(packet[TCP].sport)
+                dport = int(packet[TCP].dport)
+            elif packet.haslayer(UDP):
+                proto = "udp"
+                sport = int(packet[UDP].sport)
+                dport = int(packet[UDP].dport)
+            a = (str(ip_layer.src), sport)
+            b = (str(ip_layer.dst), dport)
+            if b < a:
+                a, b = b, a
+            return (proto, a[0], a[1], b[0], b[1])
+        except Exception:
+            return ("unknown",)
+
+    @staticmethod
+    def _ingress_confirmed_stratum(packet, payload: bytes) -> bool:
+        for attr in (
+            "_capture_stratum_evidence", "_stratum_confirmed",
+            "_stratum_payload_confirmed", "_router_stratum_confirmed",
+        ):
+            try:
+                if bool(getattr(packet, attr, False)):
+                    return True
+            except Exception:
+                pass
+        try:
+            context = dict(getattr(packet, "_handshake_transport_context", None) or {})
+            evidence = dict(context.get("stratum") or {})
+            if evidence.get("detected") or evidence.get("confirmed"):
+                return True
+            transport = str(evidence.get("transport") or "").casefold()
+            if transport in {"plaintext-jsonrpc", "stratum", "stratum-over-tls"}:
+                return True
+        except Exception:
+            pass
+        if not payload:
+            return False
+        lowered = payload[:32768].lower()
+        markers = (
+            b'"mining.subscribe"', b'"mining.authorize"', b'"mining.submit"',
+            b'"mining.notify"', b'"job"', b'"submit"', b'"login"',
+        )
+        return bool(payload[:1] in b"[{" and any(marker in lowered for marker in markers))
+
+    def _ingress_priority_value(self, packet) -> int:
+        """Return 0=bulk/noise, 1=normal, 2=protected, 3=critical.
+
+        Classification is evidence based. A common HTTPS port or a learned
+        mining-port hint alone never promotes a packet.
         """
         try:
             label = str(getattr(packet, "_capture_priority", "") or "").casefold()
@@ -3572,78 +3905,91 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         except Exception:
             pass
 
-        parsed = packet
-        if isinstance(packet, (bytes, bytearray, memoryview)):
-            raw = bytes(packet)
-            if not raw:
-                return 0
-            try:
-                version = (raw[0] >> 4) & 0x0F
-                if version == 4:
-                    parsed = IP(raw)
-                elif version == 6:
-                    parsed = IPv6(raw)
-                elif len(raw) >= 14:
-                    parsed = Ether(raw)
-            except Exception:
-                return 0
-
+        parsed = self._ingress_parsed_packet(packet)
         try:
             if parsed.haslayer(DHCP) or parsed.haslayer(DHCP6):
                 return 3
+            if parsed.haslayer(ARP):
+                return 3
+            if parsed.haslayer(ICMPv6ND_NS) or parsed.haslayer(ICMPv6ND_NA):
+                return 3
             if parsed.haslayer(DNS):
                 return 2
-            if parsed.haslayer(ARP):
-                return 1
-            if parsed.haslayer(ICMPv6ND_NS) or parsed.haslayer(ICMPv6ND_NA):
-                return 2
+            if parsed.haslayer(ISAKMP) or parsed.haslayer(IKEv2):
+                return 3
         except Exception:
             pass
 
-        critical_tcp = {
-            3333, 4444, 5555, 6666, 7777, 8888, 9999,
-            10001, 10128, 10132, 14444, 24444,
-        }
-        high_tcp = {
-            22, 25, 53, 80, 88, 110, 135, 139, 143, 389, 443, 445,
-            465, 587, 636, 853, 993, 995, 1433, 1521, 2375, 2376,
-            3306, 3389, 5432, 5671, 5672, 6379, 8080, 8443, 8883,
-            9092, 18080, 18081, 18082, 18083, 18084,
-        }
-        high_udp = {
-            53, 67, 68, 88, 123, 161, 162, 389, 443, 500, 514, 520,
-            546, 547, 1900, 3702, 4500, 4789, 51820, 5353, 5355,
-            6081, 8472, 9993,
-        }
+        payload = self._ingress_payload_bytes(parsed)
         try:
             tcp = parsed.getlayer(TCP)
             if tcp is not None:
-                ports = {int(tcp.sport), int(tcp.dport)}
-                if ports & critical_tcp:
+                flags = int(getattr(tcp, "flags", 0) or 0)
+                if flags & 0x04:  # RST
                     return 3
-                if ports & high_tcp:
+                if flags & 0x02:  # SYN
                     return 2
+                if flags & 0x01:  # FIN
+                    return 2
+                if len(payload) >= 5:
+                    content_type = int(payload[0])
+                    version = int.from_bytes(payload[1:3], "big")
+                    record_len = int.from_bytes(payload[3:5], "big")
+                    if content_type in {20, 21, 22} and 0x0300 <= version <= 0x0304 and record_len <= 18432:
+                        return 3
+                if self._ingress_confirmed_stratum(parsed, payload):
+                    return 3
             udp = parsed.getlayer(UDP)
-            if udp is not None and {int(udp.sport), int(udp.dport)} & high_udp:
-                return 2
+            if udp is not None:
+                ports = {int(udp.sport), int(udp.dport)}
+                if ports & {67, 68, 546, 547}:
+                    return 3
+                if ports & {500, 4500}:
+                    return 3
+                if self._ingress_confirmed_stratum(parsed, payload):
+                    return 3
         except Exception:
             pass
-        return 0
+        return 1
 
     @staticmethod
-    def _drop_ingress_for_pressure(q: deque, incoming_priority: int):
+    def _ingress_coalesce_key(packet, priority: int):
+        if int(priority) > 1:
+            return None
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if ip_layer is None:
+                return None
+            dst = ipaddress.ip_address(str(ip_layer.dst).split("%", 1)[0])
+            is_noise_dst = bool(dst.is_multicast or str(dst) == "255.255.255.255")
+            if not is_noise_dst:
+                return None
+            if packet.haslayer(UDP):
+                udp = packet[UDP]
+                ports = (int(udp.sport), int(udp.dport))
+                if set(ports) & {137, 138, 1900, 3702, 5353, 5355}:
+                    return ("udp-noise", str(ip_layer.src), str(ip_layer.dst), ports)
+            if packet.haslayer(ARP):
+                return ("arp-noise", str(getattr(packet[ARP], "psrc", "")), str(getattr(packet[ARP], "pdst", "")))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _drop_ingress_for_pressure(state: dict, incoming_priority: int):
+        q = state.get("queue")
         if not q:
             return None
-
-        # Prefer evicting the oldest packet in the lowest available priority.
-        lowest = min(int(item[3]) for item in q)
+        lowest = min(int(item["priority"]) for item in q)
         if int(incoming_priority) < lowest:
-            # Preserve a queue made entirely of more important traffic.
             return None
-
+        counts = collections.Counter(
+            item.get("flow") for item in q if int(item["priority"]) == lowest
+        )
+        noisy_flow = counts.most_common(1)[0][0] if counts else None
         drop_index = 0
         for index, item in enumerate(q):
-            if int(item[3]) == lowest:
+            if int(item["priority"]) == lowest and (noisy_flow is None or item.get("flow") == noisy_flow):
                 drop_index = index
                 break
         dropped = q[drop_index]
@@ -3656,7 +4002,6 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             state = self._ingress_states.get(key)
             if state is not None and state.get("thread") and state["thread"].is_alive():
                 return state
-
             stop_event = threading.Event()
             state = {
                 "iface": key,
@@ -3668,10 +4013,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "enqueued": 0,
                 "processed": 0,
                 "dropped": 0,
+                "evicted": 0,
+                "coalesced": 0,
                 "dropped_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
                 "queued_by_priority": {0: 0, 1: 0, 2: 0, 3: 0},
                 "errors": 0,
+                "latency_total": 0.0,
+                "latency_max": 0.0,
                 "last_progress": time.monotonic(),
+                "last_summary": time.monotonic(),
             }
             thread = threading.Thread(
                 target=self._ingress_worker_loop,
@@ -3684,26 +4034,44 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             thread.start()
             return state
 
+    def _log_ingress_summary(self, state: dict, *, force: bool = False) -> None:
+        now = time.monotonic()
+        interval = max(5.0, float(self._ingress_summary_interval_sec))
+        if not force and now - float(state.get("last_summary", 0.0)) < interval:
+            return
+        state["last_summary"] = now
+        processed = max(1, int(state.get("processed", 0)))
+        avg_ms = 1000.0 * float(state.get("latency_total", 0.0)) / processed
+        self._ingress_log_sparse(
+            f"summary:{state['iface']}",
+            (
+                f"[RouterIngress] iface={state['iface']} queued={len(state['queue'])} "
+                f"bytes={int(state['bytes'])} processed={int(state['processed'])} "
+                f"rejected={int(state['dropped'])} evicted={int(state['evicted'])} "
+                f"coalesced={int(state['coalesced'])} avg_latency_ms={avg_ms:.2f} "
+                f"max_latency_ms={1000.0 * float(state.get('latency_max', 0.0)):.2f}"
+            ),
+            every=interval,
+        )
+
     def enqueue_ingress_packet(self, packet, inbound_iface: str = "Unknown") -> bool:
-        """Non-blocking ingress API used by capture and virtual-pipe readers."""
+        """Non-blocking, process-friendly ingress API for all capture backends."""
         if packet is None or self._stop_sniffing_event.is_set():
             return False
-
         state = self._ensure_ingress_state(inbound_iface)
+        parsed = self._ingress_parsed_packet(packet)
         size = self._estimate_ingress_size(packet)
-        priority = self._ingress_priority_value(packet)
+        priority = self._ingress_priority_value(parsed)
+        flow = self._ingress_flow_key(parsed)
+        coalesce_key = self._ingress_coalesce_key(parsed, priority)
         single_packet_limit = self._ingress_max_bytes + (
             self._ingress_priority_reserve_bytes if priority >= 2 else 0
         )
         if size > single_packet_limit:
+            state["dropped"] += 1
             self._ingress_total_dropped += 1
-            self._ingress_log_sparse(
-                f"oversize:{inbound_iface}",
-                f"[RouterIngress] ❌ Oversize priority={priority} packet rejected on {inbound_iface}; bytes={size}",
-                every=1.0,
-            )
+            self._log_ingress_summary(state, force=True)
             return False
-
         if isinstance(packet, (bytearray, memoryview)):
             packet = bytes(packet)
 
@@ -3714,61 +4082,59 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         byte_limit = self._ingress_max_bytes + (
             self._ingress_priority_reserve_bytes if priority >= 2 else 0
         )
-        dropped_now = 0
-        dropped_priorities = collections.Counter()
         with cv:
             q = state["queue"]
-            while q and (
-                    len(q) >= frame_limit
-                    or int(state["bytes"]) + size > byte_limit
-            ):
-                dropped = self._drop_ingress_for_pressure(q, priority)
+            if coalesce_key is not None:
+                for index in range(len(q) - 1, -1, -1):
+                    old = q[index]
+                    if old.get("coalesce_key") != coalesce_key:
+                        continue
+                    state["bytes"] = max(0, int(state["bytes"]) - int(old["size"]))
+                    old_priority = int(old["priority"])
+                    state["queued_by_priority"][old_priority] = max(
+                        0, int(state["queued_by_priority"][old_priority]) - 1
+                    )
+                    del q[index]
+                    state["coalesced"] += 1
+                    self._ingress_total_coalesced += 1
+                    break
+
+            while q and (len(q) >= frame_limit or int(state["bytes"]) + size > byte_limit):
+                dropped = self._drop_ingress_for_pressure(state, priority)
                 if dropped is None:
                     break
-                _old_packet, old_size, _old_ts, old_priority = dropped
-                state["bytes"] = max(0, int(state["bytes"]) - int(old_size))
+                state["bytes"] = max(0, int(state["bytes"]) - int(dropped["size"]))
+                old_priority = int(dropped["priority"])
                 state["dropped"] += 1
-                state["dropped_by_priority"][int(old_priority)] += 1
-                state["queued_by_priority"][int(old_priority)] = max(
-                    0,
-                    int(state["queued_by_priority"][int(old_priority)]) - 1,
+                state["evicted"] += 1
+                state["dropped_by_priority"][old_priority] += 1
+                state["queued_by_priority"][old_priority] = max(
+                    0, int(state["queued_by_priority"][old_priority]) - 1
                 )
                 self._ingress_total_dropped += 1
-                dropped_priorities[int(old_priority)] += 1
-                dropped_now += 1
+                self._ingress_total_evicted += 1
 
             if len(q) >= frame_limit or int(state["bytes"]) + size > byte_limit:
                 state["dropped"] += 1
                 state["dropped_by_priority"][int(priority)] += 1
                 self._ingress_total_dropped += 1
-                self._ingress_log_sparse(
-                    f"reject:{state['iface']}:{priority}",
-                    f"[RouterIngress] ❌ priority={priority} packet rejected on {state['iface']}; queued={len(q)} bytes={state['bytes']} limits={frame_limit}/{byte_limit}",
-                    every=1.0,
-                )
+                self._log_ingress_summary(state, force=True)
                 return False
 
-            q.append((packet, size, time.monotonic(), int(priority)))
+            q.append({
+                "packet": packet,
+                "size": size,
+                "queued_ts": time.monotonic(),
+                "priority": int(priority),
+                "flow": flow,
+                "coalesce_key": coalesce_key,
+            })
             state["bytes"] = int(state["bytes"]) + size
             state["enqueued"] += 1
             state["queued_by_priority"][int(priority)] += 1
             self._ingress_total_enqueued += 1
             cv.notify()
-
-        if dropped_now:
-            self._ingress_log_sparse(
-                f"pressure:{state['iface']}",
-                RouterRandomMessages(
-                    name="RouterIngress",
-                    message=(
-                        f"pressure on {state['iface']}; evicted={dropped_now} "
-                        f"priorities={dict(dropped_priorities)} "
-                        f"queued={len(state['queue'])} bytes={state['bytes']}"
-                    ),
-                    emoticons=["⚠️", "📦", "🛡️"],
-                ),
-                every=30.0,
-            )
+        self._log_ingress_summary(state)
         return True
 
     ingest_packet = enqueue_ingress_packet
@@ -3777,31 +4143,40 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         cv = state["cv"]
         stop_event = state["stop"]
         iface = state["iface"]
-
         while not stop_event.is_set():
+            batch = []
             with cv:
                 while not state["queue"] and not stop_event.is_set():
                     cv.wait(timeout=0.25)
                 if stop_event.is_set() and not state["queue"]:
                     break
-                packet, size, queued_ts, priority = state["queue"].popleft()
-                state["bytes"] = max(0, int(state["bytes"]) - int(size))
-                state["queued_by_priority"][int(priority)] = max(
-                    0,
-                    int(state["queued_by_priority"][int(priority)]) - 1,
-                )
-
-            try:
-                self.process_packet(packet, iface)
-                state["processed"] += 1
-                self._ingress_total_processed += 1
-                state["last_progress"] = time.monotonic()
-            except Exception as exc:
-                state["errors"] += 1
-                self._ingress_log_sparse(
-                    f"worker-error:{iface}",
-                    f"[Router][Ingress] ❗ worker error on {iface}: {type(exc).__name__}: {exc}",
-                )
+                for _ in range(max(1, int(self._ingress_batch_size))):
+                    if not state["queue"]:
+                        break
+                    item = state["queue"].popleft()
+                    state["bytes"] = max(0, int(state["bytes"]) - int(item["size"]))
+                    priority = int(item["priority"])
+                    state["queued_by_priority"][priority] = max(
+                        0, int(state["queued_by_priority"][priority]) - 1
+                    )
+                    batch.append(item)
+            for item in batch:
+                try:
+                    latency = max(0.0, time.monotonic() - float(item["queued_ts"]))
+                    state["latency_total"] += latency
+                    state["latency_max"] = max(float(state["latency_max"]), latency)
+                    self.process_packet(item["packet"], iface)
+                    state["processed"] += 1
+                    self._ingress_total_processed += 1
+                    state["last_progress"] = time.monotonic()
+                except Exception as exc:
+                    state["errors"] += 1
+                    self._ingress_log_sparse(
+                        f"worker-error:{iface}",
+                        f"[Router][Ingress] ❗ worker error on {iface}: {type(exc).__name__}: {exc}",
+                        every=5.0,
+                    )
+            self._log_ingress_summary(state)
 
     def _stop_ingress_workers(self, *, discard: bool = True) -> None:
         with self._ingress_lock:
@@ -3842,6 +4217,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     "dropped_by_priority": dict(state.get("dropped_by_priority", {})),
                     "queued_by_priority": dict(state.get("queued_by_priority", {})),
                     "errors": int(state["errors"]),
+                    "evicted": int(state.get("evicted", 0)),
+                    "coalesced": int(state.get("coalesced", 0)),
+                    "avg_latency_ms": (
+                        1000.0 * float(state.get("latency_total", 0.0)) / max(1, int(state.get("processed", 0)))
+                    ),
+                    "max_latency_ms": 1000.0 * float(state.get("latency_max", 0.0)),
                     "worker_alive": bool(state.get("thread") and state["thread"].is_alive()),
                     "last_progress_age_sec": max(0.0, time.monotonic() - float(state["last_progress"])),
                 }
@@ -3853,6 +4234,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             "ingress_total_enqueued": self._ingress_total_enqueued,
             "ingress_total_processed": self._ingress_total_processed,
             "ingress_total_dropped": self._ingress_total_dropped,
+            "ingress_total_evicted": self._ingress_total_evicted,
+            "ingress_total_coalesced": self._ingress_total_coalesced,
             "ingress": ingress,
         }
         try:
@@ -3978,7 +4361,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     promisc=promisc,
                     stop_filter=lambda p: self._stop_sniffing_event.is_set(),
                     filter=filter_str,
-                    mac_filter_only=True,
+                    mac_filter_only=bool(
+                        self._manager_settings.get("require_ethernet_on_physical_capture", True)
+                    ),
+                    allow_l3_on_loopback=True,
+                    allow_l3_on_virtual=True,
                     session=TCPSession,
                 )
             except Exception as e:
@@ -6443,6 +6830,73 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         except Exception:
             pass
 
+    def resolve_interface_identity(self, selector: Optional[str]) -> dict:
+        raw = str(selector or "").strip()
+        if not raw:
+            return {}
+        raw_cf = raw.casefold()
+        for full_name, config in list(self._interfaces_config.items()):
+            if not isinstance(config, dict):
+                continue
+            aliases = {
+                str(full_name), str(config.get("friendly_name") or ""),
+                str(config.get("physical_iface") or ""), str(config.get("capture_iface") or ""),
+                str(config.get("ip_addr") or ""), str(config.get("if_index") or ""),
+            }
+            if raw_cf in {value.casefold() for value in aliases if value}:
+                return {
+                    "selector": raw,
+                    "full_name": str(full_name),
+                    "friendly_name": str(config.get("friendly_name") or full_name),
+                    "ipv4": str(config.get("ip_addr") or ""),
+                    "if_index": config.get("if_index"),
+                    "aliases": sorted(value for value in aliases if value),
+                    "programmatic": bool(config.get("programmatic_interface")),
+                    "wan_capable": bool(config.get("wan_capable")),
+                }
+        return {"selector": raw, "full_name": raw, "friendly_name": raw, "aliases": [raw]}
+
+    def ingest_codeoutput_packet(
+            self, packet, *, source_iface: Optional[str] = None,
+            direction: str = "wan-in", metadata: Optional[dict] = None,
+    ) -> bool:
+        """Enter programmatic CodeOutput traffic through the Npcap ingress queue."""
+        metadata = dict(metadata or {})
+        iface = str(source_iface or CodeOutputInterfaceManager.LOGICAL_IFACE)
+        try:
+            setattr(packet, "_codeoutput_packet", True)
+            setattr(packet, "_codeoutput_metadata", metadata)
+            setattr(packet, "_codeoutput_direction", str(direction or "wan-in"))
+            setattr(packet, "_router_ingress_owner", "CodeOutputInterfaceManager")
+            setattr(packet, "_programmatic_ingress", True)
+        except Exception:
+            pass
+        return bool(self.enqueue_ingress_packet(packet, iface))
+
+    def route_codeoutput_packet(
+            self, packet, *, inbound_iface: Optional[str] = None,
+            egress_iface: Optional[str] = None,
+            reason: str = "codeoutput-explicit",
+    ) -> bool:
+        """Route only an explicit CodeOutput transmission request.
+
+        Passive observations cannot call this path, which prevents capture and
+        reinjection loops.
+        """
+        try:
+            setattr(packet, "_codeoutput_explicit_route", True)
+            setattr(packet, "_codeoutput_route_reason", str(reason or "codeoutput-explicit"))
+        except Exception:
+            pass
+        if egress_iface:
+            return bool(self.packet_writer.queue_packet(packet, interface=str(egress_iface)))
+        return bool(self.ingest_codeoutput_packet(
+            packet,
+            source_iface=inbound_iface or CodeOutputInterfaceManager.LOGICAL_IFACE,
+            direction="explicit",
+            metadata={"reason": reason, "explicit": True},
+        ))
+
     def inject_codeoutput_packet(self, packet, metadata: Optional[dict] = None):
         """Inject PacketLab traffic through CodeOutput and the normal router pipeline."""
         metadata = dict(metadata or {})
@@ -6467,11 +6921,23 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self.router_logger.log_message(
             f"[CodeOutputInterface] ➡️ PacketLab injecting {packet.summary()} into router pipeline."
         )
-        return self.codeoutput_interface_manager.submit_packet(
-            packet,
-            metadata=metadata,
-            phase="packetlab",
-        )
+        try:
+            return {
+                "status": "QUEUED" if self.code_output_manager.ingest_packet(
+                    packet,
+                    source_iface=CodeOutputInterfaceManager.LOGICAL_IFACE,
+                    direction="packetlab",
+                    metadata=metadata,
+                ) else "REJECTED",
+                "interface": CodeOutputInterfaceManager.LOGICAL_IFACE,
+                "summary": packet.summary(),
+            }
+        except Exception:
+            return self.codeoutput_interface_manager.submit_packet(
+                packet,
+                metadata=metadata,
+                phase="packetlab",
+            )
 
     def inject_process_packet(self, packet, metadata: Optional[dict] = None):
         """Public bridge used by ProcessTab/process capture to enter the router pipeline."""
@@ -7209,54 +7675,39 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 self.router_logger.log_message("[Bridge] ⚠️ No Ether/IP/IPv6 layer; dropping.")
                 return
 
-            if IP in packet:
-                if packet.haslayer(ESP):
-                    if self.hyperv_enabled:
-                        handled = self.esp_manager.handle_packet(
-                            packet, inbound_iface, self._interfaces_config, self.arp_manager.get_mac,
-                            self.rip_manager.find_route
+            if (
+                    packet.haslayer(ESP)
+                    or packet.haslayer(AH)
+                    or packet.haslayer(GRE)
+                    or packet.haslayer(ISAKMP)
+                    or packet.haslayer(IKEv2)
+                    or (
+                        packet.haslayer(UDP)
+                        and ({int(packet[UDP].sport), int(packet[UDP].dport)} & {500, 4500})
+                    )
+            ):
+                if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
+                    if self.isakmp_manager.handle_packet(packet, inbound_iface):
+                        self.code_output_manager.submit_packet(
+                            packet, inbound_iface=inbound_iface,
+                            phase="handled", component="isakmp-manager",
                         )
-                        if handled:
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
-                            )
-                            return
-                        else:
-                            self.router_logger.log_message(
-                                f"[ESP] Sending ESP packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
-                            )
-                            self.hyperv_manager.send_packet(packet)
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-c++"
-                            )
-                            return
-                    else:
-                        handled = self.esp_manager.handle_packet(
-                            packet, inbound_iface, self._interfaces_config, self.arp_manager.get_mac,
-                            self.rip_manager.find_route
-                        )
-                        if handled:
-                            self.code_output_manager.submit_packet(
-                                packet, inbound_iface=inbound_iface, phase="handled", component="esp-manager"
-                            )
-                            return
-
-                if packet.haslayer(AH):
-                    if self.hyperv_enabled:
-                        self.router_logger.log_message(
-                            f"[AH] Sending AH packet from {packet[IP].src} to {packet[IP].dst} to C++ Python Pipe"
-                        )
-                        self.hyperv_manager.send_packet(packet)
-                        return True
-                if packet.haslayer(GRE):
-                    if self.hyperv_enabled:
-                        self.router_logger.log_message(
-                            f"[GRE] Sending GRE packet from {packet[IP].src} to {packet[IP].dst}")
-                        self.hyperv_manager.send_packet(packet)
-                        return True
-            if packet.haslayer(ISAKMP) or packet.haslayer(IKEv2):
-                if self.isakmp_manager.handle_packet(packet, inbound_iface):
+                        return
+                handled = self.esp_manager.handle_packet(
+                    packet,
+                    inbound_iface,
+                    self._interfaces_config,
+                    self.arp_manager.get_mac,
+                    self.rip_manager.find_route,
+                )
+                if handled:
+                    self.code_output_manager.submit_packet(
+                        packet, inbound_iface=inbound_iface,
+                        phase="handled", component="tunnel-manager",
+                    )
                     return
+                # Unhandled tunnel traffic stays in the ordinary forwarding path.
+                # It is never diverted into a Hyper-V-only C++ pipe.
 
 
             is_for_router = dst_ip in self._get_all_local_ips()
@@ -8067,6 +8518,32 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self._manager_settings.update(
                 requested_manager_settings
             )
+            self._ingress_max_frames = max(1024, min(
+                262144, int(self._manager_settings.get("ingress_max_frames", 32768))
+            ))
+            self._ingress_max_bytes = max(16 * 1024 * 1024, min(
+                1024 * 1024 * 1024,
+                int(self._manager_settings.get("ingress_max_bytes", 192 * 1024 * 1024)),
+            ))
+            self._ingress_priority_reserve_frames = max(0, min(
+                self._ingress_max_frames,
+                int(self._manager_settings.get("ingress_priority_reserve_frames", 4096)),
+            ))
+            self._ingress_priority_reserve_bytes = max(0, min(
+                self._ingress_max_bytes,
+                int(self._manager_settings.get(
+                    "ingress_priority_reserve_bytes", 64 * 1024 * 1024
+                )),
+            ))
+            self._ingress_batch_size = max(1, min(
+                512, int(self._manager_settings.get("ingress_batch_size", 64))
+            ))
+            self._ingress_summary_interval_sec = max(5.0, min(
+                300.0, float(self._manager_settings.get("ingress_summary_interval_sec", 30.0))
+            ))
+            self.esp_manager.log_success_packets = bool(
+                self._manager_settings.get("tunnel_log_success_packets", False)
+            )
 
             bool_manager_settings = {
                 "enable_firewall",
@@ -8076,6 +8553,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "enable_syn_scanner",
                 "enable_igmp",
                 "enable_mdns",
+                "require_ethernet_on_physical_capture",
+                "tunnel_log_success_packets",
                 "handshake_log_tcp_lifecycle",
                 "handshake_log_non_tls_tcp",
                 "handshake_log_tls_records",
@@ -8151,6 +8630,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "https_parse_quic_crypto",
                 "tls_learning_enabled",
                 "https_init_context",
+                "classification_mode",
+                "stratum_port_policy",
+                "stratum_tls_requires_endpoint_evidence",
+                "analysis_payload_only",
+                "analysis_sample_rate",
+                "analysis_flow_cooldown_sec",
             }
             unknown_transport_settings = (
                 set(requested_transport_settings)
