@@ -9,7 +9,7 @@ from collections import deque
 
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread
-from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
+from p2pool_gui_elements import P2PoolTab, WiresharkTab, RouterTab, ProcessTab, CodeOutputChatTab, PacketSenderTab, AsyncWorker, PacketSendingThread, \
     PacketSenderWorker, GeminiChatTab, NmapTab, GobusterTab, ScrapingTab, OllamaModelTab, OllamaLogger
 
 
@@ -300,6 +300,7 @@ class P2PoolGUI(QMainWindow):
     trigger_send_tcp_syn = pyqtSignal(str, int, str, str, int)
     trigger_send_udp_packet = pyqtSignal(str, int, bytes, str, str, int)
     trigger_send_dns_query = pyqtSignal(str, str, str, str, str, int)
+    trigger_send_packetlab = pyqtSignal(dict)
     router_start_completed = pyqtSignal(bool, str, object)
     router_stop_completed = pyqtSignal(bool, str)
 
@@ -402,6 +403,17 @@ class P2PoolGUI(QMainWindow):
         self.wireshark_tab = WiresharkTab()
         self.packet_sender_tab = PacketSenderTab()
         self.router_tab = RouterTab(self.router_logger)
+        self.process_tab = ProcessTab(
+            manager_provider=lambda: getattr(
+                self.helper.router_manager,
+                "process_interface_manager",
+                None,
+            ),
+            logger=self.router_logger,
+        )
+        self.codeoutput_chat_tab = CodeOutputChatTab(
+            router_provider=lambda: self.helper.router_manager,
+        )
         self.gemini_chat_tab = GeminiChatTab(self.gemini_logger)
         self.nmap_tab = NmapTab(self.nmap_logger, self.async_worker.loop)
         self.gobuster_tab = GobusterTab(self.gobuster_logger, self.async_worker.loop)
@@ -415,6 +427,8 @@ class P2PoolGUI(QMainWindow):
         self.tabs.addTab(self.wireshark_tab, "Wireshark Capture")
         self.tabs.addTab(self.packet_sender_tab, "Send Packets")
         self.tabs.addTab(self.router_tab, "Router")
+        self.tabs.addTab(self.process_tab, "ProcessTab")
+        self.tabs.addTab(self.codeoutput_chat_tab, "CodeOutput Chat")
         self.tabs.addTab(self.gemini_chat_tab, "Gemini Chat")
         self.tabs.addTab(self.nmap_tab, "Nmap Scan")
         self.tabs.addTab(self.gobuster_tab, "Gobuster Scan")
@@ -442,6 +456,14 @@ class P2PoolGUI(QMainWindow):
         self.router_tab.codeoutput_probe_requested.connect(
             self.run_codeoutput_probe
         )
+        if hasattr(self.router_tab, "codeoutput_interface_create_requested"):
+            self.router_tab.codeoutput_interface_create_requested.connect(
+                self.create_codeoutput_interface
+            )
+        if hasattr(self.router_tab, "codeoutput_interface_remove_requested"):
+            self.router_tab.codeoutput_interface_remove_requested.connect(
+                self.remove_codeoutput_interface
+            )
         self.router_start_completed.connect(self._on_router_start_completed)
         self.router_stop_completed.connect(self._on_router_stop_completed)
 
@@ -449,6 +471,7 @@ class P2PoolGUI(QMainWindow):
         self.packet_sender_tab.send_tcp_syn_requested.connect(self.trigger_send_tcp_syn)
         self.packet_sender_tab.send_udp_requested.connect(self.trigger_send_udp_packet)
         self.packet_sender_tab.send_dns_requested.connect(self.trigger_send_dns_query)
+        self.packet_sender_tab.send_packetlab_requested.connect(self.trigger_send_packetlab)
         self.packet_sender_tab.populate_interfaces(self.packet_manager.get_interfaces())
 
 
@@ -466,6 +489,7 @@ class P2PoolGUI(QMainWindow):
         self.trigger_send_tcp_syn.connect(self.packet_sender_worker.do_send_tcp_syn)
         self.trigger_send_udp_packet.connect(self.packet_sender_worker.do_send_udp_packet)
         self.trigger_send_dns_query.connect(self.packet_sender_worker.do_send_dns_query)
+        self.trigger_send_packetlab.connect(self.packet_sender_worker.do_send_packetlab)
 
         self.packet_sender_qthread.start()
 
@@ -532,30 +556,7 @@ class P2PoolGUI(QMainWindow):
     def start_p2pool(self):
         self.gui_logger.log_message("[GUI] Requesting to start P2Pool...")
         if self.helper.asyncio_main_loop and self.helper.processor:
-            try:
-                bind_mode = str(
-                    self.p2pool_tab.stratum_bind_mode_combo.currentData()
-                    or "auto"
-                )
-                bind_ip = self.p2pool_tab.stratum_bind_ip_input.text().strip()
-                port = int(self.p2pool_tab.stratum_listen_port_input.text().strip() or "3333")
-                self.helper.processor.configure_stratum_bind(
-                    bind_mode=bind_mode,
-                    bind_ip=bind_ip,
-                    port=port,
-                )
-                self.gui_logger.log_message(
-                    f"[GUI] P2Pool Stratum bind mode={bind_mode} "
-                    f"address={bind_ip or 'auto/all'} port={port}."
-                )
-            except Exception as exc:
-                self.gui_logger.log_message(f"[GUI] Invalid P2Pool listener setting: {exc}")
-                return
-
-            asyncio.run_coroutine_threadsafe(
-                self.helper.processor.start_p2pool(),
-                self.helper.asyncio_main_loop,
-            )
+            asyncio.run_coroutine_threadsafe(self.helper.processor.start_p2pool(), self.helper.asyncio_main_loop)
             self.p2pool_tab.start_p2pool_button.setEnabled(False)
             self.p2pool_tab.stop_p2pool_button.setEnabled(True)
         else:
@@ -573,13 +574,7 @@ class P2PoolGUI(QMainWindow):
     def start_wireshark(self):
         self.wireshark_logger.log_message("[GUI] Requesting to start Wireshark capture...")
         if self.helper.wireshark_manager:
-            capture_settings = self.wireshark_tab.capture_settings()
-            if self.helper.wireshark_manager.start_capture(
-                    main_interface_name=capture_settings.get("main_interface", "Auto"),
-                    router_manager=self.helper.router_manager,
-                    promiscuous=bool(capture_settings.get("promiscuous", True)),
-                    settings=capture_settings,
-            ):
+            if self.helper.wireshark_manager.start_capture(main_interface_name='Wi-Fi', router_manager=self.helper.router_manager):
                 self.wireshark_tab.start_wireshark_button.setEnabled(False)
                 self.wireshark_tab.stop_wireshark_button.setEnabled(True)
             else:
@@ -680,7 +675,6 @@ class P2PoolGUI(QMainWindow):
         label: str,
         *,
         minimum: float | None = None,
-        maximum: float | None = None,
     ) -> float:
         raw = str(value or "").strip()
         if not raw:
@@ -691,8 +685,6 @@ class P2PoolGUI(QMainWindow):
             raise ValueError(f"{label} must be numeric.") from exc
         if minimum is not None and parsed < minimum:
             raise ValueError(f"{label} must be at least {minimum}.")
-        if maximum is not None and parsed > maximum:
-            raise ValueError(f"{label} must be at most {maximum}.")
         return parsed
 
     @staticmethod
@@ -763,6 +755,53 @@ class P2PoolGUI(QMainWindow):
             self.router_logger.log_message(
                 f"[CodeOutput][GUI] ❌ Probe could not be submitted: {exc}"
             )
+
+    @pyqtSlot(dict)
+    def create_codeoutput_interface(self, request: dict):
+        manager = getattr(self.helper.router_manager, "codeoutput_interface_manager", None)
+        if manager is None:
+            self.router_logger.log_message("[CodeOutputInterface][GUI] Manager is unavailable.")
+            return
+        config = dict(request or {})
+
+        def work():
+            try:
+                status = manager.create_interface(
+                    switch_name=config.get("switch_name"),
+                    adapter_name=config.get("adapter_name"),
+                    ipv4=config.get("ipv4"),
+                    prefix_length=config.get("prefix_length"),
+                    start_capture=True,
+                )
+                self.router_logger.log_message(
+                    f"[CodeOutputInterface][GUI] ✅ Runtime interface ready: {status}"
+                )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[CodeOutputInterface][GUI] ❌ Runtime creation failed: {exc}"
+                )
+
+        threading.Thread(target=work, name="CodeOutputInterfaceCreate", daemon=True).start()
+
+    @pyqtSlot(bool)
+    def remove_codeoutput_interface(self, force: bool = False):
+        manager = getattr(self.helper.router_manager, "codeoutput_interface_manager", None)
+        if manager is None:
+            self.router_logger.log_message("[CodeOutputInterface][GUI] Manager is unavailable.")
+            return
+
+        def work():
+            try:
+                removed = manager.remove_interface(force=bool(force))
+                self.router_logger.log_message(
+                    f"[CodeOutputInterface][GUI] Removal result: {removed}."
+                )
+            except Exception as exc:
+                self.router_logger.log_message(
+                    f"[CodeOutputInterface][GUI] ❌ Removal failed: {exc}"
+                )
+
+        threading.Thread(target=work, name="CodeOutputInterfaceRemove", daemon=True).start()
 
     def start_router(self):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
@@ -1448,16 +1487,6 @@ class P2PoolGUI(QMainWindow):
                 "packet_catcher_default_rate": (
                     packet_catcher_default_rate
                 ),
-                "sniff_mac_filter_only": tab.sniff_mac_only_checkbox.isChecked(),
-                "sniff_allow_l3_loopback": tab.sniff_allow_loopback_l3_checkbox.isChecked(),
-                "sniff_allow_l3_virtual": tab.sniff_allow_virtual_l3_checkbox.isChecked(),
-                "ingress_dedupe_noise": tab.ingress_dedupe_noise_checkbox.isChecked(),
-                "tunnel_log_success": tab.tunnel_success_logs_checkbox.isChecked(),
-                "ingress_max_frames": int(tab.ingress_max_frames_input.value()),
-                "ingress_max_bytes_mb": int(tab.ingress_max_mb_input.value()),
-                "ingress_priority_reserve_frames": int(tab.ingress_reserve_frames_input.value()),
-                "ingress_worker_batch": int(tab.ingress_worker_batch_input.value()),
-                "ingress_summary_interval": int(tab.ingress_summary_interval_input.value()),
             }
 
             # ---------------- transport managers ----------------
@@ -1492,31 +1521,6 @@ class P2PoolGUI(QMainWindow):
                 ),
                 "parallel_analysis": (
                     tab.transport_parallel_analysis_checkbox.isChecked()
-                ),
-                "classification_mode": str(
-                    tab.transport_classification_mode_combo.currentData()
-                    or "strict"
-                ),
-                "stratum_port_policy": str(
-                    tab.transport_stratum_port_policy_combo.currentData()
-                    or "hint"
-                ),
-                "stratum_tls_requires_endpoint_evidence": (
-                    tab.transport_stratum_tls_endpoint_checkbox.isChecked()
-                ),
-                "analysis_payload_only": (
-                    tab.transport_analysis_payload_only_checkbox.isChecked()
-                ),
-                "analysis_sample_rate": self._float_setting(
-                    tab.transport_analysis_sample_rate_input.text(),
-                    "Passive analysis sample rate",
-                    minimum=0.0,
-                    maximum=1.0,
-                ),
-                "analysis_flow_cooldown_sec": self._float_setting(
-                    tab.transport_analysis_cooldown_input.text(),
-                    "Passive analysis flow cooldown",
-                    minimum=0.0,
                 ),
                 "inspection_log_rps": self._float_setting(
                     tab.transport_inspection_rps_input.text(),
@@ -1634,9 +1638,13 @@ class P2PoolGUI(QMainWindow):
                 ),
                 "probe_rate_per_minute": int(tab.codeoutput_probe_rate_input.value()),
                 "probe_max_concurrent": int(tab.codeoutput_probe_concurrency_input.value()),
-                "probe_default_iface": tab.selected_codeoutput_interface(),
-                "probe_use_router_path": tab.codeoutput_use_router_path_checkbox.isChecked(),
-                "virtual_wan_enabled": tab.codeoutput_virtual_wan_checkbox.isChecked(),
+                "probe_default_iface": tab.codeoutput_iface_dropdown.currentText().strip(),
+                "interface_enabled": tab.codeoutput_interface_checkbox.isChecked(),
+                "interface_switch_name": tab.codeoutput_switch_name_input.text().strip() or "CodeOutput",
+                "interface_adapter_name": tab.codeoutput_adapter_name_input.text().strip() or "CodeOutput",
+                "interface_ipv4": tab.codeoutput_interface_ip_input.text().strip() or "172.30.253.1",
+                "interface_prefix_length": int(tab.codeoutput_interface_prefix_input.value()),
+                "interface_remove_on_shutdown": tab.codeoutput_remove_on_shutdown_checkbox.isChecked(),
             }
 
             # ---------------- Wi-Fi host ----------------
@@ -1889,6 +1897,13 @@ class P2PoolGUI(QMainWindow):
             self.router_logger.log_message(
                 "[RouterTab] ✅ Router startup completed; packet workers remain asynchronous."
             )
+            try:
+                code_iface = getattr(self.helper.router_manager, "codeoutput_interface_manager", None)
+                if code_iface is not None:
+                    code_iface.start_capture_worker()
+                self.packet_sender_tab.populate_interfaces(self.packet_manager.get_interfaces())
+            except Exception as exc:
+                self.router_logger.log_message(f"[CodeOutputInterface][GUI] Refresh warning: {exc}")
         else:
             self.router_tab.start_router_button.setEnabled(True)
             self.router_tab.stop_router_button.setEnabled(False)
@@ -2005,6 +2020,20 @@ class P2PoolGUI(QMainWindow):
         """Ensures all worker threads are cleanly shut down on application exit."""
         self._closing = True
         self.gui_logger.log_message("[GUI] Closing. Signaling all services to shut down...")
+        try:
+            if getattr(self, "process_tab", None):
+                self.process_tab.shutdown()
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[ProcessTab] Shutdown warning: {exc}"
+            )
+        try:
+            if getattr(self, "codeoutput_chat_tab", None):
+                self.codeoutput_chat_tab.shutdown()
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[CodeOutputChat] Shutdown warning: {exc}"
+            )
 
         # A backend start/stop may still be working.  Give it a short bounded
         # window, then request a best-effort router stop without blocking Qt

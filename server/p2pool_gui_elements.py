@@ -1,4 +1,6 @@
 import logging
+import ctypes
+import ctypes.wintypes as wintypes
 import os
 import re
 import webbrowser
@@ -15,7 +17,7 @@ from PyQt5.QtGui import QTextCursor, QIcon, QPixmap
 from PyQt5.QtWidgets import QWidget, QLineEdit, QLabel, QComboBox, QGroupBox, QFormLayout, QPushButton, QPlainTextEdit, \
     QVBoxLayout, QHBoxLayout, QTextEdit, QListWidget, QCheckBox, QTreeWidgetItem, QTreeWidget, QTabWidget, QHeaderView, \
     QGridLayout, QProgressBar, QMessageBox, QFileDialog, QSizePolicy, QMenu, QApplication, QListWidgetItem, QSpinBox, \
-    QSplitter, QAbstractItemView
+    QSplitter, QAbstractItemView, QFrame
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QThread, QTimer, Qt
 from pygments.formatters.html import HtmlFormatter
 
@@ -1518,6 +1520,10 @@ class PacketSenderWorker(QObject):
     def do_send_dns_query(self, dns_server, domain, record_type, iface, src_ip, timeout):
         self.request_queue.put(('dns', (dns_server, domain, record_type, iface, src_ip, timeout)))
 
+    @pyqtSlot(dict)
+    def do_send_packetlab(self, config):
+        self.request_queue.put(('packetlab', (dict(config or {}),)))
+
 
 class PacketSendingThread(threading.Thread):
     """
@@ -1554,6 +1560,10 @@ class PacketSendingThread(threading.Thread):
                 elif request_type == 'dns':
                     status, answers = self.packet_manager.send_dns_query(*args)
                     self.logger.log_message(f"[Result] DNS for {args[1]}: {status} -> {answers}")
+                elif request_type == 'packetlab':
+                    status, packet = self.packet_manager.send_packetlab(*args)
+                    summary = packet.summary() if packet is not None else "no packet"
+                    self.logger.log_message(f"[PacketLab Result] {status}: {summary}")
 
             except Exception as e:
                 self.logger.log_message(f"[PacketSenderThread] CRITICAL ERROR: {e}")
@@ -1590,25 +1600,6 @@ class P2PoolTab(QWidget):
         self.stop_p2pool_button.setObjectName("stop_button")
         self.stop_p2pool_button.setEnabled(False)
 
-        self.stratum_bind_mode_combo = QComboBox()
-        self.stratum_bind_mode_combo.addItem("Auto / all local IPv4 addresses", "auto")
-        self.stratum_bind_mode_combo.addItem("ATT Air IP passthrough / public IPv4", "passthrough")
-        self.stratum_bind_mode_combo.addItem("Private LAN IPv4", "lan")
-        self.stratum_bind_mode_combo.addItem("Explicit local IPv4", "explicit")
-        self.stratum_bind_ip_input = QLineEdit()
-        self.stratum_bind_ip_input.setPlaceholderText(
-            "Used only with Explicit local IPv4; never defaults to 192.168.0.10"
-        )
-        self.stratum_bind_ip_input.setEnabled(False)
-        self.stratum_bind_mode_combo.currentIndexChanged.connect(
-            lambda _index: self.stratum_bind_ip_input.setEnabled(
-                self.stratum_bind_mode_combo.currentData() == "explicit"
-            )
-        )
-        self.stratum_listen_port_input = QLineEdit()
-        self.stratum_listen_port_input.setText("3333")
-        self.stratum_listen_port_input.setPlaceholderText("P2Pool Stratum listen port")
-
         self.command_label = QLabel("P2Pool Command:")
         self.command_input = QLineEdit()
         self.command_input.setPlaceholderText("Type a P2Pool command and press Enter...")
@@ -1630,23 +1621,12 @@ class P2PoolTab(QWidget):
         control_layout.addWidget(self.stop_p2pool_button)
         control_layout.addStretch(1)
 
-        bind_group = QGroupBox("P2Pool Stratum Listener")
-        bind_layout = QGridLayout(bind_group)
-        bind_layout.addWidget(QLabel("Bind mode:"), 0, 0)
-        bind_layout.addWidget(self.stratum_bind_mode_combo, 0, 1)
-        bind_layout.addWidget(QLabel("Explicit IPv4:"), 1, 0)
-        bind_layout.addWidget(self.stratum_bind_ip_input, 1, 1)
-        bind_layout.addWidget(QLabel("Listen port:"), 0, 2)
-        bind_layout.addWidget(self.stratum_listen_port_input, 0, 3)
-        bind_layout.setColumnStretch(1, 1)
-
         command_layout = QHBoxLayout()
         command_layout.addWidget(self.command_label)
         command_layout.addWidget(self.command_input, 1)
         command_layout.addWidget(self.send_command_button)
 
         layout.addLayout(control_layout)
-        layout.addWidget(bind_group)
         layout.addLayout(command_layout)
         layout.addWidget(self.console_log)
 
@@ -1712,14 +1692,16 @@ class P2PoolTab(QWidget):
         self.console_log.appendPlainText(message)
 
 class WiresharkTab(QWidget):
-    """Wireshark/tshark capture controls with bounded, explicit capture policy."""
-
+    """
+    A QWidget that encapsulates all UI elements and logic for the Wireshark Capture tab.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self._create_widgets()
         self._configure_layout()
 
     def _create_widgets(self):
+        """Creates all the widgets for the tab."""
         self.start_wireshark_button = QPushButton("Start Wireshark Capture")
         self.start_wireshark_button.setObjectName("start_wireshark_button")
         self.start_wireshark_button.setEnabled(False)
@@ -1728,111 +1710,34 @@ class WiresharkTab(QWidget):
         self.stop_wireshark_button.setObjectName("stop_wireshark_button")
         self.stop_wireshark_button.setEnabled(False)
 
-        self.main_interface_input = QLineEdit("Auto")
-        self.main_interface_input.setPlaceholderText("Friendly name, GUID, NPF path, or Auto")
-
-        self.include_loopback_checkbox = QCheckBox("Capture loopback")
-        self.include_loopback_checkbox.setChecked(True)
-        self.include_vpn_checkbox = QCheckBox("Capture detected VPN adapters")
-        self.include_vpn_checkbox.setChecked(True)
-        self.include_multicast_checkbox = QCheckBox("Capture multicast")
-        self.include_multicast_checkbox.setChecked(False)
-        self.include_discovery_checkbox = QCheckBox("Capture mDNS/SSDP/WS-Discovery/LLMNR")
-        self.include_discovery_checkbox.setChecked(False)
-        self.include_dhcp_checkbox = QCheckBox("Capture DHCPv4/DHCPv6")
-        self.include_dhcp_checkbox.setChecked(True)
-        self.include_localhost_checkbox = QCheckBox("Capture localhost addresses")
-        self.include_localhost_checkbox.setChecked(True)
-        self.promiscuous_checkbox = QCheckBox("Promiscuous mode")
-        self.promiscuous_checkbox.setChecked(True)
-        self.full_details_checkbox = QCheckBox("Request full tshark protocol details")
-        self.full_details_checkbox.setChecked(True)
-        self.feed_router_checkbox = QCheckBox("Feed reconstructed packets into router queue")
-        self.feed_router_checkbox.setChecked(False)
-        self.feed_router_checkbox.setToolTip(
-            "Off by default because Npcap already feeds the router. Enable only when tshark is the intended capture source."
-        )
-        self.log_summaries_checkbox = QCheckBox("Log one summary per packet")
-        self.log_summaries_checkbox.setChecked(False)
-        self.log_payloads_checkbox = QCheckBox("Log decoded/raw payload previews")
-        self.log_payloads_checkbox.setChecked(False)
-        self.log_filtered_checkbox = QCheckBox("Log every filtered/noisy packet")
-        self.log_filtered_checkbox.setChecked(False)
-
-        self.min_packet_len_input = QSpinBox()
-        self.min_packet_len_input.setRange(0, 65535)
-        self.min_packet_len_input.setValue(0)
-        self.max_interfaces_input = QSpinBox()
-        self.max_interfaces_input.setRange(1, 32)
-        self.max_interfaces_input.setValue(8)
-        self.custom_bpf_input = QLineEdit()
-        self.custom_bpf_input.setPlaceholderText("Optional additional BPF expression")
-
         self.wireshark_log = QPlainTextEdit()
         self.wireshark_log.setReadOnly(True)
         self.wireshark_log.setMaximumBlockCount(10000)
 
-    def capture_settings(self) -> dict:
-        return {
-            "main_interface": self.main_interface_input.text().strip() or "Auto",
-            "include_loopback": self.include_loopback_checkbox.isChecked(),
-            "include_vpn": self.include_vpn_checkbox.isChecked(),
-            "include_multicast": self.include_multicast_checkbox.isChecked(),
-            "include_discovery": self.include_discovery_checkbox.isChecked(),
-            "include_dhcp": self.include_dhcp_checkbox.isChecked(),
-            "include_localhost": self.include_localhost_checkbox.isChecked(),
-            "promiscuous": self.promiscuous_checkbox.isChecked(),
-            "full_details": self.full_details_checkbox.isChecked(),
-            "feed_router": self.feed_router_checkbox.isChecked(),
-            "log_packet_summaries": self.log_summaries_checkbox.isChecked(),
-            "log_payloads": self.log_payloads_checkbox.isChecked(),
-            "log_filtered_packets": self.log_filtered_checkbox.isChecked(),
-            "min_packet_len": int(self.min_packet_len_input.value()),
-            "max_interfaces": int(self.max_interfaces_input.value()),
-            "custom_bpf": self.custom_bpf_input.text().strip(),
-        }
-
     def _configure_layout(self):
+        """Sets up the layout for the tab."""
         layout = QVBoxLayout(self)
         control_layout = QHBoxLayout()
+
         control_layout.addWidget(self.start_wireshark_button)
         control_layout.addWidget(self.stop_wireshark_button)
         control_layout.addStretch(1)
-        layout.addLayout(control_layout)
 
-        settings_box = QGroupBox("Capture Settings")
-        grid = QGridLayout(settings_box)
-        grid.addWidget(QLabel("Main interface:"), 0, 0)
-        grid.addWidget(self.main_interface_input, 0, 1, 1, 3)
-        grid.addWidget(self.include_loopback_checkbox, 1, 0)
-        grid.addWidget(self.include_vpn_checkbox, 1, 1)
-        grid.addWidget(self.include_multicast_checkbox, 1, 2)
-        grid.addWidget(self.include_discovery_checkbox, 1, 3)
-        grid.addWidget(self.include_dhcp_checkbox, 2, 0)
-        grid.addWidget(self.include_localhost_checkbox, 2, 1)
-        grid.addWidget(self.promiscuous_checkbox, 2, 2)
-        grid.addWidget(self.full_details_checkbox, 2, 3)
-        grid.addWidget(self.feed_router_checkbox, 3, 0, 1, 2)
-        grid.addWidget(self.log_summaries_checkbox, 3, 2)
-        grid.addWidget(self.log_payloads_checkbox, 3, 3)
-        grid.addWidget(self.log_filtered_checkbox, 4, 0, 1, 2)
-        grid.addWidget(QLabel("Minimum frame length:"), 5, 0)
-        grid.addWidget(self.min_packet_len_input, 5, 1)
-        grid.addWidget(QLabel("Maximum interfaces:"), 5, 2)
-        grid.addWidget(self.max_interfaces_input, 5, 3)
-        grid.addWidget(QLabel("Additional BPF:"), 6, 0)
-        grid.addWidget(self.custom_bpf_input, 6, 1, 1, 3)
-        layout.addWidget(settings_box)
+        layout.addLayout(control_layout)
         layout.addWidget(self.wireshark_log)
 
     @pyqtSlot(str)
     def log_message(self, message: str):
+        """Appends a message to the Wireshark console log."""
         self.wireshark_log.appendPlainText(message)
+
 
 
 
 class RouterTab(QWidget):
     codeoutput_probe_requested = pyqtSignal(dict)
+    codeoutput_interface_create_requested = pyqtSignal(dict)
+    codeoutput_interface_remove_requested = pyqtSignal(bool)
     _PREFIX_RE = re.compile(r"\[([^\[\]]{1,64})\]")
 
     def __init__(self, logger, parent=None):
@@ -2158,35 +2063,6 @@ class RouterTab(QWidget):
             "Parallel Passive Analysis"
         )
         self.transport_parallel_analysis_checkbox.setChecked(True)
-        self.transport_classification_mode_combo = QComboBox()
-        self.transport_classification_mode_combo.addItem(
-            "Strict evidence (recommended)", "strict"
-        )
-        self.transport_classification_mode_combo.addItem(
-            "Balanced evidence", "balanced"
-        )
-        self.transport_classification_mode_combo.addItem(
-            "Legacy port-first", "legacy"
-        )
-        self.transport_stratum_port_policy_combo = QComboBox()
-        self.transport_stratum_port_policy_combo.addItem(
-            "Port is a hint (recommended)", "hint"
-        )
-        self.transport_stratum_port_policy_combo.addItem(
-            "Port is authoritative (legacy)", "authoritative"
-        )
-        self.transport_stratum_tls_endpoint_checkbox = QCheckBox(
-            "Require endpoint/flow proof for Stratum over TLS"
-        )
-        self.transport_stratum_tls_endpoint_checkbox.setChecked(True)
-        self.transport_analysis_payload_only_checkbox = QCheckBox(
-            "Passive analysis only when payload exists"
-        )
-        self.transport_analysis_payload_only_checkbox.setChecked(True)
-        self.transport_analysis_sample_rate_input = QLineEdit()
-        self.transport_analysis_sample_rate_input.setText("0.15")
-        self.transport_analysis_cooldown_input = QLineEdit()
-        self.transport_analysis_cooldown_input.setText("0.25")
         self.transport_protocol_checkboxes = {}
         transport_protocol_labels = [
             ("inspection", "Deep Inspection"),
@@ -2310,18 +2186,6 @@ class RouterTab(QWidget):
             "Allow Public Internet Targets"
         )
         self.codeoutput_allow_public_checkbox.setChecked(False)
-        self.codeoutput_use_router_path_checkbox = QCheckBox(
-            "Resolve selected adapter GUID and use router path"
-        )
-        self.codeoutput_use_router_path_checkbox.setChecked(True)
-        self.codeoutput_virtual_wan_checkbox = QCheckBox(
-            "Expose CodeOutputInterface as a programmatic WAN capture interface"
-        )
-        self.codeoutput_virtual_wan_checkbox.setChecked(True)
-        self.codeoutput_virtual_wan_checkbox.setToolTip(
-            "Packets submitted through CodeOutput are queued into PythonRouterManager exactly like Npcap ingress, "
-            "without pretending the synthetic interface is a Windows/Npcap adapter."
-        )
         self.codeoutput_verbose_input = QSpinBox()
         self.codeoutput_verbose_input.setRange(0, 5)
         self.codeoutput_verbose_input.setValue(2)
@@ -2352,6 +2216,21 @@ class RouterTab(QWidget):
         self.codeoutput_iface_dropdown = QComboBox()
         self.codeoutput_iface_dropdown.setEditable(True)
         self.codeoutput_probe_button = QPushButton("Send CodeOutput Probe")
+
+        self.codeoutput_interface_checkbox = QCheckBox("Create and register real CodeOutput interface")
+        self.codeoutput_interface_checkbox.setChecked(False)
+        self.codeoutput_switch_name_input = QLineEdit("CodeOutput")
+        self.codeoutput_adapter_name_input = QLineEdit("CodeOutput")
+        self.codeoutput_interface_ip_input = QLineEdit("172.30.253.1")
+        self.codeoutput_interface_prefix_input = QSpinBox()
+        self.codeoutput_interface_prefix_input.setRange(1, 30)
+        self.codeoutput_interface_prefix_input.setValue(30)
+        self.codeoutput_remove_on_shutdown_checkbox = QCheckBox("Remove CodeOutput switch on router shutdown")
+        self.codeoutput_remove_on_shutdown_checkbox.setChecked(False)
+        self.codeoutput_force_remove_checkbox = QCheckBox("Force removal of an existing switch")
+        self.codeoutput_force_remove_checkbox.setChecked(False)
+        self.codeoutput_create_interface_button = QPushButton("Create / Register CodeOutput Interface")
+        self.codeoutput_remove_interface_button = QPushButton("Remove CodeOutput Interface")
 
         self.core_firewall_checkbox = QCheckBox("Firewall Manager")
         self.core_firewall_checkbox.setChecked(True)
@@ -2527,37 +2406,6 @@ class RouterTab(QWidget):
 
         self.promisc_checkbox = QCheckBox("Promiscuous")
         self.promisc_checkbox.setChecked(False)
-
-        self.sniff_mac_only_checkbox = QCheckBox("Require Ethernet/MAC frames on physical captures")
-        self.sniff_mac_only_checkbox.setChecked(True)
-        self.sniff_mac_only_checkbox.setToolTip(
-            "Default on. L3-only loopback and virtual-interface packets remain allowed by the two exceptions below."
-        )
-        self.sniff_allow_loopback_l3_checkbox = QCheckBox("Allow L3-only loopback packets")
-        self.sniff_allow_loopback_l3_checkbox.setChecked(True)
-        self.sniff_allow_virtual_l3_checkbox = QCheckBox("Allow L3-only virtual/CodeOutput packets")
-        self.sniff_allow_virtual_l3_checkbox.setChecked(True)
-        self.ingress_dedupe_noise_checkbox = QCheckBox("Coalesce repeated low-value multicast/broadcast frames")
-        self.ingress_dedupe_noise_checkbox.setChecked(True)
-        self.tunnel_success_logs_checkbox = QCheckBox("Log every successful ESP/AH/GRE forward")
-        self.tunnel_success_logs_checkbox.setChecked(False)
-
-        self.ingress_max_frames_input = QSpinBox()
-        self.ingress_max_frames_input.setRange(2048, 131072)
-        self.ingress_max_frames_input.setValue(32768)
-        self.ingress_max_mb_input = QSpinBox()
-        self.ingress_max_mb_input.setRange(32, 1024)
-        self.ingress_max_mb_input.setValue(192)
-        self.ingress_reserve_frames_input = QSpinBox()
-        self.ingress_reserve_frames_input.setRange(256, 32768)
-        self.ingress_reserve_frames_input.setValue(4096)
-        self.ingress_worker_batch_input = QSpinBox()
-        self.ingress_worker_batch_input.setRange(1, 1024)
-        self.ingress_worker_batch_input.setValue(64)
-        self.ingress_summary_interval_input = QSpinBox()
-        self.ingress_summary_interval_input.setRange(5, 300)
-        self.ingress_summary_interval_input.setValue(15)
-
         self.ollama_checkbox = QCheckBox("Ollama")
         self.ollama_checkbox.setChecked(False)
         self.use_wifi_host_checkbox = QCheckBox("Host Wireless Network")
@@ -2732,27 +2580,6 @@ class RouterTab(QWidget):
         )
         peerinterface_help.setWordWrap(True)
         peerinterface_form.addRow(peerinterface_help)
-
-        capture_queue_content = QWidget()
-        capture_queue_grid = QGridLayout(capture_queue_content)
-        capture_queue_grid.setContentsMargins(8, 8, 8, 8)
-        capture_queue_grid.setHorizontalSpacing(12)
-        capture_queue_grid.setVerticalSpacing(8)
-        capture_queue_grid.addWidget(self.sniff_mac_only_checkbox, 0, 0, 1, 2)
-        capture_queue_grid.addWidget(self.sniff_allow_loopback_l3_checkbox, 0, 2)
-        capture_queue_grid.addWidget(self.sniff_allow_virtual_l3_checkbox, 0, 3)
-        capture_queue_grid.addWidget(self.ingress_dedupe_noise_checkbox, 1, 0, 1, 2)
-        capture_queue_grid.addWidget(self.tunnel_success_logs_checkbox, 1, 2, 1, 2)
-        capture_queue_grid.addWidget(QLabel("Base queue frames:"), 2, 0)
-        capture_queue_grid.addWidget(self.ingress_max_frames_input, 2, 1)
-        capture_queue_grid.addWidget(QLabel("Queue memory MiB:"), 2, 2)
-        capture_queue_grid.addWidget(self.ingress_max_mb_input, 2, 3)
-        capture_queue_grid.addWidget(QLabel("Protected reserve frames:"), 3, 0)
-        capture_queue_grid.addWidget(self.ingress_reserve_frames_input, 3, 1)
-        capture_queue_grid.addWidget(QLabel("Worker batch:"), 3, 2)
-        capture_queue_grid.addWidget(self.ingress_worker_batch_input, 3, 3)
-        capture_queue_grid.addWidget(QLabel("Summary interval (s):"), 4, 0)
-        capture_queue_grid.addWidget(self.ingress_summary_interval_input, 4, 1)
 
         core_managers_content = QWidget()
         core_managers_grid = QGridLayout(core_managers_content)
@@ -3151,60 +2978,6 @@ class RouterTab(QWidget):
             1,
             2,
         )
-        transport_tuning_grid.addWidget(
-            QLabel("Classification mode:"),
-            13,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_classification_mode_combo,
-            13,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Stratum port policy:"),
-            13,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_stratum_port_policy_combo,
-            13,
-            3,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_stratum_tls_endpoint_checkbox,
-            14,
-            0,
-            1,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_analysis_payload_only_checkbox,
-            14,
-            2,
-            1,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Passive analysis sample (0-1):"),
-            15,
-            0,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_analysis_sample_rate_input,
-            15,
-            1,
-        )
-        transport_tuning_grid.addWidget(
-            QLabel("Analysis flow cooldown:"),
-            15,
-            2,
-        )
-        transport_tuning_grid.addWidget(
-            self.transport_analysis_cooldown_input,
-            15,
-            3,
-        )
 
         transport_protocol_box = QGroupBox(
             "Protocol Managers"
@@ -3243,23 +3016,34 @@ class RouterTab(QWidget):
         codeoutput_grid.addWidget(self.codeoutput_min_packets_input, 3, 1)
         codeoutput_grid.addWidget(self.codeoutput_active_probes_checkbox, 4, 0, 1, 2)
         codeoutput_grid.addWidget(self.codeoutput_allow_public_checkbox, 4, 2, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_use_router_path_checkbox, 5, 0, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_virtual_wan_checkbox, 5, 2, 1, 2)
-        codeoutput_grid.addWidget(QLabel("Probe timeout:"), 6, 0)
-        codeoutput_grid.addWidget(self.codeoutput_probe_timeout_input, 6, 1)
-        codeoutput_grid.addWidget(QLabel("Rate/min:"), 6, 2)
-        codeoutput_grid.addWidget(self.codeoutput_probe_rate_input, 6, 3)
-        codeoutput_grid.addWidget(QLabel("Target:"), 7, 0)
-        codeoutput_grid.addWidget(self.codeoutput_target_input, 7, 1)
-        codeoutput_grid.addWidget(self.codeoutput_protocol_dropdown, 7, 2)
-        codeoutput_grid.addWidget(self.codeoutput_port_input, 7, 3)
-        codeoutput_grid.addWidget(QLabel("Interface GUID / source:"), 8, 0)
-        codeoutput_grid.addWidget(self.codeoutput_iface_dropdown, 8, 1)
-        codeoutput_grid.addWidget(QLabel("Payload:"), 8, 2)
-        codeoutput_grid.addWidget(self.codeoutput_payload_input, 8, 3)
-        codeoutput_grid.addWidget(QLabel("Concurrency:"), 9, 0)
-        codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 9, 1)
-        codeoutput_grid.addWidget(self.codeoutput_probe_button, 9, 2, 1, 2)
+        codeoutput_grid.addWidget(QLabel("Probe timeout:"), 5, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_timeout_input, 5, 1)
+        codeoutput_grid.addWidget(QLabel("Rate/min:"), 5, 2)
+        codeoutput_grid.addWidget(self.codeoutput_probe_rate_input, 5, 3)
+        codeoutput_grid.addWidget(QLabel("Target:"), 6, 0)
+        codeoutput_grid.addWidget(self.codeoutput_target_input, 6, 1)
+        codeoutput_grid.addWidget(self.codeoutput_protocol_dropdown, 6, 2)
+        codeoutput_grid.addWidget(self.codeoutput_port_input, 6, 3)
+        codeoutput_grid.addWidget(QLabel("Interface/source IP:"), 7, 0)
+        codeoutput_grid.addWidget(self.codeoutput_iface_dropdown, 7, 1)
+        codeoutput_grid.addWidget(QLabel("Payload:"), 7, 2)
+        codeoutput_grid.addWidget(self.codeoutput_payload_input, 7, 3)
+        codeoutput_grid.addWidget(QLabel("Concurrency:"), 8, 0)
+        codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 8, 1)
+        codeoutput_grid.addWidget(self.codeoutput_probe_button, 8, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_interface_checkbox, 9, 0, 1, 4)
+        codeoutput_grid.addWidget(QLabel("Hyper-V switch name:"), 10, 0)
+        codeoutput_grid.addWidget(self.codeoutput_switch_name_input, 10, 1)
+        codeoutput_grid.addWidget(QLabel("Windows adapter name:"), 10, 2)
+        codeoutput_grid.addWidget(self.codeoutput_adapter_name_input, 10, 3)
+        codeoutput_grid.addWidget(QLabel("CodeOutput IPv4:"), 11, 0)
+        codeoutput_grid.addWidget(self.codeoutput_interface_ip_input, 11, 1)
+        codeoutput_grid.addWidget(QLabel("Prefix length:"), 11, 2)
+        codeoutput_grid.addWidget(self.codeoutput_interface_prefix_input, 11, 3)
+        codeoutput_grid.addWidget(self.codeoutput_remove_on_shutdown_checkbox, 12, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_force_remove_checkbox, 12, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_create_interface_button, 13, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_remove_interface_button, 13, 2, 1, 2)
 
         comms_content = QWidget()
         comms_form = QFormLayout(comms_content)
@@ -3652,12 +3436,6 @@ class RouterTab(QWidget):
             self._make_settings_section(
                 "PeerInterface P2P",
                 peerinterface_content,
-            )
-        )
-        settings_layout.addWidget(
-            self._make_settings_section(
-                "Capture & Ingress Queue",
-                capture_queue_content,
             )
         )
         settings_layout.addWidget(
@@ -4154,6 +3932,15 @@ class RouterTab(QWidget):
         self.codeoutput_probe_button.clicked.connect(
             self._emit_codeoutput_probe
         )
+        self.codeoutput_create_interface_button.clicked.connect(
+            self._emit_codeoutput_interface_create
+        )
+        self.codeoutput_remove_interface_button.clicked.connect(
+            self._emit_codeoutput_interface_remove
+        )
+        self.codeoutput_interface_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
         self.codeoutput_active_probes_checkbox.stateChanged.connect(
             self._sync_enable_states
         )
@@ -4212,80 +3999,8 @@ class RouterTab(QWidget):
             self._sync_enable_states
         )
 
-    @staticmethod
-    def _normalize_interface_guid(value) -> str:
-        text = str(value or "").strip()
-        match = re.search(
-            r"\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}?",
-            text,
-        )
-        return "{" + match.group(1).upper() + "}" if match else ""
-
-    def _interface_identity_records(self) -> List[Dict[str, object]]:
-        """Return display rows whose saved value is the stable Windows GUID."""
-        psutil_names = sorted(psutil.net_if_addrs().keys(), key=str.casefold)
-        rows: List[Dict[str, object]] = []
-        claimed_names = set()
-        try:
-            from scapy.arch.windows import get_windows_if_list
-            windows_rows = list(get_windows_if_list() or [])
-        except Exception:
-            windows_rows = []
-
-        for raw in windows_rows:
-            guid = self._normalize_interface_guid(
-                raw.get("guid") or raw.get("name") or raw.get("network_name")
-            )
-            friendly = str(
-                raw.get("win_name") or raw.get("friendlyname")
-                or raw.get("description") or raw.get("name") or guid
-            ).strip()
-            candidates = {
-                str(v).strip().casefold() for v in (
-                    raw.get("name"), raw.get("win_name"), raw.get("friendlyname"),
-                    raw.get("description"), raw.get("network_name"), friendly,
-                ) if str(v or "").strip()
-            }
-            matched_name = next(
-                (name for name in psutil_names if name.casefold() in candidates),
-                friendly,
-            )
-            claimed_names.add(str(matched_name).casefold())
-            token = f"guid:{guid}" if guid else str(matched_name)
-            label = str(matched_name)
-            if guid:
-                label = f"{matched_name}  |  {guid}"
-            try:
-                if_index = int(raw.get("index") or raw.get("if_index") or 0)
-            except Exception:
-                if_index = 0
-            rows.append({
-                "label": label,
-                "token": token,
-                "guid": guid,
-                "friendly_name": matched_name,
-                "description": str(raw.get("description") or ""),
-                "if_index": if_index,
-            })
-
-        for name in psutil_names:
-            if name.casefold() in claimed_names:
-                continue
-            rows.append({
-                "label": name, "token": name, "guid": "",
-                "friendly_name": name, "description": "", "if_index": 0,
-            })
-        rows.sort(key=lambda row: str(row.get("friendly_name") or row.get("label")).casefold())
-        return rows
-
     def _selected_interface_names(self, widget: QListWidget) -> List[str]:
-        selected = []
-        for item in widget.selectedItems():
-            token = item.data(Qt.UserRole)
-            value = str(token if token not in (None, "") else item.text()).strip()
-            if value:
-                selected.append(value)
-        return selected
+        return [item.text() for item in widget.selectedItems() if item.text().strip()]
 
     def selected_lan_dhcp_interfaces(self) -> List[str]:
         return self._selected_interface_names(self.dhcp_lan_interfaces_list)
@@ -4293,62 +4008,29 @@ class RouterTab(QWidget):
     def selected_wan_dhcp_interfaces(self) -> List[str]:
         return self._selected_interface_names(self.dhcp_wan_interfaces_list)
 
-    def selected_codeoutput_interface(self) -> str:
-        index = self.codeoutput_iface_dropdown.currentIndex()
-        if index >= 0:
-            token = self.codeoutput_iface_dropdown.itemData(index, Qt.UserRole)
-            shown = self.codeoutput_iface_dropdown.itemText(index)
-            current = self.codeoutput_iface_dropdown.currentText().strip()
-            if token and current == shown:
-                return str(token).strip()
-        return self.codeoutput_iface_dropdown.currentText().strip()
-
     @pyqtSlot()
     def refresh_network_interfaces(self):
         previous_lan = set(self.selected_lan_dhcp_interfaces()) if hasattr(self, "dhcp_lan_interfaces_list") else set()
         previous_wan = set(self.selected_wan_dhcp_interfaces()) if hasattr(self, "dhcp_wan_interfaces_list") else set()
-        previous_codeoutput = self.selected_codeoutput_interface() if hasattr(self, "codeoutput_iface_dropdown") else ""
-        records = self._interface_identity_records()
-
+        names = sorted(psutil.net_if_addrs().keys(), key=str.casefold)
         for widget in (self.dhcp_lan_interfaces_list, self.dhcp_wan_interfaces_list):
             widget.clear()
-            for record in records:
-                item = QListWidgetItem(str(record["label"]))
-                item.setData(Qt.UserRole, str(record["token"]))
-                item.setData(Qt.UserRole + 1, dict(record))
-                item.setToolTip(
-                    f"Runtime selector: {record['token']}\n"
-                    f"Interface index: {record.get('if_index') or '-'}"
-                )
-                widget.addItem(item)
-
+            widget.addItems(names)
         self.codeoutput_iface_dropdown.clear()
-        self.codeoutput_iface_dropdown.addItem("", "")
-        for record in records:
-            self.codeoutput_iface_dropdown.addItem(
-                str(record["label"]), str(record["token"])
-            )
-        self.codeoutput_iface_dropdown.addItem("PeerInterface", "PeerInterface")
-        self.codeoutput_iface_dropdown.addItem("HyperVManager", "HyperVManager")
-
-        for widget, previous, default_tokens in (
-            (self.dhcp_lan_interfaces_list, previous_lan, ("ethernet", "veth", "bridge", "lan")),
-            (self.dhcp_wan_interfaces_list, previous_wan, ("wi-fi", "wifi", "wireless", "wan")),
-        ):
-            for index in range(widget.count()):
-                item = widget.item(index)
-                token = str(item.data(Qt.UserRole) or item.text()).strip()
-                shown = item.text().casefold()
-                default_match = any(value in shown for value in default_tokens)
-                item.setSelected(token in previous or (not previous and default_match))
-
-        if previous_codeoutput:
-            for index in range(self.codeoutput_iface_dropdown.count()):
-                if str(self.codeoutput_iface_dropdown.itemData(index) or "") == previous_codeoutput:
-                    self.codeoutput_iface_dropdown.setCurrentIndex(index)
-                    break
-            else:
-                self.codeoutput_iface_dropdown.setEditText(previous_codeoutput)
+        self.codeoutput_iface_dropdown.addItem("")
+        self.codeoutput_iface_dropdown.addItems(
+            names + ["CodeOutput", "ProcessInterface", "PeerInterface", "HyperVManager"]
+        )
+        for index in range(self.dhcp_lan_interfaces_list.count()):
+            item = self.dhcp_lan_interfaces_list.item(index)
+            name = item.text()
+            default_lan = any(token in name.casefold() for token in ("ethernet", "veth", "bridge", "lan"))
+            item.setSelected(name in previous_lan or (not previous_lan and default_lan))
+        for index in range(self.dhcp_wan_interfaces_list.count()):
+            item = self.dhcp_wan_interfaces_list.item(index)
+            name = item.text()
+            default_wan = any(token in name.casefold() for token in ("wi-fi", "wifi", "wireless", "wan"))
+            item.setSelected(name in previous_wan or (not previous_wan and default_wan))
 
     @pyqtSlot()
     def _emit_codeoutput_probe(self):
@@ -4360,9 +4042,24 @@ class RouterTab(QWidget):
             "port": None if protocol == "icmp" else port,
             "payload": self.codeoutput_payload_input.text(),
             "timeout": float(self.codeoutput_probe_timeout_input.text().strip() or 3.0),
-            "iface": self.selected_codeoutput_interface(),
+            "iface": self.codeoutput_iface_dropdown.currentText().strip(),
             "expect_response": True,
         })
+
+    @pyqtSlot()
+    def _emit_codeoutput_interface_create(self):
+        self.codeoutput_interface_create_requested.emit({
+            "switch_name": self.codeoutput_switch_name_input.text().strip() or "CodeOutput",
+            "adapter_name": self.codeoutput_adapter_name_input.text().strip() or "CodeOutput",
+            "ipv4": self.codeoutput_interface_ip_input.text().strip() or "172.30.253.1",
+            "prefix_length": int(self.codeoutput_interface_prefix_input.value()),
+        })
+
+    @pyqtSlot()
+    def _emit_codeoutput_interface_remove(self):
+        self.codeoutput_interface_remove_requested.emit(
+            self.codeoutput_force_remove_checkbox.isChecked()
+        )
 
     def _sync_enable_states(self):
         use_static = self.use_static_checkbox.isChecked()
@@ -4438,12 +4135,10 @@ class RouterTab(QWidget):
             self.codeoutput_min_packets_input,
             self.codeoutput_max_chars_input,
             self.codeoutput_active_probes_checkbox,
-            self.codeoutput_virtual_wan_checkbox,
         ):
             widget.setEnabled(codeoutput_enabled)
         for widget in (
             self.codeoutput_allow_public_checkbox,
-            self.codeoutput_use_router_path_checkbox,
             self.codeoutput_probe_timeout_input,
             self.codeoutput_probe_rate_input,
             self.codeoutput_probe_concurrency_input,
@@ -4455,6 +4150,20 @@ class RouterTab(QWidget):
             self.codeoutput_probe_button,
         ):
             widget.setEnabled(probe_enabled)
+
+        codeoutput_interface_enabled = codeoutput_enabled and self.codeoutput_interface_checkbox.isChecked()
+        self.codeoutput_interface_checkbox.setEnabled(codeoutput_enabled)
+        self.codeoutput_create_interface_button.setEnabled(codeoutput_interface_enabled)
+        self.codeoutput_remove_interface_button.setEnabled(codeoutput_enabled)
+        for widget in (
+            self.codeoutput_switch_name_input,
+            self.codeoutput_adapter_name_input,
+            self.codeoutput_interface_ip_input,
+            self.codeoutput_interface_prefix_input,
+            self.codeoutput_remove_on_shutdown_checkbox,
+            self.codeoutput_force_remove_checkbox,
+        ):
+            widget.setEnabled(codeoutput_interface_enabled)
 
         peerinterface_enabled = self.use_peerinterface_checkbox.isChecked()
         for widget in (
@@ -4514,12 +4223,6 @@ class RouterTab(QWidget):
         )
         for widget in (
             self.transport_parallel_analysis_checkbox,
-            self.transport_classification_mode_combo,
-            self.transport_stratum_port_policy_combo,
-            self.transport_stratum_tls_endpoint_checkbox,
-            self.transport_analysis_payload_only_checkbox,
-            self.transport_analysis_sample_rate_input,
-            self.transport_analysis_cooldown_input,
             self.transport_stratum_ports_input,
             self.transport_monero_ports_input,
             self.transport_voip_start_input,
@@ -4541,8 +4244,6 @@ class RouterTab(QWidget):
             self.transport_https_logging_checkbox,
             self.transport_https_certificates_checkbox,
             self.transport_https_quic_crypto_checkbox,
-            self.transport_tls_learning_checkbox,
-            self.transport_https_init_context_checkbox,
             *self.transport_protocol_checkboxes.values(),
         ):
             widget.setEnabled(transport_enabled)
@@ -4897,157 +4598,1013 @@ class RouterTab(QWidget):
 
 
 
+class ProcessTab(QWidget):
+    """Dock an existing Windows process and attach its sockets to the router.
+
+    Docking changes only the selected top-level window's parent. It does not start,
+    stop, import, or merge the client process. Network routing is delegated to the
+    server-owned ProcessInterfaceManager.
+    """
+
+    operation_completed = pyqtSignal(str, bool, str, object)
+
+    GWL_STYLE = -16
+    GWL_EXSTYLE = -20
+    WS_CHILD = 0x40000000
+    WS_VISIBLE = 0x10000000
+    WS_POPUP = 0x80000000
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_SYSMENU = 0x00080000
+    WS_CLIPSIBLINGS = 0x04000000
+    WS_CLIPCHILDREN = 0x02000000
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
+    SWP_SHOWWINDOW = 0x0040
+    SW_RESTORE = 9
+
+    def __init__(self, manager_provider, logger=None, parent=None):
+        super().__init__(parent)
+        self.manager_provider = manager_provider
+        self.logger = logger
+        self._operation_thread = None
+        self._docked_hwnd = None
+        self._docked_pid = None
+        self._original_parent = 0
+        self._original_style = 0
+        self._original_exstyle = 0
+        self._original_rect = None
+        self._user32 = None
+        self._get_window_long = None
+        self._set_window_long = None
+
+        self._build_ui()
+        self.operation_completed.connect(self._on_operation_completed)
+
+        self._dock_timer = QTimer(self)
+        self._dock_timer.setInterval(250)
+        self._dock_timer.timeout.connect(self._maintain_docked_window)
+        self._dock_timer.start()
+
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self.refresh_status)
+        self._status_timer.start()
+
+        self.refresh_processes()
+        self.refresh_status()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        selector_group = QGroupBox("Separate Process Selection")
+        selector_layout = QGridLayout(selector_group)
+        self.process_combo = QComboBox()
+        self.process_combo.setMinimumWidth(360)
+        self.process_combo.currentIndexChanged.connect(self.refresh_windows)
+        self.refresh_button = QPushButton("Refresh Processes")
+        self.refresh_button.clicked.connect(self.refresh_processes)
+        self.window_combo = QComboBox()
+        self.window_combo.setMinimumWidth(360)
+        self.dock_button = QPushButton("Dock Selected Window")
+        self.dock_button.clicked.connect(self.dock_selected_window)
+        self.detach_button = QPushButton("Detach Window")
+        self.detach_button.clicked.connect(self.detach_window)
+        self.detach_button.setEnabled(False)
+
+        selector_layout.addWidget(QLabel("Process:"), 0, 0)
+        selector_layout.addWidget(self.process_combo, 0, 1)
+        selector_layout.addWidget(self.refresh_button, 0, 2)
+        selector_layout.addWidget(QLabel("Top-level window:"), 1, 0)
+        selector_layout.addWidget(self.window_combo, 1, 1)
+        dock_buttons = QHBoxLayout()
+        dock_buttons.addWidget(self.dock_button)
+        dock_buttons.addWidget(self.detach_button)
+        dock_buttons.addStretch(1)
+        selector_layout.addLayout(dock_buttons, 1, 2)
+        root.addWidget(selector_group)
+
+        self.process_splitter = QSplitter(Qt.Vertical)
+        self.process_splitter.setChildrenCollapsible(False)
+
+        self.dock_frame = QFrame()
+        self.dock_frame.setFrameShape(QFrame.StyledPanel)
+        self.dock_frame.setMinimumHeight(300)
+        self.dock_frame.setAttribute(Qt.WA_NativeWindow, True)
+        self.dock_frame.setStyleSheet(
+            "QFrame { background-color: #111111; border: 1px solid #555555; }"
+        )
+        dock_layout = QVBoxLayout(self.dock_frame)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        self.dock_placeholder = QLabel(
+            "Select a running process and dock one of its visible windows here.\n"
+            "The client remains an independent process with its own PID and runtime."
+        )
+        self.dock_placeholder.setAlignment(Qt.AlignCenter)
+        self.dock_placeholder.setWordWrap(True)
+        dock_layout.addWidget(self.dock_placeholder)
+        self.process_splitter.addWidget(self.dock_frame)
+
+        interface_group = QGroupBox("ProcessInterface Routing")
+        interface_layout = QGridLayout(interface_group)
+        self.interface_status_label = QLabel("Interface: checking...")
+        self.route_status_label = QLabel("Process route: disabled")
+        self.switch_name_input = QLineEdit("ProcessInterface")
+        self.interface_ip_input = QLineEdit("172.30.254.1")
+        self.prefix_spin = QSpinBox()
+        self.prefix_spin.setRange(1, 30)
+        self.prefix_spin.setValue(30)
+        self.create_interface_checkbox = QCheckBox(
+            "Create/enable Hyper-V ProcessInterface before routing"
+        )
+        self.create_interface_checkbox.setChecked(True)
+        self.route_mode_combo = QComboBox()
+        self.route_mode_combo.addItems([
+            "Stratum Only",
+            "All TCP/UDP",
+            "Observe Only",
+        ])
+        self.stratum_ports_input = QLineEdit(
+            "3333,3334,4444,5555,7777,10001,10128,20128,4242"
+        )
+        self.stratum_ports_input.setToolTip(
+            "In Stratum Only mode, a selected process flow is attached when either "
+            "endpoint uses one of these ports."
+        )
+        self.create_interface_button = QPushButton("Create / Enable Interface")
+        self.create_interface_button.clicked.connect(self.create_interface)
+        self.remove_interface_button = QPushButton("Remove Interface")
+        self.remove_interface_button.clicked.connect(self.remove_interface)
+        self.start_route_button = QPushButton("Route Selected Process")
+        self.start_route_button.clicked.connect(self.start_process_route)
+        self.stop_route_button = QPushButton("Stop Process Routing")
+        self.stop_route_button.clicked.connect(self.stop_process_route)
+
+        interface_layout.addWidget(self.interface_status_label, 0, 0, 1, 3)
+        interface_layout.addWidget(self.route_status_label, 1, 0, 1, 3)
+        interface_layout.addWidget(QLabel("Hyper-V switch:"), 2, 0)
+        interface_layout.addWidget(self.switch_name_input, 2, 1)
+        interface_layout.addWidget(QLabel("Server IPv4 / prefix:"), 3, 0)
+        address_row = QHBoxLayout()
+        address_row.addWidget(self.interface_ip_input, 1)
+        address_row.addWidget(self.prefix_spin)
+        interface_layout.addLayout(address_row, 3, 1)
+        interface_buttons = QHBoxLayout()
+        interface_buttons.addWidget(self.create_interface_button)
+        interface_buttons.addWidget(self.remove_interface_button)
+        interface_buttons.addStretch(1)
+        interface_layout.addLayout(interface_buttons, 2, 2, 2, 1)
+        interface_layout.addWidget(self.create_interface_checkbox, 4, 0, 1, 3)
+        interface_layout.addWidget(QLabel("Routing mode:"), 5, 0)
+        interface_layout.addWidget(self.route_mode_combo, 5, 1)
+        interface_layout.addWidget(QLabel("Stratum ports:"), 6, 0)
+        interface_layout.addWidget(self.stratum_ports_input, 6, 1, 1, 2)
+        route_buttons = QHBoxLayout()
+        route_buttons.addWidget(self.start_route_button)
+        route_buttons.addWidget(self.stop_route_button)
+        route_buttons.addStretch(1)
+        interface_layout.addLayout(route_buttons, 7, 0, 1, 3)
+
+        explanation = QLabel(
+            "Routing is PID-scoped by correlating the selected process's live socket "
+            "tuples with packets arriving from the router's host WinDivert/loopback "
+            "capture. It does not replace the machine-wide default route. Start the "
+            "Router first; reconnect an existing network session if it was opened before "
+            "the policy was enabled."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("color: #bbbbbb;")
+        interface_layout.addWidget(explanation, 8, 0, 1, 3)
+        controls_panel = QWidget()
+        controls_layout = QVBoxLayout(controls_panel)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.addWidget(interface_group)
+
+        self.process_log = QPlainTextEdit()
+        self.process_log.setReadOnly(True)
+        self.process_log.setMaximumBlockCount(5000)
+        self.process_log.setMinimumHeight(110)
+        controls_layout.addWidget(self.process_log)
+        self.process_splitter.addWidget(controls_panel)
+        self.process_splitter.setSizes([360, 330])
+        root.addWidget(self.process_splitter, 1)
+
+    def _append_log(self, message: str):
+        text = str(message or "").rstrip()
+        if not text:
+            return
+        self.process_log.appendPlainText(text)
+        if self.logger is not None:
+            try:
+                self.logger.log_message(text)
+            except Exception:
+                pass
+
+    def _manager(self):
+        try:
+            return self.manager_provider() if callable(self.manager_provider) else None
+        except Exception as exc:
+            self._append_log(f"[ProcessTab] Manager lookup failed: {exc}")
+            return None
+
+    def refresh_processes(self):
+        selected_pid = self.process_combo.currentData()
+        processes = []
+        for process in psutil.process_iter(["pid", "name", "exe", "username"]):
+            try:
+                info = process.info
+                pid = int(info.get("pid") or 0)
+                if pid <= 0 or pid == os.getpid():
+                    continue
+                name = str(info.get("name") or f"PID {pid}")
+                path = str(info.get("exe") or "")
+                processes.append((name.casefold(), pid, name, path))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+        processes.sort(key=lambda item: (item[0], item[1]))
+
+        self.process_combo.blockSignals(True)
+        self.process_combo.clear()
+        restore_index = -1
+        for index, (_, pid, name, path) in enumerate(processes):
+            label = f"{name}  [PID {pid}]"
+            self.process_combo.addItem(label, {"pid": pid, "name": name, "path": path})
+            if selected_pid and isinstance(selected_pid, dict) and selected_pid.get("pid") == pid:
+                restore_index = index
+        if restore_index >= 0:
+            self.process_combo.setCurrentIndex(restore_index)
+        self.process_combo.blockSignals(False)
+        self.refresh_windows()
+        self._append_log(f"[ProcessTab] Found {len(processes)} running processes.")
+
+    def _initialize_user32(self):
+        if os.name != "nt":
+            return False
+        if self._user32 is not None:
+            return True
+        try:
+            self._user32 = ctypes.windll.user32
+            user32 = self._user32
+            user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+            user32.SetParent.restype = wintypes.HWND
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            user32.GetWindowTextLengthW.restype = ctypes.c_int
+            user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetWindowTextW.restype = ctypes.c_int
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetWindowRect.restype = wintypes.BOOL
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.ShowWindow.restype = wintypes.BOOL
+            pointer_type = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_long = getattr(self._user32, "SetWindowLongPtrW", self._user32.SetWindowLongW)
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long.restype = pointer_type
+            set_long.argtypes = [wintypes.HWND, ctypes.c_int, pointer_type]
+            set_long.restype = pointer_type
+            self._get_window_long = get_long
+            self._set_window_long = set_long
+            return True
+        except Exception as exc:
+            self._append_log(f"[ProcessTab] Win32 initialization failed: {exc}")
+            return False
+
+    def _enumerate_windows(self, pid: int):
+        if not self._initialize_user32():
+            return []
+        user32 = self._user32
+        windows = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(hwnd, _):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                owner_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+                if int(owner_pid.value) != int(pid):
+                    return True
+                length = int(user32.GetWindowTextLengthW(hwnd))
+                if length <= 0:
+                    return True
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                title = buffer.value.strip()
+                if title:
+                    windows.append({"hwnd": int(hwnd), "title": title})
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(callback, 0)
+        return windows
+
+    def refresh_windows(self):
+        self.window_combo.clear()
+        process_data = self.process_combo.currentData()
+        if not isinstance(process_data, dict):
+            self.window_combo.addItem("No process selected", None)
+            return
+        pid = int(process_data.get("pid") or 0)
+        windows = self._enumerate_windows(pid)
+        if not windows:
+            self.window_combo.addItem(
+                "No visible top-level window (routing can still be enabled)",
+                None,
+            )
+            return
+        for window in windows:
+            self.window_combo.addItem(
+                f"{window['title']}  [HWND 0x{window['hwnd']:X}]",
+                window,
+            )
+
+    def dock_selected_window(self):
+        if os.name != "nt" or not self._initialize_user32():
+            self._append_log("[ProcessTab] Window docking is available only on Windows.")
+            return
+        process_data = self.process_combo.currentData()
+        window_data = self.window_combo.currentData()
+        if not isinstance(process_data, dict) or not isinstance(window_data, dict):
+            self._append_log("[ProcessTab] Select a process with a visible window first.")
+            return
+        if self._docked_hwnd:
+            self.detach_window()
+
+        hwnd = int(window_data["hwnd"])
+        pid = int(process_data["pid"])
+        user32 = self._user32
+        if not user32.IsWindow(hwnd):
+            self._append_log("[ProcessTab] The selected window no longer exists.")
+            self.refresh_windows()
+            return
+
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        self._original_rect = (rect.left, rect.top, rect.right, rect.bottom)
+        self._original_parent = int(user32.GetParent(hwnd) or 0)
+        self._original_style = int(self._get_window_long(hwnd, self.GWL_STYLE)) & 0xFFFFFFFF
+        self._original_exstyle = int(self._get_window_long(hwnd, self.GWL_EXSTYLE)) & 0xFFFFFFFF
+
+        host_hwnd = int(self.dock_frame.winId())
+        ctypes.set_last_error(0)
+        previous_parent = user32.SetParent(hwnd, host_hwnd)
+        error = ctypes.get_last_error()
+        if not previous_parent and error:
+            self._append_log(
+                f"[ProcessTab] SetParent failed with Windows error {error}. "
+                "Run both programs at the same integrity level and DPI mode."
+            )
+            return
+
+        new_style = self._original_style
+        new_style &= ~(
+            self.WS_POPUP | self.WS_CAPTION | self.WS_THICKFRAME |
+            self.WS_MINIMIZEBOX | self.WS_MAXIMIZEBOX | self.WS_SYSMENU
+        )
+        new_style |= (
+            self.WS_CHILD | self.WS_VISIBLE |
+            self.WS_CLIPSIBLINGS | self.WS_CLIPCHILDREN
+        )
+        self._set_window_long(hwnd, self.GWL_STYLE, new_style)
+        user32.ShowWindow(hwnd, self.SW_RESTORE)
+
+        self._docked_hwnd = hwnd
+        self._docked_pid = pid
+        self.dock_placeholder.hide()
+        self.detach_button.setEnabled(True)
+        self.dock_button.setEnabled(False)
+        self._resize_docked_window()
+        self._append_log(
+            f"[ProcessTab] Docked PID {pid} window '{window_data['title']}'. "
+            "The process remains independent."
+        )
+
+    def _resize_docked_window(self):
+        hwnd = self._docked_hwnd
+        if not hwnd or not self._initialize_user32():
+            return
+        if not self._user32.IsWindow(hwnd):
+            return
+        width = max(1, int(self.dock_frame.contentsRect().width()))
+        height = max(1, int(self.dock_frame.contentsRect().height()))
+        self._user32.SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            width,
+            height,
+            self.SWP_NOZORDER | self.SWP_NOACTIVATE |
+            self.SWP_FRAMECHANGED | self.SWP_SHOWWINDOW,
+        )
+
+    def _maintain_docked_window(self):
+        hwnd = self._docked_hwnd
+        if not hwnd:
+            return
+        if not self._initialize_user32() or not self._user32.IsWindow(hwnd):
+            self._append_log("[ProcessTab] Docked process window closed.")
+            self._clear_dock_state()
+            return
+        try:
+            if self._docked_pid and not psutil.pid_exists(self._docked_pid):
+                self._append_log("[ProcessTab] Docked process exited.")
+                self._clear_dock_state()
+                return
+        except Exception:
+            pass
+        self._resize_docked_window()
+
+    def _clear_dock_state(self):
+        self._docked_hwnd = None
+        self._docked_pid = None
+        self._original_parent = 0
+        self._original_style = 0
+        self._original_exstyle = 0
+        self._original_rect = None
+        self.dock_placeholder.show()
+        self.detach_button.setEnabled(False)
+        self.dock_button.setEnabled(True)
+
+    def detach_window(self):
+        hwnd = self._docked_hwnd
+        if not hwnd:
+            return
+        if self._initialize_user32() and self._user32.IsWindow(hwnd):
+            try:
+                self._user32.SetParent(hwnd, self._original_parent or 0)
+                self._set_window_long(hwnd, self.GWL_STYLE, self._original_style)
+                self._set_window_long(hwnd, self.GWL_EXSTYLE, self._original_exstyle)
+                if self._original_rect:
+                    left, top, right, bottom = self._original_rect
+                    width = max(200, right - left)
+                    height = max(120, bottom - top)
+                else:
+                    left, top, width, height = 100, 100, 900, 700
+                self._user32.SetWindowPos(
+                    hwnd,
+                    0,
+                    left,
+                    top,
+                    width,
+                    height,
+                    self.SWP_NOZORDER | self.SWP_FRAMECHANGED | self.SWP_SHOWWINDOW,
+                )
+                self._user32.ShowWindow(hwnd, self.SW_RESTORE)
+            except Exception as exc:
+                self._append_log(f"[ProcessTab] Detach warning: {exc}")
+        self._append_log("[ProcessTab] Window detached; client process was not stopped.")
+        self._clear_dock_state()
+
+    def _parse_ports(self):
+        ports = []
+        for token in re.split(r"[,;\s]+", self.stratum_ports_input.text().strip()):
+            if not token:
+                continue
+            try:
+                port = int(token)
+            except ValueError:
+                raise ValueError(f"Invalid port: {token}")
+            if not 1 <= port <= 65535:
+                raise ValueError(f"Port outside 1-65535: {port}")
+            ports.append(port)
+        return sorted(set(ports))
+
+    def _run_operation(self, name: str, function):
+        if self._operation_thread and self._operation_thread.is_alive():
+            self._append_log("[ProcessTab] Another ProcessInterface operation is running.")
+            return
+        self._set_operation_buttons_enabled(False)
+
+        def worker():
+            try:
+                result = function()
+                self.operation_completed.emit(name, True, "", result)
+            except Exception as exc:
+                self.operation_completed.emit(name, False, str(exc), None)
+
+        self._operation_thread = threading.Thread(
+            target=worker,
+            name=f"ProcessTab-{name}",
+            daemon=True,
+        )
+        self._operation_thread.start()
+
+    def _set_operation_buttons_enabled(self, enabled: bool):
+        for button in (
+            self.create_interface_button,
+            self.remove_interface_button,
+            self.start_route_button,
+            self.stop_route_button,
+        ):
+            button.setEnabled(enabled)
+
+    def create_interface(self):
+        manager = self._manager()
+        if manager is None:
+            self._append_log("[ProcessTab] ProcessInterfaceManager is unavailable.")
+            return
+        switch_name = self.switch_name_input.text().strip() or "ProcessInterface"
+        ipv4 = self.interface_ip_input.text().strip()
+        prefix = int(self.prefix_spin.value())
+        self._run_operation(
+            "create-interface",
+            lambda: manager.create_interface(
+                switch_name=switch_name,
+                ipv4=ipv4,
+                prefix_length=prefix,
+            ),
+        )
+
+    def remove_interface(self):
+        manager = self._manager()
+        if manager is None:
+            return
+        self._run_operation(
+            "remove-interface",
+            lambda: manager.remove_interface(force=False),
+        )
+
+    def start_process_route(self):
+        process_data = self.process_combo.currentData()
+        if not isinstance(process_data, dict):
+            self._append_log("[ProcessTab] Select a process first.")
+            return
+        manager = self._manager()
+        if manager is None:
+            self._append_log("[ProcessTab] ProcessInterfaceManager is unavailable.")
+            return
+        router = getattr(manager, "router_manager", None)
+        if router is None or not getattr(router, "started", False):
+            self._append_log(
+                "[ProcessTab] Start the Router first so ProcessInterface packets have "
+                "an active forwarding/NAT path."
+            )
+            return
+        pid = int(process_data["pid"])
+        mode = self.route_mode_combo.currentText()
+        try:
+            ports = self._parse_ports()
+        except Exception as exc:
+            self._append_log(f"[ProcessTab] {exc}")
+            return
+        create_first = self.create_interface_checkbox.isChecked()
+        switch_name = self.switch_name_input.text().strip() or "ProcessInterface"
+        ipv4 = self.interface_ip_input.text().strip()
+        prefix = int(self.prefix_spin.value())
+
+        def operation():
+            status = manager.status()
+            if create_first and not status.get("interface_ready"):
+                manager.create_interface(
+                    switch_name=switch_name,
+                    ipv4=ipv4,
+                    prefix_length=prefix,
+                )
+            return manager.enable_process(
+                pid,
+                mode=mode,
+                stratum_ports=ports,
+            )
+
+        self._run_operation("enable-route", operation)
+
+    def stop_process_route(self):
+        manager = self._manager()
+        if manager is None:
+            return
+        self._run_operation(
+            "disable-route",
+            lambda: manager.disable_process(),
+        )
+
+    @pyqtSlot(str, bool, str, object)
+    def _on_operation_completed(self, name, ok, message, result):
+        self._operation_thread = None
+        self._set_operation_buttons_enabled(True)
+        if ok:
+            self._append_log(f"[ProcessTab] ✅ {name} completed.")
+        else:
+            self._append_log(f"[ProcessTab] ❌ {name} failed: {message}")
+        self.refresh_status()
+
+    def refresh_status(self):
+        manager = self._manager()
+        if manager is None:
+            self.interface_status_label.setText("Interface: manager unavailable")
+            self.route_status_label.setText("Process route: unavailable")
+            return
+        try:
+            status = manager.status()
+        except Exception as exc:
+            self.interface_status_label.setText(f"Interface: status error ({exc})")
+            return
+        if status.get("interface_ready"):
+            self.interface_status_label.setText(
+                f"Interface: {status.get('interface_alias')} | "
+                f"{status.get('interface_ipv4')}/{status.get('prefix_length')} | "
+                f"ifIndex={status.get('interface_index') or '-'}"
+            )
+        else:
+            self.interface_status_label.setText(
+                "Interface: not created (Hyper-V + administrator rights required)"
+            )
+        if status.get("enabled"):
+            self.route_status_label.setText(
+                f"Process route: PID {status.get('pid')} {status.get('process_name')} | "
+                f"mode={status.get('mode')} | flows={status.get('flow_count')} | "
+                f"tagged packets={status.get('packets_tagged')}"
+            )
+        else:
+            self.route_status_label.setText("Process route: disabled")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_docked_window()
+
+    def shutdown(self):
+        self.detach_window()
+        manager = self._manager()
+        if manager is not None:
+            try:
+                manager.disable_process()
+            except Exception:
+                pass
+
+class CodeOutputChatTab(QWidget):
+    """Text-only English chat grounded in live PythonRouter/CodeOutput state."""
+
+    response_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, router_provider, parent=None):
+        super().__init__(parent)
+        self.router_provider = router_provider
+        self._closing = False
+        self._worker = None
+        self._chat_history = []
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        self.status_label = QLabel("CodeOutput Chat: ready (English text only)")
+        header.addWidget(self.status_label)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        self.chat_output = QPlainTextEdit()
+        self.chat_output.setReadOnly(True)
+        self.chat_output.setMaximumBlockCount(5000)
+        layout.addWidget(self.chat_output, 1)
+
+        prompt_row = QHBoxLayout()
+        self.prompt_input = QLineEdit()
+        self.prompt_input.setPlaceholderText(
+            "Ask in English about endpoints, conversations, protocols, ports, interfaces, routing stages, or recent flows"
+        )
+        self.ask_button = QPushButton("Ask CodeOutput")
+        self.refresh_button = QPushButton("Current Communication Summary")
+        self.clear_button = QPushButton("Clear Chat")
+        prompt_row.addWidget(self.prompt_input, 1)
+        prompt_row.addWidget(self.ask_button)
+        prompt_row.addWidget(self.refresh_button)
+        prompt_row.addWidget(self.clear_button)
+        layout.addLayout(prompt_row)
+
+        self.ask_button.clicked.connect(self._ask)
+        self.refresh_button.clicked.connect(self._refresh)
+        self.clear_button.clicked.connect(self._clear_chat)
+        self.prompt_input.returnPressed.connect(self._ask)
+        self.response_ready.connect(self._show_response)
+        self.error_ready.connect(self._show_error)
+
+    def _router(self):
+        try:
+            return self.router_provider() if callable(self.router_provider) else None
+        except Exception:
+            return None
+
+    def _refresh(self):
+        self.prompt_input.setText("Summarize the current communications and routing stages in English.")
+        self._ask()
+
+    def _clear_chat(self):
+        self._chat_history.clear()
+        self.chat_output.clear()
+        self.status_label.setText("CodeOutput Chat: ready (English text only)")
+
+    def _ask(self):
+        prompt = self.prompt_input.text().strip() or "Summarize current communications in English."
+        router = self._router()
+        if router is None:
+            self._show_error("Router manager is unavailable.")
+            return
+        if self._worker and self._worker.is_alive():
+            self._show_error("A CodeOutput analysis is already running.")
+            return
+        history_snapshot = list(self._chat_history[-12:])
+        self._chat_history.append({"role": "user", "content": prompt})
+        self.chat_output.appendPlainText(f"\nYou: {prompt}")
+        self.status_label.setText("CodeOutput Chat: analyzing router knowledge...")
+        self.ask_button.setEnabled(False)
+        self.prompt_input.clear()
+
+        def work():
+            try:
+                method = getattr(router, "ask_codeoutput", None)
+                if not callable(method):
+                    raise RuntimeError("The router does not expose ask_codeoutput().")
+                try:
+                    response = str(method(prompt, chat_history=history_snapshot))
+                except TypeError:
+                    response = str(method(prompt))
+                if not self._closing:
+                    self.response_ready.emit(response)
+            except Exception as exc:
+                if not self._closing:
+                    self.error_ready.emit(str(exc))
+
+        self._worker = threading.Thread(target=work, name="CodeOutputTextChat", daemon=True)
+        self._worker.start()
+
+    @pyqtSlot(str)
+    def _show_response(self, response: str):
+        response = str(response or "No response was generated.").strip()
+        self._chat_history.append({"role": "assistant", "content": response})
+        self.chat_output.appendPlainText(f"\nCodeOutput: {response}\n")
+        self.status_label.setText("CodeOutput Chat: ready (English text only)")
+        self.ask_button.setEnabled(True)
+
+    @pyqtSlot(str)
+    def _show_error(self, error: str):
+        self.chat_output.appendPlainText(f"\nCodeOutput error: {error}\n")
+        self.status_label.setText("CodeOutput Chat: error")
+        self.ask_button.setEnabled(True)
+
+    def shutdown(self):
+        self._closing = True
+
+
 class PacketSenderTab(QWidget):
-    """
-    A QWidget that encapsulates all UI elements for the Packet Sending tab.
-    It emits signals with the necessary data for the worker to send packets.
-    """
-    # Signals that will be emitted when a send button is clicked
+    """PacketLab: advanced packet construction routed through CodeOutput or a selected interface."""
+
+    # Original signals are retained for external compatibility.
     send_ping_requested = pyqtSignal(str, str, str, int)
     send_tcp_syn_requested = pyqtSignal(str, int, str, str, int)
     send_udp_requested = pyqtSignal(str, int, bytes, str, str, int)
     send_dns_requested = pyqtSignal(str, str, str, str, str, int)
+    send_packetlab_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._create_widgets()
         self._configure_layout()
         self._connect_signals()
+        self._update_protocol_controls()
 
     def _create_widgets(self):
-        """Creates all the widgets for the tab."""
         self.iface_combo = QComboBox()
+        self.iface_combo.setEditable(True)
+        self.iface_combo.addItem("CodeOutput", userData="CodeOutput")
 
-        self.ping_ip_input = QLineEdit("8.8.8.8")
-        self.send_ping_button = QPushButton("Send Ping")
+        self.route_via_codeoutput_checkbox = QCheckBox(
+            "Route through CodeOutputManager and CodeOutput interface"
+        )
+        self.route_via_codeoutput_checkbox.setChecked(True)
 
-        self.tcp_ip_input = QLineEdit("example.com")
-        self.tcp_port_input = QLineEdit("443")
-        self.send_tcp_button = QPushButton("Send TCP SYN")
+        self.ip_version_combo = QComboBox()
+        self.ip_version_combo.addItems(["IPv4", "IPv6"])
+        self.protocol_combo = QComboBox()
+        self.protocol_combo.addItems(["TCP", "UDP", "ICMP", "DNS", "Raw IP"])
 
-        self.udp_ip_input = QLineEdit("8.8.8.8")
-        self.udp_port_input = QLineEdit("53")
-        self.udp_payload_input = QLineEdit("HelloUDP")
-        self.send_udp_button = QPushButton("Send UDP Packet")
+        self.target_input = QLineEdit("example.com")
+        self.target_input.setPlaceholderText("Hostname, IPv4, or IPv6 target")
+        self.source_input = QLineEdit()
+        self.source_input.setPlaceholderText("Optional source IPv4/IPv6")
+
+        self.source_port_input = QSpinBox()
+        self.source_port_input.setRange(0, 65535)
+        self.source_port_input.setSpecialValueText("Automatic")
+        self.dest_port_input = QSpinBox()
+        self.dest_port_input.setRange(0, 65535)
+        self.dest_port_input.setValue(443)
+        self.tcp_flags_input = QLineEdit("S")
+        self.tcp_flags_input.setPlaceholderText("S, A, PA, F, R...")
+        self.ttl_input = QSpinBox()
+        self.ttl_input.setRange(1, 255)
+        self.ttl_input.setValue(64)
+
+        self.payload_encoding_combo = QComboBox()
+        self.payload_encoding_combo.addItems(["UTF-8", "Hex", "Base64"])
+        self.payload_input = QPlainTextEdit()
+        self.payload_input.setPlaceholderText("Optional payload")
+        self.payload_input.setMaximumHeight(100)
 
         self.dns_server_input = QLineEdit("8.8.8.8")
         self.dns_domain_input = QLineEdit("google.com")
         self.dns_type_combo = QComboBox()
-        self.dns_type_combo.addItems(["A", "AAAA", "MX", "NS", "TXT"])
-        self.send_dns_button = QPushButton("Send DNS Query")
+        self.dns_type_combo.addItems(["A", "AAAA", "MX", "NS", "TXT", "SRV", "PTR", "CAA"])
+        self.dns_transport_combo = QComboBox()
+        self.dns_transport_combo.addItems(["UDP", "TCP"])
 
+        self.send_packet_button = QPushButton("Build and Route Packet")
+        self.send_packet_button.setEnabled(False)
+        self.clear_log_button = QPushButton("Clear PacketLab Log")
         self.packet_log = QPlainTextEdit()
         self.packet_log.setReadOnly(True)
+        self.packet_log.setMaximumBlockCount(10000)
 
-        # Initially disable buttons until services are ready
-        self.send_ping_button.setEnabled(False)
-        self.send_tcp_button.setEnabled(False)
-        self.send_udp_button.setEnabled(False)
-        self.send_dns_button.setEnabled(False)
+        # Compatibility aliases expected by older main-window enable/disable code.
+        self.send_ping_button = self.send_packet_button
+        self.send_tcp_button = self.send_packet_button
+        self.send_udp_button = self.send_packet_button
+        self.send_dns_button = self.send_packet_button
+        self.ping_ip_input = self.target_input
+        self.tcp_ip_input = self.target_input
+        self.tcp_port_input = self.dest_port_input
+        self.udp_ip_input = self.target_input
+        self.udp_port_input = self.dest_port_input
+        self.udp_payload_input = self.payload_input
 
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
         main_layout = QVBoxLayout(self)
-        group_box = QGroupBox("Send Custom Packets")
-        group_layout = QVBoxLayout(group_box)
+        main_layout.setContentsMargins(8, 8, 8, 8)
 
-        # Interface Selector
-        iface_layout = QFormLayout()
-        iface_layout.addRow(QLabel("Send From Interface:"), self.iface_combo)
-        group_layout.addLayout(iface_layout)
-        group_layout.addSpacing(15)
+        group = QGroupBox("PacketLab Builder")
+        grid = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
 
-        # Ping
-        ping_layout = QFormLayout()
-        ping_layout.addRow(QLabel("Target IP:"), self.ping_ip_input)
-        ping_layout.addRow(self.send_ping_button)
-        group_layout.addLayout(ping_layout)
-        group_layout.addSpacing(10)
+        grid.addWidget(QLabel("Send/ingress interface:"), 0, 0)
+        grid.addWidget(self.iface_combo, 0, 1)
+        grid.addWidget(self.route_via_codeoutput_checkbox, 0, 2, 1, 2)
 
-        # TCP
-        tcp_layout = QFormLayout()
-        tcp_layout.addRow(QLabel("Target IP:"), self.tcp_ip_input)
-        tcp_layout.addRow(QLabel("Target Port:"), self.tcp_port_input)
-        tcp_layout.addRow(self.send_tcp_button)
-        group_layout.addLayout(tcp_layout)
-        group_layout.addSpacing(10)
+        grid.addWidget(QLabel("IP version:"), 1, 0)
+        grid.addWidget(self.ip_version_combo, 1, 1)
+        grid.addWidget(QLabel("Protocol:"), 1, 2)
+        grid.addWidget(self.protocol_combo, 1, 3)
 
-        # UDP
-        udp_layout = QFormLayout()
-        udp_layout.addRow(QLabel("Target IP:"), self.udp_ip_input)
-        udp_layout.addRow(QLabel("Target Port:"), self.udp_port_input)
-        udp_layout.addRow(QLabel("Payload (UTF-8):"), self.udp_payload_input)
-        udp_layout.addRow(self.send_udp_button)
-        group_layout.addLayout(udp_layout)
-        group_layout.addSpacing(10)
+        grid.addWidget(QLabel("Target/hostname:"), 2, 0)
+        grid.addWidget(self.target_input, 2, 1)
+        grid.addWidget(QLabel("Optional source address:"), 2, 2)
+        grid.addWidget(self.source_input, 2, 3)
 
-        # DNS
-        dns_layout = QFormLayout()
-        dns_layout.addRow(QLabel("DNS Server:"), self.dns_server_input)
-        dns_layout.addRow(QLabel("Domain Name:"), self.dns_domain_input)
-        dns_layout.addRow(QLabel("Record Type:"), self.dns_type_combo)
-        dns_layout.addRow(self.send_dns_button)
-        group_layout.addLayout(dns_layout)
+        grid.addWidget(QLabel("Source port:"), 3, 0)
+        grid.addWidget(self.source_port_input, 3, 1)
+        grid.addWidget(QLabel("Destination port:"), 3, 2)
+        grid.addWidget(self.dest_port_input, 3, 3)
 
-        main_layout.addWidget(group_box)
-        main_layout.addWidget(self.packet_log)
+        grid.addWidget(QLabel("TCP flags:"), 4, 0)
+        grid.addWidget(self.tcp_flags_input, 4, 1)
+        grid.addWidget(QLabel("TTL / hop limit:"), 4, 2)
+        grid.addWidget(self.ttl_input, 4, 3)
+
+        self.dns_group = QGroupBox("DNS Query")
+        dns_grid = QGridLayout(self.dns_group)
+        dns_grid.addWidget(QLabel("DNS server:"), 0, 0)
+        dns_grid.addWidget(self.dns_server_input, 0, 1)
+        dns_grid.addWidget(QLabel("Query name:"), 0, 2)
+        dns_grid.addWidget(self.dns_domain_input, 0, 3)
+        dns_grid.addWidget(QLabel("Record type:"), 1, 0)
+        dns_grid.addWidget(self.dns_type_combo, 1, 1)
+        dns_grid.addWidget(QLabel("Transport:"), 1, 2)
+        dns_grid.addWidget(self.dns_transport_combo, 1, 3)
+        grid.addWidget(self.dns_group, 5, 0, 1, 4)
+
+        grid.addWidget(QLabel("Payload encoding:"), 6, 0)
+        grid.addWidget(self.payload_encoding_combo, 6, 1)
+        grid.addWidget(QLabel("Payload:"), 6, 2)
+        grid.addWidget(self.payload_input, 6, 3)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.send_packet_button)
+        buttons.addWidget(self.clear_log_button)
+        buttons.addStretch(1)
+        grid.addLayout(buttons, 7, 0, 1, 4)
+
+        main_layout.addWidget(group)
+        main_layout.addWidget(QLabel("PacketLab and router output"))
+        main_layout.addWidget(self.packet_log, 1)
 
     def _connect_signals(self):
-        """Connects button clicks to handler methods that emit signals."""
-        self.send_ping_button.clicked.connect(self._on_send_ping)
-        self.send_tcp_button.clicked.connect(self._on_send_tcp_syn)
-        self.send_udp_button.clicked.connect(self._on_send_udp)
-        self.send_dns_button.clicked.connect(self._on_send_dns)
+        self.send_packet_button.clicked.connect(self._on_send_packet)
+        self.clear_log_button.clicked.connect(self.packet_log.clear)
+        self.protocol_combo.currentTextChanged.connect(self._update_protocol_controls)
+        self.route_via_codeoutput_checkbox.toggled.connect(self._update_interface_mode)
+
+    def _update_interface_mode(self):
+        routed = self.route_via_codeoutput_checkbox.isChecked()
+        self.iface_combo.setEnabled(not routed)
+        if routed:
+            index = self.iface_combo.findData("CodeOutput")
+            if index >= 0:
+                self.iface_combo.setCurrentIndex(index)
+
+    def _update_protocol_controls(self):
+        protocol = self.protocol_combo.currentText().strip().upper()
+        uses_ports = protocol in {"TCP", "UDP", "DNS"}
+        self.source_port_input.setEnabled(uses_ports)
+        self.dest_port_input.setEnabled(uses_ports)
+        self.tcp_flags_input.setEnabled(protocol == "TCP")
+        self.dns_group.setVisible(protocol == "DNS")
+        if protocol == "DNS":
+            self.dest_port_input.setValue(53)
+        elif protocol == "TCP" and self.dest_port_input.value() == 53:
+            self.dest_port_input.setValue(443)
+        self._update_interface_mode()
 
     def _get_selected_interface(self) -> str:
-        """Returns the full name of the selected interface."""
-        iface = self.iface_combo.currentData()
-        if not iface:
-            self.log_message("[GUI Error] Please select a valid interface.")
-        return iface
+        value = self.iface_combo.currentData()
+        return str(value or self.iface_combo.currentText() or "CodeOutput").strip()
 
     @pyqtSlot()
+    def _on_send_packet(self):
+        config = {
+            "iface": self._get_selected_interface(),
+            "route_via_codeoutput": self.route_via_codeoutput_checkbox.isChecked(),
+            "ip_version": self.ip_version_combo.currentText(),
+            "protocol": self.protocol_combo.currentText(),
+            "target": self.target_input.text().strip(),
+            "source": self.source_input.text().strip(),
+            "source_port": int(self.source_port_input.value()),
+            "dest_port": int(self.dest_port_input.value()),
+            "tcp_flags": self.tcp_flags_input.text().strip(),
+            "ttl": int(self.ttl_input.value()),
+            "payload_encoding": self.payload_encoding_combo.currentText(),
+            "payload": self.payload_input.toPlainText(),
+            "dns_server": self.dns_server_input.text().strip(),
+            "dns_name": self.dns_domain_input.text().strip(),
+            "dns_type": self.dns_type_combo.currentText(),
+            "dns_transport": self.dns_transport_combo.currentText(),
+        }
+        self.log_message(
+            f"[PacketLab GUI] Queued {config['ip_version']} {config['protocol']} "
+            f"target={config['dns_server'] if config['protocol'] == 'DNS' else config['target']} "
+            f"via={'CodeOutput' if config['route_via_codeoutput'] else config['iface']}"
+        )
+        self.send_packetlab_requested.emit(config)
+
+    # Compatibility handlers now translate into PacketLab requests.
     def _on_send_ping(self):
-        iface = self._get_selected_interface()
-        if iface and self.ping_ip_input.text():
-            self.send_ping_requested.emit(self.ping_ip_input.text().strip(), iface, None, 2)
+        self.protocol_combo.setCurrentText("ICMP")
+        self._on_send_packet()
 
-    @pyqtSlot()
     def _on_send_tcp_syn(self):
-        iface = self._get_selected_interface()
-        if iface and self.tcp_ip_input.text() and self.tcp_port_input.text().isdigit():
-            self.send_tcp_syn_requested.emit(self.tcp_ip_input.text().strip(), int(self.tcp_port_input.text()), iface,
-                                             None, 2)
+        self.protocol_combo.setCurrentText("TCP")
+        self.tcp_flags_input.setText("S")
+        self._on_send_packet()
 
-    @pyqtSlot()
     def _on_send_udp(self):
-        iface = self._get_selected_interface()
-        if iface and self.udp_ip_input.text() and self.udp_port_input.text().isdigit():
-            payload = self.udp_payload_input.text().encode('utf-8')
-            self.send_udp_requested.emit(self.udp_ip_input.text().strip(), int(self.udp_port_input.text()), payload,
-                                         iface, None, 2)
+        self.protocol_combo.setCurrentText("UDP")
+        self._on_send_packet()
 
-    @pyqtSlot()
     def _on_send_dns(self):
-        iface = self._get_selected_interface()
-        if iface and self.dns_server_input.text() and self.dns_domain_input.text():
-            self.send_dns_requested.emit(self.dns_server_input.text().strip(), self.dns_domain_input.text().strip(),
-                                         self.dns_type_combo.currentText(), iface, None, 2)
+        self.protocol_combo.setCurrentText("DNS")
+        self._on_send_packet()
 
     @pyqtSlot(list)
     def populate_interfaces(self, interfaces: List[dict]):
-        """Populates the interface dropdown."""
+        current = self._get_selected_interface()
         self.iface_combo.clear()
-        if not interfaces:
-            self.iface_combo.addItem("No interfaces found")
-            self.iface_combo.setEnabled(False)
-            return
-
-        for iface in interfaces:
-            self.iface_combo.addItem(iface['friendly_name'], userData=iface['full_name'])
-        self.iface_combo.setEnabled(True)
+        self.iface_combo.addItem("CodeOutput", userData="CodeOutput")
+        self.iface_combo.addItem("ProcessInterface", userData="ProcessInterface")
+        seen = {"codeoutput", "processinterface"}
+        for iface in interfaces or []:
+            friendly = str(iface.get("friendly_name") or iface.get("full_name") or "").strip()
+            full = str(iface.get("full_name") or friendly).strip()
+            if not friendly or full.casefold() in seen:
+                continue
+            seen.add(full.casefold())
+            self.iface_combo.addItem(friendly, userData=full)
+        index = self.iface_combo.findData(current)
+        if index >= 0:
+            self.iface_combo.setCurrentIndex(index)
+        self.iface_combo.setEnabled(not self.route_via_codeoutput_checkbox.isChecked())
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """Appends a message to the packet console log."""
-        self.packet_log.appendPlainText(message)
+        self.packet_log.appendPlainText(str(message))
+        self.packet_log.verticalScrollBar().setValue(self.packet_log.verticalScrollBar().maximum())
+
