@@ -1692,16 +1692,14 @@ class P2PoolTab(QWidget):
         self.console_log.appendPlainText(message)
 
 class WiresharkTab(QWidget):
-    """
-    A QWidget that encapsulates all UI elements and logic for the Wireshark Capture tab.
-    """
+    """Wireshark/tshark capture controls with bounded, explicit capture policy."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._create_widgets()
         self._configure_layout()
 
     def _create_widgets(self):
-        """Creates all the widgets for the tab."""
         self.start_wireshark_button = QPushButton("Start Wireshark Capture")
         self.start_wireshark_button.setObjectName("start_wireshark_button")
         self.start_wireshark_button.setEnabled(False)
@@ -1710,25 +1708,105 @@ class WiresharkTab(QWidget):
         self.stop_wireshark_button.setObjectName("stop_wireshark_button")
         self.stop_wireshark_button.setEnabled(False)
 
+        self.main_interface_input = QLineEdit("Auto")
+        self.main_interface_input.setPlaceholderText("Friendly name, GUID, NPF path, or Auto")
+
+        self.include_loopback_checkbox = QCheckBox("Capture loopback")
+        self.include_loopback_checkbox.setChecked(True)
+        self.include_vpn_checkbox = QCheckBox("Capture detected VPN adapters")
+        self.include_vpn_checkbox.setChecked(True)
+        self.include_multicast_checkbox = QCheckBox("Capture multicast")
+        self.include_multicast_checkbox.setChecked(False)
+        self.include_discovery_checkbox = QCheckBox("Capture mDNS/SSDP/WS-Discovery/LLMNR")
+        self.include_discovery_checkbox.setChecked(False)
+        self.include_dhcp_checkbox = QCheckBox("Capture DHCPv4/DHCPv6")
+        self.include_dhcp_checkbox.setChecked(True)
+        self.include_localhost_checkbox = QCheckBox("Capture localhost addresses")
+        self.include_localhost_checkbox.setChecked(True)
+        self.promiscuous_checkbox = QCheckBox("Promiscuous mode")
+        self.promiscuous_checkbox.setChecked(True)
+        self.full_details_checkbox = QCheckBox("Request full tshark protocol details")
+        self.full_details_checkbox.setChecked(True)
+        self.feed_router_checkbox = QCheckBox("Feed reconstructed packets into router queue")
+        self.feed_router_checkbox.setChecked(False)
+        self.feed_router_checkbox.setToolTip(
+            "Off by default because Npcap already feeds the router. Enable only when tshark is the intended capture source."
+        )
+        self.log_summaries_checkbox = QCheckBox("Log one summary per packet")
+        self.log_summaries_checkbox.setChecked(False)
+        self.log_payloads_checkbox = QCheckBox("Log decoded/raw payload previews")
+        self.log_payloads_checkbox.setChecked(False)
+        self.log_filtered_checkbox = QCheckBox("Log every filtered/noisy packet")
+        self.log_filtered_checkbox.setChecked(False)
+
+        self.min_packet_len_input = QSpinBox()
+        self.min_packet_len_input.setRange(0, 65535)
+        self.min_packet_len_input.setValue(0)
+        self.max_interfaces_input = QSpinBox()
+        self.max_interfaces_input.setRange(1, 32)
+        self.max_interfaces_input.setValue(8)
+        self.custom_bpf_input = QLineEdit()
+        self.custom_bpf_input.setPlaceholderText("Optional additional BPF expression")
+
         self.wireshark_log = QPlainTextEdit()
         self.wireshark_log.setReadOnly(True)
         self.wireshark_log.setMaximumBlockCount(10000)
 
+    def capture_settings(self) -> dict:
+        return {
+            "main_interface": self.main_interface_input.text().strip() or "Auto",
+            "include_loopback": self.include_loopback_checkbox.isChecked(),
+            "include_vpn": self.include_vpn_checkbox.isChecked(),
+            "include_multicast": self.include_multicast_checkbox.isChecked(),
+            "include_discovery": self.include_discovery_checkbox.isChecked(),
+            "include_dhcp": self.include_dhcp_checkbox.isChecked(),
+            "include_localhost": self.include_localhost_checkbox.isChecked(),
+            "promiscuous": self.promiscuous_checkbox.isChecked(),
+            "full_details": self.full_details_checkbox.isChecked(),
+            "feed_router": self.feed_router_checkbox.isChecked(),
+            "log_packet_summaries": self.log_summaries_checkbox.isChecked(),
+            "log_payloads": self.log_payloads_checkbox.isChecked(),
+            "log_filtered_packets": self.log_filtered_checkbox.isChecked(),
+            "min_packet_len": int(self.min_packet_len_input.value()),
+            "max_interfaces": int(self.max_interfaces_input.value()),
+            "custom_bpf": self.custom_bpf_input.text().strip(),
+        }
+
     def _configure_layout(self):
-        """Sets up the layout for the tab."""
         layout = QVBoxLayout(self)
         control_layout = QHBoxLayout()
-
         control_layout.addWidget(self.start_wireshark_button)
         control_layout.addWidget(self.stop_wireshark_button)
         control_layout.addStretch(1)
-
         layout.addLayout(control_layout)
+
+        settings_box = QGroupBox("Capture Settings")
+        grid = QGridLayout(settings_box)
+        grid.addWidget(QLabel("Main interface:"), 0, 0)
+        grid.addWidget(self.main_interface_input, 0, 1, 1, 3)
+        grid.addWidget(self.include_loopback_checkbox, 1, 0)
+        grid.addWidget(self.include_vpn_checkbox, 1, 1)
+        grid.addWidget(self.include_multicast_checkbox, 1, 2)
+        grid.addWidget(self.include_discovery_checkbox, 1, 3)
+        grid.addWidget(self.include_dhcp_checkbox, 2, 0)
+        grid.addWidget(self.include_localhost_checkbox, 2, 1)
+        grid.addWidget(self.promiscuous_checkbox, 2, 2)
+        grid.addWidget(self.full_details_checkbox, 2, 3)
+        grid.addWidget(self.feed_router_checkbox, 3, 0, 1, 2)
+        grid.addWidget(self.log_summaries_checkbox, 3, 2)
+        grid.addWidget(self.log_payloads_checkbox, 3, 3)
+        grid.addWidget(self.log_filtered_checkbox, 4, 0, 1, 2)
+        grid.addWidget(QLabel("Minimum frame length:"), 5, 0)
+        grid.addWidget(self.min_packet_len_input, 5, 1)
+        grid.addWidget(QLabel("Maximum interfaces:"), 5, 2)
+        grid.addWidget(self.max_interfaces_input, 5, 3)
+        grid.addWidget(QLabel("Additional BPF:"), 6, 0)
+        grid.addWidget(self.custom_bpf_input, 6, 1, 1, 3)
+        layout.addWidget(settings_box)
         layout.addWidget(self.wireshark_log)
 
     @pyqtSlot(str)
     def log_message(self, message: str):
-        """Appends a message to the Wireshark console log."""
         self.wireshark_log.appendPlainText(message)
 
 
