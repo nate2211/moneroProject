@@ -9367,7 +9367,8 @@ class TransportHTTPSManager:
             "quic_crypto_reassembly_bytes", "quic_crypto_partial",
             "flows_created", "flows_touched", "opaque_non443_rejected",
             "buffer_parse_failures", "quic_coalesced_packets_seen",
-            "tls_records_reassembled",
+            "tls_records_reassembled", "sni_metadata_hits",
+            "sni_multiple_names", "tls_resync_candidates",
             # Browser-oriented additions.
             "browser_candidates", "browser_confirmed", "browser_h2",
             "browser_http11", "browser_h3_candidate", "browser_ech",
@@ -9552,8 +9553,14 @@ class TransportHTTPSManager:
                     if value not in (None, "", [], {}):
                         return value
             return None
+        external_sni = first("sni_all", "server_names", "sni", "server_name")
+        if isinstance(external_sni, (list, tuple, set)):
+            external_sni_all = [self._normalize_sni_value(v) for v in external_sni]
+        else:
+            external_sni_all = [self._normalize_sni_value(external_sni)]
+        external_sni_all = [v for v in dict.fromkeys(external_sni_all) if v]
         mapping = {
-            "sni": first("sni", "server_name"),
+            "sni": external_sni_all[0] if external_sni_all else None,
             "alpn": first("alpn", "alpn_protocols"),
             "cipher": first("cipher_suite_int", "cipher_suite", "cipher"),
             "ja3": first("ja3_md5", "ja3"),
@@ -9565,6 +9572,8 @@ class TransportHTTPSManager:
                 state[name] = value
         state["handshake_context"] = context
         state["handshake_context_seq"] = context.get("seq")
+        if external_sni_all:
+            state["sni_all"] = list(dict.fromkeys(list(state.get("sni_all") or []) + external_sni_all))[:32]
         if mapping["sni"]:
             state["sni_source"] = "handshake-manager"
             state["sni_inferred"] = False
@@ -9578,6 +9587,66 @@ class TransportHTTPSManager:
             state["classified"] = True
             state["proto_hint"] = self._PROTO_HINT_TLS
             state["confidence"] = max(float(state.get("confidence", 0.0)), 0.98)
+
+    @staticmethod
+    def _normalize_sni_value(value: Any) -> str:
+        text = str(value or "").strip().strip("\x00").rstrip(".").casefold()
+        if not text or len(text) > 253 or any(ch.isspace() for ch in text):
+            return ""
+        try:
+            text = text.encode("idna").decode("ascii").casefold()
+        except Exception:
+            text = text.encode("ascii", "ignore").decode("ascii").casefold()
+        labels = text.split(".")
+        if not labels or any(not label or len(label) > 63 for label in labels):
+            return ""
+        if any(label.startswith("-") or label.endswith("-") for label in labels):
+            return ""
+        return text
+
+    def _merge_packet_tls_metadata(self, packet: Any, state: dict) -> None:
+        """Merge passive sniffer/handshake metadata without touching wire bytes."""
+        try:
+            protocol_meta = getattr(packet, "_protocol_metadata", None) or {}
+            tls = dict(protocol_meta.get("tls") or {})
+            if not tls:
+                tls = dict(getattr(packet, "_https_transport_meta", None) or {})
+            if not tls:
+                return
+            hello = dict(tls.get("client_hello") or {})
+            raw_names = []
+            for value in (tls.get("sni_all"), hello.get("sni"), tls.get("sni")):
+                if isinstance(value, (list, tuple, set)):
+                    raw_names.extend(value)
+                elif value:
+                    raw_names.append(value)
+            names = []
+            for value in raw_names:
+                name = self._normalize_sni_value(value)
+                if name and name not in names:
+                    names.append(name)
+            if names:
+                prior = list(state.get("sni_all") or [])
+                merged = list(dict.fromkeys(prior + names))[:32]
+                state["sni_all"] = merged
+                if not state.get("sni") or state.get("sni_inferred"):
+                    state["sni"] = merged[0]
+                    state["sni_source"] = str(tls.get("source") or "sniffer-metadata")
+                    state["sni_inferred"] = False
+                state["classified"] = True
+                state["tls_detected"] = True
+                state["proto_hint"] = self._PROTO_HINT_TLS
+                state["confidence"] = max(float(state.get("confidence", 0.0)), 0.97)
+                self._metrics["sni_metadata_hits"] += 1
+                if len(merged) > 1:
+                    self._metrics["sni_multiple_names"] += 1
+            alpn = hello.get("alpn") or tls.get("alpn")
+            if alpn and not state.get("alpn"):
+                state["alpn"] = list(alpn) if isinstance(alpn, (list, tuple, set)) else [str(alpn)]
+            if hello.get("ja3") and not state.get("ja3"):
+                state["ja3"] = hello.get("ja3")
+        except Exception:
+            self._metrics["parser_errors"] += 1
 
     def snapshot_metrics(self) -> dict:
         return dict(self._metrics)
@@ -9716,6 +9785,14 @@ class TransportHTTPSManager:
         if existing is not None and external_context:
             self._merge_external_context(existing, external_context)
         first_header = self._peek_tls_record_header_mv(memoryview(raw)) if raw else None
+        first_record_offset = 0
+        if raw and not first_header:
+            found = self._find_tls_record_offset(memoryview(raw), prefer_client_hello=True)
+            if found is not None:
+                first_record_offset = int(found)
+                first_header = self._peek_tls_record_header_mv(memoryview(raw)[first_record_offset:])
+                if first_header:
+                    self._metrics["tls_resync_candidates"] += 1
         sslv2 = self._peek_sslv2_header(memoryview(raw)) if raw and not first_header else None
 
         if not on_443 and not push_port and self.detect_non443_tls and not existing and not first_header and not sslv2:
@@ -9725,6 +9802,7 @@ class TransportHTTPSManager:
         st = self._get_or_create_flow(fkey, now)
         if external_context:
             self._merge_external_context(st, external_context)
+        self._merge_packet_tls_metadata(packet, st)
         self._apply_ip_family_metadata(st, src_ip, dst_ip, "tcp")
         self._touch_flow(fkey, st, now)
         self._update_flow_roles(st, src_ip, sport, dst_ip, dport, tmeta)
@@ -9866,6 +9944,7 @@ class TransportHTTPSManager:
             "tls_record_versions": [],
             "tls_records_seen": 0,
             "sni": None,
+            "sni_all": [],
             "alpn": None,
             "selected_alpn": None,
             "ja3": None,
@@ -9997,6 +10076,8 @@ class TransportHTTPSManager:
                 "tls_state": st.get("tls_state"),
                 "tls_version": st.get("tls_ver_neg"),
                 "sni": st.get("sni"),
+                "sni_all": list(st.get("sni_all") or ([st.get("sni")] if st.get("sni") else [])),
+                "sni_source": st.get("sni_source"),
                 "alpn": list(st.get("alpn") or []),
                 "selected_alpn": st.get("selected_alpn"),
                 "browser_ready": bool(st.get("browser_ready")),
@@ -10223,12 +10304,23 @@ class TransportHTTPSManager:
             p = record_end
         return p
 
-    def _find_tls_record_offset(self, mv: memoryview) -> Optional[int]:
-        cap = min(max(0, len(mv) - 4), 4096)
+    def _find_tls_record_offset(self, mv: memoryview, *, prefer_client_hello: bool = False) -> Optional[int]:
+        cap = min(max(0, len(mv) - 5), 64 * 1024)
+        fallback = None
         for offset in range(1, cap + 1):
-            if self._peek_tls_record_header_mv(mv[offset:]):
+            header = self._peek_tls_record_header_mv(mv[offset:])
+            if not header:
+                continue
+            if fallback is None:
+                fallback = offset
+            if prefer_client_hello and header.get("ct") == "Handshake" and offset + 9 <= len(mv):
+                hs_type = int(mv[offset + 5])
+                hs_len = int.from_bytes(bytes(mv[offset + 6:offset + 9]), "big")
+                if hs_type in {1, 2} and 0 < hs_len <= self.TLS_HANDSHAKE_BUFFER_MAX:
+                    return offset
+            if not prefer_client_hello:
                 return offset
-        return None
+        return fallback
 
     def _handle_tls_handshake_record(self, record_mv: memoryview, st: dict, direction: str):
         dstate = st["tls_buffers"].setdefault(direction, self._new_tls_dir_state())
@@ -10318,13 +10410,23 @@ class TransportHTTPSManager:
             if field in ch:
                 st[field] = ch[field]
 
-        sni = ch.get("sni")
-        if sni:
+        raw_names = ch.get("sni_all") or ch.get("sni") or []
+        if not isinstance(raw_names, (list, tuple, set)):
+            raw_names = [raw_names]
+        names = [self._normalize_sni_value(v) for v in raw_names]
+        names = [v for v in dict.fromkeys(names) if v]
+        if names:
+            sni = names[0]
             if st.get("sni") == sni:
                 self._metrics["sni_cache_hits"] += 1
             else:
                 self._metrics["sni_parsed"] += 1
             st["sni"] = sni
+            st["sni_all"] = list(dict.fromkeys(list(st.get("sni_all") or []) + names))[:32]
+            st["sni_source"] = "client-hello"
+            st["sni_inferred"] = False
+            if len(st["sni_all"]) > 1:
+                self._metrics["sni_multiple_names"] += 1
 
         if ch.get("ech_seen"):
             self._metrics["ech_seen"] += 1
@@ -10592,6 +10694,7 @@ class TransportHTTPSManager:
             ec_point_formats = []
             alpn = []
             sni = None
+            sni_all = []
             ech_seen = False
             early_data = False
             alps_seen = False
@@ -10614,7 +10717,8 @@ class TransportHTTPSManager:
                     extension_ids.append(etype)
 
                     if etype == 0:
-                        sni = self._parse_sni_extension(edata)
+                        sni_all = self._parse_sni_extension_all(edata)
+                        sni = sni_all[0] if sni_all else None
                     elif etype == 10:
                         supported_groups = self._parse_u16_vector(edata, 2)
                     elif etype == 11 and edata:
@@ -10689,6 +10793,7 @@ class TransportHTTPSManager:
                 "client_hello": True,
                 "legacy_version": self._tls_version_tuple_name(legacy_version),
                 "sni": sni,
+                "sni_all": sni_all,
                 "alpn": alpn or None,
                 "cipher_suites": clean_ciphers,
                 "cipher_suite_names": [self._cipher_name(x) for x in clean_ciphers],
@@ -10769,11 +10874,12 @@ class TransportHTTPSManager:
             self._metrics["parser_errors"] += 1
             return None
 
-    @staticmethod
-    def _parse_sni_extension(edata: bytes) -> Optional[str]:
+    @classmethod
+    def _parse_sni_extension_all(cls, edata: bytes) -> list[str]:
+        out = []
         try:
-            if len(edata) < 5:
-                return None
+            if len(edata) < 2:
+                return out
             total = int.from_bytes(edata[:2], "big")
             p = 2
             end = min(len(edata), 2 + total)
@@ -10785,11 +10891,21 @@ class TransportHTTPSManager:
                     break
                 value = edata[p:p + name_len]
                 p += name_len
-                if name_type == 0 and value:
-                    return value.decode("ascii", "ignore").lower().rstrip(".")
+                if name_type != 0 or not value:
+                    continue
+                name = cls._normalize_sni_value(value.decode("ascii", "ignore"))
+                if name and name not in out:
+                    out.append(name)
+                if len(out) >= 32:
+                    break
         except Exception:
             pass
-        return None
+        return out
+
+    @classmethod
+    def _parse_sni_extension(cls, edata: bytes) -> Optional[str]:
+        values = cls._parse_sni_extension_all(edata)
+        return values[0] if values else None
 
     @staticmethod
     def _parse_alpn_extension(edata: bytes) -> list[str]:
@@ -15159,11 +15275,21 @@ class TransportMoneroManager:
 
             sport = int(sport)
             dport = int(dport)
+            protocol_meta = dict(getattr(packet, "_protocol_metadata", None) or {})
+            tls_meta = dict(protocol_meta.get("tls") or {})
+            tls_sni = str(tls_meta.get("sni") or "").casefold().rstrip(".")
+            gulf_hint = tls_sni == "gulf.moneroocean.stream" or tls_sni.endswith(".moneroocean.stream")
             family = str(
                 getattr(packet, "_transport_monero_family", "") or ""
             ).strip().casefold()
             if family not in {"monero_rpc", "monero_p2p", "p2pool"}:
                 family = self._service_family_from_ports(sport, dport)
+            if protocol_meta.get("monero_levin"):
+                family = "monero_p2p"
+            elif protocol_meta.get("monero_rpc"):
+                family = "monero_rpc"
+            elif gulf_hint:
+                family = "monero_rpc" if sport in self.MONERO_RPC_PORTS or dport in self.MONERO_RPC_PORTS else "p2pool"
             if family == "unknown" and not self._is_service_port(sport, dport):
                 return False
 
@@ -15179,6 +15305,15 @@ class TransportMoneroManager:
 
             st["last"] = now
             st["iface"] = iface
+            if protocol_meta:
+                st["sniffer_protocol_metadata"] = {
+                    key: protocol_meta.get(key)
+                    for key in ("monero_levin", "monero_rpc", "stratum", "tls", "ipv6")
+                    if protocol_meta.get(key) is not None
+                }
+            if gulf_hint:
+                st["gulf_moneroocean"] = True
+                st["server_name"] = tls_sni
 
             direction = self._direction_for_flow(st, src_ip, sport, dst_ip, dport)
             flags = self._tcp_flags(packet)
@@ -33089,12 +33224,25 @@ class TransportManager:
         return True
 
     def start(self) -> None:
+        self.enabled = True
         self.started = True
         self.logger.log_message("[Transport] ▶️ Manager started.")
 
     def stop(self) -> None:
+        self.enabled = False
         self.started = False
         self._initiators.clear()
+        self._analysis_flow_last.clear()
+        self._stratum_tls_flows.clear()
+        self._process_owner_cache.clear()
+        self._tls_context_cache.clear()
+        detach = self._handshake_detach
+        self._handshake_detach = None
+        if callable(detach):
+            try:
+                detach()
+            except Exception:
+                pass
         for manager in (
             self.transport_dhcp,
             self.transport_dhcp6,
@@ -38036,6 +38184,36 @@ class ICMPManager:
 
         self.log.log_message("[ICMP] Manager initialized (ultra-verbose IPv6+IPv4 UNFOLD + TX-aware).")
 
+    @staticmethod
+    def _safe_field_int(obj, field_name: str, default: int = 0) -> int:
+        """Read a Scapy numeric field without ever converting ``None``.
+
+        Scapy commonly leaves calculated fields such as IP.len/IP.ihl unset until
+        packet serialization.  ``getattr(obj, name, default)`` still returns None
+        when the attribute exists, so callers must explicitly normalize it.
+        """
+        try:
+            value = getattr(obj, field_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            return int(default)
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+
+    @classmethod
+    def _safe_layer_length(cls, layer, field_name: str = "len") -> int:
+        """Return a declared Scapy length or a serialized-length fallback."""
+        declared = cls._safe_field_int(layer, field_name, -1)
+        if declared >= 0:
+            return declared
+        try:
+            return len(bytes(layer))
+        except Exception:
+            return 0
+
     # --------------------------------------------------------------------------
     # Central TX wrapper (logs every send)
     # --------------------------------------------------------------------------
@@ -38623,7 +38801,7 @@ class ICMPManager:
             return False
 
         icmp = pkt[ICMP]
-        t = int(getattr(icmp, "type", 255))
+        t = self._safe_field_int(icmp, "type", 255)
 
         # Echo-requests
         if t == 8:
@@ -39470,23 +39648,22 @@ class ICMPManager:
         """
         ip = pkt[IP]
         icmp = pkt[ICMP]
-        icmp_type = int(getattr(icmp, "type", 255))
+        icmp_type = self._safe_field_int(icmp, "type", 255)
 
         # Only care about echo messages
         if icmp_type not in (0, 8):  # 0=echo-reply, 8=echo-request
             return False
 
         is_reply = (icmp_type == 0)
-        # --- Unfold/log details
-        try:
-            ihl_bytes = int(getattr(ip, "ihl", 5)) * 4
-        except Exception:
-            ihl_bytes = 20
-        icmp_id = int(getattr(icmp, "id", 0))
-        icmp_seq = int(getattr(icmp, "seq", 0))
-        ttl = int(getattr(ip, "ttl", -1))
-        total = int(getattr(ip, "len", len(bytes(ip))))
-        df = bool(int(getattr(ip, "flags", 0)) & 0x2)
+        # Scapy leaves calculated IP fields as None on newly built/copied packets
+        # until serialization.  Normalize every field before logging or policy work.
+        ihl_words = self._safe_field_int(ip, "ihl", 5)
+        ihl_bytes = max(20, ihl_words * 4) if ihl_words > 0 else 20
+        icmp_id = self._safe_field_int(icmp, "id", 0)
+        icmp_seq = self._safe_field_int(icmp, "seq", 0)
+        ttl = self._safe_field_int(ip, "ttl", -1)
+        total = self._safe_layer_length(ip, "len")
+        df = bool(self._safe_field_int(ip, "flags", 0) & 0x2)
         payload = bytes(icmp.payload) if hasattr(icmp, "payload") else b""
 
         kind = "reply" if is_reply else "request"

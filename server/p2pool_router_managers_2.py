@@ -8192,6 +8192,13 @@ class RIPManager:
         if not ifname or not isinstance(cfg, dict):
             return False
 
+        # Logical/programmatic/capture-only interfaces are route-table identities,
+        # not packet-transmit devices.  Never ask Scapy to send RIPv2 on them.
+        if cfg.get("rip_advertise") is False:
+            return False
+        if cfg.get("logical_only") or cfg.get("programmatic_interface") or cfg.get("capture_only"):
+            return False
+
         short = self._safe_iface_name(ifname).lower()
 
         if "loopback" in short or short == "lo":
@@ -8334,6 +8341,123 @@ class RIPManager:
         with self._interfaces_lock:
             return ifname in self._interfaces_config
 
+    def register_interface(
+            self,
+            ifname: str,
+            config: Dict[str, Any],
+            *,
+            install_direct_route: bool = True,
+    ) -> bool:
+        """Register or refresh one router interface in RIP's private snapshot.
+
+        Router interfaces can be created after ``initialize_routes()`` (for
+        example CodeOutput and ProcessInterface).  Updating the router's main
+        interface dictionary alone does not update RIP because RIP deliberately
+        owns a stable copy for its background advertisement thread.  This method
+        is the only supported late-registration path.
+
+        Synthetic/programmatic interfaces may participate in route lookup while
+        remaining ineligible for RIPv2 transmit/export via ``rip_advertise`` and
+        ``rip_export``.
+        """
+        name = str(ifname or "").strip()
+        if not name or not isinstance(config, dict):
+            return False
+
+        cfg = dict(config)
+        cfg.setdefault(
+            "rip_advertise",
+            not bool(cfg.get("logical_only") or cfg.get("programmatic_interface") or cfg.get("capture_only")),
+        )
+        cfg.setdefault("rip_export", bool(cfg.get("rip_advertise", True)))
+
+        network = self._coerce_route_network(cfg.get("network"))
+        if network is not None and not isinstance(network, ipaddress.IPv4Network):
+            # RIP v2 is IPv4-only. Keep the interface metadata, but do not add an
+            # IPv6 route to this manager's table.
+            network = None
+
+        changed = False
+        with self._interfaces_lock:
+            previous = self._interfaces_config.get(name)
+            if previous != cfg:
+                self._interfaces_config[name] = cfg
+                changed = True
+
+        route_changed = False
+        if install_direct_route and network is not None:
+            now = time.time()
+            with self._rt_lock:
+                stale = [
+                    net for net, details in self._routing_table.items()
+                    if details.get("interface") == name
+                    and details.get("type") == "direct"
+                    and net != network
+                ]
+                for net in stale:
+                    self._routing_table.pop(net, None)
+                    self._protected_nets.discard(net)
+                    route_changed = True
+
+                desired = {
+                    "next_hop": "0.0.0.0",
+                    "cost": 1,
+                    "interface": name,
+                    "advertised_by": "self",
+                    "last_update": now,
+                    "type": "direct",
+                }
+                current = self._routing_table.get(network)
+                if not current or any(
+                    current.get(key) != value
+                    for key, value in desired.items()
+                    if key != "last_update"
+                ):
+                    self._routing_table[network] = desired
+                    self._protected_nets.add(network)
+                    route_changed = True
+
+                if route_changed:
+                    self._route_change_seq += 1
+
+        if changed or route_changed:
+            self._request_triggered_update()
+        return True
+
+    def unregister_interface(self, ifname: str, *, remove_routes: bool = True) -> bool:
+        """Remove a late-registered interface and any routes owned by it."""
+        name = str(ifname or "").strip()
+        if not name:
+            return False
+
+        removed = False
+        with self._interfaces_lock:
+            removed = self._interfaces_config.pop(name, None) is not None
+
+        route_removed = False
+        if remove_routes:
+            with self._rt_lock:
+                owned = [
+                    net for net, details in self._routing_table.items()
+                    if details.get("interface") == name
+                ]
+                for net in owned:
+                    self._routing_table.pop(net, None)
+                    self._static_route_pins.discard(net)
+                    self._protected_nets.discard(net)
+                    self._route_hold_down.pop(net, None)
+                    route_removed = True
+                if route_removed:
+                    self._route_change_seq += 1
+
+        self._disable_rip_ifaces.discard(name)
+        self._wan_like_ifaces.discard(name)
+        self._last_advert_digest_by_iface.pop(name, None)
+        self._last_advert_send_ts_by_iface.pop(name, None)
+        if removed or route_removed:
+            self._request_triggered_update()
+        return removed or route_removed
+
     def _hold_down_snapshot(self) -> Dict[ipaddress._BaseNetwork, float]:
         with self._rt_lock:
             return dict(self._route_hold_down)
@@ -8368,14 +8492,19 @@ class RIPManager:
 
     def _is_forbidden_route_target(self, net: ipaddress._BaseNetwork) -> bool:
         try:
-            if isinstance(net, ipaddress.IPv4Network):
-                if net.is_multicast or net.is_reserved:
-                    return True
-                if str(net) == "255.255.255.255/32":
-                    return True
+            # This manager implements RIPv2 only. IPv6 routes belong to the NDP/
+            # NetRoute managers and must not be inserted with fake ::1 next hops.
+            if not isinstance(net, ipaddress.IPv4Network):
+                return True
+            if net.is_multicast or net.is_reserved or net.is_loopback:
+                return True
+            if net.is_unspecified and net.prefixlen != 0:
+                return True
+            if str(net) in {"0.0.0.0/32", "255.255.255.255/32"}:
+                return True
             return False
         except Exception:
-            return False
+            return True
 
     def _should_advertise_route(self, entry_details: Dict[str, Any]) -> bool:
         try:
@@ -8389,6 +8518,11 @@ class RIPManager:
                 return False
 
             if iface in self._wan_like_ifaces and not self._allow_wan_rip_advertisements:
+                return False
+
+            with self._interfaces_lock:
+                iface_cfg = dict(self._interfaces_config.get(iface, {}) or {})
+            if iface_cfg.get("rip_export") is False:
                 return False
 
             if net.is_loopback or net.is_multicast or net.is_reserved or net.is_unspecified:
@@ -8538,8 +8672,6 @@ class RIPManager:
             self._route_change_seq += 1
 
         # Keep the existing static-route policy and compatibility routes.
-        self.add_static_route(network_str="0.0.0.0/32", next_hop=router_gateway_out_ip,
-                              interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="0.0.0.0/0", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="8.8.8.8/32", next_hop=router_gateway_out_ip,
@@ -8570,8 +8702,6 @@ class RIPManager:
                               interface=interface_out_full_name, cost=1)
         self.add_static_route(network_str="8.20.247.20/32", next_hop=router_gateway_out_ip,
                               interface=interface_out_full_name, cost=1)
-        self.add_static_route(network_str="::/0", next_hop="::1",
-                              interface=interface_out_full_name, cost=1)
         self.add_static_route("156.154.70.1/32", router_gateway_out_ip, interface_out_full_name, 1)
         self.add_static_route("156.154.71.1/32", router_gateway_out_ip, interface_out_full_name, 1)
         self.add_static_route("185.228.168.9/32", router_gateway_out_ip, interface_out_full_name, 1)
@@ -8580,7 +8710,6 @@ class RIPManager:
         self.add_static_route("77.88.8.1/32", router_gateway_out_ip, interface_out_full_name, 1)
         self.add_static_route("45.90.28.0/32", router_gateway_out_ip, interface_out_full_name, 1)
         self.add_static_route("45.90.30.0/32", router_gateway_out_ip, interface_out_full_name, 1)
-        self.add_static_route(network_str="::1/128", next_hop="::1", interface=interface_in_full_name, cost=2)
 
         self.router_logger.log_message(
             f"[RIP] Routing table initialized with {len(self._routing_table_snapshot())} entries."
@@ -8603,6 +8732,14 @@ class RIPManager:
 
             with self._rt_lock:
                 current_route = self._routing_table.get(net)
+                if (
+                        current_route
+                        and current_route.get("type") == "static"
+                        and current_route.get("interface") == interface
+                        and str(current_route.get("next_hop")) == str(next_hop)
+                        and int(current_route.get("cost", 16)) == int(cost)
+                ):
+                    return True
                 if current_route is None or \
                         current_route["type"] != "static" or \
                         (current_route["type"] == "static" and cost < current_route["cost"]):

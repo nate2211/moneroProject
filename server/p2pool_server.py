@@ -134,10 +134,17 @@ async def application_main_loop(stop_event=None):
 
     ensure_flask_thread_started()
 
-    if p2pool_helper.router_manager is None:
-        p2pool_helper.router_manager = PythonRouterManager(router_logger)
-        p2pool_helper.packet_manager.router = p2pool_helper.router_manager
+    # Router construction is optional to the rest of the application startup.
+    # A native helper or packet-analysis mismatch must not kill the asyncio worker
+    # and permanently leave the GUI with "Router manager not available."
     p2pool_helper.set_router_logger(router_logger)
+    router_manager = p2pool_helper.ensure_router_manager(router_logger)
+    if router_manager is None:
+        status = p2pool_helper.router_manager_status()
+        p2pool_helper.logger.log_message(
+            "[Main] ⚠️ Router manager is not ready yet; the GUI Start Router "
+            f"worker may retry initialization. Last error: {status.get('last_error') or 'unknown'}"
+        )
 
     p2pool_helper.create_process_manager(
         flask_restart_callback=None,
@@ -178,7 +185,11 @@ async def application_main_loop(stop_event=None):
 
         try:
             if p2pool_helper.router_manager is not None:
-                p2pool_helper.router_manager.stop_routing()
+                shutdown = getattr(p2pool_helper.router_manager, "shutdown", None)
+                if callable(shutdown):
+                    shutdown(final=True)
+                else:
+                    p2pool_helper.router_manager.stop_routing()
         except Exception as e:
             p2pool_helper.logger.log_message(f"[Main] Router shutdown error: {e}")
 
@@ -224,7 +235,11 @@ def cleanup_on_exit():
 
     try:
         if p2pool_helper.router_manager is not None:
-            p2pool_helper.router_manager.stop_routing()
+            shutdown = getattr(p2pool_helper.router_manager, "shutdown", None)
+            if callable(shutdown):
+                shutdown(final=True)
+            else:
+                p2pool_helper.router_manager.stop_routing()
     except Exception as e:
         if logger:
             logger.log_message(f"[atexit] Router stop error: {e}")

@@ -160,6 +160,8 @@ class _TcpDirectionState:
     stream_tail: bytearray = field(default_factory=bytearray)
     pending: Dict[int, _PendingTcpSegment] = field(default_factory=dict)
     recent_segments: collections.OrderedDict = field(default_factory=collections.OrderedDict)
+    protocol_metadata: Dict[str, Any] = field(default_factory=dict)
+    protocol_scan_bytes: int = 0
 
 
 @dataclass
@@ -317,6 +319,22 @@ class SnifferSoftware:
         ICMPv6DestUnreach, ICMPv6TimeExceeded, ICMPv6ParamProblem,
         ICMPv6Unknown, ICMP
     )
+    LEVIN_SIGNATURE = 0x0101010101012101
+    LEVIN_HEADER_SIZE = 33
+    MONERO_RPC_METHODS = {
+        "get_height", "get_info", "get_block_template", "submit_block",
+        "get_last_block_header", "get_block_header_by_hash",
+        "get_block_header_by_height", "get_transactions",
+        "send_raw_transaction", "get_transaction_pool", "get_connections",
+        "get_peer_list", "hard_fork_info", "sync_info", "get_bans",
+        "set_bans", "flush_txpool", "relay_tx", "calc_pow",
+        "get_balance", "get_address", "transfer", "sweep_all",
+        "get_transfers", "incoming_transfers", "store", "refresh",
+    }
+    MONEROOCEAN_HOST_SUFFIXES = ("moneroocean.stream",)
+    PROTOCOL_HEAD_SCAN_BYTES = 160 * 1024
+    PROTOCOL_TAIL_SCAN_BYTES = 160 * 1024
+    TLS_RESYNC_SCAN_BYTES = 96 * 1024
     def __init__(self, arp_manager, rip_manager, lag_manager, outbound_manager, notification_manager=None, _interfaces_config = None, logger=None, hyperv_manager = None, use_hyperv = False):
         self.arp_manager = arp_manager
         self.rip_manager = rip_manager
@@ -2048,6 +2066,57 @@ class SnifferSoftware:
     def _is_grease_value(value: int) -> bool:
         return (value & 0x0F0F) == 0x0A0A and ((value >> 8) & 0xFF) == (value & 0xFF)
 
+    @staticmethod
+    def _normalize_hostname(value: Any) -> str:
+        text = str(value or "").strip().strip("\x00").rstrip(".").casefold()
+        if not text or len(text) > 253 or any(ch.isspace() for ch in text):
+            return ""
+        try:
+            text = text.encode("idna").decode("ascii").casefold()
+        except Exception:
+            text = text.encode("ascii", "ignore").decode("ascii").casefold()
+        labels = text.split(".")
+        if not labels or any(not label or len(label) > 63 for label in labels):
+            return ""
+        if any(label.startswith("-") or label.endswith("-") for label in labels):
+            return ""
+        if not all(re.fullmatch(r"[a-z0-9_-]+", label) for label in labels):
+            return ""
+        return text
+
+    @staticmethod
+    def _tls_record_header_at(data: bytes, offset: int) -> tuple[int, int, int] | None:
+        if offset < 0 or offset + 5 > len(data):
+            return None
+        content_type = data[offset]
+        version = struct.unpack_from("!H", data, offset + 1)[0]
+        length = struct.unpack_from("!H", data, offset + 3)[0]
+        if content_type not in {20, 21, 22, 23, 24}:
+            return None
+        if version < 0x0300 or version > 0x0304 or length > 18432:
+            return None
+        return content_type, version, length
+
+    def _find_tls_record_start(self, data: bytes) -> int | None:
+        cap = min(max(0, len(data) - 5), self.TLS_RESYNC_SCAN_BYTES)
+        fallback = None
+        for offset in range(cap + 1):
+            header = self._tls_record_header_at(data, offset)
+            if header is None:
+                continue
+            content_type, _version, length = header
+            if fallback is None:
+                fallback = offset
+            end = offset + 5 + length
+            if content_type == 22 and offset + 9 <= len(data):
+                hs_type = data[offset + 5]
+                hs_len = int.from_bytes(data[offset + 6:offset + 9], "big")
+                if hs_type in {1, 2} and 0 < hs_len <= 4 * 1024 * 1024:
+                    return offset
+            if end <= len(data) and content_type in {22, 23}:
+                return offset
+        return fallback
+
     def _parse_tls_extensions(self, data: bytes) -> dict:
         offset = 0
         extension_ids = []
@@ -2082,8 +2151,12 @@ class SnifferSoftware:
                         pos += 3
                         if pos + name_len > limit:
                             break
-                        name = body[pos:pos + name_len].decode("idna", "replace")
+                        raw_name = body[pos:pos + name_len]
                         pos += name_len
+                        try:
+                            name = raw_name.decode("ascii", "strict")
+                        except Exception:
+                            name = raw_name.decode("utf-8", "replace")
                         if name_type == 0 and name:
                             server_names.append(name)
 
@@ -2160,9 +2233,15 @@ class SnifferSoftware:
             except Exception:
                 continue
 
+        normalized_names = []
+        for value in server_names:
+            name = self._normalize_hostname(value)
+            if name and name not in normalized_names:
+                normalized_names.append(name)
+
         return {
             "extension_ids": extension_ids,
-            "server_names": server_names,
+            "server_names": normalized_names,
             "alpn": alpns,
             "supported_versions": supported_versions,
             "supported_groups": supported_groups,
@@ -2328,49 +2407,61 @@ class SnifferSoftware:
             return None
 
     def _parse_tls_records(self, data: bytes, max_records: int = 32) -> dict | None:
+        """Parse TLS records with bounded midstream resynchronization.
+
+        Handshake bytes are accumulated across record boundaries, allowing a
+        ClientHello/SNI split across multiple TCP segments or TLS records to be
+        recovered without scanning an unbounded stream on every packet.
+        """
         if len(data) < 5:
             return None
-        offset = 0
+        record_start = self._find_tls_record_start(data)
+        if record_start is None:
+            return None
+        offset = int(record_start)
         records = []
         handshakes = []
+        handshake_buffer = bytearray()
         recognized = False
+        partial_record = False
 
         while offset + 5 <= len(data) and len(records) < max_records:
-            content_type = data[offset]
-            version = struct.unpack_from("!H", data, offset + 1)[0]
-            length = struct.unpack_from("!H", data, offset + 3)[0]
-            if content_type not in {20, 21, 22, 23, 24}:
-                break
-            if version < 0x0300 or version > 0x0304:
-                break
+            header = self._tls_record_header_at(data, offset)
+            if header is None:
+                next_rel = self._find_tls_record_start(data[offset + 1:])
+                if next_rel is None:
+                    break
+                offset += 1 + next_rel
+                continue
+            content_type, version, length = header
             recognized = True
-            complete = offset + 5 + length <= len(data)
-            record_payload = data[offset + 5:min(len(data), offset + 5 + length)]
+            record_end = offset + 5 + length
+            complete = record_end <= len(data)
+            record_payload = data[offset + 5:min(len(data), record_end)]
             records.append({
+                "offset": offset,
                 "content_type": content_type,
                 "legacy_version": version,
                 "length": length,
                 "complete": complete,
             })
-            if content_type == 22:
-                hpos = 0
-                while hpos + 4 <= len(record_payload) and len(handshakes) < 64:
-                    handshake_type = record_payload[hpos]
-                    handshake_len = (
-                        (record_payload[hpos + 1] << 16)
-                        | (record_payload[hpos + 2] << 8)
-                        | record_payload[hpos + 3]
-                    )
-                    hpos += 4
-                    available = min(
-                        len(record_payload) - hpos,
-                        handshake_len,
-                    )
-                    body = record_payload[hpos:hpos + available]
+            if content_type == 22 and record_payload:
+                handshake_buffer.extend(record_payload)
+                while len(handshake_buffer) >= 4 and len(handshakes) < 64:
+                    handshake_type = handshake_buffer[0]
+                    handshake_len = int.from_bytes(handshake_buffer[1:4], "big")
+                    if handshake_len > 4 * 1024 * 1024:
+                        del handshake_buffer[0]
+                        continue
+                    total = 4 + handshake_len
+                    if len(handshake_buffer) < total:
+                        break
+                    body = bytes(handshake_buffer[4:total])
+                    del handshake_buffer[:total]
                     item = {
                         "type": handshake_type,
                         "length": handshake_len,
-                        "complete": available == handshake_len,
+                        "complete": True,
                     }
                     if handshake_type == 1:
                         parsed = self._parse_tls_client_hello(body)
@@ -2389,29 +2480,41 @@ class SnifferSoftware:
                     elif handshake_type == 20:
                         item["handshake"] = "finished"
                     handshakes.append(item)
-                    hpos += available
-                    if available < handshake_len:
-                        break
-            offset += 5 + length
+            offset = record_end
             if not complete:
+                partial_record = True
                 break
 
         if not recognized:
             return None
-        client_hellos = [
-            item for item in handshakes
-            if item.get("handshake") == "client_hello"
-        ]
-        server_hellos = [
-            item for item in handshakes
-            if item.get("handshake") == "server_hello"
-        ]
+        if handshake_buffer and len(handshakes) < 64:
+            item = {
+                "type": handshake_buffer[0] if handshake_buffer else None,
+                "length": int.from_bytes(handshake_buffer[1:4], "big") if len(handshake_buffer) >= 4 else None,
+                "complete": False,
+                "buffered_bytes": len(handshake_buffer),
+            }
+            handshakes.append(item)
+        client_hellos = [item for item in handshakes if item.get("handshake") == "client_hello"]
+        server_hellos = [item for item in handshakes if item.get("handshake") == "server_hello"]
+        sni_all = []
+        for hello in client_hellos:
+            for value in hello.get("sni") or []:
+                name = self._normalize_hostname(value)
+                if name and name not in sni_all:
+                    sni_all.append(name)
         return {
             "protocol": "tls",
+            "record_start_offset": record_start,
+            "resynchronized": bool(record_start),
             "records": records,
             "handshakes": handshakes,
             "client_hello": client_hellos[-1] if client_hellos else None,
             "server_hello": server_hellos[-1] if server_hellos else None,
+            "sni": sni_all[0] if sni_all else None,
+            "sni_all": sni_all,
+            "partial_record": partial_record,
+            "partial_handshake_bytes": len(handshake_buffer),
             "bytes_consumed": min(offset, len(data)),
             "stream_bytes_available": len(data),
         }
@@ -2580,34 +2683,123 @@ class SnifferSoftware:
         messages = []
         stratum = False
         methods = []
+        response_count = 0
+        job_count = 0
         for value in objects:
-            if isinstance(value, dict):
-                method = str(value.get("method") or "").strip()
-                command = str(value.get("command") or "").strip()
+            values = value if isinstance(value, list) else [value]
+            for obj in values[:64]:
+                if not isinstance(obj, dict):
+                    continue
+                method = str(obj.get("method") or "").strip()
+                command = str(obj.get("command") or "").strip()
                 kind = method or command
                 if kind:
                     methods.append(kind)
                 lower_kind = kind.casefold()
+                keys = {str(k).casefold() for k in obj.keys()}
+                params = obj.get("params")
+                result = obj.get("result")
+                if "job" in keys or (isinstance(result, dict) and "job" in result):
+                    job_count += 1
+                if "result" in keys or "error" in keys:
+                    response_count += 1
                 if (
                     lower_kind in self._stratum_method_names
                     or lower_kind.startswith("mining.")
-                    or {"login", "pass", "agent"}.intersection(
-                        str(k).casefold() for k in value.keys()
-                    )
+                    or lower_kind in {"login", "submit", "keepalived", "getjob", "job"}
+                    or {"login", "pass", "agent"}.intersection(keys)
+                    or ({"id", "result"}.issubset(keys) and isinstance(result, (dict, list, bool, str, type(None))))
+                    or (isinstance(params, dict) and {"login", "pass"}.intersection({str(k).casefold() for k in params}))
                 ):
                     stratum = True
-                messages.append(
-                    self._redact_json_value("", value)
-                )
-            else:
-                messages.append(value[:64] if isinstance(value, list) else value)
+                messages.append(self._redact_json_value("", obj))
+                if len(messages) >= 64:
+                    break
+            if len(messages) >= 64:
+                break
 
         protocol = "stratum-json-rpc" if stratum else "json-rpc"
         return {
             "protocol": protocol,
             "message_count": len(messages),
-            "methods": methods,
+            "methods": list(dict.fromkeys(methods)),
+            "response_count": response_count,
+            "job_count": job_count,
             "messages": messages,
+        }
+
+    def _parse_monero_levin(self, data: bytes, max_frames: int = 16) -> dict | None:
+        if len(data) < 8:
+            return None
+        magic = int(self.LEVIN_SIGNATURE).to_bytes(8, "little", signed=False)
+        search_from = 0
+        frames = []
+        while len(frames) < max_frames:
+            offset = data.find(magic, search_from)
+            if offset < 0:
+                break
+            available = len(data) - offset
+            frame = {
+                "offset": offset,
+                "header_complete": available >= self.LEVIN_HEADER_SIZE,
+                "body_complete": False,
+            }
+            if available >= 16:
+                frame["body_size"] = int.from_bytes(data[offset + 8:offset + 16], "little", signed=False)
+            if available >= 17:
+                frame["expect_response"] = bool(data[offset + 16])
+            if available >= 21:
+                frame["command"] = int.from_bytes(data[offset + 17:offset + 21], "little", signed=False)
+            if available >= 25:
+                frame["return_code"] = int.from_bytes(data[offset + 21:offset + 25], "little", signed=True)
+            if available >= 29:
+                frame["flags"] = int.from_bytes(data[offset + 25:offset + 29], "little", signed=False)
+            if available >= 33:
+                frame["protocol_version"] = int.from_bytes(data[offset + 29:offset + 33], "little", signed=False)
+                body_size = int(frame.get("body_size") or 0)
+                if body_size <= 64 * 1024 * 1024:
+                    frame["body_complete"] = available >= self.LEVIN_HEADER_SIZE + body_size
+                    frame["frame_size"] = self.LEVIN_HEADER_SIZE + body_size
+            frames.append(frame)
+            step = max(8, int(frame.get("frame_size") or self.LEVIN_HEADER_SIZE))
+            search_from = offset + step
+        if not frames:
+            return None
+        return {
+            "protocol": "monero-levin",
+            "signature": hex(self.LEVIN_SIGNATURE),
+            "frame_count": len(frames),
+            "frames": frames,
+            "resynchronized": bool(frames[0].get("offset")),
+        }
+
+    def _parse_monero_rpc(self, data: bytes, http: dict | None = None) -> dict | None:
+        objects = self._json_objects_from_bytes(data, max_objects=64)
+        methods = []
+        responses = 0
+        messages = []
+        for value in objects:
+            values = value if isinstance(value, list) else [value]
+            for obj in values[:64]:
+                if not isinstance(obj, dict):
+                    continue
+                method = str(obj.get("method") or "").strip()
+                method_cf = method.casefold()
+                if method_cf in self.MONERO_RPC_METHODS or method_cf.startswith(("get_", "set_", "relay_", "send_", "submit_")):
+                    methods.append(method)
+                if "result" in obj or "error" in obj:
+                    responses += 1
+                messages.append(self._redact_json_value("", obj))
+        target = str((http or {}).get("target") or "").casefold()
+        path_hint = any(token in target for token in ("/json_rpc", "/get_height", "/get_info", "/send_raw_transaction", "/get_transactions"))
+        if not methods and not path_hint:
+            return None
+        return {
+            "protocol": "monero-rpc",
+            "methods": list(dict.fromkeys(methods)),
+            "response_count": responses,
+            "http_target": (http or {}).get("target"),
+            "messages": messages[:32],
         }
 
     def _parse_http_headers(self, data: bytes) -> dict | None:
@@ -2821,13 +3013,28 @@ class SnifferSoftware:
         for source_name, data in candidates:
             if not data:
                 continue
+            head = data[:self.PROTOCOL_HEAD_SCAN_BYTES]
+            tail = data[-self.PROTOCOL_TAIL_SCAN_BYTES:]
             if "tls" not in metadata:
-                tls = self._parse_tls_records(data)
+                tls = self._parse_tls_records(head)
+                tls_source = source_name
+                if not tls and tail != head:
+                    tls = self._parse_tls_records(tail)
+                    tls_source = f"{source_name}-tail"
                 if tls:
-                    tls["source"] = source_name
+                    tls["source"] = tls_source
                     metadata["tls"] = tls
+            if "monero_levin" not in metadata:
+                levin = self._parse_monero_levin(head if len(head) >= 8 else data)
+                levin_source = source_name
+                if not levin and tail != head:
+                    levin = self._parse_monero_levin(tail)
+                    levin_source = f"{source_name}-tail"
+                if levin:
+                    levin["source"] = levin_source
+                    metadata["monero_levin"] = levin
             if "stratum" not in metadata and "json_rpc" not in metadata:
-                parsed_json = self._parse_json_rpc_and_stratum(data)
+                parsed_json = self._parse_json_rpc_and_stratum(tail)
                 if parsed_json:
                     parsed_json["source"] = source_name
                     if parsed_json["protocol"] == "stratum-json-rpc":
@@ -2835,12 +3042,17 @@ class SnifferSoftware:
                     else:
                         metadata["json_rpc"] = parsed_json
             if "http" not in metadata:
-                http = self._parse_http_headers(data)
+                http = self._parse_http_headers(head)
                 if http:
                     http["source"] = source_name
                     metadata["http"] = http
+            if "monero_rpc" not in metadata:
+                monero_rpc = self._parse_monero_rpc(tail, metadata.get("http"))
+                if monero_rpc:
+                    monero_rpc["source"] = source_name
+                    metadata["monero_rpc"] = monero_rpc
             if "ssh" not in metadata:
-                ssh = self._parse_ssh_banner(data)
+                ssh = self._parse_ssh_banner(head)
                 if ssh:
                     ssh["source"] = source_name
                     metadata["ssh"] = ssh
@@ -2861,6 +3073,38 @@ class SnifferSoftware:
                 "window": int(getattr(tcp, "window", 0) or 0),
                 "options": self._tcp_options_metadata(tcp),
             }
+
+        ip6 = packet.getlayer(IPv6)
+        if ip6 is not None:
+            extension_chain = []
+            layer = getattr(ip6, "payload", None)
+            for _ in range(32):
+                if layer is None:
+                    break
+                name = layer.__class__.__name__
+                if name.startswith("IPv6ExtHdr") or name in {"AH", "ESP"}:
+                    extension_chain.append(name)
+                    layer = getattr(layer, "payload", None)
+                    continue
+                break
+            metadata["ipv6"] = {
+                "source": str(getattr(ip6, "src", "") or ""),
+                "destination": str(getattr(ip6, "dst", "") or ""),
+                "traffic_class": int(getattr(ip6, "tc", 0) or 0),
+                "flow_label": int(getattr(ip6, "fl", 0) or 0),
+                "hop_limit": int(getattr(ip6, "hlim", 0) or 0),
+                "next_header": int(getattr(ip6, "nh", 0) or 0),
+                "extension_chain": extension_chain,
+                "scope_id_preserved": "%" in str(getattr(ip6, "src", "") or "") or "%" in str(getattr(ip6, "dst", "") or ""),
+            }
+            frag6 = packet.getlayer(IPv6ExtHdrFragment)
+            if frag6 is not None:
+                metadata["ipv6"]["fragment"] = {
+                    "id": int(getattr(frag6, "id", 0) or 0),
+                    "offset": int(getattr(frag6, "offset", 0) or 0),
+                    "more": bool(int(getattr(frag6, "m", 0) or 0)),
+                    "next_header": int(getattr(frag6, "nh", 0) or 0),
+                }
 
         # Control-plane and service hints remain metadata only; they never alter
         # or decrypt traffic. They let the bounded ingress path preserve packets
@@ -2916,7 +3160,7 @@ class SnifferSoftware:
             10132: "gulf-moneroocean-stratum", 18080: "monero-p2p",
             18081: "monero-rpc", 18082: "monero-zmq",
         }
-        for port in (3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444):
+        for port in (3333, 3334, 4444, 5555, 6666, 7777, 8888, 9999, 10001, 10128, 10132, 14444, 20128, 24444, 4242):
             tcp_services.setdefault(port, "stratum")
         udp_services = {
             53: "dns", 67: "dhcp-server", 68: "dhcp-client", 88: "kerberos",

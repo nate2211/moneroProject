@@ -793,6 +793,9 @@ class P2PoolGUI(QMainWindow):
                     adapter_name=config.get("adapter_name"),
                     ipv4=config.get("ipv4"),
                     prefix_length=config.get("prefix_length"),
+                    address_mode=config.get("address_mode"),
+                    dhcp_timeout=config.get("dhcp_timeout"),
+                    dhcp_fallback_static=config.get("dhcp_fallback_static"),
                     start_capture=True,
                 )
                 self.router_logger.log_message(
@@ -829,8 +832,10 @@ class P2PoolGUI(QMainWindow):
         self.router_logger.log_message("[GUI] Requesting to start Router...")
 
         if not self.helper.router_manager:
-            self.router_logger.log_message("[GUI] Router manager not available.")
-            return
+            self.router_logger.log_message(
+                "[GUI] Router manager is not ready; initialization will be retried "
+                "inside the router start worker."
+            )
 
         tab = self.router_tab
 
@@ -1714,11 +1719,39 @@ class P2PoolGUI(QMainWindow):
                 "probe_rate_per_minute": int(tab.codeoutput_probe_rate_input.value()),
                 "probe_max_concurrent": int(tab.codeoutput_probe_concurrency_input.value()),
                 "probe_default_iface": tab.codeoutput_iface_dropdown.currentText().strip(),
+                "auto_actions_enabled": tab.codeoutput_auto_actions_checkbox.isChecked(),
+                "auto_actions_ai_enabled": tab.codeoutput_auto_actions_ai_checkbox.isChecked(),
+                "auto_actions_private_only": tab.codeoutput_auto_actions_private_checkbox.isChecked(),
+                "auto_actions_interval": self._float_setting(
+                    tab.codeoutput_auto_actions_interval_input.text(),
+                    "CodeOutput automatic action interval", minimum=5.0,
+                ),
+                "auto_actions_rate_per_minute": int(
+                    tab.codeoutput_auto_actions_rate_input.value()
+                ),
+                "auto_actions_target_cooldown": self._float_setting(
+                    tab.codeoutput_auto_actions_cooldown_input.text(),
+                    "CodeOutput automatic target cooldown", minimum=10.0,
+                ),
+                "auto_actions_min_hits": int(
+                    tab.codeoutput_auto_actions_min_hits_input.value()
+                ),
+                "auto_actions_allowed": tab.codeoutput_auto_actions_allowed_input.text().strip(),
                 "interface_enabled": tab.codeoutput_interface_checkbox.isChecked(),
                 "interface_switch_name": tab.codeoutput_switch_name_input.text().strip() or "CodeOutput",
                 "interface_adapter_name": tab.codeoutput_adapter_name_input.text().strip() or "CodeOutput",
                 "interface_ipv4": tab.codeoutput_interface_ip_input.text().strip() or "172.30.253.1",
                 "interface_prefix_length": int(tab.codeoutput_interface_prefix_input.value()),
+                "interface_address_mode": (
+                    "dhcp" if tab.codeoutput_interface_dhcp_checkbox.isChecked() else "static"
+                ),
+                "interface_dhcp_timeout": self._float_setting(
+                    tab.codeoutput_interface_dhcp_timeout_input.text(),
+                    "CodeOutput DHCP timeout", minimum=3.0,
+                ),
+                "interface_dhcp_fallback_static": (
+                    tab.codeoutput_interface_dhcp_fallback_checkbox.isChecked()
+                ),
                 "interface_remove_on_shutdown": tab.codeoutput_remove_on_shutdown_checkbox.isChecked(),
             }
 
@@ -1913,19 +1946,30 @@ class P2PoolGUI(QMainWindow):
         self.router_tab.start_router_button.setText("Starting...")
         self.router_tab.stop_router_button.setEnabled(False)
 
-        manager = self.helper.router_manager
-
         def _start_backend():
             ok = False
             message = ""
             try:
-                manager.start_routing(**start_kwargs)
-                ok = bool(getattr(manager, "started", False))
-                if not ok:
+                manager = self.helper.router_manager
+                if manager is None:
+                    ensure = getattr(self.helper, "ensure_router_manager", None)
+                    if callable(ensure):
+                        manager = ensure(self.router_logger)
+                if manager is None:
+                    status_reader = getattr(self.helper, "router_manager_status", None)
+                    status = status_reader() if callable(status_reader) else {}
                     message = (
-                        "Router startup did not complete. Review the Router log "
-                        "for the failing manager."
+                        "Router manager initialization failed. "
+                        f"{status.get('last_error') or 'Review the Router log for the constructor traceback.'}"
                     )
+                else:
+                    manager.start_routing(**start_kwargs)
+                    ok = bool(getattr(manager, "started", False))
+                    if not ok:
+                        message = (
+                            "Router startup did not complete. Review the Router log "
+                            "for the failing manager."
+                        )
             except Exception as exc:
                 message = f"Exception during router start: {exc}"
             finally:

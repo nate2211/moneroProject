@@ -19,6 +19,7 @@ import sys
 import time
 import re
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
@@ -119,6 +120,11 @@ class BaseBlock:
         return {}
 
     def log(self, message: str):
+        # ``False`` is an explicit silent logger used by PacketPipelineBlock
+        # for high-rate packet stages. ``None`` keeps the original stderr
+        # fallback for standalone/debug use.
+        if self.logger is False:
+            return
         if self.logger and hasattr(self.logger, 'log_message'):
             self.logger.log_message(message)
         else:
@@ -144,6 +150,8 @@ def _home_path(*parts: str) -> str:
 
 APP_DIR = _home_path(".promptchat")
 MEMORY_PATH = os.path.join(APP_DIR, "memory.json")
+_MEMORY_LOCK = threading.RLock()
+PIPELINE_MEMORY: Dict[str, Any] = {}
 
 
 def ensure_app_dirs() -> None:
@@ -156,20 +164,25 @@ def ensure_app_dirs() -> None:
 class Memory:
     @staticmethod
     def load() -> Dict[str, Any]:
-        try:
-            with open(MEMORY_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with _MEMORY_LOCK:
+            try:
+                with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
 
     @staticmethod
     def save(data: Dict[str, Any]) -> None:
-        try:
-            ensure_app_dirs()
-            with open(MEMORY_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving memory: {e}", file=sys.stderr)
+        with _MEMORY_LOCK:
+            try:
+                ensure_app_dirs()
+                tmp_path = MEMORY_PATH + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                os.replace(tmp_path, MEMORY_PATH)
+            except Exception as e:
+                print(f"Error saving memory: {e}", file=sys.stderr)
 
 
 def parse_extras(items: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -202,30 +215,84 @@ def parse_extras(items: List[str]) -> Dict[str, Dict[str, Any]]:
 def create_pipeline_extras(
         *,
         logger: Any = None,
-        stages: str = "init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee",
+        stages: str = "init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
         memory_key: str = "last_packet_info",
         debug: bool = False,
         stop_on_error: bool = True,
-        router_ip_in: str = "127.0.0.1"
+        router_ip_in: str = "127.0.0.1",
+        ipc_port: int = 9999,
+        ipc_mode: str = "udp",
+        ipc_enabled: bool = True,
+        log_stage_messages: bool = False,
+        persist_memory: bool = False,
 ) -> Dict[str, Any]:
+    """Build a validated extras dictionary for :class:`PacketPipelineBlock`.
+
+    Defaults are intentionally non-blocking: the IPC stage uses UDP only and
+    stage-level packet chatter is disabled. The router can therefore run this
+    pipeline on a bounded background worker without slowing packet forwarding.
     """
-    Convenience helper: build an "extras" dict for PacketPipelineBlock.
+    host = str(router_ip_in or "127.0.0.1").strip() or "127.0.0.1"
+    mode = str(ipc_mode or "udp").strip().lower()
+    if mode == "tcp":
+        mode = "tcp_client"
+    if mode not in {"udp", "tcp_client", "tcp_server", "auto", "disabled", "off", "none"}:
+        mode = "udp"
+    enabled = bool(ipc_enabled) and mode not in {"disabled", "off", "none"}
+    port = max(1, min(65535, int(ipc_port)))
+
+    return {
+        "logger": logger,
+        "pipeline": {
+            "stages": stages,
+            "debug": bool(debug),
+            "stop_on_error": bool(stop_on_error),
+            "log_stage_messages": bool(log_stage_messages),
+        },
+        "tee": {
+            "key": str(memory_key or "last_packet_info"),
+            "persist": bool(persist_memory),
+        },
+        "ipc_emit": {
+            "enabled": enabled,
+            "host": host,
+            "port": port,
+            "mode": mode if enabled else "disabled",
+            "udp_nonblocking": True,
+            "tcp_connect_timeout": 0.05,
+            "tcp_use_jsonl": True,
+        },
+    }
+
+
+@BLOCKS.register("tee", help="Store the latest sanitized pipeline result in bounded memory.")
+@dataclass
+class TeeMemoryBlock(BaseBlock):
+    """Save a packet-analysis snapshot without retaining the Scapy packet.
+
+    Persistence is opt-in because writing every packet to disk is unsuitable
+    for a router hot path. The default keeps only the latest sanitized result
+    in ``PIPELINE_MEMORY``.
     """
-    extras: Dict[str, Any] = {"logger": logger, "pipeline": {
-        "stages": stages,
-        "debug": bool(debug),
-        "stop_on_error": bool(stop_on_error),
-    }, "tee": {
-        "key": memory_key,
-    }, "ipc_emit": {
-        "host": router_ip_in,
-        "port": 9999,
-        "mode": "auto",  # <-- send UDP + TCP
-        "udp_nonblocking": True,
-        "tcp_connect_timeout": 0.1,
-        "tcp_use_jsonl": True,
-    }}
-    return extras
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return payload, {"error": "payload_not_dict", "stored": False}
+
+        key = str(params.get("key", "last_packet_info") or "last_packet_info")
+        persist = bool(params.get("persist", False))
+        snapshot = {
+            "analysis": payload.get("analysis", {}),
+            "metadata": payload.get("metadata", {}),
+            "updated_at": time.time(),
+        }
+        with _MEMORY_LOCK:
+            PIPELINE_MEMORY[key] = snapshot
+            if persist:
+                data = Memory.load()
+                data[key] = snapshot
+                Memory.save(data)
+        return payload, {"stored": True, "key": key, "persisted": persist}
 
 
 # ========================================================
@@ -244,9 +311,22 @@ class InitializePacketInfoBlock(BaseBlock):
                 "metadata": {"timestamp": time.time(), "summary": str(payload)},
             }
             return info_dict, {"status": "error", "error": err}
+        iface = (
+            getattr(payload, "_router_interface_name", None)
+            or getattr(payload, "_router_ingress_iface", None)
+            or getattr(payload, "sniffed_on", None)
+        )
         info_dict = {
-            "packet": payload, "analysis": {},
-            "metadata": {"timestamp": time.time(), "summary": payload.summary()},
+            "packet": payload,
+            "analysis": {},
+            "metadata": {
+                "timestamp": time.time(),
+                "summary": payload.summary(),
+                "iface": str(iface or ""),
+                "programmatic_ingress": bool(
+                    getattr(payload, "_router_programmatic_ingress", False)
+                ),
+            },
         }
         return info_dict, {"status": "initialized", "summary": info_dict["metadata"]["summary"]}
 
@@ -765,134 +845,140 @@ class AnalyzePayloadBlock(BaseBlock):
 @BLOCKS.register("pipeline", help="Run a sequence of registered blocks by name.")
 @dataclass
 class PacketPipelineBlock(BaseBlock):
+    """Thread-safe reusable packet analysis pipeline.
+
+    Stateful stages (notably ``ipc_emit``) are cached instead of recreated for
+    every packet, allowing sockets to be reused and closed deterministically.
     """
-    Orchestrates a sequence of stages (blocks) defined in extras["pipeline"]["stages"].
-    This block is designed to be called for its side-effects (logging, memory save).
-    """
-    _meta_chain: List[Dict[str, Any]] = field(default_factory=list)
+
+    _meta_chain: List[Dict[str, Any]] = field(default_factory=list, init=False)
+    _stage_instances: Dict[str, BaseBlock] = field(default_factory=dict, init=False, repr=False)
+    _execution_lock: Any = field(default_factory=threading.RLock, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def _pipeline_params(self, extras: Dict[str, Any]) -> Dict[str, Any]:
         pipeline_config = extras.get("pipeline", {})
-        if isinstance(pipeline_config, dict):
-            return dict(pipeline_config)
-        return {}
+        return dict(pipeline_config) if isinstance(pipeline_config, dict) else {}
 
     def _resolve_stages(self, pipe_params: Dict[str, Any]) -> List[str]:
         stages_str = pipe_params.get("stages") or pipe_params.get("pipeline") or pipe_params.get("pipe")
         if not isinstance(stages_str, str) or not stages_str.strip():
             raise ValueError("Missing pipeline.stages (e.g. 'init_packet|parse_l3|...')")
-        return [s.strip() for s in stages_str.split("|") if s.strip()]
+        stages = [stage.strip().lower() for stage in stages_str.split("|") if stage.strip()]
+        if not stages:
+            raise ValueError("Packet pipeline contains no stages")
+        return stages
 
-    def _stage_params(
-            self,
-            stage: str,
-            extras: Dict[str, Any],
-            pipe_params: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def _stage_params(self, stage: str, extras: Dict[str, Any], pipe_params: Dict[str, Any]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {}
-
         stage_key = stage.strip().lower()
-
-        # 1) Global "all" group
         if isinstance(extras.get("all"), dict):
             merged.update(extras.get("all", {}))
-
-        # 2) Stage group at top-level extras: extras["ipc_emit"], extras["tee"], etc.
         if isinstance(extras.get(stage_key), dict):
             merged.update(extras.get(stage_key, {}))
-
-        # 3) Stage group nested under extras["pipeline"]: extras["pipeline"]["ipc_emit"], etc.
         pipeline_cfg = extras.get("pipeline")
         if isinstance(pipeline_cfg, dict):
             nested = pipeline_cfg.get(stage_key)
             if isinstance(nested, dict):
                 merged.update(nested)
-
-        # 4) Prefix overrides from pipe_params: "ipc_emit.host=..." etc.
         prefix = f"{stage_key}."
-        for k, v in pipe_params.items():
-            if isinstance(k, str) and k.startswith(prefix):
-                merged[k[len(prefix):]] = v
-
+        for key, value in pipe_params.items():
+            if isinstance(key, str) and key.startswith(prefix):
+                merged[key[len(prefix):]] = value
         return merged
+
+    def _stage(self, stage_name: str) -> BaseBlock:
+        block = self._stage_instances.get(stage_name)
+        if block is None:
+            block = BLOCKS.create(stage_name)
+            self._stage_instances[stage_name] = block
+        return block
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         extras: Dict[str, Any] = params or {}
-        self.logger = extras.get("logger")
+        with self._execution_lock:
+            if self._closed:
+                # A stopped router may be restarted with the same manager.
+                self._closed = False
+            self.logger = extras.get("logger")
+            pipe_params = self._pipeline_params(extras)
+            stages = self._resolve_stages(pipe_params)
+            stop_on_error = bool(pipe_params.get("stop_on_error", True))
+            debug = bool(pipe_params.get("debug", False))
+            log_stage_messages = bool(pipe_params.get("log_stage_messages", debug))
+            current = payload
+            self._meta_chain = []
 
-        pipe_params = self._pipeline_params(extras)
-        stages = self._resolve_stages(pipe_params)
+            if debug:
+                self.log(f"[Analysis][Pipeline] Starting with {len(stages)} stages: {' | '.join(stages)}")
 
-        stop_on_error = bool(pipe_params.get("stop_on_error", True))
-        debug = bool(pipe_params.get("debug", False))
+            for stage_name in stages:
+                stage_meta: Dict[str, Any] = {"stage": stage_name}
+                started = time.perf_counter()
+                try:
+                    block = self._stage(stage_name)
+                    block.logger = self.logger if log_stage_messages else False
+                    stage_params = self._stage_params(stage_name, extras, pipe_params)
 
-        current = payload
-        self._meta_chain.clear()
+                    # An explicitly disabled stage is a supported no-op.
+                    if stage_params.get("enabled") is False or str(stage_params.get("mode", "")).lower() in {"off", "none", "disabled"}:
+                        stage_meta.update({"skipped": True, "reason": "disabled"})
+                        self._meta_chain.append(stage_meta)
+                        continue
 
-        if debug:
-            self.log(f"[Analysis][Pipeline] Starting with {len(stages)} stages: {' | '.join(stages)}")
+                    output, meta = block.execute(current, params=stage_params)
+                    stage_meta.update(meta or {})
+                    stage_meta["elapsed_sec"] = round(time.perf_counter() - started, 6)
+                    self._meta_chain.append(stage_meta)
+                    current = output
 
-        for stage_name in stages:
-            stage_meta: Dict[str, Any] = {"stage": stage_name}
-            start = time.time()
-            try:
-                blk = BLOCKS.create(stage_name)
-                blk.logger = self.logger
-                stage_params = self._stage_params(stage_name, extras, pipe_params)
+                    if stop_on_error and stage_meta.get("error"):
+                        self.log(f"[Analysis][Pipeline] ERROR in stage '{stage_name}': {stage_meta.get('error')}")
+                        break
+                except Exception as exc:
+                    stage_meta.update({
+                        "error": "stage_failed",
+                        "exception": repr(exc),
+                        "elapsed_sec": round(time.perf_counter() - started, 6),
+                    })
+                    self._meta_chain.append(stage_meta)
+                    self.log(f"[Analysis][Pipeline] CRITICAL ERROR in stage '{stage_name}': {exc}")
+                    if stop_on_error:
+                        break
 
-                if debug:
-                    preview_in = str(current)
-                    stage_meta["in_len"] = len(preview_in)
-                    stage_meta["in_preview"] = preview_in[:160]
-                    self.log(f"[Analysis][Pipeline] > Running stage '{stage_name}'...")
+            return current, {
+                "type": "packet-pipeline",
+                "stages": stages,
+                "chain": list(self._meta_chain),
+                "stop_on_error": stop_on_error,
+                "debug": debug,
+            }
 
-                out, meta = blk.execute(current, params=stage_params)
-                elapsed = time.time() - start
-                stage_meta.update(meta or {})
-                stage_meta["elapsed_sec"] = round(elapsed, 6)
+    def close(self) -> None:
+        """Close sockets/resources owned by cached stateful stages."""
+        with self._execution_lock:
+            for block in list(self._stage_instances.values()):
+                for method_name in ("close", "stop", "shutdown"):
+                    method = getattr(block, method_name, None)
+                    if callable(method):
+                        try:
+                            method()
+                        except Exception:
+                            pass
+                        break
+            self._stage_instances.clear()
+            self._meta_chain.clear()
+            self._closed = True
 
-                if debug:
-                    preview_out = str(out)
-                    stage_meta["out_len"] = len(preview_out)
-                    stage_meta["out_preview"] = preview_out[:200]
-
-                self._meta_chain.append(stage_meta)
-                current = out
-
-                if stop_on_error and stage_meta.get("error"):
-                    self.log(
-                        f"[Analysis][Pipeline] ERROR in stage '{stage_name}': {stage_meta.get('error')}. Stopping pipeline.")
-                    break
-
-            except Exception as e:
-                elapsed = time.time() - start
-                stage_meta.update({
-                    "error": "stage_failed", "exception": repr(e), "elapsed_sec": round(elapsed, 6),
-                })
-                self._meta_chain.append(stage_meta)
-                self.log(f"[Analysis][Pipeline] CRITICAL ERROR in stage '{stage_name}': {e}")
-                if stop_on_error:
-                    break
-
-        if debug:
-            self.log(f"[Analysis][Pipeline] Pipeline finished.")
-
-        meta_out = {
-            "type": "packet-pipeline",
-            "stages": stages,
-            "chain": self._meta_chain,
-            "stop_on_error": stop_on_error,
-            "debug": debug,
-        }
-
-        return None, meta_out
+    stop = close
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "stages": "init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee",
+            "stages": "init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
             "stop_on_error": True,
             "debug": False,
-            "example": "Use create_pipeline_extras(...) to build the 'params' dict.",
+            "log_stage_messages": False,
+            "example": "Use create_pipeline_extras(...) to build the params dictionary.",
         }
 
 
@@ -1260,6 +1346,8 @@ class IPCEmitterBlock(BaseBlock):
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         # Configuration
+        if params.get("enabled") is False:
+            return payload, {"ipc_sent": False, "skipped": True, "reason": "disabled"}
         host = str(params.get("host", "127.0.0.1"))
         port = int(params.get("port", 9999))
 
@@ -1401,6 +1489,27 @@ class IPCEmitterBlock(BaseBlock):
         meta.setdefault("ipc_sent_tcp_client", False)
         meta.setdefault("ipc_sent_tcp_server", False)
         return payload, meta
+
+    def close(self) -> None:
+        for client in list(self._tcp_server_clients):
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._tcp_server_clients.clear()
+        for attr in ("_udp_sock", "_tcp_client_sock", "_tcp_server_sock"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        self._udp_addr = None
+        self._tcp_client_addr = None
+        self._tcp_server_addr = None
+
+    stop = close
 
     def get_params_info(self) -> Dict[str, Any]:
         return {

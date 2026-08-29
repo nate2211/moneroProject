@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Union, Tuple, Sequence, Mapping
 
 import numpy as np
+from scapy.layers.inet import IP, TCP, UDP, ICMP
+from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply
 from scapy.packet import Raw
 
 
@@ -1947,7 +1949,8 @@ class CodeOutputManager:
     PORT_TOPIC_HINTS = {
         443: "tls", 8443: "tls", 4443: "tls",
         80: "http", 8080: "http", 8000: "http",
-        18080: "monero", 18081: "monero", 18083: "monero", 18089: "monero",
+        18080: "monero", 18081: "monero", 18082: "monero", 18083: "monero", 18089: "monero",
+        10001: "stratum", 10128: "stratum", 10132: "stratum", 20128: "stratum",
         28080: "monero", 28081: "monero", 37888: "monero", 37889: "monero",
         53: "dns", 5353: "dns", 3702: "dns", 1900: "dns", 137: "dns",
         67: "dhcp", 68: "dhcp",
@@ -1961,6 +1964,10 @@ class CodeOutputManager:
     BRACKET_TAG_RE = re.compile(r"\[([A-Za-z0-9_ :#/-]+)\]")
     KV_TOKEN_RE = re.compile(r'(\b[\w\./:-]+)=(".*?"|\'.*?\'|[^\s]+)')
     NDJSON_SPLIT_RE = re.compile(r"\\r?\\n+")
+    SAFE_AUTO_ACTIONS = {
+        "arp", "icmp", "stratum", "monero-rpc", "sip-options",
+        "rtsp-options", "stun-binding",
+    }
 
     def __init__(self, router_logger: Any):
         self.logger = router_logger
@@ -1971,10 +1978,11 @@ class CodeOutputManager:
         self._clean_thread: Optional[threading.Thread] = None
         self._emit_thread: Optional[threading.Thread] = None
         self._probe_thread: Optional[threading.Thread] = None
+        self._auto_action_thread: Optional[threading.Thread] = None
         self._probe_threads: List[threading.Thread] = []
-        self._generation_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self._generation_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=256)
         self._probe_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=512)
-        self._bus_queue: "queue.Queue[Any]" = queue.Queue()
+        self._bus_queue: "queue.Queue[Any]" = queue.Queue(maxsize=8192)
         self._knowledge_by_topic: Dict[str, Deque[KnowledgePacket]] = {}
         self._recent_packet_hashes: Deque[str] = deque(maxlen=4096)
         self._emit_history: Deque[Tuple[float, str]] = deque(maxlen=64)
@@ -1991,6 +1999,14 @@ class CodeOutputManager:
         self._hooks: Dict[str, List[Callable[..., None]]] = defaultdict(list)
         self._router = None
         self._handshake_detach = None
+        self._native_control = None
+        self._native_streams: Dict[int, Dict[str, Any]] = {}
+        self._pending_probes: Dict[str, Dict[str, Any]] = {}
+        self._pending_probe_lock = threading.RLock()
+        self._active_probe_lock = threading.RLock()
+        self._active_probe_sockets: set = set()
+        self._active_probe_processes: set = set()
+        self._accepting = False
         self._settings = {
             "enabled": True,
             "verbose": 2,
@@ -2007,9 +2023,40 @@ class CodeOutputManager:
             "probe_default_iface": "",
             "probe_use_router_path": True,
             "virtual_wan_enabled": True,
+            "auto_actions_enabled": False,
+            "auto_actions_ai_enabled": True,
+            "auto_actions_private_only": True,
+            "auto_actions_interval": 15.0,
+            "auto_actions_rate_per_minute": 6,
+            "auto_actions_target_cooldown": 300.0,
+            "auto_actions_min_hits": 3,
+            "auto_actions_allowed": (
+                "arp", "icmp", "stratum", "monero-rpc", "sip-options",
+                "rtsp-options", "stun-binding",
+            ),
         }
         self._probe_history: Deque[float] = deque(maxlen=512)
         self._probe_results: Deque[Dict[str, Any]] = deque(maxlen=512)
+        self._interface_telemetry: Dict[str, Any] = {
+            "submitted": 0, "queued": 0, "dropped": 0, "events": 0,
+            "routed": 0, "ingress": 0, "last_source": "",
+        }
+        self._telemetry_last_log: Dict[str, float] = {}
+        self._telemetry_log_interval = 1.5
+        self._target_lock = threading.RLock()
+        self._learned_targets: Dict[str, Dict[str, Any]] = {}
+        self._learned_target_ttl = 30.0 * 60.0
+        self._learned_target_limit = 4096
+        self._learned_target_updates = 0
+        self._learned_target_evictions = 0
+        self._auto_action_lock = threading.RLock()
+        self._auto_action_rate: Deque[float] = deque(maxlen=512)
+        self._auto_action_target_last: Dict[Tuple[str, str], float] = {}
+        self._auto_action_history: Deque[Dict[str, Any]] = deque(maxlen=512)
+        self._auto_action_runs = 0
+        self._auto_action_executed = 0
+        self._auto_action_skipped = 0
+        self._auto_action_failed = 0
         self.packet_learner = PacketLearnerManager(keep_raw_samples=True, logger=self._log, log_level=2)
         self.stats_manager = StatisticsManager()
         self.method_generator = SnapshotMethodGenerator()
@@ -2029,6 +2076,9 @@ class CodeOutputManager:
         merged["allow_public_targets"] = bool(merged["allow_public_targets"])
         merged["probe_use_router_path"] = bool(merged["probe_use_router_path"])
         merged["virtual_wan_enabled"] = bool(merged["virtual_wan_enabled"])
+        merged["auto_actions_enabled"] = bool(merged["auto_actions_enabled"])
+        merged["auto_actions_ai_enabled"] = bool(merged["auto_actions_ai_enabled"])
+        merged["auto_actions_private_only"] = bool(merged["auto_actions_private_only"])
         merged["verbose"] = max(0, min(5, int(merged["verbose"])))
         merged["emit_interval"] = max(0.5, float(merged["emit_interval"]))
         merged["emit_jitter"] = max(0.0, float(merged["emit_jitter"]))
@@ -2038,6 +2088,34 @@ class CodeOutputManager:
         merged["probe_rate_per_minute"] = max(1, int(merged["probe_rate_per_minute"]))
         merged["probe_max_concurrent"] = max(1, min(16, int(merged["probe_max_concurrent"])))
         merged["probe_default_iface"] = str(merged["probe_default_iface"] or "").strip()
+        merged["auto_actions_interval"] = max(
+            5.0, min(3600.0, float(merged["auto_actions_interval"]))
+        )
+        merged["auto_actions_rate_per_minute"] = max(
+            1, min(60, int(merged["auto_actions_rate_per_minute"]))
+        )
+        merged["auto_actions_target_cooldown"] = max(
+            10.0, min(86400.0, float(merged["auto_actions_target_cooldown"]))
+        )
+        merged["auto_actions_min_hits"] = max(
+            1, min(100000, int(merged["auto_actions_min_hits"]))
+        )
+        raw_allowed = merged.get("auto_actions_allowed")
+        if isinstance(raw_allowed, str):
+            allowed_values = re.split(r"[,;\s]+", raw_allowed)
+        else:
+            try:
+                allowed_values = list(raw_allowed or [])
+            except Exception:
+                allowed_values = []
+        normalized_allowed = []
+        for value in allowed_values:
+            key = str(value or "").strip().casefold().replace("_", "-")
+            if key in self.SAFE_AUTO_ACTIONS and key not in normalized_allowed:
+                normalized_allowed.append(key)
+        if not normalized_allowed and "auto_actions_allowed" not in settings:
+            normalized_allowed = ["arp", "icmp"]
+        merged["auto_actions_allowed"] = tuple(normalized_allowed)
         self._settings = merged
         self.set_verbose(merged["verbose"])
         self.set_auto_emit_config(
@@ -2045,26 +2123,159 @@ class CodeOutputManager:
             jitter_s=merged["emit_jitter"],
             min_new_packets=merged["min_new_packets"],
         )
-        self.log_message(
-            "[CodeOutput] ⚙️ Configured "
+        config_message = (
+            "[CodeOutputInterface][Config] ⚙️ Configured "
             f"enabled={merged['enabled']} probes={merged['active_probes']} "
             f"public={merged['allow_public_targets']} router_path={merged['probe_use_router_path']} "
-            f"virtual_wan={merged['virtual_wan_enabled']} max_code={merged['max_generated_chars']}"
+            f"virtual_wan={merged['virtual_wan_enabled']} max_code={merged['max_generated_chars']} "
+            f"auto_actions={merged['auto_actions_enabled']} ai={merged['auto_actions_ai_enabled']} "
+            f"private_only={merged['auto_actions_private_only']}"
         )
+        self.log_message(config_message)
+        self._interface_event("config", config_message, settings=dict(merged))
         return self.settings_snapshot()
 
     def settings_snapshot(self) -> Dict[str, Any]:
         out = dict(self._settings)
+        with self._target_lock:
+            learned_target_count = len(self._learned_targets)
+            learned_target_updates = int(self._learned_target_updates)
+            learned_target_evictions = int(self._learned_target_evictions)
+        with self._auto_action_lock:
+            auto_action_history = list(self._auto_action_history)[-20:]
+            auto_action_stats = {
+                "runs": int(self._auto_action_runs),
+                "executed": int(self._auto_action_executed),
+                "skipped": int(self._auto_action_skipped),
+                "failed": int(self._auto_action_failed),
+                "recent": auto_action_history,
+            }
         out.update({
             "probe_queue": self._probe_queue.qsize(),
             "probe_results": len(self._probe_results),
             "router_bound": self._router is not None,
+            "bus_queue": self._bus_queue.qsize(),
+            "bus_queue_max": self._bus_queue.maxsize,
+            "interface_telemetry": dict(self._interface_telemetry),
+            "pending_probes": len(self._pending_probes),
+            "native_control": self._native_control.stats() if self._native_control is not None else {"available": 0},
+            "native_streams": dict(self._native_streams),
+            "learned_targets": learned_target_count,
+            "learned_target_updates": learned_target_updates,
+            "learned_target_evictions": learned_target_evictions,
+            "auto_action_stats": auto_action_stats,
         })
         return out
 
     def bind_router(self, router: Any) -> None:
         self._router = router
-        self.log_message("[CodeOutput] ✅ Router packet/response context attached.")
+        self.log_message("[CodeOutput][CodeOutputInterface] ✅ Router packet/response context attached.")
+
+    def _interface_event(self, event: str, message: str, **metadata) -> None:
+        """Mirror CodeOutput feature activity into the interface capture history."""
+        router = self._router
+        manager = getattr(router, "codeoutput_interface_manager", None) if router is not None else None
+        recorder = getattr(manager, "record_feature_event", None)
+        if callable(recorder):
+            try:
+                recorder(event, message, **metadata)
+            except Exception:
+                pass
+
+    def bind_native_control(self, native_control: Any) -> None:
+        self._native_control = native_control
+        if native_control is not None:
+            self.log_message("[CodeOutput][NativeControl] ✅ Native stream/probe control attached.")
+
+    def open_packet_stream(
+            self, *, protocol: int = 0, direction: int = 0,
+            flags: int = 0, label: str = "CodeOutputStream",
+    ) -> int:
+        if self._native_control is None or not getattr(self._native_control, "available", False):
+            raise RuntimeError("CodeOutputControl.dll is unavailable")
+        stream_id = int(self._native_control.open_stream(protocol, direction, flags))
+        if not stream_id:
+            raise RuntimeError("native CodeOutput stream table is full")
+        self._native_streams[stream_id] = {
+            "label": str(label), "protocol": int(protocol),
+            "direction": int(direction), "flags": int(flags),
+            "opened": time.time(), "frames": 0,
+        }
+        message = (
+            f"[CodeOutputInterface][Stream] ✅ opened id={stream_id} label={label} "
+            f"protocol={protocol} direction={direction} flags=0x{int(flags):x}"
+        )
+        self.log_message(message)
+        self._interface_event(
+            "stream-open", message, stream_id=stream_id, label=str(label),
+            protocol=int(protocol), direction=int(direction), flags=int(flags),
+        )
+        return stream_id
+
+    def close_packet_stream(self, stream_id: int) -> bool:
+        stream_id = int(stream_id)
+        closed = bool(self._native_control and self._native_control.close_stream(stream_id))
+        if closed:
+            self._native_streams.pop(stream_id, None)
+            message = f"[CodeOutputInterface][Stream] closed id={stream_id}"
+            self.log_message(message)
+            self._interface_event("stream-close", message, stream_id=stream_id)
+        return closed
+
+    def configure_packet_stream(
+            self, stream_id: int, *, protocol: Optional[int] = None,
+            direction: Optional[int] = None, flags: Optional[int] = None,
+    ) -> bool:
+        stream_id = int(stream_id)
+        current = dict(self._native_streams.get(stream_id) or {})
+        if not current:
+            return False
+        protocol_value = int(current.get("protocol", 0) if protocol is None else protocol)
+        direction_value = int(current.get("direction", 0) if direction is None else direction)
+        flags_value = int(current.get("flags", 0) if flags is None else flags)
+        updated = bool(
+            self._native_control
+            and self._native_control.set_stream_policy(
+                stream_id, protocol=protocol_value,
+                direction=direction_value, flags=flags_value,
+            )
+        )
+        if updated:
+            current.update({
+                "protocol": protocol_value, "direction": direction_value,
+                "flags": flags_value, "updated": time.time(),
+            })
+            self._native_streams[stream_id] = current
+            message = (
+                f"[CodeOutputInterface][Stream] policy id={stream_id} protocol={protocol_value} "
+                f"direction={direction_value} flags=0x{flags_value:x}"
+            )
+            self.log_message(message)
+            self._interface_event(
+                "stream-policy", message, stream_id=stream_id,
+                protocol=protocol_value, direction=direction_value, flags=flags_value,
+            )
+        return updated
+
+    def send_stream_packet(self, stream_id: int, packet: Any, *, pid: Optional[int] = None) -> bool:
+        stream_id = int(stream_id)
+        if self._native_control is not None and getattr(self._native_control, "available", False):
+            accepted = bool(self._native_control.submit_frame(packet, stream_id=stream_id, pid=pid))
+        else:
+            accepted = self.route_packet(
+                packet, inbound_iface="CodeOutput",
+                reason=f"codeoutput-stream:{stream_id}",
+            )
+        if accepted and stream_id in self._native_streams:
+            self._native_streams[stream_id]["frames"] += 1
+        message = (
+            f"[CodeOutputInterface][Stream] {'✅' if accepted else '❌'} frame "
+            f"stream={stream_id} pid={pid or '-'}"
+        )
+        self._interface_event(
+            "stream-frame", message, stream_id=stream_id, pid=pid, accepted=bool(accepted),
+        )
+        return accepted
 
     def bind_handshake_manager(self, handshake_manager: Any) -> None:
         self._handshake_manager = handshake_manager
@@ -2139,6 +2350,73 @@ class CodeOutputManager:
         except Exception:
             return {"selector": raw, "full_name": raw, "friendly_name": raw, "aliases": [raw]}
 
+    def _enqueue_bus_item(self, item: Dict[str, Any]) -> bool:
+        """Nonblocking producer path with drop-oldest pressure handling."""
+        try:
+            self._bus_queue.put_nowait(item)
+            self._interface_telemetry["queued"] += 1
+            return True
+        except queue.Full:
+            try:
+                self._bus_queue.get_nowait()
+                self._interface_telemetry["dropped"] += 1
+                with self._k_lock:
+                    self._stats.packets_dropped += 1
+                self._bus_queue.put_nowait(item)
+                self._interface_telemetry["queued"] += 1
+                return True
+            except Exception:
+                self._interface_telemetry["dropped"] += 1
+                with self._k_lock:
+                    self._stats.packets_dropped += 1
+                return False
+
+    @staticmethod
+    def _packet_interface_summary(packet: Any, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        context = dict(context or {})
+        out = {"length": 0, "src": "", "dst": "", "sport": 0, "dport": 0, "protocol": "packet"}
+        try:
+            out["length"] = len(bytes(packet))
+        except Exception:
+            try:
+                out["length"] = len(packet)
+            except Exception:
+                pass
+        try:
+            ip = packet.getlayer(IP) if IP is not None else None
+            if ip is None and IPv6 is not None:
+                ip = packet.getlayer(IPv6)
+            if ip is not None:
+                out["src"] = str(getattr(ip, "src", "") or "")
+                out["dst"] = str(getattr(ip, "dst", "") or "")
+                out["ip_version"] = 6 if IPv6 is not None and isinstance(ip, IPv6) else 4
+            transport = None
+            if TCP is not None and packet.haslayer(TCP):
+                transport = packet[TCP]
+                out["protocol"] = "tcp"
+            elif UDP is not None and packet.haslayer(UDP):
+                transport = packet[UDP]
+                out["protocol"] = "udp"
+            if transport is not None:
+                out["sport"] = int(getattr(transport, "sport", 0) or 0)
+                out["dport"] = int(getattr(transport, "dport", 0) or 0)
+            meta = dict(getattr(packet, "_protocol_metadata", None) or {})
+            out["topics"] = [k for k in ("tls", "stratum", "monero_levin", "monero_rpc", "json_rpc", "ipv6") if meta.get(k)]
+            tls = dict(meta.get("tls") or {})
+            if tls.get("sni"):
+                out["sni"] = tls.get("sni")
+        except Exception:
+            pass
+        out["component"] = str(context.get("component") or context.get("source") or "CodeOutput")
+        out["stage"] = str(context.get("path_stage") or context.get("phase") or "observe")
+        return out
+
+    def _emit_interface_telemetry(self, summary: Dict[str, Any], *, source: str, accepted: bool) -> None:
+        """Maintain counters only; packet-path logging is intentionally disabled."""
+        self._interface_telemetry["last_source"] = str(source or "")
+        if not accepted:
+            self._interface_telemetry["dropped"] += 1
+
     def route_packet(
             self, packet: Any, *, inbound_iface: Optional[str] = None,
             egress_iface: Optional[str] = None,
@@ -2155,10 +2433,20 @@ class CodeOutputManager:
         route = getattr(self._router, "route_codeoutput_packet", None)
         if not callable(route):
             raise RuntimeError("Bound router does not expose route_codeoutput_packet")
-        return bool(route(
+        accepted = bool(route(
             packet, inbound_iface=inbound_iface, egress_iface=egress_iface,
             reason=reason,
         ))
+        self._interface_telemetry["routed"] += int(accepted)
+        summary = self._packet_interface_summary(packet, {"phase": reason, "source": "explicit-route"})
+        self._emit_interface_telemetry(summary, source="explicit-route", accepted=accepted)
+        message = (
+            f"[CodeOutputInterface][Route] {'✅' if accepted else '❌'} "
+            f"{summary.get('protocol')} {summary.get('src')}:{summary.get('sport')} -> "
+            f"{summary.get('dst')}:{summary.get('dport')} reason={reason}"
+        )
+        self._interface_event("route", message, accepted=accepted, reason=reason, summary=summary)
+        return accepted
 
     def ingest_packet(
             self, packet: Any, *, source_iface: Optional[str] = None,
@@ -2170,6 +2458,8 @@ class CodeOutputManager:
         egress remains the responsibility of route_packet(), preventing passive
         learning from becoming a retransmission loop.
         """
+        if not self._accepting or self._stop_event.is_set():
+            return False
         if not self._settings.get("enabled", True):
             return False
         if not self._settings.get("virtual_wan_enabled", True):
@@ -2179,10 +2469,385 @@ class CodeOutputManager:
         ingest = getattr(self._router, "ingest_codeoutput_packet", None)
         if not callable(ingest):
             raise RuntimeError("Bound router does not expose ingest_codeoutput_packet")
-        return bool(ingest(
+        accepted = bool(ingest(
             packet, source_iface=source_iface, direction=direction,
             metadata=dict(metadata or {}),
         ))
+        self._interface_telemetry["ingress"] += int(accepted)
+        summary = self._packet_interface_summary(packet, dict(metadata or {}, phase=direction, source=source_iface or "CodeOutput"))
+        self._emit_interface_telemetry(summary, source=str(source_iface or "CodeOutput"), accepted=accepted)
+        return accepted
+
+    def _prune_learned_targets_locked(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else float(now)
+        cutoff = now - self._learned_target_ttl
+        for ip_text, entry in list(self._learned_targets.items()):
+            if float(entry.get("last_seen") or 0.0) < cutoff:
+                self._learned_targets.pop(ip_text, None)
+        if len(self._learned_targets) <= self._learned_target_limit:
+            return
+        victims = sorted(
+            self._learned_targets.items(),
+            key=lambda item: (
+                float(item[1].get("last_seen") or 0.0),
+                int(item[1].get("hits") or 0),
+            ),
+        )
+        remove_count = len(self._learned_targets) - self._learned_target_limit
+        for ip_text, _entry in victims[:remove_count]:
+            self._learned_targets.pop(ip_text, None)
+            self._learned_target_evictions += 1
+
+    def _learn_targets_from_packet(
+            self, packet: Any, inbound_iface: Optional[str],
+            context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Keep bounded endpoint evidence from CodeOutput's live packet data."""
+        try:
+            pkt = self._coerce_to_scapy_packet(packet)
+        except Exception:
+            pkt = None
+        if pkt is None:
+            return
+        try:
+            ip_layer = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+        except Exception:
+            ip_layer = None
+        if ip_layer is None:
+            return
+        protocol = "ip"
+        sport = dport = 0
+        try:
+            if pkt.haslayer(TCP):
+                protocol = "tcp"
+                sport, dport = int(pkt[TCP].sport), int(pkt[TCP].dport)
+            elif pkt.haslayer(UDP):
+                protocol = "udp"
+                sport, dport = int(pkt[UDP].sport), int(pkt[UDP].dport)
+            elif pkt.haslayer(ICMP) or pkt.haslayer(ICMPv6EchoRequest) or pkt.haslayer(ICMPv6EchoReply):
+                protocol = "icmp"
+        except Exception:
+            pass
+        now = time.time()
+        ctx = dict(context or {})
+        rows = (
+            (getattr(ip_layer, "src", ""), sport, "source"),
+            (getattr(ip_layer, "dst", ""), dport, "destination"),
+        )
+        with self._target_lock:
+            for ip_value, port, direction in rows:
+                text = str(ip_value or "").strip().split("%", 1)[0]
+                try:
+                    address = ipaddress.ip_address(text)
+                except Exception:
+                    continue
+                if address.is_unspecified or address.is_multicast:
+                    continue
+                ip_text = str(address)
+                entry = dict(self._learned_targets.get(ip_text) or {})
+                ports = set()
+                for value in entry.get("ports", []):
+                    try:
+                        value = int(value)
+                    except Exception:
+                        continue
+                    if value > 0:
+                        ports.add(value)
+                if int(port or 0) > 0:
+                    ports.add(int(port))
+                protocols = {str(value) for value in entry.get("protocols", []) if str(value)}
+                protocols.add(protocol)
+                interfaces = {str(value) for value in entry.get("interfaces", []) if str(value)}
+                if inbound_iface:
+                    interfaces.add(str(inbound_iface))
+                sources = {str(value) for value in entry.get("sources", []) if str(value)}
+                source = str(ctx.get("source") or ctx.get("producer") or "packet")
+                if source:
+                    sources.add(source)
+                entry.update({
+                    "ip": ip_text,
+                    "family": int(address.version),
+                    "ports": sorted(ports)[:128],
+                    "protocols": sorted(protocols)[:32],
+                    "interfaces": sorted(interfaces)[:32],
+                    "sources": sorted(sources)[:32],
+                    "direction": direction,
+                    "private": bool(address.is_private),
+                    "link_local": bool(address.is_link_local),
+                    "loopback": bool(address.is_loopback),
+                    "first_seen": float(entry.get("first_seen") or now),
+                    "last_seen": now,
+                    "hits": int(entry.get("hits") or 0) + 1,
+                })
+                self._learned_targets[ip_text] = entry
+                self._learned_target_updates += 1
+            self._prune_learned_targets_locked(now)
+
+    def learned_targets(
+            self, *, limit: int = 256, private_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        with self._target_lock:
+            self._prune_learned_targets_locked()
+            entries = [dict(value) for value in self._learned_targets.values()]
+        if private_only:
+            entries = [
+                entry for entry in entries
+                if entry.get("private") or entry.get("link_local")
+            ]
+        entries.sort(
+            key=lambda entry: (
+                float(entry.get("last_seen") or 0.0),
+                int(entry.get("hits") or 0),
+            ),
+            reverse=True,
+        )
+        return entries[:max(1, min(4096, int(limit)))]
+
+    def clear_learned_targets(self) -> None:
+        with self._target_lock:
+            self._learned_targets.clear()
+
+    def recent_auto_actions(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._auto_action_lock:
+            return list(self._auto_action_history)[-max(1, min(512, int(limit))):]
+
+    def _record_auto_action(
+            self, *, status: str, target: str = "", action: str = "",
+            reason: str = "", result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        record = {
+            "timestamp": time.time(),
+            "status": str(status),
+            "target": str(target or ""),
+            "action": str(action or ""),
+            "reason": str(reason or ""),
+            "result": dict(result or {}),
+        }
+        with self._auto_action_lock:
+            self._auto_action_history.append(record)
+            if status == "executed":
+                self._auto_action_executed += 1
+            elif status == "failed":
+                self._auto_action_failed += 1
+            else:
+                self._auto_action_skipped += 1
+        return record
+
+    def _auto_action_rate_allowed(self) -> bool:
+        now = time.monotonic()
+        cutoff = now - 60.0
+        with self._auto_action_lock:
+            while self._auto_action_rate and self._auto_action_rate[0] < cutoff:
+                self._auto_action_rate.popleft()
+            limit = int(self._settings.get("auto_actions_rate_per_minute", 6))
+            if len(self._auto_action_rate) >= limit:
+                return False
+            self._auto_action_rate.append(now)
+            return True
+
+    def _neighbor_has_mac(self, target: str) -> bool:
+        router = self._router
+        interface_manager = getattr(router, "codeoutput_interface_manager", None) if router else None
+        getter = getattr(interface_manager, "known_targets", None)
+        if not callable(getter):
+            return False
+        try:
+            for entry in getter(limit=512, private_only=False):
+                if str(entry.get("ip") or "") == str(target) and str(entry.get("mac") or ""):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _infer_auto_action(self, entry: Dict[str, Any], allowed: set) -> Tuple[str, str]:
+        target = str(entry.get("ip") or "")
+        ports = set()
+        for value in entry.get("ports", []):
+            try:
+                ports.add(int(value))
+            except Exception:
+                continue
+        protocols = {str(value).casefold() for value in entry.get("protocols", [])}
+        try:
+            address = ipaddress.ip_address(target)
+        except Exception:
+            address = None
+
+        if (
+                "arp" in allowed and address is not None and address.version == 4
+                and (address.is_private or address.is_link_local)
+                and not self._neighbor_has_mac(target)
+        ):
+            return "arp", "private IPv4 target has no cached neighbor MAC"
+
+        service_hints = (
+            ("stratum", {3333, 3334, 4242, 4444, 5555, 6666, 7777, 8888, 9999, 10001, 10128, 10132, 14444, 20128, 24444}),
+            ("monero-rpc", {18081, 18083, 18089, 28081, 38081}),
+            ("sip-options", {5060, 5061}),
+            ("rtsp-options", {554, 8554}),
+            ("stun-binding", {3478, 19302}),
+        )
+        for action, action_ports in service_hints:
+            if action in allowed and ports.intersection(action_ports):
+                return action, f"observed service port(s) {sorted(ports.intersection(action_ports))}"
+        if "stratum" in allowed and ({"stratum", "mining"} & protocols):
+            return "stratum", "packet learning classified the target as mining/Stratum"
+        if "monero-rpc" in allowed and ({"monero", "monero_rpc", "json_rpc"} & protocols):
+            return "monero-rpc", "packet learning classified the target as Monero/RPC"
+        if "icmp" in allowed:
+            return "icmp", "no stronger service evidence; bounded reachability check"
+        if "arp" in allowed and address is not None and address.version == 4:
+            return "arp", "fallback neighbor refresh"
+        return "", "no allowlisted action matches the learned evidence"
+
+    def _ai_refine_auto_action(
+            self, entry: Dict[str, Any], suggested: str, allowed: set,
+    ) -> Tuple[str, str]:
+        if not self._settings.get("auto_actions_ai_enabled", True):
+            return suggested, "AI refinement disabled"
+        target = str(entry.get("ip") or "")
+        prompt = (
+            "Choose one safe network action for the learned endpoint using only this allowlist: "
+            + ", ".join(sorted(allowed))
+            + ". Do not invent another action. Reply exactly ACTION=<token>. "
+            f"Endpoint={target}; ports={entry.get('ports', [])}; protocols={entry.get('protocols', [])}; "
+            f"hits={entry.get('hits', 0)}; suggested={suggested}."
+        )
+        try:
+            answer = str(self.ask_manager.ask(prompt) or "")
+        except Exception as exc:
+            return suggested, f"AI refinement failed: {exc}"
+        match = re.search(r"\bACTION\s*[:=]\s*([a-z0-9_-]+)", answer, re.IGNORECASE)
+        if not match:
+            return suggested, "AI returned no parseable allowlisted action"
+        candidate = match.group(1).strip().casefold().replace("_", "-")
+        if candidate not in allowed:
+            return suggested, f"AI proposed blocked action {candidate}"
+        if candidate == "arp":
+            try:
+                if ipaddress.ip_address(target).version != 4:
+                    return suggested, "AI proposed ARP for a non-IPv4 target"
+            except Exception:
+                return suggested, "AI proposed ARP for an invalid target"
+        return candidate, f"AI selected {candidate} from the configured allowlist"
+
+    def _choose_auto_action(self) -> Optional[Tuple[Dict[str, Any], str, str]]:
+        private_only = bool(self._settings.get("auto_actions_private_only", True))
+        min_hits = int(self._settings.get("auto_actions_min_hits", 3))
+        cooldown = float(self._settings.get("auto_actions_target_cooldown", 300.0))
+        allowed = set(self._settings.get("auto_actions_allowed") or ()) & self.SAFE_AUTO_ACTIONS
+        if not allowed:
+            return None
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        candidates = []
+        for entry in self.learned_targets(limit=512, private_only=private_only):
+            target = str(entry.get("ip") or "")
+            if not target or int(entry.get("hits") or 0) < min_hits:
+                continue
+            try:
+                address = ipaddress.ip_address(target)
+                if address.is_loopback or address.is_multicast or address.is_unspecified:
+                    continue
+                if private_only and not (address.is_private or address.is_link_local):
+                    continue
+            except Exception:
+                continue
+            suggested, reason = self._infer_auto_action(entry, allowed)
+            if not suggested:
+                continue
+            last = self._auto_action_target_last.get((target, suggested), 0.0)
+            if now_mono - last < cooldown:
+                continue
+            age = max(0.0, now_wall - float(entry.get("last_seen") or 0.0))
+            score = min(100000, int(entry.get("hits") or 0)) + max(0.0, 60.0 - age)
+            candidates.append((score, entry, suggested, reason))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _score, entry, suggested, reason = candidates[0]
+        action, ai_reason = self._ai_refine_auto_action(entry, suggested, allowed)
+        return entry, action, f"{reason}; {ai_reason}"
+
+    def _auto_action_loop(self) -> None:
+        while not self._stop_event.is_set():
+            interval = float(self._settings.get("auto_actions_interval", 15.0))
+            if self._stop_event.wait(max(1.0, interval)):
+                return
+            if not self._accepting or not self._settings.get("auto_actions_enabled", False):
+                continue
+            with self._auto_action_lock:
+                self._auto_action_runs += 1
+            choice = self._choose_auto_action()
+            if not choice:
+                continue
+            entry, action, reason = choice
+            target = str(entry.get("ip") or "")
+            if action != "arp" and not self._settings.get("active_probes", False):
+                try:
+                    address = ipaddress.ip_address(target)
+                except Exception:
+                    address = None
+                allowed = set(self._settings.get("auto_actions_allowed") or ())
+                if (
+                        "arp" in allowed and address is not None and address.version == 4
+                        and (address.is_private or address.is_link_local)
+                ):
+                    action = "arp"
+                    reason += "; active probes disabled, falling back to safe ARP refresh"
+                else:
+                    self._auto_action_target_last[(target, action)] = time.monotonic()
+                    self._record_auto_action(
+                        status="skipped", target=target, action=action,
+                        reason="active probes are disabled; no safe ARP fallback is available",
+                    )
+                    continue
+            if not self._auto_action_rate_allowed():
+                self._record_auto_action(
+                    status="skipped", target=target, action=action,
+                    reason="automatic action rate limit reached",
+                )
+                continue
+            router = self._router
+            interface_manager = getattr(router, "codeoutput_interface_manager", None) if router else None
+            if interface_manager is None:
+                self._record_auto_action(
+                    status="failed", target=target, action=action,
+                    reason="CodeOutputInterfaceManager is unavailable",
+                )
+                continue
+            try:
+                if action == "arp":
+                    result = interface_manager.resolve_neighbor(target)
+                else:
+                    result = interface_manager.communicate_with_target(
+                        target,
+                        service=action,
+                        resolve_neighbor=True,
+                        timeout=float(self._settings.get("probe_timeout", 3.0)),
+                    )
+                self._auto_action_target_last[(target, action)] = time.monotonic()
+                record = self._record_auto_action(
+                    status="executed", target=target, action=action,
+                    reason=reason, result=result,
+                )
+                message = (
+                    f"[CodeOutputInterface][AutoAction] ✅ {action} target={target} "
+                    f"reason={reason}"
+                )
+                self.log_message(message)
+                self._interface_event("auto-action", message, **record)
+            except Exception as exc:
+                self._auto_action_target_last[(target, action)] = time.monotonic()
+                record = self._record_auto_action(
+                    status="failed", target=target, action=action,
+                    reason=f"{reason}; error={exc}",
+                )
+                message = (
+                    f"[CodeOutputInterface][AutoAction] ❌ {action} target={target} error={exc}"
+                )
+                self.log_message(message)
+                self._interface_event("auto-action-failed", message, **record)
 
     def submit_probe(
             self,
@@ -2195,6 +2860,8 @@ class CodeOutputManager:
             iface: Optional[str] = None,
             expect_response: bool = True,
     ) -> str:
+        if not self._accepting or self._stop_event.is_set():
+            raise RuntimeError("CodeOutput is stopped")
         if not self._settings.get("enabled", True):
             raise RuntimeError("CodeOutput is disabled")
         if not self._settings.get("active_probes", False):
@@ -2226,11 +2893,60 @@ class CodeOutputManager:
             attributes={k: v for k, v in request.items() if k != "payload"} | {"payload_len": len(request["payload"])},
             tags=["codeoutput", "probe-request"], importance=2, source="CodeOutput",
         )
-        self.log_message(
-            f"[CodeOutput][Probe] ➡️ queued id={request_id} {request['protocol']} "
+        message = (
+            f"[CodeOutputInterface][Probe] ➡️ queued id={request_id} {request['protocol']} "
             f"{request['target']}:{request['port'] or '-'} iface={request['iface'] or 'route-default'}"
         )
+        self.log_message(message)
+        self._interface_event(
+            "probe-queued", message, probe_id=request_id, protocol=request["protocol"],
+            target=request["target"], port=request["port"], iface=request["iface"],
+            payload_len=len(request["payload"]),
+        )
         return request_id
+
+    def submit_service_probe(
+            self, service: str, target: str, *, iface: Optional[str] = None,
+            timeout: Optional[float] = None, port: Optional[int] = None,
+    ) -> str:
+        """Queue a router-path protocol probe for mining and telecom services."""
+        key = str(service or "").strip().casefold().replace("_", "-")
+        host = str(target or "").strip()
+        presets = {
+            "stratum": ("tcp", 10001, b'{"id":1,"method":"mining.subscribe","params":[]}\n'),
+            "monero-rpc": (
+                "tcp", 18081,
+                ("POST /json_rpc HTTP/1.1\r\nHost: " + host +
+                 "\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                 "Content-Length: 46\r\n\r\n"
+                 '{"jsonrpc":"2.0","id":"0","method":"get_info"}').encode("ascii", "replace"),
+            ),
+            "sip-options": (
+                "udp", 5060,
+                ("OPTIONS sip:" + host + " SIP/2.0\r\nVia: SIP/2.0/UDP codeoutput.invalid;branch=z9hG4bK-codeoutput\r\n"
+                 "From: <sip:codeoutput@localhost>;tag=router\r\nTo: <sip:" + host + ">\r\n"
+                 "Call-ID: codeoutput-probe@localhost\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 1\r\n"
+                 "Content-Length: 0\r\n\r\n").encode("ascii", "replace"),
+            ),
+            "rtsp-options": (
+                "tcp", 554,
+                ("OPTIONS rtsp://" + host + "/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: CodeOutputProbe/2.0\r\n\r\n").encode("ascii", "replace"),
+            ),
+            "stun-binding": (
+                "udp", 3478,
+                b"\x00\x01\x00\x00\x21\x12\xa4\x42CODEOUTPUT12",
+            ),
+        }
+        if key not in presets:
+            raise ValueError(
+                "Unknown service probe. Use stratum, monero-rpc, sip-options, "
+                "rtsp-options, or stun-binding."
+            )
+        protocol, default_port, payload = presets[key]
+        return self.submit_probe(
+            host, protocol=protocol, port=int(port or default_port),
+            payload=payload, timeout=timeout, iface=iface, expect_response=True,
+        )
 
     def recent_probe_results(self) -> List[Dict[str, Any]]:
         return list(self._probe_results)
@@ -2255,7 +2971,347 @@ class CodeOutputManager:
             self._stop_event.wait(min(sleep_for, 5.0))
         self._probe_history.append(time.monotonic())
 
+    @staticmethod
+    def _probe_packet_bytes(packet: Any) -> bytes:
+        try:
+            return bytes(packet)
+        except Exception:
+            return b""
+
+    def _match_pending_probe(self, packet: Any, *, inbound_iface: Optional[str] = None) -> None:
+        if not self._pending_probes:
+            return
+        try:
+            pkt = self._coerce_to_scapy_packet(packet)
+            if pkt is None:
+                return
+            ip_layer = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+            if ip_layer is None:
+                return
+            src = str(getattr(ip_layer, "src", "") or "").split("%", 1)[0]
+            dst = str(getattr(ip_layer, "dst", "") or "").split("%", 1)[0]
+            matches = []
+            with self._pending_probe_lock:
+                pending = list(self._pending_probes.items())
+            for probe_id, state in pending:
+                if state.get("resolved_ip") and src != state.get("resolved_ip"):
+                    continue
+                local_ip = str(state.get("source_ip") or "").split("%", 1)[0]
+                if local_ip and dst and dst != local_ip:
+                    continue
+                protocol = state.get("protocol")
+                matched = False
+                ok = False
+                detail = "response"
+                if protocol == "tcp" and pkt.haslayer(TCP):
+                    tcp = pkt[TCP]
+                    reverse_ports = (
+                        int(tcp.sport) == int(state.get("port") or 0)
+                        and int(tcp.dport) == int(state.get("sport") or 0)
+                    )
+                    if reverse_ports:
+                        flags = int(tcp.flags)
+                        phase = str(state.get("phase") or "syn")
+                        is_reset = bool(flags & 0x04)
+                        is_syn_ack = (flags & 0x12) == 0x12
+                        tcp_payload = bytes(tcp.payload) if tcp.payload is not None else b""
+                        if phase == "syn":
+                            matched = bool(is_syn_ack or is_reset)
+                            ok = bool(is_syn_ack and not is_reset)
+                            detail = "syn-ack" if is_syn_ack and not is_reset else "rst"
+                        else:
+                            has_data = bool(tcp_payload)
+                            is_fin = bool(flags & 0x01)
+                            matched = bool(has_data or is_fin or is_reset)
+                            ok = bool(has_data or (is_fin and not is_reset))
+                            detail = (
+                                "tcp-data" if has_data
+                                else "tcp-fin" if is_fin and not is_reset
+                                else "rst"
+                            )
+                        if matched:
+                            state["remote_seq"] = int(getattr(tcp, "seq", 0) or 0)
+                            state["remote_ack"] = int(getattr(tcp, "ack", 0) or 0)
+                            state["remote_flags"] = flags
+                            state["tcp_payload"] = tcp_payload[:65535]
+                elif protocol == "udp" and pkt.haslayer(UDP):
+                    udp = pkt[UDP]
+                    matched = (
+                        int(udp.sport) == int(state.get("port") or 0)
+                        and int(udp.dport) == int(state.get("sport") or 0)
+                    )
+                    ok = matched
+                    detail = "udp-response"
+                elif protocol == "icmp":
+                    if pkt.haslayer(ICMP):
+                        icmp = pkt[ICMP]
+                        matched = (
+                            int(getattr(icmp, "type", -1)) == 0
+                            and int(getattr(icmp, "id", -1)) == int(state.get("icmp_id") or -2)
+                        )
+                        ok = matched
+                        detail = "icmp-echo-reply"
+                    elif pkt.haslayer(ICMPv6EchoReply):
+                        icmp6 = pkt[ICMPv6EchoReply]
+                        matched = int(getattr(icmp6, "id", -1)) == int(state.get("icmp_id") or -2)
+                        ok = matched
+                        detail = "icmpv6-echo-reply"
+                if matched:
+                    matches.append((probe_id, state, detail, ok, pkt))
+            for probe_id, state, detail, ok, pkt in matches:
+                state["response"] = self._probe_packet_bytes(pkt)[:65535]
+                state["response_iface"] = str(inbound_iface or "")
+                state["response_type"] = detail
+                state["ok"] = bool(ok)
+                state["matched"] = True
+                state["event"].set()
+        except Exception:
+            return
+
+    def observe_probe_response(self, packet: Any, inbound_iface: Optional[str] = None) -> None:
+        """Early router hook so probe replies are matched before consuming managers return."""
+        self._match_pending_probe(packet, inbound_iface=inbound_iface)
+
+    def _run_router_probe(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        started = time.monotonic()
+        result = {
+            "id": request["id"], "target": request["target"],
+            "protocol": request["protocol"], "port": request.get("port"),
+            "iface": request.get("iface"), "ok": False, "response": b"",
+            "error": None, "resolved_ip": None, "router_path": True,
+        }
+        infos = socket.getaddrinfo(
+            request["target"], request.get("port") or 0, 0,
+            socket.SOCK_DGRAM if request["protocol"] == "udp" else socket.SOCK_STREAM,
+        )
+        if not infos:
+            raise OSError("target did not resolve")
+        family, _, _, _, sockaddr = infos[0]
+        resolved_ip = str(sockaddr[0]).split("%", 1)[0]
+        result["resolved_ip"] = resolved_ip
+        if not self._probe_allowed(resolved_ip):
+            raise PermissionError("public probe target blocked by CodeOutput settings")
+        identity = self._resolve_probe_interface(request.get("iface")) if request.get("iface") else {}
+        route_iface = str(identity.get("full_name") or request.get("iface") or "").strip()
+        source_ip = str(identity.get("ipv4") or identity.get("ipv6") or "").split("%", 1)[0]
+        if not source_ip and self._router is not None:
+            if family == socket.AF_INET6:
+                source_ip = str(
+                    getattr(self._router, "router_ipv6_out", "")
+                    or getattr(self._router, "router_ipv6_link_local_out", "")
+                    or ""
+                ).split("%", 1)[0]
+            else:
+                source_ip = str(
+                    getattr(self._router, "router_ip_out", "")
+                    or getattr(self._router, "router_ip_in", "")
+                    or ""
+                )
+        sport = random.randint(49152, 65535)
+        ident = random.randint(1, 65535)
+        seq = random.randint(1, 0x7fffffff)
+        payload = bytes(request.get("payload") or b"")
+        timeout = max(0.25, min(60.0, float(request["timeout"])))
+        deadline = time.monotonic() + timeout
+
+        def network_layer():
+            if family == socket.AF_INET6:
+                return IPv6(src=source_ip, dst=resolved_ip) if source_ip else IPv6(dst=resolved_ip)
+            return IP(src=source_ip, dst=resolved_ip, id=ident) if source_ip else IP(dst=resolved_ip, id=ident)
+
+        def mark_packet(packet, stage: str):
+            try:
+                setattr(packet, "_codeoutput_probe_id", request["id"])
+                setattr(packet, "_codeoutput_packet", True)
+                setattr(packet, "_codeoutput_explicit_route", True)
+                setattr(packet, "_codeoutput_probe_stage", stage)
+            except Exception:
+                pass
+            return packet
+
+        if request["protocol"] == "tcp":
+            packet = mark_packet(
+                network_layer() / TCP(
+                    sport=sport, dport=int(request["port"]), flags="S", seq=seq,
+                ),
+                "syn",
+            )
+        elif request["protocol"] == "udp":
+            packet = mark_packet(
+                network_layer() / UDP(
+                    sport=sport, dport=int(request["port"]),
+                ) / Raw(payload or b"\x00"),
+                "datagram",
+            )
+        else:
+            if family == socket.AF_INET6:
+                packet = mark_packet(
+                    network_layer() / ICMPv6EchoRequest(id=ident, seq=1, data=payload),
+                    "icmp-echo",
+                )
+            else:
+                packet = mark_packet(
+                    network_layer() / ICMP(type=8, id=ident, seq=1) / Raw(payload),
+                    "icmp-echo",
+                )
+
+        state = {
+            "event": threading.Event(), "protocol": request["protocol"],
+            "phase": "syn" if request["protocol"] == "tcp" else "response",
+            "resolved_ip": resolved_ip, "source_ip": source_ip,
+            "port": request.get("port"), "sport": sport, "icmp_id": ident,
+            "response": b"", "ok": False, "matched": False,
+        }
+        with self._pending_probe_lock:
+            self._pending_probes[request["id"]] = state
+        try:
+            accepted = self.route_packet(
+                packet, inbound_iface="CodeOutput", egress_iface=None,
+                reason=f"active-probe:{request['id']}:initial",
+            )
+            result["sent"] = bool(accepted)
+            result["source_ip"] = source_ip or None
+            result["resolved_iface"] = route_iface or None
+            result["sport"] = sport
+            if not accepted:
+                raise RuntimeError("router rejected CodeOutput probe packet")
+            if not request.get("expect_response", True):
+                result["ok"] = True
+            elif request["protocol"] != "tcp":
+                state["event"].wait(max(0.0, deadline - time.monotonic()))
+                result["ok"] = bool(state.get("ok"))
+            else:
+                # Raw TCP probes complete the handshake before sending the
+                # Stratum/Monero/RTSP application request.  The normal router
+                # capture path supplies SYN-ACK and response packets to
+                # observe_probe_response().
+                state["event"].wait(max(0.0, deadline - time.monotonic()))
+                if not state.get("matched"):
+                    result["error"] = "TimeoutError: no SYN-ACK/RST observed on router capture path"
+                elif state.get("response_type") == "rst":
+                    result["error"] = "ConnectionRefusedError: TCP reset received"
+                elif payload:
+                    remote_seq = int(state.get("remote_seq") or 0)
+                    state["event"].clear()
+                    state["phase"] = "data"
+                    state["matched"] = False
+                    state["ok"] = False
+                    state["response"] = b""
+                    data_packet = mark_packet(
+                        network_layer() / TCP(
+                            sport=sport,
+                            dport=int(request["port"]),
+                            flags="PA",
+                            seq=(seq + 1) & 0xFFFFFFFF,
+                            ack=(remote_seq + 1) & 0xFFFFFFFF,
+                        ) / Raw(payload),
+                        "application-data",
+                    )
+                    payload_accepted = self.route_packet(
+                        data_packet,
+                        inbound_iface="CodeOutput",
+                        egress_iface=None,
+                        reason=f"active-probe:{request['id']}:payload",
+                    )
+                    result["payload_sent"] = bool(payload_accepted)
+                    if not payload_accepted:
+                        result["error"] = "router rejected CodeOutput TCP payload"
+                    else:
+                        state["event"].wait(max(0.0, deadline - time.monotonic()))
+                        result["ok"] = bool(state.get("ok"))
+                        if not state.get("matched"):
+                            result["error"] = "TimeoutError: no TCP application response observed on router capture path"
+                else:
+                    result["ok"] = bool(state.get("ok"))
+
+            result["response"] = bytes(state.get("response") or b"")
+            result["response_iface"] = state.get("response_iface")
+            result["response_type"] = state.get("response_type")
+            if request.get("expect_response", True) and not result["ok"] and not result.get("error"):
+                result["error"] = "TimeoutError: no matching response observed on router capture path"
+        finally:
+            # Raw TCP probes must tear down the synthetic connection. A final
+            # RST/ACK prevents half-open probe streams from lingering in the
+            # peer, NAT, firewall, or router flow tables.
+            if request.get("protocol") == "tcp" and state.get("remote_seq") is not None:
+                try:
+                    remote_seq = int(state.get("remote_seq") or 0)
+                    remote_payload = bytes(state.get("tcp_payload") or b"")
+                    remote_flags = int(state.get("remote_flags") or 0)
+                    remote_advance = len(remote_payload) + (1 if remote_flags & (0x01 | 0x02) else 0)
+                    local_advance = 1 + len(payload)
+                    close_packet = mark_packet(
+                        network_layer() / TCP(
+                            sport=sport, dport=int(request["port"]), flags="RA",
+                            seq=(seq + local_advance) & 0xFFFFFFFF,
+                            ack=(remote_seq + remote_advance) & 0xFFFFFFFF,
+                        ),
+                        "cleanup-rst",
+                    )
+                    self.route_packet(
+                        close_packet, inbound_iface="CodeOutput", egress_iface=None,
+                        reason=f"active-probe:{request['id']}:cleanup",
+                    )
+                except Exception:
+                    pass
+            with self._pending_probe_lock:
+                self._pending_probes.pop(request["id"], None)
+        result["elapsed_ms"] = round((time.monotonic() - started) * 1000.0, 3)
+        result["response_len"] = len(result.get("response") or b"")
+        result["response_preview"] = (result.get("response") or b"")[:256].hex()
+        return result
+
+    def _register_probe_socket(self, sock) -> None:
+        with self._active_probe_lock:
+            self._active_probe_sockets.add(sock)
+
+    def _unregister_probe_socket(self, sock) -> None:
+        with self._active_probe_lock:
+            self._active_probe_sockets.discard(sock)
+
+    def _close_active_probe_io(self) -> None:
+        with self._active_probe_lock:
+            sockets = list(self._active_probe_sockets)
+            processes = list(self._active_probe_processes)
+            self._active_probe_sockets.clear()
+            self._active_probe_processes.clear()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        for process in processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.75)
+                    except Exception:
+                        process.kill()
+            except Exception:
+                pass
+
     def _run_probe(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        router_attempt = None
+        if self._settings.get("probe_use_router_path", True) and self._router is not None:
+            try:
+                router_attempt = self._run_router_probe(request)
+                if self._stop_event.is_set():
+                    router_attempt["error"] = router_attempt.get("error") or "CodeOutput stopped"
+                    return router_attempt
+                if router_attempt.get("ok") or not request.get("expect_response", True):
+                    return router_attempt
+                self.log_message(
+                    f"[CodeOutput][Probe] router path sent but did not complete; "
+                    f"using socket fallback: {router_attempt.get('error') or 'no response'}"
+                )
+            except Exception as exc:
+                self.log_message(f"[CodeOutput][Probe] router-path setup failed; socket fallback: {exc}")
+                router_attempt = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         started = time.monotonic()
         result = {
             "id": request["id"], "target": request["target"],
@@ -2302,16 +3358,24 @@ class CodeOutputManager:
                 elif route_iface and os.name != "nt":
                     ping_cmd.extend(["-I", route_iface])
                 ping_cmd.append(resolved_ip)
-                completed = subprocess.run(
-                    ping_cmd,
-                    capture_output=True, text=True, timeout=timeout + 2.0,
+                process = subprocess.Popen(
+                    ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
                 )
-                result["ok"] = completed.returncode == 0
-                result["response"] = (completed.stdout or completed.stderr or "").encode("utf-8", "replace")[:8192]
+                with self._active_probe_lock:
+                    self._active_probe_processes.add(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout + 2.0)
+                finally:
+                    with self._active_probe_lock:
+                        self._active_probe_processes.discard(process)
+                result["ok"] = process.returncode == 0
+                result["response"] = (stdout or stderr or "").encode("utf-8", "replace")[:8192]
             else:
                 sock_type = socket.SOCK_STREAM if request["protocol"] == "tcp" else socket.SOCK_DGRAM
-                with socket.socket(family, sock_type) as sock:
+                sock = socket.socket(family, sock_type)
+                self._register_probe_socket(sock)
+                try:
                     sock.settimeout(timeout)
                     if iface:
                         try:
@@ -2356,11 +3420,23 @@ class CodeOutputManager:
                             response, peer = sock.recvfrom(65535)
                             result["response"] = response
                             result["peer"] = peer
+                finally:
+                    self._unregister_probe_socket(sock)
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
         result["elapsed_ms"] = round((time.monotonic() - started) * 1000.0, 3)
         result["response_len"] = len(result.get("response") or b"")
         result["response_preview"] = (result.get("response") or b"")[:256].decode("utf-8", "replace")
+        if router_attempt is not None:
+            result["router_path_attempted"] = True
+            result["router_path_ok"] = bool(router_attempt.get("ok"))
+            result["router_path_error"] = router_attempt.get("error")
+            result["router_path_elapsed_ms"] = router_attempt.get("elapsed_ms")
+            result["router_path_response_type"] = router_attempt.get("response_type")
         return result
 
     def _probe_loop(self) -> None:
@@ -2372,6 +3448,8 @@ class CodeOutputManager:
             if request is None:
                 break
             self._rate_limit_probe()
+            if self._stop_event.is_set():
+                break
             result = self._run_probe(request)
             self._probe_results.append(result)
             public = {k: v for k, v in result.items() if k != "response"}
@@ -2381,11 +3459,15 @@ class CodeOutputManager:
                 importance=3 if result["ok"] else 2, source="CodeOutput",
             )
             self._fire_hooks("probe_result", result=result)
-            self.log_message(
-                f"[CodeOutput][Probe] {'✅' if result['ok'] else '❌'} id={result['id']} "
+            message = (
+                f"[CodeOutputInterface][Probe] {'✅' if result['ok'] else '❌'} id={result['id']} "
                 f"{result['protocol']} {result.get('resolved_ip') or result['target']}:"
                 f"{result.get('port') or '-'} elapsed={result['elapsed_ms']}ms "
                 f"response={result['response_len']}B error={result.get('error') or '-'}"
+            )
+            self.log_message(message)
+            self._interface_event(
+                "probe-result", message, **{k: v for k, v in public.items()}
             )
 
     def ask(self, prompt: str) -> str:
@@ -2442,63 +3524,149 @@ class CodeOutputManager:
             self.log_message("[CodeOutput] Disabled by GUI settings; workers not started.")
             return
         if self._bus_thread and self._bus_thread.is_alive():
+            self._accepting = True
             return
         self._stop_event.clear()
+        self._accepting = True
+        if self._native_control is not None and self._router is not None:
+            callback = getattr(self._router, "_native_codeoutput_packet", None)
+            if callable(callback):
+                try:
+                    self._native_control.set_packet_callback(callback)
+                except Exception:
+                    pass
         self._bus_thread = threading.Thread(target=self._bus_consumer_loop, daemon=True, name="CodeOutputBus")
         self._gen_thread = threading.Thread(target=self._generation_loop, daemon=True, name="CodeOutputGen")
         self._clean_thread = threading.Thread(target=self._cleanup_loop, daemon=True, name="CodeOutputCleanup")
         self._emit_thread = threading.Thread(target=self._auto_emit_loop, daemon=True, name="CodeOutputEmit")
+        self._auto_action_thread = threading.Thread(
+            target=self._auto_action_loop,
+            daemon=True,
+            name="CodeOutputAutoActions",
+        )
         probe_workers = int(self._settings.get("probe_max_concurrent", 2))
         self._probe_threads = [
-            threading.Thread(
-                target=self._probe_loop,
-                daemon=True,
-                name=f"CodeOutputProbe-{index + 1}",
-            )
+            threading.Thread(target=self._probe_loop, daemon=True, name=f"CodeOutputProbe-{index + 1}")
             for index in range(max(1, probe_workers))
         ]
         self._probe_thread = self._probe_threads[0]
-        self._bus_thread.start()
-        self._gen_thread.start()
-        self._clean_thread.start()
-        self._emit_thread.start()
-        for probe_thread in self._probe_threads:
-            probe_thread.start()
-        self._log(
-            f"[CodeOutput] Threads started (learning + generation + {len(self._probe_threads)} active probe workers).",
-            1,
+        for thread in (
+                self._bus_thread, self._gen_thread, self._clean_thread,
+                self._emit_thread, self._auto_action_thread, *self._probe_threads,
+        ):
+            thread.start()
+        message = (
+            f"[CodeOutputInterface] Threads started (learning + generation + "
+            f"{len(self._probe_threads)} active probe workers + automatic action policy)."
         )
+        self._log(message, 1)
+        self._interface_event("start", message, probe_workers=len(self._probe_threads))
+
+    @staticmethod
+    def _drain_queue(q) -> int:
+        count = 0
+        while True:
+            try:
+                q.get_nowait()
+                count += 1
+            except queue.Empty:
+                return count
+            except Exception:
+                return count
 
     def stop(self):
+        if self._stop_event.is_set() and not any(
+            thread and thread.is_alive()
+            for thread in (
+                self._bus_thread, self._gen_thread, self._clean_thread,
+                self._emit_thread, self._auto_action_thread, *self._probe_threads,
+            )
+        ):
+            self._accepting = False
+            return
+        self._accepting = False
         self._stop_event.set()
+        with self._pending_probe_lock:
+            for state in self._pending_probes.values():
+                state["cancelled"] = True
+                state["error"] = "CodeOutput stopped"
+                event = state.get("event")
+                if event is not None:
+                    event.set()
+        self._close_active_probe_io()
         for q in (self._generation_queue, self._bus_queue, self._probe_queue):
             try:
                 q.put_nowait(None)
             except Exception:
                 pass
-        for q, _, t in list(self._external_sources):
+        for q, _, thread in list(self._external_sources):
             try:
                 q.put_nowait(None)
             except Exception:
                 pass
-            if t.is_alive():
-                t.join(timeout=1.5)
+            if thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=1.5)
         worker_threads = [
             self._bus_thread, self._gen_thread, self._clean_thread, self._emit_thread,
+            self._auto_action_thread,
             *list(self._probe_threads),
         ]
-        for t in worker_threads:
-            if t and t.is_alive():
-                t.join(timeout=2.0)
+        for thread in worker_threads:
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=2.5)
+        for stream_id in list(self._native_streams):
+            try:
+                if self._native_control is not None:
+                    self._native_control.close_stream(int(stream_id))
+            except Exception:
+                pass
+        self._native_streams.clear()
+        with self._target_lock:
+            self._learned_targets.clear()
+        with self._auto_action_lock:
+            self._auto_action_rate.clear()
+            self._auto_action_target_last.clear()
+        if self._native_control is not None:
+            try:
+                self._native_control.set_packet_callback(None)
+            except Exception:
+                pass
+        with self._pending_probe_lock:
+            self._pending_probes.clear()
+        for q in (self._generation_queue, self._bus_queue, self._probe_queue):
+            self._drain_queue(q)
+        self._external_sources.clear()
+        self._bus_thread = None
+        self._auto_action_thread = None
+        self._gen_thread = None
+        self._clean_thread = None
+        self._emit_thread = None
         self._probe_threads = []
         self._probe_thread = None
-        self._log("[CodeOutput] Manager stopped.", 1)
+        message = "[CodeOutputInterface] Manager stopped."
+        self._interface_event("stop", message)
+        self._log(message, 1)
 
-    def submit_packet(self, packet: Any, inbound_iface: Optional[str] = None, **context) -> None:
-        try:
-            self._bus_queue.put_nowait({"_kind": "packet", "value": packet, "iface": inbound_iface, "ctx": context})
-        except Exception as ex:
-            self._log(f"[CodeOutput] submit_packet failed: {ex}", 1)
+    def submit_packet(self, packet: Any, inbound_iface: Optional[str] = None, **context) -> bool:
+        if not self._accepting or self._stop_event.is_set():
+            return False
+        self._learn_targets_from_packet(packet, inbound_iface, context)
+        self._interface_telemetry["submitted"] += 1
+        self._interface_telemetry["last_source"] = str(inbound_iface or context.get("source") or "CodeOutput")
+        item = {"_kind": "packet", "value": packet, "iface": inbound_iface, "ctx": context}
+        if self._native_control is not None and (
+                bool(getattr(packet, "_codeoutput_packet", False))
+                or bool(context.get("explicit"))
+                or str(context.get("phase") or "").startswith("codeoutput-stream")
+        ):
+            try:
+                self._native_control.observe_frame(packet, int(context.get("stream_id") or 0))
+            except Exception:
+                pass
+        accepted = self._enqueue_bus_item(item)
+        summary = self._packet_interface_summary(packet, context)
+        self._emit_interface_telemetry(summary, source=str(inbound_iface or context.get("source") or "CodeOutput"), accepted=accepted)
+        return accepted
 
     def submit_event(self, topic: str, attributes: Optional[Dict[str, Any]] = None, methods: Optional[Dict[str, Any]] = None, ttl: Optional[float] = None, source: Optional[str] = None, tags: Optional[List[str]] = None, importance: int = 0) -> None:
         payload: Dict[str, Any] = {}
@@ -2507,10 +3675,10 @@ class CodeOutputManager:
         if methods:
             payload["methods"] = dict(methods)
         pkt = KnowledgePacket(topic=topic or "misc", payload=payload or {"attributes": {}}, ttl=float(ttl if ttl is not None else self.DEFAULT_TTLS.get(topic or "misc", 120.0)), source=source, tags=list(tags or []), importance=int(importance), confidence=0.8)
-        try:
-            self._bus_queue.put_nowait({"_kind": "packet", "value": pkt, "iface": None, "ctx": {}})
-        except Exception as ex:
-            self._log(f"[CodeOutput] submit_event failed: {ex}", 1)
+        self._interface_telemetry["events"] += 1
+        accepted = self._enqueue_bus_item({"_kind": "packet", "value": pkt, "iface": None, "ctx": {"source": source or "CodeOutputEvent"}})
+        if not accepted:
+            self._log(f"[CodeOutput][CodeOutputInterface] event dropped topic={topic}", 1)
 
     def attach_external_source(self, src_queue: "queue.Queue[Any]", transform: Optional[Callable[[Any], KnowledgePacket]] = None, name: str = "ExternalCodeOutputSource") -> None:
         def _consume():
@@ -2521,9 +3689,9 @@ class CodeOutputManager:
                         break
                     if transform:
                         pkt = transform(item)
-                        self._bus_queue.put_nowait({"_kind": "packet", "value": pkt, "iface": None, "ctx": {}})
+                        self._enqueue_bus_item({"_kind": "packet", "value": pkt, "iface": None, "ctx": {"source": name}})
                     else:
-                        self._bus_queue.put_nowait({"_kind": "packet", "value": item, "iface": None, "ctx": {}})
+                        self._enqueue_bus_item({"_kind": "packet", "value": item, "iface": None, "ctx": {"source": name}})
                 except queue.Empty:
                     continue
                 except Exception as ex:
@@ -2536,8 +3704,20 @@ class CodeOutputManager:
     def set_topic_aliases(self, aliases: Dict[str, Iterable[str]]) -> None:
         self._custom_aliases = {str(k).lower(): set(map(lambda x: str(x).lower(), v)) for k, v in aliases.items()}
 
-    def queue_code_generation(self, config: Dict[str, Any]):
-        self._generation_queue.put(config)
+    def queue_code_generation(self, config: Dict[str, Any]) -> bool:
+        try:
+            self._generation_queue.put_nowait(dict(config or {}))
+            return True
+        except queue.Full:
+            try:
+                self._generation_queue.get_nowait()
+                self._generation_queue.put_nowait(dict(config or {}))
+                self._interface_telemetry["dropped"] += 1
+                self._log("[CodeOutput] generation queue pressure: oldest request replaced.", 1)
+                return True
+            except Exception:
+                self._interface_telemetry["dropped"] += 1
+                return False
 
     def _auto_emit_loop(self):
         self._log("[CodeOutput] Auto-emitter loop started.", 1)
@@ -3047,7 +4227,7 @@ class CodeOutputManager:
             from scapy.layers.l2 import Ether  # type: ignore
             from scapy.layers.inet import IP  # type: ignore
             try:
-                from scapy.layers.inet6 import IPv6  # type: ignore
+                from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply  # type: ignore
             except Exception:
                 IPv6 = None
             first_nibble = (b[0] >> 4) if b else 0
@@ -3069,13 +4249,13 @@ class CodeOutputManager:
             return []
         try:
             from scapy.layers.l2 import Ether, ARP, Dot1Q  # type: ignore
-            from scapy.layers.inet import IP, TCP, UDP, ICMP  # type: ignore
+            from scapy.layers.inet import IP, TCP, UDP, ICMP, ICMP  # type: ignore
             try:
                 from scapy.layers.inet import GRE  # type: ignore
             except Exception:
                 GRE = None
             try:
-                from scapy.layers.inet6 import IPv6  # type: ignore
+                from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply  # type: ignore
             except Exception:
                 IPv6 = None
             try:

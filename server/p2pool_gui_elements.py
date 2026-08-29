@@ -1,4 +1,5 @@
 import logging
+import json
 import ctypes
 import ctypes.wintypes as wintypes
 import os
@@ -1890,7 +1891,8 @@ class RouterTab(QWidget):
         self.presets = {
             "Full": [
                 "General", "Router", "DHCP", "Transport", "HostBoundary", "TLS", "Python", "C++", "Signing",
-                "CodeOutput", "Kerberos/ESP", "Stratum/StratumConn", "DNS",
+                "CodeOutput", "CodeOutputInterface", "ProcessInterface", "ProcessManager",
+                "Kerberos/ESP", "Stratum/StratumConn", "DNS",
                 "Handshake/SSL/TCP", "ICMP/IGMP", "PacketWriter", "PacketCatcher",
                 "Notifier", "NAT/RIP/ARP/NDP","Bridge/L2", "Wintun/WinDivert", "HyperVRouterManager", "SocketInterface", "mDNS", "Firewall", "Packet", "Analysis"
             ],
@@ -1899,6 +1901,9 @@ class RouterTab(QWidget):
 
         self._hot_prefix_to_pane = {
             self._norm("C++"): "C++",
+            self._norm("CodeOutputInterface"): "CodeOutputInterface",
+            self._norm("ProcessInterface"): "ProcessInterface",
+            self._norm("ProcessManager"): "ProcessManager",
         }
 
         # -------- safe logging state --------
@@ -2267,7 +2272,8 @@ class RouterTab(QWidget):
 
         self.transport_stratum_ports_input = QLineEdit()
         self.transport_stratum_ports_input.setText(
-            "3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444"
+            "3333, 3334, 4444, 5555, 6666, 7777, 8888, 9999, "
+            "10001, 10128, 10132, 14444, 20128, 24444, 4242"
         )
         self.transport_monero_ports_input = QLineEdit()
         self.transport_monero_ports_input.setText(
@@ -2341,6 +2347,32 @@ class RouterTab(QWidget):
             "Allow Public Internet Targets"
         )
         self.codeoutput_allow_public_checkbox.setChecked(False)
+        self.codeoutput_auto_actions_checkbox = QCheckBox(
+            "Enable Automatic Data/AI Actions"
+        )
+        self.codeoutput_auto_actions_checkbox.setChecked(False)
+        self.codeoutput_auto_actions_ai_checkbox = QCheckBox(
+            "Use CodeOutput AI to Refine Safe Actions"
+        )
+        self.codeoutput_auto_actions_ai_checkbox.setChecked(True)
+        self.codeoutput_auto_actions_private_checkbox = QCheckBox(
+            "Automatic Actions: Private/Link-local Targets Only"
+        )
+        self.codeoutput_auto_actions_private_checkbox.setChecked(True)
+        self.codeoutput_auto_actions_interval_input = QLineEdit("15.0")
+        self.codeoutput_auto_actions_rate_input = QSpinBox()
+        self.codeoutput_auto_actions_rate_input.setRange(1, 60)
+        self.codeoutput_auto_actions_rate_input.setValue(6)
+        self.codeoutput_auto_actions_cooldown_input = QLineEdit("300.0")
+        self.codeoutput_auto_actions_min_hits_input = QSpinBox()
+        self.codeoutput_auto_actions_min_hits_input.setRange(1, 100000)
+        self.codeoutput_auto_actions_min_hits_input.setValue(3)
+        self.codeoutput_auto_actions_allowed_input = QLineEdit(
+            "arp,icmp,stratum,monero-rpc,sip-options,rtsp-options,stun-binding"
+        )
+        self.codeoutput_auto_actions_allowed_input.setToolTip(
+            "Only these bounded actions may be selected automatically. Arbitrary code or payload execution is not allowed."
+        )
         self.codeoutput_verbose_input = QSpinBox()
         self.codeoutput_verbose_input.setRange(0, 5)
         self.codeoutput_verbose_input.setValue(2)
@@ -2380,6 +2412,15 @@ class RouterTab(QWidget):
         self.codeoutput_interface_prefix_input = QSpinBox()
         self.codeoutput_interface_prefix_input.setRange(1, 30)
         self.codeoutput_interface_prefix_input.setValue(30)
+        self.codeoutput_interface_dhcp_checkbox = QCheckBox(
+            "Request a DHCP lease for the CodeOutput adapter"
+        )
+        self.codeoutput_interface_dhcp_checkbox.setChecked(False)
+        self.codeoutput_interface_dhcp_fallback_checkbox = QCheckBox(
+            "Fallback to configured static IPv4 if DHCP times out"
+        )
+        self.codeoutput_interface_dhcp_fallback_checkbox.setChecked(True)
+        self.codeoutput_interface_dhcp_timeout_input = QLineEdit("20.0")
         self.codeoutput_remove_on_shutdown_checkbox = QCheckBox("Remove CodeOutput switch on router shutdown")
         self.codeoutput_remove_on_shutdown_checkbox.setChecked(False)
         self.codeoutput_force_remove_checkbox = QCheckBox("Force removal of an existing switch")
@@ -2959,19 +3000,36 @@ class RouterTab(QWidget):
         codeoutput_grid.addWidget(QLabel("Concurrency:"), 8, 0)
         codeoutput_grid.addWidget(self.codeoutput_probe_concurrency_input, 8, 1)
         codeoutput_grid.addWidget(self.codeoutput_probe_button, 8, 2, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_interface_checkbox, 9, 0, 1, 4)
-        codeoutput_grid.addWidget(QLabel("Switch/backend name:"), 10, 0)
-        codeoutput_grid.addWidget(self.codeoutput_switch_name_input, 10, 1)
-        codeoutput_grid.addWidget(QLabel("Windows adapter name:"), 10, 2)
-        codeoutput_grid.addWidget(self.codeoutput_adapter_name_input, 10, 3)
-        codeoutput_grid.addWidget(QLabel("CodeOutput IPv4:"), 11, 0)
-        codeoutput_grid.addWidget(self.codeoutput_interface_ip_input, 11, 1)
-        codeoutput_grid.addWidget(QLabel("Prefix length:"), 11, 2)
-        codeoutput_grid.addWidget(self.codeoutput_interface_prefix_input, 11, 3)
-        codeoutput_grid.addWidget(self.codeoutput_remove_on_shutdown_checkbox, 12, 0, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_force_remove_checkbox, 12, 2, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_create_interface_button, 13, 0, 1, 2)
-        codeoutput_grid.addWidget(self.codeoutput_remove_interface_button, 13, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_checkbox, 9, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_ai_checkbox, 9, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_private_checkbox, 10, 0, 1, 4)
+        codeoutput_grid.addWidget(QLabel("Auto-action interval:"), 11, 0)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_interval_input, 11, 1)
+        codeoutput_grid.addWidget(QLabel("Auto actions/min:"), 11, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_rate_input, 11, 3)
+        codeoutput_grid.addWidget(QLabel("Target cooldown:"), 12, 0)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_cooldown_input, 12, 1)
+        codeoutput_grid.addWidget(QLabel("Minimum target hits:"), 12, 2)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_min_hits_input, 12, 3)
+        codeoutput_grid.addWidget(QLabel("Allowed automatic actions:"), 13, 0)
+        codeoutput_grid.addWidget(self.codeoutput_auto_actions_allowed_input, 13, 1, 1, 3)
+        codeoutput_grid.addWidget(self.codeoutput_interface_checkbox, 14, 0, 1, 4)
+        codeoutput_grid.addWidget(QLabel("Switch/backend name:"), 15, 0)
+        codeoutput_grid.addWidget(self.codeoutput_switch_name_input, 15, 1)
+        codeoutput_grid.addWidget(QLabel("Windows adapter name:"), 15, 2)
+        codeoutput_grid.addWidget(self.codeoutput_adapter_name_input, 15, 3)
+        codeoutput_grid.addWidget(self.codeoutput_interface_dhcp_checkbox, 16, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_interface_dhcp_fallback_checkbox, 16, 2, 1, 2)
+        codeoutput_grid.addWidget(QLabel("Static/fallback IPv4:"), 17, 0)
+        codeoutput_grid.addWidget(self.codeoutput_interface_ip_input, 17, 1)
+        codeoutput_grid.addWidget(QLabel("Prefix length:"), 17, 2)
+        codeoutput_grid.addWidget(self.codeoutput_interface_prefix_input, 17, 3)
+        codeoutput_grid.addWidget(QLabel("DHCP timeout:"), 18, 0)
+        codeoutput_grid.addWidget(self.codeoutput_interface_dhcp_timeout_input, 18, 1)
+        codeoutput_grid.addWidget(self.codeoutput_remove_on_shutdown_checkbox, 18, 2, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_force_remove_checkbox, 19, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_create_interface_button, 20, 0, 1, 2)
+        codeoutput_grid.addWidget(self.codeoutput_remove_interface_button, 20, 2, 1, 2)
 
         comms_content = QWidget()
         comms_form = QFormLayout(comms_content)
@@ -3872,6 +3930,15 @@ class RouterTab(QWidget):
         self.codeoutput_active_probes_checkbox.stateChanged.connect(
             self._sync_enable_states
         )
+        self.codeoutput_auto_actions_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.codeoutput_interface_dhcp_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
+        self.codeoutput_interface_dhcp_fallback_checkbox.stateChanged.connect(
+            self._sync_enable_states
+        )
         self.codeoutput_enabled_checkbox.stateChanged.connect(
             self._sync_enable_states
         )
@@ -3981,6 +4048,13 @@ class RouterTab(QWidget):
             "adapter_name": self.codeoutput_adapter_name_input.text().strip() or "CodeOutput",
             "ipv4": self.codeoutput_interface_ip_input.text().strip() or "172.30.253.1",
             "prefix_length": int(self.codeoutput_interface_prefix_input.value()),
+            "address_mode": (
+                "dhcp" if self.codeoutput_interface_dhcp_checkbox.isChecked() else "static"
+            ),
+            "dhcp_timeout": float(
+                self.codeoutput_interface_dhcp_timeout_input.text().strip() or 20.0
+            ),
+            "dhcp_fallback_static": self.codeoutput_interface_dhcp_fallback_checkbox.isChecked(),
         })
 
     @pyqtSlot()
@@ -4063,6 +4137,7 @@ class RouterTab(QWidget):
             self.codeoutput_min_packets_input,
             self.codeoutput_max_chars_input,
             self.codeoutput_active_probes_checkbox,
+            self.codeoutput_auto_actions_checkbox,
         ):
             widget.setEnabled(codeoutput_enabled)
         for widget in (
@@ -4079,19 +4154,49 @@ class RouterTab(QWidget):
         ):
             widget.setEnabled(probe_enabled)
 
+        auto_actions_enabled = (
+            codeoutput_enabled and self.codeoutput_auto_actions_checkbox.isChecked()
+        )
+        for widget in (
+            self.codeoutput_auto_actions_ai_checkbox,
+            self.codeoutput_auto_actions_private_checkbox,
+            self.codeoutput_auto_actions_interval_input,
+            self.codeoutput_auto_actions_rate_input,
+            self.codeoutput_auto_actions_cooldown_input,
+            self.codeoutput_auto_actions_min_hits_input,
+            self.codeoutput_auto_actions_allowed_input,
+        ):
+            widget.setEnabled(auto_actions_enabled)
+
         codeoutput_interface_enabled = codeoutput_enabled and self.codeoutput_interface_checkbox.isChecked()
         self.codeoutput_interface_checkbox.setEnabled(codeoutput_enabled)
         self.codeoutput_create_interface_button.setEnabled(codeoutput_interface_enabled)
         self.codeoutput_remove_interface_button.setEnabled(codeoutput_enabled)
+        use_codeoutput_dhcp = (
+            codeoutput_interface_enabled and self.codeoutput_interface_dhcp_checkbox.isChecked()
+        )
+        keep_static_fallback = (
+            not use_codeoutput_dhcp
+            or self.codeoutput_interface_dhcp_fallback_checkbox.isChecked()
+        )
         for widget in (
             self.codeoutput_switch_name_input,
             self.codeoutput_adapter_name_input,
-            self.codeoutput_interface_ip_input,
-            self.codeoutput_interface_prefix_input,
+            self.codeoutput_interface_dhcp_checkbox,
+            self.codeoutput_interface_dhcp_fallback_checkbox,
+            self.codeoutput_interface_dhcp_timeout_input,
             self.codeoutput_remove_on_shutdown_checkbox,
             self.codeoutput_force_remove_checkbox,
         ):
             widget.setEnabled(codeoutput_interface_enabled)
+        self.codeoutput_interface_ip_input.setEnabled(
+            codeoutput_interface_enabled and keep_static_fallback
+        )
+        self.codeoutput_interface_prefix_input.setEnabled(
+            codeoutput_interface_enabled and keep_static_fallback
+        )
+        self.codeoutput_interface_dhcp_timeout_input.setEnabled(use_codeoutput_dhcp)
+        self.codeoutput_interface_dhcp_fallback_checkbox.setEnabled(use_codeoutput_dhcp)
 
         peerinterface_enabled = self.use_peerinterface_checkbox.isChecked()
         for widget in (
@@ -4526,6 +4631,58 @@ class RouterTab(QWidget):
 
 
 
+def _format_synthetic_capture_record(record: dict) -> str:
+    """Format one bounded synthetic-interface record as a Wireshark-like line."""
+    record = dict(record or {})
+    try:
+        stamp = time.strftime("%H:%M:%S", time.localtime(float(record.get("time") or time.time())))
+        millis = int((float(record.get("time") or 0.0) % 1.0) * 1000)
+        stamp = f"{stamp}.{millis:03d}"
+    except Exception:
+        stamp = time.strftime("%H:%M:%S")
+    iface = str(record.get("interface") or "Unknown")
+    seq = int(record.get("seq") or 0)
+    if str(record.get("kind") or "packet") == "event":
+        event = str(record.get("event") or "event")
+        message = str(record.get("message") or "")
+        return f"{stamp}  #{seq:<7} if={iface:<16} EVENT {event}: {message}"
+
+    protocol = str(record.get("protocol") or "packet").upper()
+    src = str(record.get("src") or "-")
+    dst = str(record.get("dst") or "-")
+    sport = int(record.get("sport") or 0)
+    dport = int(record.get("dport") or 0)
+    source = f"{src}:{sport}" if sport else src
+    destination = f"{dst}:{dport}" if dport else dst
+    details = [
+        f"len={int(record.get('length') or 0)}",
+        f"stage={record.get('stage') or 'router-ingress'}",
+    ]
+    if record.get("flags"):
+        details.append(f"flags={record['flags']}")
+    if record.get("direction"):
+        details.append(f"dir={record['direction']}")
+    if record.get("match_kind"):
+        details.append(f"match={record['match_kind']}")
+    if record.get("pid"):
+        proc = str(record.get("process_name") or "process")
+        details.append(f"pid={record['pid']}({proc})")
+    if record.get("original_iface"):
+        details.append(f"from={record['original_iface']}")
+    if record.get("probe_id"):
+        details.append(f"probe={record['probe_id']}:{record.get('probe_stage') or '-'}")
+    if record.get("stream_id"):
+        details.append(f"stream={record['stream_id']}")
+    if record.get("layers"):
+        details.append(f"layers={record['layers']}")
+    if record.get("payload_ascii"):
+        details.append(f"data='{record['payload_ascii']}'")
+    return (
+        f"{stamp}  #{seq:<7} if={iface:<16} {protocol:<5} "
+        f"{source} -> {destination}  " + "  ".join(details)
+    )
+
+
 class ProcessTab(QWidget):
     """Dock an existing Windows process and attach its sockets to the router.
 
@@ -4568,6 +4725,8 @@ class ProcessTab(QWidget):
         self._user32 = None
         self._get_window_long = None
         self._set_window_long = None
+        self._capture_sequence = 0
+        self._capture_evicted_seen = 0
 
         self._build_ui()
         self.operation_completed.connect(self._on_operation_completed)
@@ -4581,6 +4740,11 @@ class ProcessTab(QWidget):
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self.refresh_status)
         self._status_timer.start()
+
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(125)
+        self._capture_timer.timeout.connect(self._drain_packet_capture)
+        self._capture_timer.start()
 
         self.refresh_processes()
         self.refresh_status()
@@ -4688,12 +4852,12 @@ class ProcessTab(QWidget):
         self.create_interface_checkbox.setChecked(True)
         self.route_mode_combo = QComboBox()
         self.route_mode_combo.addItems([
-            "Stratum Only",
             "All TCP/UDP",
-            "Observe Only",
+            "Stratum Only",
         ])
+        self.route_mode_combo.setCurrentText("All TCP/UDP")
         self.stratum_ports_input = QLineEdit(
-            "3333,3334,4444,5555,7777,10001,10128,20128,4242"
+            "3333,3334,4242,4444,5555,6666,7777,8888,9999,10001,10128,10132,14444,20128,24444"
         )
         self.stratum_ports_input.setToolTip(
             "In Stratum Only mode, a selected process flow is attached when either "
@@ -4703,7 +4867,7 @@ class ProcessTab(QWidget):
         self.create_interface_button.clicked.connect(self.create_interface)
         self.remove_interface_button = QPushButton("Remove Interface")
         self.remove_interface_button.clicked.connect(self.remove_interface)
-        self.start_route_button = QPushButton("Route Selected Process")
+        self.start_route_button = QPushButton("Capture Process Packets Through Router")
         self.start_route_button.clicked.connect(self.start_process_route)
         self.stop_route_button = QPushButton("Stop Process Routing")
         self.stop_route_button.clicked.connect(self.stop_process_route)
@@ -4734,11 +4898,12 @@ class ProcessTab(QWidget):
         interface_layout.addLayout(route_buttons, 7, 0, 1, 3)
 
         explanation = QLabel(
-            "Routing is PID-scoped by correlating the selected process's live socket "
-            "tuples with packets arriving from the router's host WinDivert/loopback "
-            "capture. It does not replace the machine-wide default route. Start the "
-            "Router first; reconnect an existing network session if it was opened before "
-            "the policy was enabled."
+            "ProcessTab captures the selected PID and child-process TCP/UDP traffic, including "
+            "miners such as XMRig. Existing physical/loopback capture workers and optional native "
+            "PID-tagged frames converge on one bounded ProcessInterface queue. Every accepted frame "
+            "is logged with if=ProcessInterface and dispatched by the exact router call "
+            "process_packet(packet, 'ProcessInterface'). The logical interface never starts its own "
+            "Npcap, tshark, or WinDivert sniffer."
         )
         explanation.setWordWrap(True)
         explanation.setStyleSheet("color: #bbbbbb;")
@@ -4748,10 +4913,20 @@ class ProcessTab(QWidget):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.addWidget(interface_group)
 
+        capture_header = QHBoxLayout()
+        self.capture_status_label = QLabel("ProcessInterface capture: waiting for routed packets")
+        self.clear_capture_button = QPushButton("Clear Process Packet Log")
+        self.clear_capture_button.clicked.connect(self._clear_packet_capture)
+        capture_header.addWidget(self.capture_status_label)
+        capture_header.addStretch(1)
+        capture_header.addWidget(self.clear_capture_button)
+        controls_layout.addLayout(capture_header)
+
         self.process_log = QPlainTextEdit()
         self.process_log.setReadOnly(True)
-        self.process_log.setMaximumBlockCount(5000)
-        self.process_log.setMinimumHeight(110)
+        self.process_log.setMaximumBlockCount(20000)
+        self.process_log.setMinimumHeight(150)
+        self.process_log.setLineWrapMode(QPlainTextEdit.NoWrap)
         controls_layout.addWidget(self.process_log)
         self.process_splitter.addWidget(controls_panel)
         self.process_splitter.setSizes([360, 330])
@@ -4768,6 +4943,51 @@ class ProcessTab(QWidget):
             except Exception:
                 pass
 
+    def _clear_packet_capture(self):
+        manager = self._manager()
+        if manager is not None:
+            try:
+                manager.clear_capture()
+                stats = (manager.status().get("capture") or {})
+                self._capture_sequence = int(stats.get("sequence") or self._capture_sequence)
+            except Exception:
+                pass
+        self.process_log.clear()
+        self.capture_status_label.setText("ProcessInterface capture: cleared")
+
+    def _drain_packet_capture(self):
+        manager = self._manager()
+        if manager is None:
+            return
+        reader = getattr(manager, "read_capture", None)
+        if not callable(reader):
+            return
+        try:
+            batch = dict(reader(self._capture_sequence, limit=300) or {})
+        except Exception as exc:
+            self.capture_status_label.setText(f"ProcessInterface capture error: {exc}")
+            return
+        records = list(batch.get("records") or [])
+        if records:
+            lines = [_format_synthetic_capture_record(record) for record in records]
+            self.process_log.appendPlainText("\n".join(lines))
+            self._capture_sequence = int(batch.get("next_sequence") or self._capture_sequence)
+        stats = dict(batch.get("stats") or {})
+        evicted = int(stats.get("evicted_records") or 0)
+        if evicted > self._capture_evicted_seen:
+            lost = evicted - self._capture_evicted_seen
+            self.process_log.appendPlainText(
+                f"[ProcessInterface] capture history evicted {lost} oldest records under sustained load."
+            )
+            self._capture_evicted_seen = evicted
+        self.capture_status_label.setText(
+            "ProcessInterface capture: "
+            f"packets={int(stats.get('packet_records') or 0)} "
+            f"retained={int(stats.get('retained') or 0)} "
+            f"pending={int(batch.get('remaining') or 0)} "
+            f"bytes={int(stats.get('bytes') or 0)}"
+        )
+
     def _manager(self):
         try:
             return self.manager_provider() if callable(self.manager_provider) else None
@@ -4776,36 +4996,67 @@ class ProcessTab(QWidget):
             return None
 
     def refresh_processes(self):
-        selected_pid = self.process_combo.currentData()
+        selected = self.process_combo.currentData()
+        selected_pid = int(selected.get("pid") or 0) if isinstance(selected, dict) else 0
         processes = []
-        for process in psutil.process_iter(["pid", "name", "exe", "username"]):
+        # Request only PID/name in the bulk iterator. Asking psutil for exe or
+        # username here can raise AccessDenied and previously hid elevated miners
+        # such as xmrig.exe from the Process tab entirely.
+        for process in psutil.process_iter(["pid", "name"]):
             try:
                 info = process.info
                 pid = int(info.get("pid") or 0)
                 if pid <= 0 or pid == os.getpid():
                     continue
                 name = str(info.get("name") or f"PID {pid}")
-                path = str(info.get("exe") or "")
+                try:
+                    path = str(process.exe() or "")
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    path = ""
+                except Exception:
+                    path = ""
                 processes.append((name.casefold(), pid, name, path))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
+            except psutil.AccessDenied:
+                # The PID/name pair is normally still available through info.
+                try:
+                    pid = int(getattr(process, "pid", 0) or 0)
+                    if pid > 0 and pid != os.getpid():
+                        processes.append((f"pid {pid}", pid, f"PID {pid}", ""))
+                except Exception:
+                    pass
             except Exception:
                 continue
-        processes.sort(key=lambda item: (item[0], item[1]))
+        # De-duplicate PID rows in case a process changed state during iteration.
+        by_pid = {}
+        for row in processes:
+            by_pid[int(row[1])] = row
+        processes = sorted(by_pid.values(), key=lambda item: (item[0], item[1]))
 
         self.process_combo.blockSignals(True)
         self.process_combo.clear()
         restore_index = -1
+        xmrig_index = -1
         for index, (_, pid, name, path) in enumerate(processes):
             label = f"{name}  [PID {pid}]"
+            if not path:
+                label += "  [path restricted]"
             self.process_combo.addItem(label, {"pid": pid, "name": name, "path": path})
-            if selected_pid and isinstance(selected_pid, dict) and selected_pid.get("pid") == pid:
+            if selected_pid and selected_pid == pid:
                 restore_index = index
+            if xmrig_index < 0 and "xmrig" in name.casefold():
+                xmrig_index = index
         if restore_index >= 0:
             self.process_combo.setCurrentIndex(restore_index)
+        elif xmrig_index >= 0:
+            self.process_combo.setCurrentIndex(xmrig_index)
         self.process_combo.blockSignals(False)
         self.refresh_windows()
-        self._append_log(f"[ProcessTab] Found {len(processes)} running processes.")
+        self._append_log(
+            f"[ProcessTab] Found {len(processes)} running processes; elevated/path-restricted "
+            "processes remain selectable by PID."
+        )
 
     def _initialize_user32(self):
         if os.name != "nt":
@@ -5259,7 +5510,17 @@ class ProcessTab(QWidget):
             self.route_status_label.setText(
                 f"Process route: PID {status.get('pid')} {status.get('process_name')} | "
                 f"mode={status.get('mode')} | flows={status.get('flow_count')} | "
-                f"tagged packets={status.get('packets_tagged')}"
+                f"PIDs={len(status.get('tracked_pids') or [])} | "
+                f"matched={status.get('packets_tagged')} "
+                f"(exact={status.get('packet_match_exact')} "
+                f"nat={status.get('packet_match_nat_tolerant')} "
+                f"port={status.get('packet_match_local_port')}) | "
+                f"router ingress={status.get('packets_reinjected')} | "
+                f"native={status.get('native_packets_queued')}/{status.get('native_packets_received')} | "
+                f"indexes={status.get('indexed_local_ports')} ports | "
+                f"misses={status.get('packet_match_misses')} | "
+                f"deduped={status.get('packets_deduplicated')} | "
+                f"rejected={status.get('packets_reinject_failed')}"
             )
         else:
             self.route_status_label.setText("Process route: disabled")
@@ -5276,6 +5537,10 @@ class ProcessTab(QWidget):
         self._resize_docked_window()
 
     def shutdown(self):
+        try:
+            self._capture_timer.stop()
+        except Exception:
+            pass
         self.detach_window()
         manager = self._manager()
         if manager is not None:
@@ -5289,10 +5554,12 @@ class ProcessTab(QWidget):
                 pass
 
 class CodeOutputChatTab(QWidget):
-    """Text-only English chat grounded in live PythonRouter/CodeOutput state."""
+    """Text chat plus live CodeOutput capture, neighbors, and telecom controls."""
 
     response_ready = pyqtSignal(str)
     error_ready = pyqtSignal(str)
+    interface_action_ready = pyqtSignal(str)
+    interface_action_error = pyqtSignal(str)
 
     def __init__(self, router_provider, parent=None):
         super().__init__(parent)
@@ -5300,18 +5567,73 @@ class CodeOutputChatTab(QWidget):
         self._closing = False
         self._worker = None
         self._chat_history = []
+        self._capture_sequence = 0
+        self._capture_evicted_seen = 0
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
         self.status_label = QLabel("CodeOutput Chat: ready (English text only)")
+        self.clear_interface_log_button = QPushButton("Clear CodeOutput Capture")
+        self.clear_interface_log_button.clicked.connect(self._clear_interface_capture)
         header.addWidget(self.status_label)
         header.addStretch(1)
+        header.addWidget(self.clear_interface_log_button)
         layout.addLayout(header)
+
+        target_box = QGroupBox("CodeOutput learned targets and communication")
+        target_layout = QGridLayout(target_box)
+        target_layout.setColumnStretch(1, 1)
+        self.learned_target_combo = QComboBox()
+        self.learned_target_combo.setEditable(True)
+        self.learned_target_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.learned_target_combo.lineEdit().setPlaceholderText(
+            "Learned IPv4/IPv6 address or hostname"
+        )
+        self.learned_service_combo = QComboBox()
+        self.learned_service_combo.addItem("ARP / Neighbor", userData="arp")
+        self.learned_service_combo.addItem("XMRig / Stratum", userData="stratum")
+        self.learned_service_combo.addItem("Monero JSON-RPC", userData="monero-rpc")
+        self.learned_service_combo.addItem("SIP OPTIONS", userData="sip-options")
+        self.learned_service_combo.addItem("RTSP OPTIONS", userData="rtsp-options")
+        self.learned_service_combo.addItem("STUN Binding", userData="stun-binding")
+        self.learned_service_combo.addItem("ICMP Echo", userData="icmp")
+        self.refresh_targets_button = QPushButton("Refresh Learned IPs")
+        self.resolve_neighbor_button = QPushButton("Resolve ARP")
+        self.communicate_target_button = QPushButton("Communicate")
+        self.clear_neighbors_button = QPushButton("Clear IP Cache")
+        target_layout.addWidget(QLabel("Target:"), 0, 0)
+        target_layout.addWidget(self.learned_target_combo, 0, 1, 1, 3)
+        target_layout.addWidget(QLabel("Action:"), 1, 0)
+        target_layout.addWidget(self.learned_service_combo, 1, 1)
+        target_layout.addWidget(self.refresh_targets_button, 1, 2)
+        target_layout.addWidget(self.resolve_neighbor_button, 1, 3)
+        target_layout.addWidget(self.communicate_target_button, 2, 2)
+        target_layout.addWidget(self.clear_neighbors_button, 2, 3)
+        layout.addWidget(target_box)
+
+        self.codeoutput_splitter = QSplitter(Qt.Vertical)
+        self.codeoutput_splitter.setChildrenCollapsible(False)
 
         self.chat_output = QPlainTextEdit()
         self.chat_output.setReadOnly(True)
         self.chat_output.setMaximumBlockCount(5000)
-        layout.addWidget(self.chat_output, 1)
+        self.codeoutput_splitter.addWidget(self.chat_output)
+
+        capture_panel = QWidget()
+        capture_layout = QVBoxLayout(capture_panel)
+        capture_layout.setContentsMargins(0, 0, 0, 0)
+        self.interface_capture_status = QLabel(
+            "CodeOutputInterface capture/probes: waiting for backing NPF capture"
+        )
+        self.interface_capture_output = QPlainTextEdit()
+        self.interface_capture_output.setReadOnly(True)
+        self.interface_capture_output.setMaximumBlockCount(20000)
+        self.interface_capture_output.setLineWrapMode(QPlainTextEdit.NoWrap)
+        capture_layout.addWidget(self.interface_capture_status)
+        capture_layout.addWidget(self.interface_capture_output, 1)
+        self.codeoutput_splitter.addWidget(capture_panel)
+        self.codeoutput_splitter.setSizes([360, 260])
+        layout.addWidget(self.codeoutput_splitter, 1)
 
         prompt_row = QHBoxLayout()
         self.prompt_input = QLineEdit()
@@ -5333,12 +5655,292 @@ class CodeOutputChatTab(QWidget):
         self.prompt_input.returnPressed.connect(self._ask)
         self.response_ready.connect(self._show_response)
         self.error_ready.connect(self._show_error)
+        self.interface_action_ready.connect(self._show_interface_action)
+        self.interface_action_error.connect(self._show_interface_action_error)
+        self.refresh_targets_button.clicked.connect(self._refresh_learned_targets)
+        self.resolve_neighbor_button.clicked.connect(self._resolve_selected_neighbor)
+        self.communicate_target_button.clicked.connect(self._communicate_selected_target)
+        self.clear_neighbors_button.clicked.connect(self._clear_neighbor_cache)
+
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(125)
+        self._capture_timer.timeout.connect(self._drain_interface_capture)
+        self._capture_timer.start()
+        self._target_timer = QTimer(self)
+        self._target_timer.setInterval(3000)
+        self._target_timer.timeout.connect(self._refresh_learned_targets)
+        self._target_timer.start()
+        QTimer.singleShot(0, self._refresh_learned_targets)
 
     def _router(self):
         try:
             return self.router_provider() if callable(self.router_provider) else None
         except Exception:
             return None
+
+    def _interface_manager(self):
+        router = self._router()
+        return getattr(router, "codeoutput_interface_manager", None) if router is not None else None
+
+    def _codeoutput_manager(self):
+        router = self._router()
+        return getattr(router, "code_output_manager", None) if router is not None else None
+
+    def _selected_learned_target(self) -> str:
+        text = str(self.learned_target_combo.currentText() or "").strip()
+        index = self.learned_target_combo.currentIndex()
+        if index >= 0 and text == self.learned_target_combo.itemText(index):
+            value = self.learned_target_combo.itemData(index)
+            if value:
+                return str(value).strip()
+        return text
+
+    @pyqtSlot()
+    def _refresh_learned_targets(self):
+        current = self._selected_learned_target()
+        merged = {}
+        interface_manager = self._interface_manager()
+        interface_reader = getattr(interface_manager, "known_targets", None)
+        if callable(interface_reader):
+            try:
+                for entry in interface_reader(limit=512) or []:
+                    ip_text = str(entry.get("ip") or "").strip()
+                    if ip_text:
+                        merged[ip_text] = dict(entry)
+            except Exception:
+                pass
+        codeoutput_manager = self._codeoutput_manager()
+        target_reader = getattr(codeoutput_manager, "learned_targets", None)
+        if callable(target_reader):
+            try:
+                for entry in target_reader(limit=512) or []:
+                    ip_text = str(entry.get("ip") or "").strip()
+                    if not ip_text:
+                        continue
+                    combined = dict(merged.get(ip_text) or {})
+                    combined.update(entry)
+                    merged[ip_text] = combined
+            except Exception:
+                pass
+        entries = sorted(
+            merged.values(),
+            key=lambda entry: (
+                float(entry.get("last_seen") or 0.0),
+                int(entry.get("hits") or 0),
+            ),
+            reverse=True,
+        )
+        self.learned_target_combo.blockSignals(True)
+        try:
+            self.learned_target_combo.clear()
+            for entry in entries[:512]:
+                ip_text = str(entry.get("ip") or "")
+                ports = ",".join(str(value) for value in list(entry.get("ports") or [])[:6])
+                mac = str(entry.get("mac") or "")
+                label = ip_text
+                details = []
+                if mac:
+                    details.append(mac)
+                if ports:
+                    details.append(f"ports {ports}")
+                if details:
+                    label += "  [" + " | ".join(details) + "]"
+                self.learned_target_combo.addItem(label, userData=ip_text)
+            if current:
+                index = self.learned_target_combo.findData(current)
+                if index >= 0:
+                    self.learned_target_combo.setCurrentIndex(index)
+                else:
+                    self.learned_target_combo.setEditText(current)
+        finally:
+            self.learned_target_combo.blockSignals(False)
+
+    def _run_interface_action(self, callback, label: str):
+        if self._worker and self._worker.is_alive():
+            self.interface_action_error.emit("Another CodeOutput action is already running.")
+            return
+        self.resolve_neighbor_button.setEnabled(False)
+        self.communicate_target_button.setEnabled(False)
+        self.status_label.setText(f"CodeOutputInterface: {label}...")
+
+        def work():
+            try:
+                result = callback()
+                text = json.dumps(result, indent=2, sort_keys=True, default=str)
+                if not self._closing:
+                    self.interface_action_ready.emit(text)
+            except Exception as exc:
+                if not self._closing:
+                    self.interface_action_error.emit(str(exc))
+
+        self._worker = threading.Thread(
+            target=work,
+            name="CodeOutputInterfaceAction",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @pyqtSlot()
+    def _resolve_selected_neighbor(self):
+        target = self._selected_learned_target()
+        if not target:
+            self.interface_action_error.emit("Select or enter an IPv4 target first.")
+            return
+        manager = self._interface_manager()
+        resolver = getattr(manager, "resolve_neighbor", None) if manager is not None else None
+        if not callable(resolver):
+            self.interface_action_error.emit("CodeOutput neighbor resolution is unavailable.")
+            return
+        self._run_interface_action(lambda: resolver(target), f"resolving {target}")
+
+    @pyqtSlot()
+    def _communicate_selected_target(self):
+        target = self._selected_learned_target()
+        if not target:
+            self.interface_action_error.emit("Select or enter a learned target first.")
+            return
+        service = str(
+            self.learned_service_combo.currentData()
+            or self.learned_service_combo.currentText()
+            or "stratum"
+        )
+        manager = self._interface_manager()
+        if service == "arp":
+            resolver = getattr(manager, "resolve_neighbor", None) if manager is not None else None
+            if not callable(resolver):
+                self.interface_action_error.emit("CodeOutput neighbor resolution is unavailable.")
+                return
+            self._run_interface_action(lambda: resolver(target), f"resolving {target}")
+            return
+        communicator = getattr(manager, "communicate_with_target", None) if manager is not None else None
+        if not callable(communicator):
+            self.interface_action_error.emit("CodeOutput telecom controls are unavailable.")
+            return
+        self._run_interface_action(
+            lambda: communicator(target, service=service),
+            f"queuing {service} to {target}",
+        )
+
+    @pyqtSlot()
+    def _clear_neighbor_cache(self):
+        manager = self._interface_manager()
+        clearer = getattr(manager, "clear_neighbors", None) if manager is not None else None
+        if callable(clearer):
+            try:
+                clearer()
+            except Exception as exc:
+                self.interface_action_error.emit(str(exc))
+                return
+        codeoutput = self._codeoutput_manager()
+        clear_targets = getattr(codeoutput, "clear_learned_targets", None) if codeoutput is not None else None
+        if callable(clear_targets):
+            try:
+                clear_targets()
+            except Exception:
+                pass
+        self.learned_target_combo.clear()
+        self.interface_capture_output.appendPlainText(
+            "[CodeOutputInterface] Learned IP/neighbor cache cleared."
+        )
+
+    @pyqtSlot(str)
+    def _show_interface_action(self, text: str):
+        self.interface_capture_output.appendPlainText(
+            "[CodeOutputInterface][Action]\n" + str(text)
+        )
+        self.status_label.setText("CodeOutput Chat: ready (English text only)")
+        self.resolve_neighbor_button.setEnabled(True)
+        self.communicate_target_button.setEnabled(True)
+        self._refresh_learned_targets()
+
+    @pyqtSlot(str)
+    def _show_interface_action_error(self, error: str):
+        message = str(error or "Unknown CodeOutput action error")
+        if "Active CodeOutput probes are disabled" in message:
+            message += " Enable Active Packet/Socket Probes in Router settings."
+        self.interface_capture_output.appendPlainText(
+            f"[CodeOutputInterface][Action] ERROR: {message}"
+        )
+        self.status_label.setText("CodeOutput Chat: action error")
+        self.resolve_neighbor_button.setEnabled(True)
+        self.communicate_target_button.setEnabled(True)
+
+    def _clear_interface_capture(self):
+        manager = self._interface_manager()
+        if manager is not None:
+            try:
+                manager.clear_capture()
+                stats = (manager.status().get("capture") or {})
+                self._capture_sequence = int(stats.get("sequence") or self._capture_sequence)
+            except Exception:
+                pass
+        self.interface_capture_output.clear()
+        self.interface_capture_status.setText("CodeOutputInterface capture/probes: cleared")
+
+    def _drain_interface_capture(self):
+        manager = self._interface_manager()
+        reader = getattr(manager, "read_capture", None) if manager is not None else None
+        if not callable(reader):
+            return
+        try:
+            batch = dict(reader(self._capture_sequence, limit=300) or {})
+        except Exception as exc:
+            self.interface_capture_status.setText(f"CodeOutputInterface capture error: {exc}")
+            return
+        records = list(batch.get("records") or [])
+        if records:
+            self.interface_capture_output.appendPlainText(
+                "\n".join(_format_synthetic_capture_record(record) for record in records)
+            )
+            self._capture_sequence = int(batch.get("next_sequence") or self._capture_sequence)
+        stats = dict(batch.get("stats") or {})
+        evicted = int(stats.get("evicted_records") or 0)
+        if evicted > self._capture_evicted_seen:
+            lost = evicted - self._capture_evicted_seen
+            self.interface_capture_output.appendPlainText(
+                f"[CodeOutputInterface] capture history evicted {lost} oldest records under sustained load."
+            )
+            self._capture_evicted_seen = evicted
+        try:
+            interface_status = dict(manager.status() or {})
+        except Exception:
+            interface_status = {}
+        capture_device = str(interface_status.get("capture_device") or "logical-only")
+        capture_state = "active" if interface_status.get("capture_started") else "waiting"
+        codeoutput = self._codeoutput_manager()
+        try:
+            codeoutput_status = dict(codeoutput.settings_snapshot() or {}) if codeoutput is not None else {}
+        except Exception:
+            codeoutput_status = {}
+        auto_stats = dict(codeoutput_status.get("auto_action_stats") or {})
+        address_mode = str(
+            interface_status.get("active_address_mode")
+            or interface_status.get("address_mode")
+            or "static"
+        )
+        address_text = str(interface_status.get("ipv4") or "unassigned")
+        prefix_text = int(interface_status.get("prefix_length") or 0)
+        dhcp_monitor = "on" if interface_status.get("dhcp_monitor_running") else "off"
+        dhcp_error = str(interface_status.get("dhcp_last_sync_error") or "").strip()
+        self.interface_capture_status.setText(
+            "CodeOutputInterface capture/probes: "
+            f"{capture_state} device={capture_device} "
+            f"address={address_mode}:{address_text}/{prefix_text} "
+            f"dhcp-monitor={dhcp_monitor} "
+            f"NPF={int(interface_status.get('capture_packets_accepted') or 0)}/"
+            f"{int(interface_status.get('capture_packets_seen') or 0)} "
+            f"packets={int(stats.get('packet_records') or 0)} "
+            f"events={int(stats.get('event_records') or 0)} "
+            f"neighbors={int(interface_status.get('neighbor_count') or 0)} "
+            f"ARP={int(interface_status.get('arp_resolved') or 0)}/"
+            f"{int(interface_status.get('arp_requests') or 0)} "
+            f"auto={int(auto_stats.get('executed') or 0)}/"
+            f"{int(auto_stats.get('failed') or 0)} "
+            f"lease-changes={int(interface_status.get('dhcp_lease_changes') or 0)} "
+            f"retained={int(stats.get('retained') or 0)} "
+            f"pending={int(batch.get('remaining') or 0)}"
+            + (f" dhcp-error={dhcp_error}" if dhcp_error else "")
+        )
 
     def _refresh(self):
         self.prompt_input.setText("Summarize the current communications and routing stages in English.")
@@ -5399,6 +6001,14 @@ class CodeOutputChatTab(QWidget):
 
     def shutdown(self):
         self._closing = True
+        try:
+            self._capture_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._target_timer.stop()
+        except Exception:
+            pass
 
 
 class PacketSenderTab(QWidget):

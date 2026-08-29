@@ -63,26 +63,256 @@ from p2pool_router_managers import PacketSigningManager, PacketWriter, SendBackM
     ICMPManager, EthernetBridgeManager, ForwardingManager, KerberosManager, EthernetL2Manager, \
     TransportManager, SYNScanner, NotificationManager, RouterRandomMessages, FunctionCallTracker, ISAKMPManager, \
     ESPManager, SocketInterface
-from p2pool_tools import ParallelPythonTool
+from p2pool_tools import ParallelPythonTool, NativeProcessPacketTap, NativeCodeOutputControl
 from p2pool_hyperv import HyperVManager, WinDivertManager, WinTunManager
 from p2pool_router_managers_3 import CodeOutputManager
 from p2pool_pipeline import PacketPipelineBlock, create_pipeline_extras
 from tools.pythontools import start_cpu_boost, stop_cpu_boost,  yield_no_gil, burn_no_gil, unhinge_process
 import struct
+import queue
 try:
     from p2pool_ollama import install_ollama_on_router
 except Exception:
     install_ollama_on_router = None
 
 
+class _SyntheticPacketCaptureLog:
+    """Bounded, thread-safe packet/event history for synthetic router interfaces.
+
+    The history is intentionally pulled by the GUI in batches. Router/capture
+    workers only build a small record and append it to a deque, so packet logging
+    cannot block live Internet traffic or create a second capture backend.
+    """
+
+    def __init__(self, interface_name: str, *, max_records: int = 20000):
+        self.interface_name = str(interface_name)
+        self.max_records = max(512, int(max_records))
+        self._records = deque(maxlen=self.max_records)
+        self._lock = threading.RLock()
+        self._sequence = 0
+        self._total_records = 0
+        self._evicted_records = 0
+        self._packet_records = 0
+        self._event_records = 0
+        self._bytes = 0
+
+    @staticmethod
+    def _safe_bytes(packet) -> bytes:
+        if packet is None:
+            return b""
+        try:
+            return bytes(packet)
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _payload_preview(packet, *, limit: int = 64) -> tuple[int, str, str]:
+        payload = b""
+        try:
+            if packet is not None and packet.haslayer(Raw):
+                payload = bytes(packet[Raw].load or b"")
+        except Exception:
+            payload = b""
+        if not payload:
+            return 0, "", ""
+        sample = payload[:max(1, int(limit))]
+        ascii_preview = "".join(chr(b) if 32 <= b < 127 else "." for b in sample)
+        return len(payload), ascii_preview, sample.hex()
+
+    def record_packet(
+            self, packet, *, stage: str = "router-ingress",
+            metadata: Optional[dict] = None, accepted: Optional[bool] = None,
+    ) -> dict:
+        metadata = dict(metadata or {})
+        raw_bytes = self._safe_bytes(packet)
+        protocol = "packet"
+        src = dst = ""
+        sport = dport = 0
+        flags = ""
+        ip_version = 0
+        layers = ""
+        summary = ""
+        try:
+            summary = str(packet.summary())
+        except Exception:
+            summary = f"raw frame ({len(raw_bytes)} bytes)"
+        try:
+            layers = ">".join(layer.__name__ for layer in packet.layers())
+        except Exception:
+            layers = ""
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+            if ip_layer is not None:
+                src = str(getattr(ip_layer, "src", "") or "")
+                dst = str(getattr(ip_layer, "dst", "") or "")
+                ip_version = 6 if packet.haslayer(IPv6) else 4
+            if packet.haslayer(TCP):
+                layer = packet[TCP]
+                protocol = "tcp"
+                sport = int(getattr(layer, "sport", 0) or 0)
+                dport = int(getattr(layer, "dport", 0) or 0)
+                flags = str(getattr(layer, "flags", "") or "")
+            elif packet.haslayer(UDP):
+                layer = packet[UDP]
+                protocol = "udp"
+                sport = int(getattr(layer, "sport", 0) or 0)
+                dport = int(getattr(layer, "dport", 0) or 0)
+            elif packet.haslayer(ICMP):
+                protocol = "icmp"
+            elif packet.haslayer(IPv6):
+                protocol = "ipv6"
+        except Exception:
+            pass
+        payload_len, payload_ascii, payload_hex = self._payload_preview(packet)
+        with self._lock:
+            if len(self._records) >= self.max_records:
+                self._evicted_records += 1
+            self._sequence += 1
+            record = {
+                "seq": self._sequence,
+                "kind": "packet",
+                "time": time.time(),
+                "interface": self.interface_name,
+                "stage": str(stage or "router-ingress"),
+                "accepted": accepted,
+                "protocol": protocol,
+                "ip_version": ip_version,
+                "src": src,
+                "dst": dst,
+                "sport": sport,
+                "dport": dport,
+                "flags": flags,
+                "length": len(raw_bytes),
+                "payload_length": payload_len,
+                "payload_ascii": payload_ascii,
+                "payload_hex": payload_hex,
+                "layers": layers,
+                "summary": summary,
+                "direction": metadata.get("direction") or getattr(packet, "_process_interface_direction", None),
+                "match_kind": metadata.get("match_kind") or getattr(packet, "_process_interface_match_kind", None),
+                "pid": metadata.get("pid") or getattr(packet, "_process_interface_pid", None),
+                "process_name": metadata.get("process_name") or getattr(packet, "_process_interface_name", None),
+                "original_iface": metadata.get("original_iface") or getattr(packet, "_process_interface_original_iface", None),
+                "producer": metadata.get("producer") or metadata.get("source") or getattr(packet, "_router_ingress_owner", None),
+                "probe_id": metadata.get("probe_id") or getattr(packet, "_codeoutput_probe_id", None),
+                "probe_stage": metadata.get("probe_stage") or getattr(packet, "_codeoutput_probe_stage", None),
+                "stream_id": metadata.get("stream_id"),
+                "service": metadata.get("service"),
+            }
+            self._records.append(record)
+            self._total_records += 1
+            self._packet_records += 1
+            self._bytes += len(raw_bytes)
+            return dict(record)
+
+    def record_event(self, event: str, message: str, *, metadata: Optional[dict] = None) -> dict:
+        metadata = dict(metadata or {})
+        with self._lock:
+            if len(self._records) >= self.max_records:
+                self._evicted_records += 1
+            self._sequence += 1
+            record = {
+                "seq": self._sequence,
+                "kind": "event",
+                "time": time.time(),
+                "interface": self.interface_name,
+                "event": str(event or "event"),
+                "message": str(message or ""),
+                "stage": str(metadata.pop("stage", "feature")),
+                "metadata": metadata,
+            }
+            self._records.append(record)
+            self._total_records += 1
+            self._event_records += 1
+            return dict(record)
+
+    def read_since(self, sequence: int = 0, *, limit: int = 500) -> dict:
+        after = max(0, int(sequence or 0))
+        limit = max(1, min(2000, int(limit or 500)))
+        with self._lock:
+            eligible = [dict(item) for item in self._records if int(item.get("seq", 0)) > after]
+            selected = eligible[:limit]
+            next_sequence = int(selected[-1]["seq"]) if selected else after
+            return {
+                "interface": self.interface_name,
+                "records": selected,
+                "next_sequence": next_sequence,
+                "remaining": max(0, len(eligible) - len(selected)),
+                "stats": self.stats_locked(),
+            }
+
+    def stats_locked(self) -> dict:
+        return {
+            "interface": self.interface_name,
+            "sequence": int(self._sequence),
+            "retained": len(self._records),
+            "capacity": self.max_records,
+            "total_records": int(self._total_records),
+            "packet_records": int(self._packet_records),
+            "event_records": int(self._event_records),
+            "evicted_records": int(self._evicted_records),
+            "bytes": int(self._bytes),
+        }
+
+    def stats(self) -> dict:
+        with self._lock:
+            return self.stats_locked()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+
+
+class _UnavailableRuntimeManager:
+    """No-op placeholder that keeps optional Windows helpers from aborting router construction."""
+
+    def __init__(self, name: str, error: object, logger=None):
+        self.name = str(name)
+        self.error = str(error)
+        self.logger = logger
+        self.available = False
+        self.started = False
+        self._reported = False
+
+    def _report(self) -> None:
+        if self._reported:
+            return
+        self._reported = True
+        try:
+            self.logger.log_message(
+                f"[Router][Optional] ⚠️ {self.name} unavailable: {self.error}"
+            )
+        except Exception:
+            pass
+
+    def start(self, *args, **kwargs):
+        self._report()
+        return False
+
+    def stop(self, *args, **kwargs):
+        self.started = False
+        return True
+
+    def teardown(self, *args, **kwargs):
+        return self.stop(*args, **kwargs)
+
+    close = teardown
+
+    def get_pipe_stats(self):
+        return {"available": False, "started": False, "error": self.error}
+
+    def status(self):
+        return self.get_pipe_stats()
+
+
 class CodeOutputInterfaceManager:
     """Own the server-side CodeOutput virtual interface.
 
-    The interface is a real Hyper-V Internal switch created through PowerShell.
-    It is registered in the router's shared interface map, RIP table, LAN transit
-    set, PacketWriter view, and capture workers. PacketLab can also inject
-    synthetic packets through the logical ``CodeOutput`` ingress without waiting
-    for a physical frame to appear on the adapter.
+    ``CodeOutput`` remains a synthetic router-ingress identity and never becomes
+    a device passed to Npcap/tshark. When Hyper-V supplies a real backing NPF
+    adapter, the router shares one ordinary capture worker for that device and
+    relabels accepted frames to ``CodeOutput`` before ``process_packet`` runs.
+    A bounded endpoint/neighbor cache supports explicit ARP and telecom actions.
     """
 
     LOGICAL_IFACE = "CodeOutput"
@@ -103,6 +333,28 @@ class CodeOutputInterfaceManager:
         self.interface_full_name = None
         self.interface_ipv4 = self.DEFAULT_IPV4
         self.prefix_length = self.DEFAULT_PREFIX_LENGTH
+        self.static_ipv4 = self.DEFAULT_IPV4
+        self.static_prefix_length = self.DEFAULT_PREFIX_LENGTH
+        self.address_mode = "static"
+        self.active_address_mode = "static"
+        self.dhcp_timeout = 20.0
+        self.dhcp_fallback_static = True
+        self.dhcp_lease: Dict[str, Any] = {}
+        self.dhcp_attempts = 0
+        self.dhcp_successes = 0
+        self.dhcp_failures = 0
+        # DHCP is owned by the real Windows backing adapter.  A lightweight
+        # monitor keeps the logical CodeOutput router record synchronized when
+        # Windows renews or replaces the lease, without starting a sniffer on
+        # the synthetic interface name.
+        self._dhcp_monitor_stop = threading.Event()
+        self._dhcp_monitor_thread = None
+        self._dhcp_monitor_interval = 5.0
+        self._dhcp_lease_changes = 0
+        self._dhcp_last_sync = 0.0
+        self._dhcp_last_sync_error = ""
+        self._configuration_dirty = True
+        self._applied_configuration = None
         self.network = ipaddress.ip_network(
             f"{self.interface_ipv4}/{self.prefix_length}", strict=False
         )
@@ -112,6 +364,31 @@ class CodeOutputInterfaceManager:
         self.interface_created_by_manager = False
         self.capture_started = False
         self.last_error = ""
+        self._capture_log = _SyntheticPacketCaptureLog(self.LOGICAL_IFACE)
+        # The logical CodeOutput name is never sniffed.  When Hyper-V provides a
+        # real backing adapter, the router may share one ordinary Npcap capture
+        # worker for that NPF device and relabel its frames to CodeOutput before
+        # process_packet() runs.
+        self._capture_iface_key = None
+        self._capture_registered = False
+        self._capture_packets_seen = 0
+        self._capture_packets_accepted = 0
+        self._capture_echo_suppressed = 0
+        self._capture_duplicate_suppressed = 0
+        self._recent_submitted = {}
+        self._recent_captured = {}
+        self._capture_dedupe_ttl = 1.25
+        self._capture_dedupe_limit = 8192
+        self._neighbor_cache: Dict[str, Dict[str, Any]] = {}
+        self._neighbor_cache_limit = 4096
+        self._neighbor_ttl = 30.0 * 60.0
+        self._neighbor_learned = 0
+        self._neighbor_evicted = 0
+        self._arp_requests = 0
+        self._arp_resolved = 0
+        self._arp_failed = 0
+        self._telecom_requests = 0
+        self._telecom_failures = 0
 
     def _log(self, message: str) -> None:
         try:
@@ -159,35 +436,636 @@ class CodeOutputInterfaceManager:
             raise ValueError("CodeOutputInterface requires a router with process_packet().")
         self.router_manager = router_manager
 
-    def submit_packet(self, packet, metadata: Optional[dict] = None, *, phase: str = "interface") -> dict:
-        """Feed one CodeOutput packet through the router's bounded ingress queue."""
+    @staticmethod
+    def _capture_fingerprint(packet) -> bytes:
+        """Fingerprint stable L3/L4 bytes so Npcap echoes do not loop back in."""
+        try:
+            layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        except Exception:
+            layer = None
+        try:
+            payload = bytes(layer if layer is not None else packet)
+        except Exception:
+            payload = b""
+        return hashlib.blake2s(payload, digest_size=16).digest() if payload else b""
+
+    def _prune_capture_fingerprints_locked(self, now: float) -> None:
+        cutoff = now - self._capture_dedupe_ttl
+        for mapping in (self._recent_submitted, self._recent_captured):
+            for key, ts in list(mapping.items()):
+                if ts < cutoff:
+                    mapping.pop(key, None)
+            if len(mapping) > self._capture_dedupe_limit:
+                excess = len(mapping) - self._capture_dedupe_limit
+                for key, _ in sorted(mapping.items(), key=lambda item: item[1])[:excess]:
+                    mapping.pop(key, None)
+
+    def _remember_submitted_packet(self, packet) -> None:
+        fingerprint = self._capture_fingerprint(packet)
+        if not fingerprint:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._recent_submitted[fingerprint] = now
+            self._prune_capture_fingerprints_locked(now)
+
+    @staticmethod
+    def _normalize_neighbor_mac(value: Any) -> str:
+        text = str(value or "").strip().replace("-", ":").lower()
+        if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", text):
+            return text
+        return ""
+
+    @staticmethod
+    def _normalize_neighbor_ip(value: Any) -> str:
+        text = str(value or "").strip().split("%", 1)[0]
+        if not text:
+            return ""
+        try:
+            return str(ipaddress.ip_address(text))
+        except Exception:
+            return ""
+
+    def _prune_neighbor_cache_locked(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else float(now)
+        cutoff = now - self._neighbor_ttl
+        for ip_text, entry in list(self._neighbor_cache.items()):
+            if float(entry.get("last_seen") or 0.0) < cutoff:
+                self._neighbor_cache.pop(ip_text, None)
+        if len(self._neighbor_cache) <= self._neighbor_cache_limit:
+            return
+        victims = sorted(
+            self._neighbor_cache.items(),
+            key=lambda item: (
+                float(item[1].get("last_seen") or 0.0),
+                int(item[1].get("hits") or 0),
+            ),
+        )
+        remove_count = len(self._neighbor_cache) - self._neighbor_cache_limit
+        for ip_text, _entry in victims[:remove_count]:
+            self._neighbor_cache.pop(ip_text, None)
+            self._neighbor_evicted += 1
+
+    def _learn_neighbor(
+            self, ip_value: Any, *, mac: Any = None, protocol: str = "",
+            port: int = 0, source: str = "packet", direction: str = "",
+            original_iface: str = "", confidence: float = 0.5,
+    ) -> None:
+        ip_text = self._normalize_neighbor_ip(ip_value)
+        if not ip_text:
+            return
+        try:
+            address = ipaddress.ip_address(ip_text)
+            if address.is_unspecified or address.is_multicast:
+                return
+        except Exception:
+            return
+        mac_text = self._normalize_neighbor_mac(mac)
+        now = time.time()
+        with self._lock:
+            entry = dict(self._neighbor_cache.get(ip_text) or {})
+            ports = set()
+            for value in entry.get("ports", []):
+                try:
+                    value = int(value)
+                except Exception:
+                    continue
+                if value > 0:
+                    ports.add(value)
+            try:
+                requested_port = int(port or 0)
+            except Exception:
+                requested_port = 0
+            if requested_port > 0:
+                ports.add(requested_port)
+            protocols = {str(value) for value in entry.get("protocols", []) if str(value)}
+            if protocol:
+                protocols.add(str(protocol).lower())
+            sources = {str(value) for value in entry.get("sources", []) if str(value)}
+            if source:
+                sources.add(str(source))
+            entry.update({
+                "ip": ip_text,
+                "family": int(address.version),
+                "mac": mac_text or str(entry.get("mac") or ""),
+                "ports": sorted(ports)[:128],
+                "protocols": sorted(protocols)[:32],
+                "sources": sorted(sources)[:32],
+                "direction": str(direction or entry.get("direction") or ""),
+                "original_iface": str(original_iface or entry.get("original_iface") or ""),
+                "private": bool(address.is_private),
+                "loopback": bool(address.is_loopback),
+                "link_local": bool(address.is_link_local),
+                "confidence": max(float(entry.get("confidence") or 0.0), float(confidence)),
+                "first_seen": float(entry.get("first_seen") or now),
+                "last_seen": now,
+                "hits": int(entry.get("hits") or 0) + 1,
+            })
+            self._neighbor_cache[ip_text] = entry
+            self._neighbor_learned += 1
+            self._prune_neighbor_cache_locked(now)
+
+    def learn_packet_endpoints(
+            self, packet: Any, *, source: str = "packet", original_iface: str = "",
+    ) -> None:
+        """Passively learn IP/MAC/port evidence without packet-path log spam."""
+        try:
+            ether = packet.getlayer(Ether)
+        except Exception:
+            ether = None
+        src_mac = self._normalize_neighbor_mac(
+            getattr(ether, "src", "") if ether is not None else ""
+        )
+        dst_mac = self._normalize_neighbor_mac(
+            getattr(ether, "dst", "") if ether is not None else ""
+        )
+        try:
+            if packet.haslayer(ARP):
+                arp = packet[ARP]
+                self._learn_neighbor(
+                    getattr(arp, "psrc", ""),
+                    mac=getattr(arp, "hwsrc", "") or src_mac,
+                    protocol="arp", source=source, direction="source",
+                    original_iface=original_iface, confidence=0.95,
+                )
+                self._learn_neighbor(
+                    getattr(arp, "pdst", ""),
+                    mac=getattr(arp, "hwdst", "") or dst_mac,
+                    protocol="arp", source=source, direction="destination",
+                    original_iface=original_iface, confidence=0.65,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        except Exception:
+            ip_layer = None
+        if ip_layer is None:
+            return
+        protocol = "ip"
+        sport = dport = 0
+        try:
+            if packet.haslayer(TCP):
+                protocol = "tcp"
+                sport, dport = int(packet[TCP].sport), int(packet[TCP].dport)
+            elif packet.haslayer(UDP):
+                protocol = "udp"
+                sport, dport = int(packet[UDP].sport), int(packet[UDP].dport)
+            elif packet.haslayer(ICMP) or packet.haslayer(ICMPv6):
+                protocol = "icmp"
+        except Exception:
+            pass
+        self._learn_neighbor(
+            getattr(ip_layer, "src", ""), mac=src_mac, protocol=protocol, port=sport,
+            source=source, direction="source", original_iface=original_iface,
+            confidence=0.8,
+        )
+        self._learn_neighbor(
+            getattr(ip_layer, "dst", ""), mac=dst_mac, protocol=protocol, port=dport,
+            source=source, direction="destination", original_iface=original_iface,
+            confidence=0.7,
+        )
+
+    def known_targets(
+            self, *, limit: int = 256, private_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            self._prune_neighbor_cache_locked()
+            entries = [dict(value) for value in self._neighbor_cache.values()]
+        if private_only:
+            entries = [
+                entry for entry in entries
+                if entry.get("private") or entry.get("link_local")
+            ]
+        entries.sort(
+            key=lambda entry: (
+                float(entry.get("last_seen") or 0.0),
+                int(entry.get("hits") or 0),
+            ),
+            reverse=True,
+        )
+        return entries[:max(1, min(4096, int(limit)))]
+
+    def clear_neighbors(self) -> None:
+        with self._lock:
+            self._neighbor_cache.clear()
+
+    def resolve_neighbor(self, target_ip: str, *, timeout: float = 1.5) -> Dict[str, Any]:
+        """Resolve an IPv4 target/next-hop using the router's ARP manager.
+
+        A copy of the ARP request first enters ``process_packet(..., "CodeOutput")``
+        for router analysis and capture. The existing ARP manager then performs
+        the real bounded wire resolution on the backing NPF adapter.
+        """
+        target = self._normalize_neighbor_ip(target_ip)
+        if not target or ipaddress.ip_address(target).version != 4:
+            raise ValueError("CodeOutput ARP resolution requires a valid IPv4 target")
         router = self.router_manager
-        ingest = getattr(router, "ingest_codeoutput_packet", None)
-        if not callable(ingest):
-            raise RuntimeError("CodeOutputInterface is not linked to PythonRouterManager.ingest_codeoutput_packet().")
+        if router is None:
+            raise RuntimeError("CodeOutputInterface is not bound to the router")
+        with self._lock:
+            capture_iface = str(self._capture_iface_key or self.interface_full_name or "")
+            src_ip = str(self.interface_ipv4 or "")
+            src_mac = self._normalize_neighbor_mac(self.interface_mac)
+            self._arp_requests += 1
+        if not capture_iface or capture_iface == self.LOGICAL_IFACE:
+            raise RuntimeError("CodeOutput backing NPF interface is unavailable")
+        synthetic = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
+            op=1,
+            hwsrc=src_mac or "00:00:00:00:00:00",
+            psrc=src_ip,
+            hwdst="00:00:00:00:00:00",
+            pdst=target,
+        )
+        if src_mac:
+            synthetic[Ether].src = src_mac
+        try:
+            setattr(synthetic, "_pw_allow_broadcast", True)
+            setattr(synthetic, "_codeoutput_packet", True)
+            setattr(synthetic, "_codeoutput_probe_stage", "arp-request")
+        except Exception:
+            pass
+        self.submit_packet(
+            synthetic,
+            metadata={
+                "phase": "neighbor-arp-request",
+                "target": target,
+                "capture_iface": capture_iface,
+                "timeout": float(timeout),
+            },
+            phase="neighbor-arp-request",
+        )
+        resolver = getattr(getattr(router, "arp_manager", None), "resolve", None)
+        if not callable(resolver):
+            raise RuntimeError("Router ARPManager.resolve() is unavailable")
+        started = time.monotonic()
+        mac = self._normalize_neighbor_mac(resolver(target, capture_iface))
+        elapsed_ms = round((time.monotonic() - started) * 1000.0, 3)
+        with self._lock:
+            if mac:
+                self._arp_resolved += 1
+            else:
+                self._arp_failed += 1
+        if mac:
+            self._learn_neighbor(
+                target, mac=mac, protocol="arp", source="active-arp",
+                original_iface=capture_iface, confidence=1.0,
+            )
+        result = {
+            "ok": bool(mac),
+            "target": target,
+            "mac": mac or None,
+            "capture_iface": capture_iface,
+            "interface": self.LOGICAL_IFACE,
+            "elapsed_ms": elapsed_ms,
+        }
+        self.record_feature_event(
+            "neighbor-resolution",
+            (f"Resolved {target} -> {mac}" if mac else f"Failed to resolve {target}"),
+            **result,
+        )
+        return result
+
+    def communicate_with_target(
+            self, target: str, *, service: str = "stratum",
+            port: Optional[int] = None, resolve_neighbor: bool = True,
+            timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Queue a rate-limited mining/telecom probe to a learned target."""
+        target_text = self._normalize_neighbor_ip(target) or str(target or "").strip()
+        if not target_text:
+            raise ValueError("A learned IP address or hostname is required")
+        router = self.router_manager
+        codeoutput = getattr(router, "code_output_manager", None) if router is not None else None
+        if codeoutput is None:
+            raise RuntimeError("CodeOutputManager is unavailable")
+        neighbor_result = None
+        try:
+            address = ipaddress.ip_address(target_text)
+        except Exception:
+            address = None
+        with self._lock:
+            self._telecom_requests += 1
+            capture_iface = str(self._capture_iface_key or self.interface_full_name or "")
+        if (
+                resolve_neighbor and address is not None and address.version == 4
+                and (address.is_private or address.is_link_local)
+        ):
+            try:
+                neighbor_result = self.resolve_neighbor(
+                    target_text, timeout=float(timeout or 1.5)
+                )
+            except Exception as exc:
+                neighbor_result = {"ok": False, "error": str(exc), "target": target_text}
+        try:
+            key = str(service or "stratum").strip().casefold().replace("_", "-")
+            if key == "icmp":
+                probe_id = codeoutput.submit_probe(
+                    target_text,
+                    protocol="icmp",
+                    timeout=timeout,
+                    iface=capture_iface,
+                    expect_response=True,
+                )
+            else:
+                probe_id = codeoutput.submit_service_probe(
+                    key,
+                    target_text,
+                    iface=capture_iface,
+                    timeout=timeout,
+                    port=port,
+                )
+        except Exception:
+            with self._lock:
+                self._telecom_failures += 1
+            raise
+        result = {
+            "ok": True,
+            "probe_id": probe_id,
+            "target": target_text,
+            "service": str(service),
+            "port": int(port) if port else None,
+            "interface": self.LOGICAL_IFACE,
+            "capture_iface": capture_iface,
+            "neighbor": neighbor_result,
+        }
+        self.record_feature_event(
+            "telecom-action",
+            f"Queued {service} communication to {target_text} as probe {probe_id}",
+            **result,
+        )
+        return result
+
+    def accept_backing_capture(self, packet, capture_iface: str) -> bool:
+        """Accept one frame from the real CodeOutput NPF backing adapter.
+
+        The NPF device is a normal capture source, but the resulting router
+        ingress is always the canonical logical name ``CodeOutput``.  Recent
+        explicit submissions and duplicate Npcap copies are suppressed to avoid
+        feeding a packet back into the router repeatedly.
+        """
+        with self._lock:
+            expected = str(self._capture_iface_key or self.interface_full_name or "")
+            enabled = bool(self.enabled and self.interface_ready and self._capture_registered)
+        if not enabled or not expected or str(capture_iface or "") != expected:
+            return False
+        fingerprint = self._capture_fingerprint(packet)
+        now = time.monotonic()
+        with self._lock:
+            self._capture_packets_seen += 1
+            self._prune_capture_fingerprints_locked(now)
+            if fingerprint and fingerprint in self._recent_submitted:
+                self._recent_submitted.pop(fingerprint, None)
+                self._capture_echo_suppressed += 1
+                return False
+            previous = self._recent_captured.get(fingerprint) if fingerprint else None
+            if previous is not None and now - previous <= self._capture_dedupe_ttl:
+                self._capture_duplicate_suppressed += 1
+                return False
+            if fingerprint:
+                self._recent_captured[fingerprint] = now
+            self._capture_packets_accepted += 1
+        self.learn_packet_endpoints(
+            packet, source="backing-npf", original_iface=str(capture_iface or ""),
+        )
+        return True
+
+    def submit_packet(self, packet, metadata: Optional[dict] = None, *, phase: str = "interface") -> dict:
+        """Feed one CodeOutput packet into the router without packet-path logging."""
+        router = self.router_manager
         metadata = dict(metadata or {})
         metadata.setdefault("phase", phase)
-        ingress = self.interface_full_name or self.interface_alias or self.LOGICAL_IFACE
-        if phase in {"packetlab", "logical", "chat"}:
-            ingress = self.LOGICAL_IFACE
-        accepted = bool(ingest(
+        metadata.setdefault("source_adapter", self.interface_full_name or self.interface_alias or self.LOGICAL_IFACE)
+        metadata.setdefault("interface_name", self.LOGICAL_IFACE)
+        self.learn_packet_endpoints(
             packet,
-            source_iface=ingress,
-            direction=str(metadata.get("direction") or "wan-in"),
-            metadata=metadata,
-        ))
+            source=str(metadata.get("phase") or phase or "explicit"),
+            original_iface=str(metadata.get("source_adapter") or ""),
+        )
+        self._remember_submitted_packet(packet)
+        submit = getattr(router, "process_codeoutput_packet", None)
+        if callable(submit):
+            accepted = bool(submit(packet, metadata=metadata))
+        else:
+            feed = getattr(router, "feed_interface_packet", None)
+            if not callable(feed):
+                raise RuntimeError("CodeOutputInterface is not linked to router packet ingress.")
+            accepted = bool(feed(
+                packet, self.LOGICAL_IFACE, metadata=metadata, owner="CodeOutput",
+            ))
         return {
             "status": "QUEUED" if accepted else "REJECTED",
-            "interface": ingress,
-            "summary": packet.summary(),
+            "interface": self.LOGICAL_IFACE,
         }
+
+    def capture_router_packet(self, packet, *, stage: str = "router-ingress", metadata: Optional[dict] = None) -> dict:
+        """Record and learn a CodeOutput frame after canonical router ingress."""
+        details = dict(metadata or {})
+        self.learn_packet_endpoints(
+            packet,
+            source=str(details.get("producer") or stage),
+            original_iface=str(
+                details.get("original_iface") or details.get("capture_iface") or ""
+            ),
+        )
+        return self._capture_log.record_packet(packet, stage=stage, metadata=details)
+
+    def record_feature_event(self, event: str, message: str, **metadata) -> dict:
+        """Record probe/stream/control activity beside CodeOutput packet captures."""
+        return self._capture_log.record_event(event, message, metadata=metadata)
+
+    def read_capture(self, sequence: int = 0, *, limit: int = 500) -> dict:
+        return self._capture_log.read_since(sequence, limit=limit)
+
+    def clear_capture(self) -> None:
+        self._capture_log.clear()
+
+    @staticmethod
+    def _prefix_from_netmask(netmask: Any) -> int:
+        text = str(netmask or "").strip()
+        if not text:
+            return 0
+        try:
+            return int(ipaddress.IPv4Network(f"0.0.0.0/{text}").prefixlen)
+        except Exception:
+            return 0
+
+    def _read_backing_ipv4_lease(self) -> Optional[dict]:
+        """Read the active IPv4 lease directly from the Windows adapter.
+
+        psutil is used here so the steady-state monitor does not repeatedly
+        launch PowerShell.  Gateway and DNS values obtained during the explicit
+        DHCP operation are retained in ``dhcp_lease``.
+        """
+        with self._lock:
+            alias = str(self.interface_alias or self.adapter_name or "").strip()
+        if not alias:
+            return None
+        try:
+            rows = list((psutil.net_if_addrs() or {}).get(alias, []) or [])
+        except Exception as exc:
+            with self._lock:
+                self._dhcp_last_sync_error = str(exc)
+            return None
+        candidates = []
+        for row in rows:
+            if getattr(row, "family", None) != socket.AF_INET:
+                continue
+            address_text = str(getattr(row, "address", "") or "").strip()
+            try:
+                address = ipaddress.IPv4Address(address_text)
+            except Exception:
+                continue
+            if address.is_unspecified or address.is_loopback or address.is_link_local:
+                continue
+            prefix = self._prefix_from_netmask(getattr(row, "netmask", ""))
+            if not 1 <= prefix <= 32:
+                continue
+            candidates.append((address, prefix))
+        if not candidates:
+            return None
+        # Prefer a private address on an internal Hyper-V switch, otherwise keep
+        # the first usable preferred address reported by Windows.
+        candidates.sort(key=lambda item: (not item[0].is_private, str(item[0])))
+        address, prefix = candidates[0]
+        return {"ipv4": str(address), "prefix_length": int(prefix)}
+
+    def _sync_dhcp_lease_from_os(self, *, force: bool = False) -> bool:
+        with self._lock:
+            requested = self.address_mode == "dhcp"
+            ready = bool(self.enabled and self.interface_ready)
+        if not requested or not ready:
+            return False
+        lease = self._read_backing_ipv4_lease()
+        now = time.time()
+        if not lease:
+            with self._lock:
+                self._dhcp_last_sync = now
+                self._dhcp_last_sync_error = "No usable IPv4 DHCP lease is currently present."
+            return False
+        ip_text = str(lease["ipv4"])
+        prefix = int(lease["prefix_length"])
+        network = ipaddress.ip_network(f"{ip_text}/{prefix}", strict=False)
+        with self._lock:
+            changed = (
+                force
+                or self.interface_ipv4 != ip_text
+                or int(self.prefix_length) != prefix
+                or self.active_address_mode != "dhcp"
+            )
+            self.interface_ipv4 = ip_text
+            self.prefix_length = prefix
+            self.network = network
+            self.active_address_mode = "dhcp"
+            current = dict(self.dhcp_lease or {})
+            current.update({
+                "ok": True,
+                "lease_obtained": True,
+                "requested_mode": "dhcp",
+                "active_mode": "dhcp",
+                "ipv4": ip_text,
+                "prefix_length": prefix,
+                "updated_at": now,
+            })
+            self.dhcp_lease = current
+            self._dhcp_last_sync = now
+            self._dhcp_last_sync_error = ""
+            if changed:
+                self._dhcp_lease_changes += 1
+        if changed:
+            # Replace the logical interface metadata and direct route atomically
+            # enough for the router: RIP registration is idempotent and removes
+            # the old direct route for this interface before installing the new
+            # lease subnet.
+            self._resolve_capture_interface()
+            self._register_router_interface(
+                start_capture=bool(getattr(self.router_manager, "started", False))
+            )
+            self.record_feature_event(
+                "dhcp-lease-synced",
+                f"Windows DHCP lease synchronized: {ip_text}/{prefix}.",
+                ipv4=ip_text,
+                prefix_length=prefix,
+                capture_iface=self.interface_full_name,
+            )
+        return changed
+
+    def _dhcp_monitor_loop(self) -> None:
+        while not self._dhcp_monitor_stop.wait(self._dhcp_monitor_interval):
+            try:
+                self._sync_dhcp_lease_from_os(force=False)
+            except Exception as exc:
+                with self._lock:
+                    self._dhcp_last_sync = time.time()
+                    self._dhcp_last_sync_error = str(exc)
+
+    def _start_dhcp_monitor(self) -> None:
+        with self._lock:
+            should_run = bool(
+                self.enabled and self.interface_ready and self.address_mode == "dhcp"
+            )
+            current = self._dhcp_monitor_thread
+        if not should_run:
+            self._stop_dhcp_monitor()
+            return
+        if current is not None and current.is_alive():
+            return
+        self._dhcp_monitor_stop.clear()
+        thread = threading.Thread(
+            target=self._dhcp_monitor_loop,
+            name="CodeOutputDhcpLeaseMonitor",
+            daemon=True,
+        )
+        with self._lock:
+            self._dhcp_monitor_thread = thread
+        thread.start()
+
+    def _stop_dhcp_monitor(self) -> None:
+        self._dhcp_monitor_stop.set()
+        with self._lock:
+            thread = self._dhcp_monitor_thread
+            self._dhcp_monitor_thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
 
     def configure(self, **settings) -> dict:
         with self._lock:
+            old_signature = (
+                self.switch_name,
+                self.adapter_name,
+                self.address_mode,
+                self.static_ipv4,
+                int(self.static_prefix_length),
+                float(self.dhcp_timeout),
+                bool(self.dhcp_fallback_static),
+            )
             if "enabled" in settings:
                 self.enabled = bool(settings.get("enabled"))
             if "interface_enabled" in settings:
                 self.enabled = bool(settings.get("interface_enabled"))
+            requested_mode = settings.get(
+                "address_mode",
+                settings.get("interface_address_mode"),
+            )
+            if "use_dhcp" in settings:
+                requested_mode = "dhcp" if bool(settings.get("use_dhcp")) else "static"
+            if "interface_use_dhcp" in settings:
+                requested_mode = "dhcp" if bool(settings.get("interface_use_dhcp")) else "static"
+            if requested_mode is not None:
+                normalized_mode = str(requested_mode or "static").strip().casefold()
+                if normalized_mode not in {"static", "dhcp"}:
+                    raise ValueError("CodeOutput address mode must be static or dhcp.")
+                self.address_mode = normalized_mode
+            if "dhcp_timeout" in settings or "interface_dhcp_timeout" in settings:
+                value = settings.get("dhcp_timeout", settings.get("interface_dhcp_timeout"))
+                self.dhcp_timeout = max(3.0, min(120.0, float(value)))
+            if "dhcp_fallback_static" in settings or "interface_dhcp_fallback_static" in settings:
+                value = settings.get(
+                    "dhcp_fallback_static",
+                    settings.get("interface_dhcp_fallback_static"),
+                )
+                self.dhcp_fallback_static = bool(value)
             self.remove_on_shutdown = bool(
                 settings.get("remove_on_shutdown", settings.get("interface_remove_on_shutdown", self.remove_on_shutdown))
             )
@@ -202,7 +1080,7 @@ class CodeOutputInterfaceManager:
                     "CodeOutput adapter name",
                 )
             if settings.get("ipv4") or settings.get("interface_ipv4"):
-                self.interface_ipv4 = str(ipaddress.IPv4Address(
+                self.static_ipv4 = str(ipaddress.IPv4Address(
                     settings.get("ipv4") or settings.get("interface_ipv4")
                 ))
             if settings.get("prefix_length") is not None or settings.get("interface_prefix_length") is not None:
@@ -210,10 +1088,24 @@ class CodeOutputInterfaceManager:
                 value = int(value)
                 if not 1 <= value <= 30:
                     raise ValueError("CodeOutput prefix length must be between 1 and 30.")
-                self.prefix_length = value
-            self.network = ipaddress.ip_network(
-                f"{self.interface_ipv4}/{self.prefix_length}", strict=False
+                self.static_prefix_length = value
+            new_signature = (
+                self.switch_name,
+                self.adapter_name,
+                self.address_mode,
+                self.static_ipv4,
+                int(self.static_prefix_length),
+                float(self.dhcp_timeout),
+                bool(self.dhcp_fallback_static),
             )
+            if new_signature != old_signature:
+                self._configuration_dirty = True
+            if not self.interface_ready or self.address_mode == "static":
+                self.interface_ipv4 = self.static_ipv4
+                self.prefix_length = self.static_prefix_length
+                self.network = ipaddress.ip_network(
+                    f"{self.interface_ipv4}/{self.prefix_length}", strict=False
+                )
         return self.status()
 
     def create_interface(
@@ -223,27 +1115,61 @@ class CodeOutputInterfaceManager:
             adapter_name: str | None = None,
             ipv4: str | None = None,
             prefix_length: int | None = None,
+            address_mode: str | None = None,
+            use_dhcp: Optional[bool] = None,
+            dhcp_timeout: Optional[float] = None,
+            dhcp_fallback_static: Optional[bool] = None,
             start_capture: bool = True,
     ) -> dict:
+        # Reconfiguration must not race an earlier lease-renewal monitor.
+        self._stop_dhcp_monitor()
+        resolved_mode = address_mode
+        if use_dhcp is not None:
+            resolved_mode = "dhcp" if bool(use_dhcp) else "static"
         self.configure(
             enabled=True,
             switch_name=switch_name or self.switch_name,
             adapter_name=adapter_name or self.adapter_name,
-            ipv4=ipv4 or self.interface_ipv4,
-            prefix_length=self.prefix_length if prefix_length is None else prefix_length,
+            ipv4=ipv4 or self.static_ipv4,
+            prefix_length=self.static_prefix_length if prefix_length is None else prefix_length,
+            address_mode=resolved_mode or self.address_mode,
+            dhcp_timeout=self.dhcp_timeout if dhcp_timeout is None else dhcp_timeout,
+            dhcp_fallback_static=(
+                self.dhcp_fallback_static
+                if dhcp_fallback_static is None
+                else dhcp_fallback_static
+            ),
         )
         with self._lock:
             switch_name = self.switch_name
             adapter_name = self.adapter_name
-            ip_text = self.interface_ipv4
-            prefix_length = self.prefix_length
-            network = self.network
+            ip_text = self.static_ipv4
+            prefix_length = self.static_prefix_length
+            network = ipaddress.ip_network(
+                f"{ip_text}/{prefix_length}", strict=False
+            )
+            address_mode = self.address_mode
+            dhcp_timeout = self.dhcp_timeout
+            dhcp_fallback_static = self.dhcp_fallback_static
 
         ps_switch = self._ps_literal(switch_name)
         ps_adapter = self._ps_literal(adapter_name)
         ps_ip = self._ps_literal(ip_text)
         expected_alias = self._ps_literal(f"vEthernet ({switch_name})")
-        script = rf"""
+        ps_use_dhcp = "$true" if address_mode == "dhcp" else "$false"
+        ps_dhcp_fallback = "$true" if dhcp_fallback_static else "$false"
+        dhcp_wait_seconds = max(3, min(120, int(round(dhcp_timeout))))
+
+        # DHCP on an internal Hyper-V adapter must be capturable before Windows
+        # emits DISCOVER/REQUEST.  Prepare and register the real backing adapter
+        # first, start its ordinary NPF worker, and only then ask Windows for a
+        # lease.  This also lets the router's own bounded DHCP server answer when
+        # CodeOutput is included in its allowed interface policy.
+        prepared_payload = {}
+        prepared_ok = False
+        prepared_created = False
+        if address_mode == "dhcp":
+            prepare_script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
 $switchName = '{ps_switch}'
@@ -271,15 +1197,6 @@ if ($adapter.Name -ne $adapterName) {{
     $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
 }}
 Enable-NetAdapter -Name $adapterName -Confirm:$false -ErrorAction SilentlyContinue
-Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
-$existing = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
-$existing | Where-Object {{ $_.IPAddress -ne '{ps_ip}' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-$current = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -IPAddress '{ps_ip}' -ErrorAction SilentlyContinue
-if (-not $current) {{
-    New-NetIPAddress -InterfaceAlias $adapterName -IPAddress '{ps_ip}' -PrefixLength {prefix_length} -Type Unicast -ErrorAction Stop | Out-Null
-}}
-Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Forwarding Enabled -InterfaceMetric 6 -ErrorAction SilentlyContinue
-$adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
 [PSCustomObject]@{{
     Alias = [string]$adapter.Name
     IfIndex = [int]$adapter.ifIndex
@@ -288,26 +1205,199 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
     Created = [bool]$created
 }} | ConvertTo-Json -Compress
 """
+            prep_ok, prep_detail, prep_stdout = self._run_powershell(
+                prepare_script, timeout=40.0
+            )
+            if prep_ok:
+                for line in reversed((prep_stdout or "").splitlines()):
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        prepared_payload = json.loads(line)
+                        break
+                    except Exception:
+                        continue
+                prepared_ok = bool(prepared_payload)
+            if prepared_ok:
+                with self._lock:
+                    self.interface_alias = str(prepared_payload.get("Alias") or adapter_name)
+                    self.interface_index = prepared_payload.get("IfIndex")
+                    self.interface_mac = str(
+                        prepared_payload.get("MacAddress") or ""
+                    ).replace("-", ":").lower() or None
+                    prepared_created = bool(prepared_payload.get("Created", False))
+                    self.interface_created_by_manager = (
+                        self.interface_created_by_manager or prepared_created
+                    )
+                    self.interface_ready = True
+                    self.enabled = True
+                    self.active_address_mode = "dhcp-pending"
+                    self.last_error = ""
+                self._resolve_capture_interface()
+                self._register_router_interface(start_capture=False)
+                self.start_capture_worker()
+                self.record_feature_event(
+                    "dhcp-capture-ready",
+                    "Backing capture started before Windows DHCP discovery.",
+                    capture_iface=self.interface_full_name,
+                )
+            elif prep_detail:
+                self._log(
+                    f"[CodeOutputInterface][DHCP] ⚠️ Adapter preflight failed: {prep_detail}"
+                )
+
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$switchName = '{ps_switch}'
+$adapterName = '{ps_adapter}'
+$expectedAlias = '{expected_alias}'
+$useDhcp = {ps_use_dhcp}
+$fallbackStatic = {ps_dhcp_fallback}
+$created = $false
+$switch = Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue
+if (-not $switch) {{
+    $switch = New-VMSwitch -Name $switchName -SwitchType Internal -ErrorAction Stop
+    $created = $true
+}}
+$deadline = (Get-Date).AddSeconds(20)
+do {{
+    $adapter = Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
+    if (-not $adapter) {{ $adapter = Get-NetAdapter -Name $expectedAlias -ErrorAction SilentlyContinue }}
+    if (-not $adapter) {{ Start-Sleep -Milliseconds 250 }}
+}} while (-not $adapter -and (Get-Date) -lt $deadline)
+if (-not $adapter) {{ throw "Hyper-V created '$switchName' but its management adapter did not appear." }}
+if ($adapter.Name -ne $adapterName) {{
+    $existingTarget = Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
+    if ($existingTarget -and $existingTarget.ifIndex -ne $adapter.ifIndex) {{
+        throw "A different adapter already uses the name '$adapterName'."
+    }}
+    Rename-NetAdapter -Name $adapter.Name -NewName $adapterName -Confirm:$false -ErrorAction Stop
+    $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
+}}
+Enable-NetAdapter -Name $adapterName -Confirm:$false -ErrorAction SilentlyContinue
+$activeMode = 'static'
+$lease = $null
+if ($useDhcp) {{
+    Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.PrefixOrigin -eq 'Manual' }} |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+    Set-DnsClientServerAddress -InterfaceAlias $adapterName -ResetServerAddresses -ErrorAction SilentlyContinue
+    $renewProcess = $null
+    try {{
+        $renewProcess = Start-Process -FilePath 'ipconfig.exe' -ArgumentList @('/renew', $adapterName) -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+    }} catch {{}}
+    $leaseDeadline = (Get-Date).AddSeconds({dhcp_wait_seconds})
+    do {{
+        $lease = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object {{
+                $_.AddressState -eq 'Preferred' -and
+                $_.IPAddress -notlike '169.254.*' -and
+                $_.IPAddress -ne '0.0.0.0'
+            }} |
+            Sort-Object -Property PrefixOrigin -Descending |
+            Select-Object -First 1
+        if (-not $lease) {{ Start-Sleep -Milliseconds 300 }}
+    }} while (-not $lease -and (Get-Date) -lt $leaseDeadline)
+    if ($renewProcess -and -not $renewProcess.HasExited) {{
+        Stop-Process -Id $renewProcess.Id -Force -ErrorAction SilentlyContinue
+    }}
+    if ($lease) {{
+        $activeMode = 'dhcp'
+    }} elseif ($fallbackStatic) {{
+        Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
+        $existing = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $existing | Where-Object {{ $_.IPAddress -ne '{ps_ip}' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        $current = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -IPAddress '{ps_ip}' -ErrorAction SilentlyContinue
+        if (-not $current) {{
+            New-NetIPAddress -InterfaceAlias $adapterName -IPAddress '{ps_ip}' -PrefixLength {prefix_length} -Type Unicast -ErrorAction Stop | Out-Null
+        }}
+        $lease = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -IPAddress '{ps_ip}' -ErrorAction Stop | Select-Object -First 1
+        $activeMode = 'static-fallback'
+    }} else {{
+        throw "No DHCP lease was obtained on '$adapterName' within {dhcp_wait_seconds} seconds."
+    }}
+}} else {{
+    Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue
+    $existing = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    $existing | Where-Object {{ $_.IPAddress -ne '{ps_ip}' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    $current = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -IPAddress '{ps_ip}' -ErrorAction SilentlyContinue
+    if (-not $current) {{
+        New-NetIPAddress -InterfaceAlias $adapterName -IPAddress '{ps_ip}' -PrefixLength {prefix_length} -Type Unicast -ErrorAction Stop | Out-Null
+    }}
+    $lease = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -IPAddress '{ps_ip}' -ErrorAction Stop | Select-Object -First 1
+}}
+Set-NetIPInterface -InterfaceAlias $adapterName -AddressFamily IPv4 -Forwarding Enabled -InterfaceMetric 6 -ErrorAction SilentlyContinue
+$adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
+$gateway = Get-NetRoute -InterfaceAlias $adapterName -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Sort-Object -Property RouteMetric, InterfaceMetric |
+    Select-Object -First 1
+$dns = @(Get-DnsClientServerAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+[PSCustomObject]@{{
+    Alias = [string]$adapter.Name
+    IfIndex = [int]$adapter.ifIndex
+    Status = [string]$adapter.Status
+    MacAddress = [string]$adapter.MacAddress
+    Created = [bool]$created
+    AddressMode = [string]$activeMode
+    IPv4 = [string]$lease.IPAddress
+    PrefixLength = [int]$lease.PrefixLength
+    Gateway = [string]$gateway.NextHop
+    DnsServers = @($dns)
+}} | ConvertTo-Json -Compress
+"""
         self._log(
             f"[CodeOutputInterface] Creating/enabling '{adapter_name}' on Hyper-V switch "
-            f"'{switch_name}' at {ip_text}/{prefix_length}..."
+            f"'{switch_name}' with address_mode={address_mode} "
+            f"(static={ip_text}/{prefix_length}, dhcp_timeout={dhcp_wait_seconds}s)..."
         )
+        with self._lock:
+            if address_mode == "dhcp":
+                self.dhcp_attempts += 1
         ok, detail, stdout = self._run_powershell(script)
         if not ok:
             with self._lock:
+                if address_mode == "dhcp":
+                    self.dhcp_failures += 1
+                    self.dhcp_lease = {
+                        "ok": False,
+                        "lease_obtained": False,
+                        "requested_mode": "dhcp",
+                        "active_mode": "dhcp-pending" if prepared_ok else "logical-fallback",
+                        "error": detail or "unknown PowerShell failure",
+                        "updated_at": time.time(),
+                    }
                 self.last_error = detail or "unknown PowerShell failure"
-                self.interface_alias = self.LOGICAL_IFACE
-                self.interface_full_name = self.LOGICAL_IFACE
-                self.interface_index = None
-                self.interface_mac = None
-                self.interface_created_by_manager = False
-                self.interface_ready = True
-                self.enabled = True
-            self._register_router_interface(start_capture=False)
-            self._log(
-                "[CodeOutputInterface] ⚠️ Hyper-V adapter unavailable; using logical "
-                f"virtual-WAN ingress instead. PowerShell: {detail or 'unknown failure'}"
-            )
+                if prepared_ok:
+                    self.interface_ready = True
+                    self.enabled = True
+                    self.active_address_mode = "dhcp-pending"
+                else:
+                    self.interface_alias = self.LOGICAL_IFACE
+                    self.interface_full_name = self.LOGICAL_IFACE
+                    self.interface_index = None
+                    self.interface_mac = None
+                    self.interface_created_by_manager = False
+                    self.interface_ready = True
+                    self.enabled = True
+                    self.active_address_mode = "logical-fallback"
+            if prepared_ok:
+                self._resolve_capture_interface()
+                self._register_router_interface(start_capture=True)
+                self._start_dhcp_monitor()
+                self._log(
+                    "[CodeOutputInterface][DHCP] ⚠️ No lease before the configured timeout; "
+                    "the real backing adapter and capture remain active while Windows continues DHCP. "
+                    f"Last error: {detail or 'timeout'}"
+                )
+            else:
+                self._register_router_interface(start_capture=False)
+                self._log(
+                    "[CodeOutputInterface] ⚠️ Hyper-V adapter unavailable; using logical "
+                    f"virtual-WAN ingress instead. PowerShell: {detail or 'unknown failure'}"
+                )
             return self.status()
 
         payload = {}
@@ -325,17 +1415,77 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             self.interface_alias = str(payload.get("Alias") or adapter_name)
             self.interface_index = payload.get("IfIndex")
             self.interface_mac = str(payload.get("MacAddress") or "").replace("-", ":").lower() or None
-            self.interface_created_by_manager = bool(payload.get("Created", False))
+            self.interface_created_by_manager = bool(
+                self.interface_created_by_manager
+                or prepared_created
+                or payload.get("Created", False)
+            )
+            active_mode = str(payload.get("AddressMode") or address_mode or "static").strip().casefold()
+            leased_ip = str(payload.get("IPv4") or "").strip()
+            leased_prefix = payload.get("PrefixLength")
+            try:
+                if leased_ip:
+                    leased_ip = str(ipaddress.IPv4Address(leased_ip))
+                    leased_prefix = int(leased_prefix)
+                    if not 1 <= leased_prefix <= 32:
+                        raise ValueError("invalid prefix")
+                    self.interface_ipv4 = leased_ip
+                    self.prefix_length = leased_prefix
+                    self.network = ipaddress.ip_network(
+                        f"{leased_ip}/{leased_prefix}", strict=False
+                    )
+            except Exception:
+                leased_ip = self.interface_ipv4
+                leased_prefix = self.prefix_length
+                self.network = network
+            self.active_address_mode = active_mode
+            dns_value = payload.get("DnsServers") or []
+            if isinstance(dns_value, str):
+                dns_servers = [dns_value] if dns_value else []
+            else:
+                try:
+                    dns_servers = [str(value) for value in dns_value if str(value)]
+                except Exception:
+                    dns_servers = []
+            self.dhcp_lease = {
+                "ok": True,
+                "lease_obtained": active_mode == "dhcp",
+                "requested_mode": address_mode,
+                "active_mode": active_mode,
+                "ipv4": leased_ip,
+                "prefix_length": int(leased_prefix or self.prefix_length),
+                "gateway": str(payload.get("Gateway") or ""),
+                "dns_servers": dns_servers,
+                "updated_at": time.time(),
+            }
+            if address_mode == "dhcp":
+                if active_mode == "dhcp":
+                    self.dhcp_successes += 1
+                else:
+                    self.dhcp_failures += 1
+            self._applied_configuration = (
+                self.switch_name,
+                self.adapter_name,
+                self.address_mode,
+                self.static_ipv4,
+                int(self.static_prefix_length),
+                float(self.dhcp_timeout),
+                bool(self.dhcp_fallback_static),
+            )
+            self._configuration_dirty = False
             self.interface_ready = True
             self.enabled = True
-            self.network = network
             self.last_error = ""
 
         self._resolve_capture_interface()
         self._register_router_interface(start_capture=start_capture)
+        if self.address_mode == "dhcp" and self.active_address_mode == "dhcp":
+            self._sync_dhcp_lease_from_os(force=True)
+            self._start_dhcp_monitor()
         self._log(
             f"[CodeOutputInterface] ✅ Ready: {self.interface_alias} "
-            f"({self.interface_ipv4}/{self.prefix_length}); capture={self.interface_full_name or 'pending'}."
+            f"({self.interface_ipv4}/{self.prefix_length}, mode={self.active_address_mode}); "
+            f"capture={self.interface_full_name or 'pending'}."
         )
         return self.status()
 
@@ -372,90 +1522,174 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             ip_text = self.interface_ipv4
             if_index = self.interface_index
             mac = self.interface_mac
+            active_mode = str(self.active_address_mode or self.address_mode or "static")
+            lease_info = dict(self.dhcp_lease or {})
+            address_active = active_mode in {"static", "static-fallback", "dhcp"}
+            gateway = str(lease_info.get("gateway") or "").strip() or None
+            dns_servers = [
+                str(value) for value in (lease_info.get("dns_servers") or [])
+                if str(value).strip()
+            ]
         logical_config = {
             "friendly_name": alias,
             "physical_iface": full_name,
-            "ip_addr": ip_text,
-            "network": network,
-            "network_text": str(network),
-            "netmask": str(network.netmask),
-            "broadcast": str(network.broadcast_address),
-            "gateway": None,
+            "ip_addr": ip_text if address_active else None,
+            "network": network if address_active else None,
+            "network_text": str(network) if address_active else "",
+            "netmask": str(network.netmask) if address_active else None,
+            "broadcast": str(network.broadcast_address) if address_active else None,
+            "gateway": gateway,
+            "dns_servers": dns_servers,
+            "address_mode": active_mode,
+            "lease_ipv4": ip_text if active_mode == "dhcp" else None,
             "if_index": if_index,
             "mac": mac,
             "is_default_gateway_iface": False,
             "logical_codeoutput_interface": True,
             "logical_only": True,
             "programmatic_interface": True,
-            "capture_capable": True,
+            "capture_capable": False,
+            "capture_forbidden": True,
             "route_capable": True,
             "wan_capable": True,
-            "passive_observation_only": False,
+            "rip_advertise": False,
+            "rip_export": False,
             "routing_owner": "CodeOutputInterfaceManager",
-            "dhcp_owner": "static-codeoutput-interface",
+            "dhcp_owner": (
+                "windows-dhcp-client" if active_mode == "dhcp"
+                else "static-codeoutput-interface"
+            ),
         }
-        physical_config = dict(logical_config)
-        physical_config.update({
-            "friendly_name": alias,
-            "logical_only": False,
-            "capture_iface": full_name,
-        })
         try:
             router._interfaces_config[self.LOGICAL_IFACE] = logical_config
-            if full_name and full_name != self.LOGICAL_IFACE:
-                router._interfaces_config[full_name] = physical_config
-                if mac:
-                    router.interface_macs[full_name] = mac
         except Exception:
             pass
+
+        # Register the real NPF device as capture-only.  It is not a second
+        # logical interface: the capture callback immediately relabels every
+        # accepted frame to CodeOutput and queues it through process_packet().
+        capture_key = str(full_name or "").strip()
+        can_capture = bool(
+            capture_key
+            and capture_key != self.LOGICAL_IFACE
+            and (capture_key.startswith(r"\Device\NPF_") or capture_key.startswith("NPF_"))
+        )
+        if can_capture:
+            physical_config = {
+                "friendly_name": alias,
+                "physical_iface": capture_key,
+                "capture_iface": capture_key,
+                # Keep the backing capture metadata synchronized with the
+                # Windows lease even though this entry is capture-only.  The
+                # logical CodeOutput entry remains the routing identity.
+                "ip_addr": ip_text if address_active else None,
+                "network": network if address_active else None,
+                "network_text": str(network) if address_active else "",
+                "netmask": str(network.netmask) if address_active else None,
+                "broadcast": str(network.broadcast_address) if address_active else None,
+                "gateway": gateway,
+                "dns_servers": dns_servers,
+                "address_mode": active_mode,
+                "if_index": if_index,
+                "mac": mac,
+                "is_default_gateway_iface": False,
+                "logical_only": False,
+                "programmatic_interface": False,
+                "capture_capable": True,
+                "capture_forbidden": False,
+                "capture_only": True,
+                "route_capable": False,
+                "wan_capable": False,
+                "lan_capable": False,
+                "exclude_from_autoconfig": True,
+                "exclude_from_dhcp": True,
+                "codeoutput_backing_capture": True,
+                "capture_relabel_iface": self.LOGICAL_IFACE,
+                "rip_advertise": False,
+                "rip_export": False,
+                "routing_owner": "CodeOutputInterfaceManager",
+                "dhcp_owner": "none",
+            }
+            try:
+                router._interfaces_config[capture_key] = physical_config
+                with self._lock:
+                    self._capture_iface_key = capture_key
+                    self._capture_registered = True
+            except Exception:
+                with self._lock:
+                    self._capture_iface_key = None
+                    self._capture_registered = False
+        else:
+            with self._lock:
+                self._capture_iface_key = None
+                self._capture_registered = False
+
         try:
             if router.lan_manager is not None:
                 lan_ifaces = getattr(router.lan_manager, "lan_ifaces", None)
                 if isinstance(lan_ifaces, set):
                     lan_ifaces.add(self.LOGICAL_IFACE)
-                    if full_name and full_name != self.LOGICAL_IFACE:
-                        lan_ifaces.add(full_name)
         except Exception:
             pass
         try:
             if router.rip_manager is not None:
-                router.rip_manager.add_static_route(
-                    network_str=str(network),
-                    next_hop="0.0.0.0",
-                    interface=(full_name if full_name and full_name != self.LOGICAL_IFACE else self.LOGICAL_IFACE),
-                    cost=1,
-                )
+                register = getattr(router.rip_manager, "register_interface", None)
+                if callable(register):
+                    register(
+                        self.LOGICAL_IFACE,
+                        logical_config,
+                        install_direct_route=address_active,
+                    )
+                else:
+                    # Compatibility with older RIPManager builds: update its
+                    # private stable interface snapshot before adding the route.
+                    with router.rip_manager._interfaces_lock:
+                        router.rip_manager._interfaces_config[self.LOGICAL_IFACE] = dict(logical_config)
+                    if address_active:
+                        router.rip_manager.add_static_route(
+                            network_str=str(network),
+                            next_hop="0.0.0.0",
+                            interface=self.LOGICAL_IFACE,
+                            cost=1,
+                        )
         except Exception as exc:
             self._log(f"[CodeOutputInterface] ⚠️ RIP registration failed: {exc}")
-        if start_capture:
+
+        self.capture_started = False
+        if start_capture and getattr(router, "started", False):
             self.start_capture_worker()
 
     def start_capture_worker(self) -> bool:
+        """Start capture on the real NPF backing device, never on CodeOutput itself."""
         router = self.router_manager
-        if router is None or not bool(getattr(router, "started", False)):
+        if router is None:
             return False
+        self._resolve_capture_interface()
+        self._register_router_interface(start_capture=False)
         with self._lock:
-            if self.interface_index is None or self.interface_alias == self.LOGICAL_IFACE:
-                return False
-        capture_name = self.interface_full_name or self._resolve_capture_interface()
-        if not capture_name:
+            capture_iface = str(self._capture_iface_key or "")
+            registered = bool(self._capture_registered)
+        if not registered or not capture_iface:
+            self.capture_started = False
             return False
-        try:
-            with router._sniff_threads_lock:
-                existing = router._sniff_threads.get(capture_name)
+        with getattr(router, "_sniff_threads_lock", threading.Lock()):
+            existing = getattr(router, "_sniff_threads", {}).get(capture_iface)
             if existing is not None and existing.is_alive():
                 self.capture_started = True
                 return True
-            if getattr(router, "sniffer", None) is None:
-                return False
-            router._start_single_sniffer(capture_name, promisc=False)
-            self.capture_started = True
-            self._log(f"[CodeOutputInterface] 📡 Capture worker registered for {capture_name}.")
-            return True
-        except Exception as exc:
-            self.last_error = str(exc)
-            self._log(f"[CodeOutputInterface] ⚠️ Capture worker could not start: {exc}")
+        starter = getattr(router, "_start_single_sniffer", None)
+        if not callable(starter) or getattr(router, "_stop_sniffing_event", threading.Event()).is_set():
+            self.capture_started = False
             return False
+        started = bool(starter(capture_iface, False))
+        self.capture_started = started
+        if started:
+            self.record_feature_event(
+                "capture-started",
+                f"Backing NPF capture active on {capture_iface}; router iface is CodeOutput.",
+                capture_iface=capture_iface,
+            )
+        return started
 
     def _unregister_router_interface(self) -> None:
         router = self.router_manager
@@ -463,11 +1697,14 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             return
         with self._lock:
             full_name = self.interface_full_name
+            capture_key = self._capture_iface_key
             network = self.network
+            self._capture_registered = False
+            self.capture_started = False
         try:
             router._interfaces_config.pop(self.LOGICAL_IFACE, None)
-            if full_name:
-                router._interfaces_config.pop(full_name, None)
+            if capture_key:
+                router._interfaces_config.pop(capture_key, None)
         except Exception:
             pass
         try:
@@ -475,26 +1712,34 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
                 lan_ifaces = getattr(router.lan_manager, "lan_ifaces", None)
                 if isinstance(lan_ifaces, set):
                     lan_ifaces.discard(self.LOGICAL_IFACE)
-                    if full_name:
-                        lan_ifaces.discard(full_name)
         except Exception:
             pass
         try:
             if router.rip_manager is not None:
-                router.rip_manager.remove_static_route(str(network))
+                unregister = getattr(router.rip_manager, "unregister_interface", None)
+                if callable(unregister):
+                    unregister(self.LOGICAL_IFACE, remove_routes=True)
+                else:
+                    router.rip_manager.remove_static_route(str(network))
         except Exception:
             pass
 
     def start(self) -> dict:
         if not self.enabled:
             return self.status()
-        if not self.interface_ready:
-            return self.create_interface(start_capture=False)
+        if not self.interface_ready or self._configuration_dirty:
+            return self.create_interface(start_capture=True)
         self._resolve_capture_interface()
-        self._register_router_interface(start_capture=False)
+        self._register_router_interface(start_capture=True)
+        if self.address_mode == "dhcp":
+            self._sync_dhcp_lease_from_os(force=False)
+            self._start_dhcp_monitor()
+        else:
+            self._stop_dhcp_monitor()
         return self.status()
 
     def remove_interface(self, *, force: bool = False) -> bool:
+        self._stop_dhcp_monitor()
         with self._lock:
             switch_name = self.switch_name
             alias = self.interface_alias or self.adapter_name
@@ -505,6 +1750,9 @@ $adapter = Get-NetAdapter -Name $adapterName -ErrorAction Stop
             with self._lock:
                 self.interface_ready = False
                 self.capture_started = False
+                self.active_address_mode = "none"
+                self.dhcp_lease = {}
+                self._configuration_dirty = True
             self._log("[CodeOutputInterface] Logical virtual-WAN interface unregistered.")
             return True
         if not force and not created:
@@ -534,10 +1782,14 @@ if ($switch) {{ Remove-VMSwitch -Name '{self._ps_literal(switch_name)}' -Force -
             self.interface_full_name = None
             self.interface_created_by_manager = False
             self.capture_started = False
+            self.active_address_mode = "none"
+            self.dhcp_lease = {}
+            self._configuration_dirty = True
         self._log(f"[CodeOutputInterface] Removed Hyper-V switch '{switch_name}'.")
         return True
 
     def shutdown(self) -> None:
+        self._stop_dhcp_monitor()
         if self.remove_on_shutdown:
             try:
                 self.remove_interface(force=False)
@@ -558,24 +1810,58 @@ if ($switch) {{ Remove-VMSwitch -Name '{self._ps_literal(switch_name)}' -Force -
                 "ipv4": self.interface_ipv4,
                 "prefix_length": int(self.prefix_length),
                 "network": str(self.network),
+                "static_ipv4": self.static_ipv4,
+                "static_prefix_length": int(self.static_prefix_length),
+                "address_mode": self.address_mode,
+                "active_address_mode": self.active_address_mode,
+                "dhcp_timeout": float(self.dhcp_timeout),
+                "dhcp_fallback_static": bool(self.dhcp_fallback_static),
+                "dhcp_lease": dict(self.dhcp_lease),
+                "dhcp_attempts": int(self.dhcp_attempts),
+                "dhcp_successes": int(self.dhcp_successes),
+                "dhcp_failures": int(self.dhcp_failures),
+                "dhcp_monitor_running": bool(
+                    self._dhcp_monitor_thread is not None
+                    and self._dhcp_monitor_thread.is_alive()
+                ),
+                "dhcp_lease_changes": int(self._dhcp_lease_changes),
+                "dhcp_last_sync": float(self._dhcp_last_sync),
+                "dhcp_last_sync_error": self._dhcp_last_sync_error,
+                "configuration_dirty": bool(self._configuration_dirty),
                 "if_index": self.interface_index,
                 "mac": self.interface_mac,
                 "capture_started": bool(self.capture_started),
+                "capture_device": self._capture_iface_key,
+                "capture_registered": bool(self._capture_registered),
+                "capture_packets_seen": int(self._capture_packets_seen),
+                "capture_packets_accepted": int(self._capture_packets_accepted),
+                "capture_echo_suppressed": int(self._capture_echo_suppressed),
+                "capture_duplicate_suppressed": int(self._capture_duplicate_suppressed),
+                "neighbor_count": len(self._neighbor_cache),
+                "neighbor_learned": int(self._neighbor_learned),
+                "neighbor_evicted": int(self._neighbor_evicted),
+                "arp_requests": int(self._arp_requests),
+                "arp_resolved": int(self._arp_resolved),
+                "arp_failed": int(self._arp_failed),
+                "telecom_requests": int(self._telecom_requests),
+                "telecom_failures": int(self._telecom_failures),
                 "logical_only": bool(
                     self.interface_index is None
                     or self.interface_alias == self.LOGICAL_IFACE
                 ),
                 "remove_on_shutdown": bool(self.remove_on_shutdown),
                 "last_error": self.last_error,
+                "capture": self._capture_log.stats(),
             }
 
 class ProcessInterfaceManager:
     """Server-owned process docking/routing policy.
 
     The GUI process remains a completely separate Windows process. This manager
-    owns only the network policy: it creates an Internal Hyper-V interface through
-    PowerShell, watches the selected PID's live TCP/UDP sockets, and tags packets
-    captured by the router's WinDivert/loopback ingress as ``ProcessInterface``.
+    owns only the network policy: it watches the selected PID's live TCP/UDP
+    sockets and tags frames captured on the router's existing physical capture
+    paths as ``ProcessInterface``. It never starts a dedicated sniffer thread for
+    the synthetic interface name.
 
     Windows does not provide a normal route-table entry that targets one PID. The
     PID boundary is therefore enforced by socket-tuple correlation before packets
@@ -587,8 +1873,8 @@ class ProcessInterfaceManager:
     DEFAULT_IPV4 = "172.30.254.1"
     DEFAULT_PREFIX_LENGTH = 30
     DEFAULT_STRATUM_PORTS = {
-        3333, 3334, 4444, 5555, 7777,
-        10001, 10128, 20128, 4242,
+        3333, 3334, 4242, 4444, 5555, 6666, 7777, 8888, 9999,
+        10001, 10128, 10132, 14444, 20128, 24444,
     }
 
     def __init__(self, router_manager, logger):
@@ -599,7 +1885,7 @@ class ProcessInterfaceManager:
         self._monitor_thread = None
 
         self.enabled = False
-        self.mode = "stratum"
+        self.mode = "all"
         self.selected_pid = None
         self.selected_process_name = ""
         self.selected_process_path = ""
@@ -619,7 +1905,14 @@ class ProcessInterfaceManager:
         self.interface_index = None
 
         self._outbound_flows = set()
+        self._flow_expiry = {}
+        self._flow_pid_map = {}
+        self._flow_process_name_map = {}
         self._flow_details = []
+        self._tracked_pids = set()
+        self._tracked_process_names = {}
+        self._global_connection_fallback_at = 0.0
+        self._connection_refreshes = 0
         self._last_refresh_at = 0.0
         self._last_refresh_error = ""
         self._seen_flow_logs = set()
@@ -632,6 +1925,41 @@ class ProcessInterfaceManager:
         self.bundle_client_pid = None
         self._bundle_original = {}
         self._bundle_applied = {}
+        self.native_tap = getattr(router_manager, "process_packet_tap", None)
+        self._native_observed = 0
+        self._native_observe_errors = 0
+        self._packets_reinjected = 0
+        self._packets_reinject_failed = 0
+        self._packets_deduplicated = 0
+        self._last_reinject_error = ""
+        self._reinject_fingerprints = {}
+        self._reinject_dedupe_ttl = 0.75
+        self._reinject_dedupe_limit = 8192
+        self._capture_log = _SyntheticPacketCaptureLog(self.LOGICAL_IFACE)
+        # Process socket attribution indexes are refreshed by the monitor thread.
+        # They deliberately tolerate local-address changes introduced by NAT/IP
+        # passthrough while still requiring the PID-owned local port and, when
+        # available, the exact remote endpoint.
+        self._refresh_event = threading.Event()
+        self._last_refresh_request = 0.0
+        self._packet_match_misses = 0
+        self._packet_match_exact = 0
+        self._packet_match_nat_tolerant = 0
+        self._packet_match_local_port = 0
+        self._system_connection_rows = 0
+        self._process_connection_rows = 0
+        self._last_flow_count = 0
+        self._flow_retention_seconds = 8.0
+        # Indexed retained PID-owned sockets. These indexes make packet matching
+        # deterministic and cheap on capture threads, including NAT/IP-passthrough
+        # cases where the captured local address differs from the process table.
+        self._flows_by_local_port = {}
+        self._flows_by_remote_endpoint = {}
+        self._native_packets_received = 0
+        self._native_packets_queued = 0
+        self._native_packets_rejected = 0
+        self._native_packets_deduplicated = 0
+        self._flow_capture_events = 0
 
     def _log(self, message: str) -> None:
         try:
@@ -863,11 +2191,14 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             "if_index": if_index,
             "is_default_gateway_iface": False,
             "logical_process_interface": True,
-            "logical_only": bool(if_index is None or alias == self.LOGICAL_IFACE),
+            "logical_only": True,
             "programmatic_interface": True,
-            "capture_capable": True,
+            "capture_capable": False,
+            "capture_forbidden": True,
             "route_capable": True,
             "wan_capable": True,
+            "rip_advertise": False,
+            "rip_export": False,
             "routing_owner": "ProcessInterfaceManager",
             "dhcp_owner": "static-process-interface",
         }
@@ -884,12 +2215,18 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             pass
         try:
             if router.rip_manager is not None:
-                router.rip_manager.add_static_route(
-                    network_str=str(network),
-                    next_hop="0.0.0.0",
-                    interface=self.LOGICAL_IFACE,
-                    cost=1,
-                )
+                register = getattr(router.rip_manager, "register_interface", None)
+                if callable(register):
+                    register(self.LOGICAL_IFACE, config, install_direct_route=True)
+                else:
+                    with router.rip_manager._interfaces_lock:
+                        router.rip_manager._interfaces_config[self.LOGICAL_IFACE] = dict(config)
+                    router.rip_manager.add_static_route(
+                        network_str=str(network),
+                        next_hop="0.0.0.0",
+                        interface=self.LOGICAL_IFACE,
+                        cost=1,
+                    )
         except Exception:
             pass
 
@@ -910,7 +2247,11 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             pass
         try:
             if router.rip_manager is not None:
-                router.rip_manager.remove_static_route(str(self.network))
+                unregister = getattr(router.rip_manager, "unregister_interface", None)
+                if callable(unregister):
+                    unregister(self.LOGICAL_IFACE, remove_routes=True)
+                else:
+                    router.rip_manager.remove_static_route(str(self.network))
         except Exception:
             pass
 
@@ -918,33 +2259,39 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             self,
             pid: int,
             *,
-            mode: str = "stratum",
+            mode: str = "all",
             stratum_ports=None,
     ) -> dict:
         pid = int(pid)
         process = psutil.Process(pid)
         created = float(process.create_time())
-        name = process.name()
+        try:
+            name = process.name()
+        except Exception:
+            name = f"PID {pid}"
         try:
             path = process.exe()
         except Exception:
             path = ""
 
-        normalized_mode = str(mode or "stratum").strip().casefold()
+        normalized_mode = str(mode or "all").strip().casefold()
         aliases = {
             "stratum only": "stratum",
             "stratum": "stratum",
             "all tcp/udp": "all",
             "all": "all",
-            "observe only": "observe",
-            "observe": "observe",
         }
         normalized_mode = aliases.get(normalized_mode, normalized_mode)
-        if normalized_mode not in {"stratum", "all", "observe"}:
-            raise ValueError("Process routing mode must be stratum, all, or observe.")
+        if normalized_mode not in {"stratum", "all"}:
+            raise ValueError("Process routing mode must be stratum or all.")
 
         ports = set()
-        for value in (stratum_ports or self.DEFAULT_STRATUM_PORTS):
+        if isinstance(stratum_ports, str):
+            requested_ports = {part.strip() for part in re.split(r"[,;\s]+", stratum_ports) if part.strip()}
+        else:
+            requested_ports = set(stratum_ports or self.DEFAULT_STRATUM_PORTS)
+        requested_ports.add(10001)
+        for value in requested_ports:
             try:
                 port = int(value)
             except Exception:
@@ -963,52 +2310,387 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             self.stratum_ports = ports
             self.enabled = True
             self._outbound_flows.clear()
+            self._flow_expiry.clear()
+            self._flow_pid_map.clear()
+            self._flow_process_name_map.clear()
             self._flow_details.clear()
+            self._tracked_pids = {pid}
+            self._tracked_process_names = {pid: self.selected_process_name}
+            self._global_connection_fallback_at = 0.0
+            self._connection_refreshes = 0
             self._seen_flow_logs.clear()
             self._packets_tagged = 0
+            self._packets_reinjected = 0
+            self._packets_reinject_failed = 0
+            self._packets_deduplicated = 0
+            self._last_reinject_error = ""
+            self._reinject_fingerprints.clear()
             self._last_refresh_error = ""
+            self._packet_match_misses = 0
+            self._packet_match_exact = 0
+            self._packet_match_nat_tolerant = 0
+            self._packet_match_local_port = 0
+            self._system_connection_rows = 0
+            self._process_connection_rows = 0
+            self._last_flow_count = 0
+            self._flows_by_local_port.clear()
+            self._flows_by_remote_endpoint.clear()
+            self._native_packets_received = 0
+            self._native_packets_queued = 0
+            self._native_packets_rejected = 0
+            self._native_packets_deduplicated = 0
+            self._flow_capture_events = 0
             self._stop_event.clear()
+            self._refresh_event.clear()
 
         self._register_router_interface()
         self._start_monitor()
         self._ensure_packet_capture()
         self._refresh_connections()
+        self.capture_event(
+            "capture-started",
+            f"Tracking PID {pid} ({self.selected_process_name}) and child-process TCP/UDP sockets.",
+            metadata={"pid": pid, "process_name": self.selected_process_name, "mode": normalized_mode},
+        )
+        if self.native_tap is not None:
+            try:
+                self.native_tap.configure(pid, normalized_mode, ports)
+                setter = getattr(self.native_tap, "set_packet_callback", None)
+                if callable(setter):
+                    try:
+                        setter(self._native_process_packet, source="ProcessPacketTap.dll", pid=pid)
+                    except TypeError:
+                        setter(self._native_process_packet)
+            except Exception as exc:
+                self._log(f"[ProcessInterface][NativeTap] configure warning: {exc}")
         self._log(
             f"[ProcessInterface] ✅ PID {pid} ({self.selected_process_name}) attached "
             f"in {normalized_mode} mode. The client remains a separate process."
         )
         return self.status()
 
+    def bind_native_tap(self, native_tap) -> None:
+        """Attach the optional native process-frame bridge.
+
+        Physical/loopback Npcap workers remain the normal capture source.  The
+        callback is an additional supported ingress for native process-output
+        helpers that submit a frame with a PID.  Both paths converge on the same
+        bounded ProcessInterface queue.
+        """
+        self.native_tap = native_tap
+        with self._lock:
+            pid = self.selected_pid
+            mode = self.mode
+            ports = set(self.stratum_ports)
+        if native_tap is None:
+            return
+        try:
+            native_tap.configure(pid, mode, ports)
+        except Exception as exc:
+            self._log(f"[ProcessInterface][NativeTap] configure warning: {exc}")
+        setter = getattr(native_tap, "set_packet_callback", None)
+        if callable(setter):
+            try:
+                setter(
+                    self._native_process_packet,
+                    source="ProcessPacketTap.dll",
+                    pid=pid,
+                )
+            except TypeError:
+                # Compatibility with older wrappers that accepted only callback.
+                try:
+                    setter(self._native_process_packet)
+                except Exception as exc:
+                    self._log(f"[ProcessInterface][NativeTap] callback warning: {exc}")
+            except Exception as exc:
+                self._log(f"[ProcessInterface][NativeTap] callback warning: {exc}")
+
     def bind_router(self, router_manager) -> None:
         """Bind this process interface directly to PythonRouterManager."""
         if router_manager is None or not callable(getattr(router_manager, "process_packet", None)):
             raise ValueError("ProcessInterface requires a router with process_packet().")
         self.router_manager = router_manager
+        self.native_tap = getattr(router_manager, "process_packet_tap", self.native_tap)
 
-    def submit_packet(self, packet, metadata: Optional[dict] = None) -> dict:
-        """Feed a PID-owned packet through PythonRouterManager's bounded ingress queue."""
-        router = self.router_manager
-        enqueue = getattr(router, "enqueue_ingress_packet", None)
-        if not callable(enqueue):
-            raise RuntimeError("ProcessInterface is not linked to PythonRouterManager.enqueue_ingress_packet().")
-        with self._lock:
-            pid = self.selected_pid
-            name = self.selected_process_name
+    def _claim_process_frame(self, packet) -> bool:
+        """Return True once for a frame seen on multiple capture paths."""
         try:
+            frame_bytes = bytes(packet)
+        except Exception:
+            frame_bytes = b""
+        if not frame_bytes:
+            return True
+        now = time.monotonic()
+        fingerprint = hashlib.blake2s(frame_bytes, digest_size=16).digest()
+        with self._lock:
+            previous = self._reinject_fingerprints.get(fingerprint)
+            if previous is not None and now - previous <= self._reinject_dedupe_ttl:
+                self._packets_deduplicated += 1
+                return False
+            self._reinject_fingerprints[fingerprint] = now
+            cutoff = now - self._reinject_dedupe_ttl
+            if len(self._reinject_fingerprints) > self._reinject_dedupe_limit:
+                self._reinject_fingerprints = {
+                    key: ts for key, ts in self._reinject_fingerprints.items()
+                    if ts >= cutoff
+                }
+                overflow = len(self._reinject_fingerprints) - self._reinject_dedupe_limit
+                if overflow > 0:
+                    for key, _ in sorted(
+                            self._reinject_fingerprints.items(), key=lambda item: item[1]
+                    )[:overflow]:
+                        self._reinject_fingerprints.pop(key, None)
+        return True
+
+    def _stamp_process_frame(self, packet, metadata: Optional[dict] = None):
+        details = dict(metadata or {})
+        try:
+            setattr(packet, "_process_interface_pid", details.get("pid"))
+            setattr(packet, "_process_interface_name", details.get("process_name"))
+            setattr(packet, "_process_interface_mode", details.get("mode") or self.mode)
+            setattr(packet, "_process_interface_original_iface", details.get("original_iface") or "")
+            setattr(packet, "_process_interface_direction", details.get("direction") or "unknown")
+            setattr(packet, "_process_interface_match_kind", details.get("match_kind") or "process-packet")
             setattr(packet, "_process_interface_packet", True)
-            setattr(packet, "_process_interface_pid", pid)
-            setattr(packet, "_process_interface_name", name)
-            setattr(packet, "_process_interface_metadata", dict(metadata or {}))
-            setattr(packet, "_router_ingress_owner", "ProcessInterfaceManager")
+            setattr(packet, "_router_ingress_iface", self.LOGICAL_IFACE)
+            setattr(packet, "_router_programmatic_ingress", True)
+            setattr(packet, "_router_ingress_owner", details.get("producer") or "ProcessTab")
+            setattr(packet, "sniffed_on", self.LOGICAL_IFACE)
         except Exception:
             pass
-        accepted = bool(enqueue(packet, self.LOGICAL_IFACE))
+        return packet
+
+    def _native_process_packet(
+            self, packet, length=None, *, source="ProcessPacketTap.dll",
+            pid=None, metadata: Optional[dict] = None, **_kwargs,
+    ) -> bool:
+        """Route a PID-tagged frame emitted by ProcessPacketTap.dll.
+
+        The callback never calls process_packet directly. It validates ownership,
+        parses/stamps the frame, and submits it to the same bounded synthetic
+        ingress used by physically captured process traffic.
+        """
+        details = dict(metadata or {})
+        with self._lock:
+            self._native_packets_received += 1
+            enabled = bool(self.enabled)
+            selected_pid = int(self.selected_pid or 0)
+            tracked_pids = set(self._tracked_pids)
+            tracked_names = dict(self._tracked_process_names)
+            selected_name = self.selected_process_name
+            mode = self.mode
+        owner_pid = int(pid or details.get("pid") or selected_pid or 0)
+        if not enabled or not selected_pid:
+            with self._lock:
+                self._native_packets_rejected += 1
+            return False
+        if owner_pid and owner_pid not in tracked_pids and owner_pid != selected_pid:
+            with self._lock:
+                self._native_packets_rejected += 1
+            return False
+
+        router = self.router_manager
+        parsed = None
+        coerce = getattr(router, "_coerce_ingress_packet", None)
+        if callable(coerce):
+            try:
+                parsed = coerce(packet)
+            except Exception:
+                parsed = None
+        frame = parsed if parsed is not None else packet
+        if not self._claim_process_frame(frame):
+            with self._lock:
+                self._native_packets_deduplicated += 1
+            return True
+
+        process_name = str(
+            details.get("process_name")
+            or tracked_names.get(owner_pid)
+            or selected_name
+            or f"PID {owner_pid or selected_pid}"
+        )
+        details.update({
+            "source": str(source or "ProcessPacketTap.dll"),
+            "producer": str(source or "ProcessPacketTap.dll"),
+            "pid": owner_pid or selected_pid,
+            "process_name": process_name,
+            "mode": mode,
+            "direction": details.get("direction") or "native",
+            "original_iface": details.get("original_iface") or str(source or "ProcessPacketTap.dll"),
+            "match_kind": details.get("match_kind") or "native-pid",
+        })
+        frame = self._stamp_process_frame(frame, details)
+        try:
+            result = self.submit_packet(frame, metadata=details)
+            accepted = str(result.get("status") or "").upper() == "QUEUED"
+        except Exception as exc:
+            accepted = False
+            with self._lock:
+                self._last_reinject_error = str(exc)
+        with self._lock:
+            if accepted:
+                self._native_packets_queued += 1
+                self._packets_reinjected += 1
+            else:
+                self._native_packets_rejected += 1
+                self._packets_reinject_failed += 1
+        return accepted
+
+    def submit_packet(self, packet, metadata: Optional[dict] = None) -> dict:
+        """Feed one process-owned frame through exact ProcessInterface ingress."""
+        router = self.router_manager
+        metadata = dict(metadata or {})
+        with self._lock:
+            pid = metadata.get("pid") or self.selected_pid
+            name = metadata.get("process_name") or self.selected_process_name
+        metadata.setdefault("producer", str(metadata.get("source") or "ProcessTab"))
+        metadata.setdefault("interface_name", self.LOGICAL_IFACE)
+        metadata.setdefault("pid", pid)
+        metadata.setdefault("process_name", name)
+        submit = getattr(router, "process_process_tab_packet", None)
+        if callable(submit):
+            accepted = bool(submit(packet, metadata=metadata))
+        else:
+            feed = getattr(router, "feed_interface_packet", None)
+            if not callable(feed):
+                raise RuntimeError("ProcessInterface is not linked to router packet ingress.")
+            accepted = bool(feed(
+                packet, self.LOGICAL_IFACE, metadata=metadata, owner="ProcessTab",
+            ))
         return {
             "status": "QUEUED" if accepted else "REJECTED",
             "interface": self.LOGICAL_IFACE,
             "pid": pid,
-            "summary": packet.summary(),
         }
+
+    def route_captured_packet(self, packet, inbound_iface: str) -> bool:
+        """Capture a selected process frame and re-enter it as ProcessInterface.
+
+        The packet is captured by an existing physical/loopback router worker,
+        correlated to the selected PID, copied, stamped, and queued. Returning
+        True transfers ownership to ProcessInterface so the physical pipeline
+        does not process or log the same frame a second time.
+        """
+        decision = self.classify_packet(packet, inbound_iface)
+        if not decision:
+            return False
+        if not self._claim_process_frame(packet):
+            return True
+
+        try:
+            routed_packet = packet.copy() if callable(getattr(packet, "copy", None)) else packet
+        except Exception:
+            routed_packet = packet
+
+        metadata = {
+            "source": "ProcessTab",
+            "producer": "ProcessTab",
+            "original_iface": str(inbound_iface or ""),
+            "pid": decision.get("pid"),
+            "process_name": decision.get("process_name") or self.selected_process_name,
+            "direction": decision.get("direction"),
+            "mode": decision.get("mode"),
+            "flow": decision.get("flow"),
+            "match_kind": decision.get("match_kind"),
+        }
+        routed_packet = self._stamp_process_frame(routed_packet, metadata)
+
+        # Feed the optional native parser as a sidecar only. It is never capture
+        # owner and cannot bypass the bounded ProcessInterface queue.
+        if self.native_tap is not None:
+            try:
+                iface_cfg = getattr(self.router_manager, "_interfaces_config", {}).get(inbound_iface, {})
+                if_index = int(iface_cfg.get("if_index") or 0) if isinstance(iface_cfg, dict) else 0
+                direction_code = 1 if decision.get("direction") == "outbound" else 2
+                accepted_native = self.native_tap.observe_packet(
+                    routed_packet,
+                    pid=decision.get("pid"),
+                    direction=direction_code,
+                    if_index=if_index,
+                )
+                self._native_observed += int(bool(accepted_native))
+            except Exception:
+                self._native_observe_errors += 1
+
+        try:
+            result = self.submit_packet(routed_packet, metadata=metadata)
+            accepted = str(result.get("status") or "").upper() == "QUEUED"
+        except Exception as exc:
+            accepted = False
+            with self._lock:
+                self._last_reinject_error = str(exc)
+
+        with self._lock:
+            if accepted:
+                self._packets_reinjected += 1
+                self._last_reinject_error = ""
+                event_key = (
+                    int(decision.get("pid") or 0),
+                    str(decision.get("direction") or ""),
+                    tuple(decision.get("flow") or ()),
+                )
+                new_flow = event_key not in self._seen_flow_logs
+                if new_flow:
+                    self._seen_flow_logs.add(event_key)
+                    if len(self._seen_flow_logs) > 4096:
+                        self._seen_flow_logs = set(list(self._seen_flow_logs)[-2048:])
+                    self._flow_capture_events += 1
+            else:
+                self._packets_reinject_failed += 1
+                if not self._last_reinject_error:
+                    self._last_reinject_error = "synthetic ProcessInterface ingress rejected packet"
+                new_flow = False
+
+        if accepted and new_flow:
+            self.capture_event(
+                "process-flow-captured",
+                f"PID {decision.get('pid')} {decision.get('process_name')} "
+                f"{decision.get('direction')} flow entered router as ProcessInterface.",
+                metadata={
+                    "pid": decision.get("pid"),
+                    "process_name": decision.get("process_name"),
+                    "direction": decision.get("direction"),
+                    "match_kind": decision.get("match_kind"),
+                    "original_iface": str(inbound_iface or ""),
+                    "flow": list(decision.get("flow") or ()),
+                },
+            )
+        return accepted
+
+    def capture_router_packet(self, packet, *, stage: str = "router-ingress", metadata: Optional[dict] = None) -> dict:
+        details = dict(metadata or {})
+        with self._lock:
+            details.setdefault("pid", self.selected_pid)
+            details.setdefault("process_name", self.selected_process_name)
+        return self._capture_log.record_packet(packet, stage=stage, metadata=details)
+
+    def record_capture_event(self, event: str, message: str, **metadata) -> dict:
+        return self._capture_log.record_event(event, message, metadata=metadata)
+
+    def capture_event(
+            self, event: str, message: str,
+            metadata: Optional[dict] = None, **extra_metadata,
+    ) -> dict:
+        """Compatibility entry point used by Process-tab operations.
+
+        Earlier merged builds kept the call sites but dropped this method,
+        causing bundle/start/stop operations to fail after the process had
+        already been partially configured.  Normalize both the historical
+        ``metadata={...}`` form and direct keyword metadata into one event.
+        """
+        merged = {}
+        if isinstance(metadata, dict):
+            merged.update(metadata)
+        elif metadata is not None:
+            merged["metadata"] = metadata
+        merged.update(extra_metadata)
+        return self.record_capture_event(event, message, **merged)
+
+    def read_capture(self, sequence: int = 0, *, limit: int = 500) -> dict:
+        return self._capture_log.read_since(sequence, limit=limit)
+
+    def clear_capture(self) -> None:
+        self._capture_log.clear()
 
     @staticmethod
     def _priority_name(value) -> str:
@@ -1179,27 +2861,22 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         return self.status()
 
     def _ensure_packet_capture(self) -> None:
-        router = self.router_manager
-        manager = getattr(router, "windivert_manager", None) if router is not None else None
-        if manager is None:
-            self._log(
-                "[ProcessInterface] ⚠️ WinDivertManager is unavailable; socket policy will "
-                "remain ready until the router packet backend starts."
-            )
-            return
-        try:
-            already_running = any(bool(getattr(manager, attr, False)) for attr in (
-                "running", "is_running", "started", "_running", "_started",
-            ))
-            manager.start()
-            if not already_running and not bool(getattr(router, "hyperv_enabled", False)):
-                self._owns_windivert_lifecycle = True
-            self._log("[ProcessInterface] WinDivert packet ingress is active.")
-        except Exception as exc:
-            self._log(f"[ProcessInterface] ⚠️ Could not start WinDivert ingress: {exc}")
+        """Never create a ProcessInterface-specific capture backend.
+
+        Process attribution is applied to packets already received by the
+        router's ordinary physical/loopback capture paths, or to frames emitted
+        by the native process DLL callback.  Starting WinDivert here created a
+        second capture owner and could duplicate streams or stall live traffic.
+        """
+        self._owns_windivert_lifecycle = False
+        return
 
     def disable_process(self) -> None:
+        with self._lock:
+            stopping_pid = self.selected_pid
+            stopping_name = self.selected_process_name
         self._stop_event.set()
+        self._refresh_event.set()
         thread = self._monitor_thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
@@ -1219,9 +2896,28 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             self.selected_process_path = ""
             self.selected_process_created = None
             self._outbound_flows.clear()
+            self._flow_expiry.clear()
+            self._flow_pid_map.clear()
+            self._flow_process_name_map.clear()
             self._flow_details.clear()
+            self._flows_by_local_port.clear()
+            self._flows_by_remote_endpoint.clear()
+            self._tracked_pids.clear()
+            self._tracked_process_names.clear()
+            self._global_connection_fallback_at = 0.0
+            self._connection_refreshes = 0
             self._seen_flow_logs.clear()
             self._monitor_thread = None
+        if self.native_tap is not None:
+            try:
+                self.native_tap.configure(None, "all", [])
+            except Exception:
+                pass
+        self.capture_event(
+            "capture-stopped",
+            f"Stopped tracking PID {stopping_pid or '-'} ({stopping_name or 'unknown'}).",
+            metadata={"pid": stopping_pid, "process_name": stopping_name},
+        )
         self._log(f"[ProcessInterface] Process routing disabled for PID {pid or '-'}.")
 
     def shutdown(self, *, remove_interface: bool = False) -> None:
@@ -1230,8 +2926,10 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         if remove_interface:
             try:
                 self.remove_interface(force=False)
+                return
             except Exception as exc:
                 self._log(f"[ProcessInterface] Shutdown interface cleanup failed: {exc}")
+        self._unregister_router_interface()
 
     def _start_monitor(self) -> None:
         thread = self._monitor_thread
@@ -1245,7 +2943,13 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         self._monitor_thread.start()
 
     def _monitor_loop(self) -> None:
-        while not self._stop_event.wait(self._refresh_interval):
+        while not self._stop_event.is_set():
+            # A classification miss can wake this worker immediately without
+            # making the packet-capture thread call psutil synchronously.
+            self._refresh_event.wait(self._refresh_interval)
+            self._refresh_event.clear()
+            if self._stop_event.is_set():
+                return
             with self._lock:
                 if not self.enabled:
                     return
@@ -1254,9 +2958,19 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             except Exception as exc:
                 with self._lock:
                     self._last_refresh_error = str(exc)
-                time.sleep(0.5)
+                if self._stop_event.wait(0.25):
+                    return
+
+    def _request_connection_refresh(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_refresh_request < 0.10:
+                return
+            self._last_refresh_request = now
+        self._refresh_event.set()
 
     def _refresh_connections(self) -> None:
+        """Refresh selected-PID and child-process TCP/UDP socket ownership."""
         with self._lock:
             pid = self.selected_pid
             expected_created = self.selected_process_created
@@ -1264,24 +2978,85 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             ports = set(self.stratum_ports)
         if not pid:
             return
-        process = psutil.Process(pid)
-        current_created = float(process.create_time())
+        root = psutil.Process(pid)
+        current_created = float(root.create_time())
         if expected_created is not None and abs(current_created - expected_created) > 0.001:
             raise RuntimeError("Selected PID was reused by a different process.")
 
+        processes = [root]
         try:
-            connections = process.net_connections(kind="inet")
-        except AttributeError:
-            connections = process.connections(kind="inet")
+            processes.extend(root.children(recursive=True))
+        except Exception:
+            pass
+        process_by_pid = {}
+        process_names = {}
+        for proc in processes:
+            try:
+                owner_pid = int(proc.pid)
+                process_by_pid[owner_pid] = proc
+                process_names[owner_pid] = str(proc.name() or f"PID {owner_pid}")
+            except Exception:
+                continue
 
-        flows = set()
+        connection_rows = []
+        query_errors = []
+        for owner_pid, proc in process_by_pid.items():
+            try:
+                try:
+                    rows = proc.net_connections(kind="inet")
+                except AttributeError:
+                    rows = proc.connections(kind="inet")
+                connection_rows.extend((owner_pid, row) for row in rows)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+            except Exception as exc:
+                query_errors.append(f"PID {owner_pid}: {exc}")
+
+        now_wall = time.time()
+        process_row_count = len(connection_rows)
+        system_row_count = 0
+        # Windows often exposes a just-created mining socket in the system table
+        # before Process.net_connections(). Merge it once per second by owner PID.
+        if now_wall - self._global_connection_fallback_at >= 1.0:
+            self._global_connection_fallback_at = now_wall
+            try:
+                tracked = set(process_by_pid)
+                known = set()
+                for owner_pid, row in connection_rows:
+                    known.add((
+                        int(owner_pid), int(getattr(row, "family", 0) or 0),
+                        int(getattr(row, "type", 0) or 0),
+                        self._address_pair(getattr(row, "laddr", None)),
+                        self._address_pair(getattr(row, "raddr", None)),
+                    ))
+                for row in psutil.net_connections(kind="inet"):
+                    owner_pid = int(getattr(row, "pid", 0) or 0)
+                    if owner_pid not in tracked:
+                        continue
+                    identity = (
+                        owner_pid, int(getattr(row, "family", 0) or 0),
+                        int(getattr(row, "type", 0) or 0),
+                        self._address_pair(getattr(row, "laddr", None)),
+                        self._address_pair(getattr(row, "raddr", None)),
+                    )
+                    if identity in known:
+                        continue
+                    known.add(identity)
+                    connection_rows.append((owner_pid, row))
+                    system_row_count += 1
+            except Exception as exc:
+                query_errors.append(f"system connection table: {exc}")
+
+        active_flows = set()
+        active_pid_map = {}
+        active_name_map = {}
         details = []
-        for connection in connections:
-            local_ip, local_port = self._address_pair(connection.laddr)
-            remote_ip, remote_port = self._address_pair(connection.raddr)
+        for owner_pid, connection in connection_rows:
+            local_ip, local_port = self._address_pair(getattr(connection, "laddr", None))
+            remote_ip, remote_port = self._address_pair(getattr(connection, "raddr", None))
             protocol = (
-                "tcp" if connection.type == socket.SOCK_STREAM
-                else "udp" if connection.type == socket.SOCK_DGRAM
+                "tcp" if getattr(connection, "type", None) == socket.SOCK_STREAM
+                else "udp" if getattr(connection, "type", None) == socket.SOCK_DGRAM
                 else ""
             )
             if not protocol or not local_ip or not local_port:
@@ -1290,15 +3065,10 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
                 if protocol != "udp":
                     continue
                 remote_ip, remote_port = "*", 0
-            if (
-                    mode == "stratum"
-                    and remote_port
-                    and remote_port not in ports
-                    and local_port not in ports
-            ):
+            if mode == "stratum" and remote_port and remote_port not in ports and local_port not in ports:
                 continue
-            family = 6 if connection.family == socket.AF_INET6 else 4
-            key = (
+            family = 6 if getattr(connection, "family", None) == socket.AF_INET6 else 4
+            flow = (
                 family,
                 protocol,
                 self._normalize_ip(local_ip),
@@ -1306,37 +3076,94 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
                 self._normalize_ip(remote_ip),
                 int(remote_port),
             )
-            flows.add(key)
+            active_flows.add(flow)
+            active_pid_map[flow] = int(owner_pid)
+            active_name_map[flow] = process_names.get(int(owner_pid), f"PID {owner_pid}")
             details.append({
+                "pid": int(owner_pid),
+                "process_name": active_name_map[flow],
                 "family": family,
                 "protocol": protocol,
-                "local": f"{key[2]}:{key[3]}",
-                "remote": f"{key[4]}:{key[5]}",
+                "local": f"{flow[2]}:{flow[3]}",
+                "remote": f"{flow[4]}:{flow[5]}",
                 "status": str(getattr(connection, "status", "") or ""),
             })
 
+        now = time.monotonic()
         with self._lock:
-            self._outbound_flows = flows
+            for flow in active_flows:
+                self._flow_expiry[flow] = now + self._flow_retention_seconds
+                self._flow_pid_map[flow] = active_pid_map.get(flow, int(pid))
+                self._flow_process_name_map[flow] = active_name_map.get(flow, self.selected_process_name)
+            for flow, expires in list(self._flow_expiry.items()):
+                if expires <= now:
+                    self._flow_expiry.pop(flow, None)
+                    self._flow_pid_map.pop(flow, None)
+                    self._flow_process_name_map.pop(flow, None)
+
+            retained_flows = set(self._flow_expiry)
+            by_local = {}
+            by_remote = {}
+            for flow in retained_flows:
+                family, protocol, _local_ip, local_port, remote_ip, remote_port = flow
+                by_local.setdefault((family, protocol, int(local_port)), []).append(flow)
+                if remote_ip not in {"", "*"} and int(remote_port or 0) > 0:
+                    by_remote.setdefault((family, protocol, remote_ip, int(remote_port)), []).append(flow)
+            self._outbound_flows = retained_flows
+            self._flows_by_local_port = {key: tuple(value) for key, value in by_local.items()}
+            self._flows_by_remote_endpoint = {key: tuple(value) for key, value in by_remote.items()}
             self._flow_details = details
-            self._last_refresh_at = time.time()
-            self._last_refresh_error = ""
+            self._tracked_pids = set(process_by_pid)
+            self._tracked_process_names = dict(process_names)
+            previous_flow_count = self._last_flow_count
+            retained_flow_count = len(retained_flows)
+            self._last_flow_count = retained_flow_count
+            self._last_refresh_at = now_wall
+            self._connection_refreshes += 1
+            self._process_connection_rows = int(process_row_count)
+            self._system_connection_rows = int(system_row_count)
+            self._last_refresh_error = "; ".join(query_errors[:4])
+
+        if previous_flow_count != retained_flow_count:
+            self.capture_event(
+                "socket-refresh",
+                f"PID socket map refreshed: active={len(active_flows)} retained={retained_flow_count}.",
+                metadata={
+                    "pid": int(pid),
+                    "active_flows": len(active_flows),
+                    "retained_flows": retained_flow_count,
+                    "process_rows": int(process_row_count),
+                    "system_rows": int(system_row_count),
+                },
+            )
 
     def classify_packet(self, packet, inbound_iface: str):
+        """Return PID ownership for a physical TCP/UDP frame, or None."""
         with self._lock:
             if not self.enabled or not self.selected_pid:
                 return None
             mode = self.mode
             flows = set(self._outbound_flows)
-            pid = int(self.selected_pid)
-        source_name = str(inbound_iface or "").casefold()
-        # Physical LAN/WAN packets must never inherit a PID merely because their
-        # tuple happens to match. Process attribution is only valid on host-local
-        # capture paths.
-        if not any(token in source_name for token in (
-                "windivert", "loopback", "wire_shark", "wireshark", "host")):
+            by_local = dict(self._flows_by_local_port)
+            selected_pid = int(self.selected_pid)
+            selected_name = self.selected_process_name
+            flow_pid_map = dict(self._flow_pid_map)
+            flow_name_map = dict(self._flow_process_name_map)
+            stratum_ports = set(self.stratum_ports)
+        source_name = str(inbound_iface or "").strip()
+        folded_source = source_name.casefold()
+        router = self.router_manager
+        if router is not None:
+            canonical = router._canonical_programmatic_iface(source_name, packet)
+            if router._is_programmatic_ingress(canonical):
+                return None
+        if any(token in folded_source for token in ("peerinterface", "hypervmanager")):
             return None
 
-        ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        try:
+            ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
+        except Exception:
+            ip_layer = None
         if ip_layer is None:
             return None
         if packet.haslayer(TCP):
@@ -1348,43 +3175,94 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
         else:
             return None
         family = 6 if packet.haslayer(IPv6) else 4
-        key = (
-            family,
-            protocol,
-            self._normalize_ip(getattr(ip_layer, "src", "")),
-            int(getattr(transport, "sport", 0) or 0),
-            self._normalize_ip(getattr(ip_layer, "dst", "")),
-            int(getattr(transport, "dport", 0) or 0),
-        )
-        if mode == "stratum" and key[3] not in self.stratum_ports and key[5] not in self.stratum_ports:
+        src_ip = self._normalize_ip(getattr(ip_layer, "src", ""))
+        dst_ip = self._normalize_ip(getattr(ip_layer, "dst", ""))
+        sport = int(getattr(transport, "sport", 0) or 0)
+        dport = int(getattr(transport, "dport", 0) or 0)
+        if not sport or not dport:
             return None
-        wildcard_local = "::" if family == 6 else "0.0.0.0"
-        candidates = {
-            key,
-            (family, protocol, wildcard_local, key[3], key[4], key[5]),
-            (family, protocol, key[2], key[3], "*", 0),
-            (family, protocol, wildcard_local, key[3], "*", 0),
-        }
-        if not candidates.intersection(flows):
+        if mode == "stratum" and sport not in stratum_ports and dport not in stratum_ports:
             return None
+
+        packet_flow = (family, protocol, src_ip, sport, dst_ip, dport)
+        reverse_flow = (family, protocol, dst_ip, dport, src_ip, sport)
+        matched_flow = packet_flow if packet_flow in flows else reverse_flow if reverse_flow in flows else None
+        direction = "outbound" if matched_flow == packet_flow else "inbound" if matched_flow else ""
+        match_kind = "exact"
+
+        if matched_flow is None:
+            # Index by the process-owned local port. This survives NAT and IP
+            # passthrough, while the remote endpoint prevents unrelated traffic
+            # from sharing a reused local port.
+            candidates = []
+            candidates.extend((flow, "outbound") for flow in by_local.get((family, protocol, sport), ()))
+            candidates.extend((flow, "inbound") for flow in by_local.get((family, protocol, dport), ()))
+            best = None
+            best_score = -1
+            wildcard_local = "::" if family == 6 else "0.0.0.0"
+            for flow, candidate_direction in candidates:
+                try:
+                    _ffamily, _fprotocol, local_ip, local_port, remote_ip, remote_port = flow
+                except Exception:
+                    continue
+                if candidate_direction == "outbound":
+                    observed_local_ip, observed_local_port = src_ip, sport
+                    observed_remote_ip, observed_remote_port = dst_ip, dport
+                else:
+                    observed_local_ip, observed_local_port = dst_ip, dport
+                    observed_remote_ip, observed_remote_port = src_ip, sport
+                if int(local_port or 0) != int(observed_local_port):
+                    continue
+                remote_known = remote_ip not in {"", "*"} and int(remote_port or 0) > 0
+                if remote_known and (
+                        remote_ip != observed_remote_ip
+                        or int(remote_port) != int(observed_remote_port)
+                ):
+                    continue
+                score = 100 if remote_known else 45
+                if local_ip == observed_local_ip:
+                    score += 30
+                    kind = "local-port"
+                elif local_ip in {"", "*", wildcard_local}:
+                    score += 20
+                    kind = "wildcard-local"
+                else:
+                    score += 12
+                    kind = "nat-tolerant"
+                if mode == "stratum" or observed_remote_port in stratum_ports:
+                    score += 5
+                if score > best_score:
+                    best = (flow, candidate_direction, kind)
+                    best_score = score
+            if best is not None:
+                matched_flow, direction, match_kind = best
+
+        if matched_flow is None:
+            with self._lock:
+                self._packet_match_misses += 1
+            self._request_connection_refresh()
+            return None
+
+        owner_pid = int(flow_pid_map.get(matched_flow, selected_pid))
+        owner_name = str(flow_name_map.get(matched_flow, selected_name or f"PID {owner_pid}"))
         result = {
-            "pid": pid,
+            "pid": owner_pid,
+            "process_name": owner_name,
             "mode": mode,
-            "direction": "outbound",
-            "flow": key,
+            "direction": direction,
+            "flow": matched_flow,
             "logical_iface": self.LOGICAL_IFACE,
-            "route": mode != "observe",
+            "match_kind": match_kind,
+            "original_iface": source_name,
         }
         with self._lock:
             self._packets_tagged += 1
-            first_seen = key not in self._seen_flow_logs
-            if first_seen:
-                self._seen_flow_logs.add(key)
-        if first_seen:
-            self._log(
-                f"[ProcessInterface] PID {pid} flow attached: "
-                f"{key[2]}:{key[3]} -> {key[4]}:{key[5]} ({protocol})."
-            )
+            if match_kind == "exact":
+                self._packet_match_exact += 1
+            elif match_kind == "nat-tolerant":
+                self._packet_match_nat_tolerant += 1
+            else:
+                self._packet_match_local_port += 1
         return result
 
     def apply_packet_policy(self, packet, inbound_iface: str) -> str:
@@ -1393,13 +3271,29 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
             return inbound_iface
         try:
             setattr(packet, "_process_interface_pid", decision["pid"])
+            setattr(packet, "_process_interface_name", decision.get("process_name") or self.selected_process_name)
             setattr(packet, "_process_interface_mode", decision["mode"])
             setattr(packet, "_process_interface_original_iface", inbound_iface)
+            setattr(packet, "_process_interface_direction", decision["direction"])
+            setattr(packet, "_process_interface_packet", True)
+            setattr(packet, "_router_ingress_iface", self.LOGICAL_IFACE)
+            setattr(packet, "_router_programmatic_ingress", True)
+            setattr(packet, "_router_ingress_owner", "ProcessInterfaceManager")
+            setattr(packet, "sniffed_on", self.LOGICAL_IFACE)
         except Exception:
             pass
-        if decision["route"]:
-            return self.LOGICAL_IFACE
-        return inbound_iface
+        if self.native_tap is not None:
+            try:
+                iface_cfg = getattr(self.router_manager, "_interfaces_config", {}).get(inbound_iface, {})
+                if_index = int(iface_cfg.get("if_index") or 0) if isinstance(iface_cfg, dict) else 0
+                direction_code = 1 if decision["direction"] == "outbound" else 2
+                accepted = self.native_tap.observe_packet(
+                    packet, pid=decision["pid"], direction=direction_code, if_index=if_index,
+                )
+                self._native_observed += int(bool(accepted))
+            except Exception:
+                self._native_observe_errors += 1
+        return self.LOGICAL_IFACE
 
     def status(self) -> dict:
         with self._lock:
@@ -1421,8 +3315,32 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
                     or self.interface_alias == self.LOGICAL_IFACE
                 ),
                 "flow_count": len(self._outbound_flows),
+                "flow_retention_seconds": float(self._flow_retention_seconds),
+                "tracked_pids": sorted(self._tracked_pids),
+                "tracked_processes": dict(self._tracked_process_names),
+                "connection_refreshes": int(self._connection_refreshes),
+                "process_connection_rows": int(self._process_connection_rows),
+                "system_connection_rows": int(self._system_connection_rows),
+                "packet_match_exact": int(self._packet_match_exact),
+                "packet_match_nat_tolerant": int(self._packet_match_nat_tolerant),
+                "packet_match_local_port": int(self._packet_match_local_port),
+                "packet_match_misses": int(self._packet_match_misses),
                 "flows": list(self._flow_details[:64]),
                 "packets_tagged": int(self._packets_tagged),
+                "packets_reinjected": int(self._packets_reinjected),
+                "packets_reinject_failed": int(self._packets_reinject_failed),
+                "packets_deduplicated": int(self._packets_deduplicated),
+                "last_reinject_error": self._last_reinject_error,
+                "native_observed": int(self._native_observed),
+                "native_observe_errors": int(self._native_observe_errors),
+                "native_packets_received": int(self._native_packets_received),
+                "native_packets_queued": int(self._native_packets_queued),
+                "native_packets_rejected": int(self._native_packets_rejected),
+                "native_packets_deduplicated": int(self._native_packets_deduplicated),
+                "indexed_local_ports": len(self._flows_by_local_port),
+                "indexed_remote_endpoints": len(self._flows_by_remote_endpoint),
+                "flow_capture_events": int(self._flow_capture_events),
+                "native_tap": self.native_tap.stats() if self.native_tap is not None else {"available": 0},
                 "last_refresh_at": float(self._last_refresh_at),
                 "last_error": self._last_refresh_error,
                 "bundle_active": bool(self.bundle_active),
@@ -1430,6 +3348,7 @@ if ($switch) {{ Remove-VMSwitch -Name '{ps_switch}' -Force -Confirm:$false -Erro
                 "bundle_router_pid": self.bundle_router_pid,
                 "bundle_client_pid": self.bundle_client_pid,
                 "bundle_applied": dict(self._bundle_applied),
+                "capture": self._capture_log.stats(),
             }
 
 class PythonRouterManager:
@@ -1445,6 +3364,7 @@ class PythonRouterManager:
     DEFAULT_LOOPBACK_IFACE_FRIENDLY_NAME = "Loopback"
     NOTIFICATION_TARGET_IP = "127.0.0.1"  # IP of the machine to receive alerts
     NOTIFICATION_TARGET_PORT = 12345  # UDP Port to listen on
+    PROGRAMMATIC_INGRESS_IFACES = frozenset({"CodeOutput", "ProcessInterface"})
 
     # Default private IP ranges to try for the IN interface if auto-picking
     PRIVATE_SUBNETS_TO_TRY = [
@@ -1470,6 +3390,8 @@ class PythonRouterManager:
         self.code_output_manager = CodeOutputManager(self.router_logger)
         self.code_output_manager.bind_router(self)
         self.parallel_python = ParallelPythonTool(router_logger)
+        self.process_packet_tap = NativeProcessPacketTap(router_logger)
+        self.codeoutput_native_control = NativeCodeOutputControl(router_logger)
         self.outbound_load_balancer = OutboundLoadBalancer(router_logger)
         self.arp_manager = ARPManager(router_logger, self.outbound_load_balancer)
         self.ndp_manager = NDPManager(router_logger)
@@ -1576,6 +3498,11 @@ class PythonRouterManager:
         self._manager_settings = {
             "enable_firewall": True,
             "enable_packet_analyzer": True,
+            "packet_analyzer_queue_size": 4096,
+            "packet_analyzer_ipc_mode": "udp",
+            "packet_analyzer_ipc_port": 9999,
+            "packet_analyzer_log_stage_messages": False,
+            "packet_analyzer_persist_memory": False,
             "enable_packet_catcher": True,
             "enable_handshake": True,
             "enable_syn_scanner": True,
@@ -1616,12 +3543,35 @@ class PythonRouterManager:
         self.transport_manager = TransportManager(router_logger, self.packet_signer,self.code_output_manager, self.parallel_python, self.packet_writer)
         self.isakmp_manager = None
         self.esp_manager = ESPManager(router_logger, self.packet_writer)
-        self.hyperv_manager = HyperVManager(self.router_logger)
+        try:
+            self.hyperv_manager = HyperVManager(self.router_logger)
+        except Exception as exc:
+            self.hyperv_manager = _UnavailableRuntimeManager(
+                "HyperVManager", exc, self.router_logger
+            )
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ HyperVManager disabled; core router will continue: {exc}"
+            )
         self.hyperv_enabled = False
-        self.broadcast_manager = BroadcastManager(self.router_logger)
-        self.windivert_manager = WinDivertManager(
-            self,self.code_output_manager,max_frames_per_batch=64,max_bytes_per_batch=(1 << 20),  # 1 MiB
-        )
+        try:
+            self.broadcast_manager = BroadcastManager(self.router_logger)
+        except Exception as exc:
+            self.broadcast_manager = None
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ BroadcastManager unavailable: {exc}"
+            )
+        try:
+            self.windivert_manager = WinDivertManager(
+                self, self.code_output_manager, max_frames_per_batch=64,
+                max_bytes_per_batch=(1 << 20),  # 1 MiB
+            )
+        except Exception as exc:
+            self.windivert_manager = _UnavailableRuntimeManager(
+                "WinDivertManager", exc, self.router_logger
+            )
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ WinDivertManager disabled; Npcap/router capture remains available: {exc}"
+            )
         self.process_interface_manager = ProcessInterfaceManager(
             self,
             self.router_logger,
@@ -1630,21 +3580,69 @@ class PythonRouterManager:
             self,
             self.router_logger,
         )
+        try:
+            self.process_interface_manager.bind_native_tap(self.process_packet_tap)
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ ProcessPacketTap callback disabled; physical PID capture remains available: {exc}"
+            )
+        try:
+            self.code_output_manager.bind_native_control(self.codeoutput_native_control)
+            self.codeoutput_native_control.set_packet_callback(self._native_codeoutput_packet)
+        except Exception as exc:
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ CodeOutput native control disabled; Python CodeOutput routing remains available: {exc}"
+            )
         self._codeoutput_flow_lock = threading.RLock()
         self._codeoutput_recent_flows = deque(maxlen=4096)
         self._codeoutput_flow_counters = collections.Counter()
 
-        self.wintun_manager = WinTunManager(
-            self,self.code_output_manager,pipe_name=r'\\.\pipe\wintun_to_python',max_frames_per_batch=256,max_bytes_per_batch = (4 << 20)
-        )
+        try:
+            self.wintun_manager = WinTunManager(
+                self, self.code_output_manager,
+                pipe_name=r'\\.\pipe\wintun_to_python',
+                max_frames_per_batch=256, max_bytes_per_batch=(4 << 20),
+            )
+        except Exception as exc:
+            self.wintun_manager = _UnavailableRuntimeManager(
+                "WinTunManager", exc, self.router_logger
+            )
+            self.router_logger.log_message(
+                f"[Router][Init] ⚠️ WinTunManager disabled; core router will continue: {exc}"
+            )
         self.packet_catcher_heuristic_rates = {
             'TCP': 0.60,
             'UDP': 0.60,
             'DEFAULT': 0.60,
         }
         self.started = False
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_in_progress = False
+        self._shutdown_complete = True
+        self._process_manager_bridge = None
 
-        self.packet_analyzer = PacketPipelineBlock()
+        # Packet analysis is optional and must never prevent the router object
+        # from being published to the GUI.  Initialize all lifecycle fields first,
+        # then enable PacketPipelineBlock on a best-effort basis.
+        self.packet_analyzer = None
+        self.default_analysis_extras = self._build_packet_pipeline_extras(
+            host="127.0.0.1", mode="udp", port=9999, enabled=True,
+            log_stage_messages=False, persist_memory=False,
+        )
+        self._packet_analysis_config_lock = threading.RLock()
+        self._packet_analysis_queue = queue.Queue(maxsize=4096)
+        self._packet_analysis_stop_event = threading.Event()
+        self._packet_analysis_thread = None
+        self._packet_analysis_stats = collections.Counter()
+        self._packet_analysis_last_meta = None
+        self._packet_analysis_last_summary = 0.0
+        try:
+            self.packet_analyzer = PacketPipelineBlock()
+        except Exception as exc:
+            self._packet_analysis_stats["init_errors"] += 1
+            self.router_logger.log_message(
+                f"[PacketPipeline] ⚠️ Analyzer disabled during startup; routing remains available: {exc}"
+            )
 
         self.p2p_manager = None
         self.netroute_manager = None
@@ -1677,6 +3675,220 @@ class PythonRouterManager:
         self._nat_last_marked_public_on_lan: Optional[str] = None
         self.hyperv_enabled = False
         self.router_logger.log_message("[Router] Orchestrator Initialized.")
+
+    def _build_packet_pipeline_extras(
+            self, *, host: str, mode: str, port: int, enabled: bool,
+            log_stage_messages: bool, persist_memory: bool,
+    ) -> Dict[str, Any]:
+        """Build pipeline parameters with compatibility fallback.
+
+        A mismatched/older p2pool_pipeline.py must not make PythonRouterManager
+        construction fail.  The fallback dictionary is accepted by the current
+        PacketPipelineBlock and keeps analysis optional.
+        """
+        normalized_host = str(host or "127.0.0.1").strip() or "127.0.0.1"
+        normalized_mode = str(mode or "udp").strip().lower()
+        if normalized_mode == "tcp":
+            normalized_mode = "tcp_client"
+        if normalized_mode not in {"udp", "tcp_client", "tcp_server", "auto", "disabled", "off", "none"}:
+            normalized_mode = "udp"
+        try:
+            normalized_port = max(1, min(65535, int(port)))
+        except (TypeError, ValueError):
+            normalized_port = 9999
+        ipc_enabled = bool(enabled) and normalized_mode not in {"disabled", "off", "none"}
+        try:
+            return create_pipeline_extras(
+                logger=self.router_logger,
+                stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
+                memory_key="last_analyzed_packet",
+                debug=False,
+                stop_on_error=False,
+                router_ip_in=normalized_host,
+                ipc_port=normalized_port,
+                ipc_mode=normalized_mode,
+                ipc_enabled=ipc_enabled,
+                log_stage_messages=bool(log_stage_messages),
+                persist_memory=bool(persist_memory),
+            )
+        except Exception as exc:
+            try:
+                self.router_logger.log_message(
+                    f"[PacketPipeline] ⚠️ Using compatibility configuration: {exc}"
+                )
+            except Exception:
+                pass
+            return {
+                "logger": self.router_logger,
+                "pipeline": {
+                    "stages": "init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|tee|ipc_emit",
+                    "debug": False,
+                    "stop_on_error": False,
+                    "log_stage_messages": bool(log_stage_messages),
+                },
+                "tee": {
+                    "key": "last_analyzed_packet",
+                    "persist": bool(persist_memory),
+                },
+                "ipc_emit": {
+                    "enabled": ipc_enabled,
+                    "host": normalized_host,
+                    "port": normalized_port,
+                    "mode": normalized_mode if ipc_enabled else "disabled",
+                    "udp_nonblocking": True,
+                    "tcp_connect_timeout": 0.05,
+                    "tcp_use_jsonl": True,
+                },
+            }
+
+    def _configure_packet_pipeline(self, ipc_emit_host: Optional[str] = None) -> None:
+        """Build a complete PacketPipelineBlock configuration before capture starts."""
+        host = str(ipc_emit_host or "127.0.0.1").strip() or "127.0.0.1"
+        mode = str(self._manager_settings.get("packet_analyzer_ipc_mode", "udp") or "udp").strip().lower()
+        if mode == "tcp":
+            mode = "tcp_client"
+        if mode not in {"udp", "tcp_client", "tcp_server", "auto", "disabled", "off", "none"}:
+            mode = "udp"
+        try:
+            port = max(1, min(65535, int(self._manager_settings.get("packet_analyzer_ipc_port", 9999))))
+        except (TypeError, ValueError):
+            port = 9999
+        try:
+            queue_size = max(256, min(65536, int(self._manager_settings.get("packet_analyzer_queue_size", 4096))))
+        except (TypeError, ValueError):
+            queue_size = 4096
+
+        thread = self._packet_analysis_thread
+        if thread is None or not thread.is_alive():
+            self._packet_analysis_queue = queue.Queue(maxsize=queue_size)
+
+        extras = self._build_packet_pipeline_extras(
+            host=host, mode=mode, port=port,
+            enabled=mode not in {"disabled", "off", "none"},
+            log_stage_messages=bool(
+                self._manager_settings.get("packet_analyzer_log_stage_messages", False)
+            ),
+            persist_memory=bool(
+                self._manager_settings.get("packet_analyzer_persist_memory", False)
+            ),
+        )
+        with self._packet_analysis_config_lock:
+            self.default_analysis_extras = extras
+        self.router_logger.log_message(
+            f"[PacketPipeline] Configured async analysis queue={queue_size} ipc={mode}://{host}:{port}."
+        )
+
+    def _packet_analysis_worker_loop(self) -> None:
+        """Analyze copies in one worker so routing/capture threads never block."""
+        while not self._packet_analysis_stop_event.is_set() or not self._packet_analysis_queue.empty():
+            try:
+                packet, inbound_iface = self._packet_analysis_queue.get(timeout=0.20)
+            except queue.Empty:
+                continue
+            try:
+                analyzer = self.packet_analyzer
+                execute = getattr(analyzer, "execute", None)
+                if not callable(execute):
+                    self._packet_analysis_stats["disabled"] += 1
+                    continue
+                with self._packet_analysis_config_lock:
+                    extras = dict(self.default_analysis_extras or {})
+                _, meta = execute(packet, params=extras)
+                self._packet_analysis_last_meta = meta
+                self._packet_analysis_stats["processed"] += 1
+            except Exception as exc:
+                self._packet_analysis_stats["errors"] += 1
+                now = time.monotonic()
+                if now - self._packet_analysis_last_summary >= 10.0:
+                    self._packet_analysis_last_summary = now
+                    self.router_logger.log_message(
+                        f"[PacketPipeline] ⚠️ Analysis error on {inbound_iface}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            finally:
+                self._packet_analysis_queue.task_done()
+
+    def _start_packet_analysis_worker(self) -> None:
+        if not self._manager_settings.get("enable_packet_analyzer", True):
+            return
+        if not callable(getattr(self.packet_analyzer, "execute", None)):
+            self._packet_analysis_stats["disabled"] += 1
+            return
+        thread = self._packet_analysis_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._packet_analysis_stop_event.clear()
+        self._packet_analysis_thread = threading.Thread(
+            target=self._packet_analysis_worker_loop,
+            name="RouterPacketPipeline",
+            daemon=True,
+        )
+        self._packet_analysis_thread.start()
+        self.router_logger.log_message("[PacketPipeline] ✅ Background analysis worker started.")
+
+    def _stop_packet_analysis_worker(self, *, discard: bool = True, timeout: float = 2.0) -> None:
+        self._packet_analysis_stop_event.set()
+        if discard:
+            while True:
+                try:
+                    self._packet_analysis_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._packet_analysis_stats["discarded_on_stop"] += 1
+                    self._packet_analysis_queue.task_done()
+        thread = self._packet_analysis_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.1, float(timeout)))
+        self._packet_analysis_thread = None
+        try:
+            close = getattr(self.packet_analyzer, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+    def _submit_packet_analysis(self, packet, inbound_iface: str) -> bool:
+        """Queue one analysis copy; failures never interrupt forwarding."""
+        if not self._manager_settings.get("enable_packet_analyzer", True):
+            return False
+        if not callable(getattr(self.packet_analyzer, "execute", None)):
+            self._packet_analysis_stats["disabled"] += 1
+            return False
+        if not hasattr(self, "default_analysis_extras"):
+            # Compatibility guard for partially restored/pickled managers.
+            self._configure_packet_pipeline("127.0.0.1")
+        thread = self._packet_analysis_thread
+        if thread is None or not thread.is_alive():
+            self._start_packet_analysis_worker()
+        try:
+            analysis_packet = packet.copy() if hasattr(packet, "copy") else packet
+            setattr(analysis_packet, "sniffed_on", str(inbound_iface))
+            setattr(analysis_packet, "_router_ingress_iface", str(inbound_iface))
+            setattr(analysis_packet, "_router_interface_name", str(inbound_iface))
+            self._packet_analysis_queue.put_nowait((analysis_packet, str(inbound_iface)))
+            self._packet_analysis_stats["queued"] += 1
+            return True
+        except queue.Full:
+            self._packet_analysis_stats["dropped_full"] += 1
+            now = time.monotonic()
+            if now - self._packet_analysis_last_summary >= 30.0:
+                self._packet_analysis_last_summary = now
+                self.router_logger.log_message(
+                    "[PacketPipeline] ⚠️ Analysis queue full; dropping analysis copies only "
+                    f"(forwarding unaffected, dropped={self._packet_analysis_stats['dropped_full']})."
+                )
+            return False
+        except Exception as exc:
+            self._packet_analysis_stats["submit_errors"] += 1
+            now = time.monotonic()
+            if now - self._packet_analysis_last_summary >= 10.0:
+                self._packet_analysis_last_summary = now
+                self.router_logger.log_message(
+                    f"[PacketPipeline] ⚠️ Could not queue packet on {inbound_iface}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return False
 
     def _current_lan_transit_ifaces(self) -> set[str]:
         """
@@ -3579,7 +5791,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "broadcast": str(loopback_network.broadcast_address)
             }
             if self.interface_loopback_full_name:
-                self.add_static_arp_entry(loopback_ip, loopback_mac)
+                # Loopback has no Ethernet neighbor and therefore no valid ARP
+                # mapping. Trust it for local processing, but never insert a
+                # 00:00:00:00:00:00 static ARP entry.
                 self.add_trusted_arp_port(self.interface_loopback_full_name)
             self.rip_manager.interface_loopback_full_name = self.interface_loopback_full_name
             self.router_logger.log_message(
@@ -3996,6 +6210,76 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         del q[drop_index]
         return dropped
 
+    @classmethod
+    def _canonical_programmatic_iface(cls, inbound_iface: str, packet=None) -> str:
+        """Preserve synthetic ingress names before any manager or formatter runs."""
+        requested = str(inbound_iface or "Unknown").strip() or "Unknown"
+        folded = requested.casefold().replace("_", "").replace("-", "")
+        if folded in {"codeoutput", "codeoutputinterface"}:
+            return CodeOutputInterfaceManager.LOGICAL_IFACE
+        if folded in {"processinterface", "processmanager", "process"}:
+            return ProcessInterfaceManager.LOGICAL_IFACE
+        try:
+            if bool(getattr(packet, "_codeoutput_packet", False)):
+                return CodeOutputInterfaceManager.LOGICAL_IFACE
+            if bool(getattr(packet, "_process_interface_packet", False)):
+                return ProcessInterfaceManager.LOGICAL_IFACE
+            attr = str(getattr(packet, "_router_ingress_iface", "") or "").strip()
+            if attr in cls.PROGRAMMATIC_INGRESS_IFACES:
+                return attr
+        except Exception:
+            pass
+        return requested
+
+    @classmethod
+    def _is_programmatic_ingress(cls, inbound_iface: str) -> bool:
+        return str(inbound_iface or "") in cls.PROGRAMMATIC_INGRESS_IFACES
+
+    @classmethod
+    def _is_synthetic_interface_identity(cls, *values: object) -> bool:
+        """Return True for logical synthetic names and their human aliases.
+
+        Callers may explicitly exempt the registered CodeOutput backing NPF device;
+        the logical CodeOutput and ProcessInterface names themselves are never
+        passed to a capture backend.
+        """
+        for value in values:
+            text = str(value or "").strip().casefold()
+            if not text:
+                continue
+            compact = re.sub(r"[^a-z0-9]", "", text)
+            if "codeoutput" in compact or "processinterface" in compact:
+                return True
+        return False
+
+    @classmethod
+    def _stamp_programmatic_ingress(cls, packet, inbound_iface: str, metadata: Optional[dict] = None):
+        """Preserve the exact synthetic interface name on a Scapy packet."""
+        iface = cls._canonical_programmatic_iface(inbound_iface, packet)
+        if iface not in cls.PROGRAMMATIC_INGRESS_IFACES:
+            return packet
+        details = dict(metadata or {})
+        details["interface_name"] = iface
+        try:
+            setattr(packet, "_router_ingress_iface", iface)
+            setattr(packet, "_router_programmatic_ingress", True)
+            setattr(packet, "_programmatic_ingress", True)
+            setattr(packet, "_router_interface_name", iface)
+            setattr(packet, "sniffed_on", iface)
+            if iface == CodeOutputInterfaceManager.LOGICAL_IFACE:
+                setattr(packet, "_codeoutput_packet", True)
+                prior = dict(getattr(packet, "_codeoutput_metadata", None) or {})
+                prior.update(details)
+                setattr(packet, "_codeoutput_metadata", prior)
+            else:
+                setattr(packet, "_process_interface_packet", True)
+                prior = dict(getattr(packet, "_process_interface_metadata", None) or {})
+                prior.update(details)
+                setattr(packet, "_process_interface_metadata", prior)
+        except Exception:
+            pass
+        return packet
+
     def _ensure_ingress_state(self, inbound_iface: str) -> Dict[str, Any]:
         key = str(inbound_iface or "Unknown")
         with self._ingress_lock:
@@ -4023,10 +6307,14 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 "last_progress": time.monotonic(),
                 "last_summary": time.monotonic(),
             }
+            thread_prefix = (
+                "RouterSyntheticIngress" if key in self.PROGRAMMATIC_INGRESS_IFACES
+                else "RouterCaptureIngress"
+            )
             thread = threading.Thread(
                 target=self._ingress_worker_loop,
                 args=(state,),
-                name=f"RouterIngress-{key.split('_')[-1]}",
+                name=f"{thread_prefix}-{key.split('_')[-1]}",
                 daemon=True,
             )
             state["thread"] = thread
@@ -4058,6 +6346,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         """Non-blocking, process-friendly ingress API for all capture backends."""
         if packet is None or self._stop_sniffing_event.is_set():
             return False
+        inbound_iface = self._canonical_programmatic_iface(inbound_iface, packet)
+        if self._is_programmatic_ingress(inbound_iface):
+            packet = self._stamp_programmatic_ingress(packet, inbound_iface)
+        else:
+            try:
+                setattr(packet, "_router_ingress_iface", inbound_iface)
+                setattr(packet, "sniffed_on", inbound_iface)
+            except Exception:
+                pass
         state = self._ensure_ingress_state(inbound_iface)
         parsed = self._ingress_parsed_packet(packet)
         size = self._estimate_ingress_size(packet)
@@ -4165,7 +6462,18 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     latency = max(0.0, time.monotonic() - float(item["queued_ts"]))
                     state["latency_total"] += latency
                     state["latency_max"] = max(float(state["latency_max"]), latency)
-                    self.process_packet(item["packet"], iface)
+                    packet = item["packet"]
+                    if self._is_programmatic_ingress(iface):
+                        packet = self._stamp_programmatic_ingress(packet, iface)
+                    # This is the only synthetic-ingress dispatch point. Keep the
+                    # exact calls explicit so neither name can collapse back to an
+                    # NPF/GUID capture interface.
+                    if iface == CodeOutputInterfaceManager.LOGICAL_IFACE:
+                        self.process_packet(packet, "CodeOutput")
+                    elif iface == ProcessInterfaceManager.LOGICAL_IFACE:
+                        self.process_packet(packet, "ProcessInterface")
+                    else:
+                        self.process_packet(packet, iface)
                     state["processed"] += 1
                     self._ingress_total_processed += 1
                     state["last_progress"] = time.monotonic()
@@ -4238,6 +6546,13 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             "ingress_total_coalesced": self._ingress_total_coalesced,
             "ingress": ingress,
         }
+        out["packet_pipeline"] = {
+            "enabled": bool(self._manager_settings.get("enable_packet_analyzer", True)),
+            "worker_alive": bool(self._packet_analysis_thread and self._packet_analysis_thread.is_alive()),
+            "queued": int(self._packet_analysis_queue.qsize()),
+            "queue_capacity": int(getattr(self._packet_analysis_queue, "maxsize", 0) or 0),
+            "stats": dict(self._packet_analysis_stats),
+        }
         try:
             out["hyperv_pipe"] = self.hyperv_manager.get_pipe_stats()
         except Exception:
@@ -4245,19 +6560,18 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         return out
 
     def _safe_stop_component(self, label: str, component, method: str = "stop") -> bool:
-        if component is None:
+        if component is None or component is False:
             return True
         fn = getattr(component, method, None)
         if not callable(fn):
             return True
         try:
             fn()
+            self.router_logger.log_message(f"[Router][Shutdown] ✅ {label} stopped.")
             return True
         except Exception as exc:
-            self._ingress_log_sparse(
-                f"safe-stop:{label}",
-                f"[Router][Cleanup] ⚠️ {label}.{method} failed: {type(exc).__name__}: {exc}",
-                every=1.0,
+            self.router_logger.log_message(
+                f"[Router][Shutdown] ⚠️ {label}.{method} failed: {type(exc).__name__}: {exc}"
             )
             return False
 
@@ -4272,6 +6586,7 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self._runtime_network_ready.clear()
         self._stop_sniffing_event.set()
         self._stop_ingress_workers(discard=True)
+        self._stop_packet_analysis_worker(discard=True)
 
         self._safe_stop_component("SocketInterface", self.socket_interface)
         try:
@@ -4326,12 +6641,51 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self.started = False
 
     def _start_single_sniffer(self, iface_name: str, promisc = False):
-        """Starts a sniffer thread for a given interface (no rate limiting, no queue)."""
-
-        friendly_name_for_filter = next(
-            (item['friendly_name'] for item in self._discovered_tshark_interfaces if item['full_name'] == iface_name),
-            'DEFAULT'
+        """Start capture only for real devices, with optional CodeOutput relabeling."""
+        iface_name = str(iface_name or "").strip()
+        config = self._interfaces_config.get(iface_name, {})
+        discovered_friendly = next(
+            (
+                str(item.get("friendly_name") or "")
+                for item in self._discovered_tshark_interfaces
+                if str(item.get("full_name") or "") == iface_name
+            ),
+            "",
         )
+        configured_friendly = str(config.get("friendly_name") or "") if isinstance(config, dict) else ""
+        configured_alias = str(config.get("physical_iface") or config.get("capture_iface") or "") if isinstance(config, dict) else ""
+        codeoutput_backing = bool(
+            isinstance(config, dict)
+            and config.get("codeoutput_backing_capture")
+            and config.get("capture_relabel_iface") == CodeOutputInterfaceManager.LOGICAL_IFACE
+        )
+        if (
+                not iface_name
+                or self._is_programmatic_ingress(iface_name)
+                or (
+                    not codeoutput_backing
+                    and self._is_synthetic_interface_identity(
+                        iface_name, discovered_friendly, configured_friendly, configured_alias,
+                    )
+                )
+        ):
+            return False
+        if isinstance(config, dict) and (
+                (config.get("programmatic_interface") and not codeoutput_backing)
+                or config.get("capture_forbidden")
+                or config.get("capture_capable") is False
+        ):
+            return False
+
+        # Capture startup is idempotent.  DHCP preflight can start the real
+        # CodeOutput backing NPF worker before the general router capture pass;
+        # never create a second thread for the same device.
+        with self._sniff_threads_lock:
+            existing = self._sniff_threads.get(iface_name)
+            if existing is not None and existing.is_alive():
+                return True
+
+        friendly_name_for_filter = discovered_friendly or 'DEFAULT'
         filter_clauses = self.BPF_FILTER_BASE_DEFINITIONS.get(friendly_name_for_filter,
                                                               self.BPF_FILTER_BASE_DEFINITIONS.get("DEFAULT", []))
         filter_str = " or ".join(f"({clause})" for clause in filter_clauses) if filter_clauses else ""
@@ -4344,10 +6698,35 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     pkt2 = self._coerce_ingress_packet(pkt)
                     if pkt2 is None:
                         return
-                    if not self.enqueue_ingress_packet(pkt2, iface_name):
+                    ingress_iface = iface_name
+                    current_config = self._interfaces_config.get(iface_name, {})
+                    current_codeoutput_backing = bool(
+                        isinstance(current_config, dict)
+                        and current_config.get("codeoutput_backing_capture")
+                        and current_config.get("capture_relabel_iface")
+                        == CodeOutputInterfaceManager.LOGICAL_IFACE
+                    )
+                    if current_codeoutput_backing:
+                        manager = getattr(self, "codeoutput_interface_manager", None)
+                        accept = getattr(manager, "accept_backing_capture", None)
+                        if not callable(accept) or not accept(pkt2, iface_name):
+                            return
+                        ingress_iface = CodeOutputInterfaceManager.LOGICAL_IFACE
+                        try:
+                            setattr(pkt2, "_codeoutput_packet", True)
+                            setattr(pkt2, "_codeoutput_capture_source", iface_name)
+                            setattr(pkt2, "_router_ingress_owner", "CodeOutputBackingCapture")
+                            setattr(pkt2, "_codeoutput_metadata", {
+                                "source": "CodeOutputBackingCapture",
+                                "capture_iface": iface_name,
+                                "interface_name": ingress_iface,
+                            })
+                        except Exception:
+                            pass
+                    if not self.enqueue_ingress_packet(pkt2, ingress_iface):
                         self._ingress_log_sparse(
-                            f"capture-drop:{iface_name}",
-                            f"[Sniffer] ⚠️ ingress queue rejected packet on {iface_name}",
+                            f"capture-drop:{ingress_iface}",
+                            f"[Sniffer] ⚠️ ingress queue rejected packet on {ingress_iface}",
                         )
                 except Exception as e:
                     import traceback
@@ -4371,6 +6750,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             except Exception as e:
                 self.router_logger.log_message(f"‼️ CRITICAL ERROR in sniffer thread for {name.split('_')[-1]}: {e}")
             finally:
+                if codeoutput_backing:
+                    try:
+                        self.codeoutput_interface_manager.capture_started = False
+                    except Exception:
+                        pass
                 self.router_logger.log_message(f"[Router] Sniffer thread for {name.split('_')[-1]} has exited.")
 
         sniffer_thread = threading.Thread(target=sniffer_loop, name=f"Sniffer-{iface_name.split('_')[-1]}", daemon=True)
@@ -4378,12 +6762,21 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         with self._sniff_threads_lock:
             self._sniff_threads[iface_name] = sniffer_thread
         sniffer_thread.start()
+        if codeoutput_backing:
+            try:
+                self.codeoutput_interface_manager.capture_started = True
+            except Exception:
+                pass
 
         self.router_logger.log_message(f"[Router] Sniffing started on {iface_name.split('_')[-1]}.")
+        return True
 
     @staticmethod
     def _looks_like_virtual_downstream_iface(value: str) -> bool:
         name = str(value or "").casefold()
+        compact = re.sub(r"[^a-z0-9]", "", name)
+        if "codeoutput" in compact or "processinterface" in compact:
+            return False
         hints = (
             "windivertbridge", "windivert bridge", "nate's tunnel", "nates tunnel",
             "wintun", "wireshark", "wire shark", "vethernet", "virtual ethernet",
@@ -4720,6 +7113,24 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         except Exception:
             pass
 
+        # When CodeOutput is configured as a DHCP client, allow its stable
+        # logical identity and known Windows aliases before the Hyper-V adapter
+        # is created.  This lets the already-running bounded DHCP server answer
+        # the adapter's DISCOVER once its backing capture worker starts.
+        try:
+            codeoutput_iface = getattr(self, "codeoutput_interface_manager", None)
+            if (
+                    codeoutput_iface is not None
+                    and bool(getattr(codeoutput_iface, "enabled", False))
+                    and str(getattr(codeoutput_iface, "address_mode", "static")) == "dhcp"
+            ):
+                add_iface(allowed, CodeOutputInterfaceManager.LOGICAL_IFACE)
+                add_iface(allowed, getattr(codeoutput_iface, "adapter_name", None))
+                add_iface(allowed, getattr(codeoutput_iface, "interface_alias", None))
+                add_iface(allowed, getattr(codeoutput_iface, "interface_full_name", None))
+        except Exception:
+            pass
+
         # Include current software-bridge members.
         try:
             bridge_members = self.ethernet_manager.get_bridge_members()
@@ -4904,7 +7315,6 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 policy_snapshot = configure_policy(
                     allowed_ifaces=allowed,
                     denied_ifaces=denied,
-                    observe_only_ifaces=set(),
                     interface_roles=interface_roles,
                     replace=True,
                     reason=f"{reason}:{role_name}",
@@ -5066,7 +7476,6 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             ),
             allowed_ifaces=allowed_ifaces,
             denied_ifaces=denied_ifaces,
-            observe_only_ifaces=set(),
             interface_roles=interface_roles,
             control_plane_name=f"router-{role_name}-dhcp",
             preserve_leases_on_policy_update=True,
@@ -6369,8 +8778,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
         ``handled=False`` means DNSManager received the packet but intentionally
         left it on the host/transit path. It must not be interpreted as a failed
-        delivery. TCP/53 packets are observation-only until a complete framed DNS
-        message has been reassembled by the manager's TCP listener/stream logic.
+        delivery. TCP/53 packets remain on the normal router path until a complete
+        framed DNS message is reassembled by the manager's TCP stream logic.
         """
         result = {
             "available": False,
@@ -6387,9 +8796,6 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         result["available"] = True
         manager_context = dict(context or {})
         manager_context["dns_manager_delivery"] = True
-        manager_context["observation_only"] = bool(
-            manager_context.get("transport") == "tcp"
-        )
         manager_context["complete_dns_message"] = bool(
             manager_context.get("transport") == "udp"
             and manager_context.get("dns_wire")
@@ -6856,22 +9262,75 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 }
         return {"selector": raw, "full_name": raw, "friendly_name": raw, "aliases": [raw]}
 
+    def feed_interface_packet(
+            self, packet, inbound_iface: str, *, metadata: Optional[dict] = None,
+            owner: Optional[str] = None,
+    ) -> bool:
+        """Canonical nonblocking interface ingress.
+
+        The bounded per-interface worker is the only thread that calls
+        ``process_packet(packet, inbound_iface)``. This prevents DLL/capture
+        callback threads from stalling live Internet traffic.
+        """
+        requested = str(inbound_iface or "").strip().casefold()
+        if requested in {"codeoutput", "codeoutputinterface"}:
+            iface = CodeOutputInterfaceManager.LOGICAL_IFACE
+            packet_flag = "_codeoutput_packet"
+        elif requested in {"processinterface", "processmanager", "process"}:
+            iface = ProcessInterfaceManager.LOGICAL_IFACE
+            packet_flag = "_process_interface_packet"
+        else:
+            raise ValueError("Programmatic interface must be CodeOutput or ProcessInterface.")
+        details = dict(metadata or {})
+        details["interface_name"] = iface
+        details.setdefault("owner", owner or "PythonRouterManager")
+        parsed = self._coerce_ingress_packet(packet)
+        if parsed is not None:
+            packet = parsed
+        packet = self._stamp_programmatic_ingress(packet, iface, details)
+        try:
+            setattr(packet, packet_flag, True)
+            setattr(packet, "_router_ingress_owner", str(owner or "PythonRouterManager"))
+            if iface == ProcessInterfaceManager.LOGICAL_IFACE:
+                setattr(packet, "_process_interface_pid", details.get("pid"))
+                setattr(packet, "_process_interface_name", details.get("process_name"))
+        except Exception:
+            pass
+        return bool(self.enqueue_ingress_packet(packet, iface))
+
+    def process_codeoutput_packet(self, packet, metadata: Optional[dict] = None) -> bool:
+        """Queue a frame for the exact call process_packet(frame, "CodeOutput")."""
+        return bool(self.feed_interface_packet(
+            packet, "CodeOutput", metadata=dict(metadata or {}), owner="CodeOutput",
+        ))
+
+    def process_process_tab_packet(self, packet, metadata: Optional[dict] = None) -> bool:
+        """Queue a Process-tab frame for process_packet(frame, "ProcessInterface")."""
+        return bool(self.feed_interface_packet(
+            packet, "ProcessInterface", metadata=dict(metadata or {}), owner="ProcessTab",
+        ))
+
+    def _native_codeoutput_packet(self, packet, metadata: Optional[dict] = None, pid: Optional[int] = None):
+        """Receive an explicit frame emitted by CodeOutputControl.dll."""
+        details = dict(metadata or {})
+        details.setdefault("source", "CodeOutputControl.dll")
+        details.setdefault("pid", pid)
+        details.setdefault("explicit", True)
+        return self.codeoutput_interface_manager.submit_packet(
+            packet, metadata=details, phase="native-control",
+        )
+
     def ingest_codeoutput_packet(
             self, packet, *, source_iface: Optional[str] = None,
             direction: str = "wan-in", metadata: Optional[dict] = None,
     ) -> bool:
-        """Enter programmatic CodeOutput traffic through the Npcap ingress queue."""
         metadata = dict(metadata or {})
-        iface = str(source_iface or CodeOutputInterfaceManager.LOGICAL_IFACE)
-        try:
-            setattr(packet, "_codeoutput_packet", True)
-            setattr(packet, "_codeoutput_metadata", metadata)
-            setattr(packet, "_codeoutput_direction", str(direction or "wan-in"))
-            setattr(packet, "_router_ingress_owner", "CodeOutputInterfaceManager")
-            setattr(packet, "_programmatic_ingress", True)
-        except Exception:
-            pass
-        return bool(self.enqueue_ingress_packet(packet, iface))
+        metadata.setdefault("producer_iface", str(source_iface or CodeOutputInterfaceManager.LOGICAL_IFACE))
+        metadata.setdefault("direction", str(direction or "wan-in"))
+        return self.feed_interface_packet(
+            packet, CodeOutputInterfaceManager.LOGICAL_IFACE, metadata=metadata,
+            owner="CodeOutputInterfaceManager",
+        )
 
     def route_codeoutput_packet(
             self, packet, *, inbound_iface: Optional[str] = None,
@@ -6921,23 +9380,11 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         self.router_logger.log_message(
             f"[CodeOutputInterface] ➡️ PacketLab injecting {packet.summary()} into router pipeline."
         )
-        try:
-            return {
-                "status": "QUEUED" if self.code_output_manager.ingest_packet(
-                    packet,
-                    source_iface=CodeOutputInterfaceManager.LOGICAL_IFACE,
-                    direction="packetlab",
-                    metadata=metadata,
-                ) else "REJECTED",
-                "interface": CodeOutputInterfaceManager.LOGICAL_IFACE,
-                "summary": packet.summary(),
-            }
-        except Exception:
-            return self.codeoutput_interface_manager.submit_packet(
-                packet,
-                metadata=metadata,
-                phase="packetlab",
-            )
+        result = self.codeoutput_interface_manager.submit_packet(
+            packet, metadata=metadata, phase="packetlab",
+        )
+        result["summary"] = packet.summary()
+        return result
 
     def inject_process_packet(self, packet, metadata: Optional[dict] = None):
         """Public bridge used by ProcessTab/process capture to enter the router pipeline."""
@@ -7092,7 +9539,14 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         """
         yield_no_gil(2.0)
         try:
-            iface_short = inbound_iface.split('_')[-1]
+            inbound_iface = self._canonical_programmatic_iface(inbound_iface, packet)
+            programmatic_ingress = self._is_programmatic_ingress(inbound_iface)
+            try:
+                setattr(packet, "_router_ingress_iface", inbound_iface)
+                setattr(packet, "_router_programmatic_ingress", programmatic_ingress)
+            except Exception:
+                pass
+            iface_short = inbound_iface
 
             if isinstance(packet, (bytes, bytearray, memoryview)):
                 try:
@@ -7307,6 +9761,15 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                         )
 
                     packet = best_pkt
+                    if programmatic_ingress:
+                        packet = self._stamp_programmatic_ingress(packet, inbound_iface)
+                    else:
+                        try:
+                            setattr(packet, "_router_ingress_iface", inbound_iface)
+                            setattr(packet, "_router_programmatic_ingress", False)
+                            setattr(packet, "sniffed_on", inbound_iface)
+                        except Exception:
+                            pass
 
                 except Exception as e:
                     self.router_logger.log_message(
@@ -7314,22 +9777,65 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     )
                     return
 
-            process_interface = getattr(self, "process_interface_manager", None)
-            if process_interface is not None:
+            if programmatic_ingress:
+                # Record every synthetic packet in a bounded interface-owned history.
+                # The GUI pulls records in batches; this call never starts a sniffer
+                # and never writes one synchronous GUI line per packet.
                 try:
-                    routed_iface = process_interface.apply_packet_policy(
-                        packet,
-                        inbound_iface,
+                    capture_metadata = {
+                        "producer": getattr(packet, "_router_ingress_owner", None),
+                        "pid": getattr(packet, "_process_interface_pid", None),
+                        "process_name": getattr(packet, "_process_interface_name", None),
+                        "original_iface": (
+                            getattr(packet, "_process_interface_original_iface", None)
+                            or getattr(packet, "_codeoutput_capture_source", None)
+                        ),
+                        "direction": getattr(packet, "_process_interface_direction", None),
+                        "match_kind": getattr(packet, "_process_interface_match_kind", None),
+                        "probe_id": getattr(packet, "_codeoutput_probe_id", None),
+                        "probe_stage": getattr(packet, "_codeoutput_probe_stage", None),
+                    }
+                    if inbound_iface == CodeOutputInterfaceManager.LOGICAL_IFACE:
+                        self.codeoutput_interface_manager.capture_router_packet(
+                            packet, stage="router-process-packet", metadata=capture_metadata,
+                        )
+                    elif inbound_iface == ProcessInterfaceManager.LOGICAL_IFACE:
+                        self.process_interface_manager.capture_router_packet(
+                            packet, stage="router-process-packet", metadata=capture_metadata,
+                        )
+                except Exception:
+                    pass
+                # Keep the synthetic interface visible in the Router packet log
+                # without restoring the old per-packet QUEUED spam. The sparse
+                # limiter protects the GUI/event loop during high-rate streams.
+                try:
+                    self._ingress_log_sparse(
+                        f"synthetic-packet-visible:{inbound_iface}",
+                        f"[Router][Packet] if={inbound_iface} {packet.summary()}",
+                        every=0.25,
                     )
-                    if routed_iface != inbound_iface:
-                        inbound_iface = routed_iface
-                        iface_short = inbound_iface.split('_')[-1]
+                except Exception:
+                    pass
+
+            process_interface = getattr(self, "process_interface_manager", None)
+            if process_interface is not None and not programmatic_ingress:
+                try:
+                    # ProcessTab ownership becomes a real second router ingress
+                    # event. The synthetic worker later performs the exact call
+                    # process_packet(packet, "ProcessInterface") once.
+                    if process_interface.route_captured_packet(packet, inbound_iface):
+                        return
                 except Exception as exc:
                     self._ingress_log_sparse(
                         "process-interface-classify",
-                        f"[ProcessInterface] ⚠️ Packet classification failed: {exc}",
+                        f"[ProcessInterface] ⚠️ Packet classification/re-ingress failed: {exc}",
                         every=2.0,
                     )
+
+            try:
+                self.code_output_manager.observe_probe_response(packet, inbound_iface)
+            except Exception:
+                pass
 
             self._remember_codeoutput_flow(packet, inbound_iface, "ingress")
 
@@ -7383,16 +9889,20 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if self.lan_manager:
                 self.lan_manager.observe_packet(packet, inbound_iface)
 
-            if self.lan_manager and self.lan_manager.handle_packet(packet, inbound_iface):
-                return
+            # Synthetic ingress must reach Transport and the forwarding decision.
+            # LAN/Gateway/Hyper-V handlers may observe it, but cannot consume it
+            # before packet logs preserve ``if=CodeOutput``/``if=ProcessInterface``.
+            if not programmatic_ingress:
+                if self.lan_manager and self.lan_manager.handle_packet(packet, inbound_iface):
+                    return
 
-            if self.gateway_manager and self.gateway_manager.handle_packet(packet, inbound_iface):
-                return
-            if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface) and inbound_iface != "HyperVManager":
-                return
-            if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
-                                                                                                        inbound_iface):
-                return
+                if self.gateway_manager and self.gateway_manager.handle_packet(packet, inbound_iface):
+                    return
+                if self.hypervrouter_manager and self.hypervrouter_manager.handle_packet(packet, inbound_iface) and inbound_iface != "HyperVManager":
+                    return
+                if self.host_connectivity_boundary and self.host_connectivity_boundary.should_bypass_router(packet,
+                                                                                                            inbound_iface):
+                    return
             if self.netroute_manager:
                 self.netroute_manager.observe_packet(packet, inbound_iface)
             if self.python_server_manager:
@@ -7479,14 +9989,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             ):
                 self.router_logger.log_message(f"[Firewall] 🔥 Blocked packet on {iface_short}")
                 return
-            if self._manager_settings.get(
-                    "enable_packet_analyzer",
-                    True,
-            ):
-                self.packet_analyzer.execute(
-                    packet,
-                    params=self.default_analysis_extras
-                )
+            if self._manager_settings.get("enable_packet_analyzer", True):
+                self._submit_packet_analysis(packet, inbound_iface)
             # ==========================================================
             # DNS CONTROL-PLANE DISPATCH — BEFORE HANDSHAKE AND NAT
             # ==========================================================
@@ -7629,7 +10133,9 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 # Dropped (e.g., banned or ICMP sent)
                 return
 
-            is_handled_by_transport = self.transport_manager.handle_packet(packet, inbound_iface)
+            is_handled_by_transport = self.transport_manager.handle_packet(
+                packet, inbound_iface
+            )
 
             if is_handled_by_transport:
                 if self.netroute_manager:
@@ -7816,10 +10322,78 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 f"[Router] ❗ ERROR while processing on {inbound_iface}:\n{traceback.format_exc()}\nPacket: {packet.show(dump=True)}"
             )
 
+    def _select_lag_egress(
+            self, interface_name: str, packet, lag_name: str = "MyLANAggregation"
+    ) -> Optional[str]:
+        """Resolve a logical/member LAG route without assuming the LAG exists.
+
+        Capture workers can still drain packets while startup is creating the LAG or
+        shutdown is removing it.  The old forwarding path indexed the LAG snapshot
+        directly, raising ``KeyError`` whenever that lifecycle race occurred.
+        """
+        requested = str(interface_name or "").strip()
+        if not requested:
+            return None
+
+        manager = getattr(self, "lag_manager", None)
+        if manager is None:
+            return requested
+
+        try:
+            groups = manager.get_lag_members() or {}
+        except Exception as exc:
+            try:
+                self.function_call_tracker.track(
+                    identifier="LAGSnapshotUnavailable",
+                    threshold=20,
+                    final_message=(
+                        f"[Router][LAG] ⚠️ Could not read LAG state ({exc}); "
+                        "using the route interface directly. Count: {}."
+                    ),
+                    count_message=None,
+                )
+            except Exception:
+                pass
+            return requested
+
+        members = list(groups.get(lag_name) or [])
+        is_logical_lag = requested == lag_name
+        is_lag_member = requested in members
+        if not is_logical_lag and not is_lag_member:
+            return requested
+
+        if not members:
+            # A route can briefly retain the logical LAG name after the group has
+            # been removed.  There is no safe physical interface to select then.
+            return None if is_logical_lag else requested
+
+        try:
+            selected = manager.get_member_interface(lag_name, packet)
+        except Exception as exc:
+            selected = None
+            try:
+                self.function_call_tracker.track(
+                    identifier="LAGMemberSelectionFailed",
+                    threshold=20,
+                    final_message=(
+                        f"[Router][LAG] ⚠️ Member selection failed for {lag_name} "
+                        f"({exc}). Count: {{}}."
+                    ),
+                    count_message=None,
+                )
+            except Exception:
+                pass
+
+        if selected:
+            return str(selected)
+        if is_lag_member:
+            return requested
+        return str(members[0]) if members else None
+
     def _forward_general_ip_packet(self, packet, inbound_iface: str):
         """Forwards a transit packet, applying NAT, LAG, ARP resolution, and Layer 2 handling."""
         burn_no_gil(1.0, threads=4)
-        iface_short = inbound_iface.split('_')[-1]
+        iface_short = self._canonical_programmatic_iface(inbound_iface, packet)
         ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
         if not ip_layer:
             self.router_logger.log_message("[Router] ❗ No IP layer found in packet. Dropping.")
@@ -8002,7 +10576,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         if not route:
             self.router_logger.log_message(f"[Router] 🗺️ No specific route for {dst_ip}, checking for default route...")
 
-            default_route = self.rip_manager.get_forwarding_route("0.0.0.0")
+            default_destination = "::" if dst_ip_obj.version == 6 else "0.0.0.0"
+            default_route = self.rip_manager.get_forwarding_route(default_destination)
 
             if default_route:
                 route = default_route
@@ -8024,17 +10599,14 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
         wan_ifaces = set(self.outbound_load_balancer.get_configured_interfaces())
 
-        selected_iface = None
-        if initial_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
-            selected_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+        selected_iface = self._select_lag_egress(initial_outbound_iface, packet)
+        if selected_iface and selected_iface != initial_outbound_iface:
             self.code_output_manager.submit_packet(
                 packet,
                 inbound_iface=inbound_iface,
                 phase="interface",
                 component="lag",
             )
-        else:
-            selected_iface = initial_outbound_iface
 
         if not selected_iface:
             self.router_logger.log_message("[Router] ❌ No outbound interface. Dropping packet.")
@@ -8143,7 +10715,12 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         if initial_outbound_iface in self.outbound_load_balancer.get_configured_interfaces():
             selected_iface = self.outbound_load_balancer.get_next_interface(packet)
         else:
-            selected_iface = route["interface"]
+            selected_iface = self._select_lag_egress(route.get("interface"), packet)
+        if not selected_iface:
+            self.router_logger.log_message(
+                f"[Router] ❌ Route to {dst_ip} points to an unavailable LAG/interface. Dropping."
+            )
+            return
         # --- [4] Intra-LAN Loop Prevention ---
         inbound_config = self._interfaces_config.get(inbound_iface)
         inbound_network = self._get_interface_network(
@@ -8161,9 +10738,14 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             if not is_intra_lan:
                 alternate_route = self.rip_manager.find_alternate_route(dst_ip, exclude_iface=inbound_iface)
                 if alternate_route:  # ✅ Ensure alternate_route is valid first
-                    actual_outbound_iface = alternate_route["interface"]
-                    if actual_outbound_iface in self.lag_manager.get_lag_members()["MyLANAggregation"]:
-                        actual_outbound_iface = self.lag_manager.get_member_interface("MyLANAggregation", packet)
+                    actual_outbound_iface = self._select_lag_egress(
+                        alternate_route.get("interface"), packet
+                    )
+                    if not actual_outbound_iface:
+                        self.router_logger.log_message(
+                            f"[Router] ❌ Alternate route for {dst_ip} points to an unavailable LAG. Dropping."
+                        )
+                        return
                     if alternate_route:
                         self.router_logger.log_message(
                             f"[Router] 🛣️ Routing loop on {inbound_iface} for {dst_ip} — rerouting via {actual_outbound_iface.split('_')[-1]}"
@@ -8172,7 +10754,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
 
                         initial_outbound_iface = actual_outbound_iface
                 else:
-                    default_route = self.rip_manager.find_route("0.0.0.0")
+                    default_destination = "::" if dst_ip_obj.version == 6 else "0.0.0.0"
+                    default_route = self.rip_manager.find_route(default_destination)
                     if default_route:
                         actual_outbound_iface = default_route["interface"]
                         self.router_logger.log_message(
@@ -8458,6 +11041,17 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self._runtime_network_ready.clear()
             self._stop_sniffing_event.clear()
             self._stop_ingress_workers(discard=True)
+            with self._shutdown_lock:
+                self._shutdown_complete = False
+                self._shutdown_in_progress = False
+            try:
+                self.codeoutput_native_control.set_packet_callback(self._native_codeoutput_packet)
+            except Exception:
+                pass
+            bridge = getattr(self, "_process_manager_bridge", None)
+            resume = getattr(bridge, "resume_router_packets", None)
+            if callable(resume):
+                resume(self)
             self.hyperv_enabled = use_hyperv
             self.peerinterface_enabled = bool(use_peerinterface)
             self._peerinterface_settings = dict(peerinterface_settings or {})
@@ -8494,7 +11088,10 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             interface_setting_names = {
                 "interface_enabled", "interface_switch_name", "interface_adapter_name",
                 "interface_ipv4", "interface_prefix_length", "interface_remove_on_shutdown",
-                "switch_name", "adapter_name", "ipv4", "prefix_length", "remove_on_shutdown",
+                "interface_address_mode", "interface_use_dhcp", "interface_dhcp_timeout",
+                "interface_dhcp_fallback_static", "switch_name", "adapter_name", "ipv4",
+                "prefix_length", "remove_on_shutdown", "address_mode", "use_dhcp",
+                "dhcp_timeout", "dhcp_fallback_static",
             }
             interface_settings = {
                 key: requested_code_output_settings.pop(key)
@@ -8548,6 +11145,8 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             bool_manager_settings = {
                 "enable_firewall",
                 "enable_packet_analyzer",
+                "packet_analyzer_log_stage_messages",
+                "packet_analyzer_persist_memory",
                 "enable_packet_catcher",
                 "enable_handshake",
                 "enable_syn_scanner",
@@ -8600,6 +11199,26 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                     protocol_name
                 ] = parsed_rate
 
+            try:
+                self._manager_settings["packet_analyzer_queue_size"] = max(
+                    256,
+                    min(65536, int(self._manager_settings.get("packet_analyzer_queue_size", 4096))),
+                )
+            except (TypeError, ValueError):
+                self._manager_settings["packet_analyzer_queue_size"] = 4096
+            try:
+                self._manager_settings["packet_analyzer_ipc_port"] = max(
+                    1,
+                    min(65535, int(self._manager_settings.get("packet_analyzer_ipc_port", 9999))),
+                )
+            except (TypeError, ValueError):
+                self._manager_settings["packet_analyzer_ipc_port"] = 9999
+            self._configure_packet_pipeline(ipc_emit_host)
+            if self._manager_settings.get("enable_packet_analyzer", True):
+                self._start_packet_analysis_worker()
+            else:
+                self._stop_packet_analysis_worker(discard=True)
+
             requested_transport_settings = dict(
                 transport_settings or {}
             )
@@ -8651,6 +11270,14 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             self._transport_settings = (
                 requested_transport_settings
             )
+            # Transport sub-managers own resolver/cleanup threads. Rebuild the
+            # aggregate after a completed stop so a router restart never reuses
+            # one-shot stopped workers or stale flow state.
+            if not bool(getattr(self.transport_manager, "started", False)):
+                self.transport_manager = TransportManager(
+                    self.router_logger, self.packet_signer, self.code_output_manager,
+                    self.parallel_python, self.packet_writer,
+                )
             self.transport_manager.configure(
                 **self._transport_settings
             )
@@ -9448,22 +12075,36 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 except Exception as e:
                     self.router_logger.log_message(f"[Ollama] ⚠️ Failed to install bridge: {e}")
 
-            # Verbosity and active-probe behavior now come from GUI settings.
-            # TLS learning is bound to the real HandshakeManager above.
-
-            self.default_analysis_extras = create_pipeline_extras(
-                logger=self.router_logger,  # <-- Pass your logger instance here
-                stages="init_packet|parse_l2|parse_arp|parse_l3|parse_l4|parse_app|analyze_payload|ipc_emit",
-                memory_key="last_analyzed_packet",
-                debug=False,
-                stop_on_error=True,
-                router_ip_in=ipc_emit_host
+            # PacketPipelineBlock was configured and started before any capture
+            # producer. Do not replace its extras here while CodeOutput/DHCP/IGMP
+            # packets may already be queued.
+            self.router_logger.log_message(
+                f"[PacketPipeline] Active for router capture on {ipc_emit_host or '127.0.0.1'}."
             )
-            self.router_logger.log_message(f"[IPCEmit][Pipeline] Hosting on {ipc_emit_host}")
 
             sniffing_tasks = []
             for iface_name, iface_config in list(self._interfaces_config.items()):
-                if isinstance(iface_config, dict) and iface_config.get("logical_only"):
+                friendly = str((iface_config or {}).get("friendly_name") or "") if isinstance(iface_config, dict) else ""
+                physical = str((iface_config or {}).get("physical_iface") or (iface_config or {}).get("capture_iface") or "") if isinstance(iface_config, dict) else ""
+                codeoutput_backing = bool(
+                    isinstance(iface_config, dict)
+                    and iface_config.get("codeoutput_backing_capture")
+                    and iface_config.get("capture_relabel_iface") == CodeOutputInterfaceManager.LOGICAL_IFACE
+                )
+                if (
+                        self._is_programmatic_ingress(iface_name)
+                        or (
+                            not codeoutput_backing
+                            and self._is_synthetic_interface_identity(iface_name, friendly, physical)
+                        )
+                ):
+                    continue
+                if isinstance(iface_config, dict) and (
+                        (iface_config.get("logical_only") and not codeoutput_backing)
+                        or (iface_config.get("programmatic_interface") and not codeoutput_backing)
+                        or iface_config.get("capture_forbidden")
+                        or iface_config.get("capture_capable") is False
+                ):
                     continue
                 if iface_name not in ["WireShark", "Nate's Tunnel", "WinDivertBridge"]:
                     sniffing_tasks.append((self._start_single_sniffer, (iface_name,promisc,)))
@@ -9521,9 +12162,21 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
                 if self.host_connectivity_boundary:
                     self.hypervrouter_manager.attach_hostboundary_manager(self.host_connectivity_boundary)
 
-                self.hyperv_manager.start()
-                self.windivert_manager.start()
-                self.wintun_manager.start()
+                for optional_name, optional_manager in (
+                    ("HyperVManager", self.hyperv_manager),
+                    ("WinDivertManager", self.windivert_manager),
+                    ("WinTunManager", self.wintun_manager),
+                ):
+                    try:
+                        started_optional = optional_manager.start()
+                        if started_optional is False and not getattr(optional_manager, "available", True):
+                            self.router_logger.log_message(
+                                f"[Router][Optional] {optional_name} unavailable; continuing without it."
+                            )
+                    except Exception as exc:
+                        self.router_logger.log_message(
+                            f"[Router][Optional] ⚠️ {optional_name} failed to start; continuing: {exc}"
+                        )
                 self.hypervrouter_manager.start()
                 self.hyperv_enabled = True
                 self.arp_manager.add_trusted_port("WinDivertBridge")
@@ -9667,170 +12320,227 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
             )
 
 
-    def stop_routing(self,use_dhcp_out, use_dhcp_in, use_static, use_hyperv, use_stratum_comm, use_netroute, nat_os, use_ollama, use_peerinterface=False):
-        """Stops all manager threads and cleans up network interfaces."""
+    def _join_router_threads(self, timeout_per_thread: float = 2.0) -> None:
+        with self._sniff_threads_lock:
+            sniffers = list(self._sniff_threads.items())
+        for name, thread in sniffers:
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=max(0.1, float(timeout_per_thread)))
+                if thread.is_alive():
+                    self.router_logger.log_message(
+                        f"[Router][Shutdown] ⚠️ Sniffer thread still exiting: {name}"
+                    )
+        with self._sniff_threads_lock:
+            self._sniff_threads = {
+                name: thread for name, thread in self._sniff_threads.items()
+                if thread and thread.is_alive()
+            }
+        for name, thread in list(self._worker_threads.items()):
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=max(0.1, float(timeout_per_thread)))
+            if not thread or not thread.is_alive():
+                self._worker_threads.pop(name, None)
+
+    def stop_routing(
+            self, use_dhcp_out=False, use_dhcp_in=False, use_static=False,
+            use_hyperv=False, use_stratum_comm=False, use_netroute=False,
+            nat_os=False, use_ollama=False, use_peerinterface=False,
+    ):
+        """Idempotently stop every router producer, worker, and manager.
+
+        Runtime state, rather than stale GUI flags, determines which components
+        are stopped. One component failure never aborts the remainder of teardown.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_in_progress:
+                self.router_logger.log_message("[Router] Shutdown already in progress.")
+                return False
+            if self._shutdown_complete and not self.started:
+                return True
+            self._shutdown_in_progress = True
+            self._shutdown_complete = False
+
+        failures = []
+        self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
+
+        def stop_component(label, component, method="stop"):
+            ok = self._safe_stop_component(label, component, method)
+            if not ok:
+                failures.append(label)
+            return ok
+
         try:
-            self.router_logger.log_message("[Router] --- Python Router Stopping Services ---")
-            try:
-                if self.process_interface_manager is not None:
-                    self.process_interface_manager.disable_process()
-            except Exception as exc:
-                self.router_logger.log_message(
-                    f"[ProcessInterface] ⚠️ Stop error: {exc}"
-                )
+            # First reject new work and stop packet/probe producers.
+            self.started = False
             self._runtime_network_ready.clear()
             self._stop_sniffing_event.set()
-            self._stop_ingress_workers(discard=True)
-            if use_peerinterface or self.peerinterface_enabled or self.peerinterface_manager:
-                self._safe_stop_component("PeerInterfaceManager", self.peerinterface_manager)
-                self.peerinterface_manager = None
-                self.peerinterface_enabled = False
-            if use_hyperv:
-                self.hypervrouter_manager.stop()
-                self.windivert_manager.stop()
-                self.wintun_manager.stop()
-                self.hyperv_manager.teardown()
-                self.hyperv_enabled = False
+            bridge = getattr(self, "_process_manager_bridge", None)
+            pause = getattr(bridge, "pause_router_packets", None)
+            if callable(pause):
+                try:
+                    pause()
+                    self.router_logger.log_message("[Router][Shutdown] ✅ Process packet bridge paused.")
+                except Exception as exc:
+                    failures.append("ProcessManagerBridge")
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ Process packet bridge: {exc}")
+
+            stop_component("CodeOutputManager", self.code_output_manager)
             try:
-                if self.transport_manager:
-                    self.transport_manager.stop()
+                self.codeoutput_native_control.set_packet_callback(None)
+            except Exception:
+                pass
+            try:
+                self.process_interface_manager.shutdown(remove_interface=False)
+                self.router_logger.log_message("[Router][Shutdown] ✅ ProcessInterfaceManager stopped.")
             except Exception as exc:
-                self.router_logger.log_message(
-                    f"[Transport] ⚠️ Stop error: {exc}"
-                )
-            self.parallel_python.release_ram_usage()
-            try:
-                if self.scrapewebsite_manager:
-                    self.scrapewebsite_manager.stop()
-                    self.scrapewebsite_manager = None
-            except Exception as e:
-                self.router_logger.log_message(f"[ScrapeWebsite] Stop error: {e}")
-            if self.socket_interface:
-                self.socket_interface.stop()
-            if use_stratum_comm:
-                if self.daemon_manager:
-                    self.daemon_manager.stop()
-                if self.stratum_connection_manager:
-                    self.stratum_connection_manager.stop()
+                failures.append("ProcessInterfaceManager")
+                self.router_logger.log_message(f"[Router][Shutdown] ⚠️ ProcessInterfaceManager: {exc}")
             try:
                 self.codeoutput_interface_manager.shutdown()
+                self.router_logger.log_message("[Router][Shutdown] ✅ CodeOutputInterfaceManager stopped.")
             except Exception as exc:
-                self.router_logger.log_message(f"[CodeOutputInterface] ⚠️ Stop error: {exc}")
-            self.code_output_manager.stop()
-            try:
-                if self.ollama_assistant and use_ollama:
-                    self.ollama_assistant.unbind_router()
-                    self.ollama_assistant = None
-            except Exception as e:
-                self.router_logger.log_message(f"[Ollama] ⚠️ Unbind failed: {e}")
-            try:
-                if self.wifi_manager:
-                    self.wifi_manager.stop(
-                        force=False,
-                        detach_router=True,
-                    )
-            except Exception as exc:
-                self.router_logger.log_message(
-                    f"[WiFiManager] ⚠️ Wireless host stop failed: {exc}"
-                )
-            if use_static:
-                self._deconfigure_interface_settings()
-            self.parallel_python.stop()
-            stopped_dhcp_ids = set()
+                failures.append("CodeOutputInterfaceManager")
+                self.router_logger.log_message(f"[Router][Shutdown] ⚠️ CodeOutputInterfaceManager: {exc}")
 
-            for dhcp_server in (
-                    self.dhcp_server_in,
-                    self.dhcp_server_out,
-                    *list((getattr(self, "dhcp_interface_servers", {}) or {}).values()),
+            # Stop capture and virtual transport producers before discarding ingress.
+            stop_component("SocketInterface", self.socket_interface)
+            stop_component("PeerInterfaceManager", self.peerinterface_manager)
+            self.peerinterface_manager = None
+            self.peerinterface_enabled = False
+            stop_component("HyperVRouterManager", self.hypervrouter_manager)
+            stop_component("WinDivertManager", self.windivert_manager)
+            stop_component("WinTunManager", self.wintun_manager)
+            if self.hyperv_enabled or use_hyperv:
+                stop_component("HyperVManager", self.hyperv_manager, "teardown")
+            self.hyperv_enabled = False
+            self._stop_ingress_workers(discard=True)
+            self._join_router_threads()
+            self._stop_packet_analysis_worker(discard=True)
+
+            # Consumers and protocol managers can now stop without receiving new frames.
+            stop_component("TransportManager", self.transport_manager)
+            stop_component("ScrapeWebsiteManager", self.scrapewebsite_manager)
+            self.scrapewebsite_manager = None
+            stop_component("MoneroDaemonManager", self.daemon_manager)
+            stop_component("StratumConnectionManager", self.stratum_connection_manager)
+            stop_component("P2PPeerManager", self.p2p_manager)
+            stop_component("NetRouteManager", self.netroute_manager)
+            stop_component("HostConnectivityBoundaryManager", self.host_connectivity_boundary)
+            stop_component("LanManager", self.lan_manager)
+            stop_component("GatewayManager", self.gateway_manager)
+            stop_component("UplinkManager", self.upstream_manager or self.uplink_manager)
+            stop_component("PythonServerManager", self.python_server_manager)
+            stop_component("RIPManager", self.rip_manager)
+            stop_component("EthernetBridgeManager", self.ethernet_manager)
+            stop_component("PacketWriter", self.packet_writer)
+            stop_component("NATManager", self.nat_manager)
+            stop_component("DNSManager", self.dns_manager)
+            stop_component("IGMPManager", self.igmp_manager)
+            stop_component("HandshakeManager", self.handshake_manager)
+            stop_component("SYNScanner", self.syn_scanner)
+
+            seen = set()
+            for name, server in (
+                ("DHCP-IN", self.dhcp_server_in),
+                ("DHCP-OUT", self.dhcp_server_out),
+                *[(f"DHCP-{key}", value) for key, value in (getattr(self, "dhcp_interface_servers", {}) or {}).items()],
             ):
-                if dhcp_server is None:
+                if server is None or id(server) in seen:
                     continue
-
-                server_id = id(dhcp_server)
-
-                if server_id in stopped_dhcp_ids:
-                    continue
-
-                stopped_dhcp_ids.add(server_id)
-
-                try:
-                    dhcp_server.stop()
-                except Exception as exc:
-                    self.router_logger.log_message(
-                        f"[DHCP] ⚠️ Error stopping DHCP server: {exc}"
-                    )
+                seen.add(id(server))
+                stop_component(name, server)
             self.dhcp_interface_servers = {}
-            self.rip_manager.stop()
-            self.ethernet_manager.stop()
-            self.packet_writer.stop()
+
+            if self.ollama_assistant is not None:
+                try:
+                    self.ollama_assistant.unbind_router()
+                except Exception as exc:
+                    failures.append("Ollama")
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ Ollama unbind: {exc}")
+                self.ollama_assistant = None
+            if self.wifi_manager is not None:
+                try:
+                    self.wifi_manager.stop(force=False, detach_router=True)
+                    self.router_logger.log_message("[Router][Shutdown] ✅ WiFiManager stopped.")
+                except Exception as exc:
+                    failures.append("WiFiManager")
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ WiFiManager: {exc}")
+
+            try:
+                self.parallel_python.release_ram_usage()
+            except Exception:
+                pass
+            if use_static:
+                try:
+                    self._deconfigure_interface_settings()
+                except Exception as exc:
+                    failures.append("StaticInterfaceCleanup")
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ Static interface cleanup: {exc}")
             if nat_os:
-                self._disable_nat_forwarding()
-            if self.nat_manager:
-                self.nat_manager.stop()
-            self.dns_manager.stop()
-            if self.p2p_manager:
-                self.p2p_manager.stop()
-            if use_netroute:
-                if self.netroute_manager:
-                    self.netroute_manager.stop()
-            if self.host_connectivity_boundary:
-                self.host_connectivity_boundary.stop()
-            if self.lan_manager:
-                self.lan_manager.stop()
-                self.lan_manager = None
-            if self.python_server_manager:
-                self.python_server_manager.unwrap_logger_method(self.router_logger, "log_message")
-                self.python_server_manager.stop()
-                self.python_server_manager = None
-            if self.gateway_manager:
-                self.gateway_manager.stop()
-                self.gateway_manager = None
-            upstream_manager = self.upstream_manager or self.uplink_manager
-            if upstream_manager:
-                upstream_manager.stop()
+                try:
+                    self._disable_nat_forwarding()
+                except Exception as exc:
+                    failures.append("OSNAT")
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ OS NAT cleanup: {exc}")
+
+            for action, label in (
+                (lambda: self.remove_l2_bridge("MyLANBridge"), "L2 bridge"),
+                (lambda: self.remove_link_aggregation_group("MyLANAggregation"), "link aggregation"),
+            ):
+                try:
+                    action()
+                except Exception as exc:
+                    failures.append(label)
+                    self.router_logger.log_message(f"[Router][Shutdown] ⚠️ {label}: {exc}")
+            for iface in (self.interface_out_full_name, self.interface_lac_full_name, self.interface_lac_2_full_name):
+                if iface:
+                    try:
+                        self.remove_outbound_load_balancing_interface(iface)
+                    except Exception:
+                        pass
+            try:
+                self.cleanup_all_network_changes()
+            except Exception as exc:
+                failures.append("NetworkChangeCleanup")
+                self.router_logger.log_message(f"[Router][Shutdown] ⚠️ Network cleanup: {exc}")
+            try:
+                stop_cpu_boost()
+            except Exception:
+                pass
+
+            self.p2p_manager = None
+            self.netroute_manager = None
+            self.lan_manager = None
+            self.gateway_manager = None
             self.upstream_manager = None
             self.uplink_manager = None
-            self.router_logger.log_message("[Router] Waiting for worker threads to finish...")
-            self.router_logger.log_message("[Router] Worker threads stopped.")
-            self.router_logger.log_message("[Router] Worker threads stopped.")
-            # 5. Join sniffer threads (these should have died or be dying from _stop_sniffing_event)
-            self.router_logger.log_message("[Router] Waiting for sniffer threads to finish...")
-            # Access _sniff_threads with lock, as monitor might be trying to remove/add.
-
-            self.router_logger.log_message("[Router] Sniffer threads stopped.")
-            stop_cpu_boost()
-            self._sniff_threads.clear()
-            if self._manager_settings.get("enable_igmp", True):
-                self.igmp_manager.stop()
-            if self.handshake_manager:
-                self.handshake_manager.stop()
-            self.remove_l2_bridge("MyLANBridge")
-            self.remove_link_aggregation_group("MyLANAggregation")
-            if self.interface_out_full_name:
-                self.remove_outbound_load_balancing_interface(self.interface_out_full_name)
-            if self.interface_lac_full_name:
-                self.remove_outbound_load_balancing_interface(self.interface_lac_full_name)
-            if self.interface_lac_2_full_name:
-                self.remove_outbound_load_balancing_interface(self.interface_lac_2_full_name)
-            if self.syn_scanner:
-                self.syn_scanner.stop()
-            self.cleanup_all_network_changes()
-            self.started = False
-            self.router_logger.log_message("[Router] All services stopped.")
-        except Exception as e:
-            self.router_logger.log_message(
-                f"[Router] Error during normal shutdown: {type(e).__name__}: {e}; "
-                "running best-effort cleanup."
-            )
-            self._best_effort_runtime_core_stop(
-                use_hyperv=bool(use_hyperv),
-                use_peerinterface=bool(use_peerinterface),
-                use_stratum_comm=bool(use_stratum_comm),
-            )
+            self.python_server_manager = None
+            if failures:
+                self.router_logger.log_message(
+                    "[Router] Shutdown completed with warnings: " + ", ".join(sorted(set(failures)))
+                )
+                return False
+            self.router_logger.log_message("[Router] ✅ All services stopped cleanly.")
+            return True
         finally:
             self._runtime_network_ready.clear()
             self._stop_sniffing_event.set()
             self.started = False
+            with self._shutdown_lock:
+                self._shutdown_in_progress = False
+                self._shutdown_complete = True
+
+    def shutdown(self, *, final: bool = False) -> bool:
+        """Application-level shutdown; final=True also releases native DLL handles."""
+        result = self.stop_routing()
+        if final:
+            for label, component, method in (
+                ("ProcessPacketTap", self.process_packet_tap, "stop"),
+                ("CodeOutputControl", self.codeoutput_native_control, "stop"),
+                ("ParallelPython", self.parallel_python, "stop"),
+            ):
+                self._safe_stop_component(label, component, method)
+        return bool(result)
 
     def _select_dns_upstream_iface(
             self,
@@ -10248,10 +12958,13 @@ if ($route) { Write-Output ($route.InterfaceAlias + "|" + $route.NextHop) }
         }:
             return False
 
-        # Loopback / synthetic capture only.
+        # Loopback / synthetic ingress/backing adapters are never managed by
+        # the physical router-interface configuration path.
         if full and full == getattr(self, "interface_loopback_full_name", None):
             return True
         if friendly in {"adapter for loopback traffic capture", "lo", "loopback"}:
+            return True
+        if self._is_synthetic_interface_identity(full, friendly):
             return True
 
         # Keep your LAC helper adapters skipped unless they are explicitly the live WAN/LAN.
